@@ -1,0 +1,1 @@
+<BucketLoggingStatus><LoggingEnabled><TargetBucket>rustfs-access-logs</TargetBucket><TargetPrefix>buckets/interop/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>

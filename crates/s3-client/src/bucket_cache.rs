@@ -20,6 +20,7 @@
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::credentials::SignatureType;
+use crate::remote_error_code::RemoteErrorCode;
 use crate::{
     api_error_response::http_resp_to_error_response,
     signer_error,
@@ -32,7 +33,6 @@ use hyper::body::Bytes;
 use hyper::body::Incoming;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use s3s::S3ErrorCode;
 use std::collections::HashMap;
 
 fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
@@ -94,7 +94,7 @@ impl TransitionClient {
         Ok(location)
     }
 
-    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<s3s::Body>, std::io::Error> {
+    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<rustfs_s3_types::Body>, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("location".to_string(), "".to_string());
 
@@ -135,7 +135,7 @@ impl TransitionClient {
         let Ok(mut req) = Request::builder()
             .method(http::Method::GET)
             .uri(url_str)
-            .body(s3s::Body::empty())
+            .body(rustfs_s3_types::Body::empty())
         else {
             return Err(std::io::Error::other("create request error"));
         };
@@ -209,7 +209,7 @@ async fn process_bucket_location_response(
 
         let err_resp = http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "");
         match err_resp.code {
-                S3ErrorCode::NotImplemented => {
+                RemoteErrorCode::NOT_IMPLEMENTED => {
                     match err_resp.server.as_str() {
                         "AmazonSnowball" => {
                             return Ok("snowball".to_string());
@@ -222,9 +222,9 @@ async fn process_bucket_location_response(
                         }
                     }
                 }
-                S3ErrorCode::AuthorizationHeaderMalformed |
-                //S3ErrorCode::InvalidRegion |
-                S3ErrorCode::AccessDenied => {
+                RemoteErrorCode::AUTHORIZATION_HEADER_MALFORMED |
+                //RemoteErrorCode::INVALID_REGION |
+                RemoteErrorCode::ACCESS_DENIED => {
                     if err_resp.region == "" {
                       return Ok("us-east-1".to_string());
                     }

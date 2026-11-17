@@ -126,6 +126,7 @@ async fn run_entry(
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx,
                 budget,
                 updates,
@@ -138,6 +139,7 @@ async fn run_entry(
                 requires_full_scan: false,
                 service_cohort: None,
                 resolved_scope_observer: Some(observer),
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },

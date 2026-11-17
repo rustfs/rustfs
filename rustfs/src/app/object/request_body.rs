@@ -17,7 +17,9 @@
 //! after its input returned Pending, so the transport cannot infer read demand.
 
 use super::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
-use crate::app::storage_api::request_body::{ByteStream, DynByteStream, RemainingLength, StdError, StreamingBlob};
+use crate::app::storage_api::request_body::StdError;
+#[cfg(test)]
+use crate::app::storage_api::request_body::{ByteStream, DynByteStream, RemainingLength, StreamingBlob};
 use crate::error::ClientBodyReadTimeout;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -421,17 +423,36 @@ impl<R: TryGetIndex> TryGetIndex for DemandReader<R> {
 /// Establish demand for eager reads and archive sniffing before the final
 /// transformed reader exists. Pending demand is subsequently paused by the
 /// outer DemandReader when a transform returns buffered output.
-pub(crate) fn demand_upload_body(body: StreamingBlob, control: BodyReadControl) -> StreamingBlob {
-    StreamingBlob::new(DemandStream {
-        inner: body.into(),
-        control,
-    })
+pub(crate) type UploadChunks = Box<dyn Stream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin>;
+
+pub(super) fn demand_native_upload(body: UploadChunks, control: BodyReadControl) -> UploadChunks {
+    Box::new(DemandStream { inner: body, control })
 }
-struct DemandStream {
-    inner: DynByteStream,
+
+pub(crate) fn guard_native_upload_progress(
+    body: UploadChunks,
+    timeout: Duration,
+    bucket: &str,
+    key: &str,
+    request_id: &str,
+    expected: u64,
+) -> (UploadChunks, BodyReadControl) {
+    let control = BodyReadControl::default();
+    control.activate_upload(timeout, bucket, key, request_id, expected);
+    let stream = UploadProgressStream {
+        inner: body,
+        control: control.clone(),
+        timer: None,
+        ended: false,
+    };
+    (Box::new(stream), control)
+}
+
+struct DemandStream<S> {
+    inner: S,
     control: BodyReadControl,
 }
-impl Stream for DemandStream {
+impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for DemandStream<S> {
     type Item = Result<Bytes, StdError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.control.begin_read();
@@ -445,16 +466,8 @@ impl Stream for DemandStream {
         self.inner.size_hint()
     }
 }
-impl ByteStream for DemandStream {
-    fn remaining_length(&self) -> RemainingLength {
-        self.inner.remaining_length()
-    }
-}
-
-/// Fallback for direct protocol callers without the raw HTTP observation.
-/// HTTP uses ObservedBody because a signed chunk may not yield decoded output
-/// until its full payload has arrived and its signature has been verified.
-/// The final DemandReader pauses pending reads when transforms return output.
+/// Supplies the read-progress guard to tests using a legacy body.
+#[cfg(test)]
 pub(crate) fn guard_upload_progress(
     body: StreamingBlob,
     timeout: Duration,
@@ -466,7 +479,7 @@ pub(crate) fn guard_upload_progress(
     let control = BodyReadControl::default();
     control.activate_upload(timeout, bucket, key, request_id, expected);
     let stream = UploadProgressStream {
-        inner: body.into(),
+        inner: DynByteStream::from(body),
         control: control.clone(),
         timer: None,
         ended: false,
@@ -474,14 +487,14 @@ pub(crate) fn guard_upload_progress(
     (StreamingBlob::new(stream), control)
 }
 
-struct UploadProgressStream {
-    inner: DynByteStream,
+struct UploadProgressStream<S> {
+    inner: S,
     control: BodyReadControl,
     timer: Option<Pin<Box<Sleep>>>,
     ended: bool,
 }
 
-impl UploadProgressStream {
+impl<S> UploadProgressStream<S> {
     fn poll_timeout(&mut self, cx: &mut Context<'_>) -> Option<ClientBodyReadTimeout> {
         let deadline = self.control.waiting_deadline()?;
         let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
@@ -492,7 +505,7 @@ impl UploadProgressStream {
     }
 }
 
-impl Stream for UploadProgressStream {
+impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for UploadProgressStream<S> {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -541,12 +554,13 @@ impl Stream for UploadProgressStream {
         self.inner.size_hint()
     }
 }
-impl ByteStream for UploadProgressStream {
+#[cfg(test)]
+impl ByteStream for UploadProgressStream<DynByteStream> {
     fn remaining_length(&self) -> RemainingLength {
         self.inner.remaining_length()
     }
 }
-impl Drop for UploadProgressStream {
+impl<S> Drop for UploadProgressStream<S> {
     fn drop(&mut self) {
         self.control.finish();
     }

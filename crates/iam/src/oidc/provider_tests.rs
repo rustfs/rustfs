@@ -190,8 +190,12 @@ fn caller_supplied_tokens_cannot_be_signed_with_the_client_secret() {
         "iss": config.config_url, "sub": "repo:example/project:ref:refs/heads/main",
         "aud": [config.client_id, "additional-audience"], "iat": now, "exp": now + 300,
     });
-    let signed =
-        jsonwebtoken::encode(&Header::new(Algorithm::HS256), &payload, &EncodingKey::from_secret(secret.as_bytes())).unwrap();
+    let signed = jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &payload,
+        &EncodingKey::from_secret(secret.as_bytes()).expect("construct test JWT key"),
+    )
+    .unwrap();
     let token: CoreIdToken = signed.parse().unwrap();
     for workload in [false, true] {
         for (algorithms, accepted) in [
@@ -236,8 +240,12 @@ fn configured_verifier_rejects_malformed_hmac_signature_lengths() {
         (Algorithm::HS384, "HS384", 48),
         (Algorithm::HS512, "HS512", 64),
     ] {
-        let signed = jsonwebtoken::encode(&Header::new(algorithm), &payload, &EncodingKey::from_secret(secret.as_bytes()))
-            .expect("sign a valid HMAC control token");
+        let signed = jsonwebtoken::encode(
+            &Header::new(algorithm),
+            &payload,
+            &EncodingKey::from_secret(secret.as_bytes()).expect("construct test JWT key"),
+        )
+        .expect("sign a valid HMAC control token");
         let valid: CoreIdToken = signed.parse().expect("parse valid HMAC token");
         let (signing_input, signature) = signed.rsplit_once('.').expect("JWT signature segment");
         assert_eq!(

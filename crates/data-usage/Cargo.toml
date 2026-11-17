@@ -39,5 +39,8 @@ serde = { workspace = true, features = ["derive"] }
 rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lib]
 doctest = false

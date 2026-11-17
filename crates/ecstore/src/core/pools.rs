@@ -84,12 +84,13 @@ use rand::RngExt as _;
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{
     decode_dir_object, encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path,
 };
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -6399,7 +6400,7 @@ pub(crate) struct PoolMetaWriteState {
     pool_meta_absent: bool,
     bootstrap_authority: PoolMetaBootstrapAuthority,
     /// First-hand bootstrap authority this process holds for each pool
-    /// (index = pool index): `Fresh` only for pools it formatted itself,
+    /// (index = pool index): `Fresh` for pools it formatted or resumed from a complete durable plan,
     /// `LegacyAdoption` only for pools whose migration it verified. Empty when
     /// the caller tracks deployment-wide authority only.
     pool_bootstrap_authorities: Vec<PoolMetaBootstrapAuthority>,
@@ -6477,8 +6478,7 @@ impl PoolMetaWriteState {
     }
 
     /// Startup state for a process that loaded every pool format itself and
-    /// remembers, per pool, whether it created (or adopted) that pool
-    /// first-hand. Deployment-wide authority is the conjunction across pools:
+    /// remembers, per pool, whether it created, durably resumed, or adopted that pool. Deployment-wide authority is the conjunction across pools:
     /// any pool this process merely read yields `None`, exactly as before.
     pub(crate) fn for_startup_with_pool_bootstrap_authorities(
         cluster_id: uuid::Uuid,
@@ -6509,7 +6509,7 @@ impl PoolMetaWriteState {
             .is_some_and(|authority| authority.is_proven())
     }
 
-    /// Pools this process formatted or adopted first-hand during this startup.
+    /// Pools this process formatted, durably resumed, or adopted during startup.
     pub(crate) fn attested_pool_indices(&self) -> Vec<usize> {
         self.pool_bootstrap_authorities
             .iter()
@@ -6526,7 +6526,7 @@ impl PoolMetaWriteState {
     /// [`PoolMetaIdentityWriteScope::Pools`]), so a complete, agreeing pending
     /// set proves that every pool joined this bootstrap fresh. A missing,
     /// corrupt, or disagreeing replica keeps the writer fail-closed, and a
-    /// restart without first-hand proof never reopens bootstrap on its own.
+    /// restart requires a complete durable format plan to recover creator proof.
     fn pending_identity_attested_by_every_pool(&self) -> bool {
         self.elected_bootstrap_writer == Some(true)
             && self.pool_bootstrap_authority_proven(0)
@@ -6756,6 +6756,27 @@ impl PoolMetaWriteState {
 
     pub(crate) fn identity_requires_repair(&self) -> bool {
         self.expected_cluster_id.is_some() && (self.identity_needs_repair || self.identity_initialized != Some(true))
+    }
+
+    /// A committed predecessor authorizes repairing an established identity
+    /// before the next metadata write. A pending fresh identity must remain
+    /// pending until its initial metadata commit is recoverable.
+    pub(crate) fn startup_identity_precedes_metadata_write(&self) -> bool {
+        !self.pool_meta_absent && !self.identity_is_pending()
+    }
+
+    pub(crate) fn ensure_startup_identity_initialized(&self) -> Result<()> {
+        if self.expected_cluster_id.is_none()
+            || (self.identity_initialized == Some(true)
+                && !self.identity_needs_repair
+                && !self.identity_replicas_missing
+                && !self.identity_replicas_invalid)
+        {
+            return Ok(());
+        }
+        Err(Error::other(
+            "pool metadata bootstrap pending: waiting for the elected writer to initialize the identity on every pool",
+        ))
     }
 
     pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
@@ -10145,6 +10166,8 @@ impl PoolMeta {
         self.save_for_startup_observing(pools, &mut write_state).await.map(|_| ())
     }
 
+    /// Commits a complete startup snapshot while leaving identity finalization
+    /// to the caller, after durable format-bootstrap authority is retired.
     pub(crate) async fn save_for_startup_observing<S>(
         &self,
         pools: Vec<Arc<S>>,
@@ -10159,6 +10182,8 @@ impl PoolMeta {
         Ok(outcome.into_committed())
     }
 
+    /// Commits a complete startup snapshot under the writer fence. The caller
+    /// retires format-bootstrap authority before finalizing initialized identity.
     pub(crate) async fn save_for_startup_guarded<S>(
         &self,
         pools: Vec<Arc<S>>,
@@ -10361,7 +10386,10 @@ impl PoolMeta {
                     selection.revision.epoch, identity.epoch
                 )));
             }
-            if !selection.absent && write_state.identity_requires_repair() {
+            // Full-snapshot saves belong to startup. Their caller retires
+            // durable format authority before publishing initialized identity.
+            // Runtime scoped saves retain their existing identity repair.
+            if indices.is_some() && !selection.absent && write_state.identity_requires_repair() {
                 let initialized = write_state.identity_initialized != Some(false) || selection.revision.is_generation_protocol();
                 persist_pool_meta_identity(
                     pools.clone(),
@@ -10639,7 +10667,10 @@ impl PoolMeta {
             confirmed
         };
         if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
-            persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm).await?;
+            if indices.is_some() {
+                persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm)
+                    .await?;
+            }
             #[cfg(feature = "e2e-test-hooks")]
             startup_cas_test_observe(serde_json::json!({
                 "kind": "confirmed", "object": POOL_META_NAME,
@@ -13115,7 +13146,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
     bucket: &str,
     version: &rustfs_filemeta::FileInfo,
-    lifecycle_config: Option<&BucketLifecycleConfiguration>,
+    lifecycle_config: Option<&PersistedLifecycleConfiguration>,
     object_lock_config: Option<&ObjectLockConfiguration>,
     apply_actions: bool,
     event_source: &LcEventSrc,
@@ -17046,9 +17077,9 @@ impl ECStore {
         generation: OffsetDateTime,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -17220,9 +17251,9 @@ impl ECStore {
         mut deferred_entry: DeferredDecommissionEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -17329,9 +17360,9 @@ impl ECStore {
         generation: OffsetDateTime,
         set: Arc<SetDisks>,
         bi: DecomBucketInfo,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -18016,9 +18047,9 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         attempts: &mut usize,
@@ -18202,9 +18233,9 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         entry_attempt: usize,
         scanner_backlog_handoff_attempt: usize,
@@ -19490,7 +19521,7 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
     ) -> Result<()> {
         let expected_bucket_incarnation_id = if is_meta_bucketname(&bucket) {
             None
@@ -20944,12 +20975,12 @@ impl ECStore {
         let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
         let mut proof = None::<DecommissionDurableIlmReceipt>;
         let mut nonterminal_receipt_found = false;
-        for pool_idx in 0..self.pools.len() {
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
             if pool_idx == source_pool_idx {
                 continue;
             }
             let data = match read_config_limited_preserve_empty(
-                self.pools[pool_idx].clone(),
+                pool.clone(),
                 &receipt_path,
                 DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
             )
@@ -28412,7 +28443,7 @@ mod tests {
             for wrapped in [
                 err.clone(),
                 data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "b", "o", err.clone()),
-                with_decommission_entry_context("migrate_object", "b", "o", err.clone()),
+                with_decommission_entry_context("migrate_object", "b", "o", err),
             ] {
                 assert_eq!(
                     classify_decommission_capacity_failure(&wrapped),
@@ -40280,7 +40311,7 @@ mod pools_tests {
             )
             .expect("finalize records the completion");
 
-            let mut adopted = meta.clone();
+            let mut adopted = meta;
             let plan = decommission_capacity_intent_adoption_plan(&adopted, 0, generation)
                 .expect("plan adoption")
                 .expect("the interrupted completion should be planned");

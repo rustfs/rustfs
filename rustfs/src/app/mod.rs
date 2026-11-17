@@ -14,22 +14,38 @@
 
 //! Application layer module entry.
 //! Concrete use-case modules will be introduced incrementally in Phase 3.
+//!
+//! A use case that answers in the gateway's types materialises every stored name under the
+//! gateway's floor only: the strict wire grammar applies to names a client sends, never to names
+//! the store returns. A stored value is never dropped or rewritten to fit a stricter scalar
+//! ([`dto_values`]).
 
 pub mod admin_usecase;
+mod answered;
 pub(crate) mod bucket_list_through;
 pub mod bucket_usecase;
 pub mod context;
+pub(crate) mod dto_values;
 pub(crate) mod metadata_route;
 pub mod multipart_usecase;
 pub mod object;
 pub(crate) mod object_data_cache;
+pub(crate) mod object_meta;
 pub(crate) mod object_traffic_health;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
+pub(crate) mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
 pub(crate) mod trailer_adapter;
+
+// Request-scoped facts are not AppContext resolution, so consumers import them
+// from here rather than through `app::context`.
+pub(crate) use answered::Answered;
+pub(crate) use context::RequestHead;
+pub use context::{RequestCredentials, RequestEnvelope};
+pub(crate) use context::{authorize_owned_internal_object_request, authorize_owned_request};
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;
@@ -42,4 +58,10 @@ pub(crate) mod gating_test_env;
 #[cfg(test)]
 mod lifecycle_transition_api_test;
 #[cfg(test)]
+mod owned_audit_test;
+#[cfg(test)]
+mod owned_authorization_test;
+#[cfg(test)]
 mod put_prelookup_gating_test;
+#[cfg(test)]
+pub(crate) mod test_seams;

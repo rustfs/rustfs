@@ -102,6 +102,7 @@ mod body_cache_hook;
 pub mod ec_block_layout;
 mod encryption;
 mod hook_slot;
+mod multipart_completion_binding;
 mod object_mutation_hook;
 mod read_condition;
 mod readers;
@@ -128,6 +129,7 @@ pub use encryption::{
     EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
     ReadEncryptionMode, ReadEncryptionRequest,
 };
+pub use multipart_completion_binding::MultipartCompletionBinding;
 pub(crate) use object_mutation_hook::notify_object_mutation;
 pub use object_mutation_hook::{ObjectMutationHook, register_object_mutation_hook, unregister_object_mutation_hook};
 pub use readers::*;

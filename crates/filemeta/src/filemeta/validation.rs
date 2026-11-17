@@ -113,11 +113,7 @@ impl FileMetaVersionHeader {
         }
 
         // Check erasure coding parameters
-        if self.has_ec() && (self.ec_n == 0 || self.ec_m == 0 || self.ec_m < self.ec_n) {
-            return false;
-        }
-
-        true
+        !(self.has_ec() && (self.ec_n == 0 || self.ec_m == 0 || self.ec_m < self.ec_n))
     }
 }
 

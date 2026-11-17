@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Restriction registration only. These endpoints do not vend credentials.
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
     plugin_runner::{self, ObjectReference, SubmitRequest},
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
     runtime_sources,
-    storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result},
+    storage_api::s3::{self, S3Error, S3ErrorCode, S3Result},
 };
 use crate::{
     auth::{check_key_valid_with_context, get_session_token},
@@ -17,6 +18,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use matchit::Params;
 use rustfs_iam::delegation::{DelegationError, Restrictions};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::Body;
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -71,19 +73,18 @@ pub(super) fn storage_error(error: DelegationError) -> S3Error {
 }
 
 pub(super) async fn owner(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     action: AdminAction,
 ) -> S3Result<(std::sync::Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>, String)> {
     let signed = req
-        .credentials
-        .as_ref()
+        .credentials()
         .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?;
-    if get_session_token(&req.uri, &req.headers).is_some() {
+    if get_session_token(req.uri(), req.headers()).is_some() {
         return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
     }
-    let context = runtime_sources::app_context_from_req(req)
+    let context = runtime_sources::app_context_from_envelope(req.envelope())
         .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "application context unavailable"))?;
-    let (credentials, root) = check_key_valid_with_context("", &signed.access_key, Some(context.as_ref())).await?;
+    let (credentials, root) = check_key_valid_with_context("", signed.access_key(), Some(context.as_ref())).await?;
     if root || credentials.is_temp() || credentials.is_service_account() {
         return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
     }
@@ -93,32 +94,32 @@ pub(super) async fn owner(
     let iam = context.iam().handle();
     validate_admin_action_with_bucket_object_for_iam(
         iam.clone(),
-        &req.headers,
+        req.headers(),
         &credentials,
         false,
         Action::AdminAction(action),
-        crate::admin::auth::policy_source_addr(&req.extensions),
+        req.policy_source_addr(),
         AdminResourceScope::bucket_object("", ""),
     )
     .await?;
     Ok((iam, credentials.access_key))
 }
 
-pub(super) fn response<T: serde::Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
+pub(super) fn response<T: serde::Serialize>(value: &T) -> S3Result<AdminResponse> {
     let bytes =
         serde_json::to_vec(value).map_err(|_| s3::error(S3ErrorCode::InternalError, "delegation response unavailable"))?;
     let mut headers = HeaderMap::new();
     headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
+    Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(bytes), headers))
 }
 
 struct Create;
 #[async_trait::async_trait]
 impl Operation for Create {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, owner) = owner(&req, AdminAction::CreatePluginDelegationAction).await?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "delegation body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "delegation body unavailable"))?;
@@ -139,7 +140,7 @@ impl Operation for Create {
 struct Get;
 #[async_trait::async_trait]
 impl Operation for Get {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, owner) = owner(&req, AdminAction::GetPluginDelegationAction).await?;
         let id = params
             .get("id")
@@ -159,7 +160,7 @@ impl Operation for Get {
 struct Revoke;
 #[async_trait::async_trait]
 impl Operation for Revoke {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, owner) = owner(&req, AdminAction::RevokePluginDelegationAction).await?;
         let id = params
             .get("id")
@@ -189,12 +190,12 @@ struct SubmitObject {
 struct Submit;
 #[async_trait::async_trait]
 impl Operation for Submit {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, signer) = owner(&req, AdminAction::SubmitPluginJobAction).await?;
         let id = params
             .get("id")
             .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "submit body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "submit body unavailable"))?;
@@ -257,12 +258,12 @@ struct QueryRunInput {
 struct QueryRun;
 #[async_trait::async_trait]
 impl Operation for QueryRun {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, signer) = owner(&req, AdminAction::GetPluginRunAction).await?;
         let id = params
             .get("id")
             .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "query body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "query body unavailable"))?;
@@ -298,12 +299,12 @@ fn valid_history_run_input(input: &HistoryRunInput) -> bool {
 struct HistoryRun;
 #[async_trait::async_trait]
 impl Operation for HistoryRun {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, signer) = owner(&req, AdminAction::ListPluginRunsAction).await?;
         let id = params
             .get("id")
             .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "history body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "history body unavailable"))?;
@@ -328,12 +329,12 @@ impl Operation for HistoryRun {
 struct CancelRun;
 #[async_trait::async_trait]
 impl Operation for CancelRun {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, signer) = owner(&req, AdminAction::CancelPluginRunAction).await?;
         let id = params
             .get("id")
             .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "cancel body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "cancel body unavailable"))?;
@@ -371,12 +372,12 @@ fn valid_page_runs_input(input: &PageRunsInput) -> bool {
 struct PageRuns;
 #[async_trait::async_trait]
 impl Operation for PageRuns {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, signer) = owner(&req, AdminAction::ListPluginRunsAction).await?;
         let id = params
             .get("id")
             .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "page body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "page body unavailable"))?;
@@ -418,12 +419,12 @@ fn valid_replay_run_input(input: &ReplayRunInput) -> bool {
 struct ReplayRun;
 #[async_trait::async_trait]
 impl Operation for ReplayRun {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (iam, signer) = owner(&req, AdminAction::ReplayPluginRunAction).await?;
         let id = params
             .get("id")
             .ok_or_else(|| s3::error(S3ErrorCode::InvalidRequest, "delegation id required"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "replay body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "replay body unavailable"))?;
@@ -460,17 +461,12 @@ mod tests {
     #[tokio::test]
     async fn delegation_mutations_require_authenticated_original_user() {
         for operation in 0..8 {
-            let req = S3Request {
-                input: Body::from("{}".to_owned()),
-                method: Method::POST,
-                uri: http::Uri::from_static("/rustfs/admin/v3/plugin-delegations"),
-                headers: HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
+            let req =
+                crate::admin::operation::test_support::TestRequest::new(Method::POST, "/rustfs/admin/v3/plugin-delegations")
+                    .headers(HeaderMap::new())
+                    .extensions(http::Extensions::new())
+                    .body(Body::from("{}".to_owned()))
+                    .build();
             let result = if operation == 0 {
                 Get.call(req, Params::new()).await
             } else if operation == 1 {

@@ -703,7 +703,7 @@ fn service_unavailable_cause(source: &(dyn std::error::Error + 'static)) -> Opti
     timeout.or(cause)
 }
 
-impl From<ApiError> for S3Error {
+impl From<ApiError> for rustfs_s3_types::S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
         let cause = if err.code == S3ErrorCode::ServiceUnavailable {
@@ -711,7 +711,7 @@ impl From<ApiError> for S3Error {
         } else {
             None
         };
-        let mut s3e = S3Error::with_message(err.code, err.message);
+        let mut s3e = rustfs_s3_types::S3Error::with_message(err.code.into(), err.message);
         if let Some(cause) = cause {
             let mut headers = http::HeaderMap::new();
             // s3s replaces the generated headers when a custom map is supplied.
@@ -729,6 +729,16 @@ impl From<ApiError> for S3Error {
             s3e.set_source(source);
         }
         s3e
+    }
+}
+
+/// The s3s error for the legacy edge: the conversion above carried across
+/// with `From`, which yields field for field what the s3s constructor builds
+/// (code, message, explicit status, the cause itself), so both error types
+/// come from one mapping.
+impl From<ApiError> for S3Error {
+    fn from(err: ApiError) -> Self {
+        rustfs_s3_types::S3Error::from(err).into()
     }
 }
 
@@ -2408,7 +2418,7 @@ mod tests {
             StorageError::PartMissingOrCorrupt,
         ] {
             assert!(is_object_read_unavailable(&source));
-            let api_error = slow_down_read_api_error(source.clone());
+            let api_error = slow_down_read_api_error(source);
             assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
         }

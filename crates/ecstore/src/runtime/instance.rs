@@ -52,7 +52,7 @@ use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use crate::store::delete_recovery_runtime::DeleteRecoveryHints;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
-use s3s::region::Region;
+use rustfs_s3_types::Region;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, OnceLock,
@@ -99,6 +99,7 @@ pub(crate) struct ScannerPublicationLeaseEntry {
 pub(crate) struct NamespaceCommitGuard {
     ctx: Arc<InstanceContext>,
     counted: bool,
+    _usage_watch: super::usage_watch::UsageWatchMutationGuard,
 }
 
 impl Drop for NamespaceCommitGuard {
@@ -234,6 +235,8 @@ pub struct InstanceContext {
     /// never observe a torn intermediate state.
     erasure_kind: RwLock<SetupType>,
     list_read_budget: OnceLock<ListReadBudget>,
+    #[cfg(feature = "internode-transport")]
+    internode_data_transport: OnceLock<Arc<dyn crate::api::rpc::InternodeDataTransport>>,
     /// This instance's namespace lock manager (Phase 5 Slice 3, backlog#939).
     ///
     /// Owned per-instance so two instances no longer share a lock namespace
@@ -246,6 +249,10 @@ pub struct InstanceContext {
     /// Write-once like the process global it replaces: startup sets it exactly
     /// once and a duplicate write fails fast (see [`InstanceContext::set_region`]).
     region: OnceLock<Region>,
+    /// Further regions this instance accepts as a bucket `LocationConstraint`
+    /// besides [`Self::region`] - the tail of a comma-separated `RUSTFS_REGION`.
+    /// Write-once like `region`.
+    additional_regions: OnceLock<Vec<Region>>,
     /// This instance's deployment id (Phase 5 Slice 5, backlog#939).
     ///
     /// Write-once identity, mirrored by `ECStore::id` (both come from the same
@@ -365,6 +372,7 @@ pub struct InstanceContext {
     scanner_publication_state: AtomicU8,
     namespace_commits: AtomicU64,
     namespace_commit_generation: AtomicU64,
+    pub(crate) usage_watches: Arc<super::usage_watch::UsageWatchRegistry>,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     delete_recovery_hints: DeleteRecoveryHints,
@@ -385,6 +393,49 @@ impl InstanceContext {
     /// all-`false` erasure globals.
     pub fn new() -> Self {
         Self::with_lock_manager(Arc::new(GlobalLockManager::new()))
+    }
+
+    /// Select this instance's transport before creating or reconnecting remote disks.
+    /// Returns an error for a repeated installation or an unsupported configured name.
+    #[cfg(feature = "internode-transport")]
+    pub fn install_internode_data_transport(
+        &self,
+        provider: Arc<dyn crate::api::rpc::InternodeDataTransport>,
+    ) -> std::io::Result<()> {
+        let configured = std::env::var(rustfs_config::ENV_RUSTFS_INTERNODE_DATA_TRANSPORT).ok();
+        self.select_internode_data_transport(provider, configured.as_deref())
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn select_internode_data_transport(
+        &self,
+        provider: Arc<dyn crate::api::rpc::InternodeDataTransport>,
+        configured: Option<&str>,
+    ) -> std::io::Result<()> {
+        let name = provider.name();
+        if name.is_empty()
+            || name.len() > 64
+            || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            || rustfs_config::KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS.contains(&name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid external internode transport name",
+            ));
+        }
+        let selected = match configured.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) if value.eq_ignore_ascii_case(name) => provider,
+            value => crate::cluster::rpc::internode_data_transport::build_internode_data_transport(value)
+                .map_err(std::io::Error::other)?,
+        };
+        self.internode_data_transport
+            .set(selected)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "internode transport already installed"))
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn internode_data_transport(&self) -> Option<&Arc<dyn crate::api::rpc::InternodeDataTransport>> {
+        self.internode_data_transport.get()
     }
 
     /// Bound native listing fanout independently of GET body permits. A walk
@@ -414,8 +465,11 @@ impl InstanceContext {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
             list_read_budget: OnceLock::new(),
+            #[cfg(feature = "internode-transport")]
+            internode_data_transport: OnceLock::new(),
             lock_manager,
             region: OnceLock::new(),
+            additional_regions: OnceLock::new(),
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
             multipart_proof_topology: OnceLock::new(),
@@ -444,6 +498,7 @@ impl InstanceContext {
             scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
+            usage_watches: Arc::new(super::usage_watch::UsageWatchRegistry::default()),
             object_encryption_resolver: OnceLock::new(),
             delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -683,6 +738,15 @@ impl InstanceContext {
     }
 
     pub(crate) fn begin_namespace_commit(self: &Arc<Self>) -> Arc<NamespaceCommitGuard> {
+        self.begin_namespace_commit_scoped(None)
+    }
+
+    pub(crate) fn begin_namespace_commit_for_bucket(self: &Arc<Self>, bucket: &str) -> Arc<NamespaceCommitGuard> {
+        self.begin_namespace_commit_scoped(Some(bucket))
+    }
+
+    fn begin_namespace_commit_scoped(self: &Arc<Self>, bucket: Option<&str>) -> Arc<NamespaceCommitGuard> {
+        let usage_watch = self.usage_watches.begin(bucket);
         let counted = self
             .namespace_commits
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
@@ -695,6 +759,7 @@ impl InstanceContext {
         Arc::new(NamespaceCommitGuard {
             ctx: Arc::clone(self),
             counted,
+            _usage_watch: usage_watch,
         })
     }
 
@@ -832,6 +897,22 @@ impl InstanceContext {
     /// This instance's S3 region, if it has been set.
     pub fn region(&self) -> Option<Region> {
         self.region.get().cloned()
+    }
+
+    /// Set the further regions this instance accepts as a bucket
+    /// `LocationConstraint` besides its own [`Self::region`].
+    ///
+    /// Write-once: panics on a second write, like [`Self::set_region`].
+    pub fn set_additional_regions(&self, regions: Vec<Region>) {
+        self.additional_regions
+            .set(regions)
+            .expect("instance additional regions should be initialized once during startup");
+    }
+
+    /// The further regions this instance accepts as a bucket
+    /// `LocationConstraint`; empty unless startup set some.
+    pub fn additional_regions(&self) -> Vec<Region> {
+        self.additional_regions.get().cloned().unwrap_or_default()
     }
 
     /// Set this instance's deployment id.
@@ -1614,6 +1695,23 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_region(region("us-east-1"));
         ctx.set_region(region("eu-west-1"));
+    }
+
+    // Additional regions default to none and are write-once like the region.
+    #[tokio::test]
+    async fn additional_regions_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert!(ctx.additional_regions().is_empty());
+        ctx.set_additional_regions(vec![region("ap-southeast-2"), region("us-west-2")]);
+        assert_eq!(ctx.additional_regions(), vec![region("ap-southeast-2"), region("us-west-2")]);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_additional_regions_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_additional_regions(vec![region("us-west-2")]);
+        ctx.set_additional_regions(vec![region("eu-west-1")]);
     }
 
     // A fresh context has no deployment id until set; set-then-get round-trips.

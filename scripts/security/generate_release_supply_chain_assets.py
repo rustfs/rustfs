@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default=os.getenv("GITHUB_RUN_ID", ""))
     parser.add_argument("--run-attempt", default=os.getenv("GITHUB_RUN_ATTEMPT", ""))
     parser.add_argument("--cargo-lock", default="Cargo.lock", help="Cargo.lock path.")
+    parser.add_argument("--workflow", default="build.yml", help="Workflow that assembled these assets.")
     parser.add_argument("--metadata-file", help="Use an existing cargo metadata JSON file.")
     return parser.parse_args()
 
@@ -118,7 +119,7 @@ def build_sbom(packages: list[dict], args: argparse.Namespace, timestamp: str) -
 
 def build_provenance(asset_dir: Path, args: argparse.Namespace, timestamp: str) -> dict:
     subjects = []
-    for asset in sorted(asset_dir.glob("*.zip")):
+    for asset in sorted(path for path in asset_dir.iterdir() if path.suffix in (".zip", ".deb", ".rpm", ".tgz")):
         subjects.append(
             {
                 "name": asset.name,
@@ -129,7 +130,7 @@ def build_provenance(asset_dir: Path, args: argparse.Namespace, timestamp: str) 
     if not subjects:
         raise RuntimeError(f"no .zip release assets found in {asset_dir}")
 
-    workflow_ref = f"{args.repository}/.github/workflows/build.yml"
+    workflow_ref = f"{args.repository}/.github/workflows/{args.workflow}"
     invocation = args.run_id
     if args.run_attempt:
         invocation = f"{invocation}/attempts/{args.run_attempt}" if invocation else args.run_attempt

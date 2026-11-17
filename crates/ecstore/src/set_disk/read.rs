@@ -17,17 +17,18 @@ use super::{
     GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
     GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
-    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers,
     build_inline_bitrot_readers_from_refs_with_frame_size, collect_inline_data_shard_fileinfos_by_index, debug, error,
     get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
     is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
-    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
+    part_checksum_algorithm, reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
     GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
     GET_METADATA_CACHE_REASON_BODY_LAYOUT_REQUIRED, GET_METADATA_CACHE_REASON_DATA_MOVEMENT,
-    GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
+    GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE, GET_METADATA_CACHE_REASON_FENCE_LOCK_LOST,
+    GET_METADATA_CACHE_REASON_FENCE_PROOF_MISMATCH, GET_METADATA_CACHE_REASON_FENCE_PROOF_UNAVAILABLE,
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
     GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
@@ -40,7 +41,7 @@ use crate::diagnostics::get::{
     get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::{DiskAPI, new_disk};
+use crate::disk::{DiskAPI, new_disk_for_instance};
 use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
@@ -57,10 +58,38 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub(super) const GET_OBJECT_PATH_MID_SIZE_STREAMING: &str = "mid_size_streaming";
 
+#[derive(Clone)]
+struct MetadataCacheAuthority {
+    proof: Arc<rustfs_lock::CacheFenceProof>,
+    fence: crate::object_api::NamespaceLockFence,
+}
+
+impl MetadataCacheAuthority {
+    fn from_options(opts: &ObjectOptions) -> Option<Self> {
+        Some(Self {
+            proof: opts.metadata_cache_fence_proof.clone()?,
+            fence: opts.namespace_lock_fence.clone()?,
+        })
+    }
+
+    fn is_current(&self) -> bool {
+        !self.fence.is_lock_lost()
+    }
+}
+
+struct MetadataCachePublication {
+    fi: FileInfo,
+    capability: GetObjectMetadataCacheCapability,
+    verified_inline_body: Option<Bytes>,
+    authority: Option<MetadataCacheAuthority>,
+}
+
 #[cfg(test)]
 use super::DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES;
 #[cfg(test)]
 use super::DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE;
 #[cfg(test)]
 use super::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED;
 #[cfg(test)]
@@ -420,7 +449,8 @@ impl SetDisks {
         // An unregistered probe must not leave a health monitor running after
         // failure/cancellation. Only an identity-validated published handle gets
         // monitoring. No replacement formatting or healing is initiated here.
-        let probe = new_disk(
+        let probe = new_disk_for_instance(
+            &self.ctx,
             endpoint,
             &DiskOption {
                 cleanup: false,
@@ -432,7 +462,8 @@ impl SetDisks {
         if self.find_disk_index(&format)? != (self.set_index, index) {
             return Err(Error::CorruptedFormat);
         }
-        let disk = new_disk(
+        let disk = new_disk_for_instance(
+            &self.ctx,
             endpoint,
             &DiskOption {
                 cleanup: false,
@@ -453,28 +484,39 @@ impl SetDisks {
         if let Some(reason) = get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data) {
             return Some(reason);
         }
-        self.ctx
-            .is_dist_erasure()
-            .await
-            .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
+        if self.ctx.is_dist_erasure().await {
+            if !super::is_get_object_metadata_cache_distributed_proof_enabled() {
+                return Some(GET_METADATA_CACHE_REASON_DIST_ERASURE);
+            }
+            return match MetadataCacheAuthority::from_options(opts) {
+                None => Some(GET_METADATA_CACHE_REASON_FENCE_PROOF_UNAVAILABLE),
+                Some(authority) if !authority.is_current() => Some(GET_METADATA_CACHE_REASON_FENCE_LOCK_LOST),
+                Some(_) => None,
+            };
+        }
+        None
     }
 
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<Arc<GetObjectMetadataCacheEntry>> {
         match self.lookup_cached_get_object_fileinfo(bucket, object).await {
             MetadataCacheLookup::Hit(entry) => Some(entry),
-            MetadataCacheLookup::Miss | MetadataCacheLookup::RejectedInsufficientQuorum => None,
+            MetadataCacheLookup::Miss
+            | MetadataCacheLookup::RejectedInsufficientQuorum
+            | MetadataCacheLookup::RejectedFenceProof => None,
         }
     }
 
     async fn lookup_cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> MetadataCacheLookup {
-        self.lookup_cached_get_object_fileinfo_after_get(bucket, object, || {}).await
+        self.lookup_cached_get_object_fileinfo_with_authority(bucket, object, None, || {})
+            .await
     }
 
-    async fn lookup_cached_get_object_fileinfo_after_get(
+    async fn lookup_cached_get_object_fileinfo_with_authority(
         &self,
         bucket: &str,
         object: &str,
+        authority: Option<&MetadataCacheAuthority>,
         after_get: impl FnOnce(),
     ) -> MetadataCacheLookup {
         let Some(generation) = self.get_object_metadata_cache_generation(bucket, object) else {
@@ -490,11 +532,28 @@ impl SetDisks {
             self.get_object_metadata_cache.invalidate(&key).await;
             return MetadataCacheLookup::Miss;
         }
+        if authority.is_some_and(|authority| !authority.is_current())
+            || entry.distributed_fence_proof.as_deref() != authority.map(|authority| authority.proof.as_ref())
+        {
+            self.get_object_metadata_cache.invalidate(&key).await;
+            return MetadataCacheLookup::RejectedFenceProof;
+        }
         if entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum {
             MetadataCacheLookup::Hit(entry)
         } else {
             MetadataCacheLookup::RejectedInsufficientQuorum
         }
+    }
+
+    #[cfg(test)]
+    async fn lookup_cached_get_object_fileinfo_after_get(
+        &self,
+        bucket: &str,
+        object: &str,
+        after_get: impl FnOnce(),
+    ) -> MetadataCacheLookup {
+        self.lookup_cached_get_object_fileinfo_with_authority(bucket, object, None, after_get)
+            .await
     }
 
     #[cfg(test)]
@@ -512,7 +571,12 @@ impl SetDisks {
             .cache_get_object_fileinfo_owned(
                 identity,
                 generation,
-                (fi.clone(), capability, None),
+                MetadataCachePublication {
+                    fi: fi.clone(),
+                    capability,
+                    verified_inline_body: None,
+                    authority: None,
+                },
                 parts_metadata.to_vec(),
                 online_disks.to_vec(),
                 read_quorum,
@@ -524,12 +588,17 @@ impl SetDisks {
         &self,
         identity: (&str, &str),
         generation: Option<GetObjectMetadataCacheGeneration>,
-        selected: (FileInfo, GetObjectMetadataCacheCapability, Option<Bytes>),
+        publication: MetadataCachePublication,
         parts_metadata: Vec<FileInfo>,
         online_disks: Vec<Option<DiskStore>>,
         read_quorum: usize,
     ) -> GetObjectFileInfo {
-        let (fi, capability, verified_inline_body) = selected;
+        let MetadataCachePublication {
+            fi,
+            capability,
+            verified_inline_body,
+            authority,
+        } = publication;
         if fi.deleted || !fi.has_valid_erasure_geometry() {
             let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
             snapshot.set_verified_inline_body(verified_inline_body);
@@ -558,17 +627,37 @@ impl SetDisks {
             read_quorum,
             capability,
             verified_inline_body,
+            distributed_fence_proof: authority.as_ref().map(|authority| Arc::clone(&authority.proof)),
         });
-        self.insert_get_object_metadata_cache_entry_after_insert(key, generation, Arc::clone(&entry), || {})
-            .await;
+        self.insert_get_object_metadata_cache_entry_with_authority_after_insert(
+            key,
+            generation,
+            Arc::clone(&entry),
+            authority,
+            || {},
+        )
+        .await;
         GetObjectFileInfo::owned_published(entry)
     }
 
+    #[cfg(test)]
     async fn insert_get_object_metadata_cache_entry_after_insert(
         &self,
         key: GetObjectMetadataCacheKey,
         generation: GetObjectMetadataCacheGeneration,
         entry: Arc<GetObjectMetadataCacheEntry>,
+        after_insert: impl FnOnce(),
+    ) {
+        self.insert_get_object_metadata_cache_entry_with_authority_after_insert(key, generation, entry, None, after_insert)
+            .await;
+    }
+
+    async fn insert_get_object_metadata_cache_entry_with_authority_after_insert(
+        &self,
+        key: GetObjectMetadataCacheKey,
+        generation: GetObjectMetadataCacheGeneration,
+        entry: Arc<GetObjectMetadataCacheEntry>,
+        authority: Option<MetadataCacheAuthority>,
         after_insert: impl FnOnce(),
     ) {
         // Every publisher shares Moka's per-key compute lock. A partial snapshot
@@ -578,6 +667,7 @@ impl SetDisks {
             .and_compute_with(|current| {
                 std::future::ready(
                     if !self.is_get_object_metadata_cache_generation_current(generation)
+                        || authority.as_ref().is_some_and(|authority| !authority.is_current())
                         || (entry.capability != GetObjectMetadataCacheCapability::Full
                             && current
                                 .as_ref()
@@ -591,7 +681,9 @@ impl SetDisks {
             })
             .await;
         after_insert();
-        if self.is_get_object_metadata_cache_generation_current(generation) {
+        if self.is_get_object_metadata_cache_generation_current(generation)
+            && !authority.as_ref().is_some_and(|authority| !authority.is_current())
+        {
             return;
         }
 
@@ -839,6 +931,9 @@ impl SetDisks {
         let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let cache_bypass_reason = self.get_object_metadata_cache_bypass_reason(bucket, opts, read_data).await;
         let use_metadata_cache = cache_bypass_reason.is_none();
+        let metadata_cache_authority = use_metadata_cache
+            .then(|| MetadataCacheAuthority::from_options(opts))
+            .flatten();
         if let Some(reason) = cache_bypass_reason {
             rustfs_io_metrics::record_get_object_metadata_cache_decision(
                 GET_OBJECT_PATH_SET_DISK,
@@ -846,7 +941,10 @@ impl SetDisks {
                 reason,
             );
         } else if vid.is_empty() {
-            match self.lookup_cached_get_object_fileinfo(bucket, object).await {
+            match self
+                .lookup_cached_get_object_fileinfo_with_authority(bucket, object, metadata_cache_authority.as_ref(), || {})
+                .await
+            {
                 MetadataCacheLookup::Hit(cached)
                     if cached.capability == GetObjectMetadataCacheCapability::Full
                         || (cached.capability == GetObjectMetadataCacheCapability::QuorumSelected
@@ -901,6 +999,13 @@ impl SetDisks {
                         GET_OBJECT_PATH_SET_DISK,
                         GET_METADATA_CACHE_DECISION_REJECT,
                         GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
+                    );
+                }
+                MetadataCacheLookup::RejectedFenceProof => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_REJECT,
+                        GET_METADATA_CACHE_REASON_FENCE_PROOF_MISMATCH,
                     );
                 }
             }
@@ -1103,9 +1208,9 @@ impl SetDisks {
             self.cache_get_object_fileinfo_owned(
                 (bucket, object),
                 metadata_cache_generation,
-                (
+                MetadataCachePublication {
                     fi,
-                    if metadata_fanout_complete {
+                    capability: if metadata_fanout_complete {
                         GetObjectMetadataCacheCapability::Full
                     } else if condition_stopped {
                         GetObjectMetadataCacheCapability::ConditionOnly
@@ -1113,7 +1218,8 @@ impl SetDisks {
                         GetObjectMetadataCacheCapability::QuorumSelected
                     },
                     verified_inline_body,
-                ),
+                    authority: metadata_cache_authority,
+                },
                 parts_metadata,
                 op_online_disks,
                 read_quorum,
@@ -1372,12 +1478,7 @@ impl SetDisks {
         let erasure = erasure_cache.get_for_file_info(fi)?;
         let frame_size = read_frame_size_for_file_info(fi, &erasure)?;
 
-        let checksum_info = fi.erasure.get_checksum_info(part.number);
-        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-            HashAlgorithm::HighwayHash256SLegacy
-        } else {
-            checksum_info.algorithm
-        };
+        let checksum_algo = part_checksum_algorithm(fi, part.number);
         let read_length = erasure.shard_file_offset(0, object_size, object_size);
 
         if fi.data.is_some() {
@@ -1701,7 +1802,7 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
-            let checksum_algo = multipart_part_checksum_algo(&fi, part_number);
+            let checksum_algo = part_checksum_algorithm(&fi, part_number);
             let read_length = till_offset.saturating_sub(read_offset);
 
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
@@ -1767,7 +1868,7 @@ impl SetDisks {
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
                     frame_size,
-                    checksum_algo: multipart_part_checksum_algo(&fi, next_number),
+                    checksum_algo: part_checksum_algorithm(&fi, next_number),
                 };
                 let files = Arc::clone(&files);
                 let disks = Arc::clone(&disks);
@@ -2224,7 +2325,7 @@ impl SetDisks {
                     read_offset,
                     read_length: read_shard_size,
                     frame_size,
-                    checksum_algo: multipart_part_checksum_algo(fi, part_number),
+                    checksum_algo: part_checksum_algorithm(fi, part_number),
                 };
                 let (reader_setup, reader_setup_elapsed) = setup_multipart_part_readers(
                     files,
@@ -2308,7 +2409,7 @@ impl SetDisks {
                         deferred_reopeners,
                         !skip_verify_bitrot
                             && !require_reconstruction_surplus
-                            && multipart_part_checksum_algo(fi, part_number).size() > 0,
+                            && part_checksum_algorithm(fi, part_number).size() > 0,
                     )
                     .await;
                 rustfs_io_metrics::record_get_object_quantized_range_frames(
@@ -2645,12 +2746,7 @@ impl SetDisks {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
         let frame_size = read_frame_size_for_file_info(fi, erasure)?;
-        let checksum_info = fi.erasure.get_checksum_info(part_number);
-        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-            HashAlgorithm::HighwayHash256SLegacy
-        } else {
-            checksum_info.algorithm
-        };
+        let checksum_algo = part_checksum_algorithm(fi, part_number);
         let use_mmap_read = object_mmap_read_enabled();
         let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
         let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
@@ -2941,17 +3037,6 @@ struct PartReaderSetupSpec {
     checksum_algo: HashAlgorithm,
 }
 
-/// Resolve the bitrot checksum algorithm for one part, honoring the legacy
-/// HighwayHash flag.
-fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgorithm {
-    let checksum_info = fi.erasure.get_checksum_info(part_number);
-    if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-        HashAlgorithm::HighwayHash256SLegacy
-    } else {
-        checksum_info.algorithm
-    }
-}
-
 /// Resolve the physical authenticated frame size for a persisted object while
 /// keeping the original EC layout geometry for offsets and reconstruction.
 pub(in crate::set_disk) fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Result<usize> {
@@ -3143,7 +3228,12 @@ async fn setup_multipart_part_readers(
         parity_shards,
         BitrotReaderSetupMode::ReadQuorum,
         prefer_data_blocks_first,
-        None,
+        rustfs_io_metrics::get_stage_metrics_enabled().then_some(BitrotReaderStageMetrics {
+            path: GET_OBJECT_PATH_LEGACY_DUPLEX,
+            reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+            file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+            bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+        }),
         Some(BitrotReaderSetupAttribution {
             path: metrics_path,
             object_class: metrics_object_class,
@@ -3506,6 +3596,7 @@ mod metadata_cache_tests {
     use super::*;
     use crate::set_disk::core::io_primitives::disk_call_counters;
     use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
+    use rustfs_lock::{GlobalLockManager, LocalClient, LockClient, NamespaceLock, ObjectKey};
     use rustfs_utils::path::object_name_disk_identity;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4793,6 +4884,7 @@ mod metadata_cache_tests {
                     online_disks: vec![None],
                     read_quorum: 1,
                     verified_inline_body: None,
+                    distributed_fence_proof: None,
                 }),
             )
             .await;
@@ -5455,6 +5547,7 @@ mod metadata_cache_tests {
             read_quorum: 0,
             capability,
             verified_inline_body: None,
+            distributed_fence_proof: None,
         })
     }
 
@@ -5948,6 +6041,7 @@ mod metadata_cache_tests {
                     online_disks: vec![None],
                     read_quorum: 1,
                     verified_inline_body: None,
+                    distributed_fence_proof: None,
                 }),
             )
             .await;
@@ -6067,6 +6161,7 @@ mod metadata_cache_tests {
             online_disks: Vec::new(),
             read_quorum: 0,
             verified_inline_body: None,
+            distributed_fence_proof: None,
         });
 
         set.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {
@@ -6115,30 +6210,192 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    #[serial(metadata_cache_distributed_proof_env)]
     async fn metadata_cache_distribution_bypass_uses_set_instance_context() {
-        let distributed_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
-        distributed_ctx
-            .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
-            .await;
-        let standalone_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
-        standalone_ctx
-            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
-            .await;
-        let distributed = new_metadata_cache_test_set_with_ctx(distributed_ctx).await;
-        let standalone = new_metadata_cache_test_set_with_ctx(standalone_ctx).await;
+        temp_env::async_with_vars(
+            [(ENV_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE, None::<&str>)],
+            async {
+                let distributed_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                distributed_ctx
+                    .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                    .await;
+                let standalone_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                standalone_ctx
+                    .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+                    .await;
+                let distributed = new_metadata_cache_test_set_with_ctx(distributed_ctx).await;
+                let standalone = new_metadata_cache_test_set_with_ctx(standalone_ctx).await;
 
-        assert_eq!(
-            distributed
-                .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+                assert_eq!(
+                    distributed
+                        .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+                        .await,
+                    Some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
+                );
+                assert_eq!(
+                    standalone
+                        .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+                        .await,
+                    None
+                );
+            },
+        )
+        .await;
+    }
+
+    fn cache_fence_test_lock() -> NamespaceLock {
+        let clients = (0..3)
+            .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn LockClient>)
+            .collect();
+        NamespaceLock::with_clients("metadata-cache-proof".to_owned(), clients)
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_distributed_proof_env)]
+    async fn distributed_metadata_cache_requires_live_quorum_proof() {
+        temp_env::async_with_vars(
+            [(ENV_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE, Some("true"))],
+            async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                    .await;
+                let set = new_metadata_cache_test_set_with_ctx(ctx).await;
+                assert_eq!(
+                    set.get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+                        .await,
+                    Some(GET_METADATA_CACHE_REASON_FENCE_PROOF_UNAVAILABLE)
+                );
+
+                let lock = cache_fence_test_lock();
+                let resource = ObjectKey::new("bucket", "object");
+                let guard = lock
+                    .get_read_lock_with_cache_fence(resource, "reader", Duration::from_secs(1))
+                    .await
+                    .expect("proof-carrying read lock");
+                let mut opts = ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: true,
+                    ..Default::default()
+                };
+                opts.add_metadata_cache_read_guard(&guard);
+                assert!(opts.metadata_cache_fence_proof.is_some());
+                assert_eq!(set.get_object_metadata_cache_bypass_reason("bucket", &opts, true).await, None);
+
+                opts.namespace_lock_fence = Some(crate::object_api::NamespaceLockFence::lost_for_test());
+                assert_eq!(
+                    set.get_object_metadata_cache_bypass_reason("bucket", &opts, true).await,
+                    Some(GET_METADATA_CACHE_REASON_FENCE_LOCK_LOST)
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn distributed_metadata_cache_rejects_proof_after_write_quorum() {
+        let set = new_metadata_cache_test_set().await;
+        let lock = cache_fence_test_lock();
+        let resource = ObjectKey::new("bucket", "object");
+        let mut first_guard = lock
+            .get_read_lock_with_cache_fence(resource.clone(), "reader-a", Duration::from_secs(1))
+            .await
+            .expect("first proof-carrying read lock");
+        let mut first_opts = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: true,
+            ..Default::default()
+        };
+        first_opts.add_metadata_cache_read_guard(&first_guard);
+        let authority = MetadataCacheAuthority::from_options(&first_opts).expect("first read authority");
+        let fi = valid_test_fileinfo("object");
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        set.cache_get_object_fileinfo_owned(
+            ("bucket", "object"),
+            generation,
+            MetadataCachePublication {
+                fi: fi.clone(),
+                capability: GetObjectMetadataCacheCapability::Full,
+                verified_inline_body: None,
+                authority: Some(authority.clone()),
+            },
+            vec![fi],
+            Vec::new(),
+            0,
+        )
+        .await;
+        assert!(matches!(
+            set.lookup_cached_get_object_fileinfo_with_authority("bucket", "object", Some(&authority), || {})
                 .await,
-            Some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
-        );
-        assert_eq!(
-            standalone
-                .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+            MetadataCacheLookup::Hit(_)
+        ));
+        assert!(first_guard.release());
+
+        let mut writer = lock
+            .get_write_lock(resource.clone(), "writer", Duration::from_secs(1))
+            .await
+            .expect("intervening write quorum");
+        assert!(writer.release());
+
+        let mut second_guard = lock
+            .get_read_lock_with_cache_fence(resource, "reader-b", Duration::from_secs(1))
+            .await
+            .expect("second proof-carrying read lock");
+        let mut second_opts = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: true,
+            ..Default::default()
+        };
+        second_opts.add_metadata_cache_read_guard(&second_guard);
+        let second_authority = MetadataCacheAuthority::from_options(&second_opts).expect("second read authority");
+        assert!(matches!(
+            set.lookup_cached_get_object_fileinfo_with_authority("bucket", "object", Some(&second_authority), || {})
                 .await,
-            None
+            MetadataCacheLookup::RejectedFenceProof
+        ));
+        assert!(second_guard.release());
+    }
+
+    #[tokio::test]
+    async fn distributed_metadata_cache_does_not_publish_after_read_lock_loss() {
+        let set = new_metadata_cache_test_set().await;
+        let lock = cache_fence_test_lock();
+        let resource = ObjectKey::new("bucket", "lost-reader");
+        let mut guard = lock
+            .get_read_lock_with_cache_fence(resource, "reader", Duration::from_secs(1))
+            .await
+            .expect("proof-carrying read lock");
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: true,
+            ..Default::default()
+        };
+        opts.add_metadata_cache_read_guard(&guard);
+        opts.namespace_lock_fence = Some(crate::object_api::NamespaceLockFence::lost_for_test());
+        let authority = MetadataCacheAuthority::from_options(&opts).expect("lost authority retains its proof for rejection");
+        let fi = valid_test_fileinfo("lost-reader");
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "lost-reader")
+            .expect("active local generation");
+        let key = GetObjectMetadataCacheKey::new("bucket", "lost-reader", generation);
+        set.cache_get_object_fileinfo_owned(
+            ("bucket", "lost-reader"),
+            Some(generation),
+            MetadataCachePublication {
+                fi: fi.clone(),
+                capability: GetObjectMetadataCacheCapability::Full,
+                verified_inline_body: None,
+                authority: Some(authority),
+            },
+            vec![fi],
+            Vec::new(),
+            0,
+        )
+        .await;
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_none(),
+            "a lost read guard cannot publish a reusable entry"
         );
+        assert!(guard.release());
     }
 
     #[tokio::test]
@@ -6203,6 +6460,7 @@ mod metadata_cache_tests {
                 online_disks: Vec::new(),
                 read_quorum: 0,
                 verified_inline_body: None,
+                distributed_fence_proof: None,
             })
         };
 

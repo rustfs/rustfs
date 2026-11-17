@@ -53,11 +53,14 @@ concurrency:
 jobs:
   distributed:
     if: github.repository == 'rustfs/rustfs'
-    name: Distributed 4-node 4-disk e2e
+    name: Distributed 4-node 4-disk e2e (${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
     # GitHub-hosted VM: loop and tmpfs mounts work here. sm-standard-4 is an
     # ARC pod and rejects both (`mount -o loop` ENOENT, tmpfs "read-only").
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    # The gateway leg is report-only until T2.10.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       NO_PROXY: 127.0.0.1,localhost
@@ -129,6 +132,11 @@ jobs:
         run: |
           python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
 
+      # A gateway binary that refuses to start skips the suite; the summary says why.
+      - name: Gateway preflight
+        if: matrix.stack == 'gateway'
+        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/leg/stack.json"
+
       - name: Verify distributed e2e membership
         env:
           NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-distributed-list.json
@@ -140,6 +148,7 @@ jobs:
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-distributed-logs
           FILTER: ${{ inputs.filter }}
+          RUSTFS_S3_STACK: ${{ matrix.stack }}
         run: |
           set -euo pipefail
           rm -f target/nextest/e2e-distributed/junit.xml
@@ -150,11 +159,19 @@ jobs:
           fi
           test -s target/nextest/e2e-distributed/junit.xml
 
+      - name: Prove the stack and upload the leg
+        if: always()
+        uses: ./.github/actions/dual-stack-leg
+        with:
+          profile: e2e-distributed
+          stack: ${{ matrix.stack }}
+          logs: ${{ runner.temp }}/rustfs-e2e-distributed-logs
+
       - name: Upload distributed e2e diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-distributed-${{ github.run_number }}
+          name: e2e-distributed-${{ github.run_number }}-${{ matrix.stack }}
           path: |
             target/nextest/e2e-distributed/junit.xml
             ${{ runner.temp }}/rustfs-e2e-distributed-list.json
@@ -173,6 +190,20 @@ jobs:
               sudo umount "${mountpoint}"
             fi
           done
+
+  dual-stack-summary:
+    name: Both-stack diff summary
+    needs: [distributed]
+    if: github.repository == 'rustfs/rustfs' && always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dual-stack-summary
+        with:
+          profiles: e2e-distributed
 
   alert-on-failure:
     name: Alert on scheduled failure

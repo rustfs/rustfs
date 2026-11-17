@@ -121,6 +121,11 @@ when restoring `/rustfs/console` for a custom OEM build.
 - `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES` (canonical)
 - `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (canonical)
 - `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (canonical)
 - `RUSTFS_SCANNER_WALKERS_PER_DISK` (canonical)
@@ -129,6 +134,12 @@ Scanner cycle budget controls:
 
 - When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
 - An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+
+Scanner bucket quantum controls:
+
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS`, `RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS`, `RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES`, `RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES`, and `RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES` cap one bucket admission. Their persistent keys are `scanner.bucket_quantum_duration`, `scanner.bucket_quantum_objects`, `scanner.bucket_quantum_directories`, `scanner.bucket_quantum_entries`, and `scanner.bucket_quantum_name_bytes`; duration is in whole seconds and the remaining keys are work counts or bytes.
+- All five defaults are `0` for controlled rollout. A positive value enables that dimension; `0` disables that dimension, and all five zero values disable the bucket quantum. Parent cycle limits remain in force. Invalid unsigned integers and durations outside the platform timer range are rejected; environment overrides take precedence but cannot hide invalid persisted values. Admin scanner status reports each effective value and source under `runtime_config.bucket_quantum_*`, using `bucket_quantum_duration_seconds` for duration.
+- Disabled defaults are an initial rollout state, not completion of usage-convergence acceptance. Production defaults require matched-topology A/B measurements and the remote progress/fairness checks in [Scanner runtime controls](../../docs/operations/scanner-runtime-controls.md#bucket-quantum-rollout-and-acceptance). These controls do not certify partial usage or acknowledge pending dirty work.
 
 Scanner recovery retry controls:
 
@@ -276,6 +287,13 @@ Drive timeout profile preset:
   - values must be positive; `0` or an invalid value falls back to the default, and values above `60` are clamped to `60`.
   - the setting is read by the aggregating node only; it does not change the internode RPC wire contract. Any retry shares one round deadline rather than receiving a fresh timeout.
 
+## Target queue directory
+
+- `RUSTFS_TARGET_STORE_DIR`
+  - absolute root for notify and audit target queues whose `queue_dir` is the default `/opt/rustfs/events` or `/opt/rustfs/audit`; they open `<root>/events` and `<root>/audit` on this node.
+  - unset keeps those paths on Linux and macOS; native Windows uses `%ProgramData%\RustFS\events` and `%ProgramData%\RustFS\audit`.
+  - explicit `queue_dir` values are never relocated, and the persisted target configuration is unchanged. Changing the root does not migrate pending entries. See `docs/operations/target-queue-storage.md`.
+
 ## Startup filesystem boundary policy
 
 - `RUSTFS_UNSUPPORTED_FS_POLICY` controls startup behavior when RustFS detects local endpoint filesystems that are outside the supported production boundary.
@@ -283,6 +301,8 @@ Drive timeout profile preset:
   - `fail`: abort startup with an error.
 
 RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard. On Windows, endpoints on network drives (UNC shares such as `\\server\share` and mapped drive letters) are treated the same way, even though Windows reports the server's filesystem (usually `NTFS`) for them.
+
+A local POSIX filesystem bind-mounted into a gVisor sandbox with directfs is a supported storage path. gVisor presents that bind mount as `9p`/`V9FS`, so the host filesystem type is not visible; the startup guard recognizes mountinfo options `trans=fd` and `directfs` and does not treat the mount as unsupported. Genuine 9p, virtio, and NFS shares remain unsupported.
 
 ## 📄 License
 

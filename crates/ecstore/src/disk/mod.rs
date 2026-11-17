@@ -30,6 +30,7 @@ pub mod local;
 pub mod multipart_index;
 pub mod multipart_source;
 pub mod os;
+mod usage_watch;
 
 pub(crate) use io_admission::memory as background_memory;
 pub(crate) use io_admission::remote as remote_io_admission;
@@ -58,6 +59,21 @@ pub const BUCKET_META_PREFIX: &str = "buckets";
 /// a user bucket of the same name, so bucket deletion must leave it in place.
 pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
+pub(crate) const FORMAT_BOOTSTRAP_FILE: &str = "format.json.bootstrap";
+pub(crate) const FORMAT_BOOTSTRAP_DONE_FILE: &str = "format.json.bootstrap.done";
+
+/// Validate an internal format control filename for atomic publication.
+///
+/// # Errors
+/// Returns [`DiskError::MethodNotAllowed`] for every other path.
+pub fn validate_format_control_path(path: &str) -> Result<()> {
+    if matches!(path, FORMAT_CONFIG_FILE | FORMAT_BOOTSTRAP_FILE) {
+        Ok(())
+    } else {
+        Err(DiskError::MethodNotAllowed)
+    }
+}
+
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
@@ -223,8 +239,21 @@ pub enum PoolMetaNativeRecoveryResponse {
 
 pub type DiskStore = Arc<Disk>;
 
+pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
+impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
+
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
-pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn DiskFileWriter>;
+
+pub(crate) fn as_lazy_local_file_writer_mut(writer: &mut dyn DiskFileWriter) -> Option<&mut local::LazyLocalFileWriter> {
+    let any: &mut dyn std::any::Any = writer;
+    if any.is::<local::LazyLocalFileWriter>() {
+        return any.downcast_mut::<local::LazyLocalFileWriter>();
+    }
+    let slow = any.downcast_mut::<disk_store::SlowDiskWriter>()?;
+    let inner_any: &mut dyn std::any::Any = slow.inner_mut();
+    inner_any.downcast_mut::<local::LazyLocalFileWriter>()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotLeaseToken(Uuid);
@@ -732,6 +761,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.bucket_creation_witness(volume).await,
+            Disk::Remote(_) => Ok(None),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         match self {
@@ -1150,6 +1186,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.write_format_control(path, data).await,
+            Disk::Remote(remote_disk) => remote_disk.write_format_control(path, data).await,
+        }
+    }
+
     async fn compare_and_update_file(
         &self,
         volume: &str,
@@ -1386,6 +1429,16 @@ impl Disk {
 }
 
 impl Disk {
+    /// The progress flag is derived from a verified capability scope.
+    pub async fn ns_scanner_progress_capability(
+        &self,
+    ) -> Result<Option<crate::storage_api_contracts::internode::NsScannerCapabilities>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner_progress_capability().await,
+        }
+    }
+
     pub async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         match self {
             Disk::Local(_) => Ok(None),
@@ -1547,13 +1600,40 @@ impl Disk {
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
-    new_disk_with_health_tracker(ep, opt, None).await
+    new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn new_disk_for_instance(
+    _instance: &crate::runtime::instance::InstanceContext,
+    ep: &Endpoint,
+    opt: &DiskOption,
+) -> Result<DiskStore> {
+    let disk = new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        Some(_instance),
+    )
+    .await?;
+    if let Disk::Local(wrapper) = disk.as_ref() {
+        wrapper.get_disk().usage_watch_binding.bind(&_instance.usage_watches);
+    }
+    Ok(disk)
 }
 
 pub(crate) async fn new_disk_with_health_tracker(
     ep: &Endpoint,
     opt: &DiskOption,
     reconnect: Option<disk_store::ReconnectDiskHealthState>,
+    #[cfg(feature = "internode-transport")] instance: Option<&crate::runtime::instance::InstanceContext>,
 ) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
@@ -1563,8 +1643,15 @@ pub(crate) async fn new_disk_with_health_tracker(
             reconnect,
         )))))
     } else {
-        let data_transport = build_internode_data_transport_from_env();
-        let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;
+        #[cfg(feature = "internode-transport")]
+        let remote_disk = match instance.and_then(|ctx| ctx.internode_data_transport()) {
+            Some(transport) => RemoteDisk::new(ep, opt, Arc::clone(transport))
+                .await?
+                .with_instance_transport(),
+            None => RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?,
+        };
+        #[cfg(not(feature = "internode-transport"))]
+        let remote_disk = RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
@@ -1598,6 +1685,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // NSScanner
 
     // Volume operations.
+    /// Unknown or remote backends cannot attest process-local publication history.
+    async fn bucket_creation_witness(&self, _volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        Ok(None)
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
@@ -1850,6 +1942,21 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    /// Atomically publish a valid per-drive `FormatV3` control file in the system volume.
+    /// Deployment, topology and member UUID must agree with existing control records.
+    /// Pending intents admit equivalent plans, and retired intents reject bootstrap
+    /// republication. Success requires a durable replacement inode and parent entry.
+    /// Cancellation can leave the complete plan published. Retries revalidate the
+    /// plan under the per-disk owner before publishing it durably.
+    ///
+    /// # Errors
+    /// Returns [`DiskError::MethodNotAllowed`] for unsupported implementations,
+    /// paths or retired bootstrap intents, [`DiskError::CorruptedFormat`] for
+    /// invalid or conflicting plans, and an I/O error when publication or its
+    /// durability barrier fails.
+    async fn write_format_control(&self, _path: &str, _data: Bytes) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     /// Atomically replace or remove a small control file only when its current
     /// contents match `expected`. Implementations that cannot provide this
@@ -2453,7 +2560,7 @@ impl DeleteRecoveryJournal {
             }
             let id = request.version_id.unwrap_or_default();
             let Some(original) = originals.get(&id) else {
-                return false;
+                return !id.is_nil() && !locals.contains_key(&id);
             };
             match locals.get(&id) {
                 Some(local) => local == original,
@@ -2503,7 +2610,10 @@ impl DeleteRecoveryJournal {
             };
             match (local, remote) {
                 (Some(local), Some(remote)) => local == remote,
-                (None, None) => self.original_digest.is_none() && authority.original_digest.is_none(),
+                (None, None) => {
+                    (!(request.deleted && request.mark_deleted) && request.version_id.is_some_and(|id| !id.is_nil()))
+                        || (self.original_digest.is_none() && authority.original_digest.is_none())
+                }
                 _ => false,
             }
         })
@@ -2570,7 +2680,13 @@ pub struct BoundedDeleteRecoveryDiscovery {
     pub complete: bool,
 }
 
-pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+/// Entries one bounded discovery call may charge on one drive. Object-scoped
+/// discovery charges each transaction-shaped (UUID) child of the key's
+/// directory once and every name that cannot be delete evidence at
+/// 1/`PLAIN_CHILDREN_PER_BUDGET_ENTRY`, so this admits a missing-key delete of a
+/// folder prefix with this many UUID-named children per drive. The request
+/// budget (`DeleteRecoveryWorkBudget`) still bounds the total across keys.
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 262_144;
 pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2796,6 +2912,26 @@ pub fn count_part_not_success(part_errs: &[usize]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_control_paths_are_fixed_system_leaf_names() {
+        for path in [super::FORMAT_CONFIG_FILE, super::FORMAT_BOOTSTRAP_FILE] {
+            super::validate_format_control_path(path).expect("allowed format control leaf");
+        }
+        for path in [
+            "",
+            "../format.json",
+            "format.json/",
+            ".rustfs.sys/format.json",
+            "format.json.bootstrap.done",
+            "pool.bin",
+        ] {
+            assert!(matches!(
+                super::validate_format_control_path(path),
+                Err(super::DiskError::MethodNotAllowed)
+            ));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -3981,6 +4117,46 @@ mod delete_recovery_adoption_tests {
         };
         assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
         assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let missing = Uuid::new_v4();
+        journal.requests.push(FileInfo {
+            version_id: Some(missing),
+            ..Default::default()
+        });
+        journal.original_digest = Some([3; 32]);
+        assert!(
+            journal.matches_prepared_authority(&journal),
+            "an explicit UUID absent from both prepared sources remains a no-op with original metadata"
+        );
+        assert!(journal.matches_adoption_source(&[]), "both non-null versions can remain absent");
+        assert!(
+            journal.matches_adoption_source(std::slice::from_ref(&source)),
+            "a missing non-null version in the batch remains a no-op"
+        );
+        let mut unexpected = source.clone();
+        unexpected.version_id = Some(missing);
+        let mut foreign_preparation = journal.clone();
+        foreign_preparation.original_versions.push(unexpected.clone());
+        assert!(
+            !journal.matches_prepared_authority(&foreign_preparation)
+                && !foreign_preparation.matches_prepared_authority(&journal),
+            "absence from only one prepared source cannot establish a generation"
+        );
+        assert!(
+            !journal.matches_adoption_source(&[source.clone(), unexpected]),
+            "a version absent from the authority cannot be deleted locally"
+        );
+        for version_id in [None, Some(Uuid::nil())] {
+            journal.requests.last_mut().expect("missing-version request").version_id = version_id;
+            assert!(
+                !journal.matches_prepared_authority(&journal),
+                "a missing null version with original metadata cannot establish its generation"
+            );
+            assert!(
+                !journal.matches_adoption_source(std::slice::from_ref(&source)),
+                "a missing null version cannot establish its generation"
+            );
+        }
+        journal.requests.pop();
         let mut foreign = source.clone();
         foreign.metadata_digest = [2; 32];
         assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
@@ -3996,6 +4172,25 @@ mod delete_recovery_adoption_tests {
         assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
         journal.requests.clear();
         assert!(!journal.matches_adoption_source(&journal.original_versions));
+
+        let mut marker = journal.clone();
+        marker.requests = vec![FileInfo {
+            version_id: Some(id),
+            deleted: true,
+            mark_deleted: true,
+            ..Default::default()
+        }];
+        marker.original_versions.clear();
+        marker.original_digest = Some([3; 32]);
+        assert!(
+            !marker.matches_prepared_authority(&marker),
+            "a marker with original metadata requires a source generation"
+        );
+        marker.original_digest = None;
+        assert!(
+            marker.matches_prepared_authority(&marker),
+            "marker preparation without original metadata retains the existing allowance"
+        );
     }
 }
 

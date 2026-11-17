@@ -107,7 +107,7 @@ pub(super) async fn run(
             result.state = ItemState::Prepared;
             result.detail = None;
             etag = checkpoint(api, job, &etag, guard).await?;
-            let mut file = match stage(api, job, index, &info, &opts, guard).await {
+            let staged = match verify_source(api, job, index, &info, &opts, guard).await {
                 Ok(file) => file,
                 Err(IntegrityError::Conflict) => {
                     job.results[index].state = ItemState::Stale;
@@ -125,6 +125,7 @@ pub(super) async fn run(
             if job.request.mode == JobMode::Audit {
                 job.results[index].state = ItemState::Verified;
             } else {
+                let mut file = staged.ok_or(IntegrityError::Invalid("missing migration payload"))?;
                 let snapshot = validate_destination(api, job).await?;
                 file.rewind().await?;
                 let raw = sha256_bytes(&expected)?;
@@ -231,35 +232,48 @@ async fn ensure_running(api: &Arc<ECStore>, job: &Job, guard: &rustfs_lock::Name
     Ok(())
 }
 
-async fn stage(
+async fn verify_source(
     api: &Arc<ECStore>,
     job: &Job,
     index: usize,
     info: &ObjectInfo,
     opts: &ObjectOptions,
     guard: &rustfs_lock::NamespaceLockGuard,
-) -> Result<tokio::fs::File> {
+) -> Result<Option<tokio::fs::File>> {
     let mut reader = api
         .get_object_reader(&job.bucket, &job.request.items[index].key, None, Default::default(), opts)
         .await?;
     if fingerprint(&reader.object_info) != fingerprint(info) {
         return Err(IntegrityError::Conflict);
     }
-    let std_file = tokio::task::spawn_blocking(tempfile::tempfile)
-        .await
-        .map_err(|_| IntegrityError::Invalid("staging task failed"))??;
-    let mut file = tokio::fs::File::from_std(std_file);
+    let mut file = staging_file(job.request.mode, tempfile::tempfile).await?;
     let expected = job.results[index]
         .expected_sha256
         .as_deref()
         .ok_or(IntegrityError::Invalid("missing expected digest"))?;
-    copy_verified(api, job, &mut reader.stream, Some(&mut file), info.size, expected, guard).await?;
-    file.flush().await?;
+    copy_verified(api, job, &mut reader.stream, file.as_mut(), info.size, expected, guard).await?;
+    if let Some(file) = file.as_mut() {
+        file.flush().await?;
+    }
     let after = api.get_object_info(&job.bucket, &job.request.items[index].key, opts).await?;
     if fingerprint(&after) != fingerprint(info) {
         return Err(IntegrityError::Conflict);
     }
     Ok(file)
+}
+
+async fn staging_file(
+    mode: JobMode,
+    create: impl FnOnce() -> std::io::Result<std::fs::File> + Send + 'static,
+) -> Result<Option<tokio::fs::File>> {
+    // Migration must publish the exact bytes verified here. Audit has no second consumer.
+    if mode == JobMode::Audit {
+        return Ok(None);
+    }
+    let file = tokio::task::spawn_blocking(create)
+        .await
+        .map_err(|_| IntegrityError::Invalid("staging task failed"))??;
+    Ok(Some(tokio::fs::File::from_std(file)))
 }
 
 async fn copy_verified(
@@ -464,5 +478,33 @@ impl tokio::io::AsyncRead for ThrottledFile {
             }
             result => result,
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn audit_does_not_need_a_writable_payload_staging_volume() {
+        let result = staging_file(JobMode::Audit, || Err(std::io::Error::other("staging volume full")))
+            .await
+            .expect("audit must not open staging storage");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_requires_writable_payload_staging() {
+        assert!(
+            staging_file(JobMode::Migrate, || { Err(std::io::Error::other("staging volume full")) })
+                .await
+                .is_err()
+        );
+        let mut file = staging_file(JobMode::Migrate, tempfile::tempfile).await.unwrap().unwrap();
+        file.write_all(b"verified bytes").await.unwrap();
+        file.rewind().await.unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"verified bytes");
     }
 }

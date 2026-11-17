@@ -18,7 +18,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use uuid::Uuid;
 
 use crate::services::tier::{
@@ -128,7 +127,7 @@ impl WarmBackend for WarmBackendWasabi {
             self.ensure_unversioned().await?;
         }
         let (headers, reader) = self.s3.get_with_headers(object, rv, opts).await?;
-        if rv.is_empty() && (headers.contains_key(X_AMZ_VERSION_ID) || headers.contains_key(X_AMZ_DELETE_MARKER)) {
+        if rv.is_empty() && (headers.contains_key("x-amz-version-id") || headers.contains_key("x-amz-delete-marker")) {
             self.versioning_drifted.store(true, Ordering::Release);
             return Err(io::Error::other(
                 "Wasabi bucket versioning changed while reading an unversioned tier object",

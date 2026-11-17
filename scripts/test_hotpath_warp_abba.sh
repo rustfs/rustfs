@@ -6,8 +6,12 @@ RUNNER="${SCRIPT_DIR}/run_hotpath_warp_abba.sh"
 TMP_DIR="$(mktemp -d)"
 OUT_DIR="${TMP_DIR}/abba"
 TRACE_FILE="${TMP_DIR}/abba-trace.log"
+FAILURE_SERVER_PID=""
 
 cleanup() {
+  if [[ -n "$FAILURE_SERVER_PID" ]]; then
+    kill "$FAILURE_SERVER_PID" 2>/dev/null || true
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -87,6 +91,53 @@ awk -F',' 'NR == 1 {next} {seen[$3]++; if ($1 != "sync-on" || $3 !~ /^put-(128|5
 rg -Fxq 'workloads=put-128kib|put|128KiB;put-512kib|put|512KiB' "$FOCUSED_OUT_DIR/manifest.env"
 rg -Fxq 'drive_sync_matrix=sync-on|true' "$FOCUSED_OUT_DIR/manifest.env"
 
+DOCKER_OUT_DIR="${TMP_DIR}/docker-telemetry"
+DOCKER_TRACE="${TMP_DIR}/docker-telemetry-trace.log"
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --workload 'put-100kib|put|100KiB' \
+  --drive-sync 'sync-on|true' \
+  --node-docker-container 'node-1=rustfs-one' \
+  --node-docker-container 'node-2=rustfs-two' \
+  --out-dir "$DOCKER_OUT_DIR" \
+  --dry-run >"$DOCKER_TRACE" 2>&1
+rg -qx 'node_docker_container_count=2' "$DOCKER_OUT_DIR/manifest.env"
+[[ "$(rg -c -F -- '--node-docker-container node-1=rustfs-one --node-docker-container node-2=rustfs-two' "$DOCKER_TRACE")" == "4" ]]
+
+for invalid_target in 'missing-equals' '=container' 'node=' 'node,1=container' $'node=container\nother'; do
+  if "$RUNNER" \
+    --baseline-bin /usr/bin/true \
+    --candidate-bin /usr/bin/true \
+    --warp-bin /usr/bin/true \
+    --node-docker-container "$invalid_target" \
+    --out-dir "${TMP_DIR}/invalid-docker-target" \
+    --dry-run >"${TMP_DIR}/invalid-docker-target.log" 2>&1; then
+    echo "expected malformed Docker node mapping to fail" >&2
+    exit 1
+  fi
+  rg -qF -- '--node-docker-container must be node=container' "${TMP_DIR}/invalid-docker-target.log"
+  [[ ! -e "${TMP_DIR}/invalid-docker-target" ]]
+done
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --warp-bin /usr/bin/true \
+  --node-docker-container 'node-1=rustfs-one' \
+  --node-docker-container 'node-1=rustfs-two' \
+  --out-dir "${TMP_DIR}/duplicate-docker-target" \
+  --dry-run >"${TMP_DIR}/duplicate-docker-target.log" 2>&1; then
+  echo "expected duplicate Docker node mapping to fail" >&2
+  exit 1
+fi
+rg -qF -- '--node-docker-container repeats node: node-1' "${TMP_DIR}/duplicate-docker-target.log"
+[[ ! -e "${TMP_DIR}/duplicate-docker-target" ]]
+
 if "$RUNNER" --baseline-bin /usr/bin/true --candidate-bin /usr/bin/true --baseline-revision baseline-test --candidate-revision candidate-test --warp-bin /usr/bin/true --rounds 3 --workload 'bad|delete|1KiB' --out-dir "${TMP_DIR}/bad-workload" --dry-run >/dev/null 2>&1; then
   echo "expected invalid --workload mode to fail" >&2
   exit 1
@@ -99,6 +150,33 @@ rg -qF -- '--labeled-compare-csv sync-on/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-off/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-on/put-4kib/A2-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-off/put-4kib/A2-vs-A1' "$TRACE_FILE"
+[[ "$(rg -c -- '--baseline-drift' "$TRACE_FILE")" == "1" ]]
+rg 'DRY-RUN:.*candidate_gate.md' "$TRACE_FILE" >"${TMP_DIR}/candidate-gate-command.log"
+rg 'DRY-RUN:.*baseline_drift_gate.md' "$TRACE_FILE" >"${TMP_DIR}/drift-gate-command.log"
+if rg -q -- '--baseline-drift' "${TMP_DIR}/candidate-gate-command.log"; then
+  echo "expected candidate gate to retain directional regression checks" >&2
+  exit 1
+fi
+rg -q -- '--baseline-drift.*--require-tail-error' "${TMP_DIR}/drift-gate-command.log"
+
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --workload 'put-100kib|put|100KiB' \
+  --drive-sync 'sync-on|true' \
+  --allow-regression --exemption-reason 'candidate correctness tradeoff' \
+  --out-dir "${TMP_DIR}/candidate-exemption" \
+  --dry-run >"${TMP_DIR}/candidate-exemption-trace.log" 2>&1
+rg 'DRY-RUN:.*candidate_gate.md' "${TMP_DIR}/candidate-exemption-trace.log" | rg -q -- '--allow-regression'
+rg 'DRY-RUN:.*baseline_drift_gate.md' "${TMP_DIR}/candidate-exemption-trace.log" >"${TMP_DIR}/exempted-run-drift-command.log"
+rg -q -- '--baseline-drift' "${TMP_DIR}/exempted-run-drift-command.log"
+if rg -q -- '--allow-regression|--exemption-reason' "${TMP_DIR}/exempted-run-drift-command.log"; then
+  echo "expected candidate exemption to leave baseline stability checks strict" >&2
+  exit 1
+fi
 
 if "$RUNNER" \
   --baseline-bin /usr/bin/true \
@@ -242,6 +320,117 @@ for bad_field in leg phase bucket binary_sha256 dataset_reset; do
   rg -qx 'evidence_mode=external-deploy-hook-attested' "$bad_out_dir/manifest.env"
   rg -qx 'formal_evidence=true' "$bad_out_dir/manifest.env"
   rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "$bad_out_dir/manifest.env"
+done
+
+# Exercise the actual command-substitution path with a failing load driver.
+FAILURE_REPO="$TMP_DIR/failed-driver-repo"
+mkdir -p "$FAILURE_REPO/scripts" "$FAILURE_REPO/bin"
+git init -q "$FAILURE_REPO"
+cat >"$FAILURE_REPO/scripts/run_object_batch_bench_enhanced.sh" <<'DRIVER'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == --out-dir ]]; then
+    printf 'measure:%s\n' "${2##*/}" >>"$FAILURE_TRACE"
+    break
+  fi
+  shift
+done
+exit 42
+DRIVER
+cat >"$FAILURE_REPO/scripts/hotpath_warp_ab_gate.sh" <<'GATE'
+#!/usr/bin/env bash
+echo gate >>"$FAILURE_TRACE"
+exit 0
+GATE
+cat >"$FAILURE_REPO/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -z "${SERVER_PID_FILE:-}" ]]; then
+  exit 0
+fi
+for ((i = 0; i < 500; i++)); do
+  [[ -s "$SERVER_PID_FILE" ]] && exit 0
+  sleep 0.01
+done
+exit 1
+CURL
+cat >"$FAILURE_REPO/bin/rustfs" <<'SERVER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == --version ]]; then
+  echo 'test server'
+  exit 0
+fi
+echo "$$" >"$SERVER_PID_FILE"
+exec sleep 60
+SERVER
+cat >"$FAILURE_REPO/deploy.sh" <<'DEPLOY'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "deploy:$HOTPATH_ABBA_LEG" >>"$FAILURE_TRACE"
+cat >"$HOTPATH_ABBA_DEPLOY_EVIDENCE_FILE" <<EOF
+leg=$HOTPATH_ABBA_LEG
+phase=$HOTPATH_ABBA_PHASE
+bucket=$HOTPATH_ABBA_BUCKET
+binary_sha256=$HOTPATH_ABBA_BINARY_SHA256
+dataset_reset=true
+EOF
+DEPLOY
+chmod +x "$FAILURE_REPO/scripts/"*.sh "$FAILURE_REPO/bin/"* "$FAILURE_REPO/deploy.sh"
+
+for failure_mode in external local; do
+  FAILURE_OUT_DIR="$TMP_DIR/failed-driver-$failure_mode"
+  failure_trace="$TMP_DIR/failed-driver-$failure_mode.trace"
+  failure_args=(--endpoint 127.0.0.1:9000 --deploy-hook "$FAILURE_REPO/deploy.sh")
+  server_pid_file=""
+  if [[ "$failure_mode" == local ]]; then
+    failure_args=(--data-root "$FAILURE_REPO/data")
+    server_pid_file="$FAILURE_REPO/server.pid"
+  fi
+  if (
+    cd "$FAILURE_REPO"
+    PATH="$FAILURE_REPO/bin:$PATH" FAILURE_TRACE="$failure_trace" SERVER_PID_FILE="$server_pid_file" \
+      "$RUNNER" \
+        --baseline-bin "$FAILURE_REPO/bin/rustfs" \
+        --candidate-bin "$FAILURE_REPO/bin/rustfs" \
+        --baseline-revision baseline-test \
+        --candidate-revision candidate-test \
+        --warp-bin /usr/bin/true \
+        --workload 'put-100kib|put|100KiB' \
+        --drive-sync 'sync-on|true' \
+        --health-timeout 1 \
+        --out-dir "$FAILURE_OUT_DIR" \
+        "${failure_args[@]}"
+  ) >"$TMP_DIR/failed-driver-$failure_mode.log" 2>&1; then
+    echo "expected failing load driver to abort the $failure_mode run" >&2
+    exit 1
+  else
+    failure_status=$?
+  fi
+  if [[ "$failure_mode" == local && -s "$server_pid_file" ]]; then
+    FAILURE_SERVER_PID="$(cat "$server_pid_file")"
+  fi
+  [[ "$failure_status" == 42 ]]
+  if [[ "$failure_mode" == external ]]; then
+    [[ "$(cat "$failure_trace")" == $'deploy:A1\nmeasure:A1' ]]
+  else
+    [[ "$(cat "$failure_trace")" == 'measure:A1' ]]
+    [[ -n "$FAILURE_SERVER_PID" ]]
+    for ((i = 0; i < 500; i++)); do
+      kill -0 "$FAILURE_SERVER_PID" 2>/dev/null || break
+      sleep 0.01
+    done
+    if kill -0 "$FAILURE_SERVER_PID" 2>/dev/null; then
+      echo "expected EXIT cleanup to stop the local server after driver failure" >&2
+      exit 1
+    fi
+    FAILURE_SERVER_PID=""
+  fi
+  awk -F, 'NR == 2 { if ($6 != "A1") exit 1 } END { if (NR != 2) exit 1 }' "$FAILURE_OUT_DIR/abba_schedule.csv"
+  [[ ! -e "$FAILURE_OUT_DIR/summary.md" ]]
+  [[ ! -e "$FAILURE_OUT_DIR/candidate_gate.md" ]]
+  [[ ! -e "$FAILURE_OUT_DIR/baseline_drift_gate.md" ]]
 done
 
 echo "hotpath warp ABBA tests passed"

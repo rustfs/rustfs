@@ -31,8 +31,9 @@ use crate::runtime_sources::current_object_store_handle;
 use crate::storage_api::kms::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::kms::{ECStore, StorageError, get_bucket_sse_config};
 use async_trait::async_trait;
+use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration;
 use rustfs_kms::{DeletionReferenceChecker, KeyImpactReport, KeyReference, KeyReferenceKind};
-use s3s::dto::ServerSideEncryptionConfiguration;
+use rustfs_policy::policy::statement::RequestedKmsKey;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -71,7 +72,7 @@ pub(crate) async fn current_key_impact(key_id: &str, default_key_id: Option<&str
 async fn collect_key_impact(key_id: &str, default_key_id: Option<&str>, store: Option<Arc<ECStore>>) -> KeyImpactReport {
     let mut report = KeyImpactReport::configuration_layer(key_id);
 
-    if default_key_id == Some(key_id) {
+    if default_key_id.is_some_and(|default_key_id| names_same_key(default_key_id, key_id)) {
         report.push_reference(KeyReference {
             kind: KeyReferenceKind::ServiceDefaultKey,
             id: key_id.to_string(),
@@ -167,27 +168,60 @@ fn sse_config_references_key(config: &ServerSideEncryptionConfiguration, key_id:
         rule.apply_server_side_encryption_by_default
             .as_ref()
             .and_then(|sse| sse.kms_master_key_id.as_deref())
-            .is_some_and(|configured| configured == key_id)
+            .is_some_and(|configured| names_same_key(configured, key_id))
     })
+}
+
+/// Whether a configured key identifier and the one being deleted name the same
+/// key. An AWS key answers to its id and to its ARN, so the two can differ in
+/// spelling while a deletion of one still takes the other away. An alias cannot
+/// be resolved here and is compared literally.
+fn names_same_key(configured: &str, key_id: &str) -> bool {
+    configured == key_id || RequestedKmsKey::same_key(configured, key_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
     use rustfs_kms::ReferenceCompleteness;
-    use s3s::dto::{ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionRule};
 
     fn sse_kms_config(key_id: Option<&str>) -> ServerSideEncryptionConfiguration {
         ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                    sse_algorithm: "aws:kms".to_owned(),
                     kms_master_key_id: key_id.map(str::to_string),
                 }),
                 blocked_encryption_types: None,
                 bucket_key_enabled: None,
             }],
         }
+    }
+
+    /// A bucket or the service default can name an AWS key by ARN while the
+    /// deletion names it by id, or the other way round. Compared literally,
+    /// the report said nothing referenced a key that was in fact the default.
+    #[test]
+    fn references_are_found_across_spellings_of_one_aws_key() {
+        let key_id = "74e5921e-107a-4584-bfda-a5dadeb3e13e";
+        let arn = "arn:aws:kms:eu-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e";
+        let other = "arn:aws:kms:eu-north-1:111122223333:key/00000000-0000-4000-8000-000000000000";
+
+        for (configured, deleted) in [(arn, key_id), (key_id, arn), (arn, arn), (key_id, key_id)] {
+            assert!(names_same_key(configured, deleted), "{configured} and {deleted} name one key");
+            assert!(
+                bucket_reference("sse-bucket", Ok(sse_kms_config(Some(configured))), deleted).is_some(),
+                "a bucket configured with {configured} references {deleted}"
+            );
+        }
+        assert!(!names_same_key(other, key_id));
+        assert!(bucket_reference("sse-bucket", Ok(sse_kms_config(Some(other))), key_id).is_none());
+        // An alias is only ever equal to its own spelling.
+        assert!(names_same_key("alias/payroll", "alias/payroll"));
+        assert!(!names_same_key("alias/payroll", key_id));
     }
 
     #[test]

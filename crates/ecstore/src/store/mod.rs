@@ -67,11 +67,13 @@ use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_config::server_config::Config;
 use rustfs_filemeta::{FileInfo, FileMeta};
+use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
 use rustfs_heal_contracts::heal_channel::{HealItemType, HealOpts};
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
-use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::net::SocketAddr;
 use std::process::exit;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -409,7 +411,12 @@ async fn enqueue_transition_after_write(
             // still sees the object if that commit never reached this hook.
             if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
                 enqueue_transition_immediate(&oi, src.clone()).await;
-                if let Ok(api) = metadata_sys::object_store_in(&store.ctx).await {
+                // Immediate expiry needs the bucket incarnation under the
+                // metadata-transaction lock; a lockless cache PUT leaves expiry
+                // to the scanner.
+                if !opts.is_lockless_cache_write()
+                    && let Ok(api) = metadata_sys::object_store_in(&store.ctx).await
+                {
                     enqueue_immediate_expiry(api, &oi, src, opts).await;
                 }
             }
@@ -433,6 +440,7 @@ pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
+mod format_bootstrap;
 mod init;
 pub(crate) mod init_format;
 pub(crate) mod list_objects;
@@ -451,9 +459,13 @@ pub use object::{
 mod peer;
 mod rebalance;
 #[cfg(test)]
+mod usage_watch_tests;
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 
+#[cfg(feature = "internode-transport")]
+pub use peer::external_rpc_disk;
 use peer::init_local_peer;
 pub use peer::{
     BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
@@ -829,6 +841,13 @@ impl ECStore {
         runtime_sources::bucket_metadata_sys()
     }
 
+    /// Recover this instance's weak metadata owner without accepting a
+    /// process-global store belonging to another scanner or test fixture.
+    pub async fn scanner_usage_watch_store_handle(&self) -> Option<Arc<Self>> {
+        let owner = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await?;
+        std::ptr::eq(self, owner.as_ref()).then_some(owner)
+    }
+
     /// Get the global endpoints
     pub fn endpoints(&self) -> EndpointServerPools {
         runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into())
@@ -840,8 +859,14 @@ impl ECStore {
     }
 
     /// Get this store instance's configured region.
-    pub fn region(&self) -> Option<s3s::region::Region> {
+    pub fn region(&self) -> Option<rustfs_s3_types::Region> {
         self.ctx.region()
+    }
+
+    /// Get the further regions this store instance accepts as a bucket
+    /// `LocationConstraint` besides [`Self::region`].
+    pub fn additional_regions(&self) -> Vec<rustfs_s3_types::Region> {
+        self.ctx.additional_regions()
     }
 
     /// Get the tier config manager
@@ -904,6 +929,72 @@ impl ECStore {
 
     pub fn scanner_namespace_mutation_generation(&self) -> u64 {
         list_objects::scanner_namespace_mutation_generation().saturating_add(self.ctx.namespace_commit_generation())
+    }
+
+    /// Query named buckets against their current storage-owned incarnation.
+    /// Unknown identities, expired tokens and resource pressure remain explicit
+    /// Unknown entries; absence from a dirty list never creates a clean proof.
+    pub async fn scanner_usage_watch(
+        &self,
+        requests: &[crate::runtime::usage_watch::ScannerUsageWatchRequest],
+    ) -> Vec<crate::runtime::usage_watch::ScannerUsageWatchObservation> {
+        use crate::runtime::usage_watch::ScannerUsageWatchObservation;
+        let mut observations = Vec::with_capacity(requests.len().min(32));
+        if requests.len() > 32 {
+            return observations;
+        }
+        let local_map = self.ctx.local_disk_map();
+        let local_disks = local_map.read().await;
+        let bindings_complete = !local_disks.is_empty()
+            && local_disks.values().all(|disk| {
+                disk.as_ref().is_some_and(|disk| match disk.as_ref() {
+                    crate::disk::Disk::Local(wrapper) => wrapper.get_disk().usage_watch_binding.matches(&self.ctx.usage_watches),
+                    crate::disk::Disk::Remote(_) => false,
+                })
+            });
+        drop(local_disks);
+        for request in requests {
+            if request.release {
+                // Retirement needs the exact saved token, not current bucket
+                // metadata. Deleted buckets must not retain scarce watch slots.
+                self.ctx.usage_watches.observe(self.id, request);
+                observations.push(ScannerUsageWatchObservation {
+                    bucket: request.bucket.clone(),
+                    known: None,
+                });
+                continue;
+            }
+            let current = self.bucket_incarnation_id_from_disk(&request.bucket).await;
+            let known = match current {
+                Ok(incarnation) if bindings_complete && incarnation == request.bucket_incarnation && !incarnation.is_nil() => {
+                    self.ctx.usage_watches.observe(self.id, request)
+                }
+                _ => None,
+            };
+            observations.push(ScannerUsageWatchObservation {
+                bucket: request.bucket.clone(),
+                known,
+            });
+        }
+        observations
+    }
+
+    /// Invalidate session proofs after replay or an unsupported producer mode
+    /// transition; this does not change durable dirty ACK responsibility.
+    pub fn invalidate_scanner_usage_watches(&self) {
+        self.ctx.usage_watches.invalidate();
+    }
+
+    pub fn scanner_usage_watch_session_id(&self) -> Uuid {
+        self.ctx.usage_watches.session_id()
+    }
+
+    /// Revoke an exact local token without awaiting storage or peer I/O. A
+    /// failed keepalive must not let a later successful query revive its proof.
+    pub fn scanner_release_usage_watch(&self, request: &crate::runtime::usage_watch::ScannerUsageWatchRequest) {
+        if request.release {
+            self.ctx.usage_watches.observe(self.id, request);
+        }
     }
 
     pub async fn scanner_data_movement_active(&self) -> bool {
@@ -1471,11 +1562,11 @@ impl ECStore {
 
 lazy_static! {
     static ref ENABLED_OBJECT_LOCK_CONFIG: ObjectLockConfiguration = ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     };
     static ref ENABLED_VERSIONING_CONFIG: VersioningConfiguration = VersioningConfiguration {
-        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        status: Some("Enabled".to_owned()),
         ..Default::default()
     };
 }
@@ -1883,7 +1974,12 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 
     #[instrument(skip(self))]
     async fn local_storage_info(&self) -> Self::StorageInfo {
-        self.handle_local_storage_info().await
+        self.handle_local_storage_info(true).await
+    }
+
+    #[instrument(skip(self))]
+    async fn local_storage_info_with_metrics(&self, include_metrics: bool) -> Self::StorageInfo {
+        self.handle_local_storage_info(include_metrics).await
     }
 
     #[instrument(skip(self))]

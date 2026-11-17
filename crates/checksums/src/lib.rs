@@ -902,4 +902,104 @@ mod tests {
         assert_eq!(raw.len(), 8);
         assert_eq!(&raw[..], reference.digest().to_be_bytes().as_slice());
     }
+
+    #[test]
+    fn checksums_streaming_chunks_and_header_encoding_match_oneshot_across_unaligned_boundaries() {
+        use crate::http::HttpChecksum;
+
+        let all = [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Sha512,
+            ChecksumAlgorithm::Xxhash3,
+            ChecksumAlgorithm::Xxhash64,
+            ChecksumAlgorithm::Xxhash128,
+        ];
+
+        for &payload_len in &[0usize, 1, 31, 33, 1024, 4096 + 37, 64 * 1024 + 19] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| ((i * 19 + 5) % 253) as u8).collect();
+            for algorithm in all {
+                let mut one_shot = algorithm.into_impl();
+                one_shot.update(&payload);
+                let expected_raw = one_shot.finalize();
+                assert_eq!(expected_raw.len(), algorithm.raw_len());
+
+                let mut one_shot_hdr = algorithm.into_impl();
+                one_shot_hdr.update(&payload);
+                let expected_headers = one_shot_hdr.headers();
+
+                for &chunk_size in &[1usize, 31, 1021, 4096] {
+                    if payload_len > 4096 && chunk_size == 1 {
+                        continue;
+                    }
+                    let mut streaming: Box<dyn HttpChecksum> = algorithm.into_impl();
+                    for chunk in payload.chunks(chunk_size) {
+                        streaming.update(chunk);
+                    }
+                    let actual_headers = streaming.headers();
+                    assert_eq!(
+                        actual_headers.get(algorithm.http_header_name()),
+                        expected_headers.get(algorithm.http_header_name()),
+                        "{algorithm:?} streaming mismatch at payload_len={payload_len}, chunk_size={chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "utility throughput microbenchmark; run via cargo test -p rustfs-checksums --lib --release -- --ignored --nocapture"]
+    fn microbench_checksums_streaming_chunks_and_header_encoding() {
+        use crate::http::HttpChecksum;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let all = [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Sha512,
+            ChecksumAlgorithm::Xxhash3,
+            ChecksumAlgorithm::Xxhash64,
+            ChecksumAlgorithm::Xxhash128,
+        ];
+
+        let payload: Vec<u8> = (0..(256 * 1024)).map(|i| ((i * 19 + 5) % 253) as u8).collect();
+        for &chunk_size in &[4 * 1024usize, 64 * 1024, 256 * 1024] {
+            for algorithm in all {
+                let mut one_shot = algorithm.into_impl();
+                one_shot.update(&payload);
+                let expected_headers = one_shot.headers();
+
+                let iters = 8usize;
+                let t0 = Instant::now();
+                let mut last_headers = http::HeaderMap::new();
+                for _ in 0..iters {
+                    let mut streaming: Box<dyn HttpChecksum> = algorithm.into_impl();
+                    for chunk in payload.chunks(chunk_size) {
+                        streaming.update(black_box(chunk));
+                    }
+                    last_headers = streaming.headers();
+                    black_box(&last_headers);
+                }
+                let elapsed = t0.elapsed();
+                assert_eq!(
+                    last_headers.get(algorithm.http_header_name()),
+                    expected_headers.get(algorithm.http_header_name()),
+                    "{algorithm:?} streaming chunk_size={chunk_size} header mismatch"
+                );
+                let total_mib = (payload.len() * iters) as f64 / (1024.0 * 1024.0);
+                let mibs = total_mib / elapsed.as_secs_f64().max(1e-9);
+                println!(
+                    "[microbench][checksums] algo={algorithm:?} chunk_size={chunk_size}B throughput={mibs:.1} MiB/s (size={}B)",
+                    algorithm.raw_len()
+                );
+            }
+        }
+    }
 }

@@ -138,7 +138,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # 使用指定版本运行
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.4
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.5
 ```
 
 如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：
@@ -176,7 +176,7 @@ docker compose -f docker-compose-simple.yml up -d
 ./docker-buildx.sh --push
 
 # 构建指定版本
-./docker-buildx.sh --release 1.0.4 --push
+./docker-buildx.sh --release 1.0.5 --push
 
 # 构建并推送到自定义仓库
 ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
@@ -193,7 +193,7 @@ docker compose -f docker-compose-simple.yml up -d
 ```bash
 make docker-buildx                    # 本地构建
 make docker-buildx-push               # 构建并推送
-make docker-buildx-version VERSION=1.0.4  # 构建指定版本
+make docker-buildx-version VERSION=1.0.5  # 构建指定版本
 make help-docker                      # 显示所有 Docker 相关命令
 ```
 
@@ -238,6 +238,10 @@ x rustfs
 x env use rustfs
 rustfs --help
 ```
+
+### 7\. 使用 SwarmCLI Chart 部署到 Docker Swarm (Option 7)
+
+请按照 [SwarmCLI Chart 指南](https://docs.rustfs.com/zh/installation/cloud-native/swarmcli-chart)，使用开源的 [SwarmCLI `rustfs` Chart](https://github.com/Eldara-Tech/swarmcli-charts/tree/main/charts/rustfs) 在 Docker Swarm 上运行 RustFS，可部署为单节点服务，或每个节点一个对等节点、采用纠删码的分布式集群。该 Chart 将 root 凭证保存在 Docker Secret 中并拒绝默认的 `rustfsadmin` 密钥，以带版本的发布进行升级和回滚，并可通过 Traefik 以 HTTPS 提供 S3 API。控制台默认关闭，需要时再启用。该 Chart 和 [SwarmCLI](https://github.com/Eldara-Tech/swarmcli) 由 Eldara Tech 维护，并非 RustFS 项目的一部分。
 
 ---
 

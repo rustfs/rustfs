@@ -22,10 +22,11 @@ use rustfs_protos::{
     models::PingBodyBuilder,
     proto_gen::node_service::{
         BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
-        GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseReleaseResponse, ScannerPublicationLeaseRequest,
-        ScannerPublicationLeaseResponse, SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
-        SnapshotLeaseRequest, SnapshotLeaseResponse, node_service_server::NodeService,
+        GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, MrfLifecycleRequest, MrfLifecycleResponse, PingRequest,
+        PingResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseReleaseResponse,
+        ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse, SnapshotLeaseMutationResponse,
+        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, SnapshotLeaseResponse,
+        node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -42,6 +43,7 @@ fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLo
         success: response.success,
         error_info: response.error,
         lock_info: response.lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+        cache_fence_stamp: response.cache_fence_stamp.map(|stamp| stamp.encode().to_vec().into()),
         ..Default::default()
     }
 }
@@ -179,6 +181,7 @@ impl NodeService for MinimalLockNodeService {
                     success: result.success,
                     error_info: result.error,
                     lock_info: lock_info_json,
+                    cache_fence_stamp: result.cache_fence_stamp.map(|stamp| stamp.encode().to_vec().into()),
                     ..Default::default()
                 }))
             }
@@ -434,6 +437,13 @@ impl NodeService for MinimalLockNodeService {
     async fn write_all(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::WriteAllRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::WriteAllResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn write_format_control(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::WriteFormatControlRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::WriteAllResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
@@ -992,6 +1002,10 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::ScannerDirtyUsageSnapshotRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::ScannerDirtyUsageSnapshotResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn mrf_lifecycle(&self, _request: Request<MrfLifecycleRequest>) -> Result<Response<MrfLifecycleResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

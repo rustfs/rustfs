@@ -21,6 +21,8 @@ assert_version() {
   rm -f "$output"
 }
 
-assert_version "refs/tags/v1.0.0-beta.12" "v1.0.0-beta.12" "1.0.0-beta.12" "0.12.0"
+assert_version "refs/tags/v1.0.0-beta.12" "v1.0.0-beta.12" "1.0.0-beta.12" "1.0.0-beta.12"
+assert_version "2.0.0-beta.12" "2.0.0-beta.12" "2.0.0-beta.12" "2.0.0-beta.12"
+assert_version "1.0.6-rc.1" "1.0.6-rc.1" "1.0.6-rc.1" "1.0.6-rc.1"
 assert_version "v1.0.0" "v1.0.0" "1.0.0" "1.0.0"
 assert_version "refs/tags/1.0.0" "1.0.0" "1.0.0" "1.0.0"

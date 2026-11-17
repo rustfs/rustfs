@@ -1,0 +1,1 @@
+<BucketLoggingStatus><LoggingEnabled><TargetBucket>interop-logs</TargetBucket><TargetPrefix>interop/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>

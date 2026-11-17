@@ -33,11 +33,11 @@ use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_targets::config::{
     try_collect_target_configs, validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_mysql_config,
     validate_nats_config, validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
 };
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::future::Future;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;

@@ -1297,6 +1297,10 @@ impl Default for TableCatalogObjectPaths {
 }
 
 impl TableCatalogObjectPaths {
+    pub fn table_bucket_entries_prefix(&self) -> String {
+        format!("{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT)
+    }
+
     pub fn table_bucket_entry_path(&self, table_bucket: &str) -> String {
         format!("{}{}", self.table_bucket_root_prefix(table_bucket), TABLE_BUCKET_ENTRY_FILE)
     }
@@ -1373,6 +1377,41 @@ impl TableCatalogObjectPaths {
             table.as_str(),
             table_catalog_path_hash(table_id)
         )
+    }
+
+    /// Returns the table maintenance directory and record name for a canonical catalog path.
+    fn historical_table_maintenance_path<'a>(&self, table_bucket: &str, object: &'a str) -> Option<(&'a str, &'a str)> {
+        let namespace_prefix = self.namespace_entries_prefix(table_bucket);
+        let relative = object.strip_prefix(&namespace_prefix)?;
+        let (head, tail) = relative.rsplit_once(&format!("/{MAINTENANCE_ROOT}/"))?;
+        let (namespace_path, table) = head.rsplit_once(&format!("/{TABLE_ROOT}/"))?;
+        if table.contains('/')
+            || IdentifierSegment::parse(table).is_err()
+            || Namespace::from_segments(namespace_path.split('/').map(str::to_string).collect()).is_err()
+        {
+            return None;
+        }
+        let (identity_hash, suffix) = tail.split_once('/')?;
+        if identity_hash.len() != 64
+            || !identity_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let is_known = matches!(
+            suffix,
+            MAINTENANCE_CONFIG_FILE | MAINTENANCE_CURRENT_JOB_FILE | MAINTENANCE_LATEST_JOB_FILE
+        ) || suffix
+            .strip_prefix(&format!("{MAINTENANCE_JOB_ROOT}/"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        is_known.then(|| (&object[..object.len() - suffix.len()], suffix))
     }
 
     pub fn table_maintenance_job_path(
@@ -1588,7 +1627,7 @@ impl TableCatalogObjectPaths {
     }
 
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
-        format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
+        format!("{}{}/", self.table_bucket_entries_prefix(), table_catalog_path_hash(table_bucket))
     }
 }
 

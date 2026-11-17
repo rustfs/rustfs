@@ -60,7 +60,7 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const SIGNATURE_HEADER: &str = "x-rustfs-signature";
+pub(crate) const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 pub const RPC_BACKGROUND_ADMISSION_HEADER: &str = "x-rustfs-rpc-background-admission";
 const RPC_BACKGROUND_ADMISSION_V1: &str = "v1";
 const RPC_BACKGROUND_ADMISSION_DOMAIN: &[u8] = b"rustfs-rpc-background-admission-v1\0";
@@ -78,6 +78,9 @@ pub const RPC_BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-chall
 pub const RPC_BOOT_EPOCH_PROOF_HEADER: &str = "x-rustfs-rpc-boot-epoch-proof";
 pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_HEADER: &str = "x-rustfs-rpc-replay-cache-capability";
 pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-replay-cache-capability-proof";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER: &str = "x-rustfs-rpc-msgpack-manifest-request";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER: &str = "x-rustfs-rpc-msgpack-manifest-capability";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-msgpack-manifest-capability-proof";
 const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 
@@ -124,6 +127,8 @@ const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
 const RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-replay-cache-capability-proof-v1\0";
 const RPC_REPLAY_CACHE_CAPABILITY_V1: &str = "dynamic-replay-cache-v1";
+const RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-msgpack-manifest-capability-proof-v1\0";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_V1: &str = "msgpack-compat-manifest-v1";
 const HTTP_PUT_FILE_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-auth-v1\0";
 const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capability-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -139,6 +144,8 @@ const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
 const REPLAY_CACHE_METADATA_BYTES: u64 = 1024 * 1024;
 const REPLAY_CACHE_TABLE_OVERHEAD_BYTES: u64 = 512;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
+const NS_SCANNER_COMPLETE_OBSERVATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-complete-observation-v1";
+const NS_SCANNER_DURABLE_PROGRESS_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-durable-progress-v1";
 const NS_SCANNER_CHECKPOINT_COVERAGE_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-checkpoint-coverage-v1";
 const NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-tier-registry-generation-v1";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
@@ -795,6 +802,8 @@ fn update_ns_scanner_capability_mac(
     server_epoch: Uuid,
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) {
     mac.update(NS_SCANNER_CAPABILITY_AUTH_DOMAIN);
     mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
@@ -809,14 +818,22 @@ fn update_ns_scanner_capability_mac(
     if supports_checkpoint_coverage {
         mac.update(NS_SCANNER_CHECKPOINT_COVERAGE_AUTH_DOMAIN);
     }
+    if supports_durable_progress {
+        mac.update(NS_SCANNER_DURABLE_PROGRESS_AUTH_DOMAIN);
+    }
+    if supports_complete_observation {
+        mac.update(NS_SCANNER_COMPLETE_OBSERVATION_AUTH_DOMAIN);
+    }
 }
 
-fn generate_ns_scanner_capability_proof(
+fn generate_ns_scanner_capability_proof_with_observation(
     secret: &str,
     challenge: Uuid,
     server_epoch: Uuid,
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) -> std::io::Result<Vec<u8>> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
@@ -829,17 +846,22 @@ fn generate_ns_scanner_capability_proof(
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+        supports_complete_observation,
     );
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn verify_ns_scanner_capability_proof(
+#[allow(clippy::too_many_arguments)]
+fn verify_ns_scanner_capability_proof_with_observation(
     secret: &str,
     challenge: Uuid,
     server_epoch: Uuid,
     proof: &[u8],
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) -> std::io::Result<()> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
@@ -852,9 +874,33 @@ fn verify_ns_scanner_capability_proof(
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+        supports_complete_observation,
     );
     mac.verify_slice(proof)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid namespace scanner capability proof"))
+}
+
+fn generate_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof_with_observation(secret, challenge, server_epoch, tier, checkpoint, progress, false)
+}
+fn verify_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof_with_observation(secret, challenge, server_epoch, proof, tier, checkpoint, progress, false)
 }
 
 pub fn sign_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
@@ -879,12 +925,29 @@ pub fn sign_ns_scanner_capability_with_checkpoint_coverage(
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
 ) -> std::io::Result<Vec<u8>> {
+    sign_ns_scanner_capability_with_durable_progress(
+        challenge,
+        server_epoch,
+        supports_tier_registry_generation,
+        supports_checkpoint_coverage,
+        false,
+    )
+}
+
+pub fn sign_ns_scanner_capability_with_durable_progress(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+) -> std::io::Result<Vec<u8>> {
     generate_ns_scanner_capability_proof(
         &get_shared_secret()?,
         challenge,
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
     )
 }
 
@@ -910,6 +973,24 @@ pub fn verify_ns_scanner_capability_with_checkpoint_coverage(
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
 ) -> std::io::Result<()> {
+    verify_ns_scanner_capability_with_durable_progress(
+        challenge,
+        server_epoch,
+        proof,
+        supports_tier_registry_generation,
+        supports_checkpoint_coverage,
+        false,
+    )
+}
+
+pub fn verify_ns_scanner_capability_with_durable_progress(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+) -> std::io::Result<()> {
     verify_ns_scanner_capability_proof(
         &get_shared_secret()?,
         challenge,
@@ -917,6 +998,74 @@ pub fn verify_ns_scanner_capability_with_checkpoint_coverage(
         proof,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+    )
+}
+
+pub fn sign_ns_scanner_capability_with_usage_capabilities(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+    observation: bool,
+) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof_with_observation(
+        &get_shared_secret()?,
+        challenge,
+        server_epoch,
+        tier,
+        checkpoint,
+        progress,
+        observation,
+    )
+}
+fn ns_scanner_usage_watch_capability_mac(secret: &str, challenge: Uuid, server_epoch: Uuid) -> std::io::Result<HmacSha256> {
+    if challenge.is_nil() || server_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid namespace scanner usage watch capability scope"));
+    }
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    mac.update(b"rustfs-ns-scanner-usage-watch-capability-v1\0");
+    mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
+    mac.update(challenge.as_bytes());
+    mac.update(server_epoch.as_bytes());
+    Ok(mac)
+}
+
+/// Sign the independent worker capability to validate bucket watches before
+/// reusing or durably publishing a complete scanner cache.
+pub fn sign_ns_scanner_usage_watch_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+    Ok(ns_scanner_usage_watch_capability_mac(&get_shared_secret()?, challenge, server_epoch)?
+        .finalize()
+        .into_bytes()
+        .to_vec())
+}
+
+pub fn verify_ns_scanner_usage_watch_capability(challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
+    ns_scanner_usage_watch_capability_mac(&get_shared_secret()?, challenge, server_epoch)?
+        .verify_slice(proof)
+        .map_err(|_| std::io::Error::other("Invalid namespace scanner usage watch capability proof"))
+}
+
+pub fn verify_ns_scanner_capability_with_usage_capabilities(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+    observation: bool,
+) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof_with_observation(
+        &get_shared_secret()?,
+        challenge,
+        server_epoch,
+        proof,
+        tier,
+        checkpoint,
+        progress,
+        observation,
     )
 }
 
@@ -1094,6 +1243,50 @@ fn verify_replay_cache_capability_proof(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC replay cache capability proof"))
 }
 
+fn update_msgpack_manifest_capability_proof(mac: &mut HmacSha256, audience: &str, challenge: Uuid, boot_epoch: Uuid) {
+    mac.update(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_DOMAIN);
+    for part in [
+        audience.as_bytes(),
+        b"|",
+        challenge.as_bytes(),
+        b"|",
+        boot_epoch.as_bytes(),
+        b"|",
+        RPC_MSGPACK_MANIFEST_CAPABILITY_V1.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+}
+
+fn generate_msgpack_manifest_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+) -> std::io::Result<String> {
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_msgpack_manifest_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
+}
+
+fn verify_msgpack_manifest_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    proof: &str,
+) -> std::io::Result<()> {
+    let proof = base64_simd::STANDARD
+        .decode_to_vec(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC msgpack manifest capability proof"))?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_msgpack_manifest_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    mac.verify_slice(&proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC msgpack manifest capability proof"))
+}
+
 fn non_nil_uuid(value: &str, name: &str) -> std::io::Result<Uuid> {
     let value = Uuid::parse_str(value).map_err(|_| std::io::Error::other(format!("Invalid {name}")))?;
     (!value.is_nil())
@@ -1193,8 +1386,24 @@ pub fn tonic_boot_epoch_challenge(headers: &HeaderMap) -> std::io::Result<Option
         .transpose()
 }
 
+/// Whether the request opts into the optional msgpack manifest capability proof.
+pub fn tonic_msgpack_manifest_capability_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER)
+        .is_some_and(|value| value == RPC_MSGPACK_MANIFEST_CAPABILITY_V1)
+}
+
 /// Build the authenticated response headers for a client boot-epoch challenge.
 pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std::io::Result<HeaderMap> {
+    tonic_boot_epoch_response_headers_with_msgpack_capability(audience, challenge, false)
+}
+
+/// Build authenticated boot-epoch headers and, when requested, the msgpack manifest capability.
+pub fn tonic_boot_epoch_response_headers_with_msgpack_capability(
+    audience: &str,
+    challenge: Uuid,
+    include_msgpack_manifest: bool,
+) -> std::io::Result<HeaderMap> {
     let boot_epoch = tonic_rpc_boot_epoch();
     let secret = get_shared_secret()?;
     let proof = generate_boot_epoch_proof(&secret, audience, challenge, boot_epoch)?;
@@ -1210,6 +1419,17 @@ pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std
         RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
         header_value(&capability_proof, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)?,
     );
+    if include_msgpack_manifest {
+        let msgpack_capability_proof = generate_msgpack_manifest_capability_proof(&secret, audience, challenge, boot_epoch)?;
+        headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER,
+            HeaderValue::from_static(RPC_MSGPACK_MANIFEST_CAPABILITY_V1),
+        );
+        headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER,
+            header_value(&msgpack_capability_proof, RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER)?,
+        );
+    }
     Ok(headers)
 }
 
@@ -1243,6 +1463,12 @@ pub(crate) struct AuthenticatedPeerReplayCapabilities {
     pub(crate) dynamic_replay_cache: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPeerMsgpackCapabilities {
+    pub(crate) boot_epoch: Uuid,
+    pub(crate) msgpack_compat_manifest: bool,
+}
+
 pub(crate) fn verify_tonic_peer_replay_capabilities_response(
     audience: &str,
     challenge: Uuid,
@@ -1271,6 +1497,57 @@ pub(crate) fn verify_tonic_peer_replay_capabilities_response(
     Ok(AuthenticatedPeerReplayCapabilities {
         boot_epoch,
         dynamic_replay_cache: true,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn verify_tonic_peer_msgpack_capabilities_response(
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerMsgpackCapabilities> {
+    let secret = get_shared_secret()?;
+    let boot_epoch = verify_tonic_boot_epoch_response_with_secret(&secret, audience, challenge, headers)?;
+    verify_tonic_peer_msgpack_capability_for_epoch_with_secret(&secret, audience, challenge, boot_epoch, headers)
+}
+
+pub(crate) fn verify_tonic_peer_msgpack_capability_for_authenticated_epoch(
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerMsgpackCapabilities> {
+    verify_tonic_peer_msgpack_capability_for_epoch_with_secret(&get_shared_secret()?, audience, challenge, boot_epoch, headers)
+}
+
+fn verify_tonic_peer_msgpack_capability_for_epoch_with_secret(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerMsgpackCapabilities> {
+    let capability = headers.get(RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER);
+    let proof = headers.get(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER);
+    if capability.is_none() && proof.is_none() {
+        return Ok(AuthenticatedPeerMsgpackCapabilities {
+            boot_epoch,
+            msgpack_compat_manifest: false,
+        });
+    }
+    let capability = capability
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC msgpack manifest capability"))?;
+    if capability != RPC_MSGPACK_MANIFEST_CAPABILITY_V1 {
+        return Err(std::io::Error::other("Unsupported RPC msgpack manifest capability"));
+    }
+    let proof = proof
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC msgpack manifest capability proof"))?;
+    verify_msgpack_manifest_capability_proof(secret, audience, challenge, boot_epoch, proof)?;
+    Ok(AuthenticatedPeerMsgpackCapabilities {
+        boot_epoch,
+        msgpack_compat_manifest: true,
     })
 }
 
@@ -1309,7 +1586,7 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
         Some("ReadMultiple") => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
         Some("ReadVersion") => INTERNODE_OPERATION_GRPC_READ_VERSION,
         Some("BatchReadVersion") => INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
-        Some("WriteAll") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        Some("WriteAll" | "WriteFormatControl") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
         Some("CompareAndUpdateFile") => INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
         Some("Lock") => INTERNODE_OPERATION_GRPC_LOCK,
         Some("UnLock") => INTERNODE_OPERATION_GRPC_UNLOCK,
@@ -1397,6 +1674,73 @@ pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) -
     inject_trace_context_into_http_headers(headers);
     inject_request_id_into_http_headers(headers);
     Ok(())
+}
+
+/// Signs only external stream controls targeting members of this instance's topology.
+#[cfg(feature = "internode-transport")]
+#[derive(Clone)]
+pub struct ExternalStreamAuth {
+    peers: std::sync::Arc<std::collections::HashSet<url::Origin>>,
+}
+
+#[cfg(feature = "internode-transport")]
+impl ExternalStreamAuth {
+    /// The authenticated HTTP route used by peer stream controls.
+    pub const PATH: &'static str = "/rustfs/rpc/external_stream";
+
+    /// Capture the topology already configured for this host; a missing topology has no peers.
+    pub fn new(instance: &crate::runtime::instance::InstanceContext) -> Self {
+        let mut peers = std::collections::HashSet::new();
+        if let Some(topology) = instance.endpoints() {
+            for pool in topology.0 {
+                for endpoint in pool.endpoints.as_ref() {
+                    if matches!(endpoint.url.scheme(), "http" | "https") {
+                        peers.insert(endpoint.url.origin());
+                    }
+                }
+            }
+        }
+        Self {
+            peers: std::sync::Arc::new(peers),
+        }
+    }
+
+    /// Sign a fresh POST for one configured origin, request body digest and replay nonce.
+    /// The caller must send it to the returned URL without redirects or resubmission.
+    pub fn sign_control(&self, endpoint: &str, digest: &[u8; 32]) -> std::io::Result<(String, HeaderMap)> {
+        let mut url = url::Url::parse(endpoint).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || !self.peers.contains(&url.origin())
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid internode control endpoint",
+            ));
+        }
+        url.set_path(Self::PATH);
+        url.query_pairs_mut()
+            .append_pair("body_sha256", &hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower))
+            .append_pair("request_nonce", &Uuid::new_v4().to_string());
+        let url = url.to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        build_auth_headers(&url, &Method::POST, &mut headers)?;
+        Ok((url, headers))
+    }
+
+    /// Derive the operation key for this stream protocol and exact request digest.
+    /// The shared RPC signing credential is never exposed to the stream provider.
+    pub fn transfer_key(&self, request_digest: &[u8; 32]) -> std::io::Result<[u8; 32]> {
+        let secret = get_shared_secret()?;
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(std::io::Error::other)?;
+        mac.update(b"rustfs-external-stream-key-v1\0");
+        mac.update(request_digest);
+        Ok(mac.finalize().into_bytes().into())
+    }
 }
 
 pub fn gen_signature_headers(url: &str, method: &Method) -> std::io::Result<HeaderMap> {
@@ -2135,13 +2479,119 @@ mod tests {
         let secret = "test-scanner-capability-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false)
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false, false)
             .expect("capability proof should be generated");
 
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, false, false).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof, false, false).is_err());
-        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, false, false, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof, false, false, false).is_err());
+        assert!(
+            verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false, false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn namespace_scanner_watch_capability_is_independent_and_rejects_replay() {
+        let _ = rustfs_credentials::set_global_rpc_secret("usage-watch-capability-test-secret".into());
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let proof = sign_ns_scanner_usage_watch_capability(challenge, epoch).expect("watch capability");
+        verify_ns_scanner_usage_watch_capability(challenge, epoch, &proof).expect("exact watch capability scope");
+        assert!(verify_ns_scanner_usage_watch_capability(Uuid::new_v4(), epoch, &proof).is_err());
+        assert!(verify_ns_scanner_usage_watch_capability(challenge, Uuid::new_v4(), &proof).is_err());
+        for progress in [false, true] {
+            for observation in [false, true] {
+                let other =
+                    sign_ns_scanner_capability_with_usage_capabilities(challenge, epoch, true, true, progress, observation)
+                        .expect("independent older capabilities");
+                assert!(verify_ns_scanner_usage_watch_capability(challenge, epoch, &other).is_err());
+                assert!(
+                    verify_ns_scanner_capability_with_usage_capabilities(
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        progress,
+                        observation
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_scanner_observation_and_progress_scopes_are_independent() {
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let secret = "independent-usage-capabilities";
+        for progress in [false, true] {
+            for observation in [false, true] {
+                let proof = generate_ns_scanner_capability_proof_with_observation(
+                    secret,
+                    challenge,
+                    epoch,
+                    true,
+                    true,
+                    progress,
+                    observation,
+                )
+                .expect("proof");
+                assert!(
+                    verify_ns_scanner_capability_proof_with_observation(
+                        secret,
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        progress,
+                        observation
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    verify_ns_scanner_capability_proof_with_observation(
+                        secret,
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        !progress,
+                        observation
+                    )
+                    .is_err()
+                );
+                assert!(
+                    verify_ns_scanner_capability_proof_with_observation(
+                        secret,
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        progress,
+                        !observation
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_scanner_capability_proof_binds_durable_progress_independently() {
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let secret = "durable-progress-test";
+        for supported in [false, true] {
+            let proof = generate_ns_scanner_capability_proof(secret, challenge, epoch, true, true, supported).expect("proof");
+            assert!(verify_ns_scanner_capability_proof(secret, challenge, epoch, &proof, true, true, supported).is_ok());
+            assert!(verify_ns_scanner_capability_proof(secret, challenge, epoch, &proof, true, true, !supported).is_err());
+            assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), epoch, &proof, true, true, supported).is_err());
+        }
     }
 
     #[test]
@@ -2149,16 +2599,16 @@ mod tests {
         let secret = "checkpoint-capability-test-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, true)
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, true, false)
             .expect("checkpoint capability proof");
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, true).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, true).is_err());
-        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false)
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, true, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, true, false).is_err());
+        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false, false)
             .expect("legacy generation capability proof");
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, true).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &[], true, true).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, true, true).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, true, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &[], true, true, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, true, true, false).is_err());
     }
 
     #[test]
@@ -2166,14 +2616,14 @@ mod tests {
         let secret = "test-scanner-capability-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false)
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false, false)
             .expect("generation capability proof should be generated");
 
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false).is_err());
-        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false)
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false, false).is_err());
+        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false, false)
             .expect("legacy capability proof should be generated");
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, false, false).is_err());
     }
 
     /// Security regression for GHSA-r5qv-rc46-hv8q (internode RPC fail-closed,
@@ -2831,6 +3281,55 @@ mod tests {
     }
 
     #[test]
+    fn msgpack_manifest_capability_is_requested_explicitly_and_proved_for_one_epoch() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let mut request_headers = HeaderMap::new();
+        assert!(!tonic_msgpack_manifest_capability_requested(&request_headers));
+        request_headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+            HeaderValue::from_static(RPC_MSGPACK_MANIFEST_CAPABILITY_V1),
+        );
+        assert!(tonic_msgpack_manifest_capability_requested(&request_headers));
+        request_headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+            HeaderValue::from_static("msgpack-compat-manifest-v2"),
+        );
+        assert!(!tonic_msgpack_manifest_capability_requested(&request_headers));
+
+        let legacy_headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("legacy capability headers");
+        let legacy = verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &legacy_headers)
+            .expect("authenticated response without msgpack capability");
+        assert_eq!(legacy.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(!legacy.msgpack_compat_manifest);
+
+        let headers = tonic_boot_epoch_response_headers_with_msgpack_capability("node-a:9000", challenge, true)
+            .expect("msgpack capability headers");
+        let capability = verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &headers)
+            .expect("matching msgpack capability proof");
+        assert_eq!(capability.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(capability.msgpack_compat_manifest);
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+
+        let mut changed_capability = headers.clone();
+        changed_capability.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER,
+            HeaderValue::from_static("msgpack-compat-manifest-v2"),
+        );
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &changed_capability).is_err());
+        let mut forged_proof = headers;
+        forged_proof.insert(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER, HeaderValue::from_static("forged"));
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &forged_proof).is_err());
+        let mut missing_proof = forged_proof.clone();
+        missing_proof.remove(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER);
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &missing_proof).is_err());
+        let mut missing_value = forged_proof;
+        missing_value.remove(RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER);
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &missing_value).is_err());
+    }
+
+    #[test]
     fn tonic_rpc_auth_failure_reason_maps_security_relevant_errors() {
         for (message, reason) in [
             ("Invalid RPC v2 signature", "invalid_v2_signature"),
@@ -3126,6 +3625,10 @@ mod tests {
         );
         assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/WriteAll"),
+            INTERNODE_OPERATION_GRPC_WRITE_ALL
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/WriteFormatControl"),
             INTERNODE_OPERATION_GRPC_WRITE_ALL
         );
         assert_eq!(

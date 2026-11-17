@@ -133,7 +133,8 @@ pub(crate) struct DeleteRecoverySummary {
     pub reclaimed: usize,
     /// Observed removals for this exact key, not aggregated across prefixes.
     pub removed_versions: HashSet<Uuid>,
-    /// Read-only evidence for ordinary missing-key S3 semantics. This never
+    /// Complete discovery on a strict majority found no transaction for this key.
+    /// Reusable only under the same key locks before a mutation. This never
     /// authorizes settlement while a configured participant is unavailable.
     pub no_transactions_at_quorum: bool,
 }
@@ -515,7 +516,7 @@ impl SetDisks {
         let owner = context
             .namespace_owner
             .take()
-            .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+            .unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket));
         context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
         let can_commit = context.can_commit;
         let can_try_local_fast_path = disks.len() == self.set_drive_count
@@ -791,7 +792,7 @@ impl SetDisks {
             let namespace_owner = context
                 .namespace_owner
                 .clone()
-                .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+                .unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket));
             context.namespace_owner = Some(Arc::new((namespace_owner, guard.clone())));
         }
         let can_commit = context.can_commit;
@@ -821,7 +822,7 @@ impl SetDisks {
             let owner = context
                 .namespace_owner
                 .take()
-                .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+                .unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket));
             context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
         }
         let DeleteRecoveryContext {
@@ -862,16 +863,18 @@ impl SetDisks {
                 Err(error) => return Err(error),
             }
         }
+        let no_transactions_at_quorum = transactions.is_empty() && !unsupported && inspected > self.set_drive_count / 2;
         if offline {
             return Ok(DeleteRecoverySummary {
                 discovered: transactions.len(),
                 pending: 1,
-                no_transactions_at_quorum: transactions.is_empty() && !unsupported && inspected > self.set_drive_count / 2,
+                no_transactions_at_quorum,
                 ..Default::default()
             });
         }
         let mut summary = DeleteRecoverySummary {
             discovered: transactions.len(),
+            no_transactions_at_quorum,
             ..Default::default()
         };
         let mut all_states = BTreeMap::new();
@@ -1025,7 +1028,7 @@ impl SetDisks {
         let namespace_owner = if dry_run {
             None
         } else {
-            Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_namespace_commit()))
+            Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket)))
         };
         if !dry_run && metadata_may_change {
             self.invalidate_get_object_metadata_cache(bucket, object).await;
@@ -1400,6 +1403,7 @@ fn unavailable(error: &DiskError) -> bool {
     match error {
         DiskError::DiskNotFound
         | DiskError::FaultyDisk
+        | DiskError::FaultyRemoteDisk
         | DiskError::DiskOngoingReq
         | DiskError::Timeout
         | DiskError::RemoteClientUnavailable(_) => true,
@@ -1426,6 +1430,32 @@ fn unavailable(error: &DiskError) -> bool {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+
+    #[test]
+    fn recovery_availability_classifies_local_and_remote_disk_failures() {
+        for error in [
+            DiskError::DiskNotFound,
+            DiskError::FaultyDisk,
+            DiskError::FaultyRemoteDisk,
+            DiskError::Timeout,
+            DiskError::DiskOngoingReq,
+        ] {
+            assert!(unavailable(&error), "drive availability failure must defer recovery: {error:?}");
+        }
+        for error in [
+            DiskError::FileCorrupt,
+            DiskError::DiskAccessDenied,
+            DiskError::FileAccessDenied,
+            DiskError::InvalidPath,
+            DiskError::DeleteRecoveryWorkLimit,
+            DiskError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+        ] {
+            assert!(
+                !unavailable(&error),
+                "integrity, access and unclassified IO errors must propagate: {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn unresolved_heal_error_distinguishes_legacy_ambiguity_from_transient_blocks() {
@@ -1707,6 +1737,37 @@ mod tests {
             crate::error::is_err_object_not_found(&error),
             "small complete inventory retains no-op semantics: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_missing_key_naming_a_folder_of_uuid_named_keys_completes() {
+        let bucket = "recover-uuid-named-folder";
+        let (dirs, store, _) = fixture(bucket).await;
+        // More UUID-named child keys per drive than the former 4096-entry probe
+        // could cover once each child's `xl.meta` and data directory were charged
+        // (three entries per child).
+        const CHILDREN: usize = 1500;
+        for dir in &dirs {
+            let prefix = dir.path().join(bucket).join("uploads");
+            for _ in 0..CHILDREN {
+                let child = prefix.join(Uuid::new_v4().to_string());
+                std::fs::create_dir_all(child.join(Uuid::new_v4().to_string())).expect("child key data dir");
+                std::fs::write(child.join(crate::disk::STORAGE_FORMAT_FILE), b"meta").expect("child key metadata");
+            }
+        }
+        let error = store
+            .delete_object(bucket, "uploads", ObjectOptions::default())
+            .await
+            .expect_err("the folder's own key does not exist");
+        assert!(
+            crate::error::is_err_object_not_found(&error),
+            "a complete inventory keeps the missing-key no-op semantics: {error:?}"
+        );
+        assert!(dirs.iter().all(|dir| {
+            std::fs::read_dir(dir.path().join(bucket).join("uploads"))
+                .map(|entries| entries.count() == CHILDREN)
+                .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]
@@ -3040,6 +3101,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_batch_with_missing_version_recovers_after_preparation_failure() {
+        use crate::disk::RUSTFS_META_TMP_BUCKET;
+        use crate::storage_api_contracts::object::ObjectToDelete;
+
+        let bucket = "recover-batch-missing-version";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let deleted = put(&store, bucket, &vec![48; 4096], true).await.expect("version to delete");
+        let remaining = vec![49; 4096];
+        let retained = put(&store, bucket, &remaining, true).await.expect("version to retain");
+        let missing = Uuid::new_v4();
+        let temporary = dirs[3].path().join(RUSTFS_META_TMP_BUCKET);
+        let saved = dirs[3].path().join("saved-delete-tmp");
+        tokio::fs::rename(&temporary, &saved)
+            .await
+            .expect("save returning disk's staging directory");
+        tokio::fs::write(&temporary, b"block preparation")
+            .await
+            .expect("fail staging after the recovery preflight");
+
+        let (objects, errors) = store
+            .delete_objects(
+                bucket,
+                [deleted, missing]
+                    .into_iter()
+                    .map(|version| ObjectToDelete {
+                        object_name: "object".into(),
+                        version_id: Some(version),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(objects.len(), 2);
+        assert!(errors.iter().all(Option::is_none), "batch deletion succeeds at quorum: {errors:?}");
+        assert!(
+            disks[3]
+                .discover_delete_transactions(bucket, Some("object"), None, 100)
+                .await
+                .expect("inspect failed preparation")
+                .transactions
+                .is_empty(),
+            "returning disk must adopt the quorum decision without a local preparation"
+        );
+        tokio::fs::remove_file(&temporary).await.expect("remove preparation failure");
+        tokio::fs::rename(&saved, &temporary)
+            .await
+            .expect("restore returning disk staging");
+
+        let result = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("recover batch containing a missing non-null version");
+        assert!(result.detail.contains("blocked=0"), "{}", result.detail);
+        assert_eq!(body(&store, bucket, Some(retained)).await, remaining);
+        for version in [deleted, missing] {
+            assert_eq!(
+                disks[3]
+                    .read_version(bucket, bucket, "object", &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect_err("returning disk must not retain or create a deleted version"),
+                DiskError::FileVersionNotFound
+            );
+        }
+        for disk in &disks {
+            assert!(
+                disk.discover_delete_transactions(bucket, Some("object"), None, 100)
+                    .await
+                    .expect("inspect converged batch")
+                    .transactions
+                    .is_empty(),
+                "every participant must converge and release the decision"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_dry_run_matches_adoption_of_already_absent_non_null_version() {
         let bucket = "recover-preview-non-null";
         let (_dirs, store, disks) = fixture(bucket).await;
@@ -3224,6 +3365,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_missing_delete_reuses_locked_discovery() {
+        use crate::bucket::metadata_sys::ObjectLockConfigState;
+        use crate::object_api::ObjectLockConfigSnapshot;
+
+        for offline in [false, true] {
+            let bucket = if offline {
+                "missing-probe-degraded"
+            } else {
+                "missing-probe-healthy"
+            };
+            let (_dirs, store, disks) = fixture(bucket).await;
+            let set = &store.pools[0].disk_set[0];
+            if offline {
+                disks[3].force_offline_for_test();
+            }
+            for object in ["missing", "missing/deep/key"] {
+                let online = &disks[..if offline { 3 } else { 4 }];
+                let before: Vec<_> = online
+                    .iter()
+                    .map(|disk| {
+                        disk.metrics_snapshot()
+                            .expect("local disk metrics")
+                            .api_calls
+                            .get("discover_delete_transactions")
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                let opts = ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                };
+                let error = set
+                    .delete_object(bucket, object, opts)
+                    .await
+                    .expect_err("set layer retains typed absence");
+                assert!(crate::error::is_err_object_not_found(&error), "typed absence: {error:?}");
+                for (disk, before) in online.iter().zip(before) {
+                    let after = disk
+                        .metrics_snapshot()
+                        .expect("local disk metrics")
+                        .api_calls
+                        .get("discover_delete_transactions")
+                        .copied()
+                        .unwrap_or(0);
+                    assert_eq!(
+                        after - before,
+                        1,
+                        "one locked discovery per online drive, offline={offline}, key={object}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_set_ordinary_missing_single_and_batch_keep_quorum_semantics() {
         let bucket = "recover-missing-quorum";
         let (_dirs, store, disks) = fixture(bucket).await;
@@ -3403,6 +3602,140 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("no retained version decision may keep the empty bucket nonempty");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_partial_batch_receipt_handles_missing_versions() {
+        use crate::disk::RUSTFS_META_TMP_BUCKET;
+        use crate::set_disk::ops::object::DeleteCleanupBarrier;
+        use crate::storage_api_contracts::object::ObjectToDelete;
+
+        for include_missing in [false, true] {
+            let bucket = "recover-prepared-batch-missing-versions";
+            let (dirs, store, disks) = fixture(bucket).await;
+            metadata_sys::update_in(
+                &store.ctx,
+                bucket,
+                crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("enable supported versioned bucket");
+            let first = put(&store, bucket, &vec![81; 1024 * 1024], true)
+                .await
+                .expect("first version");
+            let second = put(&store, bucket, &vec![82; 4096], true).await.expect("retained version");
+            let missing = Uuid::new_v4();
+            let barrier = DeleteCleanupBarrier::install(bucket);
+            let deleting = store.clone();
+            let task = tokio::spawn(async move {
+                let mut versions = vec![first];
+                if include_missing {
+                    versions.push(missing);
+                }
+                deleting
+                    .delete_objects(
+                        bucket,
+                        versions
+                            .into_iter()
+                            .map(|version| ObjectToDelete {
+                                object_name: "object".into(),
+                                version_id: Some(version),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            let transactions = disks[0]
+                .discover_delete_transactions(bucket, Some("object"), None, 100)
+                .await
+                .expect("discover batch preparation")
+                .transactions;
+            assert_eq!(transactions.len(), 1);
+            let transaction = transactions[0].transaction;
+            for disk in &disks {
+                let state = disk
+                    .inspect_delete_transaction(bucket, "object", transaction)
+                    .await
+                    .expect("inspect prepared batch");
+                assert_eq!(state.state, DeleteRecoveryState::NewPrepared);
+                let journal = state.journal.expect("prepared journal");
+                assert!(journal.original_digest.is_some());
+                assert!(journal.original_versions.iter().all(|v| v.version_id != Some(missing)));
+            }
+            // Fail durable receipt staging on two participants after metadata quorum.
+            for dir in dirs.iter().skip(2) {
+                tokio::fs::rename(dir.path().join(RUSTFS_META_TMP_BUCKET), dir.path().join("saved-receipt-staging"))
+                    .await
+                    .expect("save receipt staging directory");
+                tokio::fs::write(dir.path().join(RUSTFS_META_TMP_BUCKET), b"receipt staging I/O failure")
+                    .await
+                    .expect("inject receipt staging failure");
+            }
+            barrier.release();
+            let (_, errors) = task.await.expect("batch deletion must join");
+            drop(barrier);
+            assert_eq!(errors.len(), if include_missing { 2 } else { 1 });
+            assert!(errors.iter().all(Option::is_some), "partial receipts are indeterminate: {errors:?}");
+            let mut receipts = 0;
+            let mut prepared = 0;
+            for disk in &disks {
+                match disk
+                    .inspect_delete_transaction(bucket, "object", transaction)
+                    .await
+                    .expect("partial decision")
+                    .state
+                {
+                    DeleteRecoveryState::QuorumCommitted => receipts += 1,
+                    DeleteRecoveryState::NewPrepared => prepared += 1,
+                    state => panic!("unexpected post-publication state: {state:?}"),
+                }
+            }
+            assert_eq!((receipts, prepared), (2, 2));
+            for dir in dirs.iter().skip(2) {
+                tokio::fs::remove_file(dir.path().join(RUSTFS_META_TMP_BUCKET))
+                    .await
+                    .expect("remove injected staging failure");
+                tokio::fs::rename(dir.path().join("saved-receipt-staging"), dir.path().join(RUSTFS_META_TMP_BUCKET))
+                    .await
+                    .expect("restore receipt staging");
+            }
+            store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(second.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("later version deletion succeeds");
+            store
+                .recover_delete_transactions(bucket, &HealOpts::default())
+                .await
+                .expect("certified batch must recover after later version deletion");
+            for disk in &disks {
+                assert!(
+                    disk.discover_delete_transactions(bucket, Some("object"), None, 100)
+                        .await
+                        .expect("settled transaction inventory")
+                        .transactions
+                        .is_empty()
+                );
+            }
+            store
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("settled receipts must not block removal of the empty bucket");
+        }
     }
 
     #[tokio::test]

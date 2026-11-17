@@ -1004,6 +1004,15 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
             .await,
             "legacy replay attempts must finish"
         );
+        let stats = manager.get_statistics().await;
+        assert_eq!(stats.failed_tasks, 0, "the first physical legacy repair must not be a failed attempt");
+        assert_eq!(
+            stats.unverified_tasks, 1,
+            "no second Deep is needed to classify the repaired legacy object"
+        );
+        assert_eq!(stats.total_unverified_objects_repaired, 1);
+        assert_eq!(stats.total_unverified_bytes_repaired, 36);
+        assert_eq!(stats.total_objects_healed, 0, "physical repair does not prove legacy identity");
         // Cover two MRF admission backoff periods so a missed hold notice
         // cannot pass merely because its task finished between polls.
         let retry_window = tokio::time::Instant::now() + Duration::from_secs(12);

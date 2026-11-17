@@ -29,6 +29,7 @@ mod metrics;
 pub mod object_store;
 pub mod parquet_budget;
 pub mod query;
+pub mod request;
 pub mod server;
 mod storage_api;
 pub use csv_input::csv_input_requires_normalization;

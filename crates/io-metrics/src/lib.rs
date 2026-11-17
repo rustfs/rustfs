@@ -179,8 +179,9 @@ fn record_get_stage_local_summary(
 /// Enable or disable general (non GET/PUT-stage) metric emission.
 ///
 /// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
+/// Enable after installing the recorder; the release/acquire pair publishes it to handle caches.
 pub fn set_metrics_enabled(enabled: bool) {
-    METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+    METRICS_ENABLED.store(enabled, Ordering::Release);
 }
 
 /// Returns `true` if detailed per-stage PUT metrics are enabled.
@@ -259,6 +260,7 @@ pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION: &str = "put_objec
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP: &str = "put_object_quota_begin_object_store_lookup";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD: &str = "put_object_quota_begin_context_build";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER: &str = "put_object_commit_submit_to_closure_enter";
+pub const PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START: &str = "app_put_commit_owner_submit_to_start";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT: &str = "put_object_commit_closure_enter_to_first_await";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL: &str = "put_object_commit_closure_total";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME: &str = "put_object_commit_before_rename";
@@ -358,6 +360,13 @@ pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL: &str = "set_disk_rename_disk_wait_local";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE: &str = "set_disk_rename_disk_wait_remote";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE: &str = "set_disk_rename_remote_client_prepare";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE: &str = "set_disk_rename_remote_client_json_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE: &str = "set_disk_rename_remote_client_msgpack_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES: &str = "set_disk_rename_remote_client_json_bytes";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES: &str = "set_disk_rename_remote_client_msgpack_bytes";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT: &str = "set_disk_rename_remote_client_get_client";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST: &str =
+    "set_disk_rename_remote_client_canonical_body_digest";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC: &str = "set_disk_rename_remote_client_rpc";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT: &str = "set_disk_rename_remote_client_rpc_await";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT: &str =
@@ -424,8 +433,10 @@ pub const PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR: &str = "lock_error";
 
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
+pub const PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED: &str = "grouped";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER: &str = "leader";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER: &str = "follower";
+pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT: &str = "follower_timeout";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS: &str = "enqueue_waiters";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES: &str = "enqueue_files";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS: &str = "batch_waiters";
@@ -447,7 +458,7 @@ pub fn get_stage_metrics_enabled() -> bool {
 /// Returns `true` if general (non GET/PUT-stage) metric emission is enabled.
 #[inline(always)]
 pub fn metrics_enabled() -> bool {
-    METRICS_ENABLED.load(Ordering::Relaxed)
+    METRICS_ENABLED.load(Ordering::Acquire)
 }
 
 // Handle-cached emission for hot, LABEL-LESS metrics. The `metrics` macros
@@ -484,6 +495,20 @@ macro_rules! gauge_set_cached {
         #[cfg(test)]
         {
             metrics::gauge!($name).set($value);
+        }
+    }};
+}
+
+macro_rules! gauge_update_cached {
+    ($name:literal, $operation:ident, $value:expr) => {{
+        #[cfg(not(test))]
+        {
+            static HANDLE: std::sync::LazyLock<metrics::Gauge> = std::sync::LazyLock::new(|| metrics::gauge!($name));
+            HANDLE.$operation($value);
+        }
+        #[cfg(test)]
+        {
+            metrics::gauge!($name).$operation($value);
         }
     }};
 }
@@ -2542,6 +2567,10 @@ pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
     if !put_stage_metrics_enabled() {
         return;
     }
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary("put", stage, "", "", duration_ms / 1000.0);
+        return;
+    }
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
@@ -2558,6 +2587,116 @@ pub fn record_put_object_stage_count(stage: &'static str, count: u64) {
         return;
     }
     counter!("rustfs_s3_put_object_stage_count", "stage" => stage).increment(count);
+}
+
+#[inline(always)]
+pub fn record_put_object_stage_bytes(stage: &'static str, bytes: usize) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_stage_bytes", "stage" => stage).record(bytes as f64);
+}
+
+#[derive(Default)]
+struct DiskFsyncWorkerMetricsState {
+    workers: AtomicU64,
+    workers_peak: AtomicU64,
+    spinning_workers: AtomicU64,
+    spinning_workers_peak: AtomicU64,
+}
+
+static DISK_FSYNC_WORKER_METRICS: LazyLock<DiskFsyncWorkerMetricsState> = LazyLock::new(DiskFsyncWorkerMetricsState::default);
+
+fn record_disk_fsync_worker_peak(peak: &AtomicU64, current: u64, increment_gauge: impl FnOnce(f64)) {
+    let previous = peak.fetch_max(current, Ordering::Relaxed);
+    if current > previous {
+        // Positive deltas commute even when workers publish their peaks out of order.
+        increment_gauge(f64::from(u32::try_from(current - previous).unwrap_or(u32::MAX)));
+    }
+}
+
+/// Tracks an executing fsync worker from closure entry through retirement.
+///
+/// Counts are aggregated across this process. Workers queued in a blocking pool
+/// are excluded. Enabled guards finish their accounting even if detailed PUT
+/// metrics are subsequently disabled. Peak gauges cover the process lifetime.
+#[must_use]
+pub struct DiskFsyncWorkerMetricsGuard<'a> {
+    state: &'a DiskFsyncWorkerMetricsState,
+}
+
+/// Start diagnostics when a native fsync worker actually enters its closure.
+///
+/// Call outside the disk queue lock. With detailed PUT metrics disabled, this
+/// performs only the gate check and allocates no guard or metric handles.
+#[inline]
+pub fn start_disk_fsync_worker_metrics() -> Option<DiskFsyncWorkerMetricsGuard<'static>> {
+    if !put_stage_metrics_enabled() {
+        return None;
+    }
+    Some(start_disk_fsync_worker_metrics_with_state(&DISK_FSYNC_WORKER_METRICS))
+}
+
+fn start_disk_fsync_worker_metrics_with_state(state: &DiskFsyncWorkerMetricsState) -> DiskFsyncWorkerMetricsGuard<'_> {
+    let current = state.workers.fetch_add(1, Ordering::Relaxed) + 1;
+    gauge_update_cached!("rustfs_disk_fsync_workers_current", increment, 1.0);
+    record_disk_fsync_worker_peak(&state.workers_peak, current, |delta| {
+        gauge_update_cached!("rustfs_disk_fsync_workers_peak", increment, delta);
+    });
+    DiskFsyncWorkerMetricsGuard { state }
+}
+
+impl DiskFsyncWorkerMetricsGuard<'_> {
+    /// Start one idle-spin episode after releasing the disk queue lock.
+    ///
+    /// The returned guard borrows this worker so idle accounting finishes before
+    /// worker retirement. Its timer begins after publishing the entry metrics.
+    pub fn start_idle_spin(&self) -> DiskFsyncIdleSpinMetricsGuard<'_> {
+        let current = self.state.spinning_workers.fetch_add(1, Ordering::Relaxed) + 1;
+        gauge_update_cached!("rustfs_disk_fsync_spinning_workers_current", increment, 1.0);
+        record_disk_fsync_worker_peak(&self.state.spinning_workers_peak, current, |delta| {
+            gauge_update_cached!("rustfs_disk_fsync_spinning_workers_peak", increment, delta);
+        });
+        DiskFsyncIdleSpinMetricsGuard {
+            state: self.state,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for DiskFsyncWorkerMetricsGuard<'_> {
+    fn drop(&mut self) {
+        self.state.workers.fetch_sub(1, Ordering::Relaxed);
+        gauge_update_cached!("rustfs_disk_fsync_workers_current", decrement, 1.0);
+    }
+}
+
+/// Tracks actual idle-spin activity, excluding queued or executing operations.
+#[must_use]
+pub struct DiskFsyncIdleSpinMetricsGuard<'a> {
+    state: &'a DiskFsyncWorkerMetricsState,
+    started_at: std::time::Instant,
+}
+
+impl DiskFsyncIdleSpinMetricsGuard<'_> {
+    /// Finish an episode and report its loop count once, outside the spin loop.
+    ///
+    /// Duration is elapsed wall time, which can include descheduling. It ends
+    /// before metric publication and must be interpreted alongside CPU profiles.
+    pub fn finish(self, iterations: usize) {
+        let duration_ms = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        drop(self);
+        counter_increment_cached!("rustfs_disk_fsync_idle_spin_episodes", 1);
+        counter_increment_cached!("rustfs_disk_fsync_idle_spin_iterations", u64::try_from(iterations).unwrap_or(u64::MAX));
+        histogram_record_cached!("rustfs_disk_fsync_idle_spin_duration_ms", duration_ms);
+    }
+}
+
+impl Drop for DiskFsyncIdleSpinMetricsGuard<'_> {
+    fn drop(&mut self) {
+        self.state.spinning_workers.fetch_sub(1, Ordering::Relaxed);
+        gauge_update_cached!("rustfs_disk_fsync_spinning_workers_current", decrement, 1.0);
+    }
 }
 
 /// Observe a future's latency and wakeup behavior only while detailed PUT
@@ -2678,6 +2817,10 @@ pub fn record_put_rename_quorum_wait_fanout(
 /// operations that are NOT part of the PUT object hot path.
 #[inline(always)]
 pub fn record_stage_duration(stage: &'static str, duration_ms: f64) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary("internal", stage, "", "", duration_ms / 1000.0);
+        return;
+    }
     if !metrics_enabled() {
         return;
     }
@@ -4081,6 +4224,7 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD,
+            PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START,
             PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
@@ -4160,6 +4304,10 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
@@ -4218,6 +4366,7 @@ mod tests {
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY
                 || stage.starts_with("put_object_commit_ready_")
                 || stage.starts_with("put_object_quota_begin_")
+                || *stage == PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL
@@ -4234,6 +4383,14 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
         ];
         assert_eq!(count_stages.iter().copied().collect::<HashSet<_>>().len(), count_stages.len());
+        let byte_samples = [
+            (PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES, 0_usize),
+            (PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES, 17_usize),
+        ];
+        assert_eq!(
+            byte_samples.iter().map(|(stage, _)| *stage).collect::<HashSet<_>>().len(),
+            byte_samples.len()
+        );
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -4245,12 +4402,18 @@ mod tests {
             for stage in count_stages {
                 record_put_object_stage_count(stage, 1);
             }
+            for (stage, bytes) in byte_samples {
+                record_put_object_stage_bytes(stage, bytes + 1);
+            }
             set_put_stage_metrics_enabled(true);
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
             }
             for stage in count_stages {
                 record_put_object_stage_count(stage, 1);
+            }
+            for (stage, bytes) in byte_samples {
+                record_put_object_stage_bytes(stage, bytes);
             }
             set_put_stage_metrics_enabled(false);
         });
@@ -4260,6 +4423,25 @@ mod tests {
             counter_total(&rows, "rustfs_s3_put_object_stage_count"),
             Some(u64::try_from(count_stages.len()).expect("count stage length fits u64")),
         );
+        let recorded_bytes = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_bytes"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "stage")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(recorded_bytes.len(), byte_samples.len());
+        assert!(byte_samples.iter().all(|(stage, _)| recorded_bytes.contains(*stage)));
+        let mut byte_values = histogram_samples(&rows, "rustfs_s3_put_object_stage_bytes");
+        byte_values.sort_by(f64::total_cmp);
+        assert_eq!(byte_values, vec![0.0, 17.0]);
         let recorded = rows
             .into_iter()
             .filter(|(composite, _, _, _)| {
@@ -4421,13 +4603,16 @@ mod tests {
             set_put_stage_metrics_enabled(false);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, 2);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
             record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST, 3.0);
             record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
 
             set_put_stage_metrics_enabled(true);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL, 9);
+            record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED, 4);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER, 2.0);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES, 4);
@@ -4441,7 +4626,10 @@ mod tests {
         });
 
         let rows = snapshotter.snapshot().into_vec();
-        assert_eq!(histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"), vec![9.0]);
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"),
+            vec![4.0, 9.0]
+        );
         let batch_modes = rows
             .iter()
             .filter(|(composite, _, _, _)| {
@@ -4457,13 +4645,19 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<HashSet<_>>();
-        assert_eq!(batch_modes, HashSet::from([PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string()]));
+        assert_eq!(
+            batch_modes,
+            HashSet::from([
+                PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED.to_string(),
+                PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string(),
+            ])
+        );
 
         let quorum_samples = histogram_samples(&rows, "rustfs_s3_put_object_rename_quorum_wait_fanout_disks");
         assert_eq!(quorum_samples, vec![0.0, 1.0, 3.0, 3.0, 4.0]);
         assert_eq!(
             histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_wait_ms"),
-            vec![1.0, 2.0]
+            vec![1.0, 2.0, 3.0]
         );
         assert_eq!(
             histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_outstanding"),
@@ -4493,6 +4687,7 @@ mod tests {
             HashSet::from([
                 PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER.to_string(),
                 PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT.to_string(),
             ])
         );
         let group_outstanding_states = rows
@@ -5122,6 +5317,130 @@ mod tests {
             worker.join().expect("stage worker should not panic");
         }
         assert_eq!(current(), current_before);
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_gate_and_finish_existing_guards() {
+        let _lock = METRICS_FLAG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            assert!(start_disk_fsync_worker_metrics().is_none());
+            assert!(snapshotter.snapshot().into_vec().is_empty());
+
+            set_put_stage_metrics_enabled(true);
+            let worker = start_disk_fsync_worker_metrics().expect("enabled worker diagnostics");
+            let spin = worker.start_idle_spin();
+            set_put_stage_metrics_enabled(false);
+            spin.finish(17);
+            drop(worker);
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_current"), Some(0.0));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_iterations"), Some(17));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_episodes"), Some(1));
+        assert_eq!(DISK_FSYNC_WORKER_METRICS.workers.load(Ordering::Relaxed), 0);
+        assert_eq!(DISK_FSYNC_WORKER_METRICS.spinning_workers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_record_concurrent_peaks_and_spin_iterations() {
+        const WORKERS: usize = 4;
+        let state = DiskFsyncWorkerMetricsState::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let entered = Barrier::new(WORKERS + 1);
+        let release = Barrier::new(WORKERS + 1);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    metrics::with_local_recorder(&recorder, || {
+                        let worker = start_disk_fsync_worker_metrics_with_state(&state);
+                        let spin = worker.start_idle_spin();
+                        entered.wait();
+                        release.wait();
+                        spin.finish(256);
+                    });
+                });
+            }
+            entered.wait();
+            let observed = (
+                state.workers.load(Ordering::Relaxed),
+                state.spinning_workers.load(Ordering::Relaxed),
+                state.workers_peak.load(Ordering::Relaxed),
+                state.spinning_workers_peak.load(Ordering::Relaxed),
+            );
+            release.wait();
+            assert_eq!(observed, (4, 4, 4, 4));
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(state.workers.load(Ordering::Relaxed), 0);
+        assert_eq!(state.spinning_workers.load(Ordering::Relaxed), 0);
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_peak"), Some(4.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_peak"), Some(4.0));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_episodes"), Some(4));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_iterations"), Some(1024));
+        assert_eq!(histogram_samples(&rows, "rustfs_disk_fsync_idle_spin_duration_ms").len(), 4);
+        assert!(rows.iter().all(|(key, _, _, _)| key.key().labels().next().is_none()));
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_balance_panicking_workers() {
+        let state = DiskFsyncWorkerMetricsState::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            metrics::with_local_recorder(&recorder, || {
+                let worker = start_disk_fsync_worker_metrics_with_state(&state);
+                let _spin = worker.start_idle_spin();
+                panic!("worker unwound while idle diagnostics were active");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(state.workers.load(Ordering::Relaxed), 0);
+        assert_eq!(state.spinning_workers.load(Ordering::Relaxed), 0);
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_current"), Some(0.0));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_episodes"), None);
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_keep_peak_when_publication_is_reordered() {
+        let peak = AtomicU64::new(0);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let peak = &peak;
+            let recorder = &recorder;
+            scope.spawn(move || {
+                record_disk_fsync_worker_peak(peak, 1, |delta| {
+                    first_tx.send(()).expect("first peak was observed");
+                    release_rx.recv().expect("allow delayed publication");
+                    metrics::with_local_recorder(recorder, || {
+                        gauge_update_cached!("rustfs_disk_fsync_workers_peak", increment, delta);
+                    });
+                });
+            });
+            first_rx.recv().expect("first peak publication is delayed");
+            record_disk_fsync_worker_peak(peak, 2, |delta| {
+                metrics::with_local_recorder(recorder, || {
+                    gauge_update_cached!("rustfs_disk_fsync_workers_peak", increment, delta);
+                });
+            });
+            release_tx.send(()).expect("release first peak publication");
+        });
+        assert_eq!(peak.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            gauge_value(&snapshotter.snapshot().into_vec(), "rustfs_disk_fsync_workers_peak"),
+            Some(2.0)
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@
 #![allow(clippy::all)]
 
 use crate::bucket_cache::BucketLocationCache;
+use crate::remote_error_code::RemoteErrorCode;
 use crate::{
     api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
@@ -50,6 +51,7 @@ use md5::Digest;
 use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_gateway_types::dto::{Owner, ReplicationStatus};
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
@@ -58,13 +60,12 @@ use rustfs_utils::{
         AMZ_CHECKSUM_SHA256,
     },
     net::get_endpoint_url,
-    retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer},
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
 };
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
-use s3s::S3ErrorCode;
-use s3s::dto::Owner;
-use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error as StdError;
@@ -118,6 +119,33 @@ fn transition_transport_error(err: hyper_util::client::legacy::Error) -> std::io
         return remote_tier_timeout_error("remote tier connection timed out");
     }
     std::io::Error::other(err)
+}
+
+fn is_retryable_transport_error(error: &std::io::Error) -> bool {
+    // Hyper wraps connection and body errors; the outer io::Error is often Other.
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        }) || error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(|error| error.is_incomplete_message() || error.is_closed())
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 async fn next_response_body_data<B>(
@@ -277,7 +305,7 @@ pub struct TransitionClient {
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
     pub secure: bool,
-    pub http_client: Client<HttpsConnector<HttpConnector>, s3s::Body>,
+    pub http_client: Client<HttpsConnector<HttpConnector>, rustfs_s3_types::Body>,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
@@ -655,7 +683,7 @@ impl TransitionClient {
         dead_code,
         reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
     )]
-    fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &Request<rustfs_s3_types::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -664,7 +692,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
+    pub async fn doit(&self, req: Request<rustfs_s3_types::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let http_client = self.http_client.clone();
         let req_method = req.method().clone();
         let resp = tokio::time::timeout(self.timeouts.request_timeout, http_client.request(req)).await;
@@ -728,6 +756,18 @@ impl TransitionClient {
         Ok(resp)
     }
 
+    /// Executes a remote request, retrying transient failures up to `max_retries` total attempts.
+    ///
+    /// Only GET, HEAD, and PUT of a fixed multipart upload part with a buffered body
+    /// are replayed. Object readers and other mutations get one attempt: replaying
+    /// ordinary PUT or DELETE can create additional versions or delete markers.
+    /// Request construction failures and errors reading a successful response body
+    /// are not retried. Dropping this future stops further attempts and any pending
+    /// backoff; a failed or canceled request may still have reached the remote server.
+    ///
+    /// # Errors
+    /// Returns a request construction error, a permanent remote error, or the last
+    /// transient error when the attempt budget is exhausted.
     pub async fn execute_method(
         &self,
         method: http::Method,
@@ -739,24 +779,27 @@ impl TransitionClient {
             return Err(std::io::Error::other(s));
         }
 
-        let retryable: bool;
-        //let mut body_seeker: BufferReader;
-        let mut req_retry = self.max_retries;
-        let mut resp: Response<Incoming>;
-
-        //if metadata.content_body != nil {
-        //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
-        retryable = true;
-        if !retryable {
-            req_retry = 1;
-        }
-        //}
+        let retryable = matches!(&metadata.content_body, ReaderImpl::Body(_))
+            && (method == http::Method::GET
+                || method == http::Method::HEAD
+                || (method == http::Method::PUT
+                    && metadata.query_values.get("uploadId").is_some_and(|value| !value.is_empty())
+                    && metadata.query_values.get("partNumber").is_some_and(|value| !value.is_empty())));
+        let req_retry = if retryable { self.max_retries.max(1) } else { 1 };
+        let mut last_error = None;
 
         let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, self.random);
         while retry_timer.next().await.is_some() {
             let req = self.new_request(&method, metadata).await?;
 
-            resp = self.doit(req).await?;
+            let resp = match self.doit(req).await {
+                Ok(resp) => resp,
+                Err(error) if retryable && is_retryable_transport_error(&error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             for http_status in SUCCESS_STATUS {
                 if http_status == resp.status() {
@@ -767,14 +810,20 @@ impl TransitionClient {
             let resp_status = resp.status();
             let h = resp.headers().clone();
 
-            let body_vec = self
-                .collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE)
-                .await?;
+            let body_vec = match self.collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE).await {
+                Ok(body) => body,
+                Err(error) if retryable && is_retryable_transport_error(&error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let parsed_error =
                 http_resp_to_error_response(resp_status, &h, body_vec, &metadata.bucket_name, &metadata.object_name);
+            let retryable_response = is_http_status_retryable(&resp_status) || is_s3code_retryable(parsed_error.code.as_str());
             let routing_region = parsed_error.region;
             let code = match parsed_error.code {
-                S3ErrorCode::Custom(_) => S3ErrorCode::ResponseInterrupted,
+                code if code.is_custom() => RemoteErrorCode::RESPONSE_INTERRUPTED,
                 code => code,
             };
             let err_response = ErrorResponse {
@@ -786,13 +835,18 @@ impl TransitionClient {
                 ..Default::default()
             };
 
+            if retryable && retryable_response {
+                last_error = Some(std::io::Error::other(err_response));
+                continue;
+            }
+
             if self.region == "" {
                 return match err_response.code {
-                    S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
+                    RemoteErrorCode::AUTHORIZATION_HEADER_MALFORMED | RemoteErrorCode::INVALID_ARGUMENT /*RemoteErrorCode::INVALID_REGION*/ => {
                         //break;
                         Err(std::io::Error::other(err_response))
                     }
-                    S3ErrorCode::AccessDenied => {
+                    RemoteErrorCode::ACCESS_DENIED => {
                         if routing_region.is_empty() {
                             return Err(std::io::Error::other(err_response));
                         }
@@ -820,7 +874,7 @@ impl TransitionClient {
             return Err(std::io::Error::other(err_response));
         }
 
-        Err(std::io::Error::other("remote tier request did not produce a response"))
+        Err(last_error.unwrap_or_else(|| std::io::Error::other("remote tier request did not produce a response")))
     }
 
     pub async fn collect_response_body<B>(&self, body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>
@@ -835,7 +889,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<Request<s3s::Body>, std::io::Error> {
+    ) -> Result<Request<rustfs_s3_types::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
@@ -855,7 +909,7 @@ impl TransitionClient {
         let Ok(mut req) = Request::builder()
             .method(method)
             .uri(target_url.to_string())
-            .body(s3s::Body::empty())
+            .body(rustfs_s3_types::Body::empty())
         else {
             return Err(std::io::Error::other("create request error"));
         };
@@ -985,10 +1039,10 @@ impl TransitionClient {
         if metadata.content_length > 0 {
             match &mut metadata.content_body {
                 ReaderImpl::Body(content_body) => {
-                    *req.body_mut() = s3s::Body::from(content_body.clone());
+                    *req.body_mut() = rustfs_s3_types::Body::from(content_body.clone());
                 }
                 ReaderImpl::ObjectBody(content_body) => {
-                    *req.body_mut() = s3s::Body::from(content_body.read_all().await?);
+                    *req.body_mut() = rustfs_s3_types::Body::from(content_body.read_all().await?);
                 }
             }
         }
@@ -996,7 +1050,7 @@ impl TransitionClient {
         Ok(req)
     }
 
-    pub fn set_user_agent(&self, req: &mut Request<s3s::Body>) {
+    pub fn set_user_agent(&self, req: &mut Request<rustfs_s3_types::Body>) {
         let headers = req.headers_mut();
         headers.insert("User-Agent", HeaderValue::from_static(C_USER_AGENT));
     }
@@ -1336,7 +1390,7 @@ pub struct ObjectInfo {
 }
 
 fn replication_status_default() -> ReplicationStatus {
-    ReplicationStatus::from_static(ReplicationStatus::PENDING)
+    ReplicationStatus::PENDING
 }
 
 impl Default for ObjectInfo {
@@ -1356,7 +1410,7 @@ impl Default for ObjectInfo {
             is_latest: false,
             is_delete_marker: false,
             version_id: None,
-            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_status: ReplicationStatus::PENDING,
             replication_ready: false,
             expiration: OffsetDateTime::now_utc(),
             expiration_rule_id: "".to_string(),
@@ -1591,13 +1645,13 @@ pub fn to_object_info_for_provider(
     // Get replication status
     let replication_status = {
         let status_str = get_header("x-amz-replication-status");
-        ReplicationStatus::from_static(match status_str.as_str() {
+        match status_str.as_str() {
             "COMPLETE" => ReplicationStatus::COMPLETE,
             "PENDING" => ReplicationStatus::PENDING,
             "FAILED" => ReplicationStatus::FAILED,
             "REPLICA" => ReplicationStatus::REPLICA,
             _ => ReplicationStatus::PENDING,
-        })
+        }
     };
 
     // Extract expiration rule ID and time (simplified)
@@ -1656,16 +1710,16 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 //#[derive(Clone)]
 pub struct SendRequest {
-    inner: hyper::client::conn::http1::SendRequest<s3s::Body>,
+    inner: hyper::client::conn::http1::SendRequest<rustfs_s3_types::Body>,
 }
 
-impl From<hyper::client::conn::http1::SendRequest<s3s::Body>> for SendRequest {
-    fn from(inner: hyper::client::conn::http1::SendRequest<s3s::Body>) -> Self {
+impl From<hyper::client::conn::http1::SendRequest<rustfs_s3_types::Body>> for SendRequest {
+    fn from(inner: hyper::client::conn::http1::SendRequest<rustfs_s3_types::Body>) -> Self {
         Self { inner }
     }
 }
 
-impl tower::Service<Request<s3s::Body>> for SendRequest {
+impl tower::Service<Request<rustfs_s3_types::Body>> for SendRequest {
     type Response = Response<Incoming>;
     type Error = std::io::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
@@ -1674,7 +1728,7 @@ impl tower::Service<Request<s3s::Body>> for SendRequest {
         self.inner.poll_ready(cx).map_err(std::io::Error::other)
     }
 
-    fn call(&mut self, req: Request<s3s::Body>) -> Self::Future {
+    fn call(&mut self, req: Request<rustfs_s3_types::Body>) -> Self::Future {
         //let req = hyper::Request::builder().uri("/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
         //let req = hyper::Request::builder().uri("/").body(Body::empty()).unwrap();
 
@@ -1833,7 +1887,7 @@ mod tests {
         .expect("fixture client should build");
         let request = Request::builder()
             .uri(format!("https://{endpoint}/"))
-            .body(s3s::Body::empty())
+            .body(rustfs_s3_types::Body::empty())
             .expect("fixture request should build");
 
         client

@@ -167,6 +167,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         route(Method::POST, "/"),
         admin_route(Method::GET, "/v3/is-admin"),
         admin_route(Method::GET, "/v3/accountinfo"),
+        admin_route(Method::POST, "/v4/account/permissions"),
         admin_route(Method::GET, "/v3/account/info"),
         admin_route(Method::POST, "/v3/account/password"),
         admin_route(Method::GET, "/v3/list-users"),
@@ -250,6 +251,14 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/background-heal/status"),
         admin_route(Method::GET, "/v4/heal/mrf/responsibilities"),
         admin_route(Method::POST, "/v4/heal/mrf/responsibilities/actions"),
+        admin_route(Method::GET, "/v4/heal/mrf/cluster"),
+        admin_route(Method::GET, "/v4/heal/mrf/cluster/responsibilities"),
+        admin_route_sample(
+            Method::GET,
+            "/v4/heal/mrf/cluster/responsibilities/{node_id}/{id}",
+            "/v4/heal/mrf/cluster/responsibilities/node/00000000-0000-4000-8000-000000000001",
+        ),
+        admin_route(Method::POST, "/v4/heal/mrf/cluster/responsibilities/actions"),
         admin_route(Method::GET, "/v4/heal/replacement-recovery"),
         admin_route(Method::GET, "/v3/tier"),
         admin_route(Method::GET, "/v3/tier-stats"),
@@ -311,6 +320,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
         admin_route_sample(Method::PUT, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
         admin_route_sample(Method::GET, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
@@ -391,6 +403,14 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
         admin_route(Method::POST, "/v3/replication/diff"),
         admin_route(Method::GET, "/v3/replication/mrf"),
+        // S3-shaped extension routes (handlers::s3_extension), keyed `?<sub-resource>/<bucket>`.
+        route_sample(Method::PUT, "?replication-reset/{bucket}", "?replication-reset/demo-bucket"),
+        route_sample(Method::GET, "?replication-reset-status/{bucket}", "?replication-reset-status/demo-bucket"),
+        route_sample(Method::GET, "?replication-metrics=2/{bucket}", "?replication-metrics=2/demo-bucket"),
+        route_sample(Method::GET, "?replication-metrics/{bucket}", "?replication-metrics/demo-bucket"),
+        route_sample(Method::GET, "?replication-check/{bucket}", "?replication-check/demo-bucket"),
+        route(Method::GET, "?events/"),
+        route_sample(Method::GET, "?events/{bucket}", "?events/demo-bucket"),
         admin_route(Method::GET, "/v3/integrity/readiness"),
         admin_route_sample(Method::GET, "/v3/integrity/{bucket}/inventory", "/v3/integrity/example/inventory"),
         admin_route_sample(Method::POST, "/v3/integrity/{bucket}/jobs", "/v3/integrity/example/jobs"),
@@ -1035,6 +1055,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+    assert_route(&router, Method::POST, &admin_path("/v4/account/permissions"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));
@@ -1437,6 +1458,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/bucket-etag/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/bucket-etag/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-etag/test-bucket"));
     assert_route(&router, Method::PUT, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/on-demand-migration/test-bucket"));
@@ -1681,8 +1705,9 @@ fn test_replication_diff_body_read_errors_are_not_ignored() {
         "replication diff must read the optional body through the compatible admin payload reader"
     );
 
-    let body_read_block =
-        extract_block_between_markers(handler_block, "let body = read_compatible_admin_body(", "if prefix.is_empty()");
+    // Anchor on the call itself: rustfmt may wrap the `let` binding onto two
+    // lines, which must not change what this contract checks.
+    let body_read_block = extract_block_between_markers(handler_block, "read_compatible_admin_body(", "if prefix.is_empty()");
     assert!(
         body_read_block.contains(".await?;"),
         "replication diff must fail closed when body read or MinIO-compatible decryption fails"

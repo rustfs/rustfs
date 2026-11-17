@@ -18,7 +18,6 @@ use tracing::warn;
 
 use super::request_signature_v4::{SERVICE_TYPE_S3, SignV4Error, get_scope, get_signature, get_signing_key};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use s3s::Body;
 
 const STREAMING_SIGN_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_SIGN_TRAILER_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
@@ -40,14 +39,14 @@ const _TRAILER_SIGNATURE: &str = "x-amz-trailer-signature";
 // });
 
 #[derive(Debug)]
-struct StreamingSignFailure {
-    request: request::Request<Body>,
+struct StreamingSignFailure<B> {
+    request: request::Request<B>,
     error: SignV4Error,
 }
 
-type StreamingSignOutcome = std::result::Result<request::Request<Body>, Box<StreamingSignFailure>>;
+type StreamingSignOutcome<B> = std::result::Result<request::Request<B>, Box<StreamingSignFailure<B>>>;
 
-fn streaming_fail(request: request::Request<Body>, error: SignV4Error) -> StreamingSignOutcome {
+fn streaming_fail<B>(request: request::Request<B>, error: SignV4Error) -> StreamingSignOutcome<B> {
     Err(Box::new(StreamingSignFailure { request, error }))
 }
 
@@ -84,8 +83,8 @@ fn _try_build_chunk_signature(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn streaming_sign_v4_inner(
-    mut req: request::Request<Body>,
+fn streaming_sign_v4_inner<B>(
+    mut req: request::Request<B>,
     _access_key_id: &str,
     _secret_access_key: &str,
     session_token: &str,
@@ -93,7 +92,7 @@ fn streaming_sign_v4_inner(
     data_len: i64,
     req_time: OffsetDateTime,
     trailer: HeaderMap,
-) -> StreamingSignOutcome {
+) -> StreamingSignOutcome<B> {
     let headers = req.headers_mut();
 
     if trailer.is_empty() {
@@ -196,8 +195,8 @@ fn streaming_sign_v4_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn try_streaming_sign_v4(
-    req: request::Request<Body>,
+pub fn try_streaming_sign_v4<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
@@ -205,14 +204,14 @@ pub fn try_streaming_sign_v4(
     data_len: i64,
     req_time: OffsetDateTime,
     trailer: HeaderMap,
-) -> Result<request::Request<Body>, SignV4Error> {
+) -> Result<request::Request<B>, SignV4Error> {
     streaming_sign_v4_inner(req, access_key_id, secret_access_key, session_token, region, data_len, req_time, trailer)
         .map_err(|f| f.error)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn streaming_sign_v4(
-    req: request::Request<Body>,
+pub fn streaming_sign_v4<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
@@ -220,7 +219,7 @@ pub fn streaming_sign_v4(
     data_len: i64,
     req_time: OffsetDateTime,
     trailer: HeaderMap,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match streaming_sign_v4_inner(req, access_key_id, secret_access_key, session_token, region, data_len, req_time, trailer) {
         Ok(request) => request,
         Err(failure) => {

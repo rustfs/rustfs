@@ -37,6 +37,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [placement-repair-invariants.md](placement-repair-invariants.md) | changing anything that resolves an object to a pool, set, or disk, or that admits scanner or heal work |
 | [heal-concurrency-model.md](heal-concurrency-model.md) | changing heal, PUT/multipart commit, delete, lifecycle expiry, or data-movement code that shares the `(bucket, object)` commit surface, or asking whether RustFS needs a persistent healing marker |
 | [heal-terminal-reports.md](heal-terminal-reports.md) | changing retained admin heal outcomes, terminal report publication, cancellation refinement, or report upgrade/rollback behavior |
+| [mrf-management-contract.md](mrf-management-contract.md) | changing cluster MRF observations, responsibility actions, or legacy integrity audit evidence |
 | [unified-object-generation.md](unified-object-generation.md) | adding or changing anything that fences a commit, scopes a read lease, gates old-directory cleanup, binds prepared pool reads, or settles quota against the current object version |
 | [ilm-tiering-persistence-contracts.md](ilm-tiering-persistence-contracts.md) | changing an ILM transition, tier configuration mutation, manual transition job, tier-delete recovery path, pool decommission, or any code that can create, transfer, or destroy ownership of a remote-tier object |
 | [decommission-compatibility.md](decommission-compatibility.md) | changing pool decommission or rebalance behavior, its admin API shape, the persisted `PoolMeta` fields, or how tier free versions move between pools |
@@ -46,6 +47,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [background-controller-contract.md](background-controller-contract.md) | adding a status snapshot or reconcile surface for a background service, or being tempted to fold several services into a generic controller |
 | [background-services-inventory.md](background-services-inventory.md) | you need one audited background service's desired source, current-status inputs, status surface, and declared side effects |
 | [scanner-usage-publication.md](scanner-usage-publication.md) | changing scanner data-usage cache publication, quota-visible usage snapshots, scanner cycle recovery, or the persisted scanner usage artifacts |
+| [scanner-usage-watch.md](scanner-usage-watch.md) | changing scanner reuse across cycles, adding an object mutation producer, moving a physical commit into detached work, or changing the bucket watch RPC and its compatibility fallback |
 | [scanner-prefix-statistics-contract.md](scanner-prefix-statistics-contract.md) | designing, implementing, or reviewing scanner-derived prefix statistics for the object browser or another authorized consumer (proposed; not runtime implemented) |
 | [scanner-dirty-journal-source-contract.md](scanner-dirty-journal-source-contract.md) | designing storage-verified provenance, completion receipts, repair responsibility or replay for the node-owned scanner dirty-producer journal (proposed; not runtime implemented) |
 | [scanner-usage-authority-decision.md](scanner-usage-authority-decision.md) | deciding whether quota admission depends on scanner data usage, removing scanner publication layers, or designing a scanner storage boundary |
@@ -56,6 +58,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) | changing the bulk envelope re-wrap sweep, its admin endpoints, the re-wrap primitive, or which objects a rekey may touch |
 | [remote-credential-sealing-adr.md](remote-credential-sealing-adr.md) | adding, reading, or persisting a stored remote credential (replication target, remote tier, on-demand migration source), or needing the sealed-envelope format, the mixed-version rules, or the reason this is worth doing in one deployment and not in another |
 | [tier-stats-contract.md](tier-stats-contract.md) | changing what `GET /rustfs/admin/v3/tier-stats` returns, adding a tier accounting source, or wiring a metric to a remote tier request |
+| [s3-over-rdma-llm-serving.md](s3-over-rdma-llm-serving.md) | you change the RDMA or NIXL data path, the large-PUT path, or a per-bucket ETag setting, or you build or run a client that loads model weights or offloads KV cache to RustFS over RDMA, such as the SGLang weight loader and HiCache backend |
 
 ## Support and compatibility matrices (release-facing, keep current)
 

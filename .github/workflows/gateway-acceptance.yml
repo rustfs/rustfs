@@ -1,0 +1,395 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gateway black-box acceptance lanes (rustfs/backlog#2775 T3.4, #2776 T3.5).
+#
+# Runs two suites of the rustfs/gateway repository against the candidate binary,
+# once per S3 stack (RUSTFS_S3_STACK=legacy and =gateway), one server per stack:
+#
+#   - the conformance corpus, `--profile rustfs`. That profile describes the
+#     gateway edge, so scripts/check_conformance_rulings.py judges the gateway
+#     stack against .config/conformance-rulings.toml (red: an unruled failure, a
+#     ruled case failing differently, a stale ruling, a skip on the server's own
+#     answer) and publishes the legacy run as a reference that is never judged:
+#     it only has to serve, stay up and complete;
+#   - the client matrix, ci/compat/run_matrix.sh --external, judged per stack by
+#     scripts/compat_matrix_report.py (no `fail`, no `sut-unregistered`, every
+#     client ran; a client that could not be installed is reported as skipped).
+#     The legacy matrix is the baseline: every cell that passes on legacy must
+#     pass on gateway (`compare`).
+#
+# The suites are checked out at the rustfs/gateway rev Cargo.toml pins, so the
+# suite and the framework under test never drift apart. The verdict of each
+# stack is computed from what the run left on disk (startup record, the stack
+# the server's own log names, runner exit code, liveness after the corpus,
+# report), never from the exit status of an earlier step. Needs
+# scripts/dual_stack.py and the `s3_stack` startup field of rustfs/rustfs#9367.
+#
+# The gateway stack is report-only until T2.10: its job may fail without failing
+# the workflow, and its summary says what it observed (did not start, or how many
+# cases ran, passed, failed and were answered 501). The stack comparison is
+# report-only for the same reason; its conformance half is information only.
+#
+# Not a pull-request gate. Scheduled failures are owned by the scheduled-validation
+# watchdog (.github/scheduled-validations.json).
+
+name: Gateway Acceptance
+
+on:
+  schedule:
+    - cron: "29 3 * * *"
+  workflow_dispatch:
+
+# Matches ci.yml: these variables are hashed into the rust-cache key, so the
+# candidate build reads the same ci-dev cache as build-rustfs-debug-binary.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Read the gateway pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      gateway-rev: ${{ steps.pin.outputs.rev }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Read the rustfs/gateway rev from Cargo.toml
+        id: pin
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, sys, tomllib
+          dependencies = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["dependencies"]
+          revs = {spec.get("rev") for spec in dependencies.values()
+                  if isinstance(spec, dict) and spec.get("git") == "https://github.com/rustfs/gateway.git"}
+          if len(revs) != 1 or not re.fullmatch(r"[0-9a-f]{40}", str(next(iter(revs)))):
+              sys.exit(f"Cargo.toml must pin rustfs/gateway at exactly one full rev, found {sorted(map(str, revs))}")
+          print(f"rev={revs.pop()}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  build-candidate:
+    name: Build candidate binary
+    # The same debug build as ci.yml's build-rustfs-debug-binary, reading the
+    # ci-dev cache written on sm-standard-4.
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Build debug binary
+        run: python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
+
+      - name: Upload candidate binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-acceptance-candidate-binary
+          overwrite: true
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
+          if-no-files-found: error
+          retention-days: 1
+
+  build-gateway-tools:
+    name: Build gateway conformance runner and compat-sut
+    needs: [ plan ]
+    # The gateway workspace builds with its own rust-toolchain.toml, which rustup
+    # installs on first use; nothing here names a toolchain.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout rustfs/gateway at the pinned rev
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/gateway
+          ref: ${{ needs.plan.outputs.gateway-rev }}
+          path: gateway
+          persist-credentials: false
+
+      - name: Build
+        working-directory: gateway
+        run: |
+          cargo build --locked --release -p rustfs-gateway-conformance -p rustfs-gateway-compat-sut \
+            --bin rustfs-gateway-conformance --bin compat-sut
+
+      - name: Upload tools
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-acceptance-tools
+          overwrite: true
+          path: |
+            gateway/target/release/rustfs-gateway-conformance
+            gateway/target/release/compat-sut
+          if-no-files-found: error
+          retention-days: 1
+
+  acceptance:
+    name: ${{ matrix.stack == 'gateway' && 'Acceptance (gateway, report-only until T2.10)' || 'Acceptance (legacy)' }}
+    needs: [ plan, build-candidate, build-gateway-tools ]
+    # GitHub-hosted like the s3-tests targets of reference-parity.yml: the job
+    # only runs prebuilt binaries and the pinned clients, none of which needs Docker.
+    runs-on: ubuntu-latest
+    # About 3x the 15 minutes the legacy job took in run 43325101234 (client install about
+    # 8, matrix about 3, corpus about 3), so a hung server costs 45 runner minutes, not more.
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [ legacy, gateway ]
+    env:
+      STACK: ${{ matrix.stack }}
+      ENDPOINT: http://127.0.0.1:9000
+      # The conformance suite signs with these fixed fixture credentials (the AWS
+      # documentation example pair), so the candidate is started with them and the
+      # client matrix is handed the same pair.
+      ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
+      SECRET_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout rustfs/gateway at the pinned rev
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/gateway
+          ref: ${{ needs.plan.outputs.gateway-rev }}
+          path: gateway
+          persist-credentials: false
+
+      - name: Download candidate binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gateway-acceptance-candidate-binary
+          path: target/debug
+
+      - name: Download gateway tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gateway-acceptance-tools
+          path: tools
+
+      # Records `ready`, or what the process said when it exited, in lane/startup.txt. `ready`
+      # also needs the server's own `server_starting` log event to name the requested stack
+      # (its `s3_stack` field comes from rustfs/rustfs#9367; scripts/dual_stack.py reads it).
+      - name: Start candidate (${{ matrix.stack }} stack)
+        run: |
+          set -uo pipefail
+          chmod +x target/debug/rustfs tools/*
+          mkdir -p lane "$RUNNER_TEMP"/data/rustfs{0..3}
+          target/debug/rustfs --version | tee lane/candidate-version.txt
+          # The four directories share the runner's one disk; the bypass is the CI case the
+          # physical-disk guard sanctions (as in mint.yml).
+          RUSTFS_S3_STACK="$STACK" RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address 127.0.0.1:9000 \
+            --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP"/data/rustfs{0..3} \
+            > lane/rustfs.log 2>&1 &
+          pid=$!
+          echo "$pid" > lane/rustfs.pid
+          # Liveness first: a ready answer counts only while this process is still running.
+          for _ in $(seq 120); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              status=0
+              wait "$pid" || status=$?
+              echo "did not start: exit ${status}: $(grep -v '^[[:space:]]*$' lane/rustfs.log | tail -n 1)" > lane/startup.txt
+              cat lane/startup.txt
+              exit 1
+            fi
+            if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
+              if python3 scripts/dual_stack.py stack --expect "$STACK" --out lane/stack.json lane/rustfs.log > /dev/null; then
+                echo ready > lane/startup.txt
+                exit 0
+              fi
+              echo "did not start: stack not observed" > lane/startup.txt
+              cat lane/startup.txt
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "did not start: /health/ready did not answer within 120 seconds" > lane/startup.txt
+          exit 1
+
+      # The exit code is data for the judge step, not this step's result.
+      - name: Run gateway conformance (rustfs profile)
+        run: |
+          set +e
+          tools/rustfs-gateway-conformance run --root gateway/conformance --profile rustfs \
+            --endpoint "$ENDPOINT" --allow-external-fixtures \
+            --json lane/report.json > lane/conformance.log 2>&1
+          echo "$?" > lane/runner-exit.txt
+          if kill -0 "$(cat lane/rustfs.pid)" 2>/dev/null; then echo alive; else echo exited; fi > lane/alive-after-conformance.txt
+          tail -n 20 lane/conformance.log
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Toolchains for the matrix's SDK driver programs, as the gateway's own
+      # client-matrix.yml sets them up; the client versions come from
+      # gateway/compat/versions.toml.
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version: "1.26"
+          cache: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install Maven
+        env:
+          MAVEN_VERSION: "3.9.16"
+          MAVEN_SHA512: "831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/apache-maven.tar.gz"
+          curl -sSfL -o "$archive" "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          echo "${MAVEN_SHA512}  ${archive}" | sha512sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      # One client at a time, so a client that cannot be installed is reported
+      # as skipped with its reason instead of stopping the others.
+      - name: Install pinned clients
+        working-directory: gateway
+        run: |
+          set -uo pipefail
+          python3 -m pip install --disable-pip-version-check "pyyaml==6.0.2"
+          installed=()
+          for client in $(python3 -c 'import tomllib; print(" ".join(sorted(tomllib.load(open("compat/versions.toml", "rb"))["clients"])))'); do
+            if bash ci/compat/install_clients.sh --clients "$client" > "../lane/install-${client}.log" 2>&1; then
+              installed+=("$client")
+            else
+              echo "${client}: skipped: $(tail -n 1 "../lane/install-${client}.log")" >> ../lane/skipped-clients.txt
+            fi
+          done
+          echo "COMPAT_CLIENTS=$(IFS=,; echo "${installed[*]}")" >> "$GITHUB_ENV"
+          cat ../lane/skipped-clients.txt 2>/dev/null || echo "every pinned client installed"
+
+      # The exit code is data for the judge step, not this step's result.
+      - name: Run client matrix (external)
+        working-directory: gateway
+        env:
+          GATEWAY_COMPAT_SUT_BIN: ${{ github.workspace }}/tools/compat-sut
+          GATEWAY_COMPAT_RUN_DIR: ${{ github.workspace }}/lane/compat
+          GATEWAY_COMPAT_MATRIX_OUT: ${{ github.workspace }}/lane/compat/matrix.json
+        run: |
+          set +e
+          export GATEWAY_COMPAT_ACCESS_KEY="$ACCESS_KEY" GATEWAY_COMPAT_SECRET_KEY="$SECRET_KEY"
+          PATH="$(go env GOPATH)/bin:$PATH"
+          if [[ -f ../lane/skipped-clients.txt ]]; then
+            bash ci/compat/run_matrix.sh --external "$ENDPOINT" --product rustfs --clients "$COMPAT_CLIENTS"
+          else
+            bash ci/compat/run_matrix.sh --external "$ENDPOINT" --product rustfs
+          fi
+          echo "$?" > ../lane/matrix-exit.txt
+
+      - name: Judge and summarize
+        if: always()
+        run: |
+          set -uo pipefail
+          status=0
+          python3 scripts/check_conformance_rulings.py --stack "$STACK" --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/compat_matrix_report.py check --stack "$STACK" --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          exit "$status"
+
+      - name: Upload lane results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-acceptance-lane-${{ matrix.stack }}
+          overwrite: true
+          path: |
+            lane/*.txt
+            lane/*.log
+            lane/report.json
+            lane/stack.json
+            lane/compat/matrix.json
+            lane/compat/probe.jsonl
+            lane/compat/sut.log
+            lane/compat/results/**
+          if-no-files-found: error
+          retention-days: 14
+
+  compare:
+    name: Compare stacks (report-only until T2.10)
+    needs: [ acceptance ]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download lane results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gateway-acceptance-lane-*
+          path: lanes
+
+      - name: Diff legacy and gateway
+        run: |
+          set -uo pipefail
+          status=0
+          {
+            python3 scripts/check_conformance_rulings.py \
+              --diff lanes/gateway-acceptance-lane-legacy lanes/gateway-acceptance-lane-gateway || status=1
+            echo
+            python3 scripts/compat_matrix_report.py diff \
+              --legacy lanes/gateway-acceptance-lane-legacy --gateway lanes/gateway-acceptance-lane-gateway || status=1
+          } > diff.md
+          cat diff.md
+          cat diff.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

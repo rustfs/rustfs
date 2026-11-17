@@ -1,6 +1,6 @@
 # S3 Tables Catalog Lifecycle
 
-**Use this when:** disabling an object-backed table catalog, cleaning up metadata left by deleted empty tables, or diagnosing catalog registration reads.
+**Use this when:** disabling an object-backed table catalog, cleaning up metadata left by deleted empty tables, diagnosing catalog registration reads, or recovering an interrupted table rename.
 **Source of truth:** `rustfs/src/admin/handlers/table_catalog/config.rs`, `rustfs/src/table_catalog/store/cleanup.rs`, and `rustfs/src/table_catalog/store/registration_cache.rs`.
 
 ## Disable A Table Catalog
@@ -13,7 +13,7 @@ The server persists an inactive catalog entry before clearing the bucket marker.
 
 ## Clean Up Deleted Empty Tables
 
-`DELETE /iceberg/v1/buckets/{warehouse}?cleanup=true` removes recognized metadata and internal records left by deleted empty tables, then disables the catalog. Ordinary table deletion continues to preserve files. Cleanup preserves the existing table-record formats and accepts eligible empty tables deleted before the server upgrade.
+`DELETE /iceberg/v1/buckets/{warehouse}?cleanup=true` removes recognized metadata and internal records left by deleted empty tables, then disables the catalog. After removing an active table entry, ordinary table deletion reclaims its maintenance configuration, commit logs and idempotency receipts. It preserves Iceberg data and metadata files. Bucket cleanup can reclaim the same internal records left by older releases or interrupted drops, along with maintenance job reports for deleted tables. A retained table entry or a queued or running maintenance job blocks cleanup.
 
 Complete the upgrade across all serving nodes and set `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` before cleanup. Delete the empty tables and namespaces through catalog APIs. The cleanup principal needs `admin:SetTableBucket` and `s3:GetObject`/`s3:DeleteObject` permissions for the target metadata objects. Omitting `cleanup` or setting it to `false` keeps ordinary disablement; repeated or invalid values are rejected.
 
@@ -30,3 +30,11 @@ Each server keeps a bounded memory cache of validated ownership records. Reuse r
 Registration still enumerates namespace and warehouse-index prefixes, so enumeration grows with catalog size. Cache hits reduce object-body reads and JSON parsing. A hit reuses previously validated content without reading the current body again to prove physical readability. Conditional writes, rollback, and lock-loss fencing continue to control publication; the cache does not synchronize writers that bypass those guards.
 
 Existing catalog, Iceberg metadata, and Console/client request formats remain unchanged. See the [S3 Tables support matrix](../architecture/s3-tables-support-matrix.md) for supported API boundaries.
+
+## Interrupted Table Renames
+
+Every server starts rename recovery once its own application context is ready, including embedded servers. This runs independently of `RUSTFS_TABLE_MAINTENANCE_SCHEDULER_ENABLED`. Recovery scans up to 32 bucket directories per pass, skips their child objects, and admits at most four recoveries concurrently. Passes are separated by five seconds plus jitter; failed buckets retry with exponential delays from 10 seconds up to five minutes. Larger catalogs may need multiple passes. These intervals do not guarantee a recovery deadline while storage or locks remain unavailable.
+
+Recovery resumes the rename referenced by the bucket's `active_rename_id` through the same restore fence, publication locks, conditional writes, and state validation used by `RenameTable`. Reads remain fenced until finalization completes. Missing or invalid intent records retain the fence and produce `table_catalog_rename_recovery` warnings; preserve those records and collect the warnings for investigation. Shutdown stops new admissions and drains started recoveries.
+
+A completed rename preserves the table UUID, warehouse location, and metadata location. Dropping the empty source namespace removes its namespace record and retains valid `DELETED` table/view records. Active objects, pending states, child namespaces, unreadable records, and active rename fences still prevent namespace deletion. Namespace deletion does not remove metadata or data files referenced by the destination table.

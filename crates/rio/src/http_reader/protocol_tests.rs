@@ -152,7 +152,7 @@ impl TlsPeer {
             None,
         );
         tuning.protocol = protocol;
-        build_http_client(true, tuning, &self.outbound_tls)
+        build_http_client::<false>(true, tuning, &self.outbound_tls)
             .await
             .expect("build production TLS client")
     }

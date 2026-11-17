@@ -17,7 +17,37 @@ use rustfs_credentials::Credentials;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use time::OffsetDateTime;
 use tracing::{debug, info};
+
+/// Proof that [`KeystoneAuthProvider::authenticate_with_token_and_proof`] validated a token: the
+/// fields are private and nothing else in or outside this crate builds one. Carries the user id
+/// and the expiry, never the token; deliberately neither `Clone` nor `Debug`.
+///
+/// ```compile_fail,E0451
+/// let _ = rustfs_keystone::ValidatedKeystoneToken {
+///     user_id: String::new(),
+///     expires_at: time::OffsetDateTime::UNIX_EPOCH,
+/// };
+/// ```
+pub struct ValidatedKeystoneToken {
+    user_id: String,
+    expires_at: OffsetDateTime,
+}
+
+impl ValidatedKeystoneToken {
+    /// The Keystone user id the token was issued to.
+    #[must_use]
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    /// The token's expiry as Keystone reported it.
+    #[must_use]
+    pub fn expires_at(&self) -> OffsetDateTime {
+        self.expires_at
+    }
+}
 
 /// Keystone authentication provider
 ///
@@ -49,13 +79,20 @@ impl KeystoneAuthProvider {
 
     /// Authenticate using Keystone token (X-Auth-Token header)
     pub async fn authenticate_with_token(&self, token: &str) -> Result<Credentials> {
+        self.authenticate_with_token_and_proof(token)
+            .await
+            .map(|(credentials, _)| credentials)
+    }
+
+    /// [`Self::authenticate_with_token`], together with the proof of that validation.
+    pub async fn authenticate_with_token_and_proof(&self, token: &str) -> Result<(Credentials, ValidatedKeystoneToken)> {
         // Check cache first
         if self.enable_cache
             && let Some(cached_token) = self.token_cache.get(token).await
             && !cached_token.is_expired()
         {
             debug!("Token cache hit: user_id={}", cached_token.user_id);
-            return Ok(self.keystone_token_to_credentials(&cached_token));
+            return Ok(self.validated(&cached_token));
         }
 
         if self.enable_cache {
@@ -82,7 +119,15 @@ impl KeystoneAuthProvider {
             keystone_token.username, keystone_token.project_name
         );
 
-        Ok(self.keystone_token_to_credentials(&keystone_token))
+        Ok(self.validated(&keystone_token))
+    }
+
+    fn validated(&self, token: &KeystoneToken) -> (Credentials, ValidatedKeystoneToken) {
+        let proof = ValidatedKeystoneToken {
+            user_id: token.user_id.clone(),
+            expires_at: token.expires_at,
+        };
+        (self.keystone_token_to_credentials(token), proof)
     }
 
     /// Revalidate a long-lived subscription directly with Keystone, bypassing

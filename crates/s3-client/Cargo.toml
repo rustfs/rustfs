@@ -32,7 +32,9 @@ fips = ["rustfs-tls-runtime/fips"]
 [dependencies]
 rustfs-checksums.workspace = true
 rustfs-config.workspace = true
+rustfs-gateway-types.workspace = true
 rustfs-rio.workspace = true
+rustfs-s3-types.workspace = true
 rustfs-signer.workspace = true
 rustfs-storage-api.workspace = true
 rustfs-tls-runtime.workspace = true
@@ -55,7 +57,6 @@ quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 rand = { workspace = true, features = ["serde"] }
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types.workspace = true
-s3s = { workspace = true, features = ["minio"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
@@ -68,6 +69,10 @@ tracing.workspace = true
 url.workspace = true
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
+
+# The remote error code table is checked against the legacy client's.
+[dev-dependencies]
+s3s = { workspace = true, features = ["minio"] }
 
 [lints]
 workspace = true

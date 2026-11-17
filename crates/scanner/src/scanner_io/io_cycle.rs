@@ -13,6 +13,8 @@
 // limitations under the License.
 /// ScannerIO/ScannerIOCycle implementations for ECStore: bucket planning and per-set fan-out.
 use super::*;
+use futures::{StreamExt, stream::FuturesUnordered};
+use std::collections::VecDeque;
 
 #[derive(Clone, Copy)]
 struct CollectorSlotSample<'a> {
@@ -160,6 +162,7 @@ where
     S: ScannerStorage,
 {
     let request = ScannerCycleRequest {
+        owner_ctx: ctx.clone(),
         ctx,
         budget,
         updates,
@@ -174,6 +177,8 @@ where
         #[cfg(test)]
         resolved_scope_observer: None,
         #[cfg(test)]
+        post_walk_hook: None,
+        #[cfg(test)]
         post_walk_gate: None,
         #[cfg(test)]
         peer_observations: None,
@@ -182,6 +187,8 @@ where
 }
 
 pub(crate) struct ScannerCycleRequest {
+    /// Control ownership survives a walk budget stop; external cancellation still wins.
+    pub(crate) owner_ctx: CancellationToken,
     pub(crate) ctx: CancellationToken,
     pub(crate) budget: Arc<ScannerCycleBudget>,
     pub(crate) updates: mpsc::Sender<DataUsageInfo>,
@@ -199,6 +206,8 @@ pub(crate) struct ScannerCycleRequest {
     /// Holds the post-walk guardrail probe until the test releases it, so a
     /// write issued after `resolved_scope_observer` fired is ordered before
     /// certification regardless of how fast the walk finishes.
+    #[cfg(test)]
+    pub(crate) post_walk_hook: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     pub(crate) post_walk_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
@@ -551,6 +560,7 @@ where
     S: ScannerStorage,
 {
     let ScannerCycleRequest {
+        owner_ctx,
         ctx,
         budget,
         updates,
@@ -564,6 +574,8 @@ where
         service_cohort,
         #[cfg(test)]
         resolved_scope_observer,
+        #[cfg(test)]
+        post_walk_hook,
         #[cfg(test)]
         post_walk_gate,
         #[cfg(test)]
@@ -716,8 +728,9 @@ where
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
     let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
-    let checkpoint_coverage_digest =
-        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_coverage_digest(&activity_before));
+    // A bucket checkpoint must not be invalidated by another bucket joining
+    // the inventory. The set plan above still binds the complete inventory.
+    let checkpoint_coverage_digest = DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity_before));
     let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets_after_listing(&all_buckets, dirty_usage_cutoff));
     let baseline_proof = ScannerCacheBaselineProof {
@@ -799,8 +812,7 @@ where
         let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
         let status = classify_nsscanner_cycle(
             true,
-            false,
-            ctx.is_cancelled(),
+            owner_ctx.is_cancelled(),
             ScannerBucketScanStatus::Complete,
             dirty_usage_status,
             activity_status,
@@ -837,7 +849,7 @@ where
             complete_tier_registry_cycle(want_cycle, leader_epoch);
         }
         let dirty_usage_clear = (status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone());
-        let remote_dirty_usage_acknowledgements = if status == ScannerCycleStatus::Complete {
+        let remote_dirty_usage_acknowledgements = if status == ScannerCycleStatus::Complete && pending_buckets.is_empty() {
             crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
         } else {
             Vec::new()
@@ -881,15 +893,18 @@ where
     let serial_progress_accounting = budget.requires_serial_progress_accounting();
     let set_scan_limit = scanner_budgeted_concurrency_limit(dispatch_limit, serial_progress_accounting);
     let bucket_failures = ScannerBucketFailureState::default();
-    let bucket_completions = remote_start
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(ScannerBucketCompletions::new())));
-    // Recovery sweeps have no remote certification window, but test sessions
-    // still need the actual worker completions before any values are carried.
-    #[cfg(feature = "e2e-test-hooks")]
-    let bucket_completions = bucket_completions.or_else(|| {
-        std::env::var_os("RUSTFS_E2E_SCANNER_BARRIER_DIR").map(|_| Arc::new(Mutex::new(ScannerBucketCompletions::new())))
-    });
+    let usage_watch_store = store.scanner_usage_watch_store_handle().await;
+    // A later turn may complete one source's partial bucket; another source's
+    // unresolved bucket must still veto complete coverage.
+    let source_failures: Vec<ScannerBucketFailureState> = (0..total_results)
+        .map(|_| ScannerBucketFailureState {
+            usage_watch_completions: bucket_failures.usage_watch_completions.clone(),
+            ..Default::default()
+        })
+        .collect();
+    // Local ACKs need the same per-source completion evidence as remote ACKs.
+    // Cold/LKG copies and mixed observations never enter this map.
+    let bucket_completions = Some(Arc::new(Mutex::new(ScannerBucketCompletions::new())));
     let pending_maintenance_work = Arc::new(AtomicBool::new(false));
     let cold_zero_walk_reuse_observed = Arc::new(AtomicBool::new(false));
     record_set_scan_concurrency_limit(set_scan_limit);
@@ -915,7 +930,8 @@ where
     let observed_slots = vec![false; total_results];
     let results_mutex = Arc::new(Mutex::new((results, observed_slots)));
     let first_err_mutex: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
-    let mut wait_futs = Vec::new();
+    let mut source_turns = FuturesUnordered::new();
+    let mut continuations: Vec<Option<ScannerSourceTurnContinuation>> = (0..total_results).map(|_| None).collect();
 
     let set_order = service_cohort.as_ref().map_or_else(
         || (0..set_disks.len()).collect::<Vec<_>>(),
@@ -926,162 +942,233 @@ where
                 .order_set_indices(&set_disks)
         },
     );
-    for results_index in set_order {
-        let set = &set_disks[results_index];
-        // Acquire in dispatch order, not in independently scheduled tasks.
-        // A whole set still shares the existing parent budget; this is not
-        // a per-bucket quantum or a cross-source completion guarantee.
-        let permit_wait_start = Instant::now();
-        let permit = tokio::select! {
-            biased;
-            _ = child_token.cancelled() => break,
-            permit = set_scan_semaphore.clone().acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => break,
-            },
-        };
-        if child_token.is_cancelled() || budget.budget_elapsed() {
-            break;
-        }
-        let results_index_clone = results_index;
-        // Clone the Arc to move it into the spawned task
-        let set_clone: Arc<SetDisks> = Arc::clone(set);
-        let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
-        let set_buckets = buckets_by_source.remove(&source).unwrap_or_default();
-        let pool_label = set.pool_index.to_string();
-        let set_label = set.set_index.to_string();
-
-        let child_token_clone = child_token.clone();
-        let budget_clone = budget.clone();
-        let want_cycle_clone = want_cycle;
-        let scan_mode_clone = scan_mode;
-        let results_mutex_clone = results_mutex.clone();
-        let first_err_mutex_clone = first_err_mutex.clone();
-        let queued_set_scans_clone = queued_set_scans.clone();
-        let active_set_scans_clone = active_set_scans.clone();
-
-        let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
-        let failed_scope_tx = tx.clone();
-
-        // Spawn task to receive and store results
-        let receiver_fut = tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
-                let mut results = results_mutex_clone.lock().await;
-                results.0[results_index_clone] = result;
-                results.1[results_index_clone] = true;
+    let mut pending_sources = VecDeque::from(set_order);
+    loop {
+        while source_turns.len() < set_scan_limit
+            && !pending_sources.is_empty()
+            && !child_token.is_cancelled()
+            && !budget.budget_elapsed()
+        {
+            let Some(results_index) = pending_sources.pop_front() else {
+                break;
+            };
+            let set = &set_disks[results_index];
+            // Acquire in dispatch order, not in independently scheduled tasks.
+            // Completed source turns release this same permit before returning to
+            // the FIFO tail. The queue never increases the configured concurrency.
+            let permit_wait_start = Instant::now();
+            let permit = tokio::select! {
+                biased;
+                _ = child_token.cancelled() => break,
+                permit = set_scan_semaphore.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+            if child_token.is_cancelled() || budget.budget_elapsed() {
+                break;
             }
-        });
-        wait_futs.push(AbortOnDropHandle::new(receiver_fut));
+            let results_index_clone = results_index;
+            // Clone the Arc to move it into the spawned task
+            let set_clone: Arc<SetDisks> = Arc::clone(set);
+            let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
+            let set_buckets = buckets_by_source.get(&source).cloned().unwrap_or_default();
+            let pool_label = set.pool_index.to_string();
+            let set_label = set.set_index.to_string();
 
-        let scan_plan = ScannerBucketScanPlan {
-            buckets: set_buckets,
-            all_buckets: Arc::clone(&all_buckets),
-            scope: scan_scope.clone(),
-            digest: structural_scan_plan_digest,
-            bucket_coverage_digest,
-            checkpoint_coverage_digest,
-            requires_full_scan,
-            service_cohort: service_cohort.clone(),
-            execution_digest,
-            leader_epoch,
-            tier_registry_generation,
-            publication_epoch,
-            dirty_usage_buckets: dirty_usage_snapshot.buckets.clone(),
-            bucket_failures: bucket_failures.clone(),
-            bucket_completions: bucket_completions.clone(),
-            pending_maintenance_work: pending_maintenance_work.clone(),
-            cache_cycle_floor: cache_cycle_floor.clone(),
-            cold_zero_walk_reuse_observed: cold_zero_walk_reuse_observed.clone(),
-            segment_invalidation_proof: segment_invalidation_proof.clone(),
-        };
-        // Spawn task to run the scanner
-        let scanner_fut = tokio::spawn(async move {
-            let _permit = permit;
-            if child_token_clone.is_cancelled() || budget_clone.budget_elapsed() {
-                return;
-            }
-            metrics::histogram!(
-                METRIC_SCANNER_SET_SCAN_WAIT_SECONDS,
-                "pool" => pool_label.clone(),
-                "set" => set_label.clone()
-            )
-            .record(permit_wait_start.elapsed().as_secs_f64());
-            let queued_count = decrement_atomic_usize(&queued_set_scans_clone);
-            record_set_scans_queued(queued_count);
-            let _active_guard = SetScanActiveGuard::new(active_set_scans_clone);
+            let child_token_clone = child_token.clone();
+            #[cfg(test)]
+            budget.record_source_turn_admission(results_index);
+            let (budget_clone, source_token) = budget.for_source(&child_token);
+            let continuation = continuations[results_index].take();
+            let want_cycle_clone = want_cycle;
+            let scan_mode_clone = scan_mode;
+            let results_mutex_clone = results_mutex.clone();
+            let first_err_mutex_clone = first_err_mutex.clone();
+            let queued_set_scans_clone = queued_set_scans.clone();
+            let active_set_scans_clone = active_set_scans.clone();
 
-            if let Err(e) = set_clone
-                .nsscanner_cache(child_token_clone.clone(), budget_clone, scan_plan, tx, want_cycle_clone, scan_mode_clone)
-                .await
-            {
-                if child_token_clone.is_cancelled() {
-                    debug!(
-                        pool = %pool_label,
-                        set = %set_label,
-                        error = %e,
-                        "Scanner set scan stopped after cancellation"
-                    );
-                    return;
+            let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
+            let failed_scope_tx = tx.clone();
+            #[cfg(test)]
+            let collector_sender = tx.downgrade();
+
+            // Spawn task to receive and store results
+            let receiver_fut = tokio::spawn(async move {
+                while let Some(result) = rx.recv().await {
+                    #[cfg(test)]
+                    super::tests::usage_candidate_seal::observe_collector(&result, &collector_sender).await;
+                    let mut results = results_mutex_clone.lock().await;
+                    results.0[results_index_clone] = result;
+                    results.1[results_index_clone] = true;
                 }
+            });
+            let receiver_fut = AbortOnDropHandle::new(receiver_fut);
 
-                counter!(
-                    "rustfs_scanner_set_failure_total",
+            let scan_plan = ScannerBucketScanPlan {
+                owner_ctx: owner_ctx.clone(),
+                usage_watch_store: usage_watch_store.clone(),
+                buckets: set_buckets,
+                all_buckets: Arc::clone(&all_buckets),
+                scope: scan_scope.clone(),
+                digest: structural_scan_plan_digest,
+                bucket_coverage_digest,
+                checkpoint_coverage_digest,
+                requires_full_scan,
+                service_cohort: service_cohort.clone(),
+                execution_digest,
+                leader_epoch,
+                tier_registry_generation,
+                publication_epoch,
+                dirty_usage_buckets: dirty_usage_snapshot.buckets.clone(),
+                bucket_failures: source_failures[results_index].clone(),
+                bucket_completions: bucket_completions.clone(),
+                pending_maintenance_work: pending_maintenance_work.clone(),
+                cache_cycle_floor: cache_cycle_floor.clone(),
+                cold_zero_walk_reuse_observed: cold_zero_walk_reuse_observed.clone(),
+                segment_invalidation_proof: segment_invalidation_proof.clone(),
+            };
+            // Spawn task to run the scanner
+            let scanner_fut = tokio::spawn(async move {
+                let _permit = permit;
+                if child_token_clone.is_cancelled() || budget_clone.budget_elapsed() {
+                    return (results_index, None);
+                }
+                metrics::histogram!(
+                    METRIC_SCANNER_SET_SCAN_WAIT_SECONDS,
                     "pool" => pool_label.clone(),
-                    "set" => set_label.clone(),
-                    "stage" => "nsscanner_cache".to_string()
+                    "set" => set_label.clone()
                 )
-                .increment(1);
+                .record(permit_wait_start.elapsed().as_secs_f64());
+                let queued_count = decrement_atomic_usize(&queued_set_scans_clone);
+                record_set_scans_queued(queued_count);
+                let _active_guard = SetScanActiveGuard::new(active_set_scans_clone);
+
+                let result = {
+                    let scan = set_clone.nsscanner_cache_turn(
+                        source_token.clone(),
+                        budget_clone.clone(),
+                        ScannerSourceTurnRequest { scan_plan, continuation },
+                        tx,
+                        want_cycle_clone,
+                        scan_mode_clone,
+                    );
+                    tokio::pin!(scan);
+                    tokio::select! {
+                      result = &mut scan => result,
+                      _ = source_token.cancelled() => {
+                          let deadline = budget_clone.shutdown_deadline();
+                          tokio::time::timeout_at(deadline, &mut scan).await
+                              .unwrap_or_else(|_| Err(StorageError::other("scanner source turn exceeded its bounded drain")))
+                      }
+                    }
+                };
+                let continuation = match result {
+                    Ok(receipt) => receipt.continuation,
+                    Err(e) => {
+                        if child_token_clone.is_cancelled() {
+                            debug!(
+                                pool = %pool_label,
+                                set = %set_label,
+                                error = %e,
+                                "Scanner set scan stopped after cancellation"
+                            );
+                            return (results_index, None);
+                        }
+
+                        counter!(
+                            "rustfs_scanner_set_failure_total",
+                            "pool" => pool_label.clone(),
+                            "set" => set_label.clone(),
+                            "stage" => "nsscanner_cache".to_string()
+                        )
+                        .increment(1);
+                        error!(
+                            target: "rustfs::scanner::io",
+                            event = EVENT_SCANNER_SET_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_IO,
+                            pool = %pool_label,
+                            set = %set_label,
+                            error = %e,
+                            state = "set_scan_failed",
+                            "Scanner set scan failed; continuing cycle"
+                        );
+                        let _ = failed_scope_tx
+                            .send(DataUsageCache {
+                                info: DataUsageCacheInfo {
+                                    name: DATA_USAGE_ROOT.to_string(),
+                                    next_cycle: want_cycle_clone,
+                                    leader_epoch,
+                                    source: Some(source),
+                                    snapshot_complete: false,
+                                    scan_plan_digest: Some(scan_plan_digest),
+                                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                                    ..Default::default()
+                                },
+                                cache: HashMap::new(),
+                            })
+                            .await;
+                        let mut first_err = first_err_mutex_clone.lock().await;
+                        record_set_scan_failure(&mut first_err, e);
+                        None
+                    }
+                };
+                drop(failed_scope_tx);
+                if let Err(err) = receiver_fut.await {
+                    let mut first_err = first_err_mutex_clone.lock().await;
+                    record_set_scan_failure(&mut first_err, scanner_task_join_error("scanner set receiver", err));
+                    return (results_index, None);
+                }
+                (results_index, continuation)
+            });
+            source_turns.push(AbortOnDropHandle::new(scanner_fut));
+        }
+
+        let Some(join_result) = source_turns.next().await else {
+            break;
+        };
+        match join_result {
+            Ok((index, Some(continuation))) if !child_token.is_cancelled() && !budget.budget_elapsed() => {
+                continuations[index] = Some(continuation);
+                pending_sources.push_back(index);
+                let queued = queued_set_scans.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+                record_set_scans_queued(queued);
+            }
+            Ok(_) => {}
+            Err(err) => {
                 error!(
                     target: "rustfs::scanner::io",
                     event = EVENT_SCANNER_SET_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_IO,
-                    pool = %pool_label,
-                    set = %set_label,
-                    error = %e,
-                    state = "set_scan_failed",
-                    "Scanner set scan failed; continuing cycle"
+                    state = "set_task_join_failed",
+                    error = %err,
+                    "Scanner set task join failed"
                 );
-                let _ = failed_scope_tx
-                    .send(DataUsageCache {
-                        info: DataUsageCacheInfo {
-                            name: DATA_USAGE_ROOT.to_string(),
-                            next_cycle: want_cycle_clone,
-                            leader_epoch,
-                            source: Some(source),
-                            snapshot_complete: false,
-                            scan_plan_digest: Some(scan_plan_digest),
-                            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                            ..Default::default()
-                        },
-                        cache: HashMap::new(),
-                    })
-                    .await;
-                let mut first_err = first_err_mutex_clone.lock().await;
-                record_set_scan_failure(&mut first_err, e);
+                let mut first_err = first_err_mutex.lock().await;
+                record_set_scan_failure(&mut first_err, scanner_task_join_error("scanner set", err));
             }
-        });
-        wait_futs.push(AbortOnDropHandle::new(scanner_fut));
+        }
     }
-
-    for join_result in join_all(wait_futs).await {
-        if let Err(err) = join_result {
-            error!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_SET_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                state = "set_task_join_failed",
-                error = %err,
-                "Scanner set task join failed"
-            );
-            let mut first_err = first_err_mutex.lock().await;
-            record_set_scan_failure(&mut first_err, scanner_task_join_error("scanner set", err));
+    for failure in &source_failures {
+        for (aggregate, source) in [
+            (&bucket_failures.hard, &failure.hard),
+            (&bucket_failures.partial, &failure.partial),
+            (&bucket_failures.partial_carried, &failure.partial_carried),
+            (&bucket_failures.namespace_not_found, &failure.namespace_not_found),
+        ] {
+            let pending = source.lock().await.clone();
+            aggregate.lock().await.extend(pending);
         }
     }
     record_set_scan_concurrency_limit(0);
     record_set_scans_queued(0);
     record_set_scans_active(0);
+    #[cfg(test)]
+    if let Some(hook) = post_walk_hook {
+        hook();
+    }
     #[cfg(test)]
     if let Some(gate) = post_walk_gate {
         let _ = gate.await;
@@ -1127,8 +1214,7 @@ where
     // A mixed-plan tail can save its checkpoint without producing a root
     // candidate. Do not infer progress from an arbitrary missing update, or
     // let a successful set hide another set's worker/persistence failure.
-    let partial_bucket_progress = !budget_elapsed
-        && !ctx.is_cancelled()
+    let partial_bucket_progress = !owner_ctx.is_cancelled()
         && scanner_partial_progress_is_usable(
             bucket_plan_complete,
             scan_scope_matches,
@@ -1175,7 +1261,7 @@ where
         remote_certification_attempted,
     );
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
-    let completed_usage = completed_usage_candidate(
+    let mut completed_usage = completed_usage_candidate(
         &results,
         &ScannerSnapshotScope {
             sources: &expected_sources,
@@ -1190,9 +1276,16 @@ where
         },
         &tier_registry.names,
         bucket_plan_complete,
-        budget_elapsed,
-        ctx.is_cancelled(),
+        owner_ctx.is_cancelled(),
     );
+    if let (Some(candidate), Some(baseline)) = (
+        completed_usage.as_mut(),
+        persisted_usage_baseline
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<DataUsageInfo>(bytes).ok()),
+    ) {
+        candidate.retain_carried_certifications(&baseline);
+    }
     let observational_usage = completed_usage
         .is_none()
         .then(|| {
@@ -1210,13 +1303,12 @@ where
     let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
     let cycle_status = classify_nsscanner_cycle(
         structurally_complete_snapshot,
-        budget_elapsed,
-        ctx.is_cancelled(),
+        owner_ctx.is_cancelled(),
         bucket_scan_status,
         dirty_usage_status,
         activity_status,
     );
-    if cycle_status == ScannerCycleStatus::Incomplete && result.is_ok() && !budget_elapsed && !ctx.is_cancelled() {
+    if cycle_status == ScannerCycleStatus::Incomplete && result.is_ok() && !budget_elapsed && !owner_ctx.is_cancelled() {
         let slots =
             set_disks
                 .iter()
@@ -1295,27 +1387,100 @@ where
         Some(completions) => completions.lock().await.clone(),
         None => ScannerBucketCompletions::new(),
     };
+    let watch_completions = bucket_failures.usage_watch_completions.lock().await.clone();
+    let mut usage_watch_proofs = BTreeMap::<String, ScannerUsageWatchProof>::new();
+    let mut invalid_watch_buckets = HashSet::new();
+    for (source, buckets) in &watch_completions {
+        for (bucket, proof) in buckets {
+            if !completions
+                .get(source)
+                .is_some_and(|completed| completed.contains_key(bucket))
+            {
+                continue;
+            }
+            if let Some(previous) = usage_watch_proofs.insert(bucket.clone(), proof.clone())
+                && previous.digest() != proof.digest()
+            {
+                invalid_watch_buckets.insert(bucket.clone());
+            }
+        }
+    }
+    for (bucket, proof) in &usage_watch_proofs {
+        let valid = store.scanner_verify_usage_watches(std::slice::from_ref(proof)).await;
+        if !valid {
+            invalid_watch_buckets.insert(bucket.clone());
+        }
+    }
+    uncertified_buckets.extend(invalid_watch_buckets.iter().cloned());
+    let mut ended_sweeps = completions.clone();
+    for result in &results {
+        let Some(source) = result.info.source else {
+            continue;
+        };
+        for (bucket, observation) in &result.info.scan_bucket_observations {
+            if observation.completed_epoch == leader_epoch && observation.completed_cycle == want_cycle {
+                ended_sweeps
+                    .entry(source)
+                    .or_default()
+                    .insert(bucket.clone(), observation.identity.bucket_incarnation);
+            }
+        }
+    }
+    let completed_buckets = all_bucket_names
+        .iter()
+        .filter(|bucket| peer_certification::bucket_completed_in_all_sources(bucket, &expected_sources, &ended_sweeps).is_some())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let usage_watch_retirements = watch_completions
+        .values()
+        .flat_map(|buckets| buckets.iter())
+        .filter(|(bucket, _)| completed_buckets.contains(*bucket))
+        .map(|(_, proof)| (proof.digest().0, proof.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect();
+    let coverage_pending_buckets = all_bucket_names
+        .iter()
+        .filter(|bucket| {
+            dirty_usage_snapshot.buckets.contains_key(bucket.as_str())
+                && peer_certification::bucket_completed_in_all_sources(bucket, &expected_sources, &completions).is_none()
+        })
+        .cloned()
+        .collect::<ScannerCyclePendingBuckets>();
+    uncertified_buckets.extend(coverage_pending_buckets.iter().cloned());
     let (certified_acknowledgements, remote_pending_buckets) = remote_certification.as_ref().map_or_else(
         || (Vec::new(), ScannerCyclePendingBuckets::new()),
         |proof| proof.classify_buckets(&expected_sources, &completions, &uncertified_buckets),
     );
-    let remote_dirty_usage_pending = !remote_pending_buckets.is_empty();
+    let scoped_remote_dirty_usage_pending = !remote_pending_buckets.is_empty();
     uncertified_buckets.extend(remote_pending_buckets.iter().cloned());
     let pending_buckets = if cycle_status == ScannerCycleStatus::Complete {
         let mut pending = local_pending_buckets;
         pending.extend(partial_buckets.iter().cloned());
+        pending.extend(coverage_pending_buckets);
         pending.extend(remote_pending_buckets);
+        pending.extend(invalid_watch_buckets);
         pending
     } else {
         ScannerCyclePendingBuckets::new()
     };
-    // A verified but empty scoped ACK is deliberate. It must never become a
-    // whole-generation ACK that could clear a hot or carried partial bucket.
+    usage_watch_proofs.retain(|bucket, _| !uncertified_buckets.contains(bucket));
+    // A verified empty scoped ACK cannot become a whole-generation ACK. Old
+    // peers need every bucket freshly completed and no pending responsibility.
+    let legacy_ack_allowed = pending_buckets.is_empty()
+        && all_bucket_names
+            .iter()
+            .all(|bucket| peer_certification::bucket_completed_in_all_sources(bucket, &expected_sources, &completions).is_some());
+    let legacy_remote_dirty_usage_pending = remote_certification.is_none()
+        && (cycle_status != ScannerCycleStatus::Complete || remote_certification_attempted || !legacy_ack_allowed)
+        && (!remote_dirty_usage_acknowledgements.is_empty()
+            || !crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before).is_empty());
+    let remote_dirty_usage_pending = scoped_remote_dirty_usage_pending || legacy_remote_dirty_usage_pending;
     let remote_dirty_usage_acknowledgements = if cycle_status != ScannerCycleStatus::Complete {
         Vec::new()
     } else if remote_certification.is_some() {
         certified_acknowledgements
-    } else if remote_certification_attempted {
+    } else if remote_certification_attempted || !legacy_ack_allowed {
         Vec::new()
     } else if !remote_dirty_usage_acknowledgements.is_empty() {
         remote_dirty_usage_acknowledgements
@@ -1380,7 +1545,7 @@ where
         } else {
             publish_usage_snapshot(&updates, cycle_status, &pending_buckets, data_usage_info).await?
         }
-    } else if !ctx.is_cancelled()
+    } else if !owner_ctx.is_cancelled()
         && let Some((data_usage_info, _)) = observational_usage
     {
         publish_observational_snapshot(&updates, data_usage_info).await?
@@ -1392,7 +1557,6 @@ where
     let dirty_usage_clear = should_clear_dirty_usage_snapshot(
         result.is_ok(),
         structurally_complete_snapshot,
-        budget_elapsed,
         activity_status == ScannerCycleActivityStatus::Unchanged,
         &dirty_usage_snapshot.buckets,
         &uncertified_buckets,
@@ -1402,6 +1566,8 @@ where
         complete_tier_registry_cycle(want_cycle, leader_epoch);
     }
     Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
+        .with_usage_watch_proofs(usage_watch_proofs.into_values().collect())
+        .with_usage_watch_retirements(usage_watch_retirements)
         .with_publication_epoch(publication_epoch)
         .with_activity_digest(activity_digest)
         .with_activity_baseline(activity_before)
@@ -1543,7 +1709,6 @@ mod collector_summary_tests {
             assert_eq!(
                 classify_nsscanner_cycle(
                     sets_complete,
-                    false,
                     false,
                     bucket_status,
                     dirty_status,

@@ -1,0 +1,1 @@
+<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:*</Event><Event>s3:ObjectRemoved:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>uploads/</Value></FilterRule></S3Key></Filter><Id>rustfs-webhook</Id><Queue>arn:rustfs:sqs::primary:webhook</Queue></QueueConfiguration></NotificationConfiguration>

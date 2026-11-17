@@ -12,22 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse};
 use crate::admin::runtime_sources;
 use crate::admin::runtime_sources::default_admin_usecase;
-use crate::admin::storage_api::access::{ReqInfo, authorize_internal_object_request};
+use crate::admin::storage_api::access::{ReqInfo, authorize_owned_internal_object_request};
 use crate::admin::storage_api::bucket::metadata::table_catalog_path_hash;
 use crate::admin::storage_api::runtime::ECStore;
-use crate::admin::utils::empty_response;
+use crate::admin::utils::owned_empty_response;
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
 };
+use crate::app::RequestEnvelope;
 use crate::auth::{check_key_valid_with_context, get_session_token};
 use crate::error::ApiError;
 use crate::server::{TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -42,8 +45,8 @@ use rustfs_policy::{
         action::{Action, AdminAction, S3Action},
     },
 };
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::crypto::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad, hex_sha256};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
@@ -893,8 +896,8 @@ struct IamTableCredentialIssuer {
 }
 
 impl IamTableCredentialIssuer {
-    fn from_request(req: &S3Request<Body>) -> S3Result<Self> {
-        let context = runtime_sources::app_context_from_req(req)
+    fn from_request(req: &AdminRequest) -> S3Result<Self> {
+        let context = runtime_sources::app_context_from_envelope(req.envelope())
             .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
         let iam = context.iam();
         if !iam.is_ready() {
@@ -1070,23 +1073,19 @@ fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigRes
     })
 }
 
-fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
+    Ok(AdminResponse::with_headers(status, Body::from(data), headers))
 }
 
-fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let mut response = build_json_response(status, body)?;
-    response
-        .headers
-        .insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
-    response
-        .headers
-        .insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
-    response.headers.insert(http::header::EXPIRES, HeaderValue::from_static("0"));
-    Ok(response)
+fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<AdminResponse> {
+    let (status, mut headers, body) = build_json_response(status, body)?.into_parts();
+    headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(http::header::EXPIRES, HeaderValue::from_static("0"));
+    Ok(AdminResponse::with_headers(status, body, headers))
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
@@ -1150,15 +1149,15 @@ fn exists_status(exists: bool) -> StatusCode {
     }
 }
 
-async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
+async fn authorize_table_catalog_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
     let principal = table_catalog_request_principal(req).await?;
     validate_admin_action_with_bucket_object_for_iam(
         principal.iam_store,
-        &req.headers,
+        req.headers(),
         &principal.credentials,
         principal.owner,
         Action::AdminAction(action),
-        crate::admin::auth::policy_source_addr(&req.extensions),
+        req.policy_source_addr(),
         AdminResourceScope::bucket(""),
     )
     .await
@@ -1224,7 +1223,7 @@ impl<'a> TableCatalogResource<'a> {
 }
 
 async fn authorize_table_catalog_resource_request(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     resource: &TableCatalogResource<'_>,
     action: AdminAction,
 ) -> S3Result<TableCatalogRequestPrincipal> {
@@ -1235,7 +1234,7 @@ async fn authorize_table_catalog_resource_request(
 }
 
 async fn authorize_table_catalog_resource_for_principal(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     principal: &TableCatalogRequestPrincipal,
     resource: &TableCatalogResource<'_>,
     action: AdminAction,
@@ -1245,7 +1244,7 @@ async fn authorize_table_catalog_resource_for_principal(
         .await
 }
 
-async fn authorize_table_warehouse_location_request(req: &S3Request<Body>, bucket: &str, location: &str) -> S3Result<()> {
+async fn authorize_table_warehouse_location_request(req: &AdminRequest, bucket: &str, location: &str) -> S3Result<()> {
     let prefix =
         crate::table_catalog::table_warehouse_object_prefix_from_location(bucket, location).map_err(catalog_store_error)?;
     let principal = table_catalog_request_principal(req).await?;
@@ -1260,7 +1259,7 @@ async fn authorize_table_warehouse_location_request(req: &S3Request<Body>, bucke
 }
 
 async fn authorize_table_catalog_object_for_principal(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     principal: &TableCatalogRequestPrincipal,
     bucket: &str,
     object: &str,
@@ -1268,11 +1267,11 @@ async fn authorize_table_catalog_object_for_principal(
 ) -> S3Result<()> {
     validate_admin_action_with_bucket_object_for_iam(
         principal.iam_store.clone(),
-        &req.headers,
+        req.headers(),
         &principal.credentials,
         principal.owner,
         Action::AdminAction(action),
-        crate::admin::auth::policy_source_addr(&req.extensions),
+        req.policy_source_addr(),
         AdminResourceScope::bucket_object(bucket, object),
     )
     .await
@@ -1284,16 +1283,19 @@ struct TableCatalogRequestPrincipal {
     iam_store: Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>,
 }
 
-fn install_table_catalog_s3_request_info(req: &mut S3Request<Body>, principal: &TableCatalogRequestPrincipal) -> S3Result<()> {
-    if req.extensions.get::<ReqInfo>().is_none() {
-        req.extensions.insert(ReqInfo {
-            region: req.region.clone(),
+fn install_table_catalog_s3_request_info(req: &mut AdminRequest, principal: &TableCatalogRequestPrincipal) -> S3Result<()> {
+    if req.req_info().is_none() {
+        let _ = req.install_req_info(ReqInfo {
+            region: req
+                .region()
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| table_catalog_internal_error("invalid table catalog request region"))?,
             ..Default::default()
         });
     }
     let req_info = req
-        .extensions
-        .get_mut::<ReqInfo>()
+        .req_info_mut()
         .ok_or_else(|| s3_error!(InternalError, "failed to install table catalog authorization context"))?;
     req_info.cred = Some(principal.credentials.clone());
     req_info.is_owner = principal.owner;
@@ -1301,15 +1303,14 @@ fn install_table_catalog_s3_request_info(req: &mut S3Request<Body>, principal: &
 }
 
 async fn authorize_table_catalog_s3_actions(
-    req: &mut S3Request<Body>,
+    req: &mut AdminRequest,
     bucket: &str,
     object: &str,
     actions: &[S3Action],
 ) -> S3Result<()> {
     let original = {
         let req_info = req
-            .extensions
-            .get_mut::<ReqInfo>()
+            .req_info_mut()
             .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
         (
             req_info.bucket.replace(bucket.to_string()),
@@ -1320,26 +1321,26 @@ async fn authorize_table_catalog_s3_actions(
 
     let mut result = Ok(());
     for action in actions {
-        if let Err(err) = authorize_internal_object_request(req, Action::S3Action(*action)).await {
+        if let Err(err) = authorize_owned_internal_object_request(req.envelope_mut(), Action::S3Action(*action)).await {
             result = Err(err);
             break;
         }
     }
-    if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
+    if let Some(req_info) = req.req_info_mut() {
         (req_info.bucket, req_info.object, req_info.version_id) = original;
     }
     result
 }
 
-async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<TableCatalogRequestPrincipal> {
-    let Some(input_cred) = &req.credentials else {
+async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCatalogRequestPrincipal> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
-    let context = runtime_sources::app_context_from_req(req)
+    let context = runtime_sources::app_context_from_envelope(req.envelope())
         .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
     let (credentials, owner) = check_key_valid_with_context(
-        get_session_token(&req.uri, &req.headers).unwrap_or_default(),
-        &input_cred.access_key,
+        get_session_token(req.uri(), req.headers()).unwrap_or_default(),
+        input_cred.access_key(),
         Some(context.as_ref()),
     )
     .await?;
@@ -1366,7 +1367,7 @@ async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<Tabl
 
 #[derive(Clone)]
 enum TableCommitObjectAuthorization {
-    Request(Arc<tokio::sync::Mutex<S3Request<Body>>>),
+    Request(Arc<tokio::sync::Mutex<AdminRequest>>),
     Preauthorized,
     #[cfg(test)]
     Test {
@@ -1439,7 +1440,7 @@ where
         }
     }
 
-    fn for_request(backend: B, req: S3Request<Body>) -> Self {
+    fn for_request(backend: B, req: AdminRequest) -> Self {
         Self::new(
             backend,
             TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(req))),
@@ -2141,7 +2142,13 @@ async fn read_limited_body(mut input: Body, max_size: usize, timeout: StdDuratio
                 |operation| S3Error::from(ApiError::invalid_request(format!("timed out reading {operation} request body"))),
             )
         })?
-        .map_err(|err| S3Error::from(ApiError::invalid_request(format!("failed to read request body: {err}"))))
+        .map_err(|err| {
+            if err.is::<rustfs_s3_types::BodyTooLarge>() {
+                S3Error::from(ApiError::invalid_request("failed to read request body: length limit exceeded"))
+            } else {
+                S3Error::from(ApiError::invalid_request(format!("failed to read request body: {err}")))
+            }
+        })
 }
 
 async fn read_json_body<T: DeserializeOwned>(input: Body) -> S3Result<T> {
@@ -2587,17 +2594,6 @@ fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     Ok(job.to_string())
 }
 
-fn table_catalog_backend_from_extensions(
-    extensions: &http::Extensions,
-) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
-    let context = runtime_sources::app_context_from_extensions(extensions)
-        .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_registration_cache(
-        context.object_store(),
-        context.table_catalog_registration_cache(),
-    ))
-}
-
 type EcStoreObjectTableCatalogStore =
     crate::table_catalog::ObjectTableCatalogStore<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>>;
 
@@ -2607,21 +2603,35 @@ fn table_catalog_store_from_backend(
     crate::table_catalog::ConfiguredTableCatalogStore::from_env(backend).map_err(catalog_store_error)
 }
 
-fn table_catalog_store_from_extensions(
-    extensions: &http::Extensions,
-) -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
-    table_catalog_store_from_backend(table_catalog_backend_from_extensions(extensions)?)
+// Request-scoped catalog state for handlers on the owned admin request
+// boundary; each helper resolves the injected server slot or the ambient
+// process context.
+fn table_catalog_backend_from_envelope(
+    envelope: &RequestEnvelope,
+) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
+    let context = runtime_sources::app_context_from_envelope(envelope)
+        .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_registration_cache(
+        context.object_store(),
+        context.table_catalog_registration_cache(),
+    ))
 }
 
-fn table_catalog_object_store_from_extensions(extensions: &http::Extensions) -> S3Result<EcStoreObjectTableCatalogStore> {
+fn table_catalog_store_from_envelope(
+    envelope: &RequestEnvelope,
+) -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+    table_catalog_store_from_backend(table_catalog_backend_from_envelope(envelope)?)
+}
+
+fn table_catalog_object_store_from_envelope(envelope: &RequestEnvelope) -> S3Result<EcStoreObjectTableCatalogStore> {
     crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
-    Ok(crate::table_catalog::ObjectTableCatalogStore::new(table_catalog_backend_from_extensions(
-        extensions,
+    Ok(crate::table_catalog::ObjectTableCatalogStore::new(table_catalog_backend_from_envelope(
+        envelope,
     )?))
 }
 
-async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<bool> {
-    let store = runtime_sources::object_store_from_extensions(extensions)
+async fn table_bucket_enabled_from_envelope(envelope: &RequestEnvelope, bucket: &str) -> S3Result<bool> {
+    let store = runtime_sources::object_store_from_envelope(envelope)
         .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
     store
         .table_bucket_enabled(bucket)
@@ -2629,8 +2639,8 @@ async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, buc
         .map_err(|err| s3_error!(InvalidRequest, "failed to load table bucket metadata for {bucket}: {}", err))
 }
 
-async fn ensure_table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<()> {
-    if table_bucket_enabled_from_extensions(extensions, bucket).await? {
+async fn ensure_table_bucket_enabled_from_envelope(envelope: &RequestEnvelope, bucket: &str) -> S3Result<()> {
+    if table_bucket_enabled_from_envelope(envelope, bucket).await? {
         return Ok(());
     }
     Err(s3_error!(InvalidRequest, "bucket {bucket} is not table-enabled"))
@@ -5892,7 +5902,7 @@ fn namespace_entry_from_create_request(
     })
 }
 
-fn iceberg_rest_error(error_type: &str, status: StatusCode, message: impl Into<String>) -> S3Error {
+fn iceberg_rest_error(error_type: &'static str, status: StatusCode, message: impl Into<String>) -> S3Error {
     let mut err = S3Error::with_message(S3ErrorCode::Custom(error_type.into()), message.into());
     err.set_status_code(status);
     err

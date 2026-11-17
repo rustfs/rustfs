@@ -20,8 +20,10 @@
 //! counted and the count is carried on the next entry that is let through.
 
 use crate::module_switches::is_audit_module_enabled;
-use crate::storage::access::{ReqInfo, request_context_from_req};
-use crate::storage::helper::{DenialRequest, DenialScope, authorization_denial_entry, spawn_background_with_context};
+use crate::storage::helper::{
+    AuditRequestView, DenialRequest, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
+    spawn_background_with_context,
+};
 use crate::storage::request_context::RequestContext;
 use rustfs_audit::{AuditEntry, global::AuditLogger};
 use rustfs_policy::policy::action::Action;
@@ -184,21 +186,32 @@ impl DenialAuditor {
         scope: DenialScope,
         now: Instant,
     ) {
+        self.audit_view_at(&AuditRequestView::legacy(req), now, || {
+            authorization_denial_entry(req, action, reason, scope)
+        });
+    }
+
+    /// Audits a denial for a request an owned edge decoded into `view`.
+    pub(crate) fn audit_owned(&self, view: &AuditRequestView<'_>, action: &Action, reason: &'static str, scope: DenialScope) {
+        self.audit_view_at(view, (self.clock)(), || authorization_denial_entry_for_view(view, action, reason, scope));
+    }
+
+    fn audit_view_at(&self, req: &AuditRequestView<'_>, now: Instant, build_entry: impl FnOnce() -> AuditEntry) {
         if !(self.enabled)() {
             return;
         }
-        let anonymous = req.extensions.get::<ReqInfo>().is_none_or(|info| info.cred.is_none());
+        let anonymous = req.req_info.is_none_or(|info| info.cred.is_none());
         let Admission::Emit { suppressed } = self.limiter.admit(anonymous, now) else {
             return;
         };
-        let mut entry = authorization_denial_entry(req, action, reason, scope);
+        let mut entry = build_entry();
         if suppressed > 0 {
             entry
                 .tags
                 .get_or_insert_with(Default::default)
                 .insert(SUPPRESSED_DENIALS_TAG.to_string(), Value::from(suppressed));
         }
-        (self.emit)(request_context_from_req(req), entry);
+        (self.emit)(req.request_context(), entry);
     }
 }
 

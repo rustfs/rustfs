@@ -89,6 +89,51 @@ enum ActionFamily {
     Mixed,
 }
 
+/// A requested KMS key identifier, reduced to what `key/<key_id>` patterns are
+/// written against.
+///
+/// Policies name a key by its id, and [`Resource`] validation refuses a key
+/// pattern containing a separator. An identifier reaching the matcher in any
+/// other spelling of the same key was therefore compared as a different key: a
+/// `Deny` on `key/<id>` did not cover a request naming that key by its AWS ARN.
+/// Only the spellings the AWS KMS API itself accepts are recognized; anything
+/// else is matched literally.
+#[derive(Debug, PartialEq)]
+pub enum RequestedKmsKey<'a> {
+    /// A key id, taken from the identifier itself or from a key ARN
+    /// (`arn:<partition>:kms:<region>:<account>:key/<key_id>`).
+    Key(&'a str),
+    /// An alias name or alias ARN: it names a key only the backend can resolve.
+    Alias,
+}
+
+impl<'a> RequestedKmsKey<'a> {
+    /// Whether two identifiers provably name the same key. An alias is never
+    /// provably the same key as anything, itself included.
+    pub fn same_key(left: &str, right: &str) -> bool {
+        matches!(
+            (RequestedKmsKey::parse(left), RequestedKmsKey::parse(right)),
+            (RequestedKmsKey::Key(left), RequestedKmsKey::Key(right)) if left == right
+        )
+    }
+
+    pub fn parse(identifier: &'a str) -> Self {
+        let fields: Vec<&str> = identifier.splitn(6, ':').collect();
+        let resource = match fields.as_slice() {
+            ["arn", _partition, "kms", _region, _account, resource] => *resource,
+            _ if identifier.starts_with(Resource::KMS_ALIAS_SEGMENT) => return Self::Alias,
+            _ => return Self::Key(identifier),
+        };
+        if resource.starts_with(Resource::KMS_ALIAS_SEGMENT) {
+            return Self::Alias;
+        }
+        match resource.strip_prefix(Resource::KMS_KEY_SEGMENT) {
+            Some(key_id) if !key_id.is_empty() && !key_id.contains('/') => Self::Key(key_id),
+            _ => Self::Key(identifier),
+        }
+    }
+}
+
 impl Statement {
     fn skips_resource_match_for_args(&self, args: &Args<'_>) -> bool {
         if self.is_sts() {
@@ -178,8 +223,9 @@ impl Statement {
     /// patterns instead of the bucket/object path grammar used by S3 statements.
     ///
     /// Call-site contract (wired up by the admin/SSE authorization paths): the requested
-    /// key identifier (pre-alias-resolution) travels in `args.object` with `args.bucket`
-    /// left empty. An empty `args.object` means the caller did not scope the request to a
+    /// key identifier travels in `args.object`, as the request spelled it, with `args.bucket`
+    /// left empty; [`RequestedKmsKey`] reduces it to the key id the patterns are written
+    /// against. An empty `args.object` means the caller did not scope the request to a
     /// key, which preserves the legacy match-every-key behaviour.
     async fn kms_key_scope_matches(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
         if self.not_resources.iter().any(|resource| matches!(resource, Resource::All)) {
@@ -223,7 +269,27 @@ impl Statement {
             return true;
         }
 
-        let requested = format!("{}{}", Resource::KMS_KEY_SEGMENT, args.object);
+        let key_id = match RequestedKmsKey::parse(args.object) {
+            RequestedKmsKey::Key(key_id) => key_id,
+            RequestedKmsKey::Alias => {
+                // Which key an alias names is known only to the backend, so a
+                // statement scoped to particular keys cannot be shown to cover
+                // or to exclude it. Fail closed in both directions: every
+                // key-scoped Deny applies, and only an Allow on all keys does.
+                return match self.effect {
+                    Effect::Deny => true,
+                    Effect::Allow => {
+                        kms_not_resources.is_empty()
+                            && kms_resources.iter().any(|resource| match resource {
+                                Resource::All => true,
+                                Resource::Kms(pattern) => pattern == "*",
+                                Resource::S3(_) => false,
+                            })
+                    }
+                };
+            }
+        };
+        let requested = format!("{}{}", Resource::KMS_KEY_SEGMENT, key_id);
 
         if !kms_resources.is_empty() {
             let mut matched = false;

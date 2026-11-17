@@ -8504,7 +8504,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
 
         handle.await.unwrap().unwrap();
@@ -8533,7 +8533,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
 
         handle.await.unwrap().unwrap();
@@ -9177,7 +9177,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
 
         handle.await.unwrap().unwrap();
@@ -9265,7 +9265,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9295,7 +9295,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9367,7 +9367,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9401,7 +9401,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9491,7 +9491,7 @@ mod test {
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
             assert!(entry.is_object(), "the directory-marker object must shadow the same-named prefix dir");
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9514,7 +9514,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9538,7 +9538,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 

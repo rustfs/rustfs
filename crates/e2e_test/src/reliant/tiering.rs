@@ -412,6 +412,7 @@ struct ManualTransitionRunReport {
     skipped_delete_marker: u64,
     skipped_directory: u64,
     skipped_replication: u64,
+    skipped_already_transitioned: u64,
     skipped_already_in_flight: u64,
     skipped_queue_full: u64,
     skipped_queue_closed: u64,
@@ -1214,9 +1215,16 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert!(!due.report.dry_run);
     assert!(due.report.lifecycle_config_found);
     assert_eq!(due.report.scanned, 1, "due report: {:#?}", due.report);
-    assert_eq!(due.report.eligible, 1, "due report: {:#?}", due.report);
+    // PUT can enqueue this object before the manual scan. Account for each
+    // terminal outcome without depending on how fast the tier worker runs.
     assert_eq!(
-        due.report.enqueued + due.report.skipped_already_in_flight,
+        due.report.eligible + due.report.skipped_already_transitioned,
+        1,
+        "due report: {:#?}",
+        due.report
+    );
+    assert_eq!(
+        due.report.enqueued + due.report.skipped_already_in_flight + due.report.skipped_already_transitioned,
         1,
         "due report: {:#?}",
         due.report
@@ -1225,12 +1233,34 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(due.report.skipped_delete_marker, 0);
     assert_eq!(due.report.skipped_directory, 0);
     assert_eq!(due.report.skipped_replication, 0);
+    assert_eq!(due.report.skipped_queue_full, 0);
+    assert_eq!(due.report.skipped_queue_closed, 0);
+    assert_eq!(due.report.skipped_queue_timeout, 0);
     assert_eq!(due.report.tier_failure, 0);
     assert!(!due.report.cancelled);
     assert!(!due.report.truncated_by_limit);
     assert!(!due.report.truncated_by_duration);
     wait_for_transition(&hot_client, MANUAL_DUE_BUCKET, MANUAL_DUE_KEY, StdDuration::from_secs(90)).await?;
     let remote_count_after_due = cold_tier_object_count(&cold_client).await?;
+    assert_eq!(remote_count_after_due, 1, "due object must have exactly one remote copy");
+
+    // Once HEAD observes the committed transition, a repeated manual scan must
+    // report the completed object and leave both local reads and the tier intact.
+    let repeated = manual_transition_run(&hot, MANUAL_DUE_BUCKET, "manual-due/", false).await?;
+    assert_eq!(repeated.state, "completed", "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.scanned, 1, "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.eligible, 0, "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.enqueued, 0, "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.skipped_already_transitioned, 1);
+    assert_eq!(repeated.report.skipped_already_in_flight, 0);
+    assert_eq!(cold_tier_object_count(&cold_client).await?, remote_count_after_due);
+    let due_object = hot_client
+        .get_object()
+        .bucket(MANUAL_DUE_BUCKET)
+        .key(MANUAL_DUE_KEY)
+        .send()
+        .await?;
+    assert_eq!(due_object.body.collect().await?.into_bytes().as_ref(), b"manual due object");
 
     hot_client.create_bucket().bucket(MANUAL_DRY_RUN_BUCKET).send().await?;
     enable_bucket_versioning(&hot_client, MANUAL_DRY_RUN_BUCKET).await?;
@@ -2286,6 +2316,14 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     )
     .await?;
 
+    // Configuration updates enqueue existing due objects. Observe their commit
+    // before paging so eligibility stays stable across the source restart.
+    for idx in 0..2 {
+        let key = format!("{MANUAL_CONTINUATION_PREFIX}obj-{idx:02}");
+        wait_for_transition(&hot_client, MANUAL_CONTINUATION_BUCKET, &key, StdDuration::from_secs(90)).await?;
+    }
+    assert_eq!(cold_tier_object_count(&cold_client).await?, 2);
+
     let first = manual_transition_run_with_max(&hot, MANUAL_CONTINUATION_BUCKET, MANUAL_CONTINUATION_PREFIX, true, 1).await?;
     assert_eq!(first.state, "partial", "first continuation page: {first:#?}");
     assert_eq!(first.mode, "enqueue_only");
@@ -2293,8 +2331,10 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     assert_eq!(first.report.prefix, MANUAL_CONTINUATION_PREFIX);
     assert!(first.report.dry_run);
     assert_eq!(first.report.scanned, 1, "first continuation page: {first:#?}");
-    assert_eq!(first.report.eligible, 1, "first continuation page: {first:#?}");
-    assert_eq!(first.report.dry_run_eligible, 1, "first continuation page: {first:#?}");
+    assert_eq!(first.report.eligible, 0, "first continuation page: {first:#?}");
+    assert_eq!(first.report.dry_run_eligible, 0, "first continuation page: {first:#?}");
+    assert_eq!(first.report.skipped_already_transitioned, 1);
+    assert_eq!(first.report.enqueued, 0);
     assert_eq!(first.report.tier_failure, 0);
     assert!(!first.report.cancelled);
     assert!(first.report.truncated_by_limit);
@@ -2321,12 +2361,15 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     .await?;
     assert_eq!(second.state, "completed", "second continuation page: {second:#?}");
     assert_eq!(second.report.scanned, 1, "second continuation page: {second:#?}");
-    assert_eq!(second.report.eligible, 1, "second continuation page: {second:#?}");
-    assert_eq!(second.report.dry_run_eligible, 1, "second continuation page: {second:#?}");
+    assert_eq!(second.report.eligible, 0, "second continuation page: {second:#?}");
+    assert_eq!(second.report.dry_run_eligible, 0, "second continuation page: {second:#?}");
+    assert_eq!(second.report.skipped_already_transitioned, 1);
+    assert_eq!(second.report.enqueued, 0);
     assert_eq!(second.report.tier_failure, 0);
     assert!(!second.report.cancelled);
     assert!(!second.report.truncated_by_limit);
     assert!(second.report.continuation_token.is_none());
+    assert_eq!(cold_tier_object_count(&cold_client).await?, 2);
 
     Ok(())
 }

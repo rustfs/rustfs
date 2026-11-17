@@ -935,12 +935,20 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
 /// a fixed body length when locating the authenticated trailer. Clamping it
 /// to `0` would claim an empty body and misframe the stream. `0` stays `0`
 /// because a genuinely empty object still means an empty body.
-fn bitrot_create_file_size(length: i64, shard_size: usize, checksum_algo: &HashAlgorithm) -> i64 {
+fn bitrot_create_file_size(length: i64, shard_size: usize, checksum_algo: &HashAlgorithm) -> disk::error::Result<i64> {
     if length <= 0 {
-        return length;
+        return Ok(length);
     }
-    let length = length as usize;
-    (length.div_ceil(shard_size) * checksum_algo.size() + length) as i64
+    if shard_size == 0 {
+        return Err(DiskError::other("bitrot shard size is zero"));
+    }
+    let payload = usize::try_from(length).map_err(|_| DiskError::other("bitrot shard length exceeds usize"))?;
+    let framed = payload
+        .div_ceil(shard_size)
+        .checked_mul(checksum_algo.size())
+        .and_then(|overhead| payload.checked_add(overhead))
+        .ok_or_else(|| DiskError::other("bitrot framed length overflows"))?;
+    i64::try_from(framed).map_err(|_| DiskError::other("bitrot framed length exceeds i64"))
 }
 
 pub async fn create_bitrot_writer(
@@ -966,15 +974,19 @@ pub async fn create_bitrot_writer_with_orig_volume(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
 ) -> disk::error::Result<BitrotWriterWrapper> {
+    let framed_length = bitrot_create_file_size(length, shard_size, &checksum_algo)?;
     let writer = if is_inline_buffer {
-        CustomWriter::new_inline_buffer()
+        if framed_length < 0 {
+            CustomWriter::new_inline_buffer()
+        } else {
+            let limit = usize::try_from(framed_length).map_err(|_| DiskError::other("inline buffer limit exceeds usize"))?;
+            CustomWriter::new_bounded_inline_buffer(limit)
+        }
     } else if let Some(disk) = disk {
-        let length = bitrot_create_file_size(length, shard_size, &checksum_algo);
-
-        let file = disk.create_file(origvolume, volume, path, length).await?;
+        let file = disk.create_file(origvolume, volume, path, framed_length).await?;
         #[cfg(feature = "hotpath")]
         let file = instrument_raw_shard_writer(file, disk.is_local());
-        CustomWriter::new_tokio_writer(file)
+        CustomWriter::from_file_writer(file)
     } else {
         return Err(DiskError::DiskNotFound);
     };
@@ -1168,21 +1180,39 @@ mod tests {
 
     #[test]
     fn bitrot_create_file_size_grows_known_length_by_checksums() {
-        // 10 bytes over 4-byte shards = 3 shards, each followed by a 32-byte hash.
-        assert_eq!(bitrot_create_file_size(10, 4, &HashAlgorithm::HighwayHash256), 10 + 3 * 32);
-        assert_eq!(bitrot_create_file_size(10, 4, &HashAlgorithm::None), 10);
+        // 10 bytes over 4-byte shards = 3 frames with a 32-byte prefix each.
+        assert_eq!(
+            bitrot_create_file_size(10, 4, &HashAlgorithm::HighwayHash256).expect("known frame size"),
+            10 + 3 * 32
+        );
+        assert_eq!(bitrot_create_file_size(10, 4, &HashAlgorithm::None).expect("unhashed frame size"), 10);
     }
 
     #[test]
     fn bitrot_create_file_size_keeps_empty_and_unknown_distinct() {
-        assert_eq!(bitrot_create_file_size(0, 4, &HashAlgorithm::HighwayHash256), 0);
+        assert_eq!(
+            bitrot_create_file_size(0, 4, &HashAlgorithm::HighwayHash256).expect("empty frame size"),
+            0
+        );
         // SSE/compression streams advertise SIZE_PRESERVE_LAYER (-1); the remote
         // put_file_stream receiver relies on a non-positive size to parse the auth
         // trailer from the stream tail, so the sentinel must survive untouched.
         assert_eq!(
-            bitrot_create_file_size(rustfs_rio::HashReader::SIZE_PRESERVE_LAYER, 4, &HashAlgorithm::HighwayHash256),
+            bitrot_create_file_size(rustfs_rio::HashReader::SIZE_PRESERVE_LAYER, 4, &HashAlgorithm::HighwayHash256)
+                .expect("unknown length sentinel"),
             rustfs_rio::HashReader::SIZE_PRESERVE_LAYER
         );
+    }
+
+    #[test]
+    fn bitrot_create_file_size_rejects_invalid_geometry_and_overflow() {
+        assert!(bitrot_create_file_size(1, 0, &HashAlgorithm::HighwayHash256S).is_err());
+        assert!(bitrot_create_file_size(i64::MAX, 1, &HashAlgorithm::HighwayHash256S).is_err());
+        assert_eq!(
+            bitrot_create_file_size(-7, 0, &HashAlgorithm::HighwayHash256S).expect("negative sentinel"),
+            -7
+        );
+        assert_eq!(bitrot_create_file_size(0, 0, &HashAlgorithm::HighwayHash256S).expect("empty body"), 0);
     }
 
     struct TestChunkReader {
@@ -2116,6 +2146,28 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_inline_bitrot_writer_counts_each_frame_header() {
+        let mut writer = create_bitrot_writer(true, None, "bucket", "object", 6, 4, HashAlgorithm::HighwayHash256S)
+            .await
+            .expect("bounded inline writer");
+        writer.write(b"abcd").await.expect("first full frame");
+        writer.write(b"ef").await.expect("final partial frame");
+        let raw = writer.into_inline_data().expect("export framed bytes");
+        assert_eq!(raw.len(), 6 + 2 * 32);
+        let mut exact = create_bitrot_writer(true, None, "bucket", "object", 4, 4, HashAlgorithm::HighwayHash256S)
+            .await
+            .expect("exact bounded writer");
+        exact.write(b"abcd").await.expect("fill admitted frame");
+        assert!(exact.write(b"e").await.is_err());
+        assert_eq!(exact.into_inline_data().expect("intact first frame").len(), 4 + 32);
+        assert!(
+            create_bitrot_writer(true, None, "bucket", "object", 1, 0, HashAlgorithm::HighwayHash256S)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

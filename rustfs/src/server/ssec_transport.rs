@@ -49,6 +49,7 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service};
 use tracing::warn;
 
+use crate::shared_types::NativeTlsTransport;
 use crate::storage_api::server::layer::request_context::RequestContext;
 
 /// Opt in to refusing SSE-C on a plaintext transport. Default `false` for this
@@ -62,10 +63,6 @@ pub(crate) const METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL: &str = "rustfs_ssec_plain
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
-
-/// Set only by the listener stack; proxy protocol assertions do not establish this marker.
-#[derive(Clone, Copy)]
-pub(crate) struct NativeTlsTransport(pub(crate) bool);
 
 /// Every header that carries, or announces, a customer-provided key: the
 /// object's own triple and the copy-source triple that CopyObject and
@@ -95,7 +92,7 @@ fn carries_ssec_headers(headers: &HeaderMap) -> bool {
 /// protocol is only consulted as a second source because the trusted-proxy
 /// layer has already decided whether the peer is allowed to assert it; a
 /// request that arrives direct carries no such assertion.
-fn is_secure_transport(connection_is_tls: bool, client_info: Option<&ClientInfo>) -> bool {
+pub(crate) fn is_secure_transport(connection_is_tls: bool, client_info: Option<&ClientInfo>) -> bool {
     if connection_is_tls {
         return true;
     }
@@ -104,7 +101,7 @@ fn is_secure_transport(connection_is_tls: bool, client_info: Option<&ClientInfo>
         .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
 }
 
-fn require_tls() -> bool {
+pub(crate) fn require_tls() -> bool {
     rustfs_utils::get_env_bool(ENV_SSE_C_REQUIRE_TLS, DEFAULT_SSE_C_REQUIRE_TLS)
 }
 
@@ -140,9 +137,7 @@ fn ssec_requires_tls_response(request_id: Option<&str>) -> Response<BoxBody> {
          <Message>Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.</Message>\
          {request_id_xml}</Error>"
     );
-    let body: BoxBody = Full::new(Bytes::from(body))
-        .map_err(|e| -> BoxError { Box::new(e) })
-        .boxed_unsync();
+    let body: BoxBody = Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync();
 
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::BAD_REQUEST;

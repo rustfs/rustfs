@@ -359,6 +359,25 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}/{*prefix}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/background-heal/status", HEAL, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v4/heal/mrf/cluster", HEAL, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/mrf/cluster/responsibilities",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/mrf/cluster/responsibilities/{node_id}/{id}",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/heal/mrf/cluster/responsibilities/actions",
+        HEAL,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v4/heal/mrf/responsibilities",
@@ -430,6 +449,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Delete,
         "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
         CONFIG_UPDATE,
         RouteRiskLevel::High,
     ),
@@ -1841,6 +1878,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/account/permissions",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
     // The self-service account routes act on the caller, never on a target
     // named in the request, so they gate on possession of the credential (plus,
     // for the mutation, knowledge of the current secret) rather than on an
@@ -2012,6 +2054,18 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/list-remote-targets",
         DeferredRoutePolicyReason::CredentialOnly,
     ),
+    // S3-shaped extension routes (handlers::s3_extension), keyed `?<sub-resource>/<bucket>`.
+    // Each authorizes one S3 action on the bucket: reset and reset-status
+    // s3:ResetBucketReplicationState, check s3:PutReplicationConfiguration, both
+    // metrics s3:GetReplicationConfiguration; the listen routes
+    // s3:ListenNotification and s3:ListenBucketNotification.
+    deferred(HttpMethod::Put, "?replication-reset/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-reset-status/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-check/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-metrics=2/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-metrics/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?events/", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?events/{bucket}", DeferredRoutePolicyReason::S3Action),
 ];
 
 #[allow(
@@ -2599,6 +2653,11 @@ mod tests {
             DeferredRoutePolicyReason::MultipleActions,
         );
         assert_deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action);
+        assert_deferred(
+            HttpMethod::Post,
+            "/rustfs/admin/v4/account/permissions",
+            DeferredRoutePolicyReason::CredentialOnly,
+        );
         assert_deferred(
             HttpMethod::Post,
             "/rustfs/admin/v3/object-zip-downloads",

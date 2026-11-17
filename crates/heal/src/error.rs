@@ -291,6 +291,8 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
         | EcstoreError::VolumeNotFound
         | EcstoreError::FaultyDisk
         | EcstoreError::FaultyRemoteDisk
+        | EcstoreError::TooManyOpenFiles
+        | EcstoreError::OutdatedXLMeta
         | EcstoreError::SlowDown
         | EcstoreError::DeleteRecoveryWorkLimit
         | EcstoreError::OperationCanceled
@@ -319,6 +321,8 @@ pub(crate) fn classify_disk_error(error: &DiskError) -> HealErrorClass {
         | DiskError::SourceStalled
         | DiskError::FaultyRemoteDisk
         | DiskError::FaultyDisk
+        | DiskError::TooManyOpenFiles
+        | DiskError::OutdatedXLMeta
         | DiskError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
         DiskError::Io(error) => classify_io_error(error),
         _ => classify_error_display(&error.to_string()).unwrap_or(HealErrorClass::Permanent),
@@ -570,7 +574,7 @@ mod tests {
             tonic::Status::internal("operation was canceled"),
         ] {
             assert!(
-                !Error::Storage(EcstoreError::from(status).clone()).is_recoverable_heal(),
+                !Error::Storage(EcstoreError::from(status)).is_recoverable_heal(),
                 "cancellation text alone must not change application error classification"
             );
         }
@@ -718,7 +722,7 @@ mod tests {
             for error in [
                 Error::Disk(DiskError::from(status.clone())),
                 Error::Storage(EcstoreError::from(status.clone())),
-                Error::Io(std::io::Error::from(DiskError::from(status.clone()))),
+                Error::Io(std::io::Error::from(DiskError::from(status))),
             ] {
                 assert!(!error.is_recoverable_heal(), "application RPC errors must stay terminal: {error:?}");
             }
@@ -788,6 +792,18 @@ mod tests {
         assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyDisk).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyRemoteDisk).is_recoverable_heal());
+    }
+
+    #[test]
+    fn concurrent_metadata_and_capacity_errors_are_recoverable() {
+        for error in [
+            Error::Disk(DiskError::OutdatedXLMeta),
+            Error::Storage(EcstoreError::OutdatedXLMeta),
+            Error::Disk(DiskError::TooManyOpenFiles),
+            Error::Storage(EcstoreError::TooManyOpenFiles),
+        ] {
+            assert!(error.is_recoverable_heal(), "transient heal failure must be retried: {error:?}");
+        }
     }
 
     #[test]

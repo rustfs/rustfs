@@ -21,14 +21,15 @@ use crate::backends::vault_credentials::{
 };
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
-    classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_rewrap_context_matches,
-    ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key, validate_key_id_segment,
+    classify_listed_key_failure, destruction_requires_pending_deletion, empty_key_page, ensure_key_state_permits,
+    ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
+    validate_key_id_segment,
 };
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
 use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
-use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
+use crate::policy::{self, AttemptError, OpClass, OwnWrite, OwnWrites, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
 use base64_simd::STANDARD as BASE64;
@@ -57,9 +58,15 @@ use vaultrs::{
 use zeroize::Zeroizing;
 
 /// Attempt budget for metadata read-modify-write cycles: every check-and-set
-/// conflict triggers a fresh read plus state-gate re-validation, never a blind
-/// replay of the stale snapshot.
-const METADATA_CAS_ATTEMPTS: usize = 3;
+/// conflict triggers a pause ([`policy::stale_read_backoff`]), a fresh read
+/// and state-gate re-validation, never a blind replay of the stale snapshot.
+/// The pause matters when reads are answered by a replica that has not applied
+/// the winning write yet: an immediate re-read would return the same snapshot.
+const METADATA_CAS_ATTEMPTS: u32 = 5;
+
+/// The sole error message of the 400 Vault Transit returns when a data-path
+/// call names a key that does not exist.
+const TRANSIT_KEY_NOT_FOUND_MESSAGE: &str = "encryption key not found";
 
 /// TTL bound on cached metadata records. This caps how long one node can keep
 /// acting on lifecycle state another node has since changed (disable,
@@ -99,6 +106,15 @@ fn is_cas_conflict(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::APIError { code: 400, errors } if errors.iter().any(|message| message.contains("check-and-set"))
+    )
+}
+
+/// Whether a transit key delete was refused because the key's
+/// `deletion_allowed` switch reads as off.
+fn is_deletion_not_allowed(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::APIError { code: 400, errors } if errors.iter().any(|message| message.contains("deletion is not allowed"))
     )
 }
 
@@ -396,6 +412,9 @@ pub struct VaultTransitKmsClient {
     /// [`METADATA_CACHE_TTL`]): a lifecycle change made by another node
     /// becomes visible here within one TTL window at the latest.
     metadata_cache: Cache<String, TransitKeyMetadata>,
+    /// What this client last did to each metadata record it wrote, so a read
+    /// answered by a lagging replica is re-read instead of trusted.
+    own_metadata_writes: OwnWrites,
     /// Budgets wrapping every outbound Vault call (see `crate::policy`).
     retry: RetryPolicy,
     /// Cancellation point for the operation executor: aborts in-flight
@@ -442,6 +461,7 @@ impl VaultTransitKmsClient {
                 .max_capacity(METADATA_CACHE_CAPACITY)
                 .time_to_live(METADATA_CACHE_TTL)
                 .build(),
+            own_metadata_writes: OwnWrites::new(),
             retry,
             cancel: CancellationToken::new(),
         })
@@ -486,6 +506,14 @@ impl VaultTransitKmsClient {
         match error {
             vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
             vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+            // Transit answers decrypt and rewrap for a key that does not exist
+            // with a 400, not the 404 a key read gets. Left as a backend error
+            // it would surface as a retryable outage instead of a missing key.
+            vaultrs::error::ClientError::APIError { code: 400, ref errors }
+                if errors.iter().any(|message| message == TRANSIT_KEY_NOT_FOUND_MESSAGE) =>
+            {
+                KmsError::key_not_found(key_id)
+            }
             other => KmsError::backend_error(format!("Vault Transit {operation} failed for key {key_id}: {other}")),
         }
     }
@@ -628,6 +656,19 @@ impl VaultTransitKmsClient {
 
     async fn read_metadata_from_kv(&self, key_id: &str) -> Result<Option<TransitKeyMetadata>> {
         let path = self.metadata_key_path(key_id)?;
+        // This read carries no KV2 version, so it can only tell that a record
+        // this client wrote is missing or that one it deleted is still served.
+        self.own_metadata_writes
+            .read(
+                &path,
+                || self.read_metadata_from_kv_once(key_id),
+                |result, own| matches!((result, own), (Ok(None), OwnWrite::Version(_)) | (Ok(Some(_)), OwnWrite::Deleted)),
+            )
+            .await
+    }
+
+    async fn read_metadata_from_kv_once(&self, key_id: &str) -> Result<Option<TransitKeyMetadata>> {
+        let path = self.metadata_key_path(key_id)?;
         let path = path.as_str();
         self.run("vault_transit_read_metadata", OpClass::ReadIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
@@ -652,6 +693,21 @@ impl VaultTransitKmsClient {
     /// holding it, so a later write can be check-and-set against exactly this
     /// snapshot. `None` means no record exists (a pre-persistence key).
     async fn read_metadata_from_kv_versioned(&self, key_id: &str) -> Result<Option<(u32, TransitKeyMetadata)>> {
+        let path = self.metadata_key_path(key_id)?;
+        self.own_metadata_writes
+            .read(
+                &path,
+                || self.read_metadata_from_kv_versioned_once(key_id),
+                |result, own| match (result, own) {
+                    (Ok(Some((version, _))), OwnWrite::Version(written)) => *version < written,
+                    (Ok(None), OwnWrite::Version(_)) | (Ok(Some(_)), OwnWrite::Deleted) => true,
+                    _ => false,
+                },
+            )
+            .await
+    }
+
+    async fn read_metadata_from_kv_versioned_once(&self, key_id: &str) -> Result<Option<(u32, TransitKeyMetadata)>> {
         let path = self.metadata_key_path(key_id)?;
         let path = path.as_str();
 
@@ -706,19 +762,31 @@ impl VaultTransitKmsClient {
         let path = path.as_str();
         let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
         let persisted = &persisted;
-        self.run("vault_transit_cas_write_metadata", OpClass::MutatingNonIdempotent, move || async move {
-            let vault = self.vault().map_err(AttemptError::fatal)?;
-            match kv2::set_with_options(&vault.client, &self.metadata_kv_mount, path, persisted, SetSecretRequestOptions { cas })
+        let written = self
+            .run("vault_transit_cas_write_metadata", OpClass::MutatingNonIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::set_with_options(
+                    &vault.client,
+                    &self.metadata_kv_mount,
+                    path,
+                    persisted,
+                    SetSecretRequestOptions { cas },
+                )
                 .await
-            {
-                Ok(_) => Ok(true),
-                Err(e) if is_cas_conflict(&e) => Ok(false),
-                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                    KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}"))
-                })),
-            }
-        })
-        .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(e) if is_cas_conflict(&e) => Ok(false),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}"))
+                    })),
+                }
+            })
+            .await?;
+        if written {
+            // A check-and-set write against version `cas` produces `cas + 1`.
+            self.own_metadata_writes.wrote(path, cas.saturating_add(1)).await;
+        }
+        Ok(written)
     }
 
     /// The error surfaced when a metadata read-modify-write exhausts its
@@ -744,7 +812,9 @@ impl VaultTransitKmsClient {
                 })),
             }
         })
-        .await
+        .await?;
+        self.own_metadata_writes.deleted(path).await;
+        Ok(())
     }
 
     /// Flip `deletion_allowed` on the transit key so it can be deleted.
@@ -767,20 +837,36 @@ impl VaultTransitKmsClient {
     }
 
     /// Physically delete the transit key material in Vault.
+    /// Delete the transit key. Callers enable deletion on it first.
+    ///
+    /// A replica that validates the delete against its own copy of the key
+    /// refuses it until it has applied the write that enabled deletion, so
+    /// that one refusal is retried after a pause instead of reported.
     async fn delete_transit_key(&self, key_id: &str) -> Result<()> {
         validate_key_id_segment(key_id)?;
-        self.run("vault_transit_delete_key", OpClass::MutatingNonIdempotent, move || async move {
-            let vault = self.vault().map_err(AttemptError::fatal)?;
-            key::delete(&vault.client, &self.config.mount_path, key_id)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| {
-                        KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}"))
-                    })
+        for attempt in 1..=METADATA_CAS_ATTEMPTS {
+            let deleted = self
+                .run("vault_transit_delete_key", OpClass::MutatingNonIdempotent, move || async move {
+                    let vault = self.vault().map_err(AttemptError::fatal)?;
+                    match key::delete(&vault.client, &self.config.mount_path, key_id).await {
+                        Ok(_) => Ok(true),
+                        Err(e) if attempt < METADATA_CAS_ATTEMPTS && is_deletion_not_allowed(&e) => Ok(false),
+                        Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                            KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}"))
+                        })),
+                    }
                 })
-        })
-        .await
+                .await?;
+            if deleted {
+                break;
+            }
+            debug!(
+                key_id,
+                attempt, "Vault Transit delete was refused before the deletion switch was visible; retrying"
+            );
+            policy::stale_read_backoff(attempt).await;
+        }
+        Ok(())
     }
 
     async fn get_key_metadata(&self, key_id: &str) -> Result<TransitKeyMetadata> {
@@ -790,7 +876,7 @@ impl VaultTransitKmsClient {
             return Ok(metadata);
         }
 
-        for _ in 0..METADATA_CAS_ATTEMPTS {
+        for attempt in 1..=METADATA_CAS_ATTEMPTS {
             // On cache miss, try reading from the persistent KV store.
             if let Some(persisted) = self.read_metadata_from_kv(key_id).await? {
                 self.metadata_cache.insert(key_id.to_string(), persisted.clone()).await;
@@ -815,6 +901,9 @@ impl VaultTransitKmsClient {
             if self.cas_write_metadata_to_kv(key_id, &metadata, 0).await? {
                 self.metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
                 return Ok(metadata);
+            }
+            if attempt < METADATA_CAS_ATTEMPTS {
+                policy::stale_read_backoff(attempt).await;
             }
         }
         Err(Self::metadata_cas_conflict(key_id))
@@ -846,7 +935,7 @@ impl VaultTransitKmsClient {
     where
         F: FnMut(&mut TransitKeyMetadata) -> Result<()>,
     {
-        for _ in 0..METADATA_CAS_ATTEMPTS {
+        for attempt in 1..=METADATA_CAS_ATTEMPTS {
             let (cas, mut metadata) = match self.read_metadata_from_kv_versioned(key_id).await? {
                 Some(snapshot) => snapshot,
                 None => {
@@ -864,6 +953,9 @@ impl VaultTransitKmsClient {
                 return Ok(metadata);
             }
             self.metadata_cache.invalidate(key_id).await;
+            if attempt < METADATA_CAS_ATTEMPTS {
+                policy::stale_read_backoff(attempt).await;
+            }
         }
         Err(Self::metadata_cas_conflict(key_id))
     }
@@ -1709,25 +1801,35 @@ impl KmsBackend for VaultTransitKmsBackend {
         let mut key_metadata = self.client.key_metadata_response(&key_id).await?;
 
         let deletion_date = if request.force_immediate.unwrap_or(false) {
-            if key_metadata.key_state == KeyState::PendingDeletion {
-                if !self.client.read_transit_key(&key_id).await?.deletion_allowed {
-                    self.client.allow_transit_key_deletion(&key_id).await?;
-                }
-                self.client.delete_transit_key(&key_id).await?;
-                self.client.delete_key_metadata(&key_id).await?;
-                None
-            } else {
-                let now = Zoned::now();
-                self.client
-                    .mutate_key_metadata(&key_id, |metadata| {
-                        metadata.key_state = KeyState::PendingDeletion;
-                        metadata.deletion_date = Some(now.clone());
+            // Expedited destruction only skips the rest of the waiting window:
+            // the key must already be pending deletion (or be a tombstone left
+            // by a crashed removal, which may simply be completed).
+            //
+            // Tombstone first, as the expired-key sweep does: an Unavailable
+            // record is rejected by every state gate, so a crash before the
+            // Transit key is destroyed leaves a key that is already unusable.
+            // Re-checked against every fresh snapshot: a concurrent
+            // cancellation that commits first fails this removal.
+            let now = Zoned::now();
+            self.client
+                .mutate_key_metadata(&key_id, |metadata| match metadata.key_state {
+                    KeyState::PendingDeletion | KeyState::Unavailable => {
+                        metadata.key_state = KeyState::Unavailable;
                         Ok(())
-                    })
-                    .await?;
-                key_metadata = self.client.key_metadata_response(&key_id).await?;
-                None
+                    }
+                    KeyState::Enabled | KeyState::Disabled | KeyState::PendingImport => {
+                        Err(destruction_requires_pending_deletion(&key_id))
+                    }
+                })
+                .await?;
+            if !self.client.read_transit_key(&key_id).await?.deletion_allowed {
+                self.client.allow_transit_key_deletion(&key_id).await?;
             }
+            self.client.delete_transit_key(&key_id).await?;
+            self.client.delete_key_metadata(&key_id).await?;
+            key_metadata.key_state = KeyState::PendingDeletion;
+            key_metadata.deletion_date = Some(now);
+            None
         } else {
             ensure_key_state_permits(&key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
@@ -1850,7 +1952,7 @@ impl KmsBackend for VaultTransitKmsBackend {
         // and the sweep backs off) or after it (the cancel's own
         // check-and-set write fails).
         let mut tombstoned = false;
-        for _ in 0..METADATA_CAS_ATTEMPTS {
+        for attempt in 1..=METADATA_CAS_ATTEMPTS {
             let Some((cas, mut metadata)) = self.client.read_metadata_from_kv_versioned(key_id).await? else {
                 // No persisted lifecycle record (pre-persistence key): the
                 // worker never destroys material whose scheduling state was
@@ -1878,6 +1980,9 @@ impl KmsBackend for VaultTransitKmsBackend {
                         // Lost the check-and-set race — most likely a
                         // concurrent cancel; re-read and re-decide.
                         self.client.metadata_cache.invalidate(key_id).await;
+                        if attempt < METADATA_CAS_ATTEMPTS {
+                            policy::stale_read_backoff(attempt).await;
+                        }
                         continue;
                     }
                 }
@@ -2720,7 +2825,7 @@ mod tests {
     async fn wired_disable_cas_conflict_budget_is_bounded() {
         let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
         let mut responses = Vec::new();
-        for cycle in 0..3u64 {
+        for cycle in 0..u64::from(METADATA_CAS_ATTEMPTS) {
             responses.push(ScriptedResponse::ok(kv2_metadata_read_data(cycle + 1)));
             responses.push(ScriptedResponse::ok(metadata_read_data(&enabled)));
             responses.push(ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE));
@@ -2738,7 +2843,104 @@ mod tests {
         );
 
         let requests = vault.requests();
-        assert_eq!(requests.len(), 9, "exactly three read+read+write cycles, no blind replays: {requests:?}");
+        assert_eq!(
+            requests.len(),
+            3 * METADATA_CAS_ATTEMPTS as usize,
+            "one read+read+write cycle per attempt, no blind replays: {requests:?}"
+        );
+    }
+
+    /// A replica that answers reads may keep returning the metadata version a
+    /// lost write was based on. The loop pauses between attempts and keeps
+    /// re-reading until the winning version is visible instead of spending the
+    /// whole budget on the same stale snapshot.
+    #[tokio::test]
+    async fn wired_disable_outlasts_a_replica_that_lags_the_winning_write() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut responses = Vec::new();
+        for _ in 1..METADATA_CAS_ATTEMPTS {
+            responses.push(ScriptedResponse::ok(kv2_metadata_read_data(1)));
+            responses.push(ScriptedResponse::ok(metadata_read_data(&enabled)));
+            responses.push(ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE));
+        }
+        responses.push(ScriptedResponse::ok(kv2_metadata_read_data(2)));
+        responses.push(ScriptedResponse::ok(metadata_read_data(&enabled)));
+        responses.push(ScriptedResponse::ok(kv2_write_ack()));
+        let (vault, client) = scripted_client(responses).await;
+
+        client
+            .disable_key("wired-key", None)
+            .await
+            .expect("the write must land once the replica serves the winning version");
+
+        assert_eq!(vault.requests().len(), 3 * METADATA_CAS_ATTEMPTS as usize, "{:?}", vault.requests());
+    }
+
+    /// A lifecycle change that follows this client's own change of the same
+    /// key must be decided on the state that change left, not on the state a
+    /// lagging replica still serves for it.
+    #[tokio::test]
+    async fn wired_lifecycle_read_after_own_write_outlasts_a_lagging_replica() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut disabled = enabled.clone();
+        disabled.key_state = KeyState::Disabled;
+        let (vault, client) = scripted_client(vec![
+            // disable_key: versioned read of version 1, write lands as version 2.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // enable_key: the replica still serves version 1, then catches up.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(metadata_read_data(&disabled)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        client.disable_key("wired-key", None).await.expect("disable");
+        client.enable_key("wired-key", None).await.expect("enable");
+
+        let bodies = vault.request_bodies();
+        assert_eq!(bodies.len(), 8, "{:?}", vault.requests());
+        let enable_write: serde_json::Value =
+            serde_json::from_str(bodies.last().expect("final write")).expect("write body is JSON");
+        assert_eq!(enable_write["options"]["cas"], serde_json::json!(2), "{enable_write}");
+    }
+
+    /// The delete that follows enabling deletion may reach a replica that has
+    /// not applied the switch yet and refuses on its own stale copy.
+    #[tokio::test]
+    async fn wired_transit_delete_outlasts_a_replica_that_lags_the_deletion_switch() {
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::error(400, "error deleting policy wired-key: deletion is not allowed for this key"),
+            ScriptedResponse::error(400, "error deleting policy wired-key: deletion is not allowed for this key"),
+            ScriptedResponse::ok(serde_json::Value::Null),
+        ])
+        .await;
+
+        client
+            .delete_transit_key("wired-key")
+            .await
+            .expect("the delete must land once the replica has the switch");
+        assert_eq!(vault.requests().len(), 3, "{:?}", vault.requests());
+    }
+
+    /// A key whose deletion stays refused is reported, after a bounded number
+    /// of attempts, with the backend's own answer.
+    #[tokio::test]
+    async fn wired_transit_delete_refusal_is_bounded() {
+        let refusals = (0..METADATA_CAS_ATTEMPTS)
+            .map(|_| ScriptedResponse::error(400, "error deleting policy wired-key: deletion is not allowed for this key"))
+            .collect();
+        let (vault, client) = scripted_client(refusals).await;
+
+        let error = client
+            .delete_transit_key("wired-key")
+            .await
+            .expect_err("a delete that stays refused must fail");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+        assert_eq!(vault.requests().len(), METADATA_CAS_ATTEMPTS as usize, "{:?}", vault.requests());
     }
 
     #[tokio::test]
@@ -3002,6 +3204,149 @@ mod tests {
         assert!(
             requests[3].starts_with("GET ") && requests[4].starts_with("GET "),
             "the recovery pass must be reads only: {requests:?}"
+        );
+    }
+
+    /// Transit reports a missing key on the data path as a 400. Reads of
+    /// objects under a destroyed key must see a missing key, not a backend
+    /// outage the client is told to retry.
+    #[tokio::test]
+    async fn wired_decrypt_under_a_destroyed_transit_key_reports_key_not_found() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(400, TRANSIT_KEY_NOT_FOUND_MESSAGE)]).await;
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: b"vault:v1:AAAA".to_vec(),
+            nonce: Vec::new(),
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: Some(1),
+            context_binding: None,
+        };
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&envelope).expect("serialize envelope"),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("decrypting under a destroyed key must fail");
+        assert!(matches!(&error, KmsError::KeyNotFound { .. }), "got {error:?}");
+        assert_eq!(
+            vault.requests(),
+            ["POST /v1/transit/decrypt/wired-key"],
+            "a missing key must not be retried"
+        );
+    }
+
+    /// Destruction always passes through the cancellable pending state. An
+    /// immediate deletion of a key that was never scheduled is refused without
+    /// writing anything: parking it in PendingDeletion and reporting success
+    /// would tell the caller a key is gone while every object under it stays
+    /// readable.
+    #[tokio::test]
+    async fn wired_immediate_deletion_of_an_enabled_key_is_refused_without_writing() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let vault = ScriptedVault::serve(vec![
+            // Current key metadata.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            // The check-and-set read observes a key that is not pending.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        let error = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some("wired-key".to_string()),
+            })
+            .await
+            .expect_err("a key that is not pending deletion must not be destroyed in one request");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("not pending deletion")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert!(
+            requests.iter().all(|line| line.starts_with("GET ")),
+            "a refused immediate deletion must neither write nor delete: {requests:?}"
+        );
+    }
+
+    /// The other half: once the key is pending deletion, one immediate request
+    /// tombstones the metadata, destroys the Transit key and removes the record.
+    #[tokio::test]
+    async fn wired_immediate_deletion_of_a_pending_key_destroys_it() {
+        let mut pending = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        pending.key_state = KeyState::PendingDeletion;
+        pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+        let vault = ScriptedVault::serve(vec![
+            // Current key metadata for the response.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&pending)),
+            // Check-and-set tombstone.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&pending)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // Transit refuses deletion until the key is configured to allow it.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(serde_json::Value::Null),
+            // Transit key, then its metadata record.
+            ScriptedResponse::ok(serde_json::Value::Null),
+            ScriptedResponse::ok(serde_json::Value::Null),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        let response = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some("wired-key".to_string()),
+            })
+            .await
+            .expect("immediate deletion of a pending key should succeed");
+        assert!(response.deletion_date.is_none(), "a destroyed key has no future deadline to report");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 9, "{requests:?}");
+        let tombstone: serde_json::Value = serde_json::from_str(&vault.request_bodies()[4]).expect("tombstone body is JSON");
+        assert_eq!(tombstone["options"]["cas"], serde_json::json!(1), "{tombstone}");
+        assert_eq!(tombstone["data"]["key_state"], serde_json::json!("Unavailable"), "{tombstone}");
+        assert_eq!(
+            requests[7], "DELETE /v1/transit/keys/wired-key",
+            "the transit key must be destroyed: {requests:?}"
+        );
+        assert_eq!(
+            requests[8],
+            format!("DELETE {METADATA_VERSION_PATH}"),
+            "the metadata record must be removed: {requests:?}"
         );
     }
 
