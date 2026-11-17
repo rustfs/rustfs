@@ -13825,7 +13825,9 @@ mod tests {
         let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
         let sys = sys.read().await.clone();
         let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
-        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        metadata
+            .update_config(crate::bucket::metadata::BUCKET_TABLE_CONFIG, br#"{"enabled":true}"#.to_vec())
+            .expect("table bucket configuration should update its identity");
         sys.persist_and_set(metadata)
             .await
             .expect("table bucket marker should be persisted");
@@ -14067,7 +14069,9 @@ mod tests {
         let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
         let sys = sys.read().await.clone();
         let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
-        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        metadata
+            .update_config(crate::bucket::metadata::BUCKET_TABLE_CONFIG, br#"{"enabled":true}"#.to_vec())
+            .expect("table bucket configuration should update its identity");
         sys.persist_and_set(metadata)
             .await
             .expect("table bucket marker should be persisted");

@@ -476,6 +476,178 @@ async fn catalog_vector_scope_is_independent_of_table_backup_fence() {
     drop(guard);
 }
 
+async fn prepared_table_isolation_fixture(
+    fixture: &PreparedFixture,
+) -> (ObjectTableCatalogStore<TestCatalogObjectBackend>, TableEntry) {
+    let store = ObjectTableCatalogStore::new(fixture.backend.clone());
+    let bucket = "table-warehouse";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+    let entry = test_table_entry(bucket, &namespace, &table, "tables/table-id/metadata/v1.json".to_string());
+    store.create_table(entry.clone()).await.unwrap();
+    assert_eq!(store.load_table(bucket, "sales", "orders").await.unwrap(), Some(entry.clone()));
+    (store, entry)
+}
+
+async fn assert_prepared_commit_and_exact_read(
+    fixture: &PreparedFixture,
+    prepared: PreparedCatalogCommit,
+    expected_bytes: &[u8],
+) {
+    let candidate = prepared.candidate_metadata().clone();
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        let committed = fixture.store.commit_prepared(prepared).await.unwrap();
+        assert_eq!(committed.table.generation, 2);
+        let head = fixture
+            .store
+            .read_catalog_head(
+                &fixture.bucket,
+                &Namespace::parse("indexes").unwrap(),
+                &CatalogName::parse("index.v1").unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected = CatalogHead::from_vector_entry(&committed.table).unwrap();
+        assert_eq!(head.resource_identity(), expected.resource_identity());
+        assert_eq!(head.expected_head(), expected.expected_head());
+        assert_eq!(head.metadata(), &candidate);
+        let history = fixture.store.read_committed_history(&head).await.unwrap();
+        assert_eq!(history.versions().len(), 2);
+        assert_eq!(history.versions()[0].metadata(), &candidate);
+        assert_eq!(history.versions()[1].metadata(), &fixture.initial);
+        let object = fixture
+            .backend
+            .read_object(fixture.bucket.storage_bucket_id().as_str(), head.metadata().object_key().as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.data, expected_bytes);
+        assert_eq!(
+            CatalogMetadataRef::from_read(head.metadata().object_key().clone(), &object).unwrap(),
+            candidate
+        );
+    })
+    .await
+    .expect("Vector commit and exact reads must finish while Table control state is present");
+}
+
+#[tokio::test]
+async fn catalog_vector_scope_commits_and_reads_with_legacy_table_preparing_marker() {
+    let fixture = prepared_fixture().await;
+    let (table_store, table_entry) = prepared_table_isolation_fixture(&fixture).await;
+    let bucket = table_entry.table_bucket.as_str();
+    let paths = TableCatalogObjectPaths::default();
+    let marker_path = paths.legacy_backing_migration_fence_path(bucket);
+    let marker = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "table_bucket": bucket,
+        "migration_id": "a4a8fa4a-7f2b-4838-ae51-bb8a775632e6",
+        "status": "PREPARING",
+        "target_bucket_existed": true,
+        "source_fingerprint": null,
+        "target_snapshot_etag": null
+    }))
+    .unwrap();
+    let guard = fixture
+        .backend
+        .acquire_write_lock(RUSTFS_META_BUCKET, &paths.backing_migration_fence_lock_path(bucket))
+        .await
+        .unwrap();
+    fixture.backend.seed_object(RUSTFS_META_BUCKET, &marker_path, marker).await;
+    drop(guard);
+    let before = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &marker_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(table_store.read_table_directory_state(bucket).await.unwrap().is_none());
+    assert_matches!(
+        table_store.load_table(bucket, "sales", "orders").await,
+        Err(TableCatalogStoreError::Unavailable(message))
+            if message == format!("legacy per-bucket catalog fence is present for table bucket {bucket}; explicit catalog recovery is required")
+    );
+
+    let prepared = prepared_candidate(&fixture, "8b600b69-889c-4a54-b492-e3bc5f646ff6", b"legacy-marker-vector-content").await;
+    assert_prepared_commit_and_exact_read(&fixture, prepared, b"legacy-marker-vector-content").await;
+
+    assert_eq!(fixture.backend.read_object(RUSTFS_META_BUCKET, &marker_path).await.unwrap(), Some(before));
+    assert_matches!(
+        table_store.load_table(bucket, "sales", "orders").await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    fixture.backend.delete_object(RUSTFS_META_BUCKET, &marker_path).await.unwrap();
+    assert_eq!(table_store.load_table(bucket, "sales", "orders").await.unwrap(), Some(table_entry));
+}
+
+#[tokio::test]
+async fn catalog_vector_scope_commits_and_reads_during_table_directory_building() {
+    let fixture = prepared_fixture().await;
+    let (table_store, table_entry) = prepared_table_isolation_fixture(&fixture).await;
+    let bucket = table_entry.table_bucket.as_str();
+    let paths = TableCatalogObjectPaths::default();
+    let state_path = paths.backing_migration_fence_path(bucket);
+    let state = serde_json::json!({
+        "kind": "table-entry-directory",
+        "version": 1,
+        "table_bucket": bucket,
+        "activation_id": "a1a8dd22-ddf3-46ce-bf84-1c65181977b3",
+        "phase": "building",
+        "cursor": null,
+        "prune_cursor": null
+    });
+    // Resume a persisted Building state through the production directory worker.
+    fixture
+        .backend
+        .seed_object(RUSTFS_META_BUCKET, &state_path, serde_json::to_vec(&state).unwrap())
+        .await;
+    assert!(table_store.read_table_directory_state(bucket).await.unwrap().is_some());
+    let before = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &state_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let table_path = paths.table_entry_path(bucket, &Namespace::parse(&table_entry.namespace).unwrap(), &table_entry.table);
+    // Pause the Building worker after its page scan, while it reads the original Table entry.
+    let pause = fixture.backend.pause_next_read(RUSTFS_META_BUCKET, &table_path).await;
+    let owner = table_store.clone();
+    let building_bucket = bucket.to_string();
+    let building = tokio::spawn(async move { owner.advance_table_directory(&building_bucket).await });
+    tokio::time::timeout(StdDuration::from_secs(5), pause.wait_started())
+        .await
+        .expect("Table directory worker must reach its Table entry read");
+    assert!(!building.is_finished());
+    let prepared =
+        prepared_candidate(&fixture, "f26c2420-a752-4584-8981-c70efaa85099", b"directory-building-vector-content").await;
+    assert_prepared_commit_and_exact_read(&fixture, prepared, b"directory-building-vector-content").await;
+    assert!(!building.is_finished());
+    assert_eq!(fixture.backend.read_object(RUSTFS_META_BUCKET, &state_path).await.unwrap(), Some(before));
+    pause.release();
+    let status = tokio::time::timeout(StdDuration::from_secs(5), building)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(status.scanned_objects > 0);
+    assert_eq!(serde_json::to_value(status).unwrap()["phase"], "ready");
+    let after = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &state_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&after.data).unwrap();
+    assert_eq!(after["phase"], "ready");
+    assert_eq!(after["activation_id"], state["activation_id"]);
+    assert_eq!(table_store.load_table(bucket, "sales", "orders").await.unwrap(), Some(table_entry));
+}
+
 #[tokio::test]
 async fn catalog_vector_history_rejects_ambiguous_chain() {
     let fixture = prepared_fixture().await;

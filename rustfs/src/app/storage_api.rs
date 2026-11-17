@@ -2009,6 +2009,8 @@ pub(crate) mod test {
         LocalPublicationPause, LocalPublicationStage, ReadOptions, StorageDiskRpcExt, all_local_disk_path, find_local_disk_by_ref,
     };
     pub(crate) mod sse {
+        #[cfg(feature = "gateway-stack")]
+        pub(crate) use crate::storage::storage_api::ecstore_object::{EncryptionResolutionError, EncryptionResolutionErrorKind};
         pub(crate) use crate::storage::storage_api::test_consumer::sse::{
             KmsKeyAuthorizer, LocalSseDekProvider, RecordingKmsKeyAuthorizer, TestAuthorizationHooks,
             kms_sse_dek_provider_for_test, reset_sse_dek_provider, set_sse_dek_provider_for_test, sse_kms_object_metadata,

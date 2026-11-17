@@ -187,6 +187,8 @@ async fn async_main(#[cfg(feature = "internode-transport")] build: Option<BuildP
         }
     };
 
+    crate::startup_runtime_hooks::install_default_crypto_provider()?;
+
     // Execute subcommand, or prepare config for `server` subcommand
     let config = match command_result {
         CommandResult::Info(opts) => {

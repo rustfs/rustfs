@@ -723,7 +723,16 @@ jobs:
         run: |
           cargo nextest run --profile ci --locked -p rustfs --features gateway-stack --no-tests fail \
             --status-level all --final-status-level all \
-            -E 'test(/gateway_stack|gateway_handlers|server::stack::/) | test(vector::protocol::gateway) | test(app::vector_usecase::tests::) | binary(embedded_gateway_stack_test)'
+            -E 'test(/gateway_stack|gateway_handlers|server::stack::/) | test(vector::protocol::gateway) | test(app::vector_usecase::tests::) | test(app::vector_access_tests::s3_isolation_test::) | binary(embedded_gateway_stack_test)'
+
+      - name: Verify Vector encryption with KMS key policy enforcement
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY: "true"
+        run: |
+          cargo nextest run --profile ci --locked -p rustfs --features gateway-stack --no-tests fail \
+            --status-level all --final-status-level all \
+            -E 'test(app::vector_usecase::tests::sdk_acceptance::encryption::)'
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary

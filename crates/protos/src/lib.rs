@@ -4859,6 +4859,7 @@ mod tests {
         use tonic::transport::ServerTlsConfig;
 
         let _test_guard = TLS02_TEST_LOCK.lock().await;
+        rustfs_tls_runtime::ensure_crypto_provider().expect("install the configured TLS crypto provider");
         let previous = runtime_sources::outbound_tls_state().await;
         let cases = [
             ("DNS", "127.0.0.1:0", "localhost", "localhost", true),
@@ -4973,6 +4974,7 @@ mod tests {
         use tonic::transport::{Identity, ServerTlsConfig};
 
         let _test_guard = TLS02_TEST_LOCK.lock().await;
+        rustfs_tls_runtime::ensure_crypto_provider().expect("install the configured TLS crypto provider");
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA parameters");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_key = rcgen::KeyPair::generate().expect("CA key");

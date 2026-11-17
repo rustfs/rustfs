@@ -227,7 +227,7 @@ fn vector_query_and_list_additional_read_permissions_use_real_iam_for_every_comb
     });
 }
 
-fn envelope_for_verified_identity(
+pub(super) fn envelope_for_verified_identity(
     source: &RequestEnvelope,
     credentials: &Credentials,
     owner: bool,

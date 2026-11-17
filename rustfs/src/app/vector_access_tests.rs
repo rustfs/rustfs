@@ -408,3 +408,5 @@ fn vector_real_iam_tags_and_request_sse_conditions() {
 
 mod iam_api;
 mod permission_model;
+#[cfg(feature = "gateway-stack")]
+mod s3_isolation_test;

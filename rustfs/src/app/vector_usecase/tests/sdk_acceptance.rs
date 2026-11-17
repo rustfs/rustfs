@@ -1,6 +1,8 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
+mod encryption;
+
 use super::{Fixture, run_large_stack_test};
 use crate::server::ExternalRequestContextLayer;
 use aws_sdk_s3vectors::{
