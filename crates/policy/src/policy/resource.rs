@@ -266,19 +266,19 @@ async fn resolve_resource_tokens(
         if bytes[pos..].starts_with(b"${") {
             let start = pos + 2;
             let mut end = start;
-            let mut depth = 1;
+            let mut brace_depth = 1;
             while end < bytes.len() {
                 match bytes[end] {
-                    b'{' => depth += 1,
-                    b'}' => depth -= 1,
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth -= 1,
                     _ => {}
                 }
-                if depth == 0 {
+                if brace_depth == 0 {
                     break;
                 }
                 end += 1;
             }
-            if depth != 0 {
+            if brace_depth != 0 {
                 return None;
             }
             let variable = &pattern[start..end];
@@ -571,6 +571,31 @@ mod tests {
         assert!(
             !resource
                 .is_match_with_resolver("bucket/User-user-other/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_resource_variables_enforce_recursion_limit() {
+        use crate::policy::variables::{VariableContext, VariableResolver};
+        let resolver = VariableResolver::new(VariableContext {
+            username: Some("alice".to_owned()),
+            ..Default::default()
+        });
+        let mut variable = "${aws:username}".to_owned();
+        for _ in 0..9 {
+            variable = format!("${{{variable}}}");
+        }
+        let within_limit = Resource::S3(format!("bucket/{variable}"));
+        assert!(
+            within_limit
+                .is_match_with_resolver("bucket/alice", &HashMap::new(), Some(&resolver))
+                .await
+        );
+        let beyond_limit = Resource::S3(format!("bucket/${{{variable}}}"));
+        assert!(
+            !beyond_limit
+                .is_match_with_resolver("bucket/alice", &HashMap::new(), Some(&resolver))
                 .await
         );
     }
