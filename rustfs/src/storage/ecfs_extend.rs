@@ -505,20 +505,16 @@ pub(crate) fn parse_object_lock_legal_hold_native(
 ) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
-        let status = match v.0 {
-            Some(status) => match status.as_str() {
-                ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
-                _ => {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::MalformedXML,
-                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
-                    ));
-                }
-            },
-            None => String::default(),
+        let status = match v.0.as_deref() {
+            Some(status @ (ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON)) => status.to_owned(),
+            _ => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::MalformedXML,
+                    "The XML you provided was not well-formed or did not validate against our published schema",
+                ));
+            }
         };
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         insert_str(
             &mut eval_metadata,

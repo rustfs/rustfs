@@ -772,10 +772,9 @@ mod tests {
         let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
         assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
 
-        // [4] Normal case: Legal hold with None status (empty string for status)
         let none_status_legal_hold = ObjectLockLegalHold { status: None };
-        let none_status_metadata = parse_object_lock_legal_hold(Some(none_status_legal_hold)).unwrap();
-        assert_eq!(none_status_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "");
+        let err = parse_object_lock_legal_hold(Some(none_status_legal_hold)).expect_err("Status is required");
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
 
         // [5] Error case: Legal hold with invalid status (non ON/OFF)
         let invalid_status_legal_hold = ObjectLockLegalHold {
