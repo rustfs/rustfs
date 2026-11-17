@@ -1708,7 +1708,10 @@ mod tests {
                     excluded_prefixes: Some(vec![Some("team/".to_owned())]),
                     ..Default::default()
                 };
-                assert!(!version_cfg.prefix_enabled("team/"));
+                assert!(!crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi::prefix_enabled(
+                    &version_cfg,
+                    "team/"
+                ));
                 let mut req = build_request((), Method::DELETE);
                 req.extensions.insert(slot.clone());
                 req.extensions.insert(crate::storage::access::ReqInfo {
