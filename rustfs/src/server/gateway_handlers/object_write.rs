@@ -236,6 +236,7 @@ fn native_input(input: dto::PutObjectInput, retain_until: Option<time::OffsetDat
         bucket: input.bucket.as_str().to_owned(),
         key: input.key.as_str().to_owned(),
         body: input.body.map(|body| body.into_body()),
+        post_archive: None,
         trailing_headers: None,
         frame_trailers: None,
         content_length: Some(input.content_length),

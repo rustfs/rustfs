@@ -251,7 +251,8 @@ pub(crate) mod server {
                 pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
                 pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
-                    FS, StorageObjectOptions as ObjectOptions, get_bucket_metadata, set_bucket_metadata,
+                    FS, StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
+                    set_bucket_metadata,
                 };
                 pub(crate) use s3s::{
                     S3Request,

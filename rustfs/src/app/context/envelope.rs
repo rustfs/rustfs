@@ -198,6 +198,8 @@ pub struct RequestEnvelope {
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
     gateway_post: bool,
+    #[cfg(feature = "gateway-stack")]
+    gateway_post_archive_identity: Option<Arc<()>>,
     post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
@@ -250,6 +252,8 @@ impl RequestEnvelope {
             website_read: extensions.remove(),
             post_object: extensions.remove(),
             gateway_post: false,
+            #[cfg(feature = "gateway-stack")]
+            gateway_post_archive_identity: None,
             post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
@@ -300,6 +304,8 @@ impl RequestEnvelope {
             website_read: self.website_read.clone(),
             post_object: self.post_object.clone(),
             gateway_post: self.gateway_post,
+            #[cfg(feature = "gateway-stack")]
+            gateway_post_archive_identity: self.gateway_post_archive_identity.clone(),
             post_object_policy_headers: self.post_object_policy_headers.clone(),
             req_info: self.req_info.clone(),
             bucket_generation: self.bucket_generation.clone(),
@@ -492,6 +498,20 @@ impl RequestEnvelope {
     #[cfg(feature = "gateway-stack")]
     pub(crate) fn mark_gateway_post(&mut self) {
         self.gateway_post = true;
+        self.gateway_post_archive_identity = None;
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn bind_gateway_post_archive_identity(&mut self) -> Option<&Arc<()>> {
+        if !self.gateway_post {
+            return None;
+        }
+        Some(self.gateway_post_archive_identity.get_or_insert_with(|| Arc::new(())))
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn gateway_post_identity(&self) -> Option<&Arc<()>> {
+        self.gateway_post_archive_identity.as_ref()
     }
 
     pub(crate) fn req_info(&self) -> Option<&ReqInfo> {

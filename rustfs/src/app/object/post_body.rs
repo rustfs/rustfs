@@ -43,11 +43,23 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::StreamReader;
 use zeroize::Zeroizing;
 
+mod archive_snapshot;
+use archive_snapshot::{ArchiveSnapshot, ArchiveSnapshotBudget, PreflightedArchiveSnapshot};
+mod archive_binding;
+pub(crate) use archive_binding::{
+    PreflightedPostArchive, VerifiedPostArchivePolicy, post_archive_admission_closed, stage_post_archive,
+};
+#[cfg(test)]
+pub(crate) use archive_binding::{stage_post_archive_for_test, with_archive_resources_for_test};
+
+type PostArchiveKeyPolicy = dyn Fn(&str) -> bool + Send + Sync;
+
 const REPLAY_CHUNK_SIZE: usize = 64 * 1024;
 const TAG_SIZE: usize = 16;
 const FRAME_OVERHEAD: u64 = 4 + TAG_SIZE as u64;
 const POST_STAGING_SLOTS: usize = 2;
 const POST_STAGING_BUDGET: u64 = 6 * 1024 * 1024 * 1024;
+const POST_ARCHIVE_SNAPSHOT_LIMIT: u64 = 0;
 const POST_STAGING_MAX_FREE_RESERVE: u64 = 1024 * 1024 * 1024;
 const POST_STAGING_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const POST_STAGING_SPACE_ATTEMPTS: usize = 4;
@@ -56,6 +68,7 @@ static POST_STAGING: OnceLock<io::Result<StagingResources>> = OnceLock::new();
 struct StagingResources {
     slots: Arc<Semaphore>,
     budget: Arc<StagingBudget>,
+    archive_snapshot_budget: Arc<ArchiveSnapshotBudget>,
     closer: SyncSender<StagingOwned>,
 }
 
@@ -64,6 +77,8 @@ impl StagingResources {
         Ok(Self {
             slots: Arc::new(Semaphore::new(POST_STAGING_SLOTS)),
             budget: Arc::new(StagingBudget::new(POST_STAGING_BUDGET, staging_space)),
+            // Production archive admission remains closed until its resource and identity gates pass.
+            archive_snapshot_budget: ArchiveSnapshotBudget::new(POST_ARCHIVE_SNAPSHOT_LIMIT),
             closer: staging_closer(POST_STAGING_SLOTS)?,
         })
     }
@@ -419,7 +434,7 @@ fn write_frame(file: &mut std::fs::File, cipher: &Aes256Gcm, sequence: u64, mut 
     file.write_all(&plaintext)
 }
 
-fn read_frame(file: &mut std::fs::File, cipher: &Aes256Gcm, sequence: u64) -> io::Result<Zeroizing<Vec<u8>>> {
+fn read_frame(file: &mut impl Read, cipher: &Aes256Gcm, sequence: u64) -> io::Result<Zeroizing<Vec<u8>>> {
     let mut header = [0; 4];
     file.read_exact(&mut header)?;
     let length = u32::from_be_bytes(header);
@@ -436,7 +451,7 @@ fn read_frame(file: &mut std::fs::File, cipher: &Aes256Gcm, sequence: u64) -> io
     Ok(ciphertext)
 }
 
-fn read_end_frame(file: &mut std::fs::File, cipher: &Aes256Gcm, sequence: u64) -> io::Result<()> {
+fn read_end_frame(file: &mut impl Read, cipher: &Aes256Gcm, sequence: u64) -> io::Result<()> {
     if !read_frame(file, cipher, sequence)?.is_empty() || read_chunk(file, &mut [0; 1])? != 0 {
         return Err(io::Error::other("invalid POST staging end"));
     }
@@ -518,6 +533,17 @@ impl Drop for FinishBodyRead {
 pub(crate) struct PostBodyIntegrity {
     checksum_headers: HeaderMap,
     content_md5: Option<String>,
+    content_sha256: Option<String>,
+}
+
+impl PostBodyIntegrity {
+    pub(crate) fn for_archive(checksum_headers: HeaderMap, content_md5: Option<String>, content_sha256: Option<String>) -> Self {
+        Self {
+            checksum_headers,
+            content_md5,
+            content_sha256,
+        }
+    }
 }
 
 fn checked_post_chunks(chunks: UploadChunks, integrity: Option<PostBodyIntegrity>) -> S3Result<UploadChunks> {
@@ -540,7 +566,7 @@ fn checked_post_chunks(chunks: UploadChunks, integrity: Option<PostBodyIntegrity
     let source = StreamReader::new(chunks.map(|chunk| chunk.map_err(s3s_body_error_to_io)));
     // Zero avoids a hard length limit while retaining HashReader's Content-MD5 check.
     // The file stream and staging limit still have to reach their own verified EOF.
-    let mut reader = HashReader::from_stream(source, 0, 0, md5, None, false).map_err(ApiError::from)?;
+    let mut reader = HashReader::from_stream(source, 0, 0, md5, integrity.content_sha256, false).map_err(ApiError::from)?;
     reader
         .add_checksum(&integrity.checksum_headers, None, false)
         .map_err(ApiError::from)?;
@@ -593,6 +619,20 @@ async fn stage_admitted_post_body(
     budget: Arc<StagingBudget>,
     closer: SyncSender<StagingOwned>,
 ) -> S3Result<(Body, i64)> {
+    let (file, length) = ingest_admitted_post_body(envelope, bucket, key, input, permit, budget, closer).await?;
+    let replay_length = u64::try_from(length).map_err(|_| staging_io_error())?;
+    Ok((replay_post_file(file, replay_length), length))
+}
+
+async fn ingest_admitted_post_body(
+    envelope: &RequestEnvelope,
+    bucket: &str,
+    key: &str,
+    input: (Body, Option<PostBodyIntegrity>),
+    permit: OwnedSemaphorePermit,
+    budget: Arc<StagingBudget>,
+    closer: SyncSender<StagingOwned>,
+) -> S3Result<(Arc<StagedFile>, i64)> {
     let (body, integrity) = input;
     let file = tokio::task::spawn_blocking(move || {
         let cipher = staging_cipher().map_err(|_| StagingWriteError::Io)?;
@@ -628,8 +668,7 @@ async fn stage_admitted_post_body(
     if length == 0 {
         verify_empty_staging(&file).await?;
     }
-    let replay_length = u64::try_from(length).map_err(|_| staging_io_error())?;
-    Ok((replay_post_file(file, replay_length), length))
+    Ok((file, length))
 }
 
 async fn verify_empty_staging(file: &Arc<StagedFile>) -> S3Result<()> {

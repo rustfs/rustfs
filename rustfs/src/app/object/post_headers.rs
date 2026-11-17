@@ -67,6 +67,21 @@ pub(crate) fn post_metadata_headers(
 }
 
 pub(crate) fn post_checksum_headers(envelope: &RequestEnvelope, fields: &PostObjectFields) -> S3Result<Option<HeaderMap>> {
+    post_checksum_headers_inner(envelope, fields, false)
+}
+
+pub(crate) fn post_archive_checksum_headers(
+    envelope: &RequestEnvelope,
+    fields: &PostObjectFields,
+) -> S3Result<Option<HeaderMap>> {
+    post_checksum_headers_inner(envelope, fields, true)
+}
+
+fn post_checksum_headers_inner(
+    envelope: &RequestEnvelope,
+    fields: &PostObjectFields,
+    allow_archive: bool,
+) -> S3Result<Option<HeaderMap>> {
     let checksums = [
         ("x-amz-checksum-crc32", "CRC32", fields.checksum_crc32.as_deref()),
         ("x-amz-checksum-crc32c", "CRC32C", fields.checksum_crc32c.as_deref()),
@@ -122,7 +137,8 @@ pub(crate) fn post_checksum_headers(envelope: &RequestEnvelope, fields: &PostObj
         return Err(invalid());
     }
     let selected = form.or(wire);
-    if super::is_put_object_extract_requested(headers)
+    if !allow_archive
+        && super::is_put_object_extract_requested(headers)
         && (selected.is_some()
             || algorithm.is_some()
             || header_algorithm.is_some()
@@ -167,6 +183,22 @@ pub(crate) fn post_checksum_headers(envelope: &RequestEnvelope, fields: &PostObj
         projected.insert(name, value);
         projected
     }))
+}
+
+pub(crate) fn post_archive_content_md5(envelope: &RequestEnvelope, fields: &PostObjectFields) -> S3Result<Option<String>> {
+    let mut values = envelope.headers().get_all("content-md5").iter();
+    let wire = values
+        .next()
+        .map(|value| value.to_str().map_err(|_| s3_error!(InvalidDigest)))
+        .transpose()?;
+    if values.next().is_some()
+        || wire
+            .zip(fields.content_md5.as_deref())
+            .is_some_and(|(wire, form)| wire != form)
+    {
+        return Err(s3_error!(InvalidRequest, "The POST content-MD5 declarations conflict"));
+    }
+    Ok(fields.content_md5.as_deref().or(wire).map(str::to_owned))
 }
 
 #[cfg(test)]
@@ -267,6 +299,50 @@ mod tests {
         let error = post_checksum_headers(&request(mismatch, HeaderMap::new()), &PostObjectFields::default())
             .expect_err("wire algorithm cannot hide a different checksum");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn post_archive_checksum_projection_preserves_closed_guard_and_rejects_md5_conflicts() {
+        let mut wire = HeaderMap::new();
+        wire.insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
+        wire.insert("content-md5", HeaderValue::from_static("XUFAKrxLKna5cZ2REBfFkg=="));
+        let fields = PostObjectFields {
+            content_md5: Some("XUFAKrxLKna5cZ2REBfFkg==".to_owned()),
+            checksum_crc32: Some("NhCmhg==".to_owned()),
+            ..Default::default()
+        };
+        let envelope = request(wire.clone(), HeaderMap::new());
+        assert_eq!(
+            post_checksum_headers(&envelope, &fields)
+                .expect_err("closed archive refuses checksums")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        let headers = post_archive_checksum_headers(&envelope, &fields)
+            .expect("valid archive checksums")
+            .expect("form checksum projection");
+        assert_eq!(headers["x-amz-checksum-crc32"], "NhCmhg==");
+        assert_eq!(
+            post_archive_content_md5(&envelope, &fields).expect("matching MD5").as_deref(),
+            Some("XUFAKrxLKna5cZ2REBfFkg==")
+        );
+
+        wire.insert("content-md5", HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="));
+        let conflict = request(wire.clone(), HeaderMap::new());
+        assert_eq!(
+            post_archive_content_md5(&conflict, &fields)
+                .expect_err("different MD5 sources")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        wire.append("content-md5", HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="));
+        let duplicate = request(wire, HeaderMap::new());
+        assert_eq!(
+            post_archive_content_md5(&duplicate, &PostObjectFields::default())
+                .expect_err("duplicate MD5")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
     }
 
     #[test]

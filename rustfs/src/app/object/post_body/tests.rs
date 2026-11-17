@@ -156,6 +156,7 @@ async fn post_staging_checked_body_validates_checksums_before_replay() {
                 Some(PostBodyIntegrity {
                     checksum_headers: headers,
                     content_md5: Some(md5),
+                    content_sha256: None,
                 }),
             )
             .expect("valid checksum declarations");
@@ -201,6 +202,7 @@ async fn post_staging_checked_body_refuses_malformed_md5_before_reading() {
             Some(PostBodyIntegrity {
                 checksum_headers: HeaderMap::new(),
                 content_md5: Some(value.to_owned()),
+                content_sha256: None,
             }),
         );
         let error = match result {
@@ -221,6 +223,7 @@ async fn post_staging_checked_body_rejects_md5_mismatch() {
         Some(PostBodyIntegrity {
             checksum_headers: HeaderMap::new(),
             content_md5: Some("AAAAAAAAAAAAAAAAAAAAAA==".to_owned()),
+            content_sha256: None,
         }),
     )
     .expect("valid MD5 declaration");
@@ -260,6 +263,7 @@ async fn post_staging_integrity_precedes_replay_and_releases_budget_on_failure()
                 Some(PostBodyIntegrity {
                     checksum_headers: headers,
                     content_md5: None,
+                    content_sha256: None,
                 }),
             ),
             acquire_staging_slot(&slots).expect("admit staging"),
@@ -299,6 +303,7 @@ async fn post_staging_checked_body_preserves_incomplete_transport_failure() {
         Some(PostBodyIntegrity {
             checksum_headers: HeaderMap::new(),
             content_md5: None,
+            content_sha256: None,
         }),
     )
     .expect("empty checksum declaration");

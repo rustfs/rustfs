@@ -25,6 +25,8 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) bucket: String,
     pub(crate) key: String,
     pub(crate) body: Option<Body>,
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) post_archive: Option<super::post_body::PreflightedPostArchive>,
     pub(crate) frame_trailers: Option<std::sync::Arc<super::native_body::FrameTrailers>>,
     pub(crate) trailing_headers: Option<SharedTrailerSource>,
     pub(crate) content_length: Option<i64>,

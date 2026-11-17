@@ -41,6 +41,8 @@ mod object_meta;
 mod object_misc;
 mod object_read;
 mod object_write;
+#[cfg(test)]
+mod post_archive_diagnostic_tests;
 mod post_object;
 
 #[cfg(test)]

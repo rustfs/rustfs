@@ -17,8 +17,12 @@
 
 use super::{GatewayBackend, OpRow, access, handler_error, object_write::retain_until_with_offset};
 use crate::app::RequestEnvelope;
-use crate::app::object::post_body::stage_post_body;
-use crate::app::object::post_headers::{post_checksum_headers, post_metadata_headers};
+use crate::app::object::post_body::{
+    PostBodyIntegrity, VerifiedPostArchivePolicy, post_archive_admission_closed, stage_post_archive, stage_post_body,
+};
+use crate::app::object::post_headers::{
+    post_archive_checksum_headers, post_archive_content_md5, post_checksum_headers, post_metadata_headers,
+};
 use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput};
 use crate::storage_api::server::http::access::access_owned::object_write::{
     PostObjectFormPolicy, PostObjectPolicyFields, PutObjectAuthorization, authorize_post_object, authorize_put_object,
@@ -40,11 +44,21 @@ fn register(builder: ServiceBuilder, backend: &Arc<GatewayBackend>) -> ServiceBu
     builder.register_post_object_after_authorization(Arc::clone(backend))
 }
 
-impl PostObjectHandler for GatewayBackend {
-    type Authorization = RequestEnvelope;
+pub(crate) struct PostAuthorization {
+    envelope: RequestEnvelope,
+    archive_policy: Option<VerifiedPostArchivePolicy>,
+}
 
-    fn authorize(&self, request: &Req<dto::PostObject>) -> BoxFuture<'_, Result<RequestEnvelope, HandlerError>> {
+impl PostObjectHandler for GatewayBackend {
+    type Authorization = PostAuthorization;
+
+    fn authorize(&self, request: &Req<dto::PostObject>) -> BoxFuture<'_, Result<PostAuthorization, HandlerError>> {
         let admission = access::admit(&self.server_ctx, request.context());
+        let archive_policy = if post_archive_admission_closed() {
+            None
+        } else {
+            VerifiedPostArchivePolicy::from_request(request)
+        };
         let input = request.input();
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
@@ -83,16 +97,23 @@ impl PostObjectHandler for GatewayBackend {
             {
                 return Err(handler_error(s3_error!(AccessDenied)));
             }
-            Ok(envelope)
+            Ok(PostAuthorization {
+                envelope,
+                archive_policy,
+            })
         })
     }
 
     fn execute(
         &self,
-        mut envelope: RequestEnvelope,
+        authorization: PostAuthorization,
         request: Req<dto::PostObject>,
     ) -> BoxFuture<'_, HandlerResult<dto::PostObject>> {
         Box::pin(async move {
+            let PostAuthorization {
+                mut envelope,
+                archive_policy,
+            } = authorization;
             let retain_until = post_retain_until(&request).map_err(handler_error)?;
             let input = request.into_input();
             // The legacy POST hook checks the same form resource after success-control validation.
@@ -101,9 +122,26 @@ impl PostObjectHandler for GatewayBackend {
                 .map_err(|error| handler_error(error.into()))?;
             record_s3_op(S3Operation::PostObject);
 
-            let checksum_headers = post_checksum_headers(&envelope, &input.fields).map_err(handler_error)?;
-            if crate::app::object::is_put_object_extract_requested(envelope.headers()) {
+            let extract = crate::app::object::is_put_object_extract_requested(envelope.headers());
+            let archive_open = extract && !post_archive_admission_closed();
+            let checksum_headers = if archive_open {
+                post_archive_checksum_headers(&envelope, &input.fields)
+            } else {
+                post_checksum_headers(&envelope, &input.fields)
+            }
+            .map_err(handler_error)?;
+            if extract && !archive_open {
                 return Err(handler_error(s3_error!(NotImplemented, "POST archive extraction is not supported")));
+            }
+            let archive_policy = if extract {
+                Some(archive_policy.ok_or_else(|| {
+                    handler_error(s3_error!(AccessDenied, "A verified POST key policy is required for archive extraction"))
+                })?)
+            } else {
+                None
+            };
+            if extract && envelope.bind_gateway_post_archive_identity().is_none() {
+                return Err(handler_error(s3_error!(InternalError, "The POST archive request identity is missing")));
             }
             let metadata_headers =
                 post_metadata_headers(&envelope, input.content_type.as_deref(), input.fields.content_encoding.as_deref())
@@ -125,7 +163,9 @@ impl PostObjectHandler for GatewayBackend {
             // Preflight guards must not hold table publication locks while the
             // client streams. Reauthorize under fresh guards before publication.
             envelope.release_table_publication_guards();
-            let mut input = write_input(&envelope, input, retain_until).await.map_err(handler_error)?;
+            let mut input = write_input(&envelope, input, retain_until, archive_policy, checksum_headers.as_ref())
+                .await
+                .map_err(handler_error)?;
             input.metadata_headers = Some(metadata_headers);
             input.checksum_headers = checksum_headers;
             let facts = PutObjectAuthorization {
@@ -216,6 +256,8 @@ async fn write_input(
     envelope: &RequestEnvelope,
     input: dto::PostObjectInput,
     retain_until: Option<time::OffsetDateTime>,
+    archive_policy: Option<VerifiedPostArchivePolicy>,
+    checksum_headers: Option<&http::HeaderMap>,
 ) -> S3Result<PutObjectWriteInput> {
     let dto::PostObjectInput {
         bucket,
@@ -227,19 +269,35 @@ async fn write_input(
         fields,
     } = input;
     let body = body.into_body();
-    let (body, length) = match content_length {
-        Some(length) => {
-            let length = i64::try_from(length).map_err(|_| s3_error!(EntityTooLarge, "The object is too large"))?;
-            (body, length)
-        }
-        None => stage_post_body(envelope, bucket.as_str(), key.as_str(), body, None).await?,
+    let (body, length, post_archive) = if let Some(policy) = archive_policy {
+        let content_md5 = post_archive_content_md5(envelope, &fields)?;
+        let integrity = PostBodyIntegrity::for_archive(
+            checksum_headers.cloned().unwrap_or_else(|| envelope.headers().clone()),
+            content_md5,
+            crate::app::storage_api::object_usecase::options::get_content_sha256_with_query(
+                envelope.headers(),
+                envelope.uri().query(),
+            ),
+        );
+        let archive = stage_post_archive(envelope, bucket.as_str(), key.as_str(), body, integrity, policy).await?;
+        (None, None, Some(archive))
+    } else {
+        let (body, length) = match content_length {
+            Some(length) => {
+                let length = i64::try_from(length).map_err(|_| s3_error!(EntityTooLarge, "The object is too large"))?;
+                (body, length)
+            }
+            None => stage_post_body(envelope, bucket.as_str(), key.as_str(), body, None).await?,
+        };
+        (Some(body), Some(length), None)
     };
 
     Ok(PutObjectWriteInput {
         bucket: bucket.as_str().to_owned(),
         key: key.as_str().to_owned(),
-        body: Some(body),
-        content_length: Some(length),
+        body,
+        post_archive,
+        content_length: length,
         metadata: Some(metadata.into_iter().collect()),
         specific_if_none_match: is_specific_etag(fields.if_none_match.as_deref()),
         object_lock_retain_until_date: retain_until,

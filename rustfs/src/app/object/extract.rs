@@ -969,9 +969,13 @@ async fn flush_extract_batch(
     let members = batch.split_off(0);
     batch_state.clear();
     let commit_context = context.clone();
-    run_extract_outcomes_owner(context.clone(), ignore_errors, async move {
-        run_extract_commits(members, |member| commit_extract_member(commit_context.clone(), member)).await
-    })
+    run_extract_outcomes_owner(
+        context.clone(),
+        ignore_errors,
+        Box::pin(
+            async move { run_extract_commits(members, |member| commit_extract_member(commit_context.clone(), member)).await },
+        ),
+    )
     .await
 }
 
@@ -998,7 +1002,7 @@ async fn acquire_extract_member_lifecycle_permit(
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PutObjectExtractOptions {
+pub(super) struct PutObjectExtractOptions {
     prefix: Option<String>,
     ignore_dirs: bool,
     ignore_errors: bool,
@@ -1889,7 +1893,7 @@ where
     apply_extract_entry_pax_extensions(entry, bucket, object_name, object_lock_config_state, metadata, opts).await
 }
 
-fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
+pub(super) fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .map(|value| normalize_snowball_prefix(&value))
         .transpose()?
@@ -2010,6 +2014,34 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        #[cfg(feature = "gateway-stack")]
+        let input = if envelope.is_gateway_post() {
+            let mut input = input;
+            let archive = input
+                .post_archive
+                .take()
+                .ok_or_else(|| rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"))?;
+            if input.body.is_some()
+                || input.content_length.is_some()
+                || input.frame_trailers.is_some()
+                || input.trailing_headers.is_some()
+            {
+                return Err(rustfs_s3_types::s3_error!(InvalidRequest, "POST archive replay is ambiguous"));
+            }
+            let (body, length) = archive.into_replay(&envelope, &input.bucket, &input.key)?;
+            input.body = Some(body);
+            input.content_length = Some(length);
+            input
+        } else {
+            if input.post_archive.is_some() {
+                return Err(rustfs_s3_types::s3_error!(
+                    InvalidRequest,
+                    "POST archive replay requires its original request"
+                ));
+            }
+            input
+        };
+        #[cfg(not(feature = "gateway-stack"))]
         if envelope.is_gateway_post() {
             return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
         }
@@ -2645,54 +2677,63 @@ impl DefaultObjectUsecase {
                 if is_dir {
                     drop(f);
                     extract_try!(
-                        run_extract_outcomes_owner(owner_context, extract_options.ignore_errors, async move {
-                            vec![
-                                commit_extract_member(
-                                    member_context,
-                                    ExtractPreparedMember {
-                                        archive_seq: extracted_entry_count,
-                                        key: fpath,
-                                        size,
-                                        actual_size,
-                                        body: std::io::Cursor::new(Vec::new()),
-                                        write_plan,
-                                        opts,
-                                        table_data_plane_publication_guards,
-                                        replication,
-                                        producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject,
-                                        staging_permit,
-                                        member_permit,
-                                    },
-                                )
-                                .await,
-                            ]
-                        })
+                        run_extract_outcomes_owner(
+                            owner_context,
+                            extract_options.ignore_errors,
+                            Box::pin(async move {
+                                vec![
+                                    commit_extract_member(
+                                        member_context,
+                                        ExtractPreparedMember {
+                                            archive_seq: extracted_entry_count,
+                                            key: fpath,
+                                            size,
+                                            actual_size,
+                                            body: std::io::Cursor::new(Vec::new()),
+                                            write_plan,
+                                            opts,
+                                            table_data_plane_publication_guards,
+                                            replication,
+                                            producer_identity:
+                                                rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject,
+                                            staging_permit,
+                                            member_permit,
+                                        },
+                                    )
+                                    .await,
+                                ]
+                            })
+                        )
                         .await
                     );
                 } else {
                     extract_try!(
-                        run_extract_outcomes_owner(owner_context, extract_options.ignore_errors, async move {
-                            vec![
-                                commit_extract_member(
-                                    member_context,
-                                    ExtractPreparedMember {
-                                        archive_seq: extracted_entry_count,
-                                        key: fpath,
-                                        size,
-                                        actual_size,
-                                        body: f,
-                                        write_plan,
-                                        opts,
-                                        table_data_plane_publication_guards,
-                                        replication,
-                                        producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
-                                        staging_permit,
-                                        member_permit,
-                                    },
-                                )
-                                .await,
-                            ]
-                        })
+                        run_extract_outcomes_owner(
+                            owner_context,
+                            extract_options.ignore_errors,
+                            Box::pin(async move {
+                                vec![
+                                    commit_extract_member(
+                                        member_context,
+                                        ExtractPreparedMember {
+                                            archive_seq: extracted_entry_count,
+                                            key: fpath,
+                                            size,
+                                            actual_size,
+                                            body: f,
+                                            write_plan,
+                                            opts,
+                                            table_data_plane_publication_guards,
+                                            replication,
+                                            producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
+                                            staging_permit,
+                                            member_permit,
+                                        },
+                                    )
+                                    .await,
+                                ]
+                            })
+                        )
                         .await
                     );
                 }
@@ -2781,6 +2822,10 @@ impl DefaultObjectUsecase {
         result
     }
 }
+
+#[cfg(feature = "gateway-stack")]
+#[path = "extract/post_archive_preflight.rs"]
+pub(super) mod post_archive_preflight;
 
 #[cfg(test)]
 mod tests {
