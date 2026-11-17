@@ -489,7 +489,7 @@ fn invalid_table_data_plane_list_cursor() -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid table listing continuation token".to_string())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BucketGenerationGuard {
     bucket: String,
     incarnation_id: uuid::Uuid,
@@ -859,10 +859,6 @@ pub(crate) fn req_info_mut<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3R
     req.req_info_mut().ok_or_else(missing_req_info_error)
 }
 
-fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
-    ext.get_mut::<ReqInfo>().ok_or_else(missing_req_info_error)
-}
-
 /// Extract the canonical `RequestContext` from a request, checking both
 /// the request extensions directly and the `ReqInfo.request_context` field.
 pub(crate) fn request_context_from_req<R: AuthorizationRequest + ?Sized>(req: &R) -> Option<RequestContext> {
@@ -1146,6 +1142,8 @@ pub(crate) trait AuthorizationRequest {
     /// The headers that describe what the request stores: a POST upload's form
     /// fields when present, otherwise the request headers.
     fn policy_headers(&self) -> &HeaderMap;
+    fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders);
+    fn install_post_object_marker(&mut self);
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions>;
     fn take_object_tag_conditions(&mut self) -> Option<ObjectTagConditions>;
     fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions);
@@ -1279,6 +1277,12 @@ impl<T> AuthorizationRequest for S3Request<T> {
         self.extensions
             .get::<PostObjectPolicyHeaders>()
             .map_or(&self.headers, |headers| &headers.0)
+    }
+    fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders) {
+        self.extensions.insert(headers);
+    }
+    fn install_post_object_marker(&mut self) {
+        self.extensions.insert(PostObjectRequestMarker);
     }
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.extensions.get::<ObjectTagConditions>()
@@ -1502,67 +1506,34 @@ fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInp
     req.install_requested_retention(retention);
 }
 
-/// A POST upload stores the object policy inputs from its form fields, while
-/// header-derived condition keys would otherwise read the HTTP headers. Project
-/// the form fields over the headers for the policy decision, removing a header
-/// whose field is absent so a client header cannot stand in for a stored value.
 fn set_post_object_policy_headers(req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
     if req.method != http::Method::POST {
         return Ok(());
     }
+    use access_owned::object_write::{PostObjectFormPolicy, PostObjectPolicyFields, invalid_post_form_field};
     let input = &req.input;
-    let retain_until = input
-        .object_lock_retain_until_date
-        .as_ref()
-        .map(|date| OffsetDateTime::from(date.clone()).format(&time::format_description::well_known::Rfc3339))
-        .transpose()
-        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
-    let mut headers = req.headers.clone();
-    for (key, value) in [
-        ("x-amz-object-lock-mode", input.object_lock_mode.as_ref().map(ObjectLockMode::as_str)),
-        (
-            "x-amz-object-lock-legal-hold",
-            input
-                .object_lock_legal_hold_status
-                .as_ref()
-                .map(ObjectLockLegalHoldStatus::as_str),
-        ),
-        ("x-amz-object-lock-retain-until-date", retain_until.as_deref()),
-        ("x-amz-tagging", input.tagging.as_deref()),
-        ("x-amz-acl", input.acl.as_ref().map(ObjectCannedACL::as_str)),
-        ("x-amz-storage-class", input.storage_class.as_ref().map(StorageClass::as_str)),
-        (
-            "x-amz-server-side-encryption",
-            input.server_side_encryption.as_ref().map(ServerSideEncryption::as_str),
-        ),
-        ("x-amz-server-side-encryption-aws-kms-key-id", input.ssekms_key_id.as_deref()),
-        ("x-amz-server-side-encryption-customer-algorithm", input.sse_customer_algorithm.as_deref()),
-        ("x-amz-grant-full-control", input.grant_full_control.as_deref()),
-        ("x-amz-grant-read", input.grant_read.as_deref()),
-        ("x-amz-grant-write", None),
-        ("x-amz-grant-read-acp", input.grant_read_acp.as_deref()),
-        ("x-amz-grant-write-acp", input.grant_write_acp.as_deref()),
-    ] {
-        headers.remove(key);
-        if let Some(value) = value {
-            let value = value
-                .parse()
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid form field"))?;
-            headers.insert(key, value);
-        }
-    }
-    for (key, value) in [("if-match", &input.if_match), ("if-none-match", &input.if_none_match)] {
-        headers.remove(key);
-        if let Some(value) = value {
-            headers.insert(
-                key,
-                value
-                    .to_http_header()
-                    .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid form field"))?,
-            );
-        }
-    }
-    req.extensions.insert(PostObjectPolicyHeaders(headers));
+    let field = |value: &ETagCondition| value.to_http_header().map_err(|_| invalid_post_form_field());
+    PostObjectFormPolicy::new(PostObjectPolicyFields {
+        lock_mode: input.object_lock_mode.as_ref().map(ObjectLockMode::as_str),
+        legal_hold: input
+            .object_lock_legal_hold_status
+            .as_ref()
+            .map(ObjectLockLegalHoldStatus::as_str),
+        retain_until: input.object_lock_retain_until_date.clone().map(OffsetDateTime::from),
+        tagging: input.tagging.as_deref(),
+        acl: input.acl.as_ref().map(ObjectCannedACL::as_str),
+        storage_class: input.storage_class.as_ref().map(StorageClass::as_str),
+        encryption: input.server_side_encryption.as_ref().map(ServerSideEncryption::as_str),
+        kms_key_id: input.ssekms_key_id.as_deref(),
+        customer_algorithm: input.sse_customer_algorithm.as_deref(),
+        grant_full_control: input.grant_full_control.as_deref(),
+        grant_read: input.grant_read.as_deref(),
+        grant_read_acp: input.grant_read_acp.as_deref(),
+        grant_write_acp: input.grant_write_acp.as_deref(),
+        if_match: input.if_match.as_ref().map(field).transpose()?,
+        if_none_match: input.if_none_match.as_ref().map(field).transpose()?,
+    })?
+    .install(req);
     Ok(())
 }
 
@@ -4012,13 +3983,10 @@ impl S3Access for FS {
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
         validate_post_object_success_controls(&req.input)?;
 
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-        req.extensions.insert(PostObjectRequestMarker);
-
-        authorize_request(req, post_object_authorize_action()).await
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let version = req.input.version_id.clone();
+        access_owned::object_write::authorize_post_object(req, &bucket, &key, version.as_deref()).await
     }
 
     /// Checks whether the PutBucketAccelerateConfiguration request has accesses to the resources.
@@ -5972,6 +5940,38 @@ mod tests {
         set_post_object_policy_headers(&mut put).expect("PUT is untouched");
         let conditions = remaining_retention_days_conditions(&put, action);
         assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    #[test]
+    fn gateway_post_policy_projects_effective_write_conditions() {
+        use super::access_owned::object_write::{PostObjectFormPolicy, PostObjectPolicyFields};
+
+        let mut req = build_request((), Method::POST);
+        req.headers.append("if-none-match", HeaderValue::from_static("*"));
+        req.headers.append("if-none-match", HeaderValue::from_static("\"second\""));
+        req.headers
+            .insert("x-amz-server-side-encryption", HeaderValue::from_static("wire"));
+        req.headers
+            .insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        PostObjectFormPolicy::new(PostObjectPolicyFields {
+            if_match: Some(HeaderValue::from_static("\"form-only\"")),
+            if_none_match: Some(HeaderValue::from_static("\"form-only\"")),
+            encryption: Some("form"),
+            ..Default::default()
+        })
+        .expect("valid form policy")
+        .install_gateway(&mut req);
+        let projected = &req.extensions.get::<PostObjectPolicyHeaders>().expect("projected headers").0;
+        assert!(!projected.contains_key("if-match"));
+        assert_eq!(projected.get("if-none-match"), Some(&HeaderValue::from_static("*")));
+        assert_eq!(projected.get("x-amz-server-side-encryption"), Some(&HeaderValue::from_static("form")));
+        assert_eq!(
+            projected.get("x-amz-server-side-encryption-customer-algorithm"),
+            Some(&HeaderValue::from_static("AES256"))
+        );
+        assert_eq!(req.headers.get_all("if-none-match").iter().count(), 2);
+        assert_eq!(req.headers.get("x-amz-server-side-encryption"), Some(&HeaderValue::from_static("wire")));
     }
 
     #[tokio::test]

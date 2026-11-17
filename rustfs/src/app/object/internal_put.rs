@@ -307,6 +307,8 @@ impl DefaultObjectUsecase {
             ciphertext_passthrough: false,
             inbound_replication_put: false,
             headers: &headers,
+            metadata_headers: &headers,
+            checksum_headers: &headers,
             query: None,
             trailing_headers: None,
             max_content_length: None,

@@ -29,6 +29,26 @@ use rustfs_gateway::{AuthzRequest, ClientFacts, HostRequestId, InputAuthzRequest
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
+struct StalledBody(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StalledBody {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl http_body::Body for StalledBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Pending
+    }
+}
+
 const ROOT_ACCESS_KEY: &str = "rustfsgatewayroot";
 const ROOT_SECRET_KEY: &str = "rustfs-gateway-root-secret";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -269,6 +289,42 @@ fn a_disabled_body_read_timeout_lifts_the_idle_bound_instead_of_arming_zero() {
 
     assert_eq!(deadlines.read_idle(), NO_DEADLINE);
     assert_eq!(deadlines.first_byte(), NO_DEADLINE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejected_http1_body_uses_the_assembled_drain_timeout() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for timeout in [Duration::from_secs(1), Duration::ZERO] {
+        let stack = GatewayStack::assemble_with(
+            GatewayAssembly {
+                body_read_timeout: timeout,
+                ..assembly()
+            },
+            Arc::new(ScriptedIam { ready: true }),
+            root().source(),
+            early_gate(OPERATIONS),
+        )
+        .expect("the stack assembles");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let request = signed_with_a_wrong_signature(request(Method::PUT, "/test-bucket/test-key"), ROOT_ACCESS_KEY)
+            .version(http::Version::HTTP_11)
+            .body(StalledBody(Arc::clone(&dropped)))
+            .expect("request");
+        let response = stack.call(request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers().get(http::header::CONNECTION).expect("connection header"), "close");
+        tokio::task::yield_now().await;
+        assert!(!dropped.load(Ordering::SeqCst), "the drain should retain the stalled body");
+        let elapsed = if timeout.is_zero() { 301 } else { 2 };
+        tokio::time::advance(Duration::from_secs(elapsed)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            !timeout.is_zero(),
+            "the configured timeout must govern the gateway drain"
+        );
+    }
 }
 
 #[test]

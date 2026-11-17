@@ -69,7 +69,7 @@ use rustfs_gateway::{
     AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr,
     DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces,
     PlaintextCustomerKeyAck, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig,
-    TransportSecurity, decide_with,
+    TransportSecurity, UnreadBodyDrain, decide_with,
 };
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, KeystoneEstablished, KeystoneVerifier, RequestIdCarrier, RootCredentials, RootCredentialsError,
@@ -225,6 +225,8 @@ impl GatewayStack {
         let credentials = Arc::new(IamCredentials::new(iam, root));
         let builder = ServiceBuilder::new()
             .rustfs_profile()
+            // Keep the profile's inner drain aligned with the host's configured idle bound.
+            .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
             .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))

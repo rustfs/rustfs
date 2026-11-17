@@ -1602,6 +1602,8 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use crate::storage::storage_api::ecstore_compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use crate::storage::storage_api::ecstore_compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
     };
