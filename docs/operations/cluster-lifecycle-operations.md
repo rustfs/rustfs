@@ -28,7 +28,7 @@ Runtime roles:
 2. Pick each pool's set width. Pools may differ in width, but each pool must split evenly into sets of one width from `SET_SIZES`; `RUSTFS_ERASURE_SET_DRIVE_COUNT` may pin a width that is already a symmetric divisor, nothing else.
 3. Pick STANDARD and RRS parity per §4, then validate against the narrowest pool, because an explicit parity must fit every pool.
 4. Record the full launch command, endpoint order, pool order, set width, and storage-class variables. They must be identical on every node and on every restart.
-5. Give RustFS exclusive ownership of every endpoint path.
+5. Give RustFS exclusive ownership of every endpoint path. For a separate deployment, use independently mounted drives with non-overlapping storage roots and separate service endpoints. Do not point a new deployment at an existing drive root or a directory inside it: the parent deployment owns that entire tree. For example, if `/data/rustfs1` already belongs to a cluster, `/data/rustfs1/test` is not a safe drive for another cluster, even if it starts empty. To test a different topology without changing the original cluster, start it on separate drives or in an isolated lab and copy any test data through S3. Do not write `format.json` by hand to make either deployment start.
 
 Volumes come from positional arguments or `RUSTFS_VOLUMES`; `rustfs` with no arguments behaves as `rustfs server` with volumes from the environment (`rustfs/src/config/cli.rs`). Ellipsis expansion follows MinIO:
 
