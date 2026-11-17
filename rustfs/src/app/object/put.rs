@@ -4158,6 +4158,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_object_metadata_cannot_dispatch_legacy_archive_extraction() {
+        let mut req = build_request(PutObjectInput::default(), Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        let err = Box::pin(DefaultObjectUsecase::without_context().execute_put_object_extract(req))
+            .await
+            .expect_err("a legacy form cannot authorize archive replay");
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
     async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())

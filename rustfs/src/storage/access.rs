@@ -1747,6 +1747,26 @@ pub(crate) async fn resolve_req_info(
     })
 }
 
+// POST policies cover multipart fields, not the surrounding HTTP request.
+// Check before authorization can hoist query metadata into the wire headers.
+fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -> S3Result<()> {
+    fn object_property(name: &str) -> bool {
+        name == "x-amz-storage-class"
+            || name == "x-amz-snowball-auto-extract"
+            || ["x-amz-meta-", "x-minio-meta-", "x-rustfs-meta-"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+    if headers.keys().any(|name| object_property(name.as_str()))
+        || raw_query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| object_property(&name.to_ascii_lowercase()))
+        })
+    {
+        return Err(s3_error!(AccessDenied, "POST object properties must be supplied as form fields"));
+    }
+    Ok(())
+}
+
 /// The operation-aware admission every S3 request passes after its caller is resolved and before
 /// its own authorization: a signed upload-size capability is refused on any operation but the one
 /// it is scoped to, and the license must be valid.
@@ -1761,6 +1781,9 @@ pub(crate) fn admit_operation(
     operation: &str,
     signature: VerifiedSignature,
 ) -> S3Result<()> {
+    if operation == "PostObject" {
+        validate_post_object_metadata(headers, raw_query)?;
+    }
     // The size capability is intentionally scoped to the single-object
     // PutObject operation. Validate this at the operation-aware access
     // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
@@ -1793,6 +1816,26 @@ mod access_phase_tests {
     use super::{
         AccessMarkers, AuthType, MultipartStagingOperation, VerifiedPresignedRequest, VerifiedSigV4Request, VerifiedSignature,
     };
+
+    #[test]
+    fn post_object_metadata_checks_only_out_of_form_object_properties() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, "multipart/form-data; boundary=test".parse().unwrap());
+        super::validate_post_object_metadata(&headers, Some("client=browser")).unwrap();
+        for query in ["X-Amz-Meta-Label=test", "X%2DAmz-Storage-Class=STANDARD"] {
+            assert!(super::validate_post_object_metadata(&headers, Some(query)).is_err());
+        }
+        for name in [
+            "x-amz-meta-label",
+            "x-minio-meta-label",
+            "x-rustfs-meta-label",
+            "x-amz-storage-class",
+        ] {
+            headers.insert(name, "test".parse().unwrap());
+            assert!(super::validate_post_object_metadata(&headers, None).is_err());
+            headers.remove(name);
+        }
+    }
 
     #[test]
     fn only_a_sigv4_header_or_query_signature_is_marked_verified() {
