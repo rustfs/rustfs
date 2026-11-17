@@ -5420,6 +5420,7 @@ mod tests {
     /// realistic across these copy-pasted call sites and are otherwise invisible to the digestless
     /// fail-open tests.
     #[tokio::test]
+    #[serial_test::serial]
     async fn every_mutating_handler_enforces_its_body_digest() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
@@ -5475,6 +5476,48 @@ mod tests {
                 );
             }};
         }
+
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            assert!(covered_methods.insert(normalized_rpc_method("rename_data_batch")));
+            let message = RenameDataBatchRequest {
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                items: vec![RenameDataBatchItem {
+                    item_index: 0,
+                    disk: disk.clone(),
+                    file_info_msgpack: vec![0x80].into(),
+                }],
+            };
+
+            let mut ok = Request::new(message.clone());
+            let body = rustfs_protos::canonical_rename_data_batch_request_body(ok.get_ref())
+                .expect("canonical batch body should encode");
+            set_tonic_canonical_body_digest(&mut ok, &body).expect("batch digest metadata should encode");
+            mark_v2_authenticated(&mut ok);
+            if let Err(status) = service.rename_data_batch(ok).await {
+                assert_ne!(
+                    status.code(),
+                    tonic::Code::PermissionDenied,
+                    "rename_data_batch: a correctly body-bound request must pass the digest gate",
+                );
+            }
+
+            let mut bad = Request::new(message);
+            set_tonic_canonical_body_digest(&mut bad, b"unrelated-canonical-body").expect("batch digest metadata should encode");
+            mark_v2_authenticated(&mut bad);
+            let error = match service.rename_data_batch(bad).await {
+                Err(error) => error,
+                Ok(_) => panic!("rename_data_batch: a tampered body must be rejected"),
+            };
+            assert_eq!(
+                error.code(),
+                tonic::Code::PermissionDenied,
+                "rename_data_batch must fail closed on a body-digest mismatch",
+            );
+        })
+        .await;
 
         assert_gated!(
             rename_data,
