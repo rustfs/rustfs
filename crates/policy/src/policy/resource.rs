@@ -59,8 +59,21 @@ impl ResourceSet {
         conditions: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
+        self.is_match_with_unresolved(resource, conditions, resolver, false).await
+    }
+
+    pub(crate) async fn is_match_with_unresolved(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+        unresolved_matches: bool,
+    ) -> bool {
         for re in self.0.iter() {
-            if re.is_match_with_resolver(resource, conditions, resolver).await {
+            if re
+                .is_match_with_unresolved(resource, conditions, resolver, unresolved_matches)
+                .await
+            {
                 return true;
             }
         }
@@ -363,6 +376,16 @@ impl Resource {
         conditions: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
+        self.is_match_with_unresolved(resource, conditions, resolver, false).await
+    }
+
+    pub(crate) async fn is_match_with_unresolved(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+        unresolved_matches: bool,
+    ) -> bool {
         let pattern = match self {
             Resource::All => return true,
             Resource::S3(s) => s.to_owned(),
@@ -385,6 +408,8 @@ impl Resource {
             if cp != "." && resource_tokens_match(&pattern, &wildcard_resource, true) {
                 return true;
             }
+        } else {
+            return unresolved_matches;
         }
 
         false
