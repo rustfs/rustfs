@@ -722,7 +722,7 @@ impl RustFSTestEnvironment {
         cleanup_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let binary_path = rustfs_binary_path();
-        self.start_rustfs_server_inner_with_binary(&binary_path, extra_args, extra_env, cleanup_existing)
+        self.start_rustfs_server_inner_with_binary(&binary_path, extra_args, extra_env, cleanup_existing, false)
             .await
     }
 
@@ -732,6 +732,7 @@ impl RustFSTestEnvironment {
         extra_args: Vec<&str>,
         extra_env: &[(&str, &str)],
         cleanup_existing: bool,
+        read_quorum_only: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if cleanup_existing {
             self.cleanup_existing_processes().await?;
@@ -756,7 +757,7 @@ impl RustFSTestEnvironment {
         self.process = Some(process);
 
         // Wait for server to be ready
-        self.wait_for_server_ready().await?;
+        self.wait_for_server_ready_with_probe(read_quorum_only).await?;
 
         Ok(())
     }
@@ -770,7 +771,7 @@ impl RustFSTestEnvironment {
         extra_args: Vec<&str>,
         extra_env: &[(&str, &str)],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, true)
+        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, true, false)
             .await
     }
 
@@ -782,7 +783,7 @@ impl RustFSTestEnvironment {
         extra_args: Vec<&str>,
         extra_env: &[(&str, &str)],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, false)
+        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, false, false)
             .await
     }
 
@@ -798,6 +799,18 @@ impl RustFSTestEnvironment {
         extra_env: &[(&str, &str)],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.start_rustfs_server_inner(extra_args, extra_env, true).await
+    }
+
+    /// Start a degraded read-serving process using the node readiness probe.
+    /// ListBuckets retains its namespace write-quorum requirement.
+    pub async fn start_rustfs_server_with_env_at_read_quorum(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        self.start_rustfs_server_inner_with_binary(&binary_path, extra_args, extra_env, true, true)
+            .await
     }
 
     /// Start RustFS server without cleaning up other running RustFS processes.
@@ -828,8 +841,16 @@ impl RustFSTestEnvironment {
     /// Fails immediately if the spawned server process has already exited
     /// (e.g. a port bind failure) instead of polling out the full timeout.
     pub async fn wait_for_server_ready(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.wait_for_server_ready_with_probe(false).await
+    }
+
+    async fn wait_for_server_ready_with_probe(
+        &mut self,
+        read_quorum_only: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Waiting for RustFS server to be ready on {}", self.address);
         let client = self.create_s3_client();
+        let health_client = HttpClient::builder().no_proxy().timeout(Duration::from_secs(2)).build()?;
 
         for i in 0..60 {
             if let Some(process) = self.process.as_mut()
@@ -838,7 +859,16 @@ impl RustFSTestEnvironment {
                 return Err(format!("RustFS server process exited before becoming ready: {status}").into());
             }
 
-            if TcpStream::connect(&self.address).await.is_ok() && client.list_buckets().send().await.is_ok() {
+            let ready = if read_quorum_only {
+                health_client
+                    .get(format!("{}/minio/health/ready", self.url))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+            } else {
+                TcpStream::connect(&self.address).await.is_ok() && client.list_buckets().send().await.is_ok()
+            };
+            if ready {
                 info!("✅ RustFS server is ready after {} attempts", i + 1);
                 return Ok(());
             }
