@@ -1734,7 +1734,7 @@ mod tests {
                         result
                             .expect_err("stored null versions require version deletion authority")
                             .code(),
-                        &S3ErrorCode::AccessDenied
+                        &rustfs_s3_types::S3ErrorCode::AccessDenied
                     );
                 } else {
                     assert_eq!(
