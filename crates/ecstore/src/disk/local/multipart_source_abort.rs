@@ -269,6 +269,16 @@ impl SourceStore {
 }
 
 impl LocalDisk {
+    pub(super) async fn recover_multipart_abort_native(
+        &self,
+        request: MultipartSourceRequest,
+    ) -> Result<MultipartSourceResponse> {
+        request.validate()?;
+        // Source RW ownership precedes source namespace and target publication ownership.
+        let store = self.open_multipart_source_store(&request.path, None).await?;
+        self.recover_multipart_abort_owned(store, request.operation).await
+    }
+
     pub(super) async fn recover_multipart_abort_owned(
         &self,
         store: SourceStore,

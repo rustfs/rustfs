@@ -2617,6 +2617,7 @@ fn max_partition_field_id(value: &serde_json::Value) -> i64 {
 
 pub(crate) struct TableSnapshotGraphValidationContext<'a, B> {
     backend: &'a B,
+    reader: Option<&'a dyn CatalogObjectReader>,
     table_bucket: &'a str,
     entry: &'a TableEntry,
 }
@@ -2625,8 +2626,42 @@ impl<'a, B> TableSnapshotGraphValidationContext<'a, B> {
     pub(crate) fn new(backend: &'a B, table_bucket: &'a str, entry: &'a TableEntry) -> Self {
         Self {
             backend,
+            reader: None,
             table_bucket,
             entry,
+        }
+    }
+    pub(super) fn with_reader(
+        backend: &'a B,
+        table_bucket: &'a str,
+        entry: &'a TableEntry,
+        reader: &'a dyn CatalogObjectReader,
+    ) -> Self {
+        Self {
+            backend,
+            reader: Some(reader),
+            table_bucket,
+            entry,
+        }
+    }
+}
+
+impl<B: TableCatalogObjectBackend> TableSnapshotGraphValidationContext<'_, B> {
+    async fn read_object_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        match self.reader {
+            Some(reader) => reader.read_object_limited(bucket, object, max_size).await,
+            None => self.backend.read_object_limited(bucket, object, max_size).await,
+        }
+    }
+    async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
+        match self.reader {
+            Some(reader) => reader.object_exists(bucket, object).await,
+            None => self.backend.object_exists(bucket, object).await,
         }
     }
 }
@@ -2759,6 +2794,21 @@ struct SnapshotGraphManifestLocation {
 enum SnapshotGraphValidation<'a> {
     Commit(Option<&'a serde_json::Value>),
     BackupInventory,
+}
+
+pub(crate) async fn validate_table_snapshot_changes_with_publication<B>(
+    context: &TableSnapshotGraphValidationContext<'_, B>,
+    current_metadata: Option<&serde_json::Value>,
+    metadata: &serde_json::Value,
+) -> TableCatalogStoreResult<ValidatedIcebergSnapshotGraph>
+where
+    B: TableCatalogObjectBackend + IcebergGraphPublication,
+{
+    // Typed evidence must come from the observer that performs every graph read.
+    let discovery = TableSnapshotGraphValidationContext::new(context.backend, context.table_bucket, context.entry);
+    validate_table_snapshot_changes(&discovery, current_metadata, metadata).await?;
+    let reads = context.backend.capture_graph_read_set()?;
+    ValidatedIcebergSnapshotGraph::from_validated_parts(context.entry, current_metadata, metadata, reads)
 }
 
 pub(crate) async fn validate_table_snapshot_changes<B>(
@@ -3002,15 +3052,12 @@ where
             "statistics object count exceeds the commit limit".to_string(),
         ));
     }
-    let backend = context.backend.clone();
-    let bucket = context.table_bucket.to_string();
+    let bucket = context.table_bucket;
     stream::iter(objects)
         .map(move |(object_key, (expected_size, kind))| {
-            let backend = backend.clone();
-            let bucket = bucket.clone();
             async move {
-                let object = backend
-                    .read_object_limited(&bucket, &object_key, expected_size)
+                let object = context
+                    .read_object_limited(bucket, &object_key, expected_size)
                     .await?
                     .ok_or_else(|| TableCatalogStoreError::Invalid("statistics object is missing".to_string()))?;
                 if object.data.len() != expected_size {
@@ -3042,26 +3089,19 @@ where
 }
 
 async fn validate_object_keys_exist<B>(
-    backend: &B,
-    bucket: &str,
+    context: &TableSnapshotGraphValidationContext<'_, B>,
     object_keys: impl IntoIterator<Item = String>,
     missing_message: &'static str,
 ) -> TableCatalogStoreResult<()>
 where
     B: TableCatalogObjectBackend,
 {
-    let backend = backend.clone();
-    let bucket = bucket.to_string();
     stream::iter(object_keys)
-        .map(move |object_key| {
-            let backend = backend.clone();
-            let bucket = bucket.clone();
-            async move {
-                if !backend.object_exists(&bucket, &object_key).await? {
-                    return Err(TableCatalogStoreError::Invalid(missing_message.to_string()));
-                }
-                Ok(())
+        .map(move |object_key| async move {
+            if !context.object_exists(context.table_bucket, &object_key).await? {
+                return Err(TableCatalogStoreError::Invalid(missing_message.to_string()));
             }
+            Ok(())
         })
         .buffered(TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY)
         .try_for_each(|()| async { Ok(()) })
@@ -3228,7 +3268,6 @@ where
         } else {
             budget.charge_manifests(1)?;
             let manifest_object = context
-                .backend
                 .read_object_limited(context.table_bucket, &manifest_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
                 .await?
                 .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot manifest object is missing".to_string()))?;
@@ -3320,7 +3359,6 @@ where
             return Ok(Arc::clone(references));
         } else {
             let manifest_list_object = context
-                .backend
                 .read_object_limited(context.table_bucket, &manifest_list_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
                 .await?
                 .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot manifest-list object is missing".to_string()))?;
@@ -3559,13 +3597,7 @@ where
         }
     }
 
-    validate_object_keys_exist(
-        context.backend,
-        context.table_bucket,
-        live_object_keys,
-        "manifest referenced data file is missing",
-    )
-    .await
+    validate_object_keys_exist(context, live_object_keys, "manifest referenced data file is missing").await
 }
 
 fn snapshot_graph_object_key<B>(
@@ -3587,4 +3619,135 @@ fn snapshot_graph_object_key<B>(
         ));
     }
     Ok(object_key)
+}
+
+pub(crate) fn validate_table_commit_requirements(
+    metadata: &serde_json::Value,
+    requirements: &[serde_json::Value],
+) -> TableCatalogStoreResult<()> {
+    for requirement in requirements {
+        let requirement_type = requirement
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("commit requirement type is required".to_string()))?;
+        match requirement_type {
+            "assert-create" => {
+                return Err(TableCatalogStoreError::Conflict(
+                    "commit requirement failed: table already exists".to_string(),
+                ));
+            }
+            "assert-table-uuid" => {
+                let expected = requirement
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("assert-table-uuid requires uuid".to_string()))?;
+                let actual = metadata
+                    .get("table-uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("current table metadata is missing table-uuid".to_string()))?;
+                if actual != expected {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "commit requirement failed: table uuid changed".to_string(),
+                    ));
+                }
+            }
+            "assert-current-schema-id" => {
+                validate_i64_requirement(metadata, requirement, "current-schema-id", "current schema id")?;
+            }
+            "assert-default-spec-id" => {
+                validate_i64_requirement(metadata, requirement, "default-spec-id", "default spec id")?;
+            }
+            "assert-default-sort-order-id" => {
+                validate_i64_requirement(metadata, requirement, "default-sort-order-id", "default sort order id")?;
+            }
+            "assert-last-assigned-field-id" => {
+                validate_i64_requirement_with_metadata_key(
+                    metadata,
+                    requirement,
+                    "last-assigned-field-id",
+                    "last-column-id",
+                    "last assigned field id",
+                )?;
+            }
+            "assert-last-assigned-partition-id" => {
+                validate_i64_requirement_with_metadata_key(
+                    metadata,
+                    requirement,
+                    "last-assigned-partition-id",
+                    "last-partition-id",
+                    "last assigned partition id",
+                )?;
+            }
+            "assert-ref-snapshot-id" => validate_ref_snapshot_requirement(metadata, requirement)?,
+            _ => {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "unsupported commit requirement: {requirement_type}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_i64_requirement(
+    metadata: &serde_json::Value,
+    requirement: &serde_json::Value,
+    key: &str,
+    label: &str,
+) -> TableCatalogStoreResult<()> {
+    validate_i64_requirement_with_metadata_key(metadata, requirement, key, key, label)
+}
+
+fn validate_i64_requirement_with_metadata_key(
+    metadata: &serde_json::Value,
+    requirement: &serde_json::Value,
+    requirement_key: &str,
+    metadata_key: &str,
+    label: &str,
+) -> TableCatalogStoreResult<()> {
+    let expected = requirement
+        .get(requirement_key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{requirement_key} must be an integer")))?;
+    let actual = metadata
+        .get(metadata_key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| TableCatalogStoreError::Invalid(format!("current table metadata is missing {metadata_key}")))?;
+    if actual != expected {
+        return Err(TableCatalogStoreError::Conflict(format!("commit requirement failed: {label} changed")));
+    }
+    Ok(())
+}
+
+fn validate_ref_snapshot_requirement(
+    metadata: &serde_json::Value,
+    requirement: &serde_json::Value,
+) -> TableCatalogStoreResult<()> {
+    let ref_name = requirement
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("assert-ref-snapshot-id requires ref".to_string()))?;
+    let refs = metadata.get("refs").and_then(serde_json::Value::as_object);
+    let actual = refs
+        .and_then(|refs| refs.get(ref_name))
+        .and_then(|reference| reference.get("snapshot-id"))
+        .and_then(serde_json::Value::as_i64);
+    if requirement.get("snapshot-id").is_some_and(serde_json::Value::is_null) {
+        if actual.is_some() {
+            return Err(TableCatalogStoreError::Conflict(
+                "commit requirement failed: snapshot ref exists".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    let expected = requirement
+        .get("snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("assert-ref-snapshot-id requires snapshot-id".to_string()))?;
+    if actual != Some(expected) {
+        return Err(TableCatalogStoreError::Conflict(
+            "commit requirement failed: snapshot ref changed".to_string(),
+        ));
+    }
+    Ok(())
 }

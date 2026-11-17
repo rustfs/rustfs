@@ -14,7 +14,7 @@
 
 use super::*;
 
-pub(super) fn table_catalog_backing_manifest(
+pub(in crate::table_catalog) fn table_catalog_backing_manifest(
     paths: &TableCatalogObjectPaths,
     namespace: &Namespace,
     table: &IdentifierSegment,

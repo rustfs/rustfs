@@ -2458,6 +2458,10 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         is_owner,
     };
 
+    if bucket.starts_with(crate::storage::storage_api::managed::BUCKET_VECTOR_STORAGE_PREFIX) {
+        return Err(denial.deny(req, "managed_bucket_requires_managed_access", action));
+    }
+
     if let Some(cred) = &cred {
         let iam_store = request_iam_store(req)?;
 
@@ -5111,6 +5115,7 @@ mod tests {
         );
         catalog
             .put_table_bucket(crate::table_catalog::TableBucketEntry {
+                vector_bucket_binding: None,
                 version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
                 table_bucket: bucket.to_string(),
                 catalog_type: crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),

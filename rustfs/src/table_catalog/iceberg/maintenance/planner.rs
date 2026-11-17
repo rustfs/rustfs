@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::*;
+use crate::table_catalog::*;
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 #[derive(Debug)]
 struct TableSnapshotExpirationDraft {

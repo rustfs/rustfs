@@ -4313,6 +4313,13 @@ pub fn reset_sse_dek_provider() {
 }
 
 #[cfg(test)]
+pub(crate) async fn kms_sse_dek_provider_for_test(
+    manager: Arc<rustfs_kms::KmsServiceManager>,
+) -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    Ok(Arc::new(KmsSseDekProvider::new_with_service_manager(manager).await?))
+}
+
+#[cfg(test)]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
         *slot = Some(provider.clone());

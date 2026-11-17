@@ -3271,7 +3271,7 @@ impl ECStore {
         Ok(Arc::new(snapshot))
     }
 
-    pub(super) async fn object_lock_config_snapshot_under_lifecycle_fence(
+    pub(crate) async fn object_lock_config_snapshot_under_lifecycle_fence(
         &self,
         bucket: &str,
         lifecycle_fence: &NamespaceLockFence,

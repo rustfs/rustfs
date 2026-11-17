@@ -157,23 +157,38 @@ impl DefaultMultipartUsecase {
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub(crate) async fn execute_upload_part_owned(
         &self,
+        req: RequestEnvelope,
+        input: UploadPartWriteInput,
+    ) -> S3Result<UploadPartWriteOutput> {
+        self.execute_upload_part_with_origin(req, input, MultipartOrigin::Request)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    pub(crate) async fn execute_upload_part_with_origin(
+        &self,
         mut req: RequestEnvelope,
         mut input: UploadPartWriteInput,
-    ) -> S3Result<UploadPartWriteOutput> {
-        reject_presigned_multipart_max_total_object_size_for_other_operation(
-            req.headers(),
-            req.uri().query(),
-            req.verified_sigv4().is_some(),
-        )?;
-        reject_presigned_put_max_content_length_for_other_operation(
-            req.headers(),
-            req.uri().query(),
-            req.verified_presigned().is_some(),
-        )?;
-        normalize_presigned_part_checksums(&mut req, &mut input)?;
+        origin: MultipartOrigin,
+    ) -> S3Result<(UploadPartWriteOutput, CompletePart)> {
+        if origin.is_managed() {
+            req.headers_mut().clear();
+        } else {
+            reject_presigned_multipart_max_total_object_size_for_other_operation(
+                req.headers(),
+                req.uri().query(),
+                req.verified_sigv4().is_some(),
+            )?;
+            reject_presigned_put_max_content_length_for_other_operation(
+                req.headers(),
+                req.uri().query(),
+                req.verified_presigned().is_some(),
+            )?;
+            normalize_presigned_part_checksums(&mut req, &mut input)?;
+        }
         let (bucket, key) = input.target.resource();
         let mut opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&req, bucket, &mut opts)?;
+        origin.apply_bucket_guard(&req, bucket, &mut opts)?;
         let part_principal = SseKmsPrincipal::from_request(&req);
         let UploadPartWriteInput {
             body,
@@ -189,8 +204,10 @@ impl DefaultMultipartUsecase {
 
         let part_id = parse_upload_part_number(part_number)?;
 
-        reject_veeam_sosapi_mutation(|| self.object_store(), bucket, key).await?;
-        validate_table_catalog_object_mutation(bucket, key).await?;
+        if !origin.is_managed() {
+            reject_veeam_sosapi_mutation(|| self.object_store(), bucket, key).await?;
+            validate_table_catalog_object_mutation(bucket, key).await?;
+        }
 
         // cuObject S3-over-RDMA UploadPart: an empty HTTP body plus
         // `x-amz-rdma-token` means the part bytes are read from the client's
@@ -238,6 +255,9 @@ impl DefaultMultipartUsecase {
             }
         };
         rustfs_io_metrics::record_put_object_stage_duration_from("multipart_get_info", multipart_info_started);
+        origin
+            .validate_encryption(key, &fi.user_defined, part_principal.as_ref())
+            .await?;
         authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
@@ -374,7 +394,7 @@ impl DefaultMultipartUsecase {
                 sse_customer_key: sse_customer_key.clone(),
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
                 content_size: actual_size,
-                principal: None,
+                principal: if origin.is_managed() { part_principal.as_ref() } else { None },
             }
             .validate_multipart_ssec(&fi.user_defined)?;
         }
@@ -385,7 +405,7 @@ impl DefaultMultipartUsecase {
                 metadata: &fi.user_defined,
                 sse_customer_key: sse_customer_key.as_ref(),
                 sse_customer_key_md5: sse_customer_key_md5.as_ref(),
-                principal: None,
+                principal: if origin.is_managed() { part_principal.as_ref() } else { None },
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
@@ -406,7 +426,7 @@ impl DefaultMultipartUsecase {
                 metadata: &fi.user_defined,
                 sse_customer_key: None,
                 sse_customer_key_md5: None,
-                principal: None,
+                principal: if origin.is_managed() { part_principal.as_ref() } else { None },
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
@@ -491,19 +511,27 @@ impl DefaultMultipartUsecase {
 
         let mut headers = HeaderMap::new();
         crate::app::object_usecase::inject_additional_checksum_headers(&mut headers, &upload_part_extra_checksum_headers);
-        Ok(UploadPartWriteOutput {
-            server_side_encryption: requested_sse,
-            ssekms_key_id: requested_kms_key_id,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            e_tag: info.etag,
-            headers,
-        })
+        let completed_part = CompletePart {
+            part_num: info.part_num,
+            etag: info.etag.clone(),
+            ..Default::default()
+        };
+        Ok((
+            UploadPartWriteOutput {
+                server_side_encryption: requested_sse,
+                ssekms_key_id: requested_kms_key_id,
+                sse_customer_algorithm,
+                sse_customer_key_md5,
+                checksum_crc32,
+                checksum_crc32c,
+                checksum_sha1,
+                checksum_sha256,
+                checksum_crc64nvme,
+                e_tag: info.etag,
+                headers,
+            },
+            completed_part,
+        ))
     }
 }
 

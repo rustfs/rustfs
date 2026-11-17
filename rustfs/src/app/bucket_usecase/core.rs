@@ -95,6 +95,16 @@ impl DefaultBucketUsecase {
         input: gateway_dto::CreateBucketInput,
     ) -> rustfs_s3_types::S3Result<gateway_dto::CreateBucketOutput> {
         rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket);
+        if input
+            .bucket
+            .as_str()
+            .starts_with(crate::app::storage_api::managed::BUCKET_VECTOR_STORAGE_PREFIX)
+        {
+            return Err(rustfs_s3_types::s3_error!(
+                InvalidBucketName,
+                "bucket name is reserved for managed storage"
+            ));
+        }
         if let Some(location) = requested_location_constraint(&input) {
             let location = if location == "EU" { "eu-west-1" } else { location };
             let region = self.global_region();
@@ -442,6 +452,25 @@ mod tests {
             request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
             Some("s3:CreateBucket")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_create_bucket_rejects_managed_names_before_existing_bucket_response() {
+        let (request, access, _, _reset) = crate::app::object::managed_request_fixture().await;
+        let context = request
+            .server_context()
+            .expect("server context")
+            .installed_app_context()
+            .expect("installed context");
+        let usecase = DefaultBucketUsecase::with_context(Some(context));
+        for bucket in [access.bucket().storage_bucket_id().as_str(), "rustfs-v-unallocated"] {
+            let error = usecase
+                .execute_create_bucket(envelope(Some(ReqInfo::default())), create_input(bucket, None))
+                .await
+                .expect_err("ordinary S3 creation must reject the complete managed namespace");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidBucketName);
+        }
     }
 
     #[test]

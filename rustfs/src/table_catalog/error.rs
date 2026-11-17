@@ -55,6 +55,15 @@ impl fmt::Display for TableObjectMutationError {
 }
 
 impl std::error::Error for TableObjectMutationError {}
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogIoErrorKind {
+    Denied,
+    Conflict,
+    Unavailable,
+    Internal,
+}
+
 #[derive(Debug)]
 pub(crate) enum TableCatalogStoreError {
     NotFound(String),
@@ -70,6 +79,12 @@ pub(crate) enum TableCatalogStoreError {
         source: Box<rustfs_lock::LockError>,
     },
     Internal(String),
+    #[cfg(test)]
+    Io {
+        classification: CatalogIoErrorKind,
+        context: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for TableCatalogStoreError {
@@ -86,13 +101,32 @@ impl fmt::Display for TableCatalogStoreError {
                 write!(f, "table catalog temporarily unavailable: {message}")
             }
             Self::Internal(message) => write!(f, "table catalog store error: {message}"),
+            #[cfg(test)]
+            Self::Io {
+                classification, context, ..
+            } => write!(f, "catalog I/O {classification:?}: {context}"),
         }
     }
 }
 
 impl TableCatalogStoreError {
     pub(crate) fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Unavailable(_) | Self::LockUnavailable { .. })
+        let unavailable = matches!(self, Self::Unavailable(_) | Self::LockUnavailable { .. });
+        #[cfg(test)]
+        {
+            unavailable
+                || matches!(
+                    self,
+                    Self::Io {
+                        classification: CatalogIoErrorKind::Unavailable,
+                        ..
+                    }
+                )
+        }
+        #[cfg(not(test))]
+        {
+            unavailable
+        }
     }
 }
 
@@ -100,6 +134,8 @@ impl std::error::Error for TableCatalogStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LockUnavailable { source, .. } => Some(source.as_ref()),
+            #[cfg(test)]
+            Self::Io { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

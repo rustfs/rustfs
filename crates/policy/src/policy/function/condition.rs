@@ -60,6 +60,39 @@ pub enum Condition {
 }
 
 impl Condition {
+    pub(crate) fn keys(&self) -> Vec<&super::key::Key> {
+        use Condition::*;
+        match self {
+            StringEquals(s)
+            | StringNotEquals(s)
+            | StringEqualsIgnoreCase(s)
+            | StringNotEqualsIgnoreCase(s)
+            | StringLike(s)
+            | StringNotLike(s)
+            | ArnLike(s)
+            | ArnNotLike(s)
+            | ArnEquals(s)
+            | ArnNotEquals(s) => s.0.iter().map(|entry| &entry.key).collect(),
+            BinaryEquals(s) => s.0.iter().map(|entry| &entry.key).collect(),
+            IpAddress(s) | NotIpAddress(s) => s.0.iter().map(|entry| &entry.key).collect(),
+            Null(s) | Bool(s) => s.0.iter().map(|entry| &entry.key).collect(),
+            NumericEquals(s)
+            | NumericNotEquals(s)
+            | NumericLessThan(s)
+            | NumericLessThanEquals(s)
+            | NumericGreaterThan(s)
+            | NumericGreaterThanIfExists(s)
+            | NumericGreaterThanEquals(s) => s.0.iter().map(|entry| &entry.key).collect(),
+            DateEquals(s)
+            | DateNotEquals(s)
+            | DateLessThan(s)
+            | DateLessThanEquals(s)
+            | DateGreaterThan(s)
+            | DateGreaterThanEquals(s) => s.0.iter().map(|entry| &entry.key).collect(),
+            IfExists(inner) => inner.keys(),
+        }
+    }
+
     pub fn from_deserializer<'a, D: MapAccess<'a>>(key: &str, d: &mut D) -> Result<Self, D::Error> {
         // Two suffixes are retained for existing serialized policies. Bound the
         // chain before parsing so Clone, evaluation and Drop stay bounded too.

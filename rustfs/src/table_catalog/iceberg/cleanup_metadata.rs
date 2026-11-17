@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use crate::table_catalog::*;
 
 /// Validates one metadata object; callers must also validate the complete object inventory.
-pub(crate) fn validate_empty_table_cleanup_metadata(
+pub(super) fn validate_empty_table_cleanup_metadata(
     table_bucket: &str,
     object_key: &str,
     metadata: &[u8],

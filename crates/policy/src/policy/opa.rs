@@ -200,7 +200,9 @@ impl AuthZPlugin {
     }
 
     pub async fn is_allowed(&self, args: &PArgs<'_>) -> bool {
-        let payload = self.build_opa_input(args);
+        let Some(payload) = self.build_opa_input(args) else {
+            return false;
+        };
 
         let mut request = self.client.post(self.args.url.clone()).json(&payload);
         if !self.args.auth_token.is_empty() {
@@ -251,13 +253,26 @@ impl AuthZPlugin {
         }
     }
 
-    fn build_opa_input(&self, args: &PArgs<'_>) -> serde_json::Value {
+    fn build_opa_input(&self, args: &PArgs<'_>) -> Option<serde_json::Value> {
+        let resource_arn = if matches!(args.action, crate::policy::action::Action::S3VectorsAction(_)) {
+            if !crate::policy::statement::s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+                return None;
+            }
+            let [region] = args.conditions.get("RequestedRegion")?.as_slice() else {
+                return None;
+            };
+            crate::policy::resource::s3vectors_request_resource(region, args.bucket, args.object)?
+        } else if args.object.is_empty() {
+            format!("arn:aws:s3:::{}", args.bucket)
+        } else {
+            format!("arn:aws:s3:::{}/{}", args.bucket, args.object)
+        };
         let groups = match args.groups {
             Some(g) => g.clone(),
             None => vec![],
         };
         let action_str: &str = (&args.action).into();
-        json!({
+        Some(json!({
                 // Core authorization parameters for OPA policy evaluation
                 "input":{
                     "identity": {
@@ -270,11 +285,7 @@ impl AuthZPlugin {
                     "resource": {
                         "bucket": args.bucket,
                         "object": args.object,
-                        "arn": if args.object.is_empty() {
-                            format!("arn:aws:s3:::{}", args.bucket)
-                        } else {
-                            format!("arn:aws:s3:::{}/{}", args.bucket, args.object)
-                        }
+                        "arn": resource_arn
                     },
 
                     "action": action_str,
@@ -287,7 +298,7 @@ impl AuthZPlugin {
                             .to_string()
                     }
             }
-        })
+        }))
     }
 }
 
@@ -320,6 +331,114 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use temp_env;
+
+    #[test]
+    fn vector_opa_resource_arns_preserve_s3_inputs() {
+        use crate::policy::action::{Action, S3Action, S3VectorsAction};
+        let plugin = AuthZPlugin::new(Args {
+            url: "http://127.0.0.1:8181/decision".to_owned(),
+            auth_token: String::new(),
+        });
+        let conditions = HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned()])]);
+        let claims = HashMap::new();
+        for (action, bucket, object, expected) in [
+            (
+                Action::S3VectorsAction(S3VectorsAction::GetVectorBucketAction),
+                "vector-bucket",
+                "",
+                "arn:aws:s3vectors:us-east-1::bucket/vector-bucket",
+            ),
+            (
+                Action::S3VectorsAction(S3VectorsAction::GetVectorsAction),
+                "vector-bucket",
+                "index-name",
+                "arn:aws:s3vectors:us-east-1::bucket/vector-bucket/index/index-name",
+            ),
+            (Action::S3VectorsAction(S3VectorsAction::ListVectorBucketsAction), "", "", "*"),
+            (
+                Action::S3Action(S3Action::ListBucketAction),
+                "ordinary-bucket",
+                "",
+                "arn:aws:s3:::ordinary-bucket",
+            ),
+            (
+                Action::S3Action(S3Action::GetObjectAction),
+                "ordinary-bucket",
+                "path/object",
+                "arn:aws:s3:::ordinary-bucket/path/object",
+            ),
+        ] {
+            let request = PArgs {
+                account: "verified-access-key",
+                groups: &None,
+                action,
+                bucket,
+                object,
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            let input = plugin.build_opa_input(&request).expect("valid operation input");
+            assert_eq!(input["input"]["resource"]["arn"], expected);
+            assert_eq!(input["input"]["resource"]["bucket"], bucket);
+            assert_eq!(input["input"]["resource"]["object"], object);
+            assert_eq!(input["input"]["identity"]["account"], "verified-access-key");
+            assert_eq!(
+                input["input"]["context"]["conditions"]["RequestedRegion"],
+                serde_json::json!(["us-east-1"])
+            );
+        }
+    }
+
+    #[test]
+    fn vector_opa_invalid_resource_inputs_are_rejected() {
+        use crate::policy::action::{Action, S3VectorsAction};
+        let plugin = AuthZPlugin::new(Args {
+            url: "http://127.0.0.1:8181/decision".to_owned(),
+            auth_token: String::new(),
+        });
+        let claims = HashMap::new();
+        let valid_conditions = HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned()])]);
+        for conditions in [
+            HashMap::new(),
+            HashMap::from([("RequestedRegion".to_owned(), Vec::new())]),
+            HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned(), "us-west-2".to_owned()])]),
+            HashMap::from([("RequestedRegion".to_owned(), vec!["*".to_owned()])]),
+        ] {
+            let request = PArgs {
+                account: "verified-access-key",
+                groups: &None,
+                action: Action::S3VectorsAction(S3VectorsAction::GetVectorsAction),
+                bucket: "vector-bucket",
+                object: "index-name",
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            assert!(plugin.build_opa_input(&request).is_none());
+        }
+        for (action, bucket, object) in [
+            (S3VectorsAction::GetVectorsAction, "vector-bucket", ""),
+            (S3VectorsAction::GetVectorBucketAction, "vector-bucket", "index-name"),
+            (S3VectorsAction::AllActions, "vector-bucket", "index-name"),
+            (S3VectorsAction::GetVectorsAction, "vector-bucket", "../index"),
+        ] {
+            let request = PArgs {
+                account: "verified-access-key",
+                groups: &None,
+                action: Action::S3VectorsAction(action),
+                bucket,
+                object,
+                conditions: &valid_conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            assert!(plugin.build_opa_input(&request).is_none());
+        }
+    }
 
     #[derive(Clone)]
     struct TestWriter(Arc<Mutex<Vec<u8>>>);
@@ -470,7 +589,7 @@ mod tests {
             deny_only: false,
         };
 
-        let payload = plugin.build_opa_input(&args);
+        let payload = plugin.build_opa_input(&args).expect("valid ordinary OPA input");
         let timestamp = payload
             .pointer("/input/context/timestamp")
             .and_then(|value| value.as_str())

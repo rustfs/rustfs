@@ -904,6 +904,7 @@ mod tests {
             ConfiguredTableCatalogStore::new_for_test(backend, TableCatalogBackingMode::from_env().expect("catalog mode"));
         catalog
             .put_table_bucket(TableBucketEntry {
+                vector_bucket_binding: None,
                 version: TABLE_CATALOG_ENTRY_VERSION,
                 table_bucket: bucket.clone(),
                 catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_owned(),
@@ -931,6 +932,8 @@ mod tests {
             .expect("seed catalog namespace");
         catalog
             .create_table(TableEntry {
+                vector_head_binding: None,
+                vector_index_definition: None,
                 version: TABLE_CATALOG_ENTRY_VERSION,
                 table_bucket: bucket.clone(),
                 namespace: "sales".to_owned(),

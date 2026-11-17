@@ -163,6 +163,75 @@ pub enum Resource {
     All,
     S3(String),
     Kms(String),
+    /// A complete S3 Vectors ARN pattern, including region and the empty account.
+    S3Vectors(String),
+}
+
+const S3_VECTORS_PREFIX: &str = "arn:aws:s3vectors:";
+
+fn vector_region_is_valid(region: &str, pattern: bool) -> bool {
+    !region.is_empty()
+        && region.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || (pattern && matches!(byte, b'*' | b'?'))
+        })
+}
+
+fn vector_name_is_valid(name: &str, index: bool) -> bool {
+    (3..=63).contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && name
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || (index && byte == b'.'))
+}
+
+fn parse_vector_arn(arn: &str, pattern: bool) -> Option<(&str, &str)> {
+    let suffix = arn.strip_prefix(S3_VECTORS_PREFIX)?;
+    let (region, resource) = suffix.split_once("::")?;
+    if !vector_region_is_valid(region, pattern) {
+        return None;
+    }
+    let names = resource.strip_prefix("bucket/")?;
+    if pattern && names.contains(['*', '?']) {
+        if names.split('/').any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || !names.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'/' | b'*' | b'?')
+            })
+        {
+            return None;
+        }
+    } else if let Some((bucket, index)) = names.split_once("/index/") {
+        if !vector_name_is_valid(bucket, false) || !vector_name_is_valid(index, true) {
+            return None;
+        }
+    } else if !vector_name_is_valid(names, false) {
+        return None;
+    }
+    Some((region, resource))
+}
+
+/// Builds the request resource after the application has verified the selector
+/// against its deployment. Empty names represent ListVectorBuckets.
+pub(crate) fn s3vectors_request_resource(region: &str, bucket: &str, index: &str) -> Option<String> {
+    if !vector_region_is_valid(region, false) {
+        return None;
+    }
+    if bucket.is_empty() && index.is_empty() {
+        return Some("*".to_owned());
+    }
+    let arn = if index.is_empty() {
+        format!("{S3_VECTORS_PREFIX}{region}::bucket/{bucket}")
+    } else {
+        format!("{S3_VECTORS_PREFIX}{region}::bucket/{bucket}/index/{index}")
+    };
+    parse_vector_arn(&arn, false)?;
+    Some(arn)
 }
 
 impl Resource {
@@ -196,6 +265,15 @@ impl Resource {
             Resource::All => return true,
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
+            Resource::S3Vectors(pattern) => {
+                let Some((region_pattern, resource_pattern)) = parse_vector_arn(pattern, true) else {
+                    return false;
+                };
+                let Some((region, resource)) = parse_vector_arn(resource, false) else {
+                    return false;
+                };
+                return wildcard::is_match(region_pattern, region) && wildcard::is_match(resource_pattern, resource);
+            }
         };
 
         let patterns = if let Some(res) = resolver {
@@ -252,6 +330,8 @@ impl TryFrom<&str> for Resource {
             Resource::S3(suffix.into())
         } else if let Some(suffix) = value.strip_prefix(Self::KMS_PREFIX) {
             Resource::Kms(suffix.into())
+        } else if value.starts_with(S3_VECTORS_PREFIX) {
+            Resource::S3Vectors(value.into())
         } else {
             return Err(IamError::InvalidResource("unknown".into(), value.into()).into());
         };
@@ -286,6 +366,11 @@ impl Validator for Resource {
                     return Err(IamError::InvalidResource("kms".into(), pattern.into()).into());
                 }
             }
+            Self::S3Vectors(pattern) => {
+                if parse_vector_arn(pattern, true).is_none() {
+                    return Err(IamError::InvalidResource("s3vectors".into(), pattern.into()).into());
+                }
+            }
         }
         Ok(())
     }
@@ -300,6 +385,7 @@ impl Serialize for Resource {
             Resource::All => serializer.serialize_str("*"),
             Resource::S3(s) => serializer.serialize_str(&format!("{}{}", Self::S3_PREFIX, s)),
             Resource::Kms(s) => serializer.serialize_str(&format!("{}{}", Self::KMS_PREFIX, s)),
+            Resource::S3Vectors(arn) => serializer.serialize_str(arn),
         }
     }
 }

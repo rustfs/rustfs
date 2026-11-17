@@ -225,12 +225,24 @@ impl BucketIncarnationFenceGuard {
         Ok(())
     }
 
+    pub(super) fn validate_for(&self, registry: &Arc<BucketFenceRegistry>, bucket: &str) -> Result<()> {
+        if !Arc::ptr_eq(&self.registry, registry) || self.bucket != bucket || self.inner.is_none() {
+            return Err(StorageError::PreconditionFailed);
+        }
+        self.ensure_held()
+    }
+
     /// Propagate lifecycle lock loss into the storage commit checks.
     /// The caller still owns this guard until the complete write tail drains.
     pub fn attach_to_object_options(&self, opts: &mut crate::object_api::ObjectOptions) {
         if let Some(guard) = self.namespace_lock_guard() {
             opts.add_bucket_lifecycle_lock_guard(guard);
         }
+    }
+
+    /// Expose the loss signal of the retained lifecycle guard to an outer publication owner.
+    pub fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+        self.inner.as_ref().and_then(NamespaceLockGuard::lock_lost_signal)
     }
 
     pub fn is_lock_lost(&self) -> bool {
@@ -260,6 +272,22 @@ mod tests {
 
     fn uuid(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    #[tokio::test]
+    async fn borrowed_bucket_fence_requires_original_registry_and_bucket() {
+        let registry = Arc::new(BucketFenceRegistry::default());
+        let lock = NamespaceLock::new("borrowed-bucket-fence".to_owned(), Arc::new(LocalClient::new()));
+        let guard = test_fence(registry.clone(), &lock, true).await;
+        guard.validate_for(&registry, "b").expect("original store and bucket");
+        assert!(matches!(
+            guard.validate_for(&registry, "other-bucket"),
+            Err(StorageError::PreconditionFailed)
+        ));
+        assert!(matches!(
+            guard.validate_for(&Arc::new(BucketFenceRegistry::default()), "b"),
+            Err(StorageError::PreconditionFailed)
+        ));
     }
 
     fn live_probe() -> LockLossProbe {

@@ -6,7 +6,7 @@
 
 use super::function::is_server_derived_condition_key;
 use super::resource::Resource;
-use super::statement::variable_resolver_for_policy_args;
+use super::statement::{s3vectors_request_is_valid, variable_resolver_for_policy_args};
 use super::utils::wildcard;
 use super::{Args, BucketPolicy, BucketPolicyArgs, Effect, Functions, Policy, ResourceSet};
 
@@ -57,6 +57,9 @@ pub fn conditions_known_for_probe(functions: &Functions, conditions: &std::colle
 /// The decision when every relevant request condition is known, or when unknown
 /// conditions cannot change the result. None means more operation facts are required.
 pub async fn policy_probe_decision(policy: &Policy, args: &Args<'_>) -> Option<bool> {
+    if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+        return Some(false);
+    }
     let resolver = variable_resolver_for_policy_args(args);
     let mut allow = false;
     let mut unknown_allow = false;
@@ -97,6 +100,9 @@ pub async fn policy_probe_decision(policy: &Policy, args: &Args<'_>) -> Option<b
 
 /// Bucket-policy counterpart of policy_probe_decision. Owner queries inspect Deny only.
 pub async fn bucket_policy_probe_decision(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> Option<bool> {
+    if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+        return Some(false);
+    }
     let mut allow = false;
     let mut unknown_allow = false;
     let mut unknown_deny = false;
@@ -151,6 +157,7 @@ fn resource_may_name_bucket(resource: &Resource, bucket: &str) -> bool {
             wildcard::is_match(bucket_pattern, bucket)
         }
         Resource::Kms(_) => bucket.is_empty(),
+        Resource::S3Vectors(_) => false,
     }
 }
 
@@ -196,6 +203,9 @@ pub async fn bucket_policy_blocks_action_potential(policy: &BucketPolicy, args: 
 /// Disjoint object grants, partial denies and unknown request conditions remain possible; callers
 /// must authorize the exact target before executing any operation.
 pub async fn policy_action_potential(policy: &Policy, args: &Args<'_>) -> bool {
+    if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+        return false;
+    }
     let resolver = variable_resolver_for_policy_args(args);
     let mut potential = false;
     for statement in &policy.statements {
@@ -233,6 +243,9 @@ pub async fn policy_action_potential(policy: &Policy, args: &Args<'_>) -> bool {
 
 /// Entry-point hint for a bucket policy, including its Principal and known identity conditions.
 pub async fn bucket_policy_action_potential(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> bool {
+    if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+        return false;
+    }
     let mut potential = false;
     for statement in &policy.statements {
         let deny = matches!(statement.effect, Effect::Deny);

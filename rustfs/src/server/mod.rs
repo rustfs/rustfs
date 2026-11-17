@@ -19,7 +19,7 @@ mod event;
 #[cfg(feature = "gateway-stack")]
 mod gateway_handlers;
 #[cfg(feature = "gateway-stack")]
-mod gateway_stack;
+pub(crate) mod gateway_stack;
 mod health;
 mod http;
 mod hybrid;
@@ -51,9 +51,13 @@ const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
 pub(crate) use audit::apply_audit_module_switch_for_context;
 pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
 pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier};
+#[cfg(all(test, feature = "gateway-stack"))]
+pub(crate) use gateway_handlers::test_support::{Signed, signed_request_with_headers};
 pub use http::start_http_server;
 #[cfg(test)]
 pub(crate) use http::test_retire_http12_scope;
+#[cfg(all(test, feature = "gateway-stack"))]
+pub(crate) use layer::ExternalRequestContextLayer;
 pub use prefix::LOGO;
 pub use runtime::build_tokio_runtime;
 pub use service_state::SHUTDOWN_TIMEOUT;

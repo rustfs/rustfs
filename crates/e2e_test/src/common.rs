@@ -1285,6 +1285,7 @@ pub struct RustFSTestClusterEnvironment {
     /// endpoints. Proxies must be installed before [`Self::start`].
     volume_proxy_addresses: Vec<Option<SocketAddr>>,
     tls_ca_pem: Option<Vec<u8>>,
+    retain_data: bool,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -1391,7 +1392,18 @@ impl RustFSTestClusterEnvironment {
             topology,
             volume_proxy_addresses: vec![None; node_count],
             tls_ca_pem: None,
+            retain_data: false,
         })
+    }
+
+    /// Preserve this cluster's directories, including evidence from failed tests.
+    #[cfg(all(feature = "catalog-fault-worker", unix))]
+    pub(crate) fn retain_data(&mut self) -> io::Result<()> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "select data retention before starting nodes"));
+        }
+        self.retain_data = true;
+        Ok(())
     }
 
     /// Configure verified HTTPS for both volume endpoints and S3 clients.
@@ -2014,6 +2026,9 @@ impl Drop for RustFSTestClusterEnvironment {
     /// Logs a warning if directory deletion fails (does not affect program exit).
     fn drop(&mut self) {
         self.stop();
+        if self.retain_data {
+            return;
+        }
         if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
             warn!("Failed to clean up cluster temp directory {}: {}", self.temp_dir, e);
         }
@@ -2512,6 +2527,7 @@ mod tests {
             topology,
             volume_proxy_addresses: vec![None; node_count],
             tls_ca_pem: None,
+            retain_data: false,
         }
     }
 

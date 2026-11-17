@@ -1,0 +1,75 @@
+name: e2e-catalog-fault
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  catalog-fault:
+    name: Native Catalog fault tests
+    # The library test worker includes Lance and the RustFS test dependencies;
+    # its workspace test artifacts exceed the hosted runner disk budget.
+    runs-on: sm-standard-4
+    timeout-minutes: 180
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      NO_PROXY: 127.0.0.1,localhost,::1
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-catalog-worker-selfhosted
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: 'false'
+
+      - name: Validate worker provenance
+        run: python3 scripts/test_e2e_catalog_worker.py
+
+      - name: Build identified native worker
+        env:
+          CARGO_BUILD_JOBS: "4"
+          CARGO_INCREMENTAL: "0"
+        run: |
+          env -u MAKEFLAGS -u MFLAGS -u GNUMAKEFLAGS -u MAKEFILES -u MAKEOVERRIDES -u BASH_ENV -u ENV make -j4 -f - <<'MAKE'
+          .PHONY: catalog-worker
+          catalog-worker: ; python3 scripts/e2e_catalog_worker.py build
+          MAKE
+
+      - name: Run native Catalog fault scenarios
+        env:
+          CARGO_BUILD_JOBS: "4"
+          CARGO_INCREMENTAL: "0"
+          RUSTFS_CATALOG_FAULT_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-catalog-fault
+        run: |
+          env -u MAKEFLAGS -u MFLAGS -u GNUMAKEFLAGS -u MAKEFILES -u MAKEOVERRIDES -u BASH_ENV -u ENV make -j4 -f - <<'MAKE'
+          .PHONY: catalog-fault
+          catalog-fault: ; rm -f target/nextest/e2e-distributed/junit.xml && cargo nextest list --locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed -E 'test(distributed::catalog_fault_acceptance_test::)' --message-format json > target/catalog-fault-listing.json && python3 scripts/check_test_wiring.py --check-catalog-fault target/catalog-fault-listing.json && python3 scripts/e2e_catalog_worker.py run -- cargo nextest run --locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed -E 'test(distributed::catalog_fault_acceptance_test::)' --test-threads 1 --retries 0 --no-tests fail && python3 scripts/check_test_wiring.py --check-catalog-fault target/catalog-fault-listing.json target/nextest/e2e-distributed/junit.xml
+          MAKE
+
+      - name: Upload Catalog fault evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: catalog-fault-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/rustfs-catalog-fault/
+            target/catalog-fault-listing.json
+            target/nextest/e2e-distributed/junit.xml
+            target/debug/rustfs-catalog-worker.json
+          retention-days: 7
+          if-no-files-found: warn

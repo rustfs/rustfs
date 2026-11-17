@@ -1312,6 +1312,92 @@ where
     update_config_with_expected(bucket, config_file, None, mutate).await
 }
 
+pub(crate) async fn mutate_managed_bucket_config_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    expected_store_id: Uuid,
+    identity: &crate::storage_api_contracts::bucket::BucketHandle,
+    mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+) -> Result<OffsetDateTime> {
+    use crate::storage_api_contracts::bucket::BucketKind;
+
+    let sys = require_bucket_metadata_sys_in(ctx)?;
+    let metadata_sys = sys.read().await.clone();
+    let store = metadata_sys.object_store_if_live().ok_or(Error::PreconditionFailed)?;
+    if expected_store_id.is_nil() || store.id != expected_store_id || identity.kind() != BucketKind::Vector {
+        return Err(Error::PreconditionFailed);
+    }
+    let bucket = identity.storage_bucket_id().as_str();
+    // Lock order: lifecycle read, metadata transaction write, then metadata namespace.
+    // Pin this instance through every acquisition and the complete metadata save.
+    let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(bucket).await?;
+    let transaction_guard = await_bucket_namespace_operation(
+        Some(&lifecycle_guard),
+        bucket,
+        "managed bucket config transaction acquisition",
+        acquire_transaction_lock_for_store(store.clone(), bucket, "managed_bucket_config_update"),
+    )
+    .await?;
+    let incarnation_id = validate_bucket_metadata_guard_incarnation(
+        &metadata_sys,
+        bucket,
+        Some(identity.incarnation().as_uuid()),
+        &lifecycle_guard,
+        &transaction_guard,
+    )
+    .await?;
+    let guard = BucketMetadataMutationGuard {
+        bucket: bucket.to_owned(),
+        incarnation_id,
+        lifecycle_guard,
+        transaction_guard,
+    };
+    let current_store = sys.read().await.object_store_if_live().ok_or(Error::PreconditionFailed)?;
+    if current_store.id != expected_store_id {
+        return Err(Error::PreconditionFailed);
+    }
+    mutate_managed_bucket_config_under_guard(&metadata_sys, &guard, identity, mutation).await
+}
+
+async fn mutate_managed_bucket_config_under_guard(
+    metadata_sys: &BucketMetadataSys,
+    guard: &BucketMetadataMutationGuard,
+    identity: &crate::storage_api_contracts::bucket::BucketHandle,
+    mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+) -> Result<OffsetDateTime> {
+    use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+
+    let bucket = identity.storage_bucket_id().as_str();
+    guard.ensure_valid(bucket)?;
+    let config_file = match &mutation {
+        ManagedBucketConfigMutation::PutPolicy { .. } | ManagedBucketConfigMutation::DeletePolicy => {
+            super::metadata::BUCKET_POLICY_CONFIG
+        }
+        ManagedBucketConfigMutation::Tag { .. } | ManagedBucketConfigMutation::Untag { .. } => BUCKET_TAGGING_CONFIG,
+    };
+    let updated = await_bucket_namespace_operation(
+        Some(&guard.lifecycle_guard),
+        bucket,
+        "managed bucket config mutation",
+        await_bucket_namespace_operation(
+            Some(&guard.transaction_guard),
+            bucket,
+            "managed bucket config mutation transaction",
+            Box::pin(metadata_sys.update_config_with_checked(
+                bucket,
+                config_file,
+                |metadata| {
+                    metadata.validate_bucket_handle(identity)?;
+                    metadata.managed_config_mutation_data(mutation)
+                },
+                guard.incarnation_id,
+            )),
+        ),
+    )
+    .await?;
+    guard.ensure_valid(bucket)?;
+    Ok(updated)
+}
+
 async fn update_config_with_expected<F>(
     bucket: &str,
     config_file: &str,
@@ -1494,6 +1580,14 @@ async fn acquire_transaction_lock_with_sys_for_purpose(
     // write guard in `acquire_config_write_guards`, and must not still hold a
     // read guard when the namespace lock is awaited.
     let api = sys.read().await.object_store();
+    acquire_transaction_lock_for_store(api, bucket, op).await
+}
+
+pub(crate) async fn acquire_transaction_lock_for_store(
+    api: Arc<ECStore>,
+    bucket: &str,
+    op: &'static str,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
     let lock = api
         .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
         .await?;
@@ -2263,7 +2357,7 @@ impl BucketMetadataSys {
         ))
     }
 
-    fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
+    pub(crate) fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
         self.api.upgrade()
     }
 
@@ -2801,6 +2895,7 @@ impl BucketMetadataSys {
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
         self.revoke_pending_bucket_creation(&bm.name).await;
         bm.bucket_creation_committed = true;
+        bm.bucket_creation_commit_record_present = true;
         bm.save_with_store_committed(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;
@@ -2828,6 +2923,7 @@ impl BucketMetadataSys {
         // transaction, and namespace write) and physical creation already
         // returned, so this generation is committed.
         bm.bucket_creation_committed = true;
+        bm.bucket_creation_commit_record_present = true;
         bm.save_with_store_committed(self.object_store()).await?;
         self.set(bm.name.clone(), Arc::new(bm)).await;
         Ok(())
@@ -3287,6 +3383,11 @@ impl BucketMetadataSys {
             return Ok(BucketMetadataAuthority::Fabricated);
         }
         if metadata.needs_bucket_creation_commit() {
+            // Managed identities are published only by their original creation commit.
+            // Physical directories do not prove that the managed configuration was committed.
+            if metadata.bucket_kind()? == crate::storage_api_contracts::bucket::BucketKind::Vector {
+                return Err(Error::PreconditionFailed);
+            }
             metadata.bucket_creation_committed = true;
             metadata.save_with_store_committed(self.object_store()).await?;
         }
@@ -3518,7 +3619,10 @@ impl BucketMetadataSys {
         }
 
         let (metadata, persisted) = metadata_res?;
-        if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
+        if persisted
+            && (metadata.lock_enabled || metadata.bucket_kind()? == crate::storage_api_contracts::bucket::BucketKind::Vector)
+            && !metadata.bucket_creation_committed
+        {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {
@@ -3769,6 +3873,89 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn managed_bucket_config_mutation_rejects_expired_guards_before_save() {
+        use crate::storage_api_contracts::bucket::{
+            AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedBucketConfigMutation,
+            StorageBucketId,
+        };
+        use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = BucketHandle::try_from_parts(
+            BucketKind::Vector,
+            AccountNamespaceId::empty(),
+            "us-east-1".to_owned(),
+            BucketPublicName::try_new("expired-config-guard".to_owned()).expect("public name"),
+            StorageBucketId::try_new(format!("rustfs-v-{}", Uuid::new_v4().simple())).expect("storage ID"),
+            BucketIncarnation::try_new(Uuid::new_v4()).expect("incarnation"),
+        )
+        .expect("identity");
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let bucket = identity.storage_bucket_id().as_str();
+        let before = store.get_bucket_metadata_from_disk(bucket).await.expect("original metadata");
+        let metadata_sys = store.ctx.bucket_metadata_sys().expect("metadata system").read().await.clone();
+        tokio::time::pause();
+        for expire_transaction in [false, true] {
+            let short_ttl = Duration::from_millis(20);
+            let long_ttl = Duration::from_secs(3600);
+            let lock = NamespaceLock::new("managed-config-expiry-test".to_owned(), Arc::new(LocalClient::new()));
+            let lifecycle_ttl = if expire_transaction { long_ttl } else { short_ttl };
+            let transaction_ttl = if expire_transaction { short_ttl } else { long_ttl };
+            let lifecycle_guard = lock
+                .acquire_guard(
+                    &LockRequest::new(ObjectKey::new(bucket, ""), LockType::Shared, "test-owner")
+                        .with_ttl(lifecycle_ttl)
+                        .with_refresh_interval(lifecycle_ttl),
+                )
+                .await
+                .expect("lifecycle request")
+                .expect("lifecycle guard");
+            let transaction_guard = lock
+                .acquire_guard(
+                    &LockRequest::new(
+                        ObjectKey::new(RUSTFS_META_BUCKET, bucket_metadata_transaction_lock_key(bucket)),
+                        LockType::Exclusive,
+                        "test-owner",
+                    )
+                    .with_ttl(transaction_ttl)
+                    .with_refresh_interval(transaction_ttl),
+                )
+                .await
+                .expect("transaction request")
+                .expect("transaction guard");
+            let guard = BucketMetadataMutationGuard {
+                bucket: bucket.to_owned(),
+                incarnation_id: identity.incarnation().as_uuid(),
+                lifecycle_guard,
+                transaction_guard,
+            };
+            tokio::time::advance(short_ttl + Duration::from_millis(1)).await;
+            assert_eq!(guard.lifecycle_guard.is_lock_lost(), !expire_transaction);
+            assert_eq!(guard.transaction_guard.is_lock_lost(), expire_transaction);
+            let error = mutate_managed_bucket_config_under_guard(
+                &metadata_sys,
+                &guard,
+                &identity,
+                ManagedBucketConfigMutation::Tag {
+                    tags: std::collections::BTreeMap::from([("expired".to_owned(), "write".to_owned())]),
+                },
+            )
+            .await
+            .expect_err("an expired guard must reject the save");
+            assert!(error.to_string().contains("lock was lost"));
+        }
+        tokio::time::resume();
+        let after = store.get_bucket_metadata_from_disk(bucket).await.expect("unchanged metadata");
+        assert_eq!(after.tagging_config_xml, before.tagging_config_xml);
+        assert_eq!(after.tagging_config_updated_at, before.tagging_config_updated_at);
+        assert_eq!(after.bucket_identity_config_json, before.bucket_identity_config_json);
+    }
+
     use super::test_support::isolated_store_over_temp_disks;
     use super::*;
     use crate::bucket::bucket_target_sys::BucketTargetError;

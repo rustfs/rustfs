@@ -77,6 +77,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_retirements.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_catalog_worker.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_reference_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py

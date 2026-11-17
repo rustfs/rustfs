@@ -819,6 +819,26 @@
       "origin": "added"
     },
     {
+      "workflow": ".github/workflows/e2e-catalog-fault.yml",
+      "name": "e2e-catalog-fault",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "e2e-catalog-fault.yml",
+      "disposition": "Runs native Catalog fault scenarios with an identified worker and uploads their evidence on manual dispatch.",
+      "monitor_reason": "Operator-requested fault tests have no periodic freshness obligation.",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/e2e-distributed.yml",
       "name": "e2e-distributed",
       "roles": [

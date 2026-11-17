@@ -17,6 +17,10 @@ use std::sync::Arc;
 
 use rustfs_storage_api as storage_contracts;
 
+pub(crate) mod managed {
+    pub(crate) use crate::storage::storage_api::managed::BucketHandle;
+}
+
 pub(crate) mod integrity {
     pub(crate) use crate::storage::storage_api::ecstore_integrity::{
         IntegrityError, JobRequest, control_job, create_job, get_job, inventory, readiness, resume_job,
