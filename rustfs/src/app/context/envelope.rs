@@ -498,6 +498,11 @@ impl RequestEnvelope {
         self.bucket_generation.as_ref()
     }
 
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn take_bucket_generation(&mut self) -> Option<BucketGenerationGuard> {
+        self.bucket_generation.take()
+    }
+
     pub(crate) fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard> {
         self.pending_delete_bucket_generation.as_ref()
     }
@@ -520,6 +525,12 @@ impl RequestEnvelope {
 
     pub(crate) fn install_table_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
         self.table_publication_guards = Some(guards);
+    }
+
+    /// Releases preflight guards before uncommitted POST staging; publication must reauthorize.
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn release_table_publication_guards(&mut self) {
+        self.table_publication_guards = None;
     }
 
     pub(crate) fn table_list_access(&self) -> Option<&TableDataPlaneListAccess> {
@@ -690,6 +701,12 @@ impl AuthorizationRequest for RequestEnvelope {
     }
     fn policy_headers(&self) -> &HeaderMap {
         self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
+    }
+    fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders) {
+        self.post_object_policy_headers = Some(headers);
+    }
+    fn install_post_object_marker(&mut self) {
+        self.post_object = Some(PostObjectRequestMarker);
     }
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions()

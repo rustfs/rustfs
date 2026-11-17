@@ -231,6 +231,8 @@ pub(super) fn put_input(input: dto::PutObjectInput) -> S3Result<crate::app::obje
         frame_trailers: None,
         content_length: (input.content_length >= 0).then_some(input.content_length),
         metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
+        metadata_headers: None,
+        checksum_headers: None,
         specific_if_none_match,
         object_lock_retain_until_date: retain_until,
         cache_control: nonempty(input.cache_control),

@@ -29,6 +29,10 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) trailing_headers: Option<SharedTrailerSource>,
     pub(crate) content_length: Option<i64>,
     pub(crate) metadata: Option<HashMap<String, String>>,
+    /// Optional POST form projection; the original request headers remain available for audit.
+    pub(crate) metadata_headers: Option<http::HeaderMap>,
+    /// Optional checksum projection used only by the body integrity reader.
+    pub(crate) checksum_headers: Option<http::HeaderMap>,
     pub(crate) specific_if_none_match: bool,
     pub(crate) object_lock_retain_until_date: Option<time::OffsetDateTime>,
     pub(crate) cache_control: Option<String>,

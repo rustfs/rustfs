@@ -65,6 +65,8 @@ impl PutObjectWriteInput {
             trailing_headers: crate::app::trailer_adapter::trailer_source(trailing_headers),
             content_length: input.content_length,
             metadata: input.metadata,
+            metadata_headers: None,
+            checksum_headers: None,
             specific_if_none_match: matches!(input.if_none_match, Some(ETagCondition::ETag(_))),
             object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
             cache_control: input.cache_control,

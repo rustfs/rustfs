@@ -29,7 +29,7 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::PutObject>(), row::<dto::UploadPart>()];
+pub(super) const ROWS: &[OpRow] = &[row::<dto::PutObject>(), row::<dto::UploadPart>(), super::post_object::ROW];
 
 impl Served for dto::PutObject {
     const METRIC: S3Operation = S3Operation::PutObject;
@@ -240,6 +240,8 @@ fn native_input(input: dto::PutObjectInput, retain_until: Option<time::OffsetDat
         frame_trailers: None,
         content_length: Some(input.content_length),
         metadata: Some(input.metadata.into_iter().collect()),
+        metadata_headers: None,
+        checksum_headers: None,
         specific_if_none_match: input.if_none_match.as_deref().is_some_and(|value| value.trim() != "*"),
         object_lock_retain_until_date: retain_until,
         cache_control: input.cache_control,

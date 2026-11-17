@@ -1148,7 +1148,7 @@ fn extract_notification_version_id(version_id: Option<Uuid>, versioned: bool, ve
     }
 }
 
-pub(super) fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
+pub(crate) fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
     header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
 }
 
@@ -3764,6 +3764,97 @@ mod tests {
                     actual >= before && actual <= OffsetDateTime::now_utc(),
                     "ordinary upload used archive time: {actual}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_owned_member_put_iam_gates_creation_and_overwrite() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::contract::object::ObjectIO as _;
+        use crate::app::storage_api::test::{StorageObjectOptions, StoragePutObjReader};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-member-iam-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        store
+            .put_object(
+                &bucket,
+                "denied-existing",
+                &mut StoragePutObjReader::from_vec(b"original".to_vec()),
+                &StorageObjectOptions::default(),
+            )
+            .await
+            .expect("create original object");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":"s3:PutObject", "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":"s3:PutObject", "Resource":format!("arn:aws:s3:::{bucket}/denied*")}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install member policy");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let options = ObjectOptions::default();
+        let original = store
+            .get_object_info(&bucket, "denied-existing", &options)
+            .await
+            .expect("original object");
+        for (member, allowed) in [("denied-existing", false), ("denied-new", false), ("allowed-new", true)] {
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, member, &b"x"[..])
+                .await
+                .expect("archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: "archive.tar".to_owned(),
+                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                ..Default::default()
+            };
+            let mut request = build_request(input, Method::PUT);
+            request.extensions.insert(ReqInfo::default());
+            let envelope = RequestEnvelope::from_s3s(&request);
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+            if allowed {
+                result.expect("caller is allowed to write member");
+                let info = store
+                    .get_object_info(&bucket, member, &options)
+                    .await
+                    .expect("allowed member exists");
+                assert_eq!(info.size, 1);
+            } else {
+                assert_eq!(result.err().expect("IAM must deny the member").code().as_str(), "AccessDenied");
+                if member == "denied-existing" {
+                    let after = store
+                        .get_object_info(&bucket, member, &options)
+                        .await
+                        .expect("original remains");
+                    assert_eq!(after.size, original.size);
+                    assert_eq!(after.etag, original.etag);
+                } else {
+                    let missing = store
+                        .get_object_info(&bucket, member, &options)
+                        .await
+                        .expect_err("denied member absent");
+                    assert!(is_err_object_not_found(&missing), "{missing}");
+                }
             }
         }
     }
