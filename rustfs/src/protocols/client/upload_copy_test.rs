@@ -560,6 +560,9 @@ fn protocol_upload_copy_input_matches_original_codec() {
         match (actual, expected) {
             (Err(actual), Err(expected)) => assert_eq!(error_facts(actual), error_facts(expected)),
             (Ok(actual), Ok(expected)) => {
+                let crate::app::multipart_usecase::UploadPartTarget::Legacy { bucket, key, upload_id } = actual.target else {
+                    panic!("protocol client must use the legacy upload target")
+                };
                 let condition = |value: Option<ETagCondition>| -> Option<(String, Option<String>)> {
                     value.map(|value| match value {
                         ETagCondition::Any => ("any".into(), None),
@@ -576,9 +579,9 @@ fn protocol_upload_copy_input_matches_original_codec() {
                 );
                 assert_eq!(
                     (
-                        actual.bucket,
-                        actual.key,
-                        actual.upload_id,
+                        bucket,
+                        key,
+                        upload_id,
                         actual.part_number,
                         format!("{:?}", actual.copy_source),
                         actual.copy_source_range
