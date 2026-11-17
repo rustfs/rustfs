@@ -4586,9 +4586,8 @@ impl SetDisks {
                             }
                             Err(RenameBatchStartError::NotDispatched(error)) => {
                                 rustfs_io_metrics::record_ecstore_rename_batch_not_dispatched(entries.len());
-                                let message = error.to_string();
                                 for (slot, observation) in entries {
-                                    let result = Err(DiskError::other(message.clone()));
+                                    let result = Err(error.clone());
                                     observation.finish(&result);
                                     let _ = outcome_tx
                                         .send(SlotRenameOutcome {
@@ -4601,9 +4600,8 @@ impl SetDisks {
                             }
                             Err(RenameBatchStartError::MayHavePublished(error)) => {
                                 rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(entries.len());
-                                let message = error.to_string();
                                 for (slot, observation) in entries {
-                                    let result = Err(DiskError::other(message.clone()));
+                                    let result = Err(error.clone());
                                     observation.finish(&result);
                                     let _ = outcome_tx
                                         .send(SlotRenameOutcome {

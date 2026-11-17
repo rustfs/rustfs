@@ -63,7 +63,7 @@ def parse(path: Path, expected_hosts: set[str] | None) -> dict:
         raw_successful_objects = 0
         host_counts: dict[str, int] = defaultdict(int)
         for row in reader:
-            if None in row:
+            if None in row or any(row.get(field) is None for field in REQUIRED):
                 raise ValueError("Warp raw row width differs from header")
             if row["op"] != "PUT":
                 raise ValueError("Warp raw input contains a non-PUT operation")

@@ -33,6 +33,12 @@ class AdaptiveWarmupRunnerTest(unittest.TestCase):
         result = {"status": "fail", "reason": "warmup request rate is outside tolerance"}
         self.assertEqual(MODULE.result_exit_code(result), 1)
 
+    def test_saved_window_preserves_host_and_raw_evidence(self) -> None:
+        row = {"host_counts": {"a": 2, "b": 2}, "raw_quality": "window/raw-quality.json"}
+        result = MODULE.preserve_window_evidence({"reqps": 250.0}, row)
+        self.assertEqual(result["host_counts"], row["host_counts"])
+        self.assertEqual(result["raw_quality"], row["raw_quality"])
+
 
 if __name__ == "__main__":
     unittest.main()

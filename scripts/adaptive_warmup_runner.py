@@ -26,6 +26,10 @@ def result_exit_code(result: dict) -> int:
     return 1
 
 
+def preserve_window_evidence(validated: dict, row: dict) -> dict:
+    return {**validated, "host_counts": row["host_counts"], "raw_quality": row["raw_quality"]}
+
+
 def extract_latency_metrics(extractor: Path, log_path: Path) -> dict:
     result = subprocess.run(
         [
@@ -181,6 +185,7 @@ def main() -> int:
                 args.concurrency,
                 args.quality_tolerance_pct,
             )
+            validated = preserve_window_evidence(validated, row)
             (window_dir / "raw-quality.json").write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
             windows.append(validated)
             windows_path.write_text(json.dumps(windows, indent=2, sort_keys=True) + "\n")

@@ -2202,7 +2202,8 @@ impl NodeService {
         let dst_volume = Arc::<str>::from(request.dst_volume);
         let dst_path = Arc::<str>::from(request.dst_path);
         let (tx, rx) = tokio::sync::mpsc::channel(prepared.len());
-        tokio::spawn(async move {
+        let resource_context = crate::storage::storage_api::RemoteBackgroundIo::take_current();
+        tokio::spawn(crate::storage::storage_api::with_remote_background_io(resource_context, async move {
             let mut pending = FuturesUnordered::new();
             for (item_index, disk, file_info) in prepared {
                 let target = target.clone();
@@ -2248,7 +2249,7 @@ impl NodeService {
                 };
                 let _ = tx.send(Ok(response)).await;
             }
-        });
+        }));
         Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
     }
 

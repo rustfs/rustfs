@@ -62,6 +62,14 @@ class WarpRawQualityTest(unittest.TestCase):
             1_123_456_789,
         )
 
+    def test_truncated_row_fails_as_malformed_input(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "warp.tsv"
+        path.write_text(HEADER + "0\tPUT\t1\t100\ta\t\t2026-01-01T00:00:00Z\t2026-01-01T00:00:01Z\n")
+        with self.assertRaisesRegex(ValueError, "row width differs"):
+            MODULE.parse(path, {"a"})
+
 
 if __name__ == "__main__":
     unittest.main()

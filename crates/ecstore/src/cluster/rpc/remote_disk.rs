@@ -1141,7 +1141,7 @@ impl RenameBatchCallGuard {
         }
     }
 
-    fn release_for_fallback(mut self) {
+    fn release_before_dispatch(mut self) {
         self.quarantine_on_drop = false;
         if let Some(admission) = self.admission.take() {
             admission.release_all();
@@ -2519,6 +2519,54 @@ impl RemoteDisk {
         }
     }
 
+    async fn execute_peer_batch_with_timeout<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        if timeout_duration == Duration::ZERO {
+            self.record_timeout(op, timeout_duration);
+            return Err(DiskError::Timeout);
+        }
+        match time::timeout(timeout_duration, operation()).await {
+            Ok(operation_result) => {
+                if operation_result.is_ok() {
+                    rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&self.addr);
+                }
+                let evict = operation_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| !error.is_metacache_output_stream_closed() && is_network_like_disk_error(error));
+                self.handle_network_like_error(op, timeout_duration, &operation_result, FailureHealthAction::IgnoreFailure)
+                    .await;
+                if evict {
+                    evict_failed_connection_with_reason(
+                        &self.addr,
+                        ChannelRebuildReason::RpcFailure,
+                        ConnectionEvictionLogLevel::Debug,
+                    )
+                    .await;
+                }
+                operation_result
+            }
+            Err(_) => {
+                self.record_timeout(op, timeout_duration);
+                evict_failed_connection_with_reason(
+                    &self.addr,
+                    ChannelRebuildReason::OperationTimeout,
+                    ConnectionEvictionLogLevel::Debug,
+                )
+                .await;
+                Err(DiskError::Timeout)
+            }
+        }
+    }
+
     fn record_timeout(&self, op: &'static str, timeout_duration: Duration) {
         counter!(
             "rustfs_drive_op_timeout_total",
@@ -3138,8 +3186,12 @@ impl RemoteDisk {
             quarantine_on_drop: true,
         };
         let call_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if call_timeout == Duration::ZERO {
+            guard.release_before_dispatch();
+            return Err(RenameBatchStartError::NotDispatched(DiskError::Timeout));
+        }
         let response = match self
-            .execute_with_timeout_for_op(
+            .execute_peer_batch_with_timeout(
                 "rename_data_batch",
                 || async {
                     match client.rename_data_batch(request).await {
@@ -3153,7 +3205,7 @@ impl RemoteDisk {
             .await
         {
             Err(DiskError::UnsupportedDisk) => {
-                guard.release_for_fallback();
+                guard.release_before_dispatch();
                 return Err(RenameBatchStartError::UnsupportedBeforeStream);
             }
             Err(error) => return Err(RenameBatchStartError::MayHavePublished(error)),
