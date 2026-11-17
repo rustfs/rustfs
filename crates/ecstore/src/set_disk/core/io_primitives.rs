@@ -3102,6 +3102,22 @@ struct RenameSlotContext {
     write_quorum: usize,
 }
 
+struct RenameOutcomeProducerArgs {
+    disks: Arc<Vec<Option<DiskStore>>>,
+    file_infos: Arc<Vec<FileInfo>>,
+    fence_tokens: Arc<Vec<Option<Uuid>>>,
+    paths: RenameSlotPaths,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    write_quorum: usize,
+    allow_batch: bool,
+}
+
+struct RenameOutcomeProducers {
+    outcomes: mpsc::Receiver<SlotRenameOutcome>,
+    tasks: JoinSet<()>,
+}
+
 struct PreparedRenameSlot {
     context: RenameSlotContext,
     indexed_file_info: Option<FileInfo>,
@@ -4353,6 +4369,238 @@ impl SetDisks {
         }
     }
 
+    fn spawn_rename_outcome_producers(args: RenameOutcomeProducerArgs) -> RenameOutcomeProducers {
+        let RenameOutcomeProducerArgs {
+            disks,
+            file_infos,
+            fence_tokens,
+            paths,
+            namespace_owner,
+            publication_scope,
+            write_quorum,
+            allow_batch,
+        } = args;
+        debug_assert!(!allow_batch || publication_scope.is_none());
+        let disk_count = disks.len();
+        let fanout_plan = if allow_batch {
+            Self::plan_rename_fanout(
+                disks.as_slice(),
+                file_infos.as_slice(),
+                fence_tokens.as_slice(),
+                &paths.src_bucket,
+                &paths.dst_bucket,
+                &paths.dst_object,
+            )
+        } else {
+            RenameFanoutPlan::default()
+        };
+        let successful_completion_rank = rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
+        let resource_unit = crate::disk::current_resource_unit();
+        let mut tasks = JoinSet::new();
+        let (outcome_tx, outcome_rx) = mpsc::channel(disk_count.max(1));
+        for (slot, (disk, scanner_token)) in disks.iter().cloned().zip(fence_tokens.iter().copied()).enumerate() {
+            if fanout_plan.batch_slot_mask & (1_u16 << slot) != 0 {
+                continue;
+            }
+            let outcome_tx = outcome_tx.clone();
+            let context = RenameSlotContext {
+                slot,
+                disk,
+                file_infos: file_infos.clone(),
+                scanner_token,
+                namespace_owner: namespace_owner.clone(),
+                publication_scope: publication_scope.clone(),
+                paths: paths.clone(),
+                successful_completion_rank: successful_completion_rank.clone(),
+                write_quorum,
+            };
+            let resource_unit = resource_unit.clone();
+            tasks.spawn(crate::disk::with_optional_resource_unit(resource_unit, async move {
+                let outcome = Self::run_unary_rename_slot(context).await;
+                let _ = outcome_tx.send(outcome).await;
+            }));
+        }
+        for group in fanout_plan.batch_groups {
+            let outcome_tx = outcome_tx.clone();
+            let paths = paths.clone();
+            let file_infos = file_infos.clone();
+            let successful_completion_rank = successful_completion_rank.clone();
+            let namespace_owner = namespace_owner.clone();
+            let group_disks = disks.clone();
+            let group_tokens = fence_tokens.clone();
+            let resource_unit = resource_unit.clone();
+            tasks.spawn(crate::disk::with_optional_resource_unit(resource_unit, async move {
+                let prepared = join_all(group.slots.into_iter().map(|slot| {
+                    let context = RenameSlotContext {
+                        slot,
+                        disk: group_disks[slot].clone(),
+                        file_infos: file_infos.clone(),
+                        scanner_token: group_tokens[slot],
+                        namespace_owner: namespace_owner.clone(),
+                        publication_scope: None,
+                        paths: paths.clone(),
+                        successful_completion_rank: successful_completion_rank.clone(),
+                        write_quorum,
+                    };
+                    async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
+                }))
+                .await;
+                let mut admitted = Vec::with_capacity(prepared.len());
+                for (slot, result) in prepared {
+                    match result {
+                        Ok(slot) => admitted.push(slot),
+                        Err(error) => {
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(Err(error)),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                let mut entries = Vec::with_capacity(admitted.len());
+                for slot in admitted {
+                    match RenameSlotObservation::start(&slot.prepared) {
+                        Ok(observation) => entries.push((slot, observation)),
+                        Err(error) => {
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(Err(error)),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                if entries.len() < 2 {
+                    for outcome in join_all(
+                        entries
+                            .into_iter()
+                            .map(|(slot, observation)| Self::run_admitted_unary_slot(slot, observation)),
+                    )
+                    .await
+                    {
+                        let _ = outcome_tx.send(outcome).await;
+                    }
+                    return;
+                }
+                rustfs_io_metrics::record_ecstore_rename_batch_planned(entries.len());
+                let start = {
+                    let items = entries
+                        .iter()
+                        .map(|(slot, _)| RenameBatchClientItem {
+                            slot: slot.prepared.context.slot,
+                            disk: slot
+                                .prepared
+                                .context
+                                .disk
+                                .as_ref()
+                                .map(|disk| disk.endpoint().to_string())
+                                .unwrap_or_default(),
+                            file_info: slot.prepared.file_info(),
+                        })
+                        .collect();
+                    match group.representative.as_ref() {
+                        Disk::Remote(remote) => {
+                            remote
+                                .start_rename_data_batch(
+                                    &paths.src_bucket,
+                                    &paths.src_object,
+                                    &paths.dst_bucket,
+                                    &paths.dst_object,
+                                    items,
+                                )
+                                .await
+                        }
+                        Disk::Local(_) => Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected)),
+                    }
+                };
+                match start {
+                    Ok(mut stream) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_stream_started(entries.len());
+                        let mut remaining = entries.into_iter().map(Some).collect::<Vec<_>>();
+                        loop {
+                            match stream.next_outcome().await {
+                                Ok(Some(batch_outcome)) => {
+                                    if let Some(entry) = remaining.iter_mut().find(|entry| {
+                                        entry
+                                            .as_ref()
+                                            .is_some_and(|(slot, _)| slot.prepared.context.slot == batch_outcome.slot)
+                                    }) && let Some((slot, observation)) = entry.take()
+                                    {
+                                        let outcome = Self::finish_batch_slot(slot, observation, batch_outcome.result);
+                                        let _ = outcome_tx.send(outcome).await;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => break,
+                            }
+                        }
+                        let remaining_items = remaining.iter().flatten().count();
+                        rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(remaining_items);
+                        for (slot, observation) in remaining.into_iter().flatten() {
+                            let result = Err(DiskError::Unexpected);
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::MayHavePublished,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(RenameBatchStartError::UnsupportedBeforeStream) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_fallback(entries.len());
+                        let mut fallbacks = FuturesUnordered::new();
+                        for (slot, observation) in entries {
+                            fallbacks.push(Self::run_admitted_unary_slot(slot, observation));
+                        }
+                        while let Some(outcome) = fallbacks.next().await {
+                            let _ = outcome_tx.send(outcome).await;
+                        }
+                    }
+                    Err(RenameBatchStartError::NotDispatched(error)) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_not_dispatched(entries.len());
+                        for (slot, observation) in entries {
+                            let result = Err(error.clone());
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(RenameBatchStartError::MayHavePublished(error)) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(entries.len());
+                        for (slot, observation) in entries {
+                            let result = Err(error.clone());
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::MayHavePublished,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }));
+        }
+        drop(outcome_tx);
+        RenameOutcomeProducers {
+            outcomes: outcome_rx,
+            tasks,
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
     async fn rename_data_owned_early_ack_with_fence(
         disks: &[Option<DiskStore>],
@@ -4366,7 +4614,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
-            scanner_publication_commit_scope: _scanner_publication_commit_scope,
+            scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
             multipart_proof_authority: _,
@@ -4390,7 +4638,6 @@ impl SetDisks {
         let fanout_fence_tokens =
             Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
         Self::record_rename_batch_candidates(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
-        let fanout_plan = Self::plan_rename_fanout(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
         let coordinator_disks = fanout_disks.clone();
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -4406,216 +4653,25 @@ impl SetDisks {
             let fanout_dst_bucket = dst_bucket.clone();
             let fanout_dst_object = dst_object.clone();
             async move {
-                let successful_rename_completion_rank =
-                    rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-                let mut tasks = JoinSet::new();
-                let (outcome_tx, mut outcome_rx) = mpsc::channel(disk_count.max(1));
-                let paths = RenameSlotPaths {
-                    src_bucket: fanout_src_bucket.clone(),
-                    src_object: fanout_src_object.clone(),
-                    dst_bucket: fanout_dst_bucket.clone(),
-                    dst_object: fanout_dst_object.clone(),
-                };
-                for (i, (disk, scanner_publication_lease_token)) in fanout_disks
-                    .iter()
-                    .cloned()
-                    .zip(fanout_fence_tokens.iter().copied())
-                    .enumerate()
-                {
-                    if fanout_plan.batch_slot_mask & (1_u16 << i) != 0 {
-                        continue;
-                    }
-                    let outcome_tx = outcome_tx.clone();
-                    let context = RenameSlotContext {
-                        slot: i,
-                        disk,
-                        file_infos: file_infos.clone(),
-                        scanner_token: scanner_publication_lease_token,
-                        namespace_owner: namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>),
-                        publication_scope: None,
-                        paths: paths.clone(),
-                        successful_completion_rank: successful_rename_completion_rank.clone(),
-                        write_quorum,
-                    };
-                    tasks.spawn(async move {
-                        let outcome = Self::run_unary_rename_slot(context).await;
-                        let _ = outcome_tx.send(outcome).await;
-                    });
-                }
-                for group in fanout_plan.batch_groups {
-                    let outcome_tx = outcome_tx.clone();
-                    let paths = paths.clone();
-                    let file_infos = file_infos.clone();
-                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
-                    let namespace_owner = namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>);
-                    let group_disks = fanout_disks.clone();
-                    let group_tokens = fanout_fence_tokens.clone();
-                    tasks.spawn(async move {
-                        let prepared = join_all(group.slots.into_iter().map(|slot| {
-                            let context = RenameSlotContext {
-                                slot,
-                                disk: group_disks[slot].clone(),
-                                file_infos: file_infos.clone(),
-                                scanner_token: group_tokens[slot],
-                                namespace_owner: namespace_owner.clone(),
-                                publication_scope: None,
-                                paths: paths.clone(),
-                                successful_completion_rank: successful_rename_completion_rank.clone(),
-                                write_quorum,
-                            };
-                            async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
-                        }))
-                        .await;
-                        let mut admitted = Vec::with_capacity(prepared.len());
-                        for (slot, result) in prepared {
-                            match result {
-                                Ok(slot) => admitted.push(slot),
-                                Err(error) => {
-                                    let _ = outcome_tx
-                                        .send(SlotRenameOutcome {
-                                            slot,
-                                            dispatch_state: RenameDispatchState::NotDispatched,
-                                            completion: Ok(Err(error)),
-                                        })
-                                        .await;
-                                }
-                            }
-                        }
-                        let mut entries = Vec::with_capacity(admitted.len());
-                        for slot in admitted {
-                            match RenameSlotObservation::start(&slot.prepared) {
-                                Ok(observation) => entries.push((slot, observation)),
-                                Err(error) => {
-                                    let _ = outcome_tx
-                                        .send(SlotRenameOutcome {
-                                            slot: slot.prepared.context.slot,
-                                            dispatch_state: RenameDispatchState::NotDispatched,
-                                            completion: Ok(Err(error)),
-                                        })
-                                        .await;
-                                }
-                            }
-                        }
-                        if entries.len() < 2 {
-                            for outcome in join_all(
-                                entries
-                                    .into_iter()
-                                    .map(|(slot, observation)| Self::run_admitted_unary_slot(slot, observation)),
-                            )
-                            .await
-                            {
-                                let _ = outcome_tx.send(outcome).await;
-                            }
-                            return;
-                        }
-                        rustfs_io_metrics::record_ecstore_rename_batch_planned(entries.len());
-                        let start = {
-                            let items = entries
-                                .iter()
-                                .map(|(slot, _)| RenameBatchClientItem {
-                                    slot: slot.prepared.context.slot,
-                                    disk: slot
-                                        .prepared
-                                        .context
-                                        .disk
-                                        .as_ref()
-                                        .map(|disk| disk.endpoint().to_string())
-                                        .unwrap_or_default(),
-                                    file_info: slot.prepared.file_info(),
-                                })
-                                .collect();
-                            match group.representative.as_ref() {
-                                Disk::Remote(remote) => {
-                                    remote
-                                        .start_rename_data_batch(
-                                            &paths.src_bucket,
-                                            &paths.src_object,
-                                            &paths.dst_bucket,
-                                            &paths.dst_object,
-                                            items,
-                                        )
-                                        .await
-                                }
-                                Disk::Local(_) => Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected)),
-                            }
-                        };
-                        match start {
-                            Ok(mut stream) => {
-                                rustfs_io_metrics::record_ecstore_rename_batch_stream_started(entries.len());
-                                let mut remaining = entries.into_iter().map(Some).collect::<Vec<_>>();
-                                loop {
-                                    match stream.next_outcome().await {
-                                        Ok(Some(batch_outcome)) => {
-                                            if let Some(entry) = remaining.iter_mut().find(|entry| {
-                                                entry
-                                                    .as_ref()
-                                                    .is_some_and(|(slot, _)| slot.prepared.context.slot == batch_outcome.slot)
-                                            }) && let Some((slot, observation)) = entry.take()
-                                            {
-                                                let outcome = Self::finish_batch_slot(slot, observation, batch_outcome.result);
-                                                let _ = outcome_tx.send(outcome).await;
-                                            }
-                                        }
-                                        Ok(None) => break,
-                                        Err(_) => break,
-                                    }
-                                }
-                                let remaining_items = remaining.iter().flatten().count();
-                                rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(remaining_items);
-                                for (slot, observation) in remaining.into_iter().flatten() {
-                                    let result = Err(DiskError::Unexpected);
-                                    observation.finish(&result);
-                                    let _ = outcome_tx
-                                        .send(SlotRenameOutcome {
-                                            slot: slot.prepared.context.slot,
-                                            dispatch_state: RenameDispatchState::MayHavePublished,
-                                            completion: Ok(result),
-                                        })
-                                        .await;
-                                }
-                            }
-                            Err(RenameBatchStartError::UnsupportedBeforeStream) => {
-                                rustfs_io_metrics::record_ecstore_rename_batch_fallback(entries.len());
-                                let mut fallbacks = FuturesUnordered::new();
-                                for (slot, observation) in entries {
-                                    fallbacks.push(Self::run_admitted_unary_slot(slot, observation));
-                                }
-                                while let Some(outcome) = fallbacks.next().await {
-                                    let _ = outcome_tx.send(outcome).await;
-                                }
-                            }
-                            Err(RenameBatchStartError::NotDispatched(error)) => {
-                                rustfs_io_metrics::record_ecstore_rename_batch_not_dispatched(entries.len());
-                                for (slot, observation) in entries {
-                                    let result = Err(error.clone());
-                                    observation.finish(&result);
-                                    let _ = outcome_tx
-                                        .send(SlotRenameOutcome {
-                                            slot: slot.prepared.context.slot,
-                                            dispatch_state: RenameDispatchState::NotDispatched,
-                                            completion: Ok(result),
-                                        })
-                                        .await;
-                                }
-                            }
-                            Err(RenameBatchStartError::MayHavePublished(error)) => {
-                                rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(entries.len());
-                                for (slot, observation) in entries {
-                                    let result = Err(error.clone());
-                                    observation.finish(&result);
-                                    let _ = outcome_tx
-                                        .send(SlotRenameOutcome {
-                                            slot: slot.prepared.context.slot,
-                                            dispatch_state: RenameDispatchState::MayHavePublished,
-                                            completion: Ok(result),
-                                        })
-                                        .await;
-                                }
-                            }
-                        }
-                    });
-                }
-                drop(outcome_tx);
+                let allow_batch = scanner_publication_commit_scope.is_none();
+                let RenameOutcomeProducers {
+                    outcomes: mut outcome_rx,
+                    mut tasks,
+                } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                    disks: fanout_disks.clone(),
+                    file_infos: file_infos.clone(),
+                    fence_tokens: fanout_fence_tokens.clone(),
+                    paths: RenameSlotPaths {
+                        src_bucket: fanout_src_bucket.clone(),
+                        src_object: fanout_src_object.clone(),
+                        dst_bucket: fanout_dst_bucket.clone(),
+                        dst_object: fanout_dst_object.clone(),
+                    },
+                    namespace_owner: namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>),
+                    publication_scope: scanner_publication_commit_scope,
+                    write_quorum,
+                    allow_batch,
+                });
 
                 let mut commit_tx = Some(commit_tx);
                 let mut sent_commit = false;
@@ -4964,9 +5020,10 @@ impl SetDisks {
         let dst_object = Arc::new(dst_object.to_string());
 
         let disk_count = disks.len();
-        let fanout_disks = disks.to_vec();
+        let fanout_disks = Arc::new(disks.to_vec());
         let fanout_file_infos = Arc::new(file_infos);
-        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
+        let fanout_fence_tokens =
+            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
         Self::record_rename_batch_candidates(
             disks,
             &fanout_file_infos,
@@ -4989,52 +5046,38 @@ impl SetDisks {
             .or_else(|| namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>));
         let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
-        // completed disk mutations. Per-disk futures stay ordered in `join_all`,
-        // preserving slot-indexed quorum and convergence accounting without a
-        // scheduler task for every disk.
+        // completed disk mutations. Producers may complete out of order, while
+        // their stable slot indexes preserve quorum and convergence accounting.
         let fanout_future = async move {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
             let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
-            let successful_rename_completion_rank =
-                rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-            let (outcome_tx, mut outcome_rx) = mpsc::channel(disk_count.max(1));
-            let producer_outcome_tx = outcome_tx.clone();
-            let producer_file_infos = fanout_file_infos.clone();
             let paths = RenameSlotPaths {
                 src_bucket: fanout_src_bucket,
                 src_object: fanout_src_object,
                 dst_bucket: fanout_dst_bucket,
                 dst_object: fanout_dst_object.clone(),
             };
-            let futures = fanout_disks.into_iter().zip(fanout_fence_tokens.into_iter()).enumerate().map(
-                move |(i, (disk, scanner_publication_lease_token))| {
-                    let outcome_tx = producer_outcome_tx.clone();
-                    let context = RenameSlotContext {
-                        slot: i,
-                        disk,
-                        file_infos: producer_file_infos.clone(),
-                        scanner_token: scanner_publication_lease_token,
-                        namespace_owner: fanout_namespace_owner.clone(),
-                        publication_scope: scanner_publication_commit_scope.clone(),
-                        paths: paths.clone(),
-                        successful_completion_rank: successful_rename_completion_rank.clone(),
-                        write_quorum,
-                    };
-
-                    async move {
-                        let outcome = Self::run_unary_rename_slot(context).await;
-                        let _ = outcome_tx.send(outcome).await;
-                    }
-                },
-            );
-            drop(outcome_tx);
-            join_all(futures).await;
+            let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
+            let RenameOutcomeProducers {
+                outcomes: mut outcome_rx,
+                mut tasks,
+            } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                disks: fanout_disks,
+                file_infos: fanout_file_infos.clone(),
+                fence_tokens: fanout_fence_tokens,
+                paths,
+                namespace_owner: fanout_namespace_owner,
+                publication_scope: scanner_publication_commit_scope,
+                write_quorum,
+                allow_batch,
+            });
             let mut results = Vec::with_capacity(disk_count);
             while let Some(outcome) = outcome_rx.recv().await {
                 results.push(outcome);
             }
+            while tasks.join_next().await.is_some() {}
             #[cfg(test)]
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
