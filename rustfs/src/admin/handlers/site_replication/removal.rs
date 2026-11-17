@@ -15,6 +15,7 @@
 use super::*;
 use crate::runtime_sources::current_endpoints_handle;
 use rustfs_madmin::SRRemoveV2Req;
+use rustfs_s3_types::s3_error;
 
 pub(super) struct SiteRemovalV2Handler;
 pub(super) struct SiteRemovalV2CapabilitiesHandler;
