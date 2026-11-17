@@ -913,6 +913,14 @@ pub struct S3Router<T> {
     server_ctx: Option<Arc<ServerContextSlot>>,
 }
 
+/// Only control-plane routes may share the console's browser origin. Object Lambda and
+/// bucket extensions have dispatch precedence even when their paths resemble console assets.
+pub(crate) fn console_listener_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    is_control_plane_route(method, uri, headers)
+        && parse_object_lambda_request(method, uri).is_none()
+        && s3_extension::route_key(method, uri).is_none()
+}
+
 /// Whether this router answers the request itself rather than an S3 operation: the RustFS extension
 /// routes and every control-plane route.
 #[cfg(feature = "gateway-stack")]
