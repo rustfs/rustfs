@@ -4333,21 +4333,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
+        let key = req.input.key.clone();
         let source = legacy_copy_source(&req.input.copy_source);
         let source = source
             .as_ref()
             .map(|(bucket, key, version_id)| copy_source_object(bucket, key, version_id.as_deref()));
-        access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), source).await?;
-
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = None;
-
-        authorize_staged_multipart_part(req).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        access_owned::object_commit::authorize_upload_part_copy(req, self.server_ctx(), &bucket, &key, source).await
     }
 
     /// Checks whether the WriteGetObjectResponse request has accesses to the resources.
