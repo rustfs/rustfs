@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.request
 from urllib.parse import urlsplit
@@ -329,7 +330,13 @@ def artifact_list(run_id):
 
 
 def download_artifact(run, name, destination):
-    matches = [item for item in artifact_list(run["id"]) if item.get("name") == name]
+    # A finalized upload can take time to appear in the REST listing. Retry only
+    # absence; ambiguous identities and invalid metadata must fail immediately.
+    for attempt in range(6):
+        matches = [item for item in artifact_list(run["id"]) if item.get("name") == name]
+        if matches or attempt == 5:
+            break
+        time.sleep(2 ** attempt)
     require(len(matches) == 1, "candidate artifact is absent or ambiguous")
     artifact = validate_artifact(matches[0], run, name)
     destination = Path(destination)

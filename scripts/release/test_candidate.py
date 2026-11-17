@@ -53,6 +53,46 @@ class TransportTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "unsafe"):
                         candidate.download_artifact(run, "candidate", temp)
 
+    def test_download_waits_for_artifact_metadata_visibility(self):
+        import hashlib
+        run = {"id": 70, "head_sha": "a" * 40}
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as package:
+            package.writestr("record.json", b"accepted")
+        content = stream.getvalue()
+        artifact = {"id": 90, "name": "candidate", "expired": False, "workflow_run": run,
+                    "size_in_bytes": len(content), "digest": "sha256:" + hashlib.sha256(content).hexdigest()}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(candidate, "artifact_list", side_effect=[[], [artifact]]) as listing, \
+                patch("time.sleep") as sleep, \
+                patch.object(candidate, "github_stream", return_value=io.BytesIO(content)):
+            self.assertEqual(candidate.download_artifact(run, "candidate", temp), artifact)
+            self.assertEqual((Path(temp) / "record.json").read_bytes(), b"accepted")
+            self.assertEqual(listing.call_count, 2)
+            sleep.assert_called_once_with(1)
+
+    def test_missing_artifact_remains_a_bounded_failure(self):
+        run = {"id": 70, "head_sha": "a" * 40}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(candidate, "artifact_list", return_value=[]) as listing, \
+                patch("time.sleep") as sleep, patch.object(candidate, "github_stream") as download:
+            with self.assertRaisesRegex(ValueError, "absent"):
+                candidate.download_artifact(run, "candidate", temp)
+            self.assertEqual(listing.call_count, 6)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 4, 8, 16])
+            download.assert_not_called()
+
+    def test_ambiguous_artifact_is_rejected_without_retry(self):
+        run = {"id": 70, "head_sha": "a" * 40}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(candidate, "artifact_list", return_value=[{"name": "candidate"}] * 2) as listing, \
+                patch("time.sleep") as sleep, patch.object(candidate, "github_stream") as download:
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                candidate.download_artifact(run, "candidate", temp)
+            listing.assert_called_once_with(70)
+            sleep.assert_not_called()
+            download.assert_not_called()
+
     def test_duplicate_json_fields_are_not_silently_accepted(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "manifest.json"

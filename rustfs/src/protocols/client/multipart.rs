@@ -29,7 +29,7 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
-fn multipart_timestamp(value: Timestamp, operation: &str, field: &'static str) -> S3Result<time::OffsetDateTime> {
+pub(super) fn multipart_timestamp(value: Timestamp, operation: &str, field: &'static str) -> S3Result<time::OffsetDateTime> {
     let nanos = i128::from(value.subsec_nanos());
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(value.secs()) * 1_000_000_000 + nanos)
         .map_err(|_| super::conversion_error(operation, format!("{field}: an instant outside what the s3s shape can hold")))
@@ -291,6 +291,75 @@ pub(super) fn upload_part_error(error: S3Error) -> S3Error {
         error.set_message("Your proposed upload exceeds the maximum allowed object size.");
     }
     error
+}
+
+pub(super) fn upload_part_copy_input(
+    input: dto::UploadPartCopyInput,
+) -> S3Result<crate::app::multipart_usecase::UploadPartCopyWriteInput> {
+    super::owned::validate_copy_source(&input.copy_source, "UploadPartCopy copy_source")?;
+    let copy_source_if_match =
+        super::owned::copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match", "UploadPartCopy input")?;
+    // Dates must be representable at the edge; storage does not evaluate date preconditions.
+    // Dates must fit the edge codec; the storage path does not evaluate date preconditions.
+    input
+        .copy_source_if_modified_since
+        .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_modified_since"))
+        .transpose()?;
+    let copy_source_if_none_match = super::owned::copy_condition(
+        input.copy_source_if_none_match.as_deref(),
+        "copy_source_if_none_match",
+        "UploadPartCopy input",
+    )?;
+    input
+        .copy_source_if_unmodified_since
+        .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_unmodified_since"))
+        .transpose()?;
+    Ok(crate::app::multipart_usecase::UploadPartCopyWriteInput {
+        target: crate::app::multipart_usecase::UploadPartTarget::Legacy {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            upload_id: super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id),
+        },
+        part_number: input.part_number,
+        copy_source: input.copy_source,
+        copy_source_range: nonempty(input.copy_source_range),
+        copy_source_if_match,
+        copy_source_if_none_match,
+        sse_customer_algorithm: nonempty(input.sse_customer_algorithm),
+        sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
+        sse_customer_key_md5: nonempty(input.sse_customer_key_md5),
+        copy_source_sse_customer_algorithm: nonempty(input.copy_source_sse_customer_algorithm),
+        copy_source_sse_customer_key: input
+            .copy_source_sse_customer_key
+            .map(|value| value.expose_secret().to_owned()),
+        copy_source_sse_customer_key_md5: nonempty(input.copy_source_sse_customer_key_md5),
+    })
+}
+
+pub(super) fn upload_part_copy_output(
+    output: crate::app::multipart_usecase::UploadPartCopyWriteOutput,
+) -> S3Result<dto::UploadPartCopyOutput> {
+    let raw = output
+        .e_tag
+        .ok_or_else(|| super::conversion_error("UploadPartCopy output", "e_tag: the gateway shape requires this member"))?;
+    Ok(dto::UploadPartCopyOutput {
+        e_tag: super::owned::copy_xml_etag(&raw, "UploadPartCopy output")?,
+        last_modified: output
+            .last_modified
+            .map(crate::app::dto_values::timestamp)
+            .map(super::owned::millisecond_timestamp),
+        copy_source_version_id: output.copy_source_version_id,
+        server_side_encryption: output.server_side_encryption.map(dto::ServerSideEncryption::custom),
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        checksum_crc32: output.checksum_crc32,
+        checksum_crc32c: output.checksum_crc32c,
+        checksum_sha1: output.checksum_sha1,
+        checksum_sha256: output.checksum_sha256,
+        checksum_crc64nvme: output.checksum_crc64nvme,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

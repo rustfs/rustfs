@@ -4477,9 +4477,9 @@ mod tests {
             signed_request_with_headers(form, Method::GET, path, query, key, secret, headers)
         }
 
-        async fn answer<S>(service: S, request: HttpRequest<Empty<Bytes>>) -> (StatusCode, HeaderMap, Bytes)
+        async fn answer<S, B>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
         where
-            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>,
+            S: Service<HttpRequest<B>, Response = Response<s3s::Body>, Error = s3s::HttpError>,
         {
             let service = tower::Layer::layer(&crate::server::layer::ExternalRequestContextLayer::new(false), service);
             let response = service.oneshot(request).await.unwrap();
@@ -4614,10 +4614,418 @@ mod tests {
             (env, slot, legacy)
         }
 
+        fn admin_wire_failures(response: &(StatusCode, HeaderMap, Bytes), label: &str) -> Vec<String> {
+            eprintln!(
+                "admin-wire {label}: status={} headers={:?} body={}",
+                response.0,
+                response.1,
+                String::from_utf8_lossy(&response.2)
+            );
+            let mut failures = Vec::new();
+            let content_type = if response.0.is_success() {
+                "application/json"
+            } else {
+                "application/xml"
+            };
+            if !response.1.get(http::header::CONTENT_TYPE).is_some_and(|v| v == content_type) {
+                failures.push(format!("{label}: content type"));
+            }
+            if !response.1.get("x-request-id").is_some_and(|v| v == REQUEST_ID) {
+                failures.push(format!("{label}: request id"));
+            }
+            if let Some(length) = response.1.get(http::header::CONTENT_LENGTH)
+                && length.to_str().ok().and_then(|v| v.parse::<usize>().ok()) != Some(response.2.len())
+            {
+                failures.push(format!("{label}: content length"));
+            }
+            failures
+        }
+
+        fn snapshot_error_xml(body: &[u8]) -> String {
+            let xml = std::str::from_utf8(body).unwrap();
+            let declaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+            match xml.strip_prefix(&format!("{declaration}\n")) {
+                Some(tail) => format!("{declaration}{tail}"),
+                None => xml.to_owned(),
+            }
+        }
+
+        async fn iceberg_answer<S>(service: S, request: HttpRequest<Empty<Bytes>>) -> (StatusCode, HeaderMap, serde_json::Value)
+        where
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>
+                + Clone
+                + Send
+                + 'static,
+            S::Future: Send + 'static,
+        {
+            use crate::server::hybrid::HybridBody;
+            use tower::Layer as _;
+            let service = tower::service_fn(move |request| {
+                let service = service.clone();
+                async move {
+                    let response = service.oneshot(request).await.unwrap();
+                    let (parts, body) = response.into_parts();
+                    let bytes = body.collect().await.unwrap().to_bytes();
+                    Ok::<_, std::convert::Infallible>(Response::from_parts(
+                        parts,
+                        HybridBody::<Full<Bytes>, Empty<Bytes>>::Rest {
+                            rest_body: Full::from(bytes),
+                        },
+                    ))
+                }
+            });
+            let service = IcebergRestErrorCompatLayer.layer(service);
+            let service = crate::server::layer::ExternalRequestContextLayer::new(false).layer(service);
+            let response = service.oneshot(request).await.unwrap();
+            let (parts, body) = response.into_parts();
+            let bytes = body.collect().await.unwrap().to_bytes();
+            let json = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+            (parts.status, parts.headers, json)
+        }
+
+        // The strict gateway signer rejects duplicate query keys; sign this boundary probe independently.
+        fn iceberg_duplicate_query(path: &str, host: &str, key: &str, secret: &str) -> HttpRequest<Empty<Bytes>> {
+            use hmac::{Hmac, KeyInit as _, Mac as _};
+            use sha2::{Digest as _, Sha256};
+            fn mac(key: &[u8], value: &str) -> Vec<u8> {
+                let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+                mac.update(value.as_bytes());
+                mac.finalize().into_bytes().to_vec()
+            }
+            let mut request = signed(path, "warehouse=a", host, key, secret, Signed::Header);
+            let authorization = request.headers()[http::header::AUTHORIZATION].to_str().unwrap().to_owned();
+            let names = authorization
+                .split("SignedHeaders=")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap();
+            let headers = names
+                .split(';')
+                .map(|name| format!("{name}:{}\n", request.headers()[name].to_str().unwrap()))
+                .collect::<String>();
+            let date = request.headers()["x-amz-date"].to_str().unwrap();
+            let scope = format!("{}/us-east-1/s3/aws4_request", &date[..8]);
+            let canonical = format!("GET\n{path}\nwarehouse=a&warehouse=b\n{headers}\n{names}\nUNSIGNED-PAYLOAD");
+            let digest = Sha256::digest(canonical.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{digest}");
+            let day = mac(format!("AWS4{secret}").as_bytes(), &date[..8]);
+            let region = mac(&day, "us-east-1");
+            let service = mac(&region, "s3");
+            let signing_key = mac(&service, "aws4_request");
+            let signature = mac(&signing_key, &to_sign)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                format!("AWS4-HMAC-SHA256 Credential={key}/{scope}, SignedHeaders={names}, Signature={signature}")
+                    .parse()
+                    .unwrap(),
+            );
+            *request.uri_mut() = format!("{path}?warehouse=a&warehouse=b").parse().unwrap();
+            request
+        }
+
+        async fn iceberg_config_contract(native: bool) {
+            let mut failures = Vec::new();
+            macro_rules! check_eq {
+                ($left:expr, $right:expr $(,)?) => { check_eq!($left, $right, "line {}", line!()) };
+                ($left:expr, $right:expr, $($reason:tt)+) => {{
+                    let (left, right) = (&$left, &$right);
+                    if left != right { failures.push(format!("{}: left={left:?}, right={right:?}", format_args!($($reason)+))); }
+                }};
+            }
+            macro_rules! check {
+                ($condition:expr $(,)?) => { check!($condition, "line {}", line!()) };
+                ($condition:expr, $($reason:tt)+) => {{
+                    if !$condition { failures.push(format!($($reason)+)); }
+                }};
+            }
+            let calls = || crate::server::gateway_stack::CONFIG_HANDLER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let (_env, slot, legacy) = admin_fixture().await;
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.s3_stack = config::S3Stack::Gateway;
+            config.console_enable = false;
+            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot.clone()))).unwrap();
+            let native_service = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
+            let context = slot.installed_app_context().unwrap();
+            let expiration = chrono::Utc::now().timestamp() + 900;
+            let mut sessions = Vec::new();
+            for marker in [None, Some("rustfs:table-id")] {
+                let mut claims = std::collections::HashMap::from([
+                    ("exp".to_owned(), serde_json::json!(expiration)),
+                    ("parent".to_owned(), serde_json::json!(ROOT)),
+                ]);
+                if let Some(marker) = marker {
+                    claims.insert(marker.to_owned(), serde_json::json!("table-a"));
+                }
+                let mut credential = rustfs_policy::auth::get_new_credentials_with_metadata(&claims, ROOT_SECRET).unwrap();
+                credential.parent_user = ROOT.to_owned();
+                context
+                    .iam()
+                    .handle()
+                    .set_temp_user(&credential.access_key, &credential, None)
+                    .await
+                    .unwrap();
+                sessions.push(credential);
+            }
+            for path in ["/iceberg/v1/config", "/_iceberg/v1/config"] {
+                for host in ["localhost", "bucket.s3.example.test"] {
+                    for query in ["", "warehouse=warehouse-a"] {
+                        let request = || signed(path, query, host, ROOT, ROOT_SECRET, Signed::Header);
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        if native {
+                            check_eq!(calls() - before, 1, "successful config reaches the native handler");
+                        }
+                        check_eq!(old.0, StatusCode::OK, "{path}?{query} {host}: {old:?}");
+                        check_eq!(new.0, old.0);
+                        check_eq!(new.2, old.2, "complete config JSON");
+                        if native {
+                            let direct = iceberg_answer(native_service.clone(), request()).await;
+                            check_eq!(
+                                direct.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                                Some("application/json"),
+                                "direct native content type"
+                            );
+                            check_eq!(direct.0, old.0, "direct native handler status");
+                            check_eq!(direct.2, old.2, "direct native handler body");
+                        }
+                        check!(new.2["defaults"].is_object());
+                        check!(new.2["overrides"].is_object());
+                        check!(new.2["endpoints"].as_array().is_some_and(|rows| !rows.is_empty()));
+                        check!(new.2["admin_discovery"].is_object());
+                        if query.is_empty() {
+                            check!(new.2["defaults"].get("prefix").is_none());
+                        } else {
+                            check_eq!(new.2["defaults"]["prefix"], "warehouse-a");
+                        }
+                        eprintln!("iceberg config {path}?{query} {host}: {} {}", new.0, new.2);
+                    }
+                    for (key, secret, query, expected, handler_calls) in [
+                        (ROOT, ROOT_SECRET, "warehouse=", StatusCode::BAD_REQUEST, 1),
+                        (ROOT, "wrong-secret", "", StatusCode::FORBIDDEN, 0),
+                        ("info-no-policy", USER_SECRET, "", StatusCode::FORBIDDEN, 1),
+                        ("info-allowed", USER_SECRET, "", StatusCode::FORBIDDEN, 1),
+                        ("info-no-policy", USER_SECRET, "warehouse=", StatusCode::FORBIDDEN, 1),
+                    ] {
+                        let request = || signed(path, query, host, key, secret, Signed::Header);
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        if native {
+                            check_eq!(calls() - before, handler_calls, "refusal handler observation {key} {query}");
+                        }
+                        check_eq!(old.0, expected, "legacy {path}?{query}: {old:?}");
+                        check_eq!(new.0, old.0, "{path}?{query}: {new:?}");
+                        check_eq!(new.2, old.2, "complete error JSON {key} {query}");
+                        eprintln!("iceberg refusal {path}?{query} {host} {key}: {} {}", new.0, new.2);
+                    }
+                    for (key, secret, expected) in [
+                        (ROOT, ROOT_SECRET, StatusCode::BAD_REQUEST),
+                        ("info-no-policy", USER_SECRET, StatusCode::FORBIDDEN),
+                    ] {
+                        let request = || iceberg_duplicate_query(path, host, key, secret);
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        check_eq!(old.0, expected, "legacy signed duplicate {key}: {old:?}");
+                        check_eq!(
+                            old.2,
+                            serde_json::json!({"error": {
+                                "code": expected.as_u16(), "type": if key == ROOT { "BadRequestException" } else { "ForbiddenException" },
+                                "message": if key == ROOT { "warehouse query parameter must not be repeated" } else { "Access Denied" }
+                            }}),
+                            "legacy duplicate complete JSON {key}"
+                        );
+                        if native {
+                            // K-8: strict signature canonicalization rejects this exact duplicate before owned authorization.
+                            check_eq!(new.0, StatusCode::BAD_REQUEST, "native duplicate {key}");
+                            check_eq!(
+                                new.2,
+                                serde_json::json!({"error": {
+                                    "code": 400, "type": "BadRequestException",
+                                    "message": "The authorization header is malformed; the region is wrong."
+                                }}),
+                                "native duplicate complete JSON {key}"
+                            );
+                            check_eq!(calls() - before, 0, "duplicate query cannot reach the native handler");
+                        } else {
+                            check_eq!(new.2, old.2, "legacy duplicate repeat");
+                        }
+                        eprintln!(
+                            "iceberg signed duplicate {path} {host} {key}: legacy={} selected={} handler_delta={}",
+                            old.2,
+                            new.2,
+                            calls() - before
+                        );
+                    }
+                    for (index, credential) in sessions.iter().enumerate() {
+                        for query in ["", "warehouse="] {
+                            let request = || {
+                                let mut headers = HeaderMap::new();
+                                headers.insert(http::header::HOST, host.parse().unwrap());
+                                headers.insert("x-amz-security-token", credential.session_token.parse().unwrap());
+                                signed_request_with_headers(
+                                    Signed::Header,
+                                    Method::GET,
+                                    path,
+                                    query,
+                                    &credential.access_key,
+                                    &credential.secret_key,
+                                    headers,
+                                )
+                            };
+                            let old = iceberg_answer(legacy.clone(), request()).await;
+                            let before = calls();
+                            let new = if native {
+                                iceberg_answer(native_service.clone(), request()).await
+                            } else {
+                                iceberg_answer(legacy.clone(), request()).await
+                            };
+                            check_eq!(
+                                old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                                Some("application/json"),
+                                "legacy content type {path} {host}"
+                            );
+                            check_eq!(
+                                new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                                Some("application/json"),
+                                "selected content type {path} {host}"
+                            );
+                            if native {
+                                check_eq!(calls() - before, 1, "session reaches owned authorization");
+                            }
+                            let expected = if index == 1 {
+                                StatusCode::FORBIDDEN
+                            } else if query.is_empty() {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::BAD_REQUEST
+                            };
+                            check_eq!(old.0, expected, "legacy session {index} {query}: {old:?}");
+                            check_eq!(new.0, old.0, "native session {index} {query}: {new:?}");
+                            check_eq!(new.2, old.2, "session {index} complete JSON");
+                            eprintln!("iceberg session {index} {path}?{query} {host}: {} {}", new.0, new.2);
+                        }
+                    }
+                    for query in ["", "warehouse=", "warehouse=a&warehouse=b"] {
+                        let request = || {
+                            HttpRequest::builder()
+                                .uri(format!("{path}?{query}"))
+                                .header(http::header::HOST, host)
+                                .body(Empty::new())
+                                .unwrap()
+                        };
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        if native {
+                            check_eq!(calls() - before, 0, "anonymous request never reaches handler");
+                        }
+                        check_eq!(old.0, StatusCode::FORBIDDEN);
+                        check_eq!(new.0, old.0);
+                        check_eq!(
+                            old.2,
+                            serde_json::json!({"error": {
+                                "code": 403, "type": "ForbiddenException", "message": "Signature is required"
+                            }}),
+                            "legacy anonymous complete JSON"
+                        );
+                        check_eq!(
+                            new.2,
+                            serde_json::json!({"error": {
+                                "code": 403, "type": "ForbiddenException",
+                                "message": if native { "the request is not allowed" } else { "Signature is required" }
+                            }}),
+                            "selected anonymous complete JSON"
+                        );
+                        eprintln!("iceberg unsigned {path}?{query} {host}: legacy={} selected={}", old.2, new.2);
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn iceberg_config_owned_legacy_baseline() {
+            iceberg_config_contract(false).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn iceberg_config_owned_native_contract() {
+            iceberg_config_contract(true).await;
+        }
+
         const CATALOG_READS: [&str; 3] = ["/v3/datausageinfo", "/v4/plugins/catalog", "/v3/module-switches"];
 
         // Each caller uses a fresh process because ECStore publishes once-only endpoint state.
-        async fn catalog_reads_contract(use_native: bool) {
+        async fn admin_reads_contract(use_native: bool, suffixes: &[&str]) {
             let (_env, slot, legacy) = admin_fixture().await;
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
@@ -4629,7 +5037,7 @@ mod tests {
                     failures.push(label);
                 }
             };
-            for suffix in CATALOG_READS {
+            for &suffix in suffixes {
                 for prefix in ["/rustfs/admin", "/minio/admin"] {
                     let path = format!("{prefix}{suffix}");
                     for host in ["localhost", "bucket.s3.example.test"] {
@@ -4638,6 +5046,32 @@ mod tests {
                         check(root.0 == StatusCode::OK, format!("root {path} {host}: {} {:?}", root.0, refusal(&root.2)));
                         let expected: serde_json::Value = serde_json::from_slice(&root.2).unwrap();
                         eprintln!("catalog-baseline {path} {host}: status={} headers={:?} json={expected}", root.0, root.1);
+                        if suffix == "/v4/cluster/snapshot" {
+                            // This fixture has no scanner publications or deferred work; its event times are unset.
+                            let usage = &expected["snapshot"]["components"]["usage"];
+                            for field in [
+                                "last_dirty_mark_unix_secs",
+                                "last_dirty_clear_unix_secs",
+                                "last_usage_save_unix_secs",
+                                "last_durable_success_unix_secs",
+                                "last_publication_unix_secs",
+                                "last_deferred_unix_secs",
+                            ] {
+                                check(usage[field] == serde_json::json!(0), format!("{path}: unset event time {field}"));
+                            }
+                            check(
+                                usage.get("last_success_unix_secs") == Some(&serde_json::Value::Null),
+                                format!("{path}: no successful publication time"),
+                            );
+                            check(
+                                usage.get("deferred_age_secs") == Some(&serde_json::Value::Null),
+                                format!("{path}: no deferred age"),
+                            );
+                            // A writable metadata gate has no transition timestamp.
+                            let gate = &expected["snapshot"]["pool_meta_write_gate"];
+                            check(gate["state"] == "writable", format!("{path}: writable metadata gate"));
+                            check(gate.get("sinceUnixSecs").is_none(), format!("{path}: no metadata gate transition time"));
+                        }
                         for key in [
                             ROOT,
                             "info-allowed",
@@ -4664,6 +5098,20 @@ mod tests {
                                 answer(legacy.clone(), request()).await
                             };
                             let label = format!("{key} {path} {host}");
+                            if matches!(suffix, "/v4/cluster/snapshot" | "/v4/extensions/catalog") {
+                                for failure in admin_wire_failures(&old, &format!("legacy {label}")) {
+                                    check(false, failure);
+                                }
+                                for failure in admin_wire_failures(&new, &format!("selected {label}")) {
+                                    check(false, failure);
+                                }
+                                if !allowed {
+                                    check(
+                                        snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
+                                        format!("{label}: complete refusal XML"),
+                                    );
+                                }
+                            }
                             let status = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
                             check(
                                 old.0 == status && new.0 == status,
@@ -4716,6 +5164,7 @@ mod tests {
                                         .method(Method::GET)
                                         .uri(&path)
                                         .header("host", host)
+                                        .header("x-request-id", REQUEST_ID)
                                         .body(Empty::new())
                                         .unwrap()
                                 } else {
@@ -4735,6 +5184,39 @@ mod tests {
                                 new.0,
                                 refusal(&new.2)
                             );
+                            if matches!(suffix, "/v4/cluster/snapshot" | "/v4/extensions/catalog") {
+                                for failure in admin_wire_failures(&old, &format!("legacy {label} {path} {host}")) {
+                                    check(false, failure);
+                                }
+                                for failure in admin_wire_failures(&new, &format!("selected {label} {path} {host}")) {
+                                    check(false, failure);
+                                }
+                                if use_native {
+                                    let expected_xml = if label == "presigned" {
+                                        check(
+                                            serde_json::from_slice::<serde_json::Value>(&old.2).unwrap() == expected,
+                                            format!("{path}: complete legacy presigned JSON"),
+                                        );
+                                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>the request is not allowed</Message></Error>".to_owned()
+                                    } else {
+                                        let old_xml = snapshot_error_xml(&old.2);
+                                        match label {
+                                            "anonymous" => old_xml.replacen("<Message>Signature is required</Message>", "<Message>the request is not allowed</Message>", 1),
+                                            "disabled" => old_xml.replacen("<Message>check key failed</Message>", "<Message>The Access Key Id you provided does not exist in our records.</Message>", 1),
+                                            _ => old_xml,
+                                        }
+                                    };
+                                    check(
+                                        snapshot_error_xml(&new.2) == expected_xml,
+                                        format!("{label} {path}: complete refusal XML"),
+                                    );
+                                } else if label != "presigned" {
+                                    check(
+                                        snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
+                                        format!("{label} {path}: complete baseline XML"),
+                                    );
+                                }
+                            }
                             let legacy_status = if label == "presigned" {
                                 StatusCode::OK
                             } else {
@@ -4832,13 +5314,106 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn native_admin_catalog_reads_legacy_baseline() {
-            catalog_reads_contract(false).await;
+            admin_reads_contract(false, &CATALOG_READS).await;
         }
 
         #[tokio::test]
         #[serial_test::serial]
         async fn native_admin_catalog_reads_real_signature_iam_and_wire() {
-            catalog_reads_contract(true).await;
+            admin_reads_contract(true, &CATALOG_READS).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_legacy_baseline() {
+            admin_reads_contract(false, &["/v4/extensions/catalog"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &["/v4/extensions/catalog"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_legacy_baseline() {
+            admin_reads_contract(false, &["/v4/cluster/snapshot"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &["/v4/cluster/snapshot"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_unsigned_before_body() {
+            admin_unsigned_before_body("/v4/cluster/snapshot").await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_unsigned_before_body() {
+            admin_unsigned_before_body("/v4/extensions/catalog").await;
+        }
+
+        async fn admin_unsigned_before_body(suffix: &str) {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot)).unwrap());
+            let payload = Bytes::from_static(b"admin body must remain unread");
+            let (sender, body, read, _dropped) = tracked_request_body();
+            sender.send(payload.clone()).unwrap();
+            drop(sender);
+            assert_eq!(body.collect().await.unwrap().to_bytes(), payload);
+            assert_eq!(read.load(Ordering::SeqCst), payload.len(), "body observer positive control");
+            for prefix in ["/rustfs/admin", "/minio/admin"] {
+                let path = format!("{prefix}{suffix}");
+                for host in ["localhost", "bucket.s3.example.test"] {
+                    let signed = answer(native.clone(), signed(&path, "", host, ROOT, ROOT_SECRET, Signed::Header)).await;
+                    assert_eq!(signed.0, StatusCode::OK, "signed handler control");
+                    let (sender, body, read, _dropped) = tracked_request_body();
+                    sender.send(payload.clone()).unwrap();
+                    drop(sender);
+                    let request = HttpRequest::builder()
+                        .uri(&path)
+                        .header("host", host)
+                        .header("x-request-id", REQUEST_ID)
+                        .body(body)
+                        .unwrap();
+                    let response = answer(native.clone(), request).await;
+                    let old = answer(
+                        legacy.clone(),
+                        HttpRequest::builder()
+                            .uri(&path)
+                            .header("host", host)
+                            .header("x-request-id", REQUEST_ID)
+                            .body(Empty::new())
+                            .unwrap(),
+                    )
+                    .await;
+                    assert!(admin_wire_failures(&old, "legacy unsigned body observer").is_empty());
+                    assert!(admin_wire_failures(&response, "native unsigned body observer").is_empty());
+                    assert_eq!(
+                        snapshot_error_xml(&response.2),
+                        snapshot_error_xml(&old.2).replacen(
+                            "<Message>Signature is required</Message>",
+                            "<Message>the request is not allowed</Message>",
+                            1
+                        )
+                    );
+                    eprintln!(
+                        "snapshot-unsigned {path} {host}: status={} headers={:?} body={}",
+                        response.0,
+                        response.1,
+                        String::from_utf8_lossy(&response.2)
+                    );
+                    assert_eq!(response.0, StatusCode::FORBIDDEN);
+                    assert_eq!(refusal(&response.2), ("AccessDenied".to_owned(), "the request is not allowed".to_owned()));
+                    assert_eq!(read.load(Ordering::SeqCst), 0, "unsigned body must remain unread");
+                }
+            }
         }
 
         const SYSTEM_READS: [(&str, &str); 3] = [

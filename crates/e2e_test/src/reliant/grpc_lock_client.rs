@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use rustfs_lock::{
-    LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
+    CacheFenceStamp, LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockMetadata, LockPriority},
 };
 use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
@@ -64,6 +64,7 @@ impl GrpcLockClient {
             deadlock_detection: false,
             suppress_contention_logs: false,
             refresh_interval: None,
+            cache_fence_stamp_requested: false,
         }
     }
 
@@ -124,10 +125,15 @@ impl LockClient for GrpcLockClient {
 
         // Check if the lock acquisition was successful
         if resp.success {
-            Ok(LockResponse::success(
-                Self::build_lock_info(request, resp.lock_info),
-                std::time::Duration::ZERO,
-            ))
+            let info = Self::build_lock_info(request, resp.lock_info);
+            match resp
+                .cache_fence_stamp
+                .as_deref()
+                .and_then(|encoded| CacheFenceStamp::decode(encoded).ok())
+            {
+                Some(stamp) => Ok(LockResponse::success_with_cache_fence_stamp(info, std::time::Duration::ZERO, stamp)),
+                None => Ok(LockResponse::success(info, std::time::Duration::ZERO)),
+            }
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
@@ -160,7 +166,15 @@ impl LockClient for GrpcLockClient {
             .enumerate()
             .map(|(idx, request)| match resp.results.get(idx) {
                 Some(result) if result.success => {
-                    LockResponse::success(Self::build_lock_info(request, result.lock_info.clone()), std::time::Duration::ZERO)
+                    let info = Self::build_lock_info(request, result.lock_info.clone());
+                    match result
+                        .cache_fence_stamp
+                        .as_deref()
+                        .and_then(|encoded| CacheFenceStamp::decode(encoded).ok())
+                    {
+                        Some(stamp) => LockResponse::success_with_cache_fence_stamp(info, std::time::Duration::ZERO, stamp),
+                        None => LockResponse::success(info, std::time::Duration::ZERO),
+                    }
                 }
                 Some(result) => LockResponse::failure(
                     result

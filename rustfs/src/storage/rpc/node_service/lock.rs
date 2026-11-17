@@ -20,9 +20,14 @@ use tonic::{Request, Response, Status};
 
 fn lock_result_from_acquire(outcome: BatchAcquireOutcome) -> GenerallyLockResult {
     match outcome {
-        BatchAcquireOutcome::Granted { lock_info, .. } => GenerallyLockResult {
+        BatchAcquireOutcome::Granted {
+            lock_info,
+            cache_fence_stamp,
+            ..
+        } => GenerallyLockResult {
             success: true,
             lock_info: lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+            cache_fence_stamp: cache_fence_stamp.map(|stamp| stamp.encode().to_vec().into()),
             ..Default::default()
         },
         BatchAcquireOutcome::RetryableNoGrant { error } => lock_result_from_no_grant(error, LockAcquireStatus::RetryableNoGrant),
@@ -116,6 +121,7 @@ async fn release_lock(
                 error_info: result.error_info,
                 lock_info: None,
                 release_status: result.release_status,
+                cache_fence_stamp: None,
             }
         }
         Err(err) => GenerallyLockResponse {
@@ -178,6 +184,7 @@ impl NodeService {
                     error_info: result.error_info,
                     lock_info: None,
                     release_status: result.release_status,
+                    cache_fence_stamp: None,
                 }))
             }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
@@ -244,6 +251,7 @@ impl NodeService {
                     success: result.success,
                     error_info: result.error,
                     lock_info: lock_info_json,
+                    cache_fence_stamp: result.cache_fence_stamp.map(|stamp| stamp.encode().to_vec().into()),
                     ..Default::default()
                 }))
             }
@@ -428,10 +436,33 @@ mod tests {
         let result = lock_result_from_acquire(rustfs_lock::BatchAcquireOutcome::Granted {
             lock_info: None,
             wait_time: std::time::Duration::ZERO,
+            cache_fence_stamp: None,
         });
         assert!(result.success);
         assert!(result.error_info.is_none());
         assert_eq!(result.acquire_status, super::LockAcquireStatus::Unspecified as i32);
+    }
+
+    #[tokio::test]
+    async fn batch_acquire_mapping_preserves_cache_fence_stamp() {
+        use rustfs_lock::{CACHE_FENCE_SHARD_COUNT, CacheFenceStamp, LocalClient, LockClient, LockRequest, LockType, ObjectKey};
+        use std::sync::Arc;
+        use tokio::time::Instant;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let request =
+            LockRequest::new(ObjectKey::new("bucket", "cache-proof"), LockType::Shared, "reader").request_cache_fence_stamp();
+        let outcome = client
+            .acquire_locks_batch_until(std::slice::from_ref(&request), Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .into_iter()
+            .next()
+            .expect("one batch outcome");
+        let result = lock_result_from_acquire(outcome);
+        let encoded = result.cache_fence_stamp.expect("server response carries the voter stamp");
+        let decoded = CacheFenceStamp::decode(&encoded).expect("server emits the current fixed-width stamp");
+        assert!(usize::from(decoded.shard_index()) < CACHE_FENCE_SHARD_COUNT);
+        assert_eq!(decoded.generation(), 0);
     }
 
     #[tokio::test]

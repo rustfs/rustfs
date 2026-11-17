@@ -420,6 +420,10 @@ mod tests {
                 "/minio/admin/v3/datausageinfo?detail=1",
                 "/rustfs/admin/v4/plugins/catalog",
                 "/minio/admin/v4/plugins/catalog?detail=1",
+                "/rustfs/admin/v4/cluster/snapshot",
+                "/minio/admin/v4/cluster/snapshot?detail=1",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/minio/admin/v4/extensions/catalog?detail=1",
                 "/rustfs/admin/v3/module-switches",
                 "/minio/admin/v3/module-switches?detail=1",
                 "/rustfs/admin/v3/info",
@@ -430,6 +434,8 @@ mod tests {
                 "/minio/admin/v4/runtime/capabilities?detail=a%2Fb",
                 "/rustfs/admin/v3/object-data-cache/stats",
                 "/minio/admin/v3/object-data-cache/stats?detail=a%2Fb",
+                "/iceberg/v1/config",
+                "/_iceberg/v1/config?warehouse=warehouse-a",
             ] {
                 let req = Request::builder()
                     .method(Method::GET)
@@ -446,6 +452,8 @@ mod tests {
             "/v3/object-data-cache/stats",
             "/v3/datausageinfo",
             "/v4/plugins/catalog",
+            "/v4/cluster/snapshot",
+            "/v4/extensions/catalog",
             "/v3/module-switches",
         ] {
             for prefix in ["/rustfs/admin", "/minio/admin"] {
@@ -473,7 +481,12 @@ mod tests {
             (Method::GET, "/%72ustfs/admin/v3/info"),
             (Method::GET, "/rustfs/admin/v4/info"),
             (Method::POST, "/rustfs/admin/v3/info"),
-            (Method::GET, "/iceberg/v1/config"),
+            (Method::POST, "/iceberg/v1/config"),
+            (Method::POST, "/_iceberg/v1/config"),
+            (Method::GET, "/iceberg/v1/config/"),
+            (Method::GET, "/_iceberg/v1/config-neighbor"),
+            (Method::GET, "/iceberg/v10/config"),
+            (Method::GET, "/_iceberg/v1suffix/config"),
             (Method::GET, "/profile/cpu"),
             (Method::GET, "/bucket?events"),
             (Method::GET, "/bucket/key"),
