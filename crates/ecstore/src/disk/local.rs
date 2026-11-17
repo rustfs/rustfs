@@ -17956,10 +17956,13 @@ fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::c
     }
 
     let part = &fi.parts[0];
-    if !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
+    if part.size > fi.erasure.block_size || !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
         return false;
     }
-    let shard_size = fi.shard_file_size(part.actual_size);
+    let Ok(stored_size) = i64::try_from(part.size) else {
+        return false;
+    };
+    let shard_size = fi.shard_file_size(stored_size.max(part.actual_size));
     let versioned = fi.versioned || fi.version_id.is_some_and(|version_id| !version_id.is_nil());
     storage_class_config.should_inline(shard_size, fi.erasure.data_blocks, versioned)
 }
@@ -18725,6 +18728,8 @@ mod test {
             ec12.shard_file_size(1024 * 1024 + 1) < 128 * 1024,
             "a multi-block external object can still fit the per-shard budget"
         );
+        assert!(!should_read_legacy_inline_part(&ec12, &config));
+        ec12.parts[0].actual_size = 1;
         assert!(!should_read_legacy_inline_part(&ec12, &config));
     }
 
