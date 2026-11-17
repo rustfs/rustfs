@@ -43,8 +43,8 @@ pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: Cancell
 }
 
 fn configure_metric_gates(metrics_enabled: bool) {
-    let local_summary_enabled = !metrics_enabled
-        && rustfs_utils::get_env_bool(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED, false);
+    let local_summary_enabled =
+        rustfs_utils::get_env_bool(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED, false);
     let sample_rate =
         rustfs_utils::get_env_u64(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE, 64).max(1);
     startup_runtime_sources::set_get_stage_local_summary_enabled(local_summary_enabled);
@@ -159,6 +159,25 @@ mod tests {
         startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
         startup_runtime_sources::set_get_stage_local_summary_enabled(previous_local_summary);
         startup_runtime_sources::set_get_stage_local_summary_sample_rate(previous_sample_rate);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_local_summary_can_run_with_metrics_export() {
+        let previous_metrics = rustfs_io_metrics::metrics_enabled();
+        let previous_get_stages = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_local_summary = rustfs_io_metrics::get_stage_local_summary_enabled();
+
+        temp_env::with_var(LOCAL_SUMMARY_ENV, Some("true"), || {
+            configure_metric_gates(true);
+            assert!(rustfs_io_metrics::metrics_enabled());
+            assert!(rustfs_io_metrics::get_stage_metrics_enabled());
+            assert!(rustfs_io_metrics::get_stage_local_summary_enabled());
+        });
+
+        startup_runtime_sources::set_metrics_enabled(previous_metrics);
+        startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
+        startup_runtime_sources::set_get_stage_local_summary_enabled(previous_local_summary);
     }
 
     #[test]
