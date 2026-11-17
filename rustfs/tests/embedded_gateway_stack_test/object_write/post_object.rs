@@ -302,6 +302,46 @@ fn gateway_post_final_stream_failure_does_not_publish() {
 
 #[test]
 #[serial_test::serial]
+fn gateway_post_declared_file_length_does_not_replace_complete_form() {
+    stack::with_stack(stack::GATEWAY, |server| async move {
+        const BUCKET: &str = "browser-post-false-tail";
+        stack::create_bucket_in_the_store(BUCKET).await;
+        let endpoint = server.endpoint();
+        let client = WireClient {
+            endpoint: &endpoint,
+            access_key: server.access_key(),
+            secret_key: server.secret_key(),
+        };
+        let closing_length = format!("\r\n--{}--\r\n", super::POST_BOUNDARY).len();
+        for (label, size) in [("small", 64), ("streamed", 17 * 1024 * 1024)] {
+            let existing = format!("{label}-existing");
+            let absent = format!("{label}-absent");
+            let path = format!("/{BUCKET}/{existing}");
+            let original = b"original";
+            assert_eq!(client.request("PUT", &path, original, &[], Some(original.len())).await.status, 200);
+            // The declared HTTP length implies `size` file bytes, but the
+            // supposed closing delimiter is replaced by ordinary file bytes.
+            let invalid = "x".repeat(size + closing_length);
+            for key in [&existing, &absent] {
+                let answer = client
+                    .post_form_contents(BUCKET, &[("key", key)], &[], &invalid, true, false)
+                    .await;
+                assert!(answer.status >= 400, "{key}: {}", answer.body);
+            }
+            let existing_answer = client.request("GET", &path, b"", &[], Some(0)).await;
+            assert_eq!(existing_answer.status, 200);
+            assert_eq!(existing_answer.body, "original");
+            let absent_answer = client.request("GET", &format!("/{BUCKET}/{absent}"), b"", &[], Some(0)).await;
+            assert_eq!(absent_answer.status, 404);
+        }
+        let control = client.post_form(BUCKET, &[("key", "control")], &[], true, true).await;
+        assert_eq!(control.status, 204, "{}", control.body);
+        server.shutdown().await;
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn gateway_post_uses_verified_form_session_policy() {
     stack::with_stack(stack::GATEWAY, |server| async move {
         use rustfs_iam::sys::SESSION_POLICY_NAME;
