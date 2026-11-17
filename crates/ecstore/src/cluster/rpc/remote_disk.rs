@@ -1099,6 +1099,7 @@ fn peer_rename_admission(addr: &str, enabled: bool) -> Option<Arc<Semaphore>> {
 
 struct RenameAdmissionGrant {
     permit: Option<OwnedSemaphorePermit>,
+    batch: bool,
 }
 
 impl RenameAdmissionGrant {
@@ -1114,14 +1115,23 @@ impl RenameAdmissionGrant {
         let Some(permit) = self.permit.take() else {
             return;
         };
+        let items = permit.num_permits();
+        if items == 0 {
+            return;
+        }
+        let hold = deadline.saturating_duration_since(tokio::time::Instant::now());
+        rustfs_io_metrics::record_ecstore_rename_quarantine(self.batch, items, hold);
+        let batch = self.batch;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 tokio::time::sleep_until(deadline).await;
                 drop(permit);
+                rustfs_io_metrics::record_ecstore_rename_quarantine_released(batch, items);
             });
         } else {
             // Without a runtime there is no safe deadline task. Leaking until
             // process exit is safer than admitting work over a still-running mutation.
+            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(batch, items);
             std::mem::forget(permit);
         }
     }
@@ -2777,12 +2787,21 @@ impl RemoteDisk {
             return Err(err);
         }
         let weight = u32::try_from(item_count).map_err(Error::other)?;
-        let permit = match tokio::time::timeout_at(deadline, Arc::clone(semaphore).acquire_many_owned(weight)).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(Error::RemoteClientUnavailable("internode rename admission closed".to_owned())),
-            Err(_) => return Err(DiskError::DiskOngoingReq),
+        let started = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
+        let (result, timed_out) = match tokio::time::timeout_at(deadline, Arc::clone(semaphore).acquire_many_owned(weight)).await
+        {
+            Ok(Ok(permit)) => (Ok(permit), false),
+            Ok(Err(_)) => (Err(Error::RemoteClientUnavailable("internode rename admission closed".to_owned())), false),
+            Err(_) => (Err(DiskError::DiskOngoingReq), true),
         };
-        Ok(Some(RenameAdmissionGrant { permit: Some(permit) }))
+        if let Some(started) = started {
+            rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, started.elapsed(), timed_out);
+        }
+        let permit = result?;
+        Ok(Some(RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: item_count > 1,
+        }))
     }
 
     async fn get_bulk_client(&self) -> Result<NodeRpcClient> {
@@ -13397,7 +13416,10 @@ mod tests {
             .acquire_many_owned(4)
             .await
             .expect("weighted batch admission");
-        let mut grant = RenameAdmissionGrant { permit: Some(permit) };
+        let mut grant = RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: true,
+        };
         assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
         assert!(grant.release_one());
         assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3);
@@ -13435,7 +13457,11 @@ mod tests {
             .await
             .expect("weighted batch admission");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        RenameAdmissionGrant { permit: Some(permit) }.quarantine_until(deadline);
+        RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: true,
+        }
+        .quarantine_until(deadline);
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
 
         tokio::time::advance(Duration::from_millis(999)).await;
@@ -13452,7 +13478,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("pre-dispatch permits");
         drop(RenameBatchCallGuard {
-            admission: Some(RenameAdmissionGrant { permit: Some(permit) }),
+            admission: Some(RenameAdmissionGrant {
+                permit: Some(permit),
+                batch: true,
+            }),
             deadline,
             dispatch_state: RenameAdmissionDispatchState::NotDispatched,
         });
@@ -13460,7 +13489,10 @@ mod tests {
 
         let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("dispatched permits");
         let mut guard = RenameBatchCallGuard {
-            admission: Some(RenameAdmissionGrant { permit: Some(permit) }),
+            admission: Some(RenameAdmissionGrant {
+                permit: Some(permit),
+                batch: true,
+            }),
             deadline,
             dispatch_state: RenameAdmissionDispatchState::NotDispatched,
         };
@@ -13476,7 +13508,10 @@ mod tests {
             .await
             .expect("proven pre-mutation permits");
         let mut guard = RenameBatchCallGuard {
-            admission: Some(RenameAdmissionGrant { permit: Some(permit) }),
+            admission: Some(RenameAdmissionGrant {
+                permit: Some(permit),
+                batch: true,
+            }),
             deadline,
             dispatch_state: RenameAdmissionDispatchState::NotDispatched,
         };
