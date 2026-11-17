@@ -264,9 +264,11 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # commit-to-base ratchet. Keep fixture/self-test behavior unchanged while
 # making repository measurements deterministic over tracked Rust files.
 declare -a SCANNED_RUST_PATHS ECSTORE_RUST_PATHS
-if [[ "$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || true)" == "$REPO_ROOT" ]]; then
-    while IFS= read -r -d '' path; do SCANNED_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
-    while IFS= read -r -d '' path; do ECSTORE_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
+if [[ -e "$REPO_ROOT/.git" ]] \
+    && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && [[ -n "$(git -C "$REPO_ROOT" config --get remote.origin.url || true)" ]]; then
+    while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && SCANNED_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
+    while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && ECSTORE_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
 else
     SCANNED_RUST_PATHS=("$E2E_TEST_GLOB" .)
     ECSTORE_RUST_PATHS=(crates/ecstore/src)
