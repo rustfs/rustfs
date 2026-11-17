@@ -335,6 +335,21 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
 }
 
+/// A bucket can become a host prefix or the first path segment. Keep legacy
+/// uppercase and underscore names, but never permit URL syntax in that field.
+pub(crate) fn validate_tier_bucket(bucket: &str) -> std::io::Result<()> {
+    if bucket.is_empty() {
+        return Err(std::io::Error::other("no bucket name was provided"));
+    }
+    if bucket
+        .split('.')
+        .any(|label| label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+    {
+        return Err(std::io::Error::other("invalid tier bucket name"));
+    }
+    Ok(())
+}
+
 /// Return the authority format accepted by `TransitionClient::new` while
 /// retaining an explicitly configured port. `url::Url::host_str()` omits the
 /// brackets needed when an IPv6 literal is combined with a port.
@@ -385,9 +400,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         return Err(std::io::Error::other("both access and secret keys are required"));
     }
 
-    if params.bucket.is_empty() {
-        return Err(std::io::Error::other("no bucket name was provided"));
-    }
+    validate_tier_bucket(params.bucket)?;
 
     let u = match url::Url::parse(params.endpoint) {
         Ok(u) => u,
@@ -2090,6 +2103,14 @@ mod tests {
             endpoint_authority(&url).expect("the endpoint should have an authority"),
             "[2001:db8::1]:9443"
         );
+    }
+
+    #[test]
+    fn tier_bucket_is_a_name_not_a_url_component() {
+        assert!(validate_tier_bucket("archive.EU_1").is_ok());
+        for bucket in ["a:b", "a/b", "a?b", "a#b", "a@b", "a%2Fb", "a\\b", "a..b"] {
+            assert!(validate_tier_bucket(bucket).is_err());
+        }
     }
 
     #[tokio::test]
