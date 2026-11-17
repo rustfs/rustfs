@@ -16,6 +16,8 @@
 mod copy_test;
 mod multipart;
 mod owned;
+#[cfg(test)]
+mod upload_copy_test;
 
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
@@ -40,10 +42,12 @@ use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operati
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 #[cfg(test)]
+use s3s::S3;
+#[cfg(test)]
 use s3s::dto::*;
-use s3s::{S3, S3Request, S3Result};
 #[cfg(test)]
 use s3s::{S3Error as LegacyS3Error, S3ErrorCode as LegacyS3ErrorCode};
+use s3s::{S3Request, S3Result};
 use std::fmt::Display;
 use tracing::trace;
 
@@ -112,6 +116,7 @@ fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3
 /// Formats an S3 copy-source header while preserving the literal object key.
 /// The S3 copy-source parser URL-decodes the path and treats a raw `?versionId=`
 /// as query data, so encode the complete key before building the header.
+#[cfg(test)]
 fn format_copy_source(bucket: &str, key: &str) -> String {
     format!("/{bucket}/{}", urlencoding::encode(key))
 }
@@ -122,6 +127,7 @@ fn format_copy_source(bucket: &str, key: &str) -> String {
 /// protocol layer used when it handed the storage client a header string, so bucket-name and
 /// key validation and their errors are unchanged. Access point and Outposts sources are moved
 /// across unchanged, and the storage copy path refuses them as it does for any other request.
+#[cfg(test)]
 fn legacy_copy_source(
     source: rustfs_gateway_types::CopySourceValue,
 ) -> Result<s3s::dto::CopySource, s3s::dto::ParseCopySourceError> {
@@ -1100,10 +1106,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let copy_source =
-            legacy_copy_source(input.copy_source.clone()).map_err(|e| conversion_error("UploadPartCopy copy_source", e))?;
-        let input = gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(input, copy_source)
-            .map_err(|e| conversion_error("UploadPartCopy input", e))?;
+        let input = multipart::upload_part_copy_input(input)?;
         let part_number = input.part_number;
         let upload_id = input.upload_id.clone();
         let part_number = part_number.to_string();
@@ -1116,8 +1119,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             ],
         )?;
 
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -1125,13 +1127,19 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-
-        match self.fs.upload_part_copy(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::upload_part_copy::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("UploadPartCopy output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::UploadPartCopy);
+        let helper = crate::app::storage_api::context::OperationHelper::audit_only_from_view(
+            &envelope.audit_view(),
+            rustfs_s3_ops::S3Operation::UploadPartCopy,
+        );
+        let result = self
+            .owned_multipart_usecase()
+            .execute_upload_part_copy_owned(envelope, input)
+            .await
+            .map_err(owned::copy_error);
+        let _helper = helper.complete_owned(&result, http::StatusCode::OK, &HeaderMap::new());
+        result.and_then(multipart::upload_part_copy_output)
     }
 }
 

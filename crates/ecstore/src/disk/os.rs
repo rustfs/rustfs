@@ -177,6 +177,30 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&RECORDED.lock().expect("fsync dir recorder poisoned"), dir)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn count_at(dir: &Path) -> usize {
+        let canonical = dir.canonicalize().expect("sync count directory must exist");
+        RECORDED
+            .lock()
+            .expect("fsync dir recorder poisoned")
+            .iter()
+            .filter(|recorded| **recorded == canonical)
+            .count()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn count_under(dir: &Path) -> usize {
+        // Each invocation records its canonical path once, including when the
+        // syscall used a procfs mount-lease alias or a symlinked temporary root.
+        let canonical = dir.canonicalize().expect("sync count root must exist");
+        RECORDED
+            .lock()
+            .expect("fsync dir recorder poisoned")
+            .iter()
+            .filter(|recorded| recorded.starts_with(&canonical))
+            .count()
+    }
+
     pub(crate) fn set_failure(dir: &Path, kind: io::ErrorKind) {
         super::dir_fsync_failures::set(dir, kind);
     }
@@ -2347,6 +2371,8 @@ type NativeRootIdentity = (u64, u64);
 struct NativePublicationHistory {
     roots: HashMap<NativeRootIdentity, NativeRootHistory>,
     aliases: HashMap<PathBuf, HashSet<NativeRootIdentity>>,
+    #[cfg(target_os = "linux")]
+    live_proc_roots: HashMap<PathBuf, (NativeRootIdentity, Weak<std::fs::File>)>,
 }
 
 #[derive(Debug, Default)]
@@ -2426,12 +2452,59 @@ pub(crate) fn register_native_publication_root(root: &Path, io_root: &Path) -> O
 /// Record before queueing filesystem work. Cancellation never removes Started.
 pub(crate) fn record_native_publication(path: &Path) {
     let aliases: Vec<_> = {
+        #[cfg(target_os = "linux")]
+        let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+        #[cfg(not(target_os = "linux"))]
         let history = NATIVE_PUBLICATION_HISTORY.lock();
-        path.ancestors()
-            .filter(|alias| history.aliases.contains_key(*alias))
-            .map(Path::to_path_buf)
-            .collect()
+        let mut unpinned = Vec::new();
+        for alias in path.ancestors() {
+            if !history.aliases.contains_key(alias) {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some((live_identity, weak)) = history.live_proc_roots.get(alias) {
+                if weak.strong_count() > 0 {
+                    let live_identity = *live_identity;
+                    if history
+                        .aliases
+                        .get(alias)
+                        .is_some_and(|ids| ids.len() == 1 && ids.contains(&live_identity))
+                    {
+                        let Ok(relative) = path.strip_prefix(alias) else {
+                            continue;
+                        };
+                        let mut components = relative.components().filter(|part| !matches!(part, Component::CurDir));
+                        let Some(first) = components.next() else {
+                            continue;
+                        };
+                        let bucket = match first {
+                            Component::Normal(bucket) if components.all(|part| matches!(part, Component::Normal(_))) => {
+                                bucket.to_str()
+                            }
+                            _ => None,
+                        };
+                        let root = history.roots.entry(live_identity).or_default();
+                        match bucket {
+                            Some(bucket) => {
+                                if !root.started.contains(bucket) {
+                                    root.started.insert(bucket.to_owned());
+                                }
+                            }
+                            None => root.unknown = true,
+                        }
+                        continue;
+                    }
+                } else {
+                    history.live_proc_roots.remove(alias);
+                }
+            }
+            unpinned.push(alias.to_path_buf());
+        }
+        unpinned
     };
+    if aliases.is_empty() {
+        return;
+    }
     // Physical lookups must never hold the process-wide publication mutex.
     let observations: Vec<_> = aliases
         .into_iter()
@@ -2641,6 +2714,8 @@ impl DiskBlockingLane {
 #[derive(Default)]
 struct DiskBlockingQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    submitted_jobs: usize,
     active_workers: usize,
     idle_workers: usize,
     #[cfg(any(test, feature = "test-util"))]
@@ -2767,6 +2842,10 @@ impl DiskBlockingQueue {
         let should_spawn = {
             let mut state = self.lane(lane).state.lock();
             state.jobs.push_back(job);
+            #[cfg(test)]
+            {
+                state.submitted_jobs += 1;
+            }
             self.lane(lane).ready.store(true, std::sync::atomic::Ordering::Relaxed);
             if state.jobs.len() > state.idle_workers && state.active_workers < self.effective_max_workers(lane, &state) {
                 state.active_workers += 1;
@@ -2779,6 +2858,11 @@ impl DiskBlockingQueue {
         if should_spawn {
             Self::spawn_worker(Arc::clone(self), lane);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submitted_jobs_for_test(&self) -> usize {
+        self.lanes.iter().map(|lane| lane.state.lock().submitted_jobs).sum()
     }
 
     #[inline]
@@ -4765,6 +4849,14 @@ pub(crate) mod multipart_source_syscall_failures {
     }
 }
 
+#[cfg(all(test, unix))]
+static PREPARED_METADATA_SYNCS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(all(test, unix))]
+pub(crate) fn take_prepared_metadata_sync_count(destination: &Path) -> usize {
+    PREPARED_METADATA_SYNCS.lock().remove(destination).unwrap_or(0)
+}
+
 pub(crate) struct PreparedRenameSource {
     path: PathBuf,
     #[cfg(test)]
@@ -4798,6 +4890,13 @@ impl PreparedRenameSource {
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         #[cfg(test)]
         multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
+        #[cfg(all(test, unix))]
+        {
+            *PREPARED_METADATA_SYNCS
+                .lock()
+                .entry(self.test_destination.clone())
+                .or_default() += 1;
+        }
         let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
         #[cfg(windows)]
         self.source.as_file().sync_data()?;
@@ -4849,12 +4948,20 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
             let directories = &commit_guard.directories;
             let name = directories.file_name(src_file_path, true)?;
             directories.file_name(dst_file_path, false)?;
-            open_linux_relative(
-                &directories.source.file,
-                Path::new(name),
-                OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
-                Mode::from_raw_mode(0o666),
-            )?
+            if let Some(source_dir) = directories.source.get() {
+                open_linux_relative(
+                    &source_dir.file,
+                    Path::new(name),
+                    OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+                    Mode::from_raw_mode(0o666),
+                )?
+            } else {
+                directories.root.open_relative(
+                    src_file_path,
+                    OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+                    Mode::from_raw_mode(0o666),
+                )?
+            }
         };
         #[cfg(not(target_os = "linux"))]
         let source = std::fs::OpenOptions::new()
@@ -4879,6 +4986,65 @@ pub(crate) fn create_prepared_rename_source_with_commit_guard(
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) struct ReadDestinationFile {
+    pub(crate) bytes: bytes::Bytes,
+    pub(crate) file: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_destination_file_handle_with_commit_guard(
+    file_path: &Path,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<Option<ReadDestinationFile>> {
+    use rustix::fs::{Mode, OFlags};
+    let directories = &commit_guard.directories;
+    let name = directories.file_name(file_path, false)?;
+    let Some(parent) = directories.destination.get() else {
+        return Ok(None);
+    };
+    match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
+        Ok(mut file) => {
+            let len = file.metadata()?.len();
+            let cap = usize::try_from(len).map_or(0, |len| len.saturating_add(1));
+            let mut data = Vec::with_capacity(cap);
+            std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, len), &mut data)?;
+            Ok(Some(ReadDestinationFile {
+                bytes: bytes::Bytes::from(data),
+                file,
+            }))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn unlink_flat_tmp_source_std(src_file_path: &Path, src_parent: &Path, publication_root: &PublicationRoot) {
+    use rustix::fs::{AtFlags, unlinkat};
+    let Some(name) = rustfs_utils::path::unix_direct_child_file_name(src_file_path, src_parent) else {
+        return;
+    };
+    if let Ok(source_dir) = publication_root.open_directory(src_parent) {
+        let _ = unlinkat(&source_dir, name, AtFlags::empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn unlink_prepared_rename_source_with_commit_guard_std(src_file_path: &Path, commit_guard: &RenameCommitGuard) {
+    use rustix::fs::{AtFlags, unlinkat};
+    let directories = &commit_guard.directories;
+    let Ok(name) = directories.file_name(src_file_path, true) else {
+        return;
+    };
+    if let Some(source_dir) = directories.source.get()
+        && unlinkat(&*source_dir.file, name, AtFlags::empty()).is_ok()
+    {
+        return;
+    }
+    unlink_flat_tmp_source_std(src_file_path, &directories.source_path, &directories.root);
+}
+
 #[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn read_destination_file_with_commit_guard(
     file_path: &Path,
@@ -4886,23 +5052,7 @@ pub(crate) fn read_destination_file_with_commit_guard(
 ) -> io::Result<Option<Vec<u8>>> {
     #[cfg(target_os = "linux")]
     {
-        use rustix::fs::{Mode, OFlags};
-        let directories = &commit_guard.directories;
-        let name = directories.file_name(file_path, false)?;
-        let Some(parent) = directories.destination.get() else {
-            return Ok(None);
-        };
-        match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
-            Ok(mut file) => {
-                let len = file.metadata()?.len();
-                let cap = usize::try_from(len).map_or(0, |len| len.saturating_add(1));
-                let mut data = Vec::with_capacity(cap);
-                std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, len), &mut data)?;
-                Ok(Some(data))
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
-        }
+        Ok(read_destination_file_handle_with_commit_guard(file_path, commit_guard)?.map(|read| Vec::from(read.bytes)))
     }
     #[cfg(windows)]
     {
@@ -4921,17 +5071,18 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
     dst_file_path: &Path,
     backup_parent: &Path,
     backup_path: &Path,
-    old_metadata: &[u8],
+    old_destination_file: &ReadDestinationFile,
     sync_backup: bool,
     allow_hardlink: bool,
     commit_guard: &RenameCommitGuard,
 ) -> io::Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
     use rustix::io::Errno;
+    use std::os::fd::AsRawFd;
 
     record_native_publication(backup_path);
     let directories = &commit_guard.directories;
-    let dst_file_name = directories.file_name(dst_file_path, false)?;
+    let _dst_file_name = directories.file_name(dst_file_path, false)?;
     if backup_parent.parent() != Some(directories.destination_path.as_path()) || backup_path.parent() != Some(backup_parent) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4948,6 +5099,8 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
         .destination
         .get()
         .ok_or_else(|| io::Error::other("missing destination commit directory"))?;
+    let old_metadata = old_destination_file.bytes.as_ref();
+    let proc_fd_path = format!("/proc/self/fd/{}", old_destination_file.file.as_raw_fd());
 
     let mut last_err = None;
     for attempt in 0..=2 {
@@ -4978,14 +5131,14 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
 
         let stage_res = (|| -> io::Result<()> {
             let linked = if allow_hardlink {
-                match linkat(&*dst_dir.file, dst_file_name, &rollback_dir_file, backup_name, AtFlags::empty()) {
+                match linkat(CWD, proc_fd_path.as_str(), &rollback_dir_file, backup_name, AtFlags::SYMLINK_FOLLOW) {
                     Ok(()) => true,
                     Err(Errno::EXIST) => {
                         match unlinkat(&rollback_dir_file, backup_name, AtFlags::empty()) {
                             Ok(()) | Err(Errno::NOENT) => {}
                             Err(err) => return Err(io::Error::from(err)),
                         }
-                        linkat(&*dst_dir.file, dst_file_name, &rollback_dir_file, backup_name, AtFlags::empty()).is_ok()
+                        linkat(CWD, proc_fd_path.as_str(), &rollback_dir_file, backup_name, AtFlags::SYMLINK_FOLLOW).is_ok()
                     }
                     Err(_) => false,
                 }
@@ -4993,9 +5146,8 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
                 false
             };
             if linked {
-                if cfg!(test) && sync_backup && !old_metadata.is_empty() {
-                    open_linux_relative(&rollback_dir_file, Path::new(backup_name), OFlags::RDONLY, Mode::empty())?
-                        .sync_data()?;
+                if sync_backup && !old_metadata.is_empty() {
+                    old_destination_file.file.sync_data()?;
                 }
             } else {
                 match unlinkat(&rollback_dir_file, backup_name, AtFlags::empty()) {
@@ -6066,7 +6218,18 @@ impl PublicationRoot {
         #[cfg(target_os = "linux")]
         let io_path = {
             use std::os::fd::AsRawFd;
-            Arc::new(PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd())))
+            use std::os::unix::fs::MetadataExt;
+            let proc_alias = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+            if let Ok(metadata) = directory.metadata()
+                && metadata.is_dir()
+            {
+                let identity = (metadata.dev(), metadata.ino());
+                NATIVE_PUBLICATION_HISTORY
+                    .lock()
+                    .live_proc_roots
+                    .insert(proc_alias.clone(), (identity, Arc::downgrade(&directory)));
+            }
+            Arc::new(proc_alias.join("."))
         };
 
         Ok(Self {
@@ -6367,8 +6530,7 @@ pub(crate) struct RenameCommitGuard {
 #[cfg(target_os = "linux")]
 struct LinuxCommitDirectory {
     file: Arc<std::fs::File>,
-    device: u64,
-    inode: u64,
+    identity: std::sync::OnceLock<(u64, u64)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -6378,9 +6540,37 @@ impl LinuxCommitDirectory {
         let metadata = file.metadata()?;
         Ok(Self {
             file: Arc::new(file),
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            identity: std::sync::OnceLock::from((metadata.dev(), metadata.ino())),
         })
+    }
+
+    fn new_lazy(file: std::fs::File) -> Self {
+        Self {
+            file: Arc::new(file),
+            identity: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn identity(&self) -> io::Result<(u64, u64)> {
+        if let Some(&id) = self.identity.get() {
+            return Ok(id);
+        }
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.file.metadata()?;
+        let id = (metadata.dev(), metadata.ino());
+        let _ = self.identity.set(id);
+        Ok(id)
+    }
+
+    fn clone_shared(&self) -> Self {
+        let identity = std::sync::OnceLock::new();
+        if let Some(&id) = self.identity.get() {
+            let _ = identity.set(id);
+        }
+        Self {
+            file: Arc::clone(&self.file),
+            identity,
+        }
     }
 }
 
@@ -6389,7 +6579,7 @@ struct LinuxCommitDirectories {
     root: PublicationRoot,
     source_path: PathBuf,
     destination_path: PathBuf,
-    source: LinuxCommitDirectory,
+    source: std::sync::OnceLock<LinuxCommitDirectory>,
     destination: std::sync::OnceLock<LinuxCommitDirectory>,
     destination_ancestors: std::sync::OnceLock<Vec<std::fs::File>>,
     destination_base: PathBuf,
@@ -6407,10 +6597,22 @@ impl LinuxCommitDirectories {
                 .pop()
                 .ok_or_else(|| io::Error::other("missing destination directory guard"))?,
         );
-        let directory = LinuxCommitDirectory::new(directory)?;
+        let directory = LinuxCommitDirectory::new_lazy(directory);
         let ancestors = parents.into_iter().map(std::fs::File::from).collect();
         let _ = self.destination_ancestors.set(ancestors);
         Ok(self.destination.get_or_init(|| directory))
+    }
+
+    fn ensure_source_eager(&self) -> io::Result<&LinuxCommitDirectory> {
+        if let Some(source) = self.source.get() {
+            let _ = source.identity()?;
+            return Ok(source);
+        }
+        let directory = LinuxCommitDirectory::new(self.root.open_directory(&self.source_path)?)?;
+        let _ = self.source.set(directory);
+        self.source
+            .get()
+            .ok_or_else(|| io::Error::other("missing source commit directory"))
     }
 
     fn file_name<'a>(&self, path: &'a Path, source: bool) -> io::Result<&'a std::ffi::OsStr> {
@@ -6423,18 +6625,20 @@ impl LinuxCommitDirectories {
         use std::os::unix::fs::MetadataExt;
         // A pinned directory may have been unlinked or replaced. Do not report a
         // successful publication into a detached object tree.
+        let source = self.ensure_source_eager()?;
+        let source_identity = source.identity()?;
         let current = self.root.open_directory(&self.source_path)?.metadata()?;
-        if (current.dev(), current.ino()) != (self.source.device, self.source.inode) {
+        if (current.dev(), current.ino()) != source_identity {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
         }
         let destination = self.prepare_destination()?;
-        if check_destination
-            && ((self.source.device, self.source.inode) != (destination.device, destination.inode)
-                || self.source_path.as_os_str() != self.destination_path.as_os_str())
-        {
-            let current = self.root.open_directory(&self.destination_path)?.metadata()?;
-            if (current.dev(), current.ino()) != (destination.device, destination.inode) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
+        if check_destination {
+            let destination_identity = destination.identity()?;
+            if source_identity != destination_identity || self.source_path.as_os_str() != self.destination_path.as_os_str() {
+                let current = self.root.open_directory(&self.destination_path)?.metadata()?;
+                if (current.dev(), current.ino()) != destination_identity {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
+                }
             }
         }
         Ok(())
@@ -6445,12 +6649,42 @@ impl LinuxCommitDirectories {
         let source_name = self.file_name(source, true)?;
         let destination_name = self.file_name(destination, false)?;
         let destination_was_prepared = self.destination.get().is_some();
+        let source_was_prepared = self.source.get().is_some();
         let destination_parent = self.prepare_destination()?;
-        self.validate(destination_was_prepared)?;
+        let source_dir = if source_was_prepared || prepared.is_none() {
+            self.validate(destination_was_prepared)?;
+            self.source
+                .get()
+                .ok_or_else(|| io::Error::other("missing source commit directory"))?
+        } else {
+            if destination_was_prepared {
+                use std::os::unix::fs::MetadataExt;
+                let destination_identity = destination_parent.identity()?;
+                let current = self.root.open_directory(&self.destination_path)?.metadata()?;
+                if (current.dev(), current.ino()) != destination_identity {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
+                }
+            }
+            let dir = self.root.open_directory(&self.source_path)?;
+            self.source.get_or_init(|| LinuxCommitDirectory::new_lazy(dir))
+        };
         let mut attempt = 0;
         loop {
             if let Some(prepared) = prepared {
-                let metadata = rustix::fs::statat(&*self.source.file, source_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+                let metadata = match rustix::fs::statat(&*source_dir.file, source_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => metadata,
+                    Err(rustix::io::Errno::NOENT) if !source_was_prepared => {
+                        use std::os::unix::fs::MetadataExt;
+                        if prepared.source.metadata().is_ok_and(|meta| meta.nlink() > 0) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "rename source identity changed while publication was prepared",
+                            ));
+                        }
+                        return Err(io::Error::from(rustix::io::Errno::NOENT));
+                    }
+                    Err(err) => return Err(io::Error::from(err)),
+                };
                 if (prepared.path.as_os_str() != source.as_os_str() && prepared.path != source)
                     || metadata.st_dev != prepared.device
                     || metadata.st_ino != prepared.inode
@@ -6462,7 +6696,7 @@ impl LinuxCommitDirectories {
                 }
             }
             let started = rustfs_io_metrics::put_stage_timer();
-            let result = rustix::fs::renameat(&*self.source.file, source_name, &*destination_parent.file, destination_name)
+            let result = rustix::fs::renameat(&*source_dir.file, source_name, &*destination_parent.file, destination_name)
                 .map_err(io::Error::from);
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
@@ -6559,11 +6793,12 @@ impl RenameDestinationPathGuard {
         {
             let _ = self;
             before_publish()?;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(file_path)?;
+            match std::fs::remove_file(file_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(file_path)?;
             std::io::Write::write_all(&mut file, data)?;
             if sync_file {
                 file.sync_data()?;
@@ -6577,6 +6812,16 @@ impl RenameDestinationPathGuard {
 }
 
 impl RenameCommitGuard {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_prepared_destination(&self) -> bool {
+        self.directories.destination.get().is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ensure_source_pinned(&self) -> io::Result<()> {
+        self.directories.ensure_source_eager().map(|_| ())
+    }
+
     #[cfg(windows)]
     pub(crate) fn lock_source_directory_for_path_access(&self, directory: &Path) -> io::Result<RenameDestinationPathGuard> {
         if directory != self.source_parent {
@@ -6671,19 +6916,16 @@ pub(crate) fn multipart_payload_commit_guard_std(
     original.validate(true)?;
     let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
     let destination = original.prepare_destination()?;
+    let _ = destination.identity()?;
     // Clone the pinned file identity, never recapture the target pathname
     // between payload and canonical-head publication.
-    let destination = LinuxCommitDirectory {
-        file: Arc::clone(&destination.file),
-        device: destination.device,
-        inode: destination.inode,
-    };
+    let destination = destination.clone_shared();
     Ok(RenameCommitGuard {
         directories: Arc::new(LinuxCommitDirectories {
             root: original.root.clone(),
             source_path: source_parent.to_path_buf(),
             destination_path: original.destination_path.clone(),
-            source,
+            source: std::sync::OnceLock::from(source),
             destination: std::sync::OnceLock::from(destination),
             destination_ancestors: std::sync::OnceLock::new(),
             destination_base: original.destination_base.clone(),
@@ -6734,6 +6976,36 @@ pub(crate) async fn multipart_payload_commit_guard(
     run_blocking_namespace_operation(lease, operation).await
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_rename_commit_guard_flat_inline(
+    source_parent: &Path,
+    destination_parent: &Path,
+    destination_base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<RenameCommitGuard> {
+    existing_base_directory_suffix(destination_parent, destination_base)?;
+    publication_root.relative_path(source_parent)?;
+    let destination = std::sync::OnceLock::new();
+    match publication_root.open_directory(destination_parent) {
+        Ok(directory) => {
+            let _ = destination.set(LinuxCommitDirectory::new(directory)?);
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    Ok(RenameCommitGuard {
+        directories: Arc::new(LinuxCommitDirectories {
+            root: publication_root.clone(),
+            source_path: source_parent.to_path_buf(),
+            destination_path: destination_parent.to_path_buf(),
+            source: std::sync::OnceLock::new(),
+            destination,
+            destination_ancestors: std::sync::OnceLock::new(),
+            destination_base: destination_base.to_path_buf(),
+        }),
+    })
+}
+
 pub(crate) fn prepare_rename_commit_guard(
     source_parent: &Path,
     destination_parent: &Path,
@@ -6746,11 +7018,7 @@ pub(crate) fn prepare_rename_commit_guard(
         let source = LinuxCommitDirectory::new(publication_root.open_directory(source_parent)?)?;
         let destination = std::sync::OnceLock::new();
         if source_parent == destination_parent {
-            let _ = destination.set(LinuxCommitDirectory {
-                file: Arc::clone(&source.file),
-                device: source.device,
-                inode: source.inode,
-            });
+            let _ = destination.set(source.clone_shared());
         } else {
             match publication_root.open_directory(destination_parent) {
                 Ok(directory) => {
@@ -6765,7 +7033,7 @@ pub(crate) fn prepare_rename_commit_guard(
                 root: publication_root.clone(),
                 source_path: source_parent.to_path_buf(),
                 destination_path: destination_parent.to_path_buf(),
-                source,
+                source: std::sync::OnceLock::from(source),
                 destination,
                 destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: destination_base.to_path_buf(),
@@ -7863,15 +8131,8 @@ fn same_parent_commit_guard(
 ) -> io::Result<RenameCommitGuard> {
     #[cfg(target_os = "linux")]
     let same_dir = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
-        let dir = &directory_guard.directories.source;
-        Some((
-            directory_guard.directories.root.clone(),
-            LinuxCommitDirectory {
-                file: Arc::clone(&dir.file),
-                device: dir.device,
-                inode: dir.inode,
-            },
-        ))
+        let dir = directory_guard.directories.ensure_source_eager()?;
+        Some((directory_guard.directories.root.clone(), dir.clone_shared()))
     } else if let Some(fd) = leaf_fd {
         existing_base_directory_suffix(parent, base)?;
         Some((publication_root.clone(), LinuxCommitDirectory::new(std::fs::File::from(fd))?))
@@ -7891,16 +8152,13 @@ fn same_parent_commit_guard(
     };
     #[cfg(target_os = "linux")]
     if let Some((root, dir)) = same_dir {
+        let source_dir = dir.clone_shared();
         return Ok(RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
                 root,
                 source_path: parent.to_path_buf(),
                 destination_path: parent.to_path_buf(),
-                source: LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                },
+                source: std::sync::OnceLock::from(source_dir),
                 destination: std::sync::OnceLock::from(dir),
                 destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: base.to_path_buf(),
@@ -8083,7 +8341,8 @@ pub(crate) fn rename_multipart_source_owned_std(
         }
         precondition()?;
         guard.directories.rename(source, destination, Some(&pinned_source))?;
-        fsync_directory_handle_std(source_parent, Some(&guard.directories.source.file))?;
+        let source_dir = guard.directories.ensure_source_eager()?;
+        fsync_directory_handle_std(source_parent, Some(&source_dir.file))?;
         fsync_commit_directory_limited_std(destination_parent, &guard)?;
     }
     #[cfg(not(target_os = "linux"))]
@@ -14816,6 +15075,95 @@ mod native_creation_history_tests {
 mod fd_relative_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn live_proc_root_fast_path_preserves_three_way_semantics_and_retires_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("temporary disk");
+        let root = PublicationRoot::new(temp.path()).expect("pinned root");
+        let io_path = root.io_path().to_path_buf();
+        let proc_alias: PathBuf = io_path.components().collect();
+        let reg = register_native_publication_root(temp.path(), &io_path).expect("register root");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> =
+            Arc::new(super::super::local::StdBackend::new(temp.path().to_path_buf()));
+        let disk_id = uuid::Uuid::new_v4();
+
+        let bucket_a = format!("proc-fast-a-{}", uuid::Uuid::new_v4());
+        let bucket_b = format!("proc-fast-b-{}", uuid::Uuid::new_v4());
+        let witness_a = reg
+            .witness(&bucket_a, disk_id, Arc::clone(&backend))
+            .expect("witness a before publication");
+        let witness_b = reg
+            .witness(&bucket_b, disk_id, Arc::clone(&backend))
+            .expect("witness b before publication");
+
+        let stat_hits = Arc::new(AtomicUsize::new(0));
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        // Root-level path (`path == alias` or `alias/.`) must be a no-op and must not set `unknown` or stat.
+        record_native_publication(&io_path);
+        record_native_publication(&proc_alias);
+        assert_eq!(stat_hits.load(Ordering::SeqCst), 0, "live proc fast path must skip stat");
+        drop(stat_guard);
+        assert!(validate_native_creation_witnesses(std::slice::from_ref(&witness_a)));
+        assert!(validate_native_creation_witnesses(std::slice::from_ref(&witness_b)));
+
+        // Publishing into `bucket_a` marks only `bucket_a` as started without statting or poisoning `bucket_b`.
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        record_native_publication(&io_path.join(&bucket_a).join("object/xl.meta"));
+        assert_eq!(stat_hits.load(Ordering::SeqCst), 0, "live proc fast path must skip stat");
+        drop(stat_guard);
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&witness_a)));
+        assert!(validate_native_creation_witnesses(std::slice::from_ref(&witness_b)));
+
+        // Non-Normal component (`..`) sets `unknown = true`, invalidating remaining witnesses on that root.
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        record_native_publication(&io_path.join(&bucket_b).join("../escape"));
+        assert_eq!(stat_hits.load(Ordering::SeqCst), 0, "live proc fast path must skip stat");
+        drop(stat_guard);
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&witness_b)));
+
+        // Dropping the last strong owner of the root directory fd retires the live proc entry and falls back to stat.
+        assert!(NATIVE_PUBLICATION_HISTORY.lock().live_proc_roots.contains_key(&proc_alias));
+        drop(root);
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let _stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        record_native_publication(&io_path.join("after-drop"));
+        assert!(!NATIVE_PUBLICATION_HISTORY.lock().live_proc_roots.contains_key(&proc_alias));
+        assert_eq!(
+            stat_hits.load(Ordering::SeqCst),
+            1,
+            "retired proc root must fall back to native_root_identity"
+        );
+    }
 
     #[tokio::test]
     async fn guarded_first_publication_recovers_from_a_concurrent_parent_prune() {

@@ -33,6 +33,9 @@ mod object_maintenance_equivalence;
 #[path = "tests/object_backup_transfer.rs"]
 mod object_backup_transfer;
 
+#[path = "tests/rename_recovery.rs"]
+mod rename_recovery;
+
 #[tokio::test]
 async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     let object_backend = TestCatalogObjectBackend::default();
@@ -1249,11 +1252,6 @@ async fn catalog_backings_hide_and_reject_mutation_of_inactive_resources() {
                 .expect("views should list")
                 .is_empty()
         );
-        assert_matches!(
-            store.drop_namespace(&bucket, &namespace.public_name()).await,
-            Err(TableCatalogStoreError::Conflict(_))
-        );
-
         backend.seed_object(&bucket, &new_metadata, b"{}".to_vec()).await;
         let commit_error = store
             .commit_table(TableCommitRequest {
@@ -1285,6 +1283,18 @@ async fn catalog_backings_hide_and_reject_mutation_of_inactive_resources() {
             .await
             .expect_err("inactive view must reject replacement");
         assert_matches!(view_error, TableCatalogStoreError::NotFound(_));
+
+        store
+            .drop_namespace(&bucket, &namespace.public_name())
+            .await
+            .expect("deleted resources should allow namespace deletion");
+        assert!(
+            store
+                .get_namespace(&bucket, &namespace.public_name())
+                .await
+                .expect("namespace lookup should succeed")
+                .is_none()
+        );
     }
 }
 
@@ -7876,7 +7886,7 @@ async fn object_catalog_pagination_bounds_sparse_namespace_scans() {
 }
 
 #[tokio::test]
-async fn object_catalog_drop_namespace_scans_all_pages_for_inactive_resources() {
+async fn object_catalog_drop_namespace_scans_all_pages_for_pending_resources() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -7903,7 +7913,7 @@ async fn object_catalog_drop_namespace_scans_all_pages_for_inactive_resources() 
         &table,
         default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
     );
-    inactive.state = TableCatalogEntryState::Deleted;
+    inactive.state = TableCatalogEntryState::Deleting;
     store
         .write_entry(
             store.catalog_bucket(),
@@ -14848,6 +14858,91 @@ fn object_metadata_borrowed_guard_rejects_test_only_replacements() {
 }
 
 #[test]
+fn multipart_count_guard_accepts_owned_and_borrowed_resource_arguments() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 2).as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+            (
+                "src/app/multipart_usecase/upload_part.rs",
+                guarded_methods(MULTIPART_BORROWED_KEY_GUARD, 1).as_str(),
+            ),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn multipart_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        MULTIPART_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        MULTIPART_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        MULTIPART_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(MULTIPART_KEY_GUARD, 3)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/multipart_usecase.rs", parent.as_str()),
+                ("src/app/multipart_usecase/upload_part.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/multipart_usecase.rs",
+            "src/app/multipart_usecase",
+        );
+
+        let message = crate::guard_sources::panic_message(move || assert_multipart_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
+}
+
+#[test]
+fn object_metadata_key_count_guard_accepts_borrowed_resource_names() {
+    let source = guard_fixture(
+        &[
+            ("src/app/mod.rs", guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2).as_str()),
+            (
+                "src/app/object_meta/retention.rs",
+                guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 2).as_str(),
+            ),
+        ],
+        "src/app/mod.rs",
+        "src/app/object_meta",
+    );
+
+    assert_object_metadata_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_key_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {OBJECT_METADATA_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/mod.rs", parent.as_str()),
+                ("src/app/object_meta/retention.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/mod.rs",
+            "src/app/object_meta",
+        );
+        let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
+}
+
+#[test]
 fn object_metadata_key_count_guard_fails_when_a_moved_call_is_broken() {
     let moved_and_broken = guarded_methods(MULTIPART_KEY_GUARD, 1).replace("&key)", "key.as_str())");
     let parent = format!(
@@ -16040,6 +16135,22 @@ async fn object_catalog_source_recreation_after_rename_preserves_the_original_id
             .seed_object(bucket, &replacement_metadata, serde_json::to_vec(&replacement_json).unwrap())
             .await;
 
+        if destination_namespace != "sales" {
+            restarted.drop_namespace(bucket, "sales").await.unwrap();
+            assert!(restarted.get_namespace(bucket, "sales").await.unwrap().is_none());
+            assert_eq!(backend.read_object(bucket, &next).await.unwrap(), Some(before_next.clone()));
+            assert_eq!(
+                restarted
+                    .load_table(bucket, destination_namespace, "orders_v2")
+                    .await
+                    .unwrap(),
+                Some(renamed.clone())
+            );
+            restarted
+                .create_namespace(test_namespace_entry(bucket, &source_namespace))
+                .await
+                .unwrap();
+        }
         restarted
             .create_table(replacement.clone())
             .await

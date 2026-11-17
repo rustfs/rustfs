@@ -318,6 +318,27 @@ async fn object_metadata_answers_as_stored(server: rustfs::embedded::RustFSServe
     let until = retention.retain_until_date().expect("a retain-until date");
     assert_eq!(until.secs(), 2_051_305_200, "the stored instant, 2035-01-01T23:00:00Z");
 
+    let missing_version = "00000000-0000-4000-8000-000000000000";
+    let missing_retention = client
+        .get_object_retention()
+        .bucket(&locked)
+        .key("stored")
+        .version_id(missing_version)
+        .send()
+        .await
+        .expect_err("retention for a missing version");
+    assert_eq!(refusal(&missing_retention), (Some("NoSuchVersion".to_owned()), Some(404)));
+
+    let missing_hold = client
+        .get_object_legal_hold()
+        .bucket(&locked)
+        .key("stored")
+        .version_id(missing_version)
+        .send()
+        .await
+        .expect_err("legal hold for a missing version");
+    assert_eq!(refusal(&missing_hold), (Some("NoSuchVersion".to_owned()), Some(404)));
+
     let missing = client
         .get_object_tagging()
         .bucket(BUCKET)

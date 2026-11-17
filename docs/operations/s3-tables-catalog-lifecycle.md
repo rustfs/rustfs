@@ -1,6 +1,6 @@
 # S3 Tables Catalog Lifecycle
 
-**Use this when:** disabling an object-backed table catalog, cleaning up metadata left by deleted empty tables, or diagnosing catalog registration reads.
+**Use this when:** disabling an object-backed table catalog, cleaning up metadata left by deleted empty tables, diagnosing catalog registration reads, or recovering an interrupted table rename.
 **Source of truth:** `rustfs/src/admin/handlers/table_catalog/config.rs`, `rustfs/src/table_catalog/store/cleanup.rs`, and `rustfs/src/table_catalog/store/registration_cache.rs`.
 
 ## Disable A Table Catalog
@@ -30,3 +30,11 @@ Each server keeps a bounded memory cache of validated ownership records. Reuse r
 Registration still enumerates namespace and warehouse-index prefixes, so enumeration grows with catalog size. Cache hits reduce object-body reads and JSON parsing. A hit reuses previously validated content without reading the current body again to prove physical readability. Conditional writes, rollback, and lock-loss fencing continue to control publication; the cache does not synchronize writers that bypass those guards.
 
 Existing catalog, Iceberg metadata, and Console/client request formats remain unchanged. See the [S3 Tables support matrix](../architecture/s3-tables-support-matrix.md) for supported API boundaries.
+
+## Interrupted Table Renames
+
+Every server starts rename recovery once its own application context is ready, including embedded servers. This runs independently of `RUSTFS_TABLE_MAINTENANCE_SCHEDULER_ENABLED`. Recovery scans up to 32 bucket directories per pass, skips their child objects, and admits at most four recoveries concurrently. Passes are separated by five seconds plus jitter; failed buckets retry with exponential delays from 10 seconds up to five minutes. Larger catalogs may need multiple passes. These intervals do not guarantee a recovery deadline while storage or locks remain unavailable.
+
+Recovery resumes the rename referenced by the bucket's `active_rename_id` through the same restore fence, publication locks, conditional writes, and state validation used by `RenameTable`. Reads remain fenced until finalization completes. Missing or invalid intent records retain the fence and produce `table_catalog_rename_recovery` warnings; preserve those records and collect the warnings for investigation. Shutdown stops new admissions and drains started recoveries.
+
+A completed rename preserves the table UUID, warehouse location, and metadata location. Dropping the empty source namespace removes its namespace record and retains valid `DELETED` table/view records. Active objects, pending states, child namespaces, unreadable records, and active rename fences still prevent namespace deletion. Namespace deletion does not remove metadata or data files referenced by the destination table.

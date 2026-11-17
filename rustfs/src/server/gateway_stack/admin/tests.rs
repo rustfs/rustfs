@@ -28,9 +28,10 @@ use rustfs_gateway::Answer;
 use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, PathStyleOnly, Req, Resp, decide_with};
 use rustfs_gateway_dialect_rustfs_admin::AdminResponse as WireResponse;
 use rustfs_gateway_dialect_rustfs_admin::ops::{
-    get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info, get_v3_module_switches::GetV3ModuleSwitches,
-    get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
-    get_v4_cluster_snapshot::GetV4ClusterSnapshot, get_v4_plugins_catalog::GetV4PluginsCatalog,
+    get_iceberg_config::GetIcebergConfig, get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info,
+    get_v3_module_switches::GetV3ModuleSwitches, get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats,
+    get_v3_storageinfo::GetV3Storageinfo, get_v4_cluster_snapshot::GetV4ClusterSnapshot,
+    get_v4_extensions_catalog::GetV4ExtensionsCatalog, get_v4_plugins_catalog::GetV4PluginsCatalog,
     get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_s3_types::Body;
@@ -39,13 +40,15 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 #[test]
-fn native_admin_registers_only_system_reads_and_both_claims() {
+fn native_admin_registers_only_selected_reads_and_four_claims() {
     let dialect = dialect().unwrap();
     let mut expected = [
+        GetIcebergConfig::NAME,
         GetV3Info::NAME,
         GetV3Datausageinfo::NAME,
         GetV4PluginsCatalog::NAME,
         GetV4ClusterSnapshot::NAME,
+        GetV4ExtensionsCatalog::NAME,
         GetV3ModuleSwitches::NAME,
         GetV3Storageinfo::NAME,
         GetV4RuntimeCapabilities::NAME,
@@ -57,7 +60,7 @@ fn native_admin_registers_only_system_reads_and_both_claims() {
     assert_eq!(names, expected);
     assert_eq!(
         dialect.claims().iter().map(|claim| claim.prefix).collect::<Vec<_>>(),
-        ["/rustfs/admin", "/minio/admin"]
+        ["/rustfs/admin", "/minio/admin", "/_iceberg/v1", "/iceberg/v1"]
     );
     assert!(
         dialect
@@ -126,8 +129,10 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
         service: builder
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())
+            .register::<GetIcebergConfig, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Datausageinfo, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV4PluginsCatalog, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV4ExtensionsCatalog, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3ModuleSwitches, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Info, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Storageinfo, _>(Arc::new(Capture(captured.clone())))
@@ -137,8 +142,11 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
             .unwrap(),
     };
     let paths = [
+        "/iceberg/v1/config",
+        "/_iceberg/v1/config",
         "/minio/admin/v3/datausageinfo",
         "/minio/admin/v4/plugins/catalog",
+        "/minio/admin/v4/extensions/catalog",
         "/minio/admin/v3/module-switches",
         "/minio/admin/v3/info",
         "/minio/admin/v3/storageinfo",
@@ -188,12 +196,16 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
 async fn native_admin_authenticated_request_refuses_an_uninstalled_server_context() {
     let stack = assemble(assembly(), Arc::new(ScriptedIam { ready: false }), root().source()).unwrap();
     for path in [
+        "/iceberg/v1/config",
+        "/_iceberg/v1/config",
         "/rustfs/admin/v3/datausageinfo",
         "/rustfs/admin/v4/plugins/catalog",
+        "/rustfs/admin/v4/extensions/catalog",
         "/rustfs/admin/v3/module-switches",
         "/rustfs/admin/v3/info",
         "/minio/admin/v3/datausageinfo",
         "/minio/admin/v4/plugins/catalog",
+        "/minio/admin/v4/extensions/catalog",
         "/minio/admin/v3/module-switches",
         "/minio/admin/v3/info",
         "/rustfs/admin/v3/storageinfo",

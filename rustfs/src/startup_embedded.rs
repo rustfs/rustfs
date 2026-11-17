@@ -76,6 +76,7 @@ impl EmbeddedStartupArgs {
 }
 
 pub(crate) struct EmbeddedStartedServer {
+    pub(crate) table_rename_recovery: crate::table_catalog::CatalogBackgroundTask,
     pub(crate) bound_addr: SocketAddr,
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
@@ -208,6 +209,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
     release_embedded_startup_guard();
 
     Ok(EmbeddedStartedServer {
+        table_rename_recovery: service_runtime.table_rename_recovery,
         bound_addr,
         access_key: identity.access_key,
         secret_key: identity.secret_key,

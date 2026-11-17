@@ -54,6 +54,9 @@ compile_error!("gateway-stack is restricted to debug builds");
 
 mod admin;
 
+#[cfg(test)]
+pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};

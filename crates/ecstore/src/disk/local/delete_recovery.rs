@@ -209,7 +209,7 @@ impl DiscoverySession {
                             None => regular_bytes(&proof_root.join(DELETE_QUORUM_COMMITTED_FILE))
                                 .map_err(std::io::Error::from)?
                                 .filter(|bytes| !bytes.is_empty())
-                                .and_then(|bytes| serde_json::from_slice::<CommitReceipt>(&bytes).ok())
+                                .and_then(|bytes| parse_commit_receipt(&bytes).ok())
                                 .map(|receipt| receipt.journal),
                         };
                         let logical = record
@@ -271,6 +271,21 @@ static DISCOVERY_SESSIONS: std::sync::LazyLock<ParkingLotMutex<HashMap<Uuid, Dis
 struct CommitReceipt {
     journal: DeleteRecoveryJournal,
     finished: bool,
+}
+
+/// Parse a commit receipt from `delete-quorum-committed`.
+/// A bare `DeleteRecoveryJournal` (from hardlinking `delete-prepared`) always
+/// represents `finished = false`; `finished = true` is only persisted via the
+/// `CommitReceipt` wrapper when replacing the receipt entry.
+fn parse_commit_receipt(bytes: &[u8]) -> Result<CommitReceipt> {
+    if let Ok(receipt) = serde_json::from_slice::<CommitReceipt>(bytes) {
+        return Ok(receipt);
+    }
+    let journal = serde_json::from_slice::<DeleteRecoveryJournal>(bytes).map_err(|_| DiskError::FileCorrupt)?;
+    Ok(CommitReceipt {
+        journal,
+        finished: false,
+    })
 }
 
 pub(super) struct DeletePreparationContext {
@@ -866,9 +881,8 @@ pub(super) fn inspection_with_markers_bounded(
     let receipt: Option<CommitReceipt> = receipt_bytes
         .as_deref()
         .filter(|bytes| !bytes.is_empty())
-        .map(serde_json::from_slice)
-        .transpose()
-        .map_err(|_| DiskError::FileCorrupt)?;
+        .map(parse_commit_receipt)
+        .transpose()?;
     let committed = receipt.is_some();
     let finished = regular_marker(&rollback.join(FINISHED))? || receipt.as_ref().is_some_and(|receipt| receipt.finished);
     let journal: Option<DeleteRecoveryJournal> = prepared
@@ -1185,6 +1199,7 @@ struct PreparedDeleteReceiptEntry {
     journal: DeleteRecoveryJournal,
     sole_transaction: bool,
     had_old_data_dir: bool,
+    prepared_synced: bool,
     rollback_dir_fd: Option<Arc<std::fs::File>>,
     file_path_dir: Option<Arc<std::fs::File>>,
 }
@@ -1548,11 +1563,7 @@ impl LocalDisk {
                             .push(serde_json::from_slice::<DeleteRecoveryJournal>(&bytes).map_err(|_| DiskError::FileCorrupt)?);
                     }
                     if let Some(bytes) = receipt.filter(|bytes| !bytes.is_empty()) {
-                        records.push(
-                            serde_json::from_slice::<CommitReceipt>(&bytes)
-                                .map_err(|_| DiskError::FileCorrupt)?
-                                .journal,
-                        );
+                        records.push(parse_commit_receipt(&bytes)?.journal);
                     }
                     for record in records {
                         if record.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
@@ -2935,11 +2946,7 @@ impl LocalDisk {
                                     );
                                 }
                                 if let Some(bytes) = receipt.filter(|bytes| !bytes.is_empty()) {
-                                    records.push(
-                                        serde_json::from_slice::<CommitReceipt>(&bytes)
-                                            .map_err(|_| DiskError::FileCorrupt)?
-                                            .journal,
-                                    );
+                                    records.push(parse_commit_receipt(&bytes)?.journal);
                                 }
                                 for record in records {
                                     if record.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
@@ -3181,6 +3188,7 @@ impl LocalDisk {
                         journal,
                         sole_transaction,
                         had_old_data_dir,
+                        prepared_synced: sync,
                         rollback_dir_fd,
                         file_path_dir,
                     },
@@ -3244,6 +3252,7 @@ impl LocalDisk {
                     entry.journal,
                     entry.sole_transaction,
                     entry.had_old_data_dir,
+                    entry.prepared_synced,
                     entry.rollback_dir_fd,
                     entry.file_path_dir,
                 )),
@@ -3279,40 +3288,71 @@ impl LocalDisk {
             lease,
             sync,
             move || -> std::io::Result<Result<Option<PublishDeleteFastReturn>>> {
-                if let Some((journal_raw, journal, sole_transaction, had_old_data_dir, rollback_dir_fd, file_path_dir)) =
-                    cached_receipt
+                if let Some((
+                    journal_raw,
+                    journal,
+                    sole_transaction,
+                    had_old_data_dir,
+                    prepared_synced,
+                    rollback_dir_fd,
+                    file_path_dir,
+                )) = cached_receipt
                     && child_regular_file_exists(rollback_dir_fd.as_deref(), PREPARED, &rollback.join(PREPARED))
                 {
-                    let tmp_receipt = staging_root.join(format!("receipt-{transaction}.tmp"));
-                    let receipt_bytes = format_commit_receipt_bytes(&journal_raw, false);
-                    let write_res = (|| -> std::io::Result<()> {
-                        reserve.retry_after_enospc(|| {
-                            let mut file = std::fs::File::create(&tmp_receipt)?;
-                            std::io::Write::write_all(&mut file, &receipt_bytes)?;
-                            if sync && !receipt_bytes.is_empty() {
-                                file.sync_data()?;
-                            }
-                            #[cfg(test)]
-                            preparation_io_fault::run(&receipt_path)?;
-                            Ok(())
-                        })?;
+                    // Share the immutable Stage 1 PREPARED inode; any later receipt update must replace the entry by rename.
+                    let linked = if !sync || prepared_synced {
                         os::record_native_publication(&receipt_path);
-                        reserve.retry_after_enospc(|| {
-                            rename_into_dir_fd(
-                                &tmp_receipt,
-                                rollback_dir_fd.as_deref(),
-                                DELETE_QUORUM_COMMITTED_FILE,
-                                &receipt_path,
-                            )
-                        })?;
+                        reserve
+                            .retry_after_enospc(|| {
+                                link_child_files(
+                                    rollback_dir_fd.as_deref(),
+                                    PREPARED,
+                                    &rollback.join(PREPARED),
+                                    rollback_dir_fd.as_deref(),
+                                    DELETE_QUORUM_COMMITTED_FILE,
+                                    &receipt_path,
+                                )
+                            })
+                            .is_ok()
+                    } else {
+                        false
+                    };
+                    if linked {
                         if sync {
                             os::fsync_directory_handle_std(&rollback, rollback_dir_fd.as_deref())?;
                         }
-                        Ok(())
-                    })();
-                    if let Err(err) = write_res {
-                        let _ = std::fs::remove_file(&tmp_receipt);
-                        return Err(err);
+                    } else {
+                        let tmp_receipt = staging_root.join(format!("receipt-{transaction}.tmp"));
+                        let receipt_bytes = format_commit_receipt_bytes(&journal_raw, false);
+                        let write_res = (|| -> std::io::Result<()> {
+                            reserve.retry_after_enospc(|| {
+                                let mut file = std::fs::File::create(&tmp_receipt)?;
+                                std::io::Write::write_all(&mut file, &receipt_bytes)?;
+                                if sync && !receipt_bytes.is_empty() {
+                                    file.sync_data()?;
+                                }
+                                #[cfg(test)]
+                                preparation_io_fault::run(&receipt_path)?;
+                                Ok(())
+                            })?;
+                            os::record_native_publication(&receipt_path);
+                            reserve.retry_after_enospc(|| {
+                                rename_into_dir_fd(
+                                    &tmp_receipt,
+                                    rollback_dir_fd.as_deref(),
+                                    DELETE_QUORUM_COMMITTED_FILE,
+                                    &receipt_path,
+                                )
+                            })?;
+                            if sync {
+                                os::fsync_directory_handle_std(&rollback, rollback_dir_fd.as_deref())?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(err) = write_res {
+                            let _ = std::fs::remove_file(&tmp_receipt);
+                            return Err(err);
+                        }
                     }
                     let published_entry = bucket_path.map(|bucket_path| {
                         (
@@ -8522,6 +8562,9 @@ mod tests {
             journal: journal.clone(),
             finished: true,
         };
+        fs::remove_file(rollback.join(DELETE_QUORUM_COMMITTED_FILE))
+            .await
+            .expect("remove receipt before replacement");
         fs::write(
             rollback.join(DELETE_QUORUM_COMMITTED_FILE),
             serde_json::to_vec(&finished_receipt).expect("serialize finished receipt"),
@@ -8806,6 +8849,265 @@ mod tests {
                 .expect("finalize")
         );
         assert!(!rollback.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_stage2_hardlinks_prepared_journal_and_falls_back_on_conflict() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _strict = durability_mode_override::set(DurabilityMode::Strict);
+        let (_temp, disk, info, _) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").expect("object path");
+        let opts = DeleteOptions {
+            recoverable_delete: true,
+            ..Default::default()
+        };
+
+        #[cfg(target_os = "linux")]
+        {
+            let proc_vol = format!("{}/recovery", disk.io_root().display());
+            assert!(matches!(
+                disk.delete_version(&proc_vol, "object", info.clone(), false, opts.clone())
+                    .await,
+                Err(DiskError::InvalidPath)
+            ));
+        }
+
+        let tx1 = Uuid::new_v4();
+        assert_eq!(
+            disk.try_fused_recoverable_delete_version("recovery", "object", &info, &opts, tx1, None)
+                .await
+                .expect("fused prepare tx1"),
+            Some(())
+        );
+        let (journal1, sole1, satisfied1) = disk
+            .try_publish_prepared_delete_local("recovery", "object", tx1, None)
+            .await
+            .expect("publish tx1")
+            .expect("tx1 satisfied");
+        assert!(sole1 && satisfied1);
+
+        let rollback1 = root.join(tx1.to_string());
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&rollback1),
+            "strict Stage 2 hardlink must fsync rollback directory"
+        );
+        let prep_meta1 = std::fs::metadata(rollback1.join(PREPARED)).expect("prepared metadata");
+        let rec_meta1 = std::fs::metadata(rollback1.join(DELETE_QUORUM_COMMITTED_FILE)).expect("receipt metadata");
+        assert_eq!(
+            (prep_meta1.dev(), prep_meta1.ino()),
+            (rec_meta1.dev(), rec_meta1.ino()),
+            "Stage 2 fast path must hardlink PREPARED to DELETE_QUORUM_COMMITTED_FILE"
+        );
+        let raw_receipt1 = std::fs::read(rollback1.join(DELETE_QUORUM_COMMITTED_FILE)).expect("read bare receipt");
+        let parsed_bare = parse_commit_receipt(&raw_receipt1).expect("parse bare journal receipt");
+        assert!(!parsed_bare.finished && parsed_bare.journal == journal1);
+        let wrapped_true = format_commit_receipt_bytes(&raw_receipt1, true);
+        let parsed_wrapped = parse_commit_receipt(&wrapped_true).expect("parse wrapped finished receipt");
+        assert!(parsed_wrapped.finished && parsed_wrapped.journal == journal1);
+        assert!(matches!(parse_commit_receipt(b"{\"invalid\":1}"), Err(DiskError::FileCorrupt)));
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "object", tx1)
+                .await
+                .expect("inspect QuorumCommitted")
+                .state,
+            DeleteRecoveryState::QuorumCommitted
+        );
+
+        // Verify DiscoverySession::advance_bounded (:212) extracts the bound logical key ("directory/")
+        // from a bare-journal receipt when PREPARED is absent (physical dir name is "directory").
+        let dir_root = disk.io_get_object_path("recovery", "directory/").expect("dir key path");
+        let mut dir_info = info.clone();
+        dir_info.name = "directory/".to_owned();
+        let mut dir_meta = FileMeta::new();
+        dir_meta.add_version(dir_info.clone()).expect("add dir version");
+        fs::create_dir_all(&dir_root).await.expect("create dir_root");
+        fs::write(dir_root.join(STORAGE_FORMAT_FILE), dir_meta.marshal_msg().expect("marshal dir meta"))
+            .await
+            .expect("write dir xl.meta");
+        let tx_dir = Uuid::new_v4();
+        assert_eq!(
+            disk.try_fused_recoverable_delete_version("recovery", "directory/", &dir_info, &opts, tx_dir, None)
+                .await
+                .expect("fused prepare tx_dir"),
+            Some(())
+        );
+        let (journal_dir, _, _) = disk
+            .try_publish_prepared_delete_local("recovery", "directory/", tx_dir, None)
+            .await
+            .expect("publish tx_dir")
+            .expect("tx_dir satisfied");
+        let rollback_dir = dir_root.join(tx_dir.to_string());
+        fs::remove_file(rollback_dir.join(PREPARED))
+            .await
+            .expect("unlink dir PREPARED");
+        fs::remove_file(rollback_dir.join(STORAGE_FORMAT_FILE_BACKUP))
+            .await
+            .expect("unlink dir backup");
+        let discovered_dir = disk
+            .discover_delete_transactions("recovery", None, None, 16)
+            .await
+            .expect("bucket-wide discovery of directory/ bare-journal receipt");
+        assert!(
+            discovered_dir
+                .transactions
+                .iter()
+                .any(|id| id.object == "directory/" && id.transaction == tx_dir),
+            "DiscoverySession must parse logical key 'directory/' from bare-journal receipt"
+        );
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local("recovery", "directory/", tx_dir, &journal_dir, None)
+                .await
+                .expect("finalize tx_dir")
+        );
+
+        // Removing PREPARED and backup while retaining the bare-journal receipt infers CommitFinished
+        // and exercises all bare-journal parse_commit_receipt sites (bucket-wide discovery + predecessor scans).
+        fs::remove_file(rollback1.join(PREPARED)).await.expect("unlink PREPARED");
+        fs::remove_file(rollback1.join(STORAGE_FORMAT_FILE_BACKUP))
+            .await
+            .expect("unlink backup");
+        assert_eq!(
+            disk.inspect_delete_transaction("recovery", "object", tx1)
+                .await
+                .expect("inspect CommitFinished from bare-journal receipt")
+                .state,
+            DeleteRecoveryState::CommitFinished
+        );
+        let discovered_bucket = disk
+            .discover_delete_transactions("recovery", None, None, 16)
+            .await
+            .expect("bucket-wide discovery of bare-journal receipt");
+        assert!(discovered_bucket.transactions.iter().any(|id| id.transaction == tx1));
+        let preds = disk
+            .delete_recovery_predecessors("recovery", "object", Uuid::new_v4(), None, None)
+            .await
+            .expect("predecessor scan of bare-journal receipt");
+        assert_eq!(preds, vec![tx1]);
+
+        // Re-create xl.meta while tx1's bare-journal receipt is still present so Stage 1's predecessor scan
+        // parses tx1's bare-journal receipt, and pre-populate tx2's receipt before Stage 2 to force EEXIST fallback.
+        let mut meta = FileMeta::new();
+        meta.add_version(info.clone()).expect("add version");
+        fs::create_dir_all(&root).await.expect("recreate object dir");
+        fs::write(root.join(STORAGE_FORMAT_FILE), meta.marshal_msg().expect("marshal meta"))
+            .await
+            .expect("write xl.meta");
+
+        let tx2 = Uuid::new_v4();
+        assert_eq!(
+            disk.try_fused_recoverable_delete_version("recovery", "object", &info, &opts, tx2, None)
+                .await
+                .expect("fused prepare tx2"),
+            Some(())
+        );
+        let rollback2 = root.join(tx2.to_string());
+        fs::write(rollback2.join(DELETE_QUORUM_COMMITTED_FILE), b"stale")
+            .await
+            .expect("pre-create conflicting receipt");
+        let (journal2, sole2, satisfied2) = disk
+            .try_publish_prepared_delete_local("recovery", "object", tx2, None)
+            .await
+            .expect("publish tx2 fallback")
+            .expect("tx2 satisfied");
+        assert!(!sole2 && satisfied2);
+        assert_eq!(journal2.predecessors, vec![tx1]);
+        let prep_meta2 = std::fs::metadata(rollback2.join(PREPARED)).expect("prepared2 metadata");
+        let rec_meta2 = std::fs::metadata(rollback2.join(DELETE_QUORUM_COMMITTED_FILE)).expect("receipt2 metadata");
+        assert_ne!(
+            (prep_meta2.dev(), prep_meta2.ino()),
+            (rec_meta2.dev(), rec_meta2.ino()),
+            "EEXIST fallback must replace receipt with a distinct wrapper inode"
+        );
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", tx1, &journal1, None)
+                .await
+                .expect("finalize tx1")
+        );
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", tx2, &journal2, None)
+                .await
+                .expect("finalize tx2")
+        );
+
+        // Prepare tx3 under Relaxed (`prepared_synced == false`), then escalate to Strict before Stage 2:
+        // Stage 2 must not hardlink the unsynced PREPARED inode and must instead write a fresh synced receipt.
+        fs::create_dir_all(&root).await.expect("recreate object dir for tx3");
+        fs::write(root.join(STORAGE_FORMAT_FILE), meta.marshal_msg().expect("marshal meta"))
+            .await
+            .expect("write xl.meta for tx3");
+        drop(_strict);
+        let tx3 = Uuid::new_v4();
+        {
+            let _relaxed = durability_mode_override::set(DurabilityMode::Relaxed);
+            assert_eq!(
+                disk.try_fused_recoverable_delete_version("recovery", "object", &info, &opts, tx3, None)
+                    .await
+                    .expect("fused prepare tx3 relaxed"),
+                Some(())
+            );
+        }
+        let _strict_again = durability_mode_override::set(DurabilityMode::Strict);
+        let (journal3, sole3, satisfied3) = disk
+            .try_publish_prepared_delete_local("recovery", "object", tx3, None)
+            .await
+            .expect("publish tx3 escalated to strict")
+            .expect("tx3 satisfied");
+        assert!(sole3 && satisfied3);
+        let rollback3 = root.join(tx3.to_string());
+        let prep_meta3 = std::fs::metadata(rollback3.join(PREPARED)).expect("prepared3 metadata");
+        let rec_meta3 = std::fs::metadata(rollback3.join(DELETE_QUORUM_COMMITTED_FILE)).expect("receipt3 metadata");
+        assert_ne!(
+            (prep_meta3.dev(), prep_meta3.ino()),
+            (rec_meta3.dev(), rec_meta3.ino()),
+            "unsynced Stage 1 preparation must not be hardlinked when Stage 2 requires sync"
+        );
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", tx3, &journal3, None)
+                .await
+                .expect("finalize tx3")
+        );
+        drop(_strict_again);
+
+        // Prepare and publish tx4 under Relaxed (`!sync`): Stage 2 must hardlink PREPARED without directory fsync.
+        fs::create_dir_all(&root).await.expect("recreate object dir for tx4");
+        fs::write(root.join(STORAGE_FORMAT_FILE), meta.marshal_msg().expect("marshal meta"))
+            .await
+            .expect("write xl.meta for tx4");
+        let tx4 = Uuid::new_v4();
+        {
+            let _relaxed = durability_mode_override::set(DurabilityMode::Relaxed);
+            assert_eq!(
+                disk.try_fused_recoverable_delete_version("recovery", "object", &info, &opts, tx4, None)
+                    .await
+                    .expect("fused prepare tx4 relaxed"),
+                Some(())
+            );
+            let (journal4, sole4, satisfied4) = disk
+                .try_publish_prepared_delete_local("recovery", "object", tx4, None)
+                .await
+                .expect("publish tx4 relaxed")
+                .expect("tx4 satisfied");
+            assert!(sole4 && satisfied4);
+            let rollback4 = root.join(tx4.to_string());
+            assert!(
+                !os::fsync_dir_recorder::was_fsynced(&rollback4),
+                "relaxed Stage 2 hardlink must not fsync rollback directory"
+            );
+            let prep_meta4 = std::fs::metadata(rollback4.join(PREPARED)).expect("prepared4 metadata");
+            let rec_meta4 = std::fs::metadata(rollback4.join(DELETE_QUORUM_COMMITTED_FILE)).expect("receipt4 metadata");
+            assert_eq!(
+                (prep_meta4.dev(), prep_meta4.ino()),
+                (rec_meta4.dev(), rec_meta4.ino()),
+                "relaxed Stage 2 must hardlink PREPARED to DELETE_QUORUM_COMMITTED_FILE"
+            );
+            assert!(
+                disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", tx4, &journal4, None)
+                    .await
+                    .expect("finalize tx4")
+            );
+        }
     }
 }
 
