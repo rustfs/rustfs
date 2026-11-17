@@ -1,6 +1,8 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
+mod authorization;
+mod boundaries;
 mod encryption;
 
 use super::{Fixture, run_large_stack_test};
@@ -13,7 +15,9 @@ use aws_sdk_s3vectors::{
 };
 use aws_smithy_types::{Document, retry::RetryConfig, timeout::TimeoutConfig};
 use futures_util::FutureExt;
+use http_body_util::BodyExt as _;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
     panic::AssertUnwindSafe,
@@ -29,6 +33,10 @@ struct Observation {
     method: http::Method,
     uri: http::Uri,
     status: http::StatusCode,
+    body_len: usize,
+    body_sha256: [u8; 32],
+    request_marker: Option<String>,
+    content_length: Option<u64>,
 }
 
 struct SdkServer {
@@ -81,8 +89,26 @@ impl SdkServer {
                                     assert!(request.extensions().get::<crate::app::storage_api::vector_usecase::RequestContext>().is_some());
                                     let method = request.method().clone();
                                     let uri = request.uri().clone();
+                                    let request_marker = request.headers().get("x-rustfs-sdk-observation")
+                                        .map(|value| value.to_str().unwrap().to_owned());
+                                    let content_length = request.headers().get(http::header::CONTENT_LENGTH)
+                                        .map(|value| value.to_str().unwrap().parse::<u64>().unwrap());
+                                    let body_observation = Arc::new(Mutex::new((0_usize, Sha256::new())));
+                                    let streamed_observation = body_observation.clone();
+                                    let request = request.map(|body| body.map_frame(move |frame| {
+                                        if let Some(data) = frame.data_ref() {
+                                            let mut recorded = streamed_observation.lock().unwrap();
+                                            recorded.0 += data.len();
+                                            recorded.1.update(data);
+                                        }
+                                        frame
+                                    }));
                                     let response = service.call(request).await;
-                                    observed.lock().unwrap().push(Observation { method, uri, status: response.status() });
+                                    let (body_len, digest) = body_observation.lock().unwrap().clone();
+                                    observed.lock().unwrap().push(Observation {
+                                        method, uri, status: response.status(), body_len,
+                                        body_sha256: digest.finalize().into(), request_marker, content_length,
+                                    });
                                     Ok::<_, std::convert::Infallible>(response)
                                 }
                             });

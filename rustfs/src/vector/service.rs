@@ -281,6 +281,13 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
         update: crate::table_catalog::VectorTagUpdate,
     ) -> Result<(), VectorServiceError> {
         let (guard, entry) = self.begin_index(context, None).await?;
+        if let crate::table_catalog::VectorTagUpdate::Set(tags) = &update {
+            let existing = &entry.definition().tags;
+            let additional = tags.keys().filter(|key| !existing.contains_key(*key)).count();
+            if existing.len() + additional > 50 {
+                return Err(ProtocolError::validation("tags", "a resource may have at most 50 tags").into());
+            }
+        }
         // Catalog metadata commits validate the referenced manifest through this owner.
         let managed = context.managed_dataset(guard.clone(), entry.definition()).await?;
         self.catalog

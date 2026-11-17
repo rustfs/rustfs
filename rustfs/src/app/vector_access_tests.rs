@@ -407,6 +407,8 @@ fn vector_real_iam_tags_and_request_sse_conditions() {
 }
 
 mod iam_api;
+#[cfg(feature = "gateway-stack")]
+pub(in crate::app) use iam_api::issue_real_session;
 mod permission_model;
 #[cfg(feature = "gateway-stack")]
 mod s3_isolation_test;

@@ -3871,3 +3871,79 @@ async fn service_put_retry_succeeds_for_same_identity() {
 async fn service_delete_retry_succeeds_for_same_identity() {
     check_service_retry_resource_identity(true, false).await;
 }
+
+#[test]
+fn metadata_byte_limits_validate_complete_records_before_batch_creation() {
+    use super::dataset::{DatasetError, VectorRecord, record_batch};
+
+    let index = index_spec();
+    for (key, maximum) in [("private", 40_960), ("group", 2_048)] {
+        for (unit, encoded_bytes) in [("x", 1), ("é", 2), ("\"\\\n", 6)] {
+            for size in [maximum - 1, maximum, maximum + 1] {
+                // The ASCII key plus braces, quotes and colon has seven bytes of JSON overhead.
+                let payload_bytes = size - key.len() - 7;
+                let value = unit.repeat(payload_bytes / encoded_bytes) + &"x".repeat(payload_bytes % encoded_bytes);
+                let metadata = serde_json::json!({(key): value}).as_object().unwrap().clone();
+                assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), size);
+                let records = [
+                    VectorRecord {
+                        key: "first-valid".into(),
+                        data: vec![1.0, 2.0, 3.0],
+                        metadata: None,
+                    },
+                    VectorRecord {
+                        key: "sized".into(),
+                        data: vec![1.0, 2.0, 3.0],
+                        metadata: Some(metadata),
+                    },
+                ];
+                let result = record_batch(&records, &index);
+                if size <= maximum {
+                    assert_eq!(result.unwrap().num_rows(), 2);
+                } else {
+                    let error = result.expect_err("one oversized record must reject the complete batch");
+                    assert!(matches!(error, DatasetError::InvalidVector(_)), "{error:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn metadata_non_filterable_exclusion_only_removes_configured_root_fields() {
+    use super::dataset::{DatasetError, VectorRecord, record_batch};
+
+    let index = index_spec();
+    // Combining the two single-field JSON objects replaces two braces with one comma.
+    let both_limits = serde_json::json!({
+        "group": "g".repeat(2_048 - 12),
+        "private": "p".repeat(40_960 - 2_048 - 13),
+    });
+    assert_eq!(serde_json::to_vec(&both_limits).unwrap().len(), 40_960);
+    let mut record = VectorRecord {
+        key: "both-limits".into(),
+        data: vec![1.0, 2.0, 3.0],
+        metadata: Some(both_limits.as_object().unwrap().clone()),
+    };
+    assert_eq!(record_batch(&[record.clone()], &index).unwrap().num_rows(), 1);
+    record
+        .metadata
+        .as_mut()
+        .unwrap()
+        .insert("group".into(), serde_json::json!("g".repeat(2_048 - 11)));
+    record
+        .metadata
+        .as_mut()
+        .unwrap()
+        .insert("private".into(), serde_json::json!("p"));
+    let error = record_batch(&[record.clone()], &index).expect_err("filterable limit applies independently of total size");
+    assert!(matches!(error, DatasetError::InvalidVector(_)), "{error:?}");
+    record.metadata = Some(
+        serde_json::json!({"group":{"private":"x".repeat(2_048)}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let error = record_batch(&[record], &index).expect_err("nested names do not inherit the root non-filterable exclusion");
+    assert!(matches!(error, DatasetError::InvalidVector(_)), "{error:?}");
+}

@@ -35,6 +35,10 @@ pub(crate) enum VectorInputError {
     ZeroCosineVector,
     #[error("vector metadata contains {count} keys; at most 50 are supported")]
     TooManyMetadataKeys { count: usize },
+    #[error("vector metadata size {size_bytes} exceeds 40960 bytes")]
+    MetadataTooLarge { size_bytes: usize },
+    #[error("vector filterable metadata size {size_bytes} exceeds 2048 bytes")]
+    FilterableMetadataTooLarge { size_bytes: usize },
     #[error("non-filterable metadata keys must contain between 1 and 10 entries")]
     InvalidNonFilterableKeyCount,
     #[error("non-filterable metadata key length must be between 1 and 63 characters")]

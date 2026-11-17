@@ -108,7 +108,7 @@ fn vector_resource_policy_api_real_iam_identity_resource_matrix() {
     });
 }
 
-async fn issue_real_session(app: &AppContext, parent: &Credentials, policy: Option<Value>) -> Credentials {
+pub(in crate::app) async fn issue_real_session(app: &AppContext, parent: &Credentials, policy: Option<Value>) -> Credentials {
     let root = app.action_credentials().get().unwrap();
     let mut claims = HashMap::from([
         ("parent".into(), json!(parent.access_key)),

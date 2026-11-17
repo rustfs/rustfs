@@ -18,8 +18,9 @@ use crate::vector::{
     service::{ManagedDatasetAccess, VectorRequestAccess as _},
 };
 use aws_sdk_s3vectors::{
-    error::ProvideErrorMetadata as _,
-    types::{DataType, DistanceMetric, EncryptionConfiguration, SseType, VectorData},
+    config::{ConfigBag, Intercept, RuntimeComponents, interceptors::AfterDeserializationInterceptorContextRef},
+    error::{BoxError, ProvideErrorMetadata as _},
+    types::{DataType, DistanceMetric, EncryptionConfiguration, IndexMode, SseType, VectorData},
 };
 use futures_util::FutureExt as _;
 use rustfs_kms::{KmsConfig, KmsError, KmsServiceManager};
@@ -30,7 +31,7 @@ use std::{
     collections::BTreeMap,
     panic::AssertUnwindSafe,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -47,12 +48,12 @@ impl Drop for ProviderReset {
     }
 }
 
-struct EncryptionFixture {
-    request: Fixture,
-    manager: Arc<KmsServiceManager>,
+pub(super) struct EncryptionFixture {
+    pub(super) request: Fixture,
+    pub(super) manager: Arc<KmsServiceManager>,
     config: KmsConfig,
-    key_arn: String,
-    _reset: ProviderReset,
+    pub(super) key_arn: String,
+    _reset: Option<ProviderReset>,
 }
 
 fn key_material() -> String {
@@ -62,7 +63,7 @@ fn key_material() -> String {
 }
 
 impl EncryptionFixture {
-    async fn new(aes_default: bool) -> Self {
+    pub(super) async fn new(aes_default: bool) -> Self {
         let mut request = Fixture::new().await;
         assert!(request.app.kms().handle().get_encryption_service().await.is_none());
         let key_arn = format!("arn:aws:kms:{}:123456789012:key/{}", request.service.region, Uuid::new_v4());
@@ -91,7 +92,7 @@ impl EncryptionFixture {
             manager,
             config,
             key_arn,
-            _reset: reset,
+            _reset: Some(reset),
         };
         if aes_default {
             fixture.permissions_for_keys(&[], None).await;
@@ -160,14 +161,19 @@ async fn create_index(
     expected: EncryptionConfiguration,
 ) -> String {
     let bucket = format!("sdk-encrypted-{}", Uuid::new_v4().simple());
-    server
+    let bucket_wire = WireJson::default();
+    let created_bucket = server
         .client
         .create_vector_bucket()
         .vector_bucket_name(&bucket)
         .set_encryption_configuration(bucket_encryption.clone())
+        .customize()
+        .interceptor(bucket_wire.clone())
         .send()
         .await
         .unwrap();
+    assert_eq!(bucket_wire.take(), json!({"vectorBucketArn":created_bucket.vector_bucket_arn().unwrap()}));
+    let index_wire = WireJson::default();
     let found = server
         .client
         .get_vector_bucket()
@@ -185,10 +191,13 @@ async fn create_index(
         .dimension(2)
         .distance_metric(DistanceMetric::Euclidean)
         .set_encryption_configuration(index_encryption)
+        .customize()
+        .interceptor(index_wire.clone())
         .send()
         .await
         .unwrap();
     let index_arn = output.index_arn().unwrap().to_string();
+    assert_eq!(index_wire.take(), json!({"indexArn":index_arn}));
     let found = server.client.get_index().index_arn(&index_arn).send().await.unwrap();
     assert_eq!(found.index().unwrap().encryption_configuration(), Some(&expected));
     assert!(index_arn.starts_with(&format!("arn:aws:s3vectors:{}::bucket/", fixture.request.service.region)));
@@ -196,7 +205,7 @@ async fn create_index(
 }
 
 async fn managed_access(
-    fixture: &EncryptionFixture,
+    fixture: &Fixture,
     index_arn: &str,
     override_encryption: Option<VectorEffectiveEncryptionV1>,
 ) -> (ManagedDatasetAccess, CatalogMetadataRef, u64) {
@@ -206,12 +215,7 @@ async fn managed_access(
         }))
         .unwrap(),
     );
-    let admitted = fixture
-        .request
-        .service
-        .admit(fixture.request.verified(request))
-        .await
-        .unwrap();
+    let admitted = fixture.service.admit(fixture.verified(request)).await.unwrap();
     let catalog = admitted.catalog.as_ref().unwrap();
     let RequestTarget::Index { index, .. } = &admitted.target else {
         panic!("managed access requires an admitted Index target");
@@ -222,7 +226,7 @@ async fn managed_access(
         .await
         .unwrap();
     let context = dataset::IndexRequest {
-        owner: &fixture.request.service,
+        owner: &fixture.service,
         authorization: &admitted,
         index: &index,
     };
@@ -243,7 +247,7 @@ struct StoredObject {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Snapshot {
+pub(super) struct Snapshot {
     bucket_incarnation: Uuid,
     table_id: String,
     prefix: String,
@@ -252,8 +256,8 @@ struct Snapshot {
     objects: BTreeMap<String, StoredObject>,
 }
 
-async fn snapshot(fixture: &EncryptionFixture, index_arn: &str, decrypt: bool) -> Snapshot {
-    let (managed, manifest, generation) = managed_access(fixture, index_arn, None).await;
+pub(super) async fn snapshot(fixture: &EncryptionFixture, index_arn: &str, decrypt: bool) -> Snapshot {
+    let (managed, manifest, generation) = managed_access(&fixture.request, index_arn, None).await;
     let store = fixture.request.app.object_store();
     let bucket = managed.access.bucket().storage_bucket_id().as_str();
     let page = store
@@ -411,6 +415,7 @@ async fn success_case(
 ) {
     let arn = create_index(fixture, server, bucket, index, expected).await;
     put_and_read(server, &arn).await;
+    assert_configuration_stability(fixture, server, &arn).await;
     snapshot(fixture, &arn, true).await;
     server
         .client
@@ -788,7 +793,7 @@ async fn mismatch_case(fixture: &EncryptionFixture, server: &SdkServer) {
         "ValidationException",
         400
     );
-    let (managed, manifest, _) = managed_access(fixture, &arn, Some(VectorEffectiveEncryptionV1::Aes256)).await;
+    let (managed, manifest, _) = managed_access(&fixture.request, &arn, Some(VectorEffectiveEncryptionV1::Aes256)).await;
     let error = managed
         .objects
         .get(&managed.access, manifest.object_key(), None, None)
@@ -807,7 +812,7 @@ async fn mismatch_case(fixture: &EncryptionFixture, server: &SdkServer) {
         .reconfigure(KmsConfig::static_kms(fixture.key_arn.clone(), key_material()))
         .await
         .unwrap();
-    let (managed, manifest, _) = managed_access(fixture, &arn, None).await;
+    let (managed, manifest, _) = managed_access(&fixture.request, &arn, None).await;
     let error = managed
         .objects
         .get(&managed.access, manifest.object_key(), None, None)
@@ -840,6 +845,7 @@ async fn mismatch_case(fixture: &EncryptionFixture, server: &SdkServer) {
 
 #[derive(Clone, Copy)]
 enum Case {
+    EmptyBucket,
     Aes,
     Kms,
     Permissions,
@@ -848,10 +854,11 @@ enum Case {
 
 fn run_case(name: &'static str, case: Case) {
     run_large_stack_test(name, move || async move {
-        let fixture = EncryptionFixture::new(matches!(case, Case::Aes)).await;
+        let fixture = EncryptionFixture::new(matches!(case, Case::Aes | Case::EmptyBucket)).await;
         let server = SdkServer::new(&fixture.request).await;
         let result = AssertUnwindSafe(async {
             match case {
+                Case::EmptyBucket => empty_bucket_case(&fixture, &server).await,
                 Case::Aes => {
                     success_case(&fixture, &server, Some(aes()), None, aes()).await;
                     success_case(&fixture, &server, None, Some(aes()), aes()).await;
@@ -936,4 +943,553 @@ fn vector_aws_sdk_kms_revocation_preserves_dataset() {
 #[serial_test::serial]
 fn vector_aws_sdk_encryption_mismatch_preserves_ciphertext() {
     run_case("vector-sdk-encryption-mismatch", Case::Mismatch);
+}
+
+#[derive(Clone, Debug, Default)]
+struct WireJson(Arc<Mutex<Option<serde_json::Value>>>);
+
+impl Intercept for WireJson {
+    fn name(&self) -> &'static str {
+        "VectorEncryptionWireJson"
+    }
+
+    fn read_after_deserialization(
+        &self,
+        context: &AfterDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let bytes = context.response().body().bytes().expect("buffered SDK JSON response");
+        let value = serde_json::from_slice(bytes)?;
+        assert!(self.0.lock().unwrap().replace(value).is_none(), "one response without retries");
+        Ok(())
+    }
+}
+
+impl WireJson {
+    fn take(&self) -> serde_json::Value {
+        self.0.lock().unwrap().take().expect("the SDK observed an HTTP response body")
+    }
+}
+
+fn assert_no_encryption_member(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            assert!(!object.contains_key("encryptionConfiguration"));
+            for value in object.values() {
+                assert_no_encryption_member(value);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for value in array {
+                assert_no_encryption_member(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn assert_list_responses(server: &SdkServer, bucket: &str, index_arn: &str) {
+    let wire = WireJson::default();
+    let buckets = server
+        .client
+        .list_vector_buckets()
+        .prefix(bucket)
+        .customize()
+        .interceptor(wire.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(buckets.vector_buckets().len(), 1);
+    assert_eq!(buckets.vector_buckets()[0].vector_bucket_name(), bucket);
+    assert!(buckets.next_token().is_none());
+    assert_no_encryption_member(&wire.take());
+    let wire = WireJson::default();
+    let indexes = server
+        .client
+        .list_indexes()
+        .vector_bucket_name(bucket)
+        .customize()
+        .interceptor(wire.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(indexes.indexes().len(), 1);
+    assert_eq!(indexes.indexes()[0].index_arn(), index_arn);
+    assert!(indexes.next_token().is_none());
+    assert_no_encryption_member(&wire.take());
+}
+
+async fn assert_configuration_stability(fixture: &EncryptionFixture, server: &SdkServer, index_arn: &str) {
+    let original_index = server.client.get_index().index_arn(index_arn).send().await.unwrap();
+    let index = original_index.index().unwrap();
+    let bucket = index.vector_bucket_name();
+    let original_bucket = server
+        .client
+        .get_vector_bucket()
+        .vector_bucket_name(bucket)
+        .send()
+        .await
+        .unwrap();
+    let before = snapshot(fixture, index_arn, true).await;
+    assert_list_responses(server, bucket, index_arn).await;
+
+    for configuration in [index.encryption_configuration().cloned(), None] {
+        let error = server
+            .client
+            .create_index()
+            .vector_bucket_name(bucket)
+            .index_name(index.index_name())
+            .data_type(DataType::Float32)
+            .dimension(2)
+            .distance_metric(DistanceMetric::Euclidean)
+            .set_encryption_configuration(configuration)
+            .send()
+            .await
+            .expect_err("a duplicate Index must preserve its original definition");
+        assert_eq!(error.as_service_error().unwrap().code(), Some("ConflictException"));
+        assert_eq!(error.raw_response().unwrap().status().as_u16(), 409);
+        assert_eq!(snapshot(fixture, index_arn, true).await, before);
+    }
+    for configuration in [
+        original_bucket.vector_bucket().unwrap().encryption_configuration().cloned(),
+        None,
+    ] {
+        let error = server
+            .client
+            .create_vector_bucket()
+            .vector_bucket_name(bucket)
+            .set_encryption_configuration(configuration)
+            .send()
+            .await
+            .expect_err("a duplicate Vector bucket must preserve its original identity");
+        assert_eq!(error.as_service_error().unwrap().code(), Some("ConflictException"));
+        assert_eq!(error.raw_response().unwrap().status().as_u16(), 409);
+        assert_eq!(snapshot(fixture, index_arn, true).await, before);
+    }
+    server
+        .client
+        .put_vector_bucket_default_index_mode()
+        .vector_bucket_name(bucket)
+        .default_index_mode(IndexMode::Enhanced)
+        .send()
+        .await
+        .unwrap();
+    server
+        .client
+        .update_index_mode()
+        .index_arn(index_arn)
+        .index_mode(IndexMode::Enhanced)
+        .send()
+        .await
+        .unwrap();
+    sdk_error!(
+        server
+            .client
+            .put_vector_bucket_default_index_mode()
+            .vector_bucket_name(bucket)
+            .default_index_mode(IndexMode::Classic)
+            .send()
+            .await,
+        "ValidationException",
+        400
+    );
+    sdk_error!(
+        server
+            .client
+            .update_index_mode()
+            .index_arn(index_arn)
+            .index_mode(IndexMode::Classic)
+            .send()
+            .await,
+        "ValidationException",
+        400
+    );
+    let after_bucket = server
+        .client
+        .get_vector_bucket()
+        .vector_bucket_name(bucket)
+        .send()
+        .await
+        .unwrap();
+    let after_index = server.client.get_index().index_arn(index_arn).send().await.unwrap();
+    assert_eq!(after_bucket.vector_bucket(), original_bucket.vector_bucket());
+    assert_eq!(after_index.index(), original_index.index());
+    assert_eq!(snapshot(fixture, index_arn, true).await, before);
+    assert_read(server, index_arn).await;
+}
+
+async fn empty_bucket_case(fixture: &EncryptionFixture, server: &SdkServer) {
+    let bucket = format!("sdk-empty-encryption-{}", Uuid::new_v4().simple());
+    let changed = Arc::new(AtomicBool::new(false));
+    let observed = changed.clone();
+    let wire = WireJson::default();
+    let created = server
+        .client
+        .create_vector_bucket()
+        .vector_bucket_name(&bucket)
+        .encryption_configuration(aes())
+        .customize()
+        .mutate_request(move |request| {
+            let mut body: serde_json::Value = serde_json::from_slice(request.body().bytes().unwrap()).unwrap();
+            assert_eq!(body["encryptionConfiguration"], json!({"sseType":"AES256"}));
+            body["encryptionConfiguration"] = json!({});
+            let bytes = serde_json::to_vec(&body).unwrap();
+            request.headers_mut().insert("content-length", bytes.len().to_string());
+            *request.body_mut() = aws_smithy_types::body::SdkBody::from(bytes);
+            let outgoing: serde_json::Value = serde_json::from_slice(request.body().bytes().unwrap()).unwrap();
+            assert_eq!(outgoing["encryptionConfiguration"], json!({}));
+            observed.store(true, Ordering::SeqCst);
+        })
+        .interceptor(wire.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(changed.load(Ordering::SeqCst));
+    assert_eq!(wire.take(), json!({"vectorBucketArn":created.vector_bucket_arn().unwrap()}));
+    let found = server
+        .client
+        .get_vector_bucket()
+        .vector_bucket_name(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(found.vector_bucket().unwrap().encryption_configuration(), Some(&aes()));
+    let wire = WireJson::default();
+    let created = server
+        .client
+        .create_index()
+        .vector_bucket_name(&bucket)
+        .index_name("encrypted.index")
+        .data_type(DataType::Float32)
+        .dimension(2)
+        .distance_metric(DistanceMetric::Euclidean)
+        .customize()
+        .interceptor(wire.clone())
+        .send()
+        .await
+        .unwrap();
+    let index_arn = created.index_arn().unwrap();
+    assert_eq!(wire.take(), json!({"indexArn":index_arn}));
+    let found = server.client.get_index().index_arn(index_arn).send().await.unwrap();
+    assert_eq!(found.index().unwrap().encryption_configuration(), Some(&aes()));
+    put_and_read(server, index_arn).await;
+    assert_snapshot_encryption(&snapshot(fixture, index_arn, true).await, &aes());
+    assert_configuration_stability(fixture, server, index_arn).await;
+    server.client.delete_index().index_arn(index_arn).send().await.unwrap();
+    sdk_error!(
+        server.client.delete_vector_bucket().vector_bucket_name(&bucket).send().await,
+        "ConflictException",
+        409
+    );
+    let retained = server
+        .client
+        .get_vector_bucket()
+        .vector_bucket_name(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retained.vector_bucket().unwrap().encryption_configuration(), Some(&aes()));
+}
+
+#[test]
+#[serial_test::serial]
+fn vector_aws_sdk_empty_bucket_encryption_configuration_defaults_to_aes256() {
+    run_case("vector-sdk-empty-bucket-encryption", Case::EmptyBucket);
+}
+
+async fn plaintext_snapshot(fixture: &Fixture, index_arn: &str) -> Snapshot {
+    let (managed, manifest, generation) = managed_access(fixture, index_arn, None).await;
+    let store = fixture.app.object_store();
+    let bucket = managed.access.bucket().storage_bucket_id().as_str();
+    let page = store
+        .clone()
+        .list_objects_v2(bucket, managed.access.allowed_prefix(), None, None, 1000, false, None, false)
+        .await
+        .unwrap();
+    assert!(!page.is_truncated);
+    let mut objects = BTreeMap::new();
+    for object in page.objects {
+        let options = StorageObjectOptions {
+            raw_data_movement_read: true,
+            suppress_read_repair: true,
+            expected_bucket_incarnation_id: Some(managed.access.bucket().incarnation().as_uuid()),
+            ..Default::default()
+        };
+        let reader = store
+            .get_object_reader(bucket, &object.name, None, http::HeaderMap::new(), &options)
+            .await
+            .unwrap();
+        let info = reader.object_info;
+        assert!(!info.is_encrypted());
+        assert!(
+            info.user_defined
+                .keys()
+                .all(|key| !rustfs_utils::http::is_object_encryption_marker(key))
+        );
+        let mut bytes = Vec::new();
+        reader
+            .stream
+            .take(MAX_OBJECT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .unwrap();
+        assert!(u64::try_from(bytes.len()).unwrap() <= MAX_OBJECT_BYTES);
+        assert_eq!(i64::try_from(bytes.len()).unwrap(), info.size);
+        let key = CatalogObjectKey::try_new(object.name.clone()).unwrap();
+        let read = managed.objects.get(&managed.access, &key, None, info.data_dir).await.unwrap();
+        assert_eq!(bytes, read.data);
+        if key == *manifest.object_key() {
+            assert_eq!(u64::try_from(bytes.len()).unwrap(), manifest.content_length());
+            assert_eq!(
+                hex_simd::encode_to_string(Sha256::digest(&bytes), hex_simd::AsciiCase::Lower),
+                manifest.content_sha256().to_hex()
+            );
+        }
+        objects.insert(
+            object.name,
+            StoredObject {
+                bytes,
+                metadata: info
+                    .user_defined
+                    .iter()
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+                    .collect(),
+                revision: info.data_dir,
+                etag: info.etag,
+            },
+        );
+    }
+    assert!(objects.keys().any(|key| key.ends_with(".lance")));
+    assert!(objects.contains_key(manifest.object_key().as_str()));
+    Snapshot {
+        bucket_incarnation: managed.access.bucket().incarnation().as_uuid(),
+        table_id: managed.access.table_id().as_str().to_owned(),
+        prefix: managed.access.allowed_prefix().to_owned(),
+        generation,
+        manifest: manifest.object_key().as_str().to_owned(),
+        objects,
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn vector_aws_sdk_unencrypted_index_ignores_cached_s3_default_encryption() {
+    run_large_stack_test("vector-sdk-plain-cached-sse", || async {
+        use crate::app::storage_api::{
+            managed::get_bucket_metadata,
+            test::{get_global_bucket_metadata_sys, set_bucket_metadata},
+        };
+        use rustfs_gateway_types::persistence::{
+            PersistedBucketEncryptionConfiguration, PersistedBucketEncryptionRule, PersistedEncryptionByDefault,
+        };
+
+        let fixture = Fixture::new().await;
+        assert!(fixture.app.kms().handle().get_encryption_service().await.is_none());
+        reset_sse_dek_provider();
+        let _reset = ProviderReset;
+        let server = SdkServer::new(&fixture).await;
+        let mut restore = None;
+        let result = AssertUnwindSafe(async {
+            let bucket = format!("sdk-plain-default-{}", Uuid::new_v4().simple());
+            let wire = WireJson::default();
+            let created = server
+                .client
+                .create_vector_bucket()
+                .vector_bucket_name(&bucket)
+                .customize()
+                .interceptor(wire.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wire.take(), json!({"vectorBucketArn":created.vector_bucket_arn().unwrap()}));
+            let request = Request::GetVectorBucket(serde_json::from_value(json!({"vectorBucketName":bucket})).unwrap());
+            let admitted = fixture.service.admit(fixture.verified(request)).await.unwrap();
+            let handle = admitted.bucket.as_ref().unwrap();
+            let storage_id = handle.storage_bucket_id().as_str();
+            let original = get_bucket_metadata(&fixture.app.object_store(), storage_id).await.unwrap();
+            assert!(original.encryption_config_xml.is_empty());
+            assert!(original.sse_config.is_none());
+            let mut cached = original.as_ref().clone();
+            cached.encryption_config_xml =
+                crate::app::vector_usecase::encryption::configuration_xml(&VectorEffectiveEncryptionV1::Aes256).unwrap();
+            cached.sse_config = Some(PersistedBucketEncryptionConfiguration {
+                rules: vec![PersistedBucketEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(PersistedEncryptionByDefault {
+                        sse_algorithm: "AES256".into(),
+                        kms_master_key_id: None,
+                    }),
+                    ..Default::default()
+                }],
+            });
+            restore = Some((storage_id.to_owned(), original.as_ref().clone()));
+            set_bucket_metadata(storage_id.to_owned(), cached).await.unwrap();
+            let ambient = get_global_bucket_metadata_sys().unwrap();
+            let (default_sse, _) = ambient.read().await.get_sse_config(storage_id).await.unwrap();
+            assert_eq!(
+                default_sse.rules[0]
+                    .apply_server_side_encryption_by_default
+                    .as_ref()
+                    .unwrap()
+                    .sse_algorithm
+                    .as_str(),
+                "AES256"
+            );
+            let wire = WireJson::default();
+            let found = server
+                .client
+                .get_vector_bucket()
+                .vector_bucket_name(&bucket)
+                .customize()
+                .interceptor(wire.clone())
+                .send()
+                .await
+                .unwrap();
+            assert!(found.vector_bucket().unwrap().encryption_configuration().is_none());
+            assert_no_encryption_member(&wire.take());
+            let wire = WireJson::default();
+            let created = server
+                .client
+                .create_index()
+                .vector_bucket_name(&bucket)
+                .index_name("plain.index")
+                .data_type(DataType::Float32)
+                .dimension(2)
+                .distance_metric(DistanceMetric::Euclidean)
+                .customize()
+                .interceptor(wire.clone())
+                .send()
+                .await
+                .unwrap();
+            let index_arn = created.index_arn().unwrap();
+            assert_eq!(wire.take(), json!({"indexArn":index_arn}));
+            let wire = WireJson::default();
+            let found = server
+                .client
+                .get_index()
+                .index_arn(index_arn)
+                .customize()
+                .interceptor(wire.clone())
+                .send()
+                .await
+                .unwrap();
+            assert!(found.index().unwrap().encryption_configuration().is_none());
+            assert_no_encryption_member(&wire.take());
+            assert_list_responses(&server, &bucket, index_arn).await;
+            put_and_read(&server, index_arn).await;
+            let before = plaintext_snapshot(&fixture, index_arn).await;
+            assert_read(&server, index_arn).await;
+            assert_eq!(plaintext_snapshot(&fixture, index_arn).await, before);
+            let persisted = get_bucket_metadata(&fixture.app.object_store(), storage_id).await.unwrap();
+            assert_eq!(persisted.encryption_config_xml, original.encryption_config_xml);
+            assert_eq!(persisted.sse_config, original.sse_config);
+            assert!(fixture.app.kms().handle().get_encryption_service().await.is_none());
+            let (storage_id, original) = restore.take().unwrap();
+            set_bucket_metadata(storage_id, original).await.unwrap();
+            server.client.delete_index().index_arn(index_arn).send().await.unwrap();
+            sdk_error!(
+                server.client.delete_vector_bucket().vector_bucket_name(&bucket).send().await,
+                "ConflictException",
+                409
+            );
+            let retained = server
+                .client
+                .get_vector_bucket()
+                .vector_bucket_name(&bucket)
+                .send()
+                .await
+                .unwrap();
+            assert!(retained.vector_bucket().unwrap().encryption_configuration().is_none());
+        })
+        .catch_unwind()
+        .await;
+        if let Some((storage_id, original)) = restore {
+            set_bucket_metadata(storage_id, original).await.unwrap();
+        }
+        server.finish().await;
+        cleanup_iam(&fixture).await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn vector_aws_sdk_aes256_uses_production_kms_startup_context() {
+    const STARTUP_KEY: &str = "startup-aes-key";
+    let secret = format!("{STARTUP_KEY}:{}", key_material());
+    temp_env::with_vars(
+        [
+            ("RUSTFS_KMS_STATIC_SECRET_KEY", Some(secret.as_str())),
+            ("RUSTFS_KMS_STATIC_SECRET_KEY_FILE", None),
+            ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", Some("true")),
+        ],
+        || {
+            run_large_stack_test("vector-sdk-production-kms-startup", || async {
+                assert!(
+                    crate::runtime_sources::current_app_context().is_none(),
+                    "requires an isolated nextest process"
+                );
+                let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+                assert!(crate::runtime_sources::current_app_context().is_none());
+                let mut startup = crate::config::Config::new("127.0.0.1:0", Vec::new());
+                startup.kms_enable = true;
+                startup.kms_backend = "static".to_owned();
+                startup.kms_default_key_id = Some(STARTUP_KEY.to_owned());
+                crate::init::init_kms_system(&startup, store.clone()).await.unwrap();
+                let manager = AppContext::ensure_startup_kms_interface();
+                assert_eq!(manager.get_status().await, rustfs_kms::KmsServiceStatus::Running);
+                let config = manager.get_config().await.unwrap();
+                assert_eq!(config.backend, rustfs_kms::config::KmsBackend::Static);
+                assert_eq!(config.default_key_id.as_deref(), Some(STARTUP_KEY));
+                let iam = rustfs_iam::init_iam_sys(store.clone()).await.unwrap();
+                let slot = ServerContextSlot::new();
+                AppContext::ensure_startup_after_iam(store.clone(), manager.clone(), &slot, iam.clone()).unwrap();
+                let installed = slot.installed_app_context().unwrap();
+                assert!(Arc::ptr_eq(&installed.object_store(), &store));
+                assert!(Arc::ptr_eq(&installed.iam().handle(), &iam));
+                assert!(Arc::ptr_eq(&installed.kms().handle(), &manager));
+                assert!(Arc::ptr_eq(&crate::runtime_sources::current_app_context().unwrap(), &installed));
+                let encryption_service = manager.get_encryption_service().await.unwrap();
+                assert_eq!(encryption_service.get_default_key_id().map(String::as_str), Some(STARTUP_KEY));
+                assert!(Arc::ptr_eq(
+                    &crate::runtime_sources::current_encryption_service().await.unwrap(),
+                    &encryption_service
+                ));
+
+                // Fixture creates the ordinary IAM user using the context already installed by startup.
+                let mut request = Fixture::new().await;
+                assert!(Arc::ptr_eq(&request.app, &installed));
+                request.service =
+                    DefaultVectorUsecase::new(slot, request.service.limits, request.service.max_write_attempts).unwrap();
+                assert!(Arc::ptr_eq(&request.service.server.installed_app_context().unwrap(), &installed));
+                let fixture = EncryptionFixture {
+                    request,
+                    manager,
+                    config,
+                    key_arn: String::new(),
+                    _reset: None,
+                };
+                let server = SdkServer::new(&fixture.request).await;
+                let result = AssertUnwindSafe(async {
+                    success_case(&fixture, &server, Some(aes()), None, aes()).await;
+                    success_case(&fixture, &server, None, Some(aes()), aes()).await;
+                    assert!(Arc::ptr_eq(
+                        &crate::runtime_sources::current_encryption_service().await.unwrap(),
+                        &encryption_service
+                    ));
+                })
+                .catch_unwind()
+                .await;
+                server.finish().await;
+                cleanup_iam(&fixture.request).await;
+                fixture.manager.stop().await.unwrap();
+                drop(fixture);
+                if let Err(panic) = result {
+                    std::panic::resume_unwind(panic);
+                }
+            });
+        },
+    );
 }

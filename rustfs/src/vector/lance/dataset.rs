@@ -3,7 +3,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -155,6 +155,36 @@ pub(crate) fn validate_record_keys(records: &[VectorRecord]) -> Result<(), Datas
     Ok(())
 }
 
+fn serialize_metadata(
+    metadata: Option<&Map<String, Value>>,
+    non_filterable_keys: &BTreeSet<String>,
+) -> Result<Option<String>, DatasetError> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    // Reuse the persisted JSON representation when measuring the total metadata bytes.
+    let json = serde_json::to_string(metadata)?;
+    if json.len() > 40_960 {
+        return Err(VectorInputError::MetadataTooLarge { size_bytes: json.len() }.into());
+    }
+    let filterable_bytes = if metadata.keys().any(|key| non_filterable_keys.contains(key)) {
+        let filterable: BTreeMap<_, _> = metadata
+            .iter()
+            .filter(|(key, _)| !non_filterable_keys.contains(*key))
+            .collect();
+        serde_json::to_vec(&filterable)?.len()
+    } else {
+        json.len()
+    };
+    if filterable_bytes > 2_048 {
+        return Err(VectorInputError::FilterableMetadataTooLarge {
+            size_bytes: filterable_bytes,
+        }
+        .into());
+    }
+    Ok(Some(json))
+}
+
 pub(super) fn record_batch(records: &[VectorRecord], index: &VectorIndexManifestSpec) -> Result<RecordBatch, DatasetError> {
     validate_record_keys(records)?;
     for record in records {
@@ -169,7 +199,7 @@ pub(super) fn record_batch(records: &[VectorRecord], index: &VectorIndexManifest
     let vectors = FixedSizeListArray::try_new(vector_field.clone(), dimension, Arc::new(data), None)?;
     let metadata = records
         .iter()
-        .map(|record| record.metadata.as_ref().map(serde_json::to_string).transpose())
+        .map(|record| serialize_metadata(record.metadata.as_ref(), &index.non_filterable_metadata_keys))
         .collect::<Result<Vec<_>, _>>()?;
     let metadata = lance_arrow::json::JsonArray::try_from_iter(metadata)?.into_inner();
     let schema = Arc::new(ArrowSchema::new(vec![

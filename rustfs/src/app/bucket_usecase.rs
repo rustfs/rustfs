@@ -550,7 +550,13 @@ impl DefaultBucketUsecase {
         {
             Ok(()) => self.validate_bucket_handle(&identity).await?,
             Err(StorageError::PreconditionFailed) => {
-                let _guard = self.acquire_bucket_handle_guard(&identity).await?;
+                let _guard = match self.acquire_bucket_handle_guard(&identity).await {
+                    Ok(guard) => guard,
+                    Err(BucketResolveError::Storage(StorageError::BucketNotFound(_))) => {
+                        return Err(StorageError::PreconditionFailed.into());
+                    }
+                    Err(error) => return Err(error),
+                };
                 let metadata = managed::get_bucket_metadata(&store, identity.storage_bucket_id().as_str()).await?;
                 if metadata.encryption_config_xml != encryption_config_xml || metadata.tagging_config_xml != tagging_config_xml {
                     return Err(BucketResolveError::IdentityMismatch);
@@ -1669,12 +1675,16 @@ mod tests {
             BucketIncarnation::try_new(uuid::Uuid::new_v4()).expect("different incarnation"),
         )
         .expect("conflicting identity");
-        assert!(
+        assert!(matches!(
+            usecase.acquire_bucket_handle_guard(&conflicting).await,
+            Err(BucketResolveError::Storage(StorageError::BucketNotFound(_)))
+        ));
+        assert!(matches!(
             usecase
                 .create_managed_bucket(conflicting, metadata.encryption_config_xml.clone(), Vec::new())
-                .await
-                .is_err()
-        );
+                .await,
+            Err(BucketResolveError::Storage(StorageError::PreconditionFailed))
+        ));
         assert!(
             usecase
                 .create_managed_bucket(identity.clone(), Vec::new(), Vec::new())
