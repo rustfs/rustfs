@@ -12961,7 +12961,7 @@ impl LocalDisk {
                     let name = entry.trim_end_matches(SLASH_SEPARATOR);
                     let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
-                    if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    if opts.limit <= 0 || (opts.forward_to.as_ref().is_none_or(|marker| &name >= marker) && metadata_counts_toward_limit(&metadata)) {
                         *objs_returned += 1;
                     }
 
@@ -13231,7 +13231,7 @@ impl LocalDisk {
 
                         meta.metadata = read.bytes;
 
-                        if opts.limit <= 0 || read.counts_toward_limit {
+                        if opts.limit <= 0 || (opts.forward_to.as_ref().is_none_or(|marker| &meta.name >= marker) && read.counts_toward_limit) {
                             *objs_returned += 1;
                         }
 
@@ -31797,13 +31797,14 @@ mod test {
             Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str, limit: i32) -> (Vec<String>, i32) {
             let (reader, mut writer) = tokio::io::duplex(4096);
             let mut out = MetacacheWriter::new(&mut writer);
             let opts = WalkDirOptions {
                 bucket: bucket.to_string(),
                 base_dir: base_dir.to_string(),
                 recursive: true,
+                limit,
                 forward_to: Some(forward_to.to_string()),
                 ..Default::default()
             };
@@ -31828,7 +31829,7 @@ mod test {
         }
 
         let (engineering_names, engineering_count) =
-            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001").await;
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             engineering_names,
@@ -31844,7 +31845,7 @@ mod test {
         assert_eq!(engineering_count as usize, engineering_names.len());
 
         let (different_names, different_count) =
-            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001").await;
+            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001", 0).await;
 
         assert_eq!(
             different_names,
@@ -31856,7 +31857,7 @@ mod test {
         );
         assert_eq!(different_count as usize, different_names.len());
 
-        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001").await;
+        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             double_names,
@@ -31868,6 +31869,11 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+
+        fs::write(bucket_dir.join("engineering/engineering").join(STORAGE_FORMAT_FILE), b"meta").await.expect("write ancestor metadata");
+        let (names, count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 2).await;
+        assert_eq!(count, 2);
+        assert!(names.iter().any(|name| name == "engineering/engineering/repo-0002"));
     }
 
     #[tokio::test]
