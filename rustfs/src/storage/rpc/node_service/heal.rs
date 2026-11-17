@@ -32,30 +32,12 @@ const NODE_REPLACEMENT_RECOVERY_STATUS_VERSION: u8 = 1;
 const NODE_REPLACEMENT_RECOVERY_STATUS_MAX_SIZE: usize = 64 * 1024;
 const HEAL_TOPOLOGY_FINGERPRINT_DOMAIN: &[u8] = b"rustfs-heal-topology-v1\0";
 
-fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Timestamp {
-    let seconds = timestamp.timestamp();
-    let nanoseconds = match i32::try_from(timestamp.timestamp_subsec_nanos()) {
-        Ok(nanoseconds) => nanoseconds,
-        Err(_) => {
-            return if seconds < 0 { Timestamp::MIN } else { Timestamp::MAX };
-        }
-    };
-
-    match Timestamp::new(seconds, nanoseconds) {
-        Ok(timestamp) => timestamp,
-        Err(_) => {
-            if seconds < 0 {
-                Timestamp::MIN
-            } else {
-                Timestamp::MAX
-            }
-        }
-    }
+fn chrono_to_jiff_timestamp(timestamp: Timestamp) -> Timestamp {
+    timestamp
 }
 
-fn jiff_to_chrono_datetime(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    let system_time = std::time::SystemTime::try_from(timestamp).expect("heal timestamp should fit SystemTime");
-    chrono::DateTime::<chrono::Utc>::from(system_time)
+fn jiff_to_chrono_datetime(timestamp: Timestamp) -> Timestamp {
+    timestamp
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

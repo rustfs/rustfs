@@ -25,7 +25,7 @@
 //! never fail the process — this is a diagnosis tool, not a CI gate.
 
 use crate::config::{DiagnoseFormat, DiagnoseOpts};
-use chrono::{DateTime, FixedOffset, Local};
+use jiff::{SignedDuration, ZonedDateTime};
 use rustfs_log_analyzer::{
     AnalyzeOptions, Analyzer, IngestOptions, IngestReport, LogLevel, ReportFormat, RuleEngine, RuleSet, ingest_path,
     ingest_reader, render, seed_rule_set, seed_rules_with_external,
@@ -120,8 +120,11 @@ fn build_analyze_options(opts: &DiagnoseOpts) -> std::result::Result<AnalyzeOpti
 }
 
 /// RFC-3339, or a relative "30m" / "24h" / "7d" counted back from now.
-fn parse_time_arg(raw: &str) -> std::result::Result<DateTime<FixedOffset>, String> {
-    if let Ok(ts) = DateTime::parse_from_rfc3339(raw) {
+fn parse_time_arg(raw: &str) -> std::result::Result<ZonedDateTime, String> {
+    let normalized = raw
+        .strip_suffix('Z')
+        .map_or_else(|| raw.to_owned(), |prefix| format!("{prefix}+00:00"));
+    if let Ok(ts) = ZonedDateTime::strptime("%Y-%m-%dT%H:%M:%S%.f%:z", &normalized) {
         return Ok(ts);
     }
     let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
@@ -132,17 +135,16 @@ fn parse_time_arg(raw: &str) -> std::result::Result<DateTime<FixedOffset>, Strin
         .map_err(|_| format!("invalid time '{raw}' (RFC-3339 or relative like 30m/24h/7d)"))?;
     let amount = i64::from(amount);
     let duration = match unit {
-        "m" => chrono::Duration::minutes(amount),
-        "h" => chrono::Duration::hours(amount),
-        "d" => chrono::Duration::days(amount),
+        "m" => SignedDuration::from_mins(amount),
+        "h" => SignedDuration::from_hours(amount),
+        "d" => SignedDuration::from_hours(amount * 24),
         _ => return Err(format!("invalid time '{raw}' (RFC-3339 or relative like 30m/24h/7d)")),
     };
     // `checked_sub_signed`: an absurd amount (e.g. `100000000d`) underflows the
     // representable date range — return an error instead of panicking.
-    Local::now()
-        .checked_sub_signed(duration)
-        .map(|t| t.fixed_offset())
-        .ok_or_else(|| format!("invalid time '{raw}' (out of representable range)"))
+    ZonedDateTime::now()
+        .checked_sub(duration)
+        .map_err(|_| format!("invalid time '{raw}' (out of representable range)"))
 }
 
 #[cfg(test)]
