@@ -67,42 +67,75 @@ fn inner_match(pattern: impl AsRef<str>, name: impl AsRef<str>, simple: bool) ->
     if pattern == "*" {
         return true;
     }
+    if !pattern.as_bytes().iter().any(|&c| c == b'*' || c == b'?') {
+        return pattern == name;
+    }
+    if let Some((prefix, suffix)) = pattern.split_once('*')
+        && !suffix.contains('*')
+        && !pattern.contains('?')
+    {
+        return name.len() >= prefix.len() + suffix.len() && name.starts_with(prefix) && name.ends_with(suffix);
+    }
 
     deep_match(pattern.as_bytes(), name.as_bytes(), simple)
 }
 
-fn deep_match(mut pattern: &[u8], mut name: &[u8], simple: bool) -> bool {
-    while !pattern.is_empty() {
-        match pattern[0] {
-            b'?' => {
-                if name.is_empty() {
-                    return simple;
-                }
-            }
+fn deep_match(pattern: &[u8], name: &[u8], simple: bool) -> bool {
+    // One DP row holds whether each name suffix matches the pattern suffix.
+    // This bounds wildcard matching even when several '*' consume the same bytes.
+    let mut matches = vec![false; name.len() + 1];
+    matches[name.len()] = true;
 
+    for &token in pattern.iter().rev() {
+        match token {
             b'*' => {
-                return pattern.len() == 1
-                    || deep_match(&pattern[1..], name, simple)
-                    || (!name.is_empty() && deep_match(pattern, &name[1..], simple));
-            }
-
-            _ => {
-                if name.is_empty() || name[0] != pattern[0] {
-                    return false;
+                for i in (0..name.len()).rev() {
+                    matches[i] |= matches[i + 1];
                 }
+            }
+            b'?' => {
+                for i in 0..name.len() {
+                    matches[i] = matches[i + 1];
+                }
+                // Preserve the existing simple-match behavior for exhausted names.
+                matches[name.len()] = simple;
+            }
+            literal => {
+                for i in 0..name.len() {
+                    matches[i] = name[i] == literal && matches[i + 1];
+                }
+                matches[name.len()] = false;
             }
         }
-
-        name = &name[1..];
-        pattern = &pattern[1..];
     }
-
-    name.is_empty() && pattern.is_empty()
+    matches[0]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{is_match, is_match_as_pattern_prefix, is_simple_match};
+
+    #[test]
+    fn test_many_wildcards_with_long_resource_keys() {
+        let prefix = format!("arn:aws:s3:::test/{}", "a/".repeat(500));
+        let pattern = "arn:aws:s3:::test/*/*/*/*/file.txt";
+        assert!(!is_match(pattern, format!("{prefix}missing.txt")));
+        assert!(is_match(pattern, format!("{prefix}file.txt")));
+    }
+
+    #[test]
+    fn test_simple_match_preserves_exhausted_name_semantics() {
+        assert!(is_simple_match("*?*a", "a"));
+        assert!(!is_match("*?*a", "a"));
+        assert!(is_simple_match("abc?remaining", "abc"));
+        assert!(!is_match("abc?remaining", "abc"));
+    }
+
+    #[test]
+    fn test_question_mark_matches_bytes_not_unicode_scalars() {
+        assert!(!is_match("prefix?", "prefix界"));
+        assert!(is_match("prefix???", "prefix界"));
+    }
 
     #[test_case::test_case("*", "s3:GetObject" => true ; "1")]
     #[test_case::test_case("", "s3:GetObject" => false ; "2")]
