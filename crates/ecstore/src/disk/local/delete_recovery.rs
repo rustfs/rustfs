@@ -3304,6 +3304,8 @@ impl LocalDisk {
                         os::record_native_publication(&receipt_path);
                         reserve
                             .retry_after_enospc(|| {
+                                #[cfg(test)]
+                                preparation_io_fault::run(&receipt_path)?;
                                 link_child_files(
                                     rollback_dir_fd.as_deref(),
                                     PREPARED,
