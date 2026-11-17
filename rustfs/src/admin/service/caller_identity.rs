@@ -264,6 +264,14 @@ impl CallerIdentity {
             Some(denial) => Err(s3::error(S3ErrorCode::InvalidRequest, denial.message())),
         }
     }
+
+    pub(crate) fn ensure_active_mfa_parent(&self, parent: Option<&Credentials>) -> S3Result<()> {
+        if parent.is_some_and(|p| p.access_key == self.access_key && p.is_valid() && !p.is_temp() && !p.is_service_account()) {
+            Ok(())
+        } else {
+            Err(s3::error(S3ErrorCode::AccessDenied, "an active IAM parent is required"))
+        }
+    }
 }
 
 /// Whether the session was minted by an external identity provider.
@@ -328,6 +336,16 @@ mod tests {
             claims: Some(claims),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sts_mfa_requires_active_regular_parent() {
+        let caller = CallerIdentity::from_credentials(sts_session("temporary", "parent"), false);
+        let mut parent = long_term("parent");
+        assert!(caller.ensure_active_mfa_parent(Some(&parent)).is_ok());
+        parent.status = "off".to_owned();
+        assert!(caller.ensure_active_mfa_parent(Some(&parent)).is_err());
+        assert!(caller.ensure_active_mfa_parent(None).is_err());
     }
 
     #[test]
