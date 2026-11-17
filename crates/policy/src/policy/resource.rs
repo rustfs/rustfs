@@ -186,6 +186,14 @@ fn resource_tokens_match(pattern: &[ResourceToken], name: &str, wildcard: bool) 
                     star = Some((p, n));
                     p += 1;
                 }
+                Some(ResourceToken::Star) if name[n] == b'*' => {
+                    p += 1;
+                    n += 1;
+                }
+                Some(ResourceToken::Any) if name[n] == b'?' => {
+                    p += 1;
+                    n += 1;
+                }
                 _ => {
                     let Some((star_pattern, star_name)) = star else { return false };
                     n = star_name + 1;
@@ -226,7 +234,12 @@ fn resource_tokens_match(pattern: &[ResourceToken], name: &str, wildcard: bool) 
                     }
                 }
             }
-            ResourceToken::Star | ResourceToken::Any => return false,
+            ResourceToken::Star | ResourceToken::Any => {
+                let byte = if matches!(token, ResourceToken::Star) { b'*' } else { b'?' };
+                for (pos, &matched) in reachable[..name.len()].iter().enumerate() {
+                    next[pos + 1] = matched && name[pos] == byte;
+                }
+            }
         }
         if !next.iter().any(|&matched| matched) {
             return false;
@@ -506,6 +519,12 @@ mod tests {
         let resource = Resource::S3("bucket/${aws:username}/${aws:username}/*".to_owned());
         assert!(resource.is_match("bucket/user-32/user-31/object", &conditions).await);
         assert!(!resource.is_match("bucket/user-32/not-listed/object", &conditions).await);
+    }
+
+    #[tokio::test]
+    async fn directory_exact_match_preserves_literal_wildcard_compatibility() {
+        let resource = Resource::S3("bucket/name?".to_owned());
+        assert!(resource.is_match("bucket/name?/", &HashMap::new()).await);
     }
 
     #[test]
