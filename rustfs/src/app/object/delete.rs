@@ -31,14 +31,17 @@ use std::collections::{BTreeMap, HashSet};
 
 const EVENT_DELETE_OBJECTS_STORAGE_RESULT: &str = "delete_objects_storage_result";
 
+// Keep the all-or-nothing authorization pass bounded even for deep version histories.
+const MAX_RECURSIVE_DELETE_VERSIONS: usize = 16_384;
+
 async fn authorize_recursive_delete(
     envelope: &mut RequestEnvelope,
     store: &Arc<ECStore>,
     bucket: &str,
     prefix: &str,
-    versioned: bool,
+    versioned_bucket: bool,
     replica: bool,
-) -> rustfs_s3_types::S3Result<()> {
+) -> S3Result<Vec<(String, Uuid)>> {
     let original_info = req_info_ref(envelope)?.clone();
     let descendant_prefix = if prefix.ends_with('/') {
         prefix.to_owned()
@@ -46,6 +49,7 @@ async fn authorize_recursive_delete(
         format!("{prefix}/")
     };
     let result = async {
+        let mut targets = Vec::new();
         let mut marker = None;
         let mut version_marker = None;
         loop {
@@ -60,8 +64,9 @@ async fn authorize_recursive_delete(
                 if object.name != prefix && !object.name.starts_with(&descendant_prefix) {
                     continue;
                 }
+                validate_object_key(&object.name, "DeleteObject")?;
                 let object_version = object.version_id.filter(|version| !version.is_nil());
-                let version_id = (versioned || object_version.is_some())
+                let version_id = (versioned_bucket || object_version.is_some())
                     .then(|| object_version.map_or_else(|| "null".to_owned(), |id| id.to_string()));
                 let info = req_info_mut(envelope)?;
                 info.object = Some(object.name.clone());
@@ -74,9 +79,17 @@ async fn authorize_recursive_delete(
                     authorize_request(envelope, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
                 }
                 validate_table_catalog_object_mutation(bucket, &object.name).await?;
+                // Bound the complete preflight before handing any work to storage.
+                if targets.len() == MAX_RECURSIVE_DELETE_VERSIONS {
+                    return Err(rustfs_s3_types::s3_error!(
+                        InvalidRequest,
+                        "Recursive delete plan is too large; use version-specific DeleteObjects batches"
+                    ));
+                }
+                targets.push((object.name, object_version.unwrap_or_else(Uuid::nil)));
             }
             if !page.is_truncated {
-                return Ok(());
+                return Ok(targets);
             }
             if page.next_marker.is_none() || (marker == page.next_marker && version_marker == page.next_version_idmarker) {
                 return Err(rustfs_s3_types::s3_error!(InternalError, "Recursive delete listing did not advance"));
@@ -1300,8 +1313,16 @@ impl DefaultObjectUsecase {
 
         if let Some(guard) = &recursive_delete_guard {
             opts.add_bucket_lifecycle_lock_guard(guard);
-            authorize_recursive_delete(&mut envelope, &store, &bucket, &key, opts.versioned || opts.version_suspended, replica)
-                .await?;
+            let targets = authorize_recursive_delete(
+                &mut envelope,
+                &store,
+                &bucket,
+                &key,
+                version_cfg.enabled() || version_cfg.suspended(),
+                replica,
+            )
+            .await?;
+            opts.recursive_delete_targets = Some(targets.into());
         }
 
         // let mut vid = opts.version_id.clone();
@@ -1324,7 +1345,13 @@ impl DefaultObjectUsecase {
         validate_undo_delete_version(expected_current_version_id.as_deref(), opts.version_id.as_deref())?;
         opts.expected_current_version_id = expected_current_version_id.clone();
 
-        let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
+        let replicate_force_delete = force_delete
+            && opts
+                .recursive_delete_targets
+                .as_ref()
+                .is_some_and(|targets| !targets.is_empty())
+            && !replica
+            && has_active_delete_rule(&delete_config_snapshot, &key);
         let mut force_delete_intent = None;
 
         // A version purge needs the original marker identity for replication.
