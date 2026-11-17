@@ -1313,6 +1313,8 @@ impl DefaultObjectUsecase {
 
         if let Some(guard) = &recursive_delete_guard {
             opts.add_bucket_lifecycle_lock_guard(guard);
+            // Exclusions on the parent directory must not hide descendant null
+            // versions: this operation permanently removes each planned version.
             let targets = authorize_recursive_delete(
                 &mut envelope,
                 &store,
@@ -1666,6 +1668,83 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recursive_delete_null_versions_require_version_permission_under_excluded_parents() {
+        crate::app::gating_test_env::run_large_stack_test("recursive-delete-null-permissions", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_gateway_types::persistence::PersistedVersioningConfiguration;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let slot = crate::app::runtime_sources::ServerContextSlot::new();
+            assert!(slot.install(Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()))));
+            let bucket = format!("recursive-null-{}", Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store
+                .put_object(
+                    &bucket,
+                    "team/null",
+                    &mut PutObjReader::from_vec(b"null version".to_vec()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("seed a stored null version");
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                    serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":[
+                        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:DeleteObject","Resource":format!("arn:aws:s3:::{bucket}/*")},
+                        {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObjectVersion","Resource":format!("arn:aws:s3:::{bucket}/*")}
+                    ]})).expect("encode policy"),
+                )
+                .await
+                .expect("install null version deletion deny");
+            for status in [None, Some("Enabled"), Some("Suspended")] {
+                let version_cfg = PersistedVersioningConfiguration {
+                    status: status.map(str::to_owned),
+                    exclude_folders: Some(true),
+                    excluded_prefixes: Some(vec![Some("team/".to_owned())]),
+                    ..Default::default()
+                };
+                assert!(!version_cfg.prefix_enabled("team/"));
+                let mut req = build_request((), Method::DELETE);
+                req.extensions.insert(slot.clone());
+                req.extensions.insert(crate::storage::access::ReqInfo {
+                    bucket: Some(bucket.clone()),
+                    object: Some("team/".to_owned()),
+                    ..Default::default()
+                });
+                let mut envelope = RequestEnvelope::from_s3s(&req);
+                let result = authorize_recursive_delete(
+                    &mut envelope,
+                    &store,
+                    &bucket,
+                    "team/",
+                    version_cfg.enabled() || version_cfg.suspended(),
+                    false,
+                )
+                .await;
+                if status.is_some() {
+                    assert_eq!(
+                        result
+                            .expect_err("stored null versions require version deletion authority")
+                            .code(),
+                        &S3ErrorCode::AccessDenied
+                    );
+                } else {
+                    assert_eq!(
+                        result.expect("unversioned DeleteObject remains allowed"),
+                        vec![("team/null".to_owned(), Uuid::nil())]
+                    );
+                }
+                assert_eq!(req_info_ref(&envelope).expect("request info restored").object.as_deref(), Some("team/"));
+            }
+        });
+    }
+
+    #[test]
     fn recursive_replica_delete_checks_each_descendant_delete_permission() {
         crate::app::gating_test_env::run_large_stack_test("recursive-replica-permissions", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -1758,7 +1837,7 @@ mod tests {
                             && !(bypass && denied_action == Some("s3:BypassGovernanceRetention"));
                         let observed = result.map_err(|error| error.code().clone());
                         let matched = match &observed {
-                            Ok(()) => allowed,
+                            Ok(_) => allowed,
                             Err(code) => !allowed && code == &rustfs_s3_types::S3ErrorCode::AccessDenied,
                         };
                         if !matched {
