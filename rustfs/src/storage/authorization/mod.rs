@@ -34,6 +34,7 @@ mod request;
 mod table_data_plane;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
+pub(crate) use conditions::existing_object_tag_conditions;
 #[cfg(test)]
 pub(crate) use conditions::{
     BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, classify_bucket_policy_raw_load_error,
