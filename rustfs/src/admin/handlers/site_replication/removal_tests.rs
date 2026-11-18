@@ -278,12 +278,7 @@ async fn decommission_durable_cleanup_preserves_disk_shared_target_and_cancels_o
     let pool = current_replication_pool_handle().expect("replication pool");
     for arn in [&shared_arn, &orphan_arn] {
         pool.clone()
-            .admit_bucket_resync(replication::ResyncOpts {
-                bucket: bucket.to_string(),
-                arn: arn.clone(),
-                resync_id: format!("run-{arn}"),
-                ..Default::default()
-            })
+            .admit_bucket_resync(replication::resync_opts(bucket, arn.clone(), &format!("run-{arn}"), None))
             .await
             .expect("persist resync intent");
     }

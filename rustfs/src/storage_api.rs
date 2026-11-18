@@ -358,7 +358,7 @@ pub(crate) mod connect {
 /// targets, replication-config primitives, and the config-object lock
 /// helpers its state transaction runs on.
 pub(crate) mod site_replication {
-    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, NamespaceLocking};
     pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::{
         format_lifecycle_date, parse_lifecycle_date,
@@ -367,7 +367,6 @@ pub(crate) mod site_replication {
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
     };
     pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
-    pub(crate) use rustfs_storage_api::NamespaceLocking;
 
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::merge_incoming_replication_config;
