@@ -163,6 +163,8 @@ pub(crate) enum GatewayAssemblyError {
 pub(crate) struct GatewayStack {
     service: rustfs_gateway::S3Service,
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+    /// Whether this is the control-plane host, which reads each request's head before the gateway.
+    control_plane: bool,
 }
 
 impl GatewayStack {
@@ -215,6 +217,7 @@ impl GatewayStack {
         Ok(Self {
             service,
             keystone_auth: assembly.keystone_auth,
+            control_plane: false,
         })
     }
 
@@ -267,7 +270,7 @@ impl GatewayStack {
         } else {
             builder
         };
-        let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout));
+        let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout, DEFAULT_MAX_BUFFERED_BODY_BYTES));
         Ok(builder)
     }
 
@@ -278,6 +281,9 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        if self.control_plane {
+            control_plane::attach_head(&mut request);
+        }
         let extensions = request.extensions_mut();
         extensions.remove::<KeystoneEstablished>();
         extensions.remove::<OwnedKeystoneIdentity>();
@@ -333,13 +339,14 @@ fn early_gate(table: OperationTable) -> impl Authorizer {
 ///
 /// No handler runs under a total deadline, object data included: the legacy stack has none, and a
 /// large transfer must not be cut off for its duration. A committed answer is not bounded either.
-/// The request body keeps RustFS's own idle bound and no throughput floor.
-fn service_config(body_read_timeout: Duration) -> ServiceConfig {
+/// The request body keeps RustFS's own idle bound and no throughput floor, and at most
+/// `max_buffered_body_bytes` of it is held.
+fn service_config(body_read_timeout: Duration, max_buffered_body_bytes: u64) -> ServiceConfig {
     let handlers = HandlerDeadlineConfig::default()
         .without_deadline(HandlerDeadlineClass::Standard)
         .without_deadline(HandlerDeadlineClass::Extended)
         .without_commit_progress_deadline();
-    ServiceConfig::new(DEFAULT_MAX_BUFFERED_BODY_BYTES)
+    ServiceConfig::new(max_buffered_body_bytes)
         .with_handler_deadlines(handlers)
         .with_request_body_deadlines(body_deadlines(body_read_timeout))
 }

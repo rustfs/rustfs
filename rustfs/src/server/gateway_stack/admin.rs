@@ -153,6 +153,7 @@ pub(super) fn assemble(
     Ok(GatewayStack {
         service,
         keystone_auth: assembly.keystone_auth,
+        control_plane: false,
     })
 }
 

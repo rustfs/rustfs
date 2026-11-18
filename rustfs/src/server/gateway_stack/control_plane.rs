@@ -14,9 +14,10 @@
 
 //! The control-plane host: every route the admin router claims, served on the gateway stack.
 //!
-//! Responsible for: [`assemble`], a gateway service whose dialect hands each claimed request,
-//! once its signature is verified, to the admin router's own access rule and route table
-//! (`S3Router::admit` and `S3Router::dispatch`) — the admin, table-catalog and profiling prefixes
+//! Responsible for: [`assemble`], a gateway service that decides each claimed request, once its
+//! signature is verified and before any of its body is read, by the admin router's own access rule
+//! (`S3Router::admit`), and then answers it by the router's route table (`dispatch`), holding at
+//! most legacy RustFS's 1 MiB of its body — the admin, table-catalog and profiling prefixes
 //! as one claimed operation, the STS form at `/`, and the query-discriminated extension and
 //! Object Lambda rows the gateway's RustFS dialect declares.
 //! NOT responsible for: which requests reach it (`server/stack.rs`), any access decision or route
@@ -31,11 +32,12 @@ use crate::runtime_sources::ServerContextSlot;
 use crate::server::gateway_handlers::handler_error;
 use crate::storage_api::server::http::access::{ReqInfo, VerifiedSignature};
 use bytes::Bytes;
+use http::{HeaderMap, Method, Request, Uri};
 use http_body::Body as _;
-use rustfs_gateway::OperationFloor;
 use rustfs_gateway::sig::SigService;
 use rustfs_gateway::{
-    Decision, Handler, HandlerResult, OWNED_RESPONSE_HEADERS, Operation, Req, Resp, SigV4Authenticator, decide_with,
+    Authorizer, AuthzRequest, BoxFuture, Decision, Handler, HandlerError, HandlerResult, InputAuthzRequest, InputDecisions,
+    OWNED_RESPONSE_HEADERS, Operation, OperationFloor, Req, RequestContext as AuthzContext, Resp, SigV4Authenticator,
 };
 use rustfs_gateway_adapter::{IamKeyLookup, RootSource};
 use rustfs_gateway_core::codec::{CodecError, EncodedResponse, MetaView, OperationCodec, RequestBody, RequestBodyMode};
@@ -111,9 +113,13 @@ static SPEC: OperationSpec = OperationSpec::builder(NAME, 200, None)
 static FLOOR: OperationFloor =
     OperationFloor::builtin_presigned(NAME, SigService::S3).allow_anonymous_after_listing_in_the_posture_report();
 
-/// Every claimed admin request, its body buffered: legacy RustFS bounds a claimed route's body at
-/// 1 MiB, which the RustFS profile's claimed-route ceiling repeats, and a handler that answers
-/// without reading its body must not leave the gateway a body it never finished.
+/// Legacy RustFS's ceiling on a claimed route's body (`custom_route_max_body_size`, which RustFS
+/// leaves at its 1 MiB default). The RustFS profile refuses a longer declared `Content-Length`
+/// before the access rule; this host holds no more of an undeclared one either.
+const CLAIMED_ROUTE_BODY_BYTES: u64 = 1024 * 1024;
+
+/// Every claimed admin request, its body buffered up to [`CLAIMED_ROUTE_BODY_BYTES`]: a handler
+/// that answers without reading its body must not leave the gateway a body it never finished.
 #[derive(Debug)]
 pub(super) struct ControlPlane;
 
@@ -271,17 +277,9 @@ pub(super) fn assemble(
     root: Arc<dyn RootSource>,
     router: Arc<S3Router<AdminOperation>>,
 ) -> Result<GatewayStack, GatewayAssemblyError> {
-    // Every decision is `S3Router::admit`'s. A claimed request no row of this host takes — a
-    // console path while the console is off, a health path while the probe is off — routes to an
-    // operation with no handler here: a signed one is answered `501`, as the legacy route table
-    // answers it, and an anonymous one is refused.
-    let gate = decide_with(|request| {
-        if [NAME, STS_NAME].contains(&request.operation) || BORROWED.contains(&request.operation) || request.identity.is_some() {
-            Decision::Allow
-        } else {
-            Decision::Deny
-        }
-    });
+    let gate = Admission {
+        router: Arc::clone(&router),
+    };
     // Admin handlers read the caller's secret as the legacy stack hands it to every custom route:
     // the MinIO alias seals bodies with it and Object Lambda presigns its source URL with it.
     let authenticator = |authenticator: SigV4Authenticator| {
@@ -293,7 +291,9 @@ pub(super) fn assemble(
         router,
         server_ctx: Arc::clone(&assembly.server_ctx),
     });
-    let service = GatewayStack::configured_builder(&assembly, iam, root, gate, authenticator)?
+    let (builder, _settings) = GatewayStack::configured_builder(&assembly, iam, root, gate, authenticator)?
+        .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    let service = builder
         .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
         .dialect(&dialect()?)
         .register::<ControlPlane, _>(Arc::clone(&host))
@@ -311,7 +311,111 @@ pub(super) fn assemble(
     Ok(GatewayStack {
         service,
         keystone_auth: assembly.keystone_auth,
+        control_plane: true,
     })
+}
+
+/// The head of a claimed request as the transport handed it over, which the access rule reads.
+#[derive(Clone)]
+struct ClaimedHead {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    /// Whether the request carried more than one `Authorization` line, which [`attach_head`]
+    /// removed before the gateway read the request.
+    repeated_authorization: bool,
+}
+
+/// Attaches the head of `request` for the access rule, before the gateway reads anything.
+///
+/// Legacy RustFS reads a request with more than one `Authorization` line as presenting no
+/// signature, so its access rule answers it as an anonymous one; the gateway refuses such a head
+/// at the wire before any rule runs. The lines are removed, so the gateway reads the request as
+/// anonymous, and [`Admission`] refuses it in every case: with the rule's own refusal of an
+/// anonymous caller, or, where the rule would admit one, without serving it as anonymous.
+pub(super) fn attach_head<B>(request: &mut Request<B>) {
+    let repeated_authorization = request.headers().get_all(http::header::AUTHORIZATION).iter().nth(1).is_some();
+    let head = ClaimedHead {
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        headers: request.headers().clone(),
+        repeated_authorization,
+    };
+    if repeated_authorization {
+        request.headers_mut().remove(http::header::AUTHORIZATION);
+    }
+    request.extensions_mut().insert(head);
+}
+
+/// The host's authorizer: `S3Router::admit` decides every operation the host serves at the route
+/// stage, before the body is read. A claimed request no row of this host takes — a console path
+/// while the console is off, a health path while the probe is off — routes to an operation with no
+/// handler here: a signed one is answered `501`, as the legacy route table answers it, and an
+/// anonymous one is refused.
+struct Admission {
+    router: Arc<S3Router<AdminOperation>>,
+}
+
+/// Whether this host has a handler for `operation`.
+fn served(operation: &str) -> bool {
+    [NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation)
+}
+
+/// The decision once the rule has admitted a request: a served operation, or any signed request,
+/// goes on to its handler.
+fn routed(request: &AuthzRequest<'_>) -> Decision {
+    if served(request.operation) || request.identity.is_some() {
+        Decision::Allow
+    } else {
+        Decision::Deny
+    }
+}
+
+impl Admission {
+    fn route(&self, context: &AuthzContext<'_>, request: &AuthzRequest<'_>) -> Result<Decision, HandlerError> {
+        if !served(request.operation) {
+            return Ok(routed(request));
+        }
+        let head = context
+            .server_extensions()
+            .get::<ClaimedHead>()
+            .ok_or_else(|| handler_error(s3_error!(InternalError, "the claimed request head was not attached")))?;
+        let signed = request.identity.is_some() && !head.repeated_authorization;
+        self.router
+            .admit(&head.method, &head.uri, &head.headers, signed)
+            .map_err(handler_error)?;
+        Ok(if head.repeated_authorization {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        })
+    }
+}
+
+impl Authorizer for Admission {
+    fn authorize_route<'a>(&'a self, context: &'a AuthzContext<'a>, request: &'a AuthzRequest<'a>) -> BoxFuture<'a, Decision> {
+        let decision = self.route(context, request).unwrap_or(Decision::Deny);
+        Box::pin(async move { decision })
+    }
+
+    fn authorize_route_result<'a>(
+        &'a self,
+        context: &'a AuthzContext<'a>,
+        request: &'a AuthzRequest<'a>,
+    ) -> BoxFuture<'a, Result<Decision, HandlerError>> {
+        let decision = self.route(context, request);
+        Box::pin(async move { decision })
+    }
+
+    fn authorize_input<'a>(
+        &'a self,
+        _context: &'a AuthzContext<'a>,
+        request: &'a InputAuthzRequest<'a>,
+    ) -> BoxFuture<'a, InputDecisions> {
+        let stage = routed(request.route());
+        let decisions = request.decide_all(stage, |_| stage);
+        Box::pin(async move { decisions })
+    }
 }
 
 /// The admin router behind every operation of the host, and the server its requests run on.
@@ -350,9 +454,7 @@ where
         if let Some(info) = request.context().transport_extensions().get::<ReqInfo>() {
             envelope.install_req_info(info.clone());
         }
-        router
-            .admit(envelope.method(), envelope.uri(), envelope.headers(), envelope.credentials().is_some())
-            .map_err(handler_error)?;
+        // `Admission` ran `S3Router::admit` on this request before its body was read.
         let body = request.into_input().into_admin_body();
         let response = match object_lambda_target(envelope.method(), envelope.uri()) {
             Some((bucket, object)) => serve_object_lambda(envelope, &bucket, &object).await,

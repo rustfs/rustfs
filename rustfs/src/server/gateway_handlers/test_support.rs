@@ -65,6 +65,22 @@ pub(crate) fn signed_request_with_headers(
     query: &str,
     access_key: &str,
     secret_key: &str,
+    headers: HeaderMap,
+) -> Request<Empty<Bytes>> {
+    signed_session_request(form, method, path, query, access_key, secret_key, None, headers)
+}
+
+/// As [`signed_request_with_headers`], for a session whose token the signer places where the
+/// signature travels: the `X-Amz-Security-Token` header or query parameter.
+#[allow(clippy::too_many_arguments)] // A test fixture naming every signing input.
+pub(crate) fn signed_session_request(
+    form: Signed,
+    method: Method,
+    path: &str,
+    query: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
     mut headers: HeaderMap,
 ) -> Request<Empty<Bytes>> {
     headers
@@ -79,7 +95,10 @@ pub(crate) fn signed_request_with_headers(
     let accepted = WireRequest::accept(probe, &Limits::default()).expect("an acceptable host");
     let stamp = AmzDate::parse(&chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()).expect("a stamp");
     let scope = SigningScope::new(stamp.day(), "us-east-1", SigService::S3).expect("a scope");
-    let credentials = SigningCredentials::new(access_key, secret_key.as_bytes()).expect("credentials");
+    let mut credentials = SigningCredentials::new(access_key, secret_key.as_bytes()).expect("credentials");
+    if let Some(token) = session_token {
+        credentials = credentials.with_session_token(rustfs_gateway::SessionToken::new(token).expect("a session token"));
+    }
     let mut signer = SigV4Signer::new(credentials, scope);
     let signing = SigningRequest::new(
         &method,
@@ -147,4 +166,47 @@ pub(crate) fn signed_body_request(
         builder = builder.header(name, value);
     }
     builder.body(http_body_util::Full::new(body)).expect("a request")
+}
+
+/// A body of `total` bytes in 64 KiB frames that declares no length, counting every byte a reader
+/// has taken from it: what a `Transfer-Encoding: chunked` upload looks like to the stacks.
+pub(crate) struct CountedBody {
+    left: usize,
+    taken: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountedBody {
+    /// A body of `total` bytes, and the counter of the bytes read from it.
+    pub(crate) fn new(total: usize) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Self {
+                left: total,
+                taken: std::sync::Arc::clone(&taken),
+            },
+            taken,
+        )
+    }
+}
+
+impl http_body::Body for CountedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        if self.left == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        let frame = self.left.min(64 * 1024);
+        self.left -= frame;
+        self.taken.fetch_add(frame, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from(vec![b'a'; frame])))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.left == 0
+    }
 }
