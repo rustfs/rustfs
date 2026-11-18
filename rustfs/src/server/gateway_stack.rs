@@ -226,6 +226,9 @@ impl GatewayStack {
         let credentials = Arc::new(IamCredentials::new(iam, root));
         let builder = ServiceBuilder::new()
             .rustfs_profile()
+            // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
+            // the refusal once authorization succeeds.
+            .defer_encryption_header_refusals_to_handlers()
             // Keep the profile's inner drain aligned with the host's configured idle bound.
             .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
             .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())

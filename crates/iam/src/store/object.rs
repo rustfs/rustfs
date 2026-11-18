@@ -143,7 +143,6 @@ const SVC_ACC_LIST_KEY: &str = "service-accounts/";
 const GROUPS_LIST_KEY: &str = "groups/";
 const POLICIES_LIST_KEY: &str = "policies/";
 const STS_LIST_KEY: &str = "sts/";
-const POLICY_DB_PREFIX: &str = "policydb/";
 const POLICY_DB_USERS_LIST_KEY: &str = "policydb/users/";
 const POLICY_DB_STS_USERS_LIST_KEY: &str = "policydb/sts-users/";
 const POLICY_DB_GROUPS_LIST_KEY: &str = "policydb/groups/";
@@ -172,17 +171,6 @@ struct LazyRewriteEntry {
 
 static IAM_LAZY_REWRITE_TRACKER: LazyLock<Mutex<HashMap<String, LazyRewriteEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-// split_path splits a path into a top-level directory and a child item. The
-// parent directory retains the trailing slash.
-fn split_path(s: &str, last_index: bool) -> (&str, &str) {
-    let i = if last_index { s.rfind('/') } else { s.find('/') };
-
-    match i {
-        Some(index) => (&s[..index + 1], &s[index + 1..]),
-        None => (s, ""),
-    }
-}
 
 /// Attempts to decrypt an at-rest IAM config blob using the same key sources as
 /// the IAM load path: the RustFS master keys (`RUSTFS_IAM_MASTER_KEY[_OLD_KEYS]`)
@@ -490,36 +478,41 @@ impl ObjectStore {
 
     #[hotpath::measure]
     async fn list_all_iamconfig_items(&self) -> Result<HashMap<String, Vec<String>>> {
-        let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
-
-        let ctx = CancellationToken::new();
-
-        self.list_iam_config_items(format!("{}/", *IAM_CONFIG_PREFIX).as_str(), ctx.clone(), tx)
-            .await;
-
         let mut res = HashMap::new();
+        let ctx = CancellationToken::new();
+        // Walk only cache partitions. Other children of config/iam (notably
+        // plugin delegations) have independent lifetimes and cardinalities.
+        for key in [
+            USERS_LIST_KEY,
+            GROUPS_LIST_KEY,
+            POLICIES_LIST_KEY,
+            SVC_ACC_LIST_KEY,
+            STS_LIST_KEY,
+            POLICY_DB_USERS_LIST_KEY,
+            POLICY_DB_GROUPS_LIST_KEY,
+            POLICY_DB_STS_USERS_LIST_KEY,
+        ] {
+            let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
+            self.list_iam_config_items(&format!("{}/{key}", *IAM_CONFIG_PREFIX), ctx.clone(), tx)
+                .await;
+            while let Some(v) = rx.recv().await {
+                if let Some(err) = v.err {
+                    warn!(
+                        path_kind = "iam_config",
+                        operation = "list_items",
+                        reason = "walk_result",
+                        error = %err,
+                        "system path list failed"
+                    );
+                    record_system_path_failure("iam_config", "list_items", "walk_result");
+                    ctx.cancel();
 
-        while let Some(v) = rx.recv().await {
-            if let Some(err) = v.err {
-                warn!(
-                    path_kind = "iam_config",
-                    operation = "list_items",
-                    reason = "walk_result",
-                    error = %err,
-                    "system path list failed"
-                );
-                record_system_path_failure("iam_config", "list_items", "walk_result");
-                ctx.cancel();
+                    return Err(err);
+                }
 
-                return Err(err);
-            }
-
-            if let Some(item) = v.item {
-                let last_index = item.starts_with(POLICY_DB_PREFIX);
-                let (list_key, trimmed_item) = split_path(&item, last_index);
-                res.entry(list_key.to_owned())
-                    .or_insert_with(Vec::new)
-                    .push(trimmed_item.to_owned());
+                if let Some(item) = v.item {
+                    res.entry(key.to_owned()).or_insert_with(Vec::new).push(item);
+                }
             }
         }
 
@@ -1413,6 +1406,12 @@ mod tests {
                     )
                     .await;
                     let store = ObjectStore::new(env.ecstore);
+                    store
+                        .save_iam_config("fixture", "config/iam/plugin-delegations/v1/fixture")
+                        .await
+                        .expect("seed unrelated partition");
+                    let listed = store.list_all_iamconfig_items().await.expect("list IAM partitions");
+                    assert!(!listed.contains_key("plugin-delegations/"));
                     store
                         .save_group_info("reload-group", GroupInfo::new(vec!["reload-user".to_string()]))
                         .await

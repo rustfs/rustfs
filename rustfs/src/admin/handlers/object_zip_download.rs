@@ -147,6 +147,7 @@ struct ObjectZipDownloadTokenPayload {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ObjectZipDownloadReqInfoSnapshot {
+    session_present: bool,
     cred: Option<rustfs_credentials::Credentials>,
     is_owner: bool,
     bucket: Option<String>,
@@ -187,12 +188,16 @@ struct PreparedZipArchive {
 impl From<&ReqInfo> for ObjectZipDownloadReqInfoSnapshot {
     fn from(req_info: &ReqInfo) -> Self {
         let mut cred = req_info.cred.clone();
+        let session_present = req_info
+            .keystone_session_present
+            .unwrap_or_else(|| cred.as_ref().is_some_and(|cred| !cred.session_token.is_empty()));
         if let Some(cred) = cred.as_mut() {
             cred.secret_key.clear();
             cred.session_token.clear();
         }
 
         Self {
+            session_present,
             cred,
             is_owner: req_info.is_owner,
             bucket: req_info.bucket.clone(),
@@ -207,12 +212,12 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
         Self {
             cred: snapshot.cred,
             is_owner: snapshot.is_owner,
-            keystone_session_present: None,
+            keystone_session_present: Some(snapshot.session_present),
             bucket: snapshot.bucket,
             object: snapshot.object,
             version_id: snapshot.version_id,
             replication_request_authorized: false,
-            region: current_region(),
+            region: current_region().map(Into::into),
             request_context: None,
             suppress_denial_log: false,
             suppress_denial_audit: false,
@@ -382,7 +387,14 @@ fn validate_download_token(
     }
     let expires_at = OffsetDateTime::from_unix_timestamp(payload.expires_at_unix)
         .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
-    if expires_at <= now {
+    if expires_at <= now
+        || payload
+            .req_info
+            .cred
+            .as_ref()
+            .and_then(|cred| cred.expiration)
+            .is_some_and(|expiration| expiration <= now)
+    {
         return Err(s3_error!(AccessDenied, "invalid or expired download token"));
     }
 
@@ -417,7 +429,7 @@ async fn authenticate_object_zip_download_request(req: &mut AdminRequest) -> S3R
     req.install_req_info(ReqInfo {
         cred: Some(cred),
         is_owner: owner,
-        region: current_region(),
+        region: current_region().map(Into::into),
         request_context,
         ..Default::default()
     });
@@ -446,15 +458,9 @@ fn authenticated_zip_download_principal(req: &AdminRequest) -> S3Result<String> 
 }
 
 fn authenticated_zip_download_req_info(req: &AdminRequest) -> S3Result<ReqInfo> {
-    let mut req_info = req
-        .req_info()
+    req.req_info()
         .cloned()
-        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
-    if let Some(cred) = req_info.cred.as_mut() {
-        cred.secret_key.clear();
-        cred.session_token.clear();
-    }
-    Ok(req_info)
+        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))
 }
 
 fn authenticated_zip_download_auth_context(req: &AdminRequest) -> ObjectZipDownloadAuthContext {
@@ -1328,6 +1334,8 @@ mod tests {
         let record =
             validate_download_token(&created.id, &created.token, now, &credentials).expect("matching token should be accepted");
 
+        assert_eq!(record.req_info.keystone_session_present, Some(true));
+        assert!(record.req_info.cred.as_ref().expect("credential").session_token.is_empty());
         assert_eq!(record.id, created.id);
         assert_eq!(record.principal, "alice");
         assert_eq!(record.request.bucket, "photos");
@@ -1680,14 +1688,13 @@ mod tests {
     }
 
     fn test_req_info() -> ReqInfo {
-        let mut credentials = rustfs_credentials::Credentials {
+        let credentials = rustfs_credentials::Credentials {
             access_key: "alice".to_string(),
             secret_key: "should-not-be-serialized".to_string(),
             session_token: "should-not-be-serialized".to_string(),
             ..Default::default()
         };
-        credentials.secret_key.clear();
-        credentials.session_token.clear();
+
         ReqInfo {
             cred: Some(credentials),
             is_owner: false,
@@ -1696,7 +1703,7 @@ mod tests {
             object: None,
             version_id: None,
             replication_request_authorized: false,
-            region: current_region(),
+            region: current_region().map(Into::into),
             request_context: None,
             suppress_denial_log: false,
             suppress_denial_audit: false,

@@ -13,11 +13,9 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
     fs::Metadata,
     path::{Path, PathBuf},
-    sync::Mutex,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{fs::File, io};
 
@@ -239,72 +237,21 @@ pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()
     std::fs::rename(from, to)
 }
 
-// Bucket existence cache - reduces statx syscalls for repeated bucket checks
-
-/// Cache for bucket directory existence checks.
-struct BucketExistenceCache {
-    cache: Mutex<HashMap<PathBuf, (Instant, bool)>>,
-    ttl: Duration,
-}
-
-impl BucketExistenceCache {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
-            ttl,
-        }
-    }
-
-    fn check_exists(&self, path: &Path) -> Option<bool> {
-        let mut cache = self.cache.lock().ok()?;
-        if let Some((timestamp, exists)) = cache.get(path) {
-            if timestamp.elapsed() < self.ttl {
-                return Some(*exists);
-            }
-            cache.remove(path);
-        }
-        None
-    }
-
-    fn record(&self, path: PathBuf, exists: bool) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(path, (Instant::now(), exists));
-        }
-    }
-
-    fn invalidate(&self, path: &Path) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.remove(path);
-        }
-    }
-}
-
-static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
-    std::sync::LazyLock::new(|| BucketExistenceCache::new(Duration::from_secs(60)));
+// Only successful probes are cached. A missed bucket can be created at any time.
+static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<moka::sync::Cache<PathBuf, ()>> = std::sync::LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(4096)
+        .time_to_live(Duration::from_secs(60))
+        .build()
+});
 
 /// Cached access check - reduces statx syscalls
 pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
-
-    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(path) {
-        if exists {
-            return Ok(());
-        }
-        return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
+    if BUCKET_EXISTENCE_CACHE.get(path).is_none() {
+        access(path).await?;
+        BUCKET_EXISTENCE_CACHE.insert(path.to_owned(), ());
     }
-
-    let path_buf = path.to_path_buf();
-    let result = access(&path_buf).await;
-
-    match &result {
-        Ok(_) => BUCKET_EXISTENCE_CACHE.record(path_buf, true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            BUCKET_EXISTENCE_CACHE.record(path_buf, false);
-        }
-        _ => {}
-    }
-
-    result?;
     Ok(())
 }
 
@@ -318,6 +265,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn bucket_creation_is_visible_after_a_cache_miss() {
+        let root = TempDir::new().expect("bucket root");
+        let path = root.path().join("bucket");
+        assert_eq!(cached_access(&path).await.expect_err("not created yet").kind(), io::ErrorKind::NotFound);
+        tokio::fs::create_dir(&path).await.expect("create bucket");
+        cached_access(&path).await.expect("new bucket visible");
+    }
 
     #[test]
     fn cancelled_filesystem_jobs_retain_physical_resources() {

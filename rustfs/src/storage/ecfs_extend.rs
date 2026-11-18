@@ -62,7 +62,12 @@ fn format_object_lock_timestamp(timestamp: OffsetDateTime) -> String {
 }
 
 fn has_object_lock_retention_metadata(metadata: &HashMap<String, String>) -> bool {
-    metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+    matches!(
+        metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+        Some("GOVERNANCE" | "COMPLIANCE")
+    ) && metadata
+        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+        .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok())
 }
 
 pub(crate) fn remove_object_lock_retention_metadata(metadata: &mut HashMap<String, String>) -> bool {
@@ -444,6 +449,12 @@ pub(crate) fn parse_object_lock_retention_native(
     let mut eval_metadata = HashMap::new();
 
     if let Some(v) = retention {
+        if v.mode.is_some() != v.retain_until.is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::MalformedXML,
+                "Retention requires both Mode and RetainUntilDate".to_string(),
+            ));
+        }
         let mode = match v.mode {
             Some(mode) => match mode.as_str() {
                 ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
@@ -500,20 +511,16 @@ pub(crate) fn parse_object_lock_legal_hold_native(
 ) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
-        let status = match v.0 {
-            Some(status) => match status.as_str() {
-                ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
-                _ => {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::MalformedXML,
-                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
-                    ));
-                }
-            },
-            None => String::default(),
+        let status = match v.0.as_deref() {
+            Some(status @ (ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON)) => status.to_owned(),
+            _ => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::MalformedXML,
+                    "The XML you provided was not well-formed or did not validate against our published schema",
+                ));
+            }
         };
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         insert_str(
             &mut eval_metadata,

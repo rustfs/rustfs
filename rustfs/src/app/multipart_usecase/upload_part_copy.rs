@@ -252,6 +252,7 @@ impl DefaultMultipartUsecase {
             .into());
         }
         let mut dst_opts = ObjectOptions {
+            multipart_copy_source_locked: true,
             expected_bucket_incarnation_id: Some(current_destination_incarnation_id),
             ..Default::default()
         };
