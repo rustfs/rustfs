@@ -81,7 +81,3 @@ pub(crate) async fn authorize_get_object_attributes<R: AuthorizationRequest + ?S
     authorize_object_request(req, bucket, key, version_id, Action::S3Action(attributes)).await?;
     authorize_request(req, versioned_read_action(version_id)).await
 }
-
-#[cfg(test)]
-#[path = "object_read_test.rs"]
-mod tests;

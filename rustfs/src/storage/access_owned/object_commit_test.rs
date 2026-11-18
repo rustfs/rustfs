@@ -15,7 +15,7 @@
 //! Parity of the copy-source authorization across both request edges: the same decision and the
 //! same state handed on, for an `S3Request` and for a `RequestEnvelope`, in both directions.
 
-use super::{CopySourceObject, authorize_copy_source};
+use super::access_owned::object_commit::{CopySourceObject, authorize_copy_source};
 use crate::app::{RequestEnvelope, RequestHead};
 use crate::storage::access::tests::{TestKms, UnreadyIam, build_request, ensure_req_info};
 use crate::storage::access::{
@@ -336,9 +336,23 @@ async fn completion_authorization_requires_write_read_and_replication_permission
         let mut envelope = RequestEnvelope::from_s3s(&request);
         for owned in [false, true] {
             let result = if owned {
-                super::authorize_complete_multipart_upload(&mut envelope, &server, &bucket, "object", specific_etag).await
+                super::access_owned::object_commit::authorize_complete_multipart_upload(
+                    &mut envelope,
+                    &server,
+                    &bucket,
+                    "object",
+                    specific_etag,
+                )
+                .await
             } else {
-                super::authorize_complete_multipart_upload(&mut request, &server, &bucket, "object", specific_etag).await
+                super::access_owned::object_commit::authorize_complete_multipart_upload(
+                    &mut request,
+                    &server,
+                    &bucket,
+                    "object",
+                    specific_etag,
+                )
+                .await
             };
             if allowed {
                 result.expect("permitted completion");

@@ -290,7 +290,3 @@ async fn load_copy_source_bucket_generation(
         incarnation_id,
     })
 }
-
-#[cfg(test)]
-#[path = "object_commit_test.rs"]
-mod tests;

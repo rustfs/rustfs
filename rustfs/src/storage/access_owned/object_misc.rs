@@ -92,7 +92,7 @@ pub(crate) async fn authorize_delete_object<R: AuthorizationRequest + ?Sized>(
 /// source-version header), `ForceDeleteObject` for a force delete, the authenticated-caller rule
 /// for a recursive force delete, and `BypassGovernanceRetention` when the header asks for it.
 /// Returns the guard `bucket_generation` becomes.
-async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
+pub(crate) async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     bucket: &str,
     key: &str,
@@ -166,7 +166,3 @@ pub(crate) async fn authorize_select_object_content<R: AuthorizationRequest + ?S
     req_info.object = Some(key.to_owned());
     authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
 }
-
-#[cfg(test)]
-#[path = "object_misc_test.rs"]
-mod tests;

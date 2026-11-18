@@ -312,7 +312,3 @@ async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     req.install_table_list_access(access);
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "listing_multipart_test.rs"]
-mod tests;

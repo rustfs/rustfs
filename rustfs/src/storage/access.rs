@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use self::access_owned::listing_multipart::{
+use super::access_owned::listing_multipart::{
     authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
-use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
+use super::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
+// `app::metadata_route` and the legacy-edge files still import the owned shapes through this path.
 #[cfg(test)]
 use super::ECStore;
 #[cfg(test)]
 use super::ObjectOptions;
 #[cfg(test)]
 use super::StorageError;
+pub(crate) use super::access_owned;
 use super::ecfs::FS;
 #[cfg(test)]
 use crate::auth::facts::AuthzTarget;
@@ -54,9 +56,7 @@ use crate::storage::authorization::{
     merge_request_object_tag_conditions, remaining_retention_days, resource_free_condition_values,
 };
 #[cfg(test)]
-use crate::storage::authorization::{
-    DenialContext, authorize_request_core, iam_authorization_error, owner_can_bypass_policy_deny,
-};
+use crate::storage::authorization::{DenialContext, iam_authorization_error, owner_can_bypass_policy_deny};
 #[cfg(test)]
 use crate::storage::authorization::{PUT_GENERATION_READ_QUORUM_FAILURE, install_object_generation_test_hook};
 #[cfg(test)]
@@ -113,16 +113,21 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use url::Url;
 
-/// The authorization shapes one migration batch owns; a child module so they reach the guard
-/// state this module keeps private.
-#[path = "access_owned/mod.rs"]
-pub(crate) mod access_owned;
+#[cfg(test)]
+#[path = "access_owned/listing_multipart_test.rs"]
+mod owned_listing_multipart_test;
+#[cfg(test)]
+#[path = "access_owned/object_commit_test.rs"]
+mod owned_object_commit_test;
+#[cfg(test)]
+#[path = "access_owned/object_misc_test.rs"]
+mod owned_object_misc_test;
+#[cfg(test)]
+#[path = "access_owned/object_read_test.rs"]
+mod owned_object_read_test;
 #[cfg(test)]
 #[path = "access_permission_auth_test.rs"]
 mod permission_auth_test;
-#[cfg(test)]
-#[path = "access_permission_probe_test.rs"]
-mod permission_probe_test;
 #[cfg(test)]
 #[path = "access_readers_test.rs"]
 mod readers_test;

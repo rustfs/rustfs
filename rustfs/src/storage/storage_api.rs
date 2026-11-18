@@ -152,11 +152,11 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
-    pub(crate) use super::super::access::access_owned;
-    pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
-    pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
-    pub(crate) use super::super::access::access_owned::object_commit::authorize_copy_object_tags;
-    pub(crate) use super::super::access::access_owned::object_read::authorize_get_object;
+    pub(crate) use super::super::access_owned;
+    pub(crate) use super::super::access_owned::bucket_core::requested_bucket_force_delete;
+    pub(crate) use super::super::access_owned::object_commit::CopySourceObject;
+    pub(crate) use super::super::access_owned::object_commit::authorize_copy_object_tags;
+    pub(crate) use super::super::access_owned::object_read::authorize_get_object;
     pub(crate) use super::super::authorization::ObjectTagConditions;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
@@ -194,8 +194,8 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::parity_test_support;
+    pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::authorization::ObjectTagConditions;
     pub(crate) use super::super::authorization::TableDataPlanePublicationGuards;
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;

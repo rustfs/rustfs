@@ -15,7 +15,7 @@
 //! Both request forms through the one decision: the same answer and the same state handed on
 //! (the caller's `ReqInfo` and the guard), allowed and refused.
 
-use super::decide_delete_object;
+use super::access_owned::object_misc::decide_delete_object;
 use crate::app::RequestEnvelope;
 use crate::storage::access::{
     AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, ReqInfo, S3Request,
