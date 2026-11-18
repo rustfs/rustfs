@@ -669,7 +669,7 @@ impl DefaultObjectUsecase {
         // cannot flood the log.
         let mut bulk_denial_logged = false;
         // Per-key denials are audited once per denied action, in aggregate, after the loop.
-        let mut bulk_denials = crate::storage::access::BulkDenialAudit::start_owned(&mut envelope)?;
+        let mut bulk_denials = crate::storage::denial_audit::BulkDenialAudit::start_owned(&mut envelope)?;
         for (idx, obj_id) in objects.iter().enumerate() {
             // Authorization and every storage side effect must address the same
             // normalized object; retain the request key only for response entries.

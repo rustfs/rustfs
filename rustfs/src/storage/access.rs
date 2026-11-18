@@ -2207,51 +2207,6 @@ fn audit_request_denial<R: AuthorizationRequest + ?Sized>(
     req.audit_denial(auditor, &action, reason);
 }
 
-/// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
-///
-/// `start_owned` marks the request so per-key denials are logged but not audited; `finish_owned` clears the
-/// mark and emits one entry per denied action with the number of keys refused for it.
-pub(crate) struct BulkDenialAudit {
-    denied: Vec<(Action, u64)>,
-}
-
-impl BulkDenialAudit {
-    pub(crate) fn start_owned<R: AuthorizationRequest + ?Sized>(request: &mut R) -> S3Result<Self> {
-        req_info_mut(request)?.suppress_denial_audit = true;
-        Ok(Self { denied: Vec::new() })
-    }
-
-    /// Counts one refused key for `action`.
-    pub(crate) fn denied(&mut self, action: Action) {
-        match self.denied.iter_mut().find(|(denied_action, _)| *denied_action == action) {
-            Some((_, count)) => *count += 1,
-            None => self.denied.push((action, 1)),
-        }
-    }
-
-    pub(crate) fn finish_owned<R: AuthorizationRequest + ?Sized>(
-        self,
-        request: &mut R,
-        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
-    ) -> S3Result<()> {
-        self.finish_owned_with(request, audit_view, DenialAuditor::global())
-    }
-
-    fn finish_owned_with<R: AuthorizationRequest + ?Sized>(
-        self,
-        request: &mut R,
-        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
-        auditor: &DenialAuditor,
-    ) -> S3Result<()> {
-        req_info_mut(request)?.suppress_denial_audit = false;
-        let view = audit_view(request);
-        for (action, keys) in self.denied {
-            auditor.audit_owned(&view, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
-        }
-        Ok(())
-    }
-}
-
 /// Authorizes the request based on the action and credentials.
 pub(crate) async fn authorize_request<R: AuthorizationRequest + ?Sized>(req: &mut R, action: Action) -> S3Result<()> {
     // Restore the `x-amz-meta-*` user metadata the SigV4 presigners hoist into
@@ -4431,7 +4386,8 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
-    use super::{BulkDenialAudit, audit_request_denial};
+    use super::audit_request_denial;
+    use crate::storage::denial_audit::BulkDenialAudit;
     use super::{
         PostObjectPolicyHeaders, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectTags, remaining_retention_days,
         requested_bucket_location_constraint, set_post_object_policy_headers, set_requested_object_lock_retain_until,
