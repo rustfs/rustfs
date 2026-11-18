@@ -1599,6 +1599,11 @@ where
         {
             return Err(Error::AccessKeyAlreadyExists);
         }
+        // The access key is a single durable IAM path component. Reject
+        // unrepresentable keys before allocating or waiting on mutation locks.
+        if access_key.contains(['\0', '/', '\\']) || matches!(access_key, "" | "." | "..") {
+            return Err(Error::InvalidArgument);
+        }
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let parent_guard = parent_lock.lock_owned().await;
         let _service_guard = self.cache.service_account_mutation_lock().lock().await;
