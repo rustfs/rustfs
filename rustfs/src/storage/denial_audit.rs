@@ -28,7 +28,7 @@ use crate::storage::helper::{
 use crate::storage::request_context::RequestContext;
 use rustfs_audit::{AuditEntry, global::AuditLogger};
 use rustfs_policy::policy::action::Action;
-use s3s::S3Result;
+use rustfs_s3_types::S3Result;
 use serde_json::Value;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
