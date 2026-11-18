@@ -264,7 +264,7 @@ fn keystone_enabled_requires_an_initialized_provider_and_names_both_settings() {
                 .expect("the provider must be initialized before assembly");
             assert!(matches!(error, GatewayAssemblyError::KeystoneNotInitialized));
             let message = error.to_string();
-            for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE"] {
+            for named in ["gateway stack", "RUSTFS_KEYSTONE_ENABLE"] {
                 assert!(message.contains(named), "{named} is missing from: {message}");
             }
         },

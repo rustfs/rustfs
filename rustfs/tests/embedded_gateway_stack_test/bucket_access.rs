@@ -14,7 +14,7 @@
 
 //! Refusal-matrix rows of migration batch A2 (rustfs/backlog#2765).
 
-use super::{GATEWAY, LEGACY, MatrixRow, Outcome, create_bucket_in_the_store, outcome, refusal, s3_client, with_stack};
+use super::{GATEWAY, MatrixRow, Outcome, create_bucket_in_the_store, outcome, refusal, s3_client, with_stack};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::put_bucket_versioning::{
@@ -226,11 +226,6 @@ fn the_gateway_stack_answers_every_stored_bucket_for_versioning() {
     with_stack(GATEWAY, get_bucket_versioning_answers_every_stored_bucket);
 }
 
-#[test]
-fn the_legacy_stack_answers_every_stored_bucket_for_versioning() {
-    with_stack(LEGACY, get_bucket_versioning_answers_every_stored_bucket);
-}
-
 /// A bucket policy document: refused when there is none, answered verbatim when there is, and
 /// the owner reads it even when the policy denies everyone; policy status follows the document.
 async fn bucket_policy_reads_follow_the_stored_document(server: RustFSServer) {
@@ -287,11 +282,6 @@ fn the_gateway_stack_reads_the_stored_bucket_policy() {
     with_stack(GATEWAY, bucket_policy_reads_follow_the_stored_document);
 }
 
-#[test]
-fn the_legacy_stack_reads_the_stored_bucket_policy() {
-    with_stack(LEGACY, bucket_policy_reads_follow_the_stored_document);
-}
-
 /// GetBucketAcl answers the one owner with full control for any bucket the store holds.
 async fn get_bucket_acl_answers_the_owner_with_full_control(server: RustFSServer) {
     use aws_sdk_s3::types::{Permission, Type};
@@ -324,11 +314,6 @@ async fn get_bucket_acl_answers_the_owner_with_full_control(server: RustFSServer
 #[test]
 fn the_gateway_stack_answers_the_bucket_acl() {
     with_stack(GATEWAY, get_bucket_acl_answers_the_owner_with_full_control);
-}
-
-#[test]
-fn the_legacy_stack_answers_the_bucket_acl() {
-    with_stack(LEGACY, get_bucket_acl_answers_the_owner_with_full_control);
 }
 
 async fn bucket_acl_mutations(server: RustFSServer) {
@@ -402,11 +387,6 @@ fn the_gateway_stack_preserves_bucket_acl_write_behavior() {
     with_stack(GATEWAY, bucket_acl_mutations);
 }
 
-#[test]
-fn the_legacy_stack_preserves_bucket_acl_write_behavior() {
-    with_stack(LEGACY, bucket_acl_mutations);
-}
-
 const QUEUE_NOTIFICATION: &str = r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><QueueConfiguration><Id>a2-queue</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#;
 
 /// GetBucketNotificationConfiguration answers an empty configuration when none is stored, the
@@ -469,11 +449,6 @@ fn the_gateway_stack_answers_the_stored_notification_configuration() {
     with_stack(GATEWAY, get_bucket_notification_answers_the_stored_configuration);
 }
 
-#[test]
-fn the_legacy_stack_answers_the_stored_notification_configuration() {
-    with_stack(LEGACY, get_bucket_notification_answers_the_stored_configuration);
-}
-
 async fn notification_authorization_is_bound_to_the_requested_bucket(server: RustFSServer) {
     const USER: &str = "notification-reader";
     const BUCKET: &str = "notification-allowed";
@@ -530,11 +505,6 @@ async fn notification_authorization_is_bound_to_the_requested_bucket(server: Rus
 #[test]
 fn notification_authorization_binds_the_bucket_on_the_gateway_stack() {
     with_stack(GATEWAY, notification_authorization_is_bound_to_the_requested_bucket);
-}
-
-#[test]
-fn notification_authorization_binds_the_bucket_on_the_legacy_stack() {
-    with_stack(LEGACY, notification_authorization_is_bound_to_the_requested_bucket);
 }
 
 const VERSIONING_ENABLED: &str = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
@@ -697,11 +667,6 @@ async fn versioning_writes_preserve_refusal_order_and_stored_bytes(server: RustF
         .expect("bare versioning status");
     assert_eq!(stored_versioning(OTHER).await, VERSIONING_ENABLED.as_bytes());
     server.shutdown().await;
-}
-
-#[test]
-fn legacy_put_versioning_preserves_refusal_order_and_stored_bytes() {
-    with_stack(LEGACY, versioning_writes_preserve_refusal_order_and_stored_bytes);
 }
 
 #[test]
@@ -920,11 +885,6 @@ async fn notification_writes_preserve_authorization_and_stored_bytes(server: Rus
         assert_eq!(stored_notification(bucket).await, EVENT_BRIDGE_NOTIFICATION.as_bytes());
     }
     server.shutdown().await;
-}
-
-#[test]
-fn legacy_put_notification_preserves_authorization_and_stored_bytes() {
-    with_notification_stack(LEGACY, notification_writes_preserve_authorization_and_stored_bytes);
 }
 
 #[test]

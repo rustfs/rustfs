@@ -19,13 +19,10 @@ use crate::app::RequestEnvelope;
 use crate::app::dto_values;
 use crate::app::storage_api::multipart_usecase::contract::multipart::ListMultipartsInfo;
 pub(crate) use crate::app::storage_api::multipart_usecase::contract::multipart::ListPartsInfo;
-#[cfg(any(feature = "gateway-stack", test))]
 use crate::app::storage_api::multipart_usecase::contract::multipart::ListPartsOwner;
 use rustfs_gateway_types::dto as gateway_dto;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::{BucketName, ObjectKey, RecordedUpload, UploadIdClaim, resolve_upload_async};
 use rustfs_s3_types::S3Result;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 pub(crate) enum ListPartsTarget {
@@ -34,7 +31,6 @@ pub(crate) enum ListPartsTarget {
         key: String,
         upload_id: String,
     },
-    #[cfg(any(feature = "gateway-stack", test))]
     Gateway {
         bucket: BucketName,
         key: ObjectKey,
@@ -46,7 +42,6 @@ impl ListPartsTarget {
     fn resource(&self) -> (&str, &str) {
         match self {
             Self::Legacy { bucket, key, .. } => (bucket, key),
-            #[cfg(any(feature = "gateway-stack", test))]
             Self::Gateway { bucket, key, .. } => (bucket.as_str(), key.as_str()),
         }
     }
@@ -58,13 +53,11 @@ pub(crate) struct ListPartsFields {
     pub(crate) max_parts: Option<i32>,
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 struct RecordedListParts {
     owner: ListPartsOwner,
     page: ListPartsInfo,
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 impl RecordedUpload for RecordedListParts {
     fn bucket(&self) -> &str {
         &self.owner.bucket
@@ -75,7 +68,6 @@ impl RecordedUpload for RecordedListParts {
     }
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 async fn resolve_list_parts<'a, F>(
     upload_id: &'a UploadIdClaim,
     bucket: &BucketName,
@@ -210,7 +202,6 @@ impl DefaultMultipartUsecase {
                 .list_object_parts(bucket, key, upload_id, params.part_number_marker, params.max_parts, &opts)
                 .await
                 .map_err(|error| multipart_upload_api_error(error).into()),
-            #[cfg(any(feature = "gateway-stack", test))]
             ListPartsTarget::Gateway {
                 bucket: bucket_name,
                 key: object_key,

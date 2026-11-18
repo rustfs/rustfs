@@ -13,7 +13,7 @@
 
 //! ListParts wire behavior with real multipart sessions.
 
-use super::super::{GATEWAY, LEGACY, create_bucket_in_the_store, refusal, s3_client, with_stack};
+use super::super::{GATEWAY, create_bucket_in_the_store, refusal, s3_client, with_stack};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
@@ -233,11 +233,6 @@ async fn list_parts_wire(server: RustFSServer, legacy: bool) {
 }
 
 #[test]
-fn list_parts_baseline_legacy() {
-    with_stack(LEGACY, |server| list_parts_wire(server, true));
-}
-
-#[test]
 fn list_parts_wire_gateway() {
     with_stack(GATEWAY, |server| list_parts_wire(server, false));
 }
@@ -344,11 +339,6 @@ async fn list_parts_iam(server: RustFSServer) {
         "{counted:?}"
     );
     server.shutdown().await;
-}
-
-#[test]
-fn list_parts_iam_legacy() {
-    with_stack(LEGACY, list_parts_iam);
 }
 
 #[test]

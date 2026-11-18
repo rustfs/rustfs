@@ -18,7 +18,7 @@
 //! another batch's operations.
 
 use super::{
-    GATEWAY, LEGACY, MatrixRow, Outcome, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome,
+    GATEWAY, MatrixRow, Outcome, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome,
     refusal, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -414,11 +414,6 @@ fn the_gateway_stack_answers_object_metadata_as_stored() {
     with_stack(GATEWAY, object_metadata_answers_as_stored);
 }
 
-#[test]
-fn the_legacy_stack_answers_object_metadata_as_stored() {
-    with_stack(LEGACY, object_metadata_answers_as_stored);
-}
-
 fn put_tags(
     client: &Client,
     bucket: &str,
@@ -607,11 +602,6 @@ fn gateway_put_object_tagging_authorizes_body_version_and_resource() {
     with_stack(GATEWAY, put_object_tagging_authorization);
 }
 
-#[test]
-fn legacy_put_object_tagging_authorizes_body_version_and_resource() {
-    with_stack(LEGACY, put_object_tagging_authorization);
-}
-
 async fn put_object_tagging_validation(server: rustfs::embedded::RustFSServer) {
     const BUCKET: &str = "put-object-tagging-validation";
     create_bucket_in_the_store(BUCKET).await;
@@ -644,11 +634,6 @@ async fn put_object_tagging_validation(server: rustfs::embedded::RustFSServer) {
 #[test]
 fn gateway_put_object_tagging_validates_tags_before_version() {
     with_stack(GATEWAY, put_object_tagging_validation);
-}
-
-#[test]
-fn legacy_put_object_tagging_validates_tags_before_version() {
-    with_stack(LEGACY, put_object_tagging_validation);
 }
 
 fn put_object_tagging_survives_restart(stack: Option<&'static str>) {
@@ -743,11 +728,6 @@ fn gateway_put_object_tagging_replaces_stored_tags() {
     put_object_tagging_survives_restart(GATEWAY);
 }
 
-#[test]
-fn legacy_put_object_tagging_replaces_stored_tags() {
-    put_object_tagging_survives_restart(LEGACY);
-}
-
 /// The tagging actions swap to their version actions when a version is named: a user allowed only
 /// the unversioned action is refused with a version, and one allowed only the version action is
 /// refused without one.
@@ -784,11 +764,6 @@ async fn the_tagging_action_follows_the_named_version(server: rustfs::embedded::
 #[test]
 fn the_gateway_stack_swaps_the_tagging_action_for_a_named_version() {
     with_stack(GATEWAY, the_tagging_action_follows_the_named_version);
-}
-
-#[test]
-fn the_legacy_stack_swaps_the_tagging_action_for_a_named_version() {
-    with_stack(LEGACY, the_tagging_action_follows_the_named_version);
 }
 
 /// What a stack answers for a key outside the floor, independent of the operation and bucket.
@@ -874,11 +849,6 @@ fn answer<T, E: ProvideErrorMetadata>(result: Result<T, SdkError<E>>) -> (Option
             (code, status, error.message().map(str::to_owned))
         }
     }
-}
-
-#[test]
-fn the_legacy_stack_refuses_keys_outside_the_floor() {
-    with_stack(LEGACY, |server| keys_outside_the_floor_are_refused(server, None));
 }
 
 #[test]
@@ -1070,18 +1040,8 @@ fn gateway_put_object_legal_hold_edits_only_the_authorized_version() {
 }
 
 #[test]
-fn legacy_put_object_legal_hold_edits_only_the_authorized_version() {
-    put_legal_hold_on_an_explicit_version(LEGACY);
-}
-
-#[test]
 fn gateway_put_object_retention_edits_only_the_authorized_version() {
     put_retention_on_an_explicit_version(GATEWAY);
-}
-
-#[test]
-fn legacy_put_object_retention_edits_only_the_authorized_version() {
-    put_retention_on_an_explicit_version(LEGACY);
 }
 
 const RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";

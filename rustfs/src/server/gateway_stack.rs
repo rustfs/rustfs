@@ -47,11 +47,6 @@
 //! the answer is that id for every bucket, with no lookup: a missing bucket is the handler's own
 //! `NoSuchBucket`.
 
-// The stack is under construction, so a build without debug assertions must not carry it. The
-// message is checked by `scripts/check_connect_release_boundary.py`.
-#[cfg(not(debug_assertions))]
-compile_error!("gateway-stack is restricted to debug builds");
-
 mod admin;
 mod control_plane;
 
@@ -154,7 +149,7 @@ pub(crate) enum GatewayAssemblyError {
     MetadataListingDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
     #[error("RUSTFS_KEYSTONE_ENABLE configuration is invalid: {0}")]
     KeystoneConfig(rustfs_keystone::KeystoneError),
-    #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider on RUSTFS_S3_STACK=gateway")]
+    #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider before the gateway stack is assembled")]
     KeystoneNotInitialized,
     #[error("the Keystone header claim is invalid")]
     KeystoneClaim,

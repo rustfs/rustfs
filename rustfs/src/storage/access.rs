@@ -16,7 +16,7 @@ use super::access_owned::listing_multipart::{
     authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
 use super::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
-// `app::metadata_route` and the legacy-edge files still import the owned shapes through this path.
+// The legacy-edge files still import the owned shapes through this path.
 #[cfg(test)]
 use super::ECStore;
 #[cfg(test)]
@@ -31,18 +31,11 @@ use crate::auth::facts::AuthzTarget;
 use crate::auth::facts::{AuthzFacts, AuthzPrincipal, build_args, build_conditions};
 use crate::auth::{get_request_auth_type_with_query, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::shared_types::RemoteAddr;
-#[cfg(test)]
-pub(crate) use crate::storage::authorization_actions::{
-    complete_multipart_upload_authorize_action, delete_object_authorize_action, list_parts_authorize_action,
-    post_object_authorize_action, versioned_read_action, versioned_tagging_action,
-};
-// `app::metadata_route` still imports this path.
 use crate::storage::authorization::ObjectTagConditions;
 #[cfg(test)]
 use crate::storage::authorization::TableDataPlaneListCursorPosition;
 #[cfg(test)]
 use crate::storage::authorization::capture_odm_read_generation;
-pub(crate) use crate::storage::authorization::req_info_mut;
 #[cfg(test)]
 use crate::storage::authorization::{AMZ_WRITE_OFFSET_BYTES_HEADER, replication_request_authorized, request_context_from_req};
 use crate::storage::authorization::{AccessMarkers, AuthorizationRequest, VerifiedSignature, admit_operation, resolve_req_info};
@@ -88,6 +81,11 @@ use crate::storage::authorization::{
 #[cfg(test)]
 use crate::storage::authorization::{
     has_write_offset_bytes_header, request_object_store, set_requested_object_lock_retain_until,
+};
+#[cfg(test)]
+pub(crate) use crate::storage::authorization_actions::{
+    complete_multipart_upload_authorize_action, delete_object_authorize_action, list_parts_authorize_action,
+    post_object_authorize_action, versioned_read_action, versioned_tagging_action,
 };
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
@@ -3143,7 +3141,6 @@ mod tests {
         assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
     }
 
-    #[cfg(feature = "gateway-stack")]
     #[test]
     fn gateway_post_policy_projects_effective_write_conditions() {
         use super::access_owned::object_write::{PostObjectFormPolicy, PostObjectPolicyFields};

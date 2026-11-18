@@ -210,31 +210,11 @@ pub(crate) mod server {
             tonic_boot_epoch_response_headers, verify_tonic_boot_epoch_response,
         };
 
-        pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::storage_api::FS;
-        }
-
-        pub(crate) mod metadata_route {
-            pub(crate) fn with_metadata_route<A>(
-                admin: A,
-                host: Option<s3s::host::MultiDomain>,
-                website_domains: Vec<String>,
-                website_scheme: &'static str,
-                server_ctx: std::sync::Arc<super::ServerContextSlot>,
-            ) -> impl s3s::route::S3Route
-            where
-                A: s3s::route::S3Route,
-            {
-                crate::app::metadata_route::with_metadata_route(admin, host, website_domains, website_scheme, server_ctx)
-            }
-        }
-
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         }
 
         /// The access-phase functions the gateway stack shares with the legacy access hooks.
-        #[cfg(feature = "gateway-stack")]
         pub(crate) mod access {
             /// The per-batch authorization shapes, one module per migration batch.
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
