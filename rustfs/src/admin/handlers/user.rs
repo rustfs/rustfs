@@ -352,7 +352,15 @@ impl Operation for AddUser {
             args.policy = None;
             updated_at
         } else {
-            iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?
+            if authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::EnableUserAdminAction)])
+                .await
+                .is_ok()
+            {
+                iam_store.create_user(ak, &args).await
+            } else {
+                iam_store.create_user_preserving_status(ak, &args).await
+            }
+            .map_err(map_add_user_create_error)?
         };
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {

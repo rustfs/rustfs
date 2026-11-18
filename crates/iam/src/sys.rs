@@ -1296,13 +1296,32 @@ impl<T: Store> IamSys<T> {
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
+        self.upsert_regular_user(access_key, args, updated_at, true).await
+    }
+
+    /// Create a regular user, or update its credentials without changing the stored account status.
+    pub async fn create_user_preserving_status(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
+        self.upsert_regular_user(access_key, args, OffsetDateTime::now_utc(), false)
+            .await
+    }
+
+    async fn upsert_regular_user(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+        allow_status_change: bool,
+    ) -> Result<OffsetDateTime> {
         let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
         let iam = self.clone();
         let access_key = access_key.to_string();
         let args = args.clone();
         #[cfg(test)]
         let notification_probe = crate::LOAD_USER_NOTIFICATION_PROBE.try_with(Arc::clone).ok();
-        let operation = async move { iam.create_user_at_inner(&access_key, &args, updated_at).await };
+        let operation = async move {
+            iam.create_user_at_inner(&access_key, &args, updated_at, allow_status_change)
+                .await
+        };
         #[cfg(test)]
         let task = runtime.spawn(async move {
             if let Some(probe) = notification_probe {
@@ -1320,6 +1339,7 @@ impl<T: Store> IamSys<T> {
         access_key: &str,
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
+        allow_status_change: bool,
     ) -> Result<OffsetDateTime> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength);
@@ -1335,7 +1355,7 @@ impl<T: Store> IamSys<T> {
 
         let (updated_at, secret_changed, parent_guard) = self
             .store
-            .add_user_at_with_secret_change(access_key, args, updated_at)
+            .add_user_at_with_secret_change(access_key, args, updated_at, allow_status_change)
             .await?;
         if secret_changed {
             self.revoke_sts_sessions_for_parent(access_key).await?;
