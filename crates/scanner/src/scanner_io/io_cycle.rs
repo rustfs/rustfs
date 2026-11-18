@@ -1318,11 +1318,9 @@ where
         })
         .flatten();
     let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
-    // A fully drained fresh result can outlive its work budget. Carried values
-    // do not prove that a budget-stopped bucket finished its pending walk.
     let cycle_status = classify_nsscanner_cycle(
         structurally_complete_snapshot,
-        owner_ctx.is_cancelled() || (budget_elapsed && !partial_buckets.is_empty()),
+        owner_ctx.is_cancelled(),
         bucket_scan_status,
         dirty_usage_status,
         activity_status,
