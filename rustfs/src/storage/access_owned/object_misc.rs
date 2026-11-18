@@ -80,7 +80,7 @@ pub(crate) async fn authorize_delete_object<R: AuthorizationRequest + ?Sized>(
     let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
     #[cfg(test)]
     wait_for_object_generation_test_hook(bucket).await;
-    let guard = decide_delete_object(req, bucket, key, version_id, bucket_generation).await?;
+    let guard = decide_delete_object(req, bucket, key, version_id, bucket_generation.map_err(Into::into)).await?;
     req.install_pending_delete_bucket_generation(guard);
     Ok(())
 }
@@ -129,7 +129,7 @@ async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
 
     let force_delete = match force_delete_header(req.headers()) {
         Ok(value) => value.unwrap_or(false),
-        Err(_) => return Err(invalid_force_delete_header()),
+        Err(_) => return Err(invalid_force_delete_header().into()),
     };
     // The REPLICA header is caller-supplied, so it does not skip this check; `s3:*` does not
     // grant `s3:ForceDeleteObject`.
@@ -150,7 +150,7 @@ async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
         authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
     }
 
-    Ok(PendingDeleteBucketGenerationGuard::from_result(bucket_generation))
+    Ok(PendingDeleteBucketGenerationGuard::from_result(bucket_generation.map_err(Into::into)))
 }
 
 /// Select reads the current object and needs the same GetObject permission on either edge.
