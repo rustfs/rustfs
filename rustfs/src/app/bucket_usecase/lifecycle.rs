@@ -20,6 +20,26 @@ use rustfs_gateway_types::persistence::{PersistedLifecycleRule, parse_lifecycle_
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 
+static TRANSITION_SCAN_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static EXPIRY_SCAN_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static ABORT_SCAN_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+fn spawn_bounded_lifecycle_scan(
+    admission: &'static tokio::sync::Semaphore,
+    context: Option<request_context::RequestContext>,
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    // These are best-effort accelerators; the regular scanner observes persisted
+    // lifecycle configuration. Acquire before spawning so neither tasks nor waiters
+    // can accumulate when configuration is updated faster than a bucket is scanned.
+    let Ok(permit) = admission.try_acquire() else { return false };
+    spawn_background_with_context(context, async move {
+        let _permit = permit;
+        future.await;
+    });
+    true
+}
+
 pub(crate) enum PreparedLifecycleConfiguration {
     Missing,
     InvalidStatus,
@@ -319,7 +339,7 @@ impl DefaultBucketUsecase {
                 {
                     let bucket_name = bucket.to_owned();
                     let request_context = envelope.request_context().cloned();
-                    spawn_background_with_context(request_context, async move {
+                    spawn_bounded_lifecycle_scan(&TRANSITION_SCAN_ADMISSION, request_context, async move {
                         if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
                             warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
                         }
@@ -331,7 +351,7 @@ impl DefaultBucketUsecase {
                 {
                     let bucket_name = bucket.to_owned();
                     let request_context = envelope.request_context().cloned();
-                    spawn_background_with_context(request_context, async move {
+                    spawn_bounded_lifecycle_scan(&EXPIRY_SCAN_ADMISSION, request_context, async move {
                         if let Err(err) = enqueue_expiry_for_existing_objects(store, &bucket_name).await {
                             warn!(bucket = %bucket_name, error = ?err, "failed to enqueue expiry for existing objects");
                         }
@@ -343,7 +363,7 @@ impl DefaultBucketUsecase {
                 {
                     let bucket_name = bucket.to_owned();
                     let request_context = envelope.request_context().cloned();
-                    spawn_background_with_context(request_context, async move {
+                    spawn_bounded_lifecycle_scan(&ABORT_SCAN_ADMISSION, request_context, async move {
                         let deleted = run_stale_multipart_upload_cleanup_once(store).await;
                         debug!(bucket = %bucket_name, deleted, "completed lifecycle abort multipart cleanup trigger");
                     });
@@ -359,6 +379,32 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn immediate_lifecycle_scans_have_no_unbounded_waiters() {
+        let admission = Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let finish = std::sync::Arc::new(tokio::sync::Notify::new());
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let completed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (task_finish, task_started, task_completed) = (finish.clone(), started.clone(), completed.clone());
+        assert!(spawn_bounded_lifecycle_scan(admission, None, async move {
+            task_started.notify_one();
+            task_finish.notified().await;
+            task_completed.notify_one();
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("scan starts");
+        assert!(!spawn_bounded_lifecycle_scan(admission, None, async {
+            panic!("overlapping scan must not run")
+        }));
+        finish.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.notified())
+            .await
+            .expect("scan completes");
+        // The task drops its admission permit before the scheduler can run this
+        // waiter again on the single-thread test runtime.
+        assert_eq!(admission.available_permits(), 1);
+    }
     use crate::app::bucket_usecase::test_support::build_request;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;

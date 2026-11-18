@@ -62,7 +62,12 @@ fn format_object_lock_timestamp(timestamp: OffsetDateTime) -> String {
 }
 
 fn has_object_lock_retention_metadata(metadata: &HashMap<String, String>) -> bool {
-    metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+    matches!(
+        metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+        Some("GOVERNANCE" | "COMPLIANCE")
+    ) && metadata
+        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+        .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok())
 }
 
 pub(crate) fn remove_object_lock_retention_metadata(metadata: &mut HashMap<String, String>) -> bool {

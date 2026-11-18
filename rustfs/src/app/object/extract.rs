@@ -2014,6 +2014,10 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        // The legacy edge has no verified replay binding for individual members.
+        if envelope.post_object().is_some() && !envelope.is_gateway_post() {
+            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
+        }
         #[cfg(feature = "gateway-stack")]
         let input = if envelope.is_gateway_post() {
             let mut input = input;
@@ -4080,7 +4084,8 @@ mod tests {
             }
             let envelope = RequestEnvelope::from_s3s(&request);
             let input = PutObjectWriteInput::from_legacy(request.input, None);
-            let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+            // Exercise member IAM independently of the outer POST admission check.
+            let result = Box::pin(usecase.execute_put_object_extract_inner(envelope, input)).await;
             let stored = store.get_object_info(&bucket, &member, &ObjectOptions::default()).await;
             if allowed {
                 result.expect("private member is authorized");

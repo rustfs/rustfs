@@ -951,6 +951,19 @@ pub(super) fn inspection_with_markers_bounded(
     }
     let current_meta = current.as_deref().map(FileMeta::load).transpose()?;
     let before_meta = before.as_deref().map(FileMeta::load).transpose()?;
+    let mut owned_dirs = HashSet::from([transaction]);
+    if let Some(journal) = &journal {
+        owned_dirs.extend(journal.data_dirs.iter().copied());
+    }
+    for meta in before_meta.iter().chain(current_meta.iter()) {
+        owned_dirs.extend(meta.get_data_dirs()?.into_iter().flatten());
+    }
+    let marker_names = [
+        DELETE_DATA_DIR_MARKER_PREFIX,
+        RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+        RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+    ]
+    .map(|prefix| format!("{prefix}{transaction}"));
     let mut fingerprint = Sha256::new();
     for hash in [prepared_digest, target_digest, backup_digest, current_digest, receipt_digest] {
         fingerprint.update([u8::from(hash.is_some())]);
@@ -982,6 +995,21 @@ pub(super) fn inspection_with_markers_bounded(
                 // keys, which settle under their own exact-key locks and may
                 // vanish or appear concurrently. Settlement never touches it.
                 continue;
+            }
+            if kind.is_dir() && id.is_some_and(|id| !owned_dirs.contains(&id)) {
+                let path = entry.path();
+                // A UUID child with its own xl.meta is an independent object unless
+                // this transaction also has evidence here. Keep ambiguous residue
+                // in the conservative fingerprint used for legacy settlement.
+                if regular_file_exists(&path.join(STORAGE_FORMAT_FILE))? {
+                    let mut marked = false;
+                    for marker in &marker_names {
+                        marked |= regular_marker(&path.join(marker))?;
+                    }
+                    if !marked {
+                        continue;
+                    }
+                }
             }
             descriptions.push((name.clone(), kind.is_dir(), entry.metadata().map_err(to_file_error)?.len()));
             if kind.is_dir() && id.is_some_and(|id| !id.is_nil()) {
@@ -6426,7 +6454,11 @@ mod tests {
         // inspection and settlement.
         // A content-addressed child key may look like a UUID in a spelling
         // that this protocol never writes.
-        let names = ["child".to_owned(), Uuid::new_v4().simple().to_string()];
+        let names = [
+            "child".to_owned(),
+            Uuid::new_v4().simple().to_string(),
+            Uuid::new_v4().to_string(),
+        ];
         for (child_appears, name) in [false, true]
             .into_iter()
             .flat_map(|appears| names.iter().map(move |name| (appears, name)))

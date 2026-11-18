@@ -874,6 +874,47 @@ async fn delete_recursive_prefix_with_tier_delete_journal(
             }
         }
     }
+    if let Some(targets) = &opts.recursive_delete_targets {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        // Use the version-aware batch mutation under the lifecycle and metadata
+        // guards already held. Neither an empty list nor a missing version is
+        // authority to remove an underlying filesystem prefix.
+        if opts.delete_replication_config_snapshot.is_none() {
+            return Err(Error::other("planned recursive delete requires a delete configuration snapshot"));
+        }
+        for (key, _) in targets.iter() {
+            check_del_obj_args(bucket, key)?;
+        }
+        let mut exact_opts = opts.clone();
+        exact_opts.recursive_delete_targets = None;
+        exact_opts.delete_prefix = false;
+        exact_opts.version_id = None;
+        exact_opts.synthetic_version_id = false;
+        for chunk in targets.chunks(1000) {
+            let objects = chunk
+                .iter()
+                .map(|(key, version)| ObjectToDelete {
+                    object_name: encode_dir_object(key),
+                    version_id: Some(*version),
+                    ..Default::default()
+                })
+                .collect();
+            let mut batch_opts = exact_opts.clone();
+            let sink = install_tier_free_version_receipt_sink(&mut batch_opts);
+            let (_, errors, _) = store.delete_batch_under_bucket_guards(bucket, objects, batch_opts).await;
+            enqueue_recorded_tier_free_versions(store, sink).await;
+            if let Some(error) = errors
+                .into_iter()
+                .flatten()
+                .find(|err| !is_err_object_not_found(err) && !is_err_version_not_found(err))
+            {
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
     // A trailing slash selects a directory, not the object at its parent key.
     // Raw filesystem recursion would also remove that object's metadata and
     // data. Preserve it by purging the selected keys individually when they
@@ -2818,6 +2859,7 @@ fn check_batch_delete_condition(object: &ObjectToDelete, snapshot: &ConditionalD
 fn materialized_copy_user_defined(source: &HashMap<String, String>) -> HashMap<String, String> {
     let mut metadata = source.clone();
     for suffix in [
+        rustfs_utils::http::SUFFIX_INLINE_DATA,
         rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
         rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
         rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
@@ -6342,7 +6384,7 @@ impl ECStore {
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
-        let mut objects: Vec<ObjectToDelete> = objects
+        let objects: Vec<ObjectToDelete> = objects
             .iter()
             .map(|v| {
                 let mut v = v.clone();
@@ -6350,15 +6392,6 @@ impl ECStore {
                 v
             })
             .collect();
-
-        // Default return value
-        let mut del_objects = vec![DeletedObject::default(); objects.len()];
-        let mut accounting = vec![None; objects.len()];
-
-        let mut del_errs = Vec::with_capacity(objects.len());
-        for _ in 0..objects.len() {
-            del_errs.push(None)
-        }
 
         let mut opts = opts;
         opts.conditional_delete_generations = None;
@@ -6379,9 +6412,7 @@ impl ECStore {
             match ReplicationObjectBridge::delete_request_config_in(&self.ctx, bucket).await {
                 Ok(snapshot) => opts.delete_replication_config_snapshot = Some(Arc::new(snapshot)),
                 Err(err) => {
-                    let message = err.to_string();
-                    let errors = (0..objects.len()).map(|_| Some(Error::other(message.clone()))).collect();
-                    return (del_objects, errors, accounting);
+                    return return_batch_delete_lock_error_with_accounting(&objects, err);
                 }
             }
         }
@@ -6439,6 +6470,18 @@ impl ECStore {
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }
+        self.delete_batch_under_bucket_guards(bucket, objects, opts).await
+    }
+
+    async fn delete_batch_under_bucket_guards(
+        &self,
+        bucket: &str,
+        mut objects: Vec<ObjectToDelete>,
+        mut opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let mut del_errs = vec![None; objects.len()];
+        let mut accounting = vec![None; objects.len()];
         let (object_lock_guards, object_lock_failures) =
             match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
                 Ok(result) => result,
@@ -6878,7 +6921,8 @@ impl ECStore {
         let object = encode_dir_object(object);
         let opts = transition_restore_pool_opts(opts);
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, &opts).await?;
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+        // Even an unqualified restore copies back to an existing version.
+        if !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("restore is missing its bucket incarnation snapshot"))?;
@@ -7696,6 +7740,7 @@ mod tests {
     #[test]
     fn materialized_copy_drops_remote_tuple_and_free_version_compatibility_keys() {
         let protected_suffixes = [
+            rustfs_utils::http::SUFFIX_INLINE_DATA,
             rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
             rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
             rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
@@ -7720,6 +7765,10 @@ mod tests {
                 rustfs_utils::http::SUFFIX_TRANSITION_STATUS.to_ascii_uppercase()
             ),
             "complete".to_string(),
+        );
+        source.insert(
+            rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_INLINE_DATA).to_ascii_uppercase(),
+            "true".to_string(),
         );
 
         let copied = materialized_copy_user_defined(&source);
@@ -10785,6 +10834,59 @@ mod tests {
             .await
             .expect("create the bucket in both pools");
         (dirs, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recursive_delete_commits_only_planned_versions() {
+        let bucket = "recursive-delete-plan";
+        let key = "reports/item";
+        let (_dirs, store) = multipool_delete_test_store(bucket, true).await;
+        let mut versions = Vec::new();
+        for value in [1, 2] {
+            let written = store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut PutObjReader::from_vec(vec![value]),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write version");
+            versions.push(written.version_id.expect("acknowledged version"));
+        }
+        let snapshot = Arc::new(
+            ReplicationObjectBridge::delete_request_config_in(&store.ctx, bucket)
+                .await
+                .expect("delete snapshot"),
+        );
+        for plan in [vec![], vec![(key.to_owned(), versions[0])]] {
+            let empty = plan.is_empty();
+            store
+                .delete_object_with_tier_delete_journal(
+                    bucket,
+                    "reports",
+                    ObjectOptions {
+                        versioned: true,
+                        delete_prefix: true,
+                        recursive_delete_targets: Some(plan.into()),
+                        delete_replication_config_snapshot: Some(snapshot.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("commit selection");
+            let entries = store
+                .clone()
+                .inner_list_object_versions(bucket, key, None, None, None, 10)
+                .await
+                .expect("list versions");
+            let remaining: HashSet<_> = entries.objects.into_iter().filter_map(|entry| entry.version_id).collect();
+            assert!(remaining.contains(&versions[1]));
+            assert_eq!(remaining.contains(&versions[0]), empty);
+        }
     }
 
     // rustfs#8746: delete-marker replication confirms the source marker by

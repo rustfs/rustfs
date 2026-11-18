@@ -215,8 +215,9 @@ impl GatewayStack {
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
             .map_err(GatewayAssemblyError::RootCredentials)?;
+        // `RUSTFS_REGION` may list several regions; a request may be signed for any of them.
         let region = assembly.region.as_deref().unwrap_or(RUSTFS_REGION);
-        let regions = RegionSet::new([region]).map_err(|_| GatewayAssemblyError::Region {
+        let regions = RegionSet::new(region.split(',').map(str::trim)).map_err(|_| GatewayAssemblyError::Region {
             region: region.to_owned(),
         })?;
         let hosts = rustfs_host_resolver(&assembly.server_domains).map_err(GatewayAssemblyError::ServerDomains)?;

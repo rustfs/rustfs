@@ -161,6 +161,21 @@ fn an_unusable_region_fails_the_assembly() {
 }
 
 #[test]
+fn a_region_list_assembles_and_an_empty_entry_does_not() {
+    let listed = GatewayStack::assemble(GatewayAssembly {
+        region: Some("us-east-1, ap-southeast-2,us-west-2".to_owned()),
+        ..assembly()
+    });
+    assert!(listed.is_ok(), "{:?}", listed.err());
+
+    let refused = GatewayStack::assemble(GatewayAssembly {
+        region: Some("us-east-1,".to_owned()),
+        ..assembly()
+    });
+    assert!(matches!(refused, Err(GatewayAssemblyError::Region { .. })), "{:?}", refused.err());
+}
+
+#[test]
 fn an_unusable_root_access_key_fails_the_assembly_without_naming_the_secret() {
     let refused = GatewayStack::assemble(GatewayAssembly {
         root_access_key: String::new(),
