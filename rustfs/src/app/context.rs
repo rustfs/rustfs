@@ -20,11 +20,13 @@ mod envelope;
 mod global;
 mod handles;
 mod interfaces;
+mod probe_fact;
 mod runtime_sources;
 mod server_slot;
 mod startup;
 
 pub(crate) use envelope::RequestHead;
+pub(crate) use probe_fact::PermissionProbeRequestFact;
 pub use envelope::{RequestCredentials, RequestEnvelope};
 pub(crate) use envelope::{authorize_owned_internal_object_request, authorize_owned_request};
 pub use global::*;

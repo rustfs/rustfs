@@ -303,7 +303,7 @@ impl PermissionCheck {
     }
 
     fn install_operation_facts(&self, probe: &mut RequestEnvelope) -> S3Result<()> {
-        use crate::storage::access::PermissionProbeRequestFact;
+        use crate::app::context::PermissionProbeRequestFact;
         for (present, fact) in [
             (self.copy_source.is_some(), PermissionProbeRequestFact::CopySource),
             (self.if_match.is_some(), PermissionProbeRequestFact::IfMatch),

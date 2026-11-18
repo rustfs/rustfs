@@ -383,7 +383,7 @@ impl RequestEnvelope {
         }
     }
 
-    pub(crate) fn mark_permission_probe_request_fact_known(&mut self, fact: crate::storage::access::PermissionProbeRequestFact) {
+    pub(crate) fn mark_permission_probe_request_fact_known(&mut self, fact: crate::app::context::PermissionProbeRequestFact) {
         if self.permission_probe {
             self.permission_probe_known_request_facts |= fact as u8;
         }
@@ -620,7 +620,7 @@ impl AuthorizationRequest for RequestEnvelope {
     fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
         self.permission_probe_caller_authentication
     }
-    fn permission_probe_request_fact_known(&self, fact: crate::storage::access::PermissionProbeRequestFact) -> bool {
+    fn permission_probe_request_fact_known(&self, fact: crate::app::context::PermissionProbeRequestFact) -> bool {
         self.permission_probe_known_request_facts & (fact as u8) != 0
     }
     fn permission_probe(&self) -> bool {

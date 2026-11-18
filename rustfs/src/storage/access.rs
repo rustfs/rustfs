@@ -15,6 +15,7 @@
 use self::access_owned::listing_multipart::{
     authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
+use crate::app::context::PermissionProbeRequestFact;
 use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
 use super::ObjectOptions;
 use super::ecfs::FS;
@@ -239,13 +240,6 @@ impl std::fmt::Debug for PostObjectPolicyHeaders {
 /// Copy source as the handler resolves it (percent-decoded, versionId canonical).
 #[derive(Clone)]
 pub(crate) struct RequestedCopySource(pub(crate) String);
-
-#[derive(Clone, Copy)]
-pub(crate) enum PermissionProbeRequestFact {
-    CopySource = 1,
-    IfMatch = 2,
-    IfNoneMatch = 4,
-}
 
 impl RequestedCopySource {
     pub(crate) fn from_object(bucket: &str, key: &str, version_id: Option<&str>) -> Self {
