@@ -75,6 +75,14 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
 
+    /// Read an enabled regular owner's delegation epoch from authoritative storage, never an IAM cache.
+    /// Registration may initialize a legacy identity with a conditional write; concurrent edits or
+    /// unavailable/corrupt state must fail closed. Every regular identity write replaces the epoch,
+    /// including same-secret writes and recreation. Backends without this contract reject delegation.
+    async fn load_plugin_delegation_owner_epoch(&self, _name: &str, _initialize: bool) -> Result<String> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
+
     async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_secret_key(&self, name: &str, user_type: UserType) -> Result<String>;

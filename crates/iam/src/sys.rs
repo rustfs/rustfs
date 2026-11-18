@@ -453,7 +453,8 @@ impl<T: Store> IamSys<T> {
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
         crate::delegation::read_active(&self.store.api, owner, id, now).await
     }
-    /// Reads an owned delegation record for historical lookups, including expired or revoked records.
+    /// Reads an owned delegation record for historical lookups, including expired or explicitly revoked records.
+    /// Owner identity writes invalidate ownership even for historical lookups.
     pub async fn read_owned_plugin_delegation(
         &self,
         owner: &str,

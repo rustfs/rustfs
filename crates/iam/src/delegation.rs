@@ -87,6 +87,51 @@ struct Tombstone {
     owner_access_key: String,
 }
 
+// Separate from the public immutable restriction envelope so v1/v2 API shapes
+// stay unchanged. Missing legacy bindings must never be inferred from a name.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OwnerBinding {
+    version: u32,
+    id: String,
+    owner_access_key: String,
+    epoch: String,
+}
+
+async fn check_owner<T: Store>(store: &T, record: &Delegation) -> Result<(), DelegationError> {
+    let binding: OwnerBinding = store
+        .load_iam_config_strict(format!("{PREFIX}/{}/owner.json", record.id))
+        .await
+        .map_err(|error| {
+            if is_err_config_not_found(&error) {
+                DelegationError::Revoked
+            } else {
+                DelegationError::Unavailable
+            }
+        })?;
+    if binding.version != 1
+        || binding.id != record.id
+        || binding.owner_access_key != record.owner_access_key
+        || binding.epoch.len() != 32
+        || !binding.epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DelegationError::Unavailable);
+    }
+    let epoch = store
+        .load_plugin_delegation_owner_epoch(&record.owner_access_key, false)
+        .await
+        .map_err(|error| match error {
+            crate::error::Error::ConfigNotFound
+            | crate::error::Error::NoSuchUser(_)
+            | crate::error::Error::IAMActionNotAllowed => DelegationError::Revoked,
+            _ => DelegationError::Unavailable,
+        })?;
+    if epoch != binding.epoch {
+        return Err(DelegationError::Revoked);
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DelegationError {
     #[error("invalid delegation restriction")]
@@ -143,6 +188,15 @@ pub(crate) async fn create<T: Store>(
     if owner.is_empty() {
         return Err(DelegationError::OwnerRejected);
     }
+    let epoch = store
+        .load_plugin_delegation_owner_epoch(owner, true)
+        .await
+        .map_err(|error| match error {
+            crate::error::Error::ConfigNotFound
+            | crate::error::Error::NoSuchUser(_)
+            | crate::error::Error::IAMActionNotAllowed => DelegationError::OwnerRejected,
+            _ => DelegationError::Unavailable,
+        })?;
     // IDs are generated exclusively here; no update operation accepts an ID.
     let id = format!("{:032x}", rand::random::<u128>());
     let path = record_path(&id)?;
@@ -158,6 +212,24 @@ pub(crate) async fn create<T: Store>(
         created_at_unix_seconds: now,
         restrictions,
     };
+    let binding = OwnerBinding {
+        version: 1,
+        id: record.id.clone(),
+        owner_access_key: owner.to_owned(),
+        epoch,
+    };
+    let owner_path = format!("{PREFIX}/{}/owner.json", record.id);
+    store
+        .save_iam_config(&binding, &owner_path)
+        .await
+        .map_err(|_| DelegationError::Unavailable)?;
+    let saved: OwnerBinding = store
+        .load_iam_config_strict(owner_path)
+        .await
+        .map_err(|_| DelegationError::Unavailable)?;
+    if saved != binding {
+        return Err(DelegationError::Unavailable);
+    }
     store
         .save_iam_config(&record, path)
         .await
@@ -165,6 +237,7 @@ pub(crate) async fn create<T: Store>(
     if load(store, &record.id).await? != record {
         return Err(DelegationError::Unavailable);
     }
+    check_owner(store, &record).await?;
     Ok(record)
 }
 
@@ -208,6 +281,7 @@ pub(crate) async fn read_owned<T: Store>(store: &T, owner: &str, id: &str) -> Re
     if record.owner_access_key != owner {
         return Err(DelegationError::OwnerRejected);
     }
+    check_owner(store, &record).await?;
     Ok(record)
 }
 
@@ -228,6 +302,7 @@ async fn check_active<T: Store>(store: &T, record: Delegation, now: u64) -> Resu
     if now >= record.restrictions.expires_at_unix_seconds {
         return Err(DelegationError::Expired);
     }
+    check_owner(store, &record).await?;
     Ok(record)
 }
 
