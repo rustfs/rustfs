@@ -188,7 +188,9 @@ struct PreparedZipArchive {
 impl From<&ReqInfo> for ObjectZipDownloadReqInfoSnapshot {
     fn from(req_info: &ReqInfo) -> Self {
         let mut cred = req_info.cred.clone();
-        let session_present = req_info.keystone_session_present.unwrap_or_else(|| cred.as_ref().is_some_and(|cred| !cred.session_token.is_empty()));
+        let session_present = req_info
+            .keystone_session_present
+            .unwrap_or_else(|| cred.as_ref().is_some_and(|cred| !cred.session_token.is_empty()));
         if let Some(cred) = cred.as_mut() {
             cred.secret_key.clear();
             cred.session_token.clear();
@@ -385,7 +387,14 @@ fn validate_download_token(
     }
     let expires_at = OffsetDateTime::from_unix_timestamp(payload.expires_at_unix)
         .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
-    if expires_at <= now || payload.req_info.cred.as_ref().and_then(|cred| cred.expiration).is_some_and(|expiration| expiration <= now) {
+    if expires_at <= now
+        || payload
+            .req_info
+            .cred
+            .as_ref()
+            .and_then(|cred| cred.expiration)
+            .is_some_and(|expiration| expiration <= now)
+    {
         return Err(s3_error!(AccessDenied, "invalid or expired download token"));
     }
 
@@ -449,7 +458,9 @@ fn authenticated_zip_download_principal(req: &AdminRequest) -> S3Result<String> 
 }
 
 fn authenticated_zip_download_req_info(req: &AdminRequest) -> S3Result<ReqInfo> {
-    req.req_info().cloned().ok_or_else(|| s3_error!(AccessDenied, "authentication required"))
+    req.req_info()
+        .cloned()
+        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))
 }
 
 fn authenticated_zip_download_auth_context(req: &AdminRequest) -> ObjectZipDownloadAuthContext {

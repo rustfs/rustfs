@@ -1592,7 +1592,11 @@ where
     ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
         // A virtual OIDC parent is a canonical base64url-encoded SHA-256 digest.
         // It has no stored user record to collide with in the checks below.
-        if access_key.len() == 43 && base64_simd::URL_SAFE_NO_PAD.decode_to_vec(access_key.as_bytes()).is_ok_and(|bytes| bytes.len() == 32) {
+        if access_key.len() == 43
+            && base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(access_key.as_bytes())
+                .is_ok_and(|bytes| bytes.len() == 32)
+        {
             return Err(Error::AccessKeyAlreadyExists);
         }
         let parent_lock = self.cache.parent_mutation_lock(access_key);
