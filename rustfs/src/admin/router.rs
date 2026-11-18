@@ -886,7 +886,8 @@ async fn authorized_object_lambda_get_request(
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
-    s3s::access::S3Access::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), &mut get_req).await?;
+    let (bucket, key, version) = (get_req.input.bucket.clone(), get_req.input.key.clone(), get_req.input.version_id.clone());
+    crate::admin::storage_api::access::authorize_get_object(&slot, &mut get_req, &bucket, &key, version.as_deref()).await?;
     Ok(get_req)
 }
 
@@ -899,7 +900,19 @@ async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, o
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
-    let get_resp = s3s::S3::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), get_req).await?;
+    let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(slot.app_context());
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+    let envelope = crate::app::RequestEnvelope::from_s3s(&get_req);
+    let crate::app::Answered { output, status, headers } = usecase
+        .execute_get_object_fields(envelope, crate::app::object_usecase::GetObjectFields::from_s3s(get_req.input))
+        .await?;
+    let mut get_resp = S3Response::new(
+        output
+            .into_s3s()
+            .map_err(|error| S3Error::from(crate::app::dto_values::seam_error(error)))?,
+    );
+    get_resp.status = status;
+    get_resp.headers = headers;
     invoke_object_lambda_target(req, bucket, object, get_resp).await
 }
 
