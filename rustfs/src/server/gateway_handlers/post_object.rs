@@ -63,7 +63,7 @@ impl PostObjectHandler for GatewayBackend {
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let expected_owner = input.fields.expected_bucket_owner.clone();
-        let form = post_retain_until(request).map(|date| (date, form_policy(&input.fields, date)));
+        let form = post_retain_until(request).map(|date| (date, form_policy(&input.fields, &input.metadata, date)));
         let form_if_match = is_specific_etag(input.fields.if_match.as_deref());
         let legal_hold = input.fields.object_lock_legal_hold_status.is_some();
         let retention = input.fields.object_lock_mode.is_some() || input.fields.object_lock_retain_until_date.is_some();
@@ -122,7 +122,9 @@ impl PostObjectHandler for GatewayBackend {
                 .map_err(|error| handler_error(error.into()))?;
             record_s3_op(S3Operation::PostObject);
 
-            let extract = crate::app::object::is_put_object_extract_requested(envelope.headers());
+            let extract = crate::app::object::is_put_object_extract_requested(
+                crate::app::object::post_headers::post_effective_headers(&envelope),
+            );
             let archive_open = extract && !post_archive_admission_closed();
             let checksum_headers = if archive_open {
                 post_archive_checksum_headers(&envelope, &input.fields)
@@ -151,7 +153,7 @@ impl PostObjectHandler for GatewayBackend {
                 .ok_or_else(|| handler_error(s3_error!(InternalError, "The POST bucket generation is missing")))?;
             let bucket = input.bucket.as_str().to_owned();
             let key = input.key.as_str().to_owned();
-            let policy = form_policy(&input.fields, retain_until).map_err(handler_error)?;
+            let policy = form_policy(&input.fields, &input.metadata, retain_until).map_err(handler_error)?;
             let specific_etag = is_specific_etag(input.fields.if_match.as_deref())
                 || envelope
                     .headers()
@@ -222,7 +224,11 @@ fn post_retain_until(request: &Req<dto::PostObject>) -> S3Result<Option<time::Of
     retain_until_with_offset(Some(date), Some(offset))
 }
 
-fn form_policy(fields: &dto::PostObjectFields, retain_until: Option<time::OffsetDateTime>) -> S3Result<PostObjectFormPolicy> {
+fn form_policy(
+    fields: &dto::PostObjectFields,
+    metadata: &[(String, String)],
+    retain_until: Option<time::OffsetDateTime>,
+) -> S3Result<PostObjectFormPolicy> {
     Ok(PostObjectFormPolicy::new(PostObjectPolicyFields {
         lock_mode: fields.object_lock_mode.as_ref().map(|value| value.as_str()),
         legal_hold: fields.object_lock_legal_hold_status.as_ref().map(|value| value.as_str()),
@@ -239,7 +245,8 @@ fn form_policy(fields: &dto::PostObjectFields, retain_until: Option<time::Offset
         grant_write_acp: fields.grant_write_acp.as_deref(),
         if_match: fields.if_match.as_deref().map(form_condition).transpose()?,
         if_none_match: fields.if_none_match.as_deref().map(form_condition).transpose()?,
-    })?)
+    })?
+    .with_metadata(metadata)?)
 }
 
 fn form_condition(value: &str) -> S3Result<HeaderValue> {

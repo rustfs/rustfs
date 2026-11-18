@@ -54,8 +54,11 @@ async fn authorize_form(
     server: &ServerContextSlot,
     bucket: &str,
     key: &str,
+    metadata: &[(String, String)],
 ) -> Result<(), HandlerError> {
-    let form = PostObjectFormPolicy::new(PostObjectPolicyFields::default()).map_err(|error| handler_error(error.into()))?;
+    let form = PostObjectFormPolicy::new(PostObjectPolicyFields::default())
+        .and_then(|form| form.with_metadata(metadata))
+        .map_err(|error| handler_error(error.into()))?;
     let facts = PutObjectAuthorization {
         bucket,
         key,
@@ -89,7 +92,7 @@ impl Handler<dto::PostObject> for Probe {
         let input = request.into_input();
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        authorize_form(&mut envelope, &self.server, &bucket, &key).await?;
+        authorize_form(&mut envelope, &self.server, &bucket, &key, &input.metadata).await?;
         self.authorized.fetch_add(1, Ordering::SeqCst);
         let generation = envelope
             .take_bucket_generation()
@@ -111,7 +114,7 @@ impl Handler<dto::PostObject> for Probe {
             .await
             .map_err(handler_error)?;
         self.preflighted.fetch_add(1, Ordering::SeqCst);
-        authorize_form(&mut envelope, &self.server, &bucket, &key).await?;
+        authorize_form(&mut envelope, &self.server, &bucket, &key, &input.metadata).await?;
         if envelope.bucket_generation() != Some(&generation) {
             return Err(HandlerError::internal_error("archive bucket generation changed"));
         }
@@ -153,7 +156,8 @@ fn signed_form(archive: &[u8], bad_checksum: bool, tampered: bool) -> Vec<u8> {
         "conditions":[
             {"bucket":BUCKET}, ["starts-with","$key","allowed/"], {"x-amz-algorithm":"AWS4-HMAC-SHA256"},
             {"x-amz-credential":credential}, {"x-amz-date":stamp},
-            {"x-amz-checksum-sha256":sha}, {"content-md5":md5}
+            {"x-amz-checksum-sha256":sha}, {"content-md5":md5},
+            {"x-amz-meta-snowball-auto-extract":"true"}
         ]
     });
     let encoded = base64_simd::STANDARD.encode_to_string(policy.to_string().as_bytes());
@@ -175,6 +179,7 @@ fn signed_form(archive: &[u8], bad_checksum: bool, tampered: bool) -> Vec<u8> {
         ("x-amz-date", stamp.as_str()),
         ("x-amz-checksum-sha256", sha.as_str()),
         ("content-md5", md5.as_str()),
+        ("x-amz-meta-snowball-auto-extract", "true"),
         ("policy", encoded.as_str()),
         ("x-amz-signature", signature.as_str()),
     ] {
@@ -305,7 +310,6 @@ async fn signed_snapshot_preflight_and_member_iam_gate_real_storage() {
                 .uri(format!("/{BUCKET}"))
                 .header("host", "localhost")
                 .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
-                .header("x-amz-meta-snowball-auto-extract", "true")
                 .header("content-length", form.len())
                 .body(Full::new(Bytes::from(form)))
                 .expect("signed diagnostic request");
@@ -328,7 +332,7 @@ async fn signed_snapshot_preflight_and_member_iam_gate_real_storage() {
             assert_eq!(
                 probe.preflighted.load(Ordering::SeqCst),
                 preflighted + usize::from(matches!(case, "iam" | "success")),
-                "{case}: only the complete authorized key set may reach member IAM"
+                "{case}: only the complete authorized key set may reach member IAM: {status} {text}"
             );
             assert_eq!(
                 probe.committed.load(Ordering::SeqCst),
@@ -409,7 +413,6 @@ async fn signed_snapshot_preflight_and_member_iam_gate_real_storage() {
                 .uri(format!("/{BUCKET}"))
                 .header("host", "localhost")
                 .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
-                .header("x-amz-meta-snowball-auto-extract", "true")
                 .header("content-length", form.len())
                 .body(Full::new(Bytes::from(form)))
                 .expect("signed production request");

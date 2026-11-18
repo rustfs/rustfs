@@ -6004,11 +6004,14 @@ mod tests {
             ..Default::default()
         })
         .expect("valid form policy")
+        .with_metadata(&[("purpose".to_owned(), "form".to_owned())])
+        .expect("valid form metadata")
         .install_gateway(&mut req);
         let projected = &req.extensions.get::<PostObjectPolicyHeaders>().expect("projected headers").0;
         assert!(!projected.contains_key("if-match"));
         assert_eq!(projected.get("if-none-match"), Some(&HeaderValue::from_static("*")));
         assert_eq!(projected.get("x-amz-server-side-encryption"), Some(&HeaderValue::from_static("form")));
+        assert_eq!(projected.get("x-amz-meta-purpose"), Some(&HeaderValue::from_static("form")));
         assert_eq!(
             projected.get("x-amz-server-side-encryption-customer-algorithm"),
             Some(&HeaderValue::from_static("AES256"))
