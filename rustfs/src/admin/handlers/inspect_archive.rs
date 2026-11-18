@@ -45,7 +45,7 @@ use matchit::Params;
 use rand::RngExt;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
-use rsa::{Oaep, RsaPublicKey};
+use rsa::{Oaep, PublicKey};
 use rustfs_filemeta::{FileMeta, VersionType};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_s3_types::{Body, S3Result, StdError, s3_error};
@@ -340,8 +340,8 @@ async fn collect_drive_artifacts(
     Ok(artifacts)
 }
 
-fn parse_public_key(public_key_pem: &str) -> S3Result<RsaPublicKey> {
-    let key = RsaPublicKey::from_public_key_pem(public_key_pem)
+fn parse_public_key(public_key_pem: &str) -> S3Result<PublicKey> {
+    let key = PublicKey::from_public_key_pem(public_key_pem)
         .map_err(|_| s3_error!(InvalidArgument, "inspect archive requires a valid PKCS#8 RSA public key"))?;
     let bits = key.size().saturating_mul(8);
     if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
@@ -458,7 +458,7 @@ async fn send_bounded(
 async fn encrypt_archive_stream<R>(
     mut reader: R,
     completion: oneshot::Receiver<io::Result<()>>,
-    public_key: RsaPublicKey,
+    public_key: PublicKey,
     deadline: tokio::time::Instant,
     tx: mpsc::Sender<Result<Bytes, StdError>>,
 ) -> io::Result<()>
@@ -525,11 +525,7 @@ where
     send_bounded(&tx, &mut sent, final_record, deadline).await
 }
 
-fn encrypted_archive_body(
-    artifacts: Vec<DriveMetadataArtifact>,
-    public_key: RsaPublicKey,
-    deadline: tokio::time::Instant,
-) -> Body {
+fn encrypted_archive_body(artifacts: Vec<DriveMetadataArtifact>, public_key: PublicKey, deadline: tokio::time::Instant) -> Body {
     let (reader, writer) = tokio::io::duplex(ARCHIVE_CHUNK_SIZE);
     let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
     let (completion_tx, completion_rx) = oneshot::channel();
@@ -593,7 +589,7 @@ impl Operation for InspectArchiveHandler {
 mod tests {
     use super::*;
     use futures::TryStreamExt;
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
     use rsa::pkcs8::{EncodePublicKey, LineEnding};
     use rustfs_s3_types::S3ErrorCode;
     use std::pin::Pin;
@@ -602,9 +598,9 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::AsyncWriteExt;
 
-    fn test_keypair() -> (RsaPrivateKey, RsaPublicKey, String) {
-        let private = RsaPrivateKey::new(&mut rand::rng(), MIN_RSA_BITS).expect("generate test RSA key");
-        let public = RsaPublicKey::from(&private);
+    fn test_keypair() -> (PrivateKey, PublicKey, String) {
+        let private = PrivateKey::new(&mut rand::rng(), MIN_RSA_BITS).expect("generate test RSA key");
+        let public = PublicKey::from(&private);
         let pem = public.to_public_key_pem(LineEnding::LF).expect("encode test public key");
         (private, public, pem)
     }
@@ -641,7 +637,7 @@ mod tests {
 
     async fn collect_encrypted_stream(
         artifacts: Vec<DriveMetadataArtifact>,
-        public_key: RsaPublicKey,
+        public_key: PublicKey,
         deadline: tokio::time::Instant,
     ) -> io::Result<Vec<u8>> {
         let (reader, writer) = tokio::io::duplex(ARCHIVE_CHUNK_SIZE);
@@ -663,7 +659,7 @@ mod tests {
         Ok(chunks.into_iter().flatten().collect())
     }
 
-    fn decrypt_stream(private: &RsaPrivateKey, encrypted: &[u8]) -> io::Result<Vec<u8>> {
+    fn decrypt_stream(private: &PrivateKey, encrypted: &[u8]) -> io::Result<Vec<u8>> {
         if encrypted.len() < 24 || &encrypted[..8] != FORMAT_MAGIC {
             return Err(io::Error::other("invalid inspect archive header"));
         }
@@ -775,8 +771,8 @@ mod tests {
         let error = request.validate().expect_err("invalid bucket should fail");
         assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
 
-        let weak = RsaPrivateKey::new(&mut rand::rng(), 1024).expect("generate weak RSA key");
-        let weak_pem = RsaPublicKey::from(&weak)
+        let weak = PrivateKey::new(&mut rand::rng(), 1024).expect("generate weak RSA key");
+        let weak_pem = PublicKey::from(&weak)
             .to_public_key_pem(LineEnding::LF)
             .expect("encode weak public key");
         let error = parse_public_key(&weak_pem).expect_err("weak RSA key should fail");

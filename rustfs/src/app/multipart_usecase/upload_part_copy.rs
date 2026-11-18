@@ -12,13 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! UploadPartCopy.
+//! UploadPartCopy through one owned storage implementation and its legacy adapter.
+//! Protocol clients and the legacy FS edge supply request facts; multipart ownership stays in storage.
 
 use super::*;
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::CopySource;
 use crate::app::storage_api::s3::dto::{
-    CopyPartResult, CopySource, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
+    CopyPartResult, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
 };
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use crate::app::storage_api::s3::{S3Request, S3Response};
+use crate::app::{RequestEnvelope, object_usecase::CopySourceCondition};
+use rustfs_gateway_types::CopySourceValue;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+
+// No Debug: source and destination customer encryption keys are bearer material.
+pub(crate) struct UploadPartCopyWriteInput {
+    pub(crate) target: UploadPartTarget,
+    pub(crate) part_number: i32,
+    pub(crate) copy_source: CopySourceValue,
+    pub(crate) copy_source_range: Option<String>,
+    pub(crate) copy_source_if_match: Option<CopySourceCondition>,
+    pub(crate) copy_source_if_none_match: Option<CopySourceCondition>,
+    pub(crate) sse_customer_algorithm: Option<String>,
+    pub(crate) sse_customer_key: Option<String>,
+    pub(crate) sse_customer_key_md5: Option<String>,
+    pub(crate) copy_source_sse_customer_algorithm: Option<String>,
+    pub(crate) copy_source_sse_customer_key: Option<String>,
+    pub(crate) copy_source_sse_customer_key_md5: Option<String>,
+}
+
+pub(crate) struct UploadPartCopyWriteOutput {
+    pub(crate) e_tag: Option<String>,
+    pub(crate) last_modified: Option<time::OffsetDateTime>,
+    pub(crate) copy_source_version_id: Option<String>,
+    pub(crate) server_side_encryption: Option<String>,
+    pub(crate) ssekms_key_id: Option<String>,
+    pub(crate) sse_customer_algorithm: Option<String>,
+    pub(crate) sse_customer_key_md5: Option<String>,
+    pub(crate) checksum_crc32: Option<String>,
+    pub(crate) checksum_crc32c: Option<String>,
+    pub(crate) checksum_sha1: Option<String>,
+    pub(crate) checksum_sha256: Option<String>,
+    pub(crate) checksum_crc64nvme: Option<String>,
+}
 
 fn normalize_copy_source_version_id(version_id: Option<&str>) -> S3Result<Option<String>> {
     match version_id {
@@ -63,42 +100,93 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
 }
 
 impl DefaultMultipartUsecase {
-    #[instrument(level = "debug", skip(self, req))]
-    #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,
-    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+    ) -> crate::app::storage_api::s3::S3Result<S3Response<UploadPartCopyOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = req.input;
+        let condition = |value| match value {
+            crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+        };
+        let input = UploadPartCopyWriteInput {
+            target: UploadPartTarget::Legacy {
+                bucket: input.bucket,
+                key: input.key,
+                upload_id: input.upload_id,
+            },
+            part_number: input.part_number,
+            copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+            copy_source_range: input.copy_source_range,
+            copy_source_if_match: input.copy_source_if_match.map(condition),
+            copy_source_if_none_match: input.copy_source_if_none_match.map(condition),
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+            copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+            copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+            copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+        };
+        let output = self.execute_upload_part_copy_owned(envelope, input).await?;
+        Ok(S3Response::new(UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: output.e_tag.as_deref().map(to_s3s_xml_etag),
+                last_modified: output.last_modified.map(Timestamp::from),
+                checksum_crc32: output.checksum_crc32,
+                checksum_crc32c: output.checksum_crc32c,
+                checksum_sha1: output.checksum_sha1,
+                checksum_sha256: output.checksum_sha256,
+                checksum_crc64nvme: output.checksum_crc64nvme,
+                ..Default::default()
+            }),
+            copy_source_version_id: output.copy_source_version_id,
+            server_side_encryption: output.server_side_encryption.map(ServerSideEncryption::from),
+            ssekms_key_id: output.ssekms_key_id,
+            sse_customer_algorithm: output.sse_customer_algorithm,
+            sse_customer_key_md5: output.sse_customer_key_md5,
+            ..Default::default()
+        }))
+    }
+
+    /// Copies plaintext into an existing upload without changing its recorded owner.
+    #[instrument(level = "debug", skip(self, envelope, input))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
+    pub(crate) async fn execute_upload_part_copy_owned(
+        &self,
+        envelope: RequestEnvelope,
+        input: UploadPartCopyWriteInput,
+    ) -> S3Result<UploadPartCopyWriteOutput> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+            envelope.headers(),
+            envelope.uri().query(),
+            envelope.verified_sigv4().is_some(),
         )?;
         reject_presigned_put_max_content_length_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+            envelope.headers(),
+            envelope.uri().query(),
+            envelope.verified_presigned().is_some(),
         )?;
-        // Captured before `req.input` is destructured below.
-        let copy_principal = SseKmsPrincipal::from_request(&req);
-        let source_bucket = match &req.input.copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket { bucket, .. } => bucket.to_string(),
+        let copy_principal = SseKmsPrincipal::from_request(&envelope);
+        let source_bucket = match &input.copy_source {
+            CopySourceValue::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySourceValue::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+            CopySourceValue::Bucket { bucket, .. } => bucket.to_string(),
         };
         let mut source_generation_opts = ObjectOptions::default();
-        apply_copy_source_bucket_generation_guard(&req, &source_bucket, &mut source_generation_opts)?;
+        apply_copy_source_bucket_generation_guard(&envelope, &source_bucket, &mut source_generation_opts)?;
         let expected_source_incarnation_id = source_generation_opts.expected_bucket_incarnation_id;
+        let (bucket, key) = input.target.resource();
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
         let mut destination_generation_opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&req, &req.input.bucket, &mut destination_generation_opts)?;
+        apply_bucket_generation_guard(&envelope, &bucket, &mut destination_generation_opts)?;
         let expected_destination_incarnation_id = destination_generation_opts.expected_bucket_incarnation_id;
-        let UploadPartCopyInput {
-            bucket,
-            key,
+        let UploadPartCopyWriteInput {
+            target,
             copy_source,
             copy_source_range,
             part_number,
-            upload_id,
             copy_source_if_match,
             copy_source_if_none_match,
             sse_customer_algorithm,
@@ -108,17 +196,17 @@ impl DefaultMultipartUsecase {
             copy_source_sse_customer_key,
             copy_source_sse_customer_key_md5,
             ..
-        } = req.input;
+        } = input;
 
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let (src_bucket, src_key, raw_src_version_id) = match copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket {
-                bucket: ref src_bucket,
-                key: ref src_key,
+            CopySourceValue::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySourceValue::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+            CopySourceValue::Bucket {
+                bucket: src_bucket,
+                key: src_key,
                 version_id,
-            } => (src_bucket.to_string(), src_key.to_string(), version_id.map(|v| v.to_string())),
+            } => (src_bucket, src_key, version_id),
         };
         let src_version_id = normalize_copy_source_version_id(raw_src_version_id.as_deref())?;
 
@@ -164,6 +252,7 @@ impl DefaultMultipartUsecase {
             .into());
         }
         let mut dst_opts = ObjectOptions {
+            multipart_copy_source_locked: true,
             expected_bucket_incarnation_id: Some(current_destination_incarnation_id),
             ..Default::default()
         };
@@ -172,10 +261,32 @@ impl DefaultMultipartUsecase {
         }
         destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
-        let mp_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
-            .await
-            .map_err(multipart_upload_api_error)?;
+        let (upload_id, mp_info) = match target {
+            UploadPartTarget::Legacy { upload_id, .. } => {
+                let info = store
+                    .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
+                    .await
+                    .map_err(multipart_upload_api_error)?;
+                (upload_id, info)
+            }
+            #[cfg(any(feature = "gateway-stack", test))]
+            UploadPartTarget::Gateway {
+                bucket: bound_bucket,
+                key: bound_key,
+                upload_id,
+            } => {
+                let (id, upload) = rustfs_gateway_types::resolve_upload_async(&upload_id, &bound_bucket, &bound_key, |id| {
+                    let store = &store;
+                    let opts = &dst_opts;
+                    let bucket = &bucket;
+                    let key = &key;
+                    async move { super::upload_part::lookup_recorded_part_upload(store, bucket, key, id, opts).await }
+                })
+                .await?
+                .map_err(|rejection| S3Error::with_message(S3ErrorCode::NoSuchUpload, rejection.reason()))?;
+                (id.id().to_owned(), upload.info)
+            }
+        };
         authorize_sse_kms_multipart_write(copy_principal.as_ref(), &mp_info.user_defined).await?;
         let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {
@@ -194,7 +305,7 @@ impl DefaultMultipartUsecase {
 
         let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
         let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
-        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
+        let mut src_opts = copy_src_opts(&src_bucket, &src_key, envelope.headers()).map_err(ApiError::from)?;
         src_opts.version_id = src_version_id.clone();
         src_opts.versioned = src_versioned;
         src_opts.version_suspended = src_version_suspended;
@@ -245,8 +356,8 @@ impl DefaultMultipartUsecase {
 
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.into_etag() {
-                    if ETag::Strong(etag.clone()) != strong_etag {
+                if let Some(strong_etag) = if_match.strong() {
+                    if etag != strong_etag {
                         return Err(s3_error!(PreconditionFailed));
                     }
                 } else {
@@ -259,8 +370,8 @@ impl DefaultMultipartUsecase {
 
         if let Some(if_none_match) = copy_source_if_none_match
             && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.into_etag()
-            && ETag::Strong(etag.clone()) == strong_etag
+            && let Some(strong_etag) = if_none_match.strong()
+            && etag == strong_etag
         {
             return Err(s3_error!(PreconditionFailed));
         }
@@ -417,28 +528,20 @@ impl DefaultMultipartUsecase {
         let copy_checksums = reader.as_hash_reader().content_crc();
         let checksum_value = |checksum_type: rustfs_rio::ChecksumType| copy_checksums.get(&checksum_type.to_string()).cloned();
 
-        let copy_part_result = CopyPartResult {
+        Ok(UploadPartCopyWriteOutput {
+            e_tag: part_info.etag,
+            last_modified: part_info.last_mod,
+            copy_source_version_id: resolved_src_version_id,
+            server_side_encryption: requested_sse,
+            ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             checksum_crc32: checksum_value(rustfs_rio::ChecksumType::CRC32),
             checksum_crc32c: checksum_value(rustfs_rio::ChecksumType::CRC32C),
             checksum_sha1: checksum_value(rustfs_rio::ChecksumType::SHA1),
             checksum_sha256: checksum_value(rustfs_rio::ChecksumType::SHA256),
             checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
-            e_tag: part_info.etag.map(|etag| to_s3s_xml_etag(&etag)),
-            last_modified: part_info.last_mod.map(Timestamp::from),
-            ..Default::default()
-        };
-
-        let output = UploadPartCopyOutput {
-            copy_part_result: Some(copy_part_result),
-            copy_source_version_id: resolved_src_version_id,
-            server_side_encryption: requested_sse.map(ServerSideEncryption::from),
-            ssekms_key_id: requested_kms_key_id,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        })
     }
 }
 
@@ -464,7 +567,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
 
         let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
@@ -485,7 +588,7 @@ mod tests {
             let req = build_request(input, Method::PUT);
 
             let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
-            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
     }

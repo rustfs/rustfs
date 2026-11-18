@@ -81,6 +81,34 @@ pub(crate) const MATRIX: &[super::MatrixRow] = &[
             })
         },
     },
+    super::MatrixRow {
+        operation: "UploadPartCopy",
+        metric: rustfs_s3_ops::S3Operation::UploadPartCopy,
+        has_error_body: true,
+        call: |client, bucket| {
+            Box::pin(async move {
+                use rustfs_ecstore::api::object::ObjectOptions;
+                use rustfs_storage_api::MultipartOperations as _;
+                let context = rustfs::app::context::get_global_app_context().expect("embedded context");
+                let upload = context
+                    .object_store()
+                    .new_multipart_upload(bucket, "copy-part-matrix", &ObjectOptions::default())
+                    .await
+                    .expect("matrix upload");
+                super::outcome(
+                    client
+                        .upload_part_copy()
+                        .bucket(bucket)
+                        .key("copy-part-matrix")
+                        .upload_id(upload.upload_id)
+                        .part_number(1)
+                        .copy_source(format!("{COPY_MATRIX_BUCKET}/{COPY_MATRIX_SOURCE}"))
+                        .send()
+                        .await,
+                )
+            })
+        },
+    },
 ];
 
 const ORDINARY_BUCKET: &str = "e1-complete";
@@ -787,4 +815,319 @@ fn legacy_copy_object_fixed_main_contract() {
 #[serial_test::serial]
 fn gateway_copy_object_wire_contract() {
     with_stack(super::GATEWAY, copy_contract);
+}
+
+async fn upload_part_copy_contract(server: super::RustFSServer) {
+    let bucket = "native-copy-part";
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    create_bucket_in_the_store(bucket).await;
+    let source = root
+        .put_object()
+        .bucket(bucket)
+        .key("source")
+        .body(ByteStream::from_static(b"copy-data"))
+        .send()
+        .await
+        .expect("write copy source");
+    let upload = root
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("destination")
+        .send()
+        .await
+        .expect("create copy destination");
+    let id = upload.upload_id().expect("upload id");
+    for (user, read, write) in [
+        ("partcopyread", true, false),
+        ("partcopywrite", false, true),
+        ("partcopyboth", true, true),
+    ] {
+        super::create_user_without_a_policy(user).await;
+        let mut statements = Vec::new();
+        for (allowed, action, key) in [(read, "s3:GetObject", "source"), (write, "s3:PutObject", "destination")] {
+            if allowed {
+                statements.push(
+                    serde_json::json!({"Effect": "Allow", "Action": action, "Resource": format!("arn:aws:s3:::{bucket}/{key}")}),
+                );
+            }
+        }
+        let document = serde_json::json!({"Version": "2012-10-17", "Statement": statements});
+        let policy = rustfs_policy::policy::Policy::parse_config(document.to_string().as_bytes()).expect("copy part policy");
+        let iam = super::get_global_app_context().expect("server context").iam().handle();
+        iam.set_policy(user, policy).await.expect("install copy part policy");
+        iam.policy_db_set(user, rustfs_iam::store::UserType::Reg, false, user)
+            .await
+            .expect("attach copy part policy");
+        let scoped = s3_client(&server.endpoint(), user, super::USER_SECRET_KEY);
+        let result = scoped
+            .upload_part_copy()
+            .bucket(bucket)
+            .key("destination")
+            .upload_id(if read && write { id } else { "missing-upload" })
+            .part_number(1)
+            .copy_source(format!("{bucket}/source"))
+            .send()
+            .await;
+        if read && write {
+            let copied = result.expect("both permissions allow copying");
+            let copied = copied.copy_part_result().expect("copy part result");
+            assert_eq!(copied.e_tag(), source.e_tag());
+            assert!(copied.last_modified().is_some());
+        } else {
+            assert_eq!(
+                super::refusal(&result.expect_err("both permissions are required")),
+                (Some("AccessDenied".to_owned()), Some(403))
+            );
+        }
+    }
+    for (range, condition, code, status) in [
+        (Some("bytes=99-100"), None, "InvalidRange", 416),
+        (None, Some("\"wrong-etag\""), "PreconditionFailed", 412),
+    ] {
+        let error = root
+            .upload_part_copy()
+            .bucket(bucket)
+            .key("destination")
+            .upload_id(id)
+            .part_number(2)
+            .copy_source(format!("{bucket}/source"))
+            .set_copy_source_range(range.map(str::to_owned))
+            .set_copy_source_if_match(condition.map(str::to_owned))
+            .send()
+            .await
+            .expect_err("copy condition refusal");
+        assert_eq!(super::refusal(&error), (Some(code.to_owned()), Some(status)));
+    }
+    let parts = root
+        .list_parts()
+        .bucket(bucket)
+        .key("destination")
+        .upload_id(id)
+        .send()
+        .await
+        .expect("list copied parts");
+    assert_eq!(parts.parts().len(), 1, "refused copies must leave no second part");
+    assert_eq!(parts.parts()[0].size(), Some(9));
+    root.complete_multipart_upload()
+        .bucket(bucket)
+        .key("destination")
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(part(Some(1), source.e_tag().expect("source ETag")))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete copied upload");
+    let bytes = root
+        .get_object()
+        .bucket(bucket)
+        .key("destination")
+        .send()
+        .await
+        .expect("read copied object")
+        .body
+        .collect()
+        .await
+        .expect("complete copied body")
+        .into_bytes();
+    assert_eq!(bytes.as_ref(), b"copy-data");
+    server.shutdown().await;
+}
+
+#[test]
+#[serial_test::serial]
+fn legacy_upload_part_copy_wire_contract() {
+    with_stack(LEGACY, upload_part_copy_contract);
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_upload_part_copy_wire_contract() {
+    with_stack(super::GATEWAY, upload_part_copy_contract);
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_upload_part_copy_checks_source_owner() {
+    with_stack(super::GATEWAY, |server| async move {
+        const BUCKET: &str = "copy-part-source-owner";
+        create_bucket_in_the_store(BUCKET).await;
+        let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+        let owner = root
+            .get_bucket_acl()
+            .bucket(BUCKET)
+            .send()
+            .await
+            .expect("read source owner")
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("source owner ID")
+            .to_owned();
+        root.put_object()
+            .bucket(BUCKET)
+            .key("source")
+            .body(ByteStream::from_static(b"copy-data"))
+            .send()
+            .await
+            .expect("write source");
+        let upload = root
+            .create_multipart_upload()
+            .bucket(BUCKET)
+            .key("destination")
+            .send()
+            .await
+            .expect("create upload");
+        let id = upload.upload_id().expect("upload ID");
+        let denied = root
+            .upload_part_copy()
+            .bucket(BUCKET)
+            .key("destination")
+            .upload_id(id)
+            .part_number(1)
+            .copy_source(format!("{BUCKET}/source"))
+            .expected_source_bucket_owner("different-owner")
+            .send()
+            .await
+            .expect_err("wrong source owner must be denied");
+        assert_eq!(super::refusal(&denied), (Some("AccessDenied".to_owned()), Some(403)));
+        let parts = root
+            .list_parts()
+            .bucket(BUCKET)
+            .key("destination")
+            .upload_id(id)
+            .send()
+            .await
+            .expect("list upload parts");
+        assert!(parts.parts().is_empty(), "owner mismatch must not write a part");
+        let accepted = root
+            .upload_part_copy()
+            .bucket(BUCKET)
+            .key("destination")
+            .upload_id(id)
+            .part_number(1)
+            .copy_source(format!("{BUCKET}/source"))
+            .expected_source_bucket_owner(owner)
+            .send()
+            .await
+            .expect("matching source owner");
+        assert!(accepted.copy_part_result().and_then(|part| part.e_tag()).is_some());
+        let parts = root
+            .list_parts()
+            .bucket(BUCKET)
+            .key("destination")
+            .upload_id(id)
+            .send()
+            .await
+            .expect("list copied part");
+        assert_eq!(parts.parts().len(), 1);
+        assert_eq!(parts.parts()[0].size(), Some(9));
+        server.shutdown().await;
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_copy_object_checks_source_owner_before_overwriting() {
+    with_stack(super::GATEWAY, copy_object_checks_source_owner_before_overwriting);
+}
+
+#[test]
+#[serial_test::serial]
+fn legacy_copy_object_checks_source_owner_before_overwriting() {
+    with_stack(LEGACY, copy_object_checks_source_owner_before_overwriting);
+}
+
+async fn copy_object_checks_source_owner_before_overwriting(server: rustfs::embedded::RustFSServer) {
+    const SOURCE: &str = "copy-object-source-owner";
+    const DESTINATION: &str = "copy-object-owner-target";
+    create_bucket_in_the_store(SOURCE).await;
+    create_bucket_in_the_store(DESTINATION).await;
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let owner = root
+        .get_bucket_acl()
+        .bucket(SOURCE)
+        .send()
+        .await
+        .expect("read source bucket owner")
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("source owner ID")
+        .to_owned();
+    for (bucket, key, bytes) in [
+        (SOURCE, "source", b"source-data".as_slice()),
+        (DESTINATION, "existing", b"original".as_slice()),
+    ] {
+        root.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .expect("write copy fixture");
+    }
+    let denied = root
+        .copy_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner("different-owner")
+        .send()
+        .await
+        .expect_err("wrong source owner must be denied");
+    assert_eq!(super::refusal(&denied), (Some("AccessDenied".to_owned()), Some(403)));
+    let original = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .send()
+        .await
+        .expect("read destination after denial")
+        .body
+        .collect()
+        .await
+        .expect("read original bytes")
+        .into_bytes();
+    assert_eq!(original.as_ref(), b"original");
+    let denied_new = root
+        .copy_object()
+        .bucket(DESTINATION)
+        .key("not-created")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner("different-owner")
+        .send()
+        .await
+        .expect_err("wrong source owner must not create a destination");
+    assert_eq!(super::refusal(&denied_new), (Some("AccessDenied".to_owned()), Some(403)));
+    let missing = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("not-created")
+        .send()
+        .await
+        .expect_err("the denied copy must leave no object");
+    assert_eq!(super::refusal(&missing).1, Some(404));
+    root.copy_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner(owner)
+        .send()
+        .await
+        .expect("matching source owner permits copy");
+    let copied = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .send()
+        .await
+        .expect("read matching-owner copy")
+        .body
+        .collect()
+        .await
+        .expect("read copied bytes")
+        .into_bytes();
+    assert_eq!(copied.as_ref(), b"source-data");
+    server.shutdown().await;
 }

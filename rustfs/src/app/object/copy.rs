@@ -762,7 +762,7 @@ impl DefaultObjectUsecase {
         .await;
         if dsc.replicate_any() {
             insert_str(&mut user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(&mut user_defined, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
 
@@ -1186,7 +1186,7 @@ mod tests {
             .build()
             .expect("self-copy input should build");
         let mut req = build_request(input, Method::PUT);
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
+        req.extensions.insert(crate::storage::req_info::ReqInfo::default());
         fs.copy_object(&mut req)
             .await
             .expect("authorize self-copy whose object key equals its bucket");

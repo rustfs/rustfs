@@ -23,7 +23,7 @@
 use super::{
     Action, AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, HashMap,
     HeaderMap, ObjectOptions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, RemoteAddr, ReqInfo, RequestContext,
-    S3Action, S3ErrorCode, S3Request, S3Result, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
+    S3Action, S3ErrorCode, S3Request, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
     apply_copy_source_bucket_generation_guard, authorize_object_request, bucket_config_mutation_incarnation,
     capture_odm_read_generation, odm_read_generation, replication_request_authorized, request_context_from_req,
     resource_free_condition_values, retained_table_data_plane_publication_guards,
@@ -69,10 +69,10 @@ fn server_request(extensions: &mut http::Extensions) {
 /// The incarnation a reader bound, or the refusal's code and message.
 type Answer = Result<Option<uuid::Uuid>, (S3ErrorCode, String)>;
 
-fn answer<T>(result: S3Result<T>, bound: impl FnOnce(T) -> Option<uuid::Uuid>) -> Answer {
+fn answer<T>(result: rustfs_s3_types::S3Result<T>, bound: impl FnOnce(T) -> Option<uuid::Uuid>) -> Answer {
     result
         .map(bound)
-        .map_err(|err| (err.code().clone(), err.message().unwrap_or_default().to_owned()))
+        .map_err(|err| (err.code().clone().into(), err.message().unwrap_or_default().to_owned()))
 }
 
 fn refused(code: S3ErrorCode, message: &str) -> Answer {
@@ -147,7 +147,7 @@ fn bucket_generation_guard_reads_the_same_through_both_forms() {
                 legacy(|ext| {
                     ext.insert(guard(BUCKET));
                     ext.insert(PendingDeleteBucketGenerationGuard::Failed {
-                        code: S3ErrorCode::NoSuchBucket,
+                        code: S3ErrorCode::NoSuchBucket.into(),
                         message: "bucket is gone".to_owned(),
                     });
                 }),
@@ -227,7 +227,7 @@ fn odm_read_generation_reads_the_same_through_both_forms() {
                 "failed capture surfaces its error",
                 legacy(|ext| {
                     ext.insert(OdmReadGenerationGuard::Failed {
-                        code: S3ErrorCode::SlowDown,
+                        code: S3ErrorCode::SlowDown.into(),
                         message: "capture failed".to_owned(),
                     });
                 }),
@@ -292,7 +292,7 @@ fn installed_state_reads_back_through_the_envelope() {
     envelope.install_bucket_generation(guard(BUCKET));
     assert_eq!(bucket_fence(&envelope), Ok(Some(incarnation())));
     envelope.install_pending_delete_bucket_generation(PendingDeleteBucketGenerationGuard::Failed {
-        code: S3ErrorCode::NoSuchBucket,
+        code: S3ErrorCode::NoSuchBucket.into(),
         message: "bucket is gone".to_owned(),
     });
     assert_eq!(bucket_fence(&envelope), refused(S3ErrorCode::NoSuchBucket, "bucket is gone"));
@@ -444,8 +444,12 @@ async fn object_request_without_req_info_is_refused_in_both_forms() {
     let mut envelope = RequestEnvelope::from_s3s(&req);
     let action = Action::S3Action(S3Action::GetObjectAclAction);
     for result in [
-        authorize_object_request(&mut req, BUCKET, "key", Some("v1"), action).await,
-        authorize_object_request(&mut envelope, BUCKET, "key", Some("v1"), action).await,
+        authorize_object_request(&mut req, BUCKET, "key", Some("v1"), action)
+            .await
+            .map_err(super::S3Error::from),
+        authorize_object_request(&mut envelope, BUCKET, "key", Some("v1"), action)
+            .await
+            .map_err(super::S3Error::from),
     ] {
         let err = result.expect_err("a request without ReqInfo is refused");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -480,4 +484,92 @@ fn a_forked_envelope_reads_like_the_original_and_installs_alone() {
     assert_eq!(bucket_fence(&original), Ok(Some(incarnation())));
     assert_eq!(odm(&original), Ok(None));
     assert_eq!(original.req_info().and_then(|info| info.object.clone()), None);
+}
+
+#[test]
+fn resource_free_conditions_preserve_legacy_projection_and_erased_keystone_session_facts() {
+    for original_session in [None, Some(false), Some(true)] {
+        for forwarded in [false, true] {
+            let peer: SocketAddr = "192.0.2.9:9000".parse().unwrap();
+            let mut req = legacy(|ext| {
+                ext.insert(Some(RemoteAddr(peer)));
+                if forwarded {
+                    let mut client = ClientInfo::direct("198.51.100.9:443".parse().unwrap());
+                    client.forwarded_proto = Some("https".into());
+                    ext.insert(client);
+                }
+            });
+            for (name, value) in [
+                ("user-agent", "condition-client"),
+                ("referer", "https://example.test/"),
+                ("authorization", "original-authorization"),
+                ("x-amz-security-token", "header-session"),
+                ("x-amz-server-side-encryption-customer-key", "customer-key"),
+                ("x-amz-copy-source-server-side-encryption-customer-key", "source-key"),
+                ("x-amz-meta-tag", "retained-value"),
+            ] {
+                req.headers.insert(name, value.parse().unwrap());
+            }
+            let original = rustfs_credentials::Credentials {
+                access_key: "keystone:request-user".into(),
+                parent_user: "request-parent".into(),
+                session_token: if original_session == Some(true) {
+                    "original-session".into()
+                } else {
+                    String::new()
+                },
+                expiration: Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1)),
+                groups: Some(vec!["request-group".into()]),
+                claims: Some(HashMap::from([("keystone_roles".into(), serde_json::json!(["member"]))])),
+                ..Default::default()
+            };
+            let mut credential = original.clone();
+            if original_session.is_some() {
+                credential.session_token.clear();
+            }
+            req.extensions.insert(ReqInfo {
+                cred: Some(credential.clone()),
+                keystone_session_present: original_session,
+                ..Default::default()
+            });
+            let without_clock = |mut values: HashMap<String, Vec<String>>| {
+                assert!(
+                    time::OffsetDateTime::parse(
+                        values.get("CurrentTime").unwrap()[0].as_str(),
+                        &time::format_description::well_known::Rfc3339
+                    )
+                    .is_ok()
+                );
+                assert!(values.get("EpochTime").unwrap()[0].parse::<i64>().is_ok());
+                values.remove("CurrentTime");
+                values.remove("EpochTime");
+                values
+            };
+            let expected = without_clock(crate::auth::get_condition_values_with_client_info(
+                &req.headers,
+                &original,
+                None,
+                None,
+                req.remote_addr(),
+                req.client_info(),
+            ));
+            let actual = without_clock(resource_free_condition_values(&req, &credential));
+            assert_eq!(actual, expected, "session={original_session:?}, forwarded={forwarded}");
+            assert_eq!(
+                without_clock(resource_free_condition_values(&RequestEnvelope::from_s3s(&req), &credential)),
+                expected
+            );
+            assert_eq!(
+                actual.get("username").unwrap(),
+                &vec![
+                    if original_session == Some(true) {
+                        "request-parent"
+                    } else {
+                        "keystone:request-user"
+                    }
+                    .to_owned()
+                ]
+            );
+        }
+    }
 }

@@ -21,6 +21,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 
+/// A backend-owned transaction for one named group. Persistence must fail if its lock is lost.
+#[async_trait::async_trait]
+pub trait GroupEdit: Send + Sync {
+    async fn save(&self, group: &GroupInfo) -> Result<()>;
+    /// Remove the policy mapping, then the group record, after the caller verified emptiness.
+    async fn delete_empty(&self) -> Result<()>;
+}
+
 #[async_trait::async_trait]
 pub trait Store: Clone + Send + Sync + 'static {
     fn has_watcher(&self) -> bool;
@@ -34,6 +42,11 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
 
     async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;
+    /// Create a regular identity or replace one without changing its persisted status.
+    /// Return whether a previous secret was replaced. Backends without conditional writes fail closed.
+    async fn save_regular_user_preserving_status(&self, _name: &str, _item: &UserIdentity) -> Result<bool> {
+        Err(crate::error::Error::IAMActionNotAllowed)
+    }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
 
@@ -41,6 +54,12 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_secret_key(&self, name: &str, user_type: UserType) -> Result<String>;
 
+    /// Serialize edits to this group across all writers sharing the backend, then read its
+    /// durable state. Only confirmed absence yields `None`. Keep the returned guard through
+    /// save/delete and local cache publication; dropping it releases the transaction lock.
+    async fn begin_group_edit(&self, _name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+        Err(crate::error::Error::other("backend does not support serialized group edits"))
+    }
     async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()>;
     async fn delete_group_info(&self, name: &str) -> Result<()>;
     async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()>;

@@ -169,36 +169,34 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     {
         return Err(Error::CorruptedFormat);
     }
-    if matches!(format_quorum, Some(Err(Error::ErasureReadQuorum)))
-        && let Some((format, members)) = select_existing_format_read_quorum(&formats, &errs, set_drive_count)
-    {
-        retain_format_quorum_members(
-            instance_ctx,
-            disks,
-            &format,
-            &members,
-            Some(&unformatted_bootstrap_routes),
-            set_drive_count,
-        )
-        .await?;
-        // Loading an existing format grants no authority to initialize pool
-        // metadata or migrate formats. The persisted storage classes and each
-        // object's EC metadata still determine service and operation quorums.
-        return Ok(LoadedFormat {
-            format,
-            pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::None,
-        });
-    }
-    let resumable_partial_migration = formats_present > 0
+    let native_read_candidate = if matches!(format_quorum, Some(Err(Error::ErasureReadQuorum))) {
+        select_existing_format_read_quorum(&formats, &errs, set_drive_count)
+    } else {
+        None
+    };
+    let partial_native_with_blanks = formats_present > 0
         && errs.iter().any(|error| matches!(error, Some(DiskError::UnformattedDisk)))
-        && format_quorum.as_ref().is_some_and(Result::is_err)
+        && format_quorum.as_ref().is_some_and(Result::is_err);
+    let resumable_partial_migration = partial_native_with_blanks
         && formats.iter().zip(&errs).all(|(format, error)| {
             format.is_some() || matches!(error, Some(DiskError::UnformattedDisk | DiskError::DiskNotFound))
         });
 
-    if first_disk && (all_unformatted || resumable_partial_migration) {
+    let allow_migration = first_disk && (all_unformatted || resumable_partial_migration);
+    if partial_native_with_blanks && !allow_migration && native_read_candidate.is_none() {
+        return Err(Error::ErasureReadQuorum);
+    }
+    if allow_migration || (partial_native_with_blanks && native_read_candidate.is_some()) {
         info!(all_unformatted, resumable_partial_migration, "checking for a legacy storage format");
-        match try_migrate_format(disks, &formats, set_count, set_drive_count).await {
+        let mode = match native_read_candidate.as_ref() {
+            Some((reference, _)) => LegacyFormatMode::NativeRead {
+                reference,
+                native_errors: &errs,
+                allow_migration,
+            },
+            None => LegacyFormatMode::Migration,
+        };
+        match try_migrate_format(disks, &formats, set_count, set_drive_count, mode).await {
             Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
                 retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, None, set_drive_count).await?;
@@ -217,10 +215,10 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
                 );
                 return Err(Error::CorruptedFormat);
             }
-            Ok(LegacyFormatOutcome::None) => {}
+            Ok(LegacyFormatOutcome::None | LegacyFormatOutcome::ReadCompatible) => {}
             Err(e) => return Err(e),
         }
-        if fresh_bootstrap_proven {
+        if first_disk && fresh_bootstrap_proven {
             let fm = init_format_erasure(instance_ctx, disks, set_count, set_drive_count, deployment_id).await?;
             return Ok(LoadedFormat {
                 format: fm,
@@ -229,6 +227,26 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
         }
     }
 
+    // Resolve legacy migration before admitting native reads. Blank replacement
+    // slots contribute no votes and receive no formatting/bootstrap authority.
+    if let Some((format, members)) = native_read_candidate {
+        retain_format_quorum_members(
+            instance_ctx,
+            disks,
+            &format,
+            &members,
+            Some(&unformatted_bootstrap_routes),
+            set_drive_count,
+        )
+        .await?;
+        // Loading an existing format grants no authority to initialize pool
+        // metadata or migrate formats. The persisted storage classes and each
+        // object's EC metadata still determine service and operation quorums.
+        return Ok(LoadedFormat {
+            format,
+            pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::None,
+        });
+    }
     info!(
         "first_disk: {}, should_init_erasure_disks: {}",
         first_disk,
@@ -271,9 +289,11 @@ async fn verified_legacy_adoption_source(
     set_count: usize,
     set_drive_count: usize,
 ) -> Result<PoolMetaBootstrapAuthority> {
-    match try_migrate_format(disks, rustfs_formats, set_count, set_drive_count).await {
+    match try_migrate_format(disks, rustfs_formats, set_count, set_drive_count, LegacyFormatMode::Migration).await {
         Ok(LegacyFormatOutcome::Migrated { .. }) => Ok(PoolMetaBootstrapAuthority::LegacyAdoption),
-        Ok(LegacyFormatOutcome::None | LegacyFormatOutcome::Incompatible) => Ok(PoolMetaBootstrapAuthority::None),
+        Ok(LegacyFormatOutcome::None | LegacyFormatOutcome::ReadCompatible | LegacyFormatOutcome::Incompatible) => {
+            Ok(PoolMetaBootstrapAuthority::None)
+        }
         Err(err) => {
             debug!(
                 error = %err,
@@ -443,25 +463,49 @@ enum LegacyFormatOutcome {
     /// version mismatch, or a parse failure). The caller must decide how to
     /// proceed; creating a fresh format would leave the legacy objects unreadable.
     Incompatible,
+    /// Observed legacy formats agree with the native read quorum, without granting writer authority.
+    ReadCompatible,
     /// No MinIO `format.json` was present on any disk (a normal fresh install).
     None,
+}
+
+/// Native reads validate observed legacy identities without electing a migration writer.
+enum LegacyFormatMode<'a> {
+    Migration,
+    NativeRead {
+        reference: &'a FormatV3,
+        native_errors: &'a [Option<DiskError>],
+        allow_migration: bool,
+    },
 }
 
 /// Tries to migrate an on-disk MinIO `format.json` into RustFS format files.
 ///
 /// Returns [`LegacyFormatOutcome`] describing whether a legacy format was present
 /// and, if so, whether it was compatible. `Err` is returned for read or persist
-/// failures that prevent a conclusive migration decision.
+/// failures that prevent a conclusive migration decision. Native read admission
+/// checks every observed legacy format against its existing layout and tolerates
+/// unavailable nonvoters. Migration requires complete observations and a strict majority.
 async fn try_migrate_format(
     disks: &[Option<DiskStore>],
     rustfs_formats: &[Option<FormatV3>],
     set_count: usize,
     set_drive_count: usize,
+    mode: LegacyFormatMode<'_>,
 ) -> Result<LegacyFormatOutcome> {
+    let (native_reference, native_errors, allow_migration) = match mode {
+        LegacyFormatMode::Migration => (None, None, true),
+        LegacyFormatMode::NativeRead {
+            reference,
+            native_errors,
+            allow_migration,
+        } => (Some(reference), Some(native_errors), allow_migration),
+    };
     let legacy_format_max_bytes = legacy_format_max_bytes(disks.len())?;
     let mut legacy_seen = false;
     let mut invalid_legacy_format = false;
     let mut read_error: Option<Error> = None;
+    let mut unavailable_error = None;
     let mut legacy_formats = vec![None; disks.len()];
 
     let reads = stream::iter(
@@ -473,6 +517,13 @@ async fn try_migrate_format(
                 let Some(disk) = disk else {
                     return (index, None);
                 };
+                // Native format loading already proved this peer unavailable.
+                // Reuse that observation and keep it ineligible for migration.
+                if let Some(error) = native_errors.and_then(|errors| errors.get(index)).and_then(Option::as_ref)
+                    && is_network_like_disk_error(error)
+                {
+                    return (index, Some(Err(error.clone())));
+                }
                 let reader = match disk.read_file(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
                     Ok(reader) => reader,
                     Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return (index, None),
@@ -512,6 +563,9 @@ async fn try_migrate_format(
         match read {
             Ok(Some(format)) => legacy_formats[index] = Some(format),
             Ok(None) => invalid_legacy_format = true,
+            Err(err) if native_reference.is_some() && is_network_like_disk_error(&err) => {
+                unavailable_error.get_or_insert(err);
+            }
             Err(err) => {
                 read_error.get_or_insert_with(|| err.into());
             }
@@ -526,6 +580,15 @@ async fn try_migrate_format(
     }
     if invalid_legacy_format {
         return Ok(LegacyFormatOutcome::Incompatible);
+    }
+
+    if let Some(reference) = native_reference {
+        if !formats_match_reference_slots(&legacy_formats, reference, 0) {
+            return Ok(LegacyFormatOutcome::Incompatible);
+        }
+        if !allow_migration || unavailable_error.is_some() || legacy_formats.iter().flatten().count() <= disks.len() / 2 {
+            return Ok(LegacyFormatOutcome::ReadCompatible);
+        }
     }
 
     let format = match get_format_erasure_in_quorum(&legacy_formats, 0) {
@@ -677,7 +740,7 @@ fn select_existing_format_read_quorum(
         || check_format_erasure_value_for_topology(reference, formats.len(), set_drive_count).is_err()
         || formats.iter().zip(errors).any(|(format, error)| match (format, error) {
             (Some(_), None) => false,
-            (None, Some(DiskError::DiskNotFound)) => false,
+            (None, Some(DiskError::DiskNotFound | DiskError::UnformattedDisk)) => false,
             (None, Some(error)) => !is_network_like_disk_error(error),
             _ => true,
         })
@@ -1445,13 +1508,23 @@ mod tests {
     }
 
     #[test]
-    fn existing_format_read_quorum_rejects_conflicts_invalid_slots_and_blank_disks() {
+    fn existing_format_read_quorum_excludes_blank_and_network_unavailable_slots() {
+        let (formats, mut errors) = half_pool_formats();
+        errors[2] = Some(DiskError::UnformattedDisk);
+        errors[3] = Some(DiskError::Timeout);
+        let (_, members) = select_existing_format_read_quorum(&formats, &errors, 4)
+            .expect("blank and unreachable slots cannot block an existing native read quorum");
+        assert!(!members[2] && !members[3]);
+        assert_eq!(members.iter().filter(|member| **member).count(), 12);
+    }
+
+    #[test]
+    fn existing_format_read_quorum_rejects_conflicts_and_invalid_slots() {
         for failure in [
             "conflict",
             "wrong_slot",
             "nil",
             "duplicate",
-            "blank",
             "corrupt",
             "access_denied",
             "tie",
@@ -1473,7 +1546,6 @@ mod tests {
                         format.erasure.sets[5][3] = format.erasure.sets[0][0];
                     }
                 }
-                "blank" => errors[2] = Some(DiskError::UnformattedDisk),
                 "corrupt" => errors[2] = Some(DiskError::CorruptedFormat),
                 "access_denied" => errors[2] = Some(DiskError::FileAccessDenied),
                 "tie" => {
@@ -1529,6 +1601,186 @@ mod tests {
                 assert_eq!(disks.iter().flatten().count(), 12);
                 assert_eq!(format_bytes(&all_disks).await, before, "read startup must never rewrite formats");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_format_read_quorum_quarantines_blank_replacement_without_writes() {
+        for first_disk in [false, true] {
+            for surviving_slot in 0..2 {
+                let (_directory, mut disks) = local_disks_with_set_width(2, 2).await;
+                let blank = 1 - surviving_slot;
+                let mut format = FormatV3::new(1, 2);
+                format.erasure.this = format.erasure.sets[0][surviving_slot];
+                save_format_file(&disks[surviving_slot], &Some(format.clone()))
+                    .await
+                    .expect("persist surviving format");
+                let original = disks.clone();
+                let before = format_bytes(&original).await;
+                let loaded = connect_load_init_formats_with_instance_ctx(
+                    &Arc::new(InstanceContext::new()),
+                    first_disk,
+                    &mut disks,
+                    1,
+                    2,
+                    None,
+                )
+                .await
+                .expect("existing native format must load at read quorum with a blank replacement");
+                assert_eq!(loaded.format.shared_identity(), format.shared_identity());
+                assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
+                assert!(disks[surviving_slot].is_some());
+                assert!(disks[blank].is_none(), "blank replacement cannot vote or serve data");
+                assert_eq!(format_bytes(&original).await, before, "read admission cannot write either format");
+                assert!(matches!(
+                    load_format_erasure(original[blank].as_ref().expect("blank handle"), false).await,
+                    Err(DiskError::UnformattedDisk)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_read_quorum_with_blank_and_unavailable_slots_validates_legacy_without_writes() {
+        for first_disk in [false, true] {
+            for scenario in [
+                "native-remote",
+                "legacy-missing",
+                "foreign-remote",
+                "corrupt-remote",
+                "wrong-slot-missing",
+            ] {
+                let (_directory, mut disks) = local_disks_with_set_width(4, 4).await;
+                let reference = FormatV3::new(1, 4);
+                for slot in 0..2 {
+                    let mut format = reference.clone();
+                    format.erasure.this = format.erasure.sets[0][slot];
+                    save_format_file(&disks[slot], &Some(format.clone()))
+                        .await
+                        .expect("persist native read quorum");
+                    if scenario != "native-remote" {
+                        write_legacy_format(&disks[slot], &format).await;
+                    }
+                }
+                match scenario {
+                    "foreign-remote" => {
+                        let mut foreign = FormatV3::new(1, 4);
+                        foreign.erasure.this = foreign.erasure.sets[0][2];
+                        write_legacy_format(&disks[2], &foreign).await;
+                    }
+                    "corrupt-remote" => write_legacy_bytes(&disks[2], bytes::Bytes::from_static(b"corrupt legacy")).await,
+                    "wrong-slot-missing" => {
+                        let mut wrong_slot = reference.clone();
+                        wrong_slot.erasure.this = reference.erasure.sets[0][0];
+                        write_legacy_format(&disks[2], &wrong_slot).await;
+                    }
+                    _ => {}
+                }
+                let original = disks.clone();
+                let before = format_bytes(&original).await;
+                if scenario.ends_with("remote") {
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve unavailable peer address");
+                    let address = listener.local_addr().expect("peer address");
+                    drop(listener);
+                    let mut endpoint = Endpoint::try_from(format!("http://{address}/disk").as_str()).expect("remote endpoint");
+                    endpoint.is_local = false;
+                    endpoint.set_pool_index(0);
+                    endpoint.set_set_index(0);
+                    endpoint.set_disk_index(3);
+                    let remote = crate::cluster::rpc::RemoteDisk::new(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                        Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
+                    )
+                    .await
+                    .expect("construct unavailable remote handle");
+                    let remote = Arc::new(crate::disk::Disk::Remote(Box::new(remote)));
+                    let error = remote
+                        .read_all(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
+                        .await
+                        .expect_err("remote peer must be unavailable");
+                    assert!(is_network_like_disk_error(&error), "expected unavailable peer, got {error:?}");
+                    disks[3] = Some(remote);
+                } else {
+                    disks[3] = None;
+                }
+                let result = connect_load_init_formats_with_instance_ctx(
+                    &Arc::new(InstanceContext::new()),
+                    first_disk,
+                    &mut disks,
+                    1,
+                    4,
+                    None,
+                )
+                .await;
+                if matches!(scenario, "native-remote" | "legacy-missing") {
+                    let loaded = result.unwrap_or_else(|error| panic!("{scenario} must admit native reads: {error:?}"));
+                    assert_eq!(loaded.format.shared_identity(), reference.shared_identity());
+                    assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
+                    assert!(disks[..2].iter().all(Option::is_some));
+                    assert!(disks[2..].iter().all(Option::is_none), "unavailable and blank slots cannot vote");
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::CorruptedFormat)),
+                        "{scenario} observed legacy evidence must reject reads"
+                    );
+                }
+                assert_eq!(format_bytes(&original).await, before, "{scenario} cannot write native formats");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_native_format_with_legacy_quorum_reads_without_migration_writes() {
+        let (_directory, mut disks) = local_disks_with_set_width(2, 2).await;
+        let legacy = FormatV3::new(1, 2);
+        write_legacy_majority(&disks, &legacy).await;
+        let mut native = legacy.clone();
+        native.erasure.this = native.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(native))
+            .await
+            .expect("persist partial native format");
+        let original = disks.clone();
+        let before = format_bytes(&disks).await;
+        let loaded =
+            connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), false, &mut disks, 1, 2, None)
+                .await
+                .expect("follower can read the existing native layout without migrating legacy formats");
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
+        assert!(disks[0].is_some() && disks[1].is_none(), "legacy-only slots cannot vote for native reads");
+        assert_eq!(format_bytes(&original).await, before, "follower legacy inspection cannot persist formats");
+    }
+
+    #[tokio::test]
+    async fn follower_below_native_read_quorum_skips_legacy_reads_without_writes() {
+        let (_directory, mut disks) = local_disks_with_set_width(3, 3).await;
+        let mut format = FormatV3::new(1, 3);
+        format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(format))
+            .await
+            .expect("persist one native format below the two-drive read quorum");
+        for disk in &disks {
+            write_legacy_bytes(disk, bytes::Bytes::from_static(b"invalid legacy format")).await;
+        }
+        let before = format_bytes(&disks).await;
+
+        let result = connect_load_init_formats(false, &mut disks, 1, 3, None).await;
+
+        assert!(
+            matches!(result, Err(Error::ErasureReadQuorum)),
+            "a non-reader must reject quorum before probing corrupt legacy files"
+        );
+        assert_eq!(format_bytes(&disks).await, before);
+        for disk in disks.iter().flatten() {
+            assert_eq!(
+                disk.read_all(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE)
+                    .await
+                    .expect("legacy bytes must remain untouched"),
+                bytes::Bytes::from_static(b"invalid legacy format")
+            );
         }
     }
 
@@ -2375,7 +2627,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_format_migration_resumes_partial_rustfs_writes() {
-        for drive_count in [3, 4] {
+        for drive_count in [2, 3, 4] {
             let (_temp_dir, mut disks) = local_disks(drive_count).await;
             let legacy = FormatV3::new(1, drive_count);
             write_legacy_majority(&disks, &legacy).await;
@@ -2434,23 +2686,32 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_format_migration_rejects_a_foreign_partial_rustfs_format() {
-        let (_temp_dir, mut disks) = local_disks(3).await;
-        let legacy = FormatV3::new(1, 3);
-        write_legacy_majority(&disks, &legacy).await;
-        let mut foreign = FormatV3::new(1, 3);
-        foreign.erasure.this = foreign.erasure.sets[0][0];
-        let foreign_id = foreign.id;
-        save_format_file(&disks[0], &Some(foreign))
-            .await
-            .expect("foreign partial RustFS format should be written");
+        for first_disk in [false, true] {
+            for drive_count in [2, 3] {
+                let (_temp_dir, mut disks) = local_disks(drive_count).await;
+                let legacy = FormatV3::new(1, drive_count);
+                write_legacy_majority(&disks, &legacy).await;
+                let mut foreign = FormatV3::new(1, drive_count);
+                foreign.erasure.this = foreign.erasure.sets[0][0];
+                let foreign_id = foreign.id;
+                save_format_file(&disks[0], &Some(foreign))
+                    .await
+                    .expect("foreign partial RustFS format should be written");
 
-        assert!(matches!(
-            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
-            Err(Error::CorruptedFormat)
-        ));
-        let (formats, _) = load_format_erasure_all(&disks, false).await;
-        assert_eq!(formats[0].as_ref().map(|format| format.id), Some(foreign_id));
-        assert!(formats[1..].iter().all(Option::is_none), "foreign partial state must not be extended");
+                let result = connect_load_init_formats(first_disk, &mut disks, 1, drive_count, None).await;
+                if !first_disk && drive_count == 3 {
+                    assert!(matches!(result, Err(Error::ErasureReadQuorum)), "a follower below read quorum must wait");
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::CorruptedFormat)),
+                        "an eligible reader or migration writer must reject the foreign legacy layout"
+                    );
+                }
+                let (formats, _) = load_format_erasure_all(&disks, false).await;
+                assert_eq!(formats[0].as_ref().map(|format| format.id), Some(foreign_id));
+                assert!(formats[1..].iter().all(Option::is_none), "foreign partial state must not be extended");
+            }
+        }
     }
 
     #[tokio::test]

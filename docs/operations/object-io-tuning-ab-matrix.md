@@ -68,6 +68,7 @@ iostat -xz 5 > telemetry/iostat.txt &
 
 | Knob | Default | Controls | Validating stage | Risk if widened |
 | --- | --- | --- | --- | --- |
+| `RUSTFS_ERASURE_SHARD_BYTES` | `0` | `erasure_block_size_for` in `crates/filemeta/src/fileinfo.rs` derives a new user-object block from data-shard count times this byte value. Zero selects the historical 1 MiB block. Validation limits live in `crates/config/src/constants/object.rs`. Cached at first use. | Stripe count, `erasure_encode_cpu`, GET path, range bytes, TTFB and RSS | Changes geometry across pools and storage classes, direct-write eligibility and bitrot frame size |
 | `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` | 32MiB (`crates/ecstore/src/erasure/coding/encode.rs`) | EC encode producer/consumer memory budget (blocks queued between encode and shard write) | `set_disk_encode` P95 + `rustfs_ec_encode_inflight_bytes_current` | RSS growth under high concurrency |
 | `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST` | `true` | Streaming encode reads into an owned, EC-sized buffer, avoiding the input-to-encoder block copy. Set `false` to select the previous streaming Vec ingest path; batched encode always uses owned buffers. Cached at first use. | `erasure_encode_cpu`, PUT throughput and RSS | No disk-format change; queue budget does not bound total process memory |
 | `RUSTFS_OBJECT_IO_BUFFER_SIZE` | 128KiB (`crates/config/src/constants/object.rs`) | Streaming read-in / write-out block size | `ingress_prepare`, `set_disk_encode` | Larger buffers = fewer polls, more resident memory |
@@ -107,6 +108,38 @@ Collect detailed diagnostics in dedicated rounds with `RUSTFS_OBS_PUT_STAGE_METR
 | `rustfs_disk_fsync_idle_spin_duration_ms` | Elapsed time in the spin loop, including any descheduling. Interpret alongside on-CPU profiles. |
 
 These metrics cover the disk queue's Fsync lane. Direct fsync dispatches and cleanup work on the Isolated lane require their own stage observations. Peak gauges are process-lifetime high-water marks for workers whose diagnostics started while the detailed PUT gate was enabled, including startup and warmup. A retiring closure and its replacement can briefly overlap in this count while execution concurrency remains bounded. Restart each server per leg to establish a fresh lifetime. Guards finish accounting on normal exit and panic, including when the gate is disabled while a measured worker remains alive. Diagnostics use atomic accounting and cached metric handles outside the disk queue mutex; the recorder may acquire its own publication locks. Hold this observation overhead consistent within diagnostic comparisons.
+
+#### Erasure block geometry experiment
+
+The [isolated Docker inline lab](../../.docker/inline-lab/README.md) provides a frozen-source image and an owned external deployment adapter for the existing ABBA runner.
+
+Freeze the inline per-shard budget, durability mode, codec mode, queue budget, and binary before changing `RUSTFS_ERASURE_SHARD_BYTES`. Use integer bytes for this setting. `configured_erasure_shard_bytes` validates its alignment and upper bound and caches the result. Restart the tested processes and create each leg's measurement dataset after the new geometry is active. Existing versions and active multipart uploads retain their recorded geometry, so pre-existing GET data cannot establish the new-write behavior.
+
+The setting applies to every newly constructed user-object geometry. A fixed shard value produces different block sizes for different data-shard counts, including different storage classes in one pool. Record the persisted block size in each test cell. The per-shard placement budget and body materialization limits are separate contracts. Verified inline body reuse is bounded to 2 MiB and 32 frames. Trace metadata body verification and subsequent body decoding together, including reuse within the selected version snapshot.
+
+Use one candidate shard value per ABBA run, starting with a small change appropriate to the target geometry. Include full GET, PUT, small Range GET, versioned objects, multipart, transformed objects, degraded reads and a reader rollback fixture. Large blocks reduce stripe transitions while expanding read/verification granularity and the maximum single-block direct-write input. The streaming queue has a minimum of one expanded block, and direct paths have their own buffering. Validate RSS, CPU scheduling, first-byte latency and error counts alongside throughput.
+
+The pinned MinIO Community comparison uses a 1 MiB block for new objects. Its inline buffer writers can accumulate multiple blocks while the total erasure shard remains within the storage-class budget. RustFS supports bounded multi-block inline for known-length unprotected PUTs at its default 1 MiB block. The accumulated data-shard budget is 128 KiB, reduced to 16 KiB for versioned writes. EC12+4 therefore admits up to 1,572,856 logical bytes, with each bitrot frame header additionally charged to the bounded writer. Transformed and proof-protected writes retain their existing single-block admission contract. A geometry override is an independently measured configuration experiment with its own read-path and compatibility results. [MinIO object geometry](https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/storage-datatypes.go#L388-L399) and [inline writer selection](https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/erasure-object.go#L1398-L1440).
+
+For transport comparisons, keep geometry fixed and independently evaluate JSON compatibility mode and the existing MessagePack-only flag pair. Inline RenameData carries its data through metadata RPCs, so JSON serialization and duplicate payloads can outweigh the saved part-file I/O. The Docker lab pins and checks both transport flags on every node. Use its version, geometry and multipart manifests for mixed-reader and full-reader rollback checks before a performance run. Restore JSON compatibility mode before introducing an older peer and record the oldest reader actually tested.
+
+#### Borrowed inline verification kernel
+
+The inline verifier operates on already loaded frame slices. Its manual ABBA comparison exercises the streaming verifier and the borrowed verifier over identical 4 KiB and 128 KiB shard payloads. Capture the reported debug/release profile, iteration counts, elapsed times and baseline drift. This measures frame verification CPU and copying costs. End-to-end acceptance uses the fixed-condition Docker ABBA matrix with request errors, throughput and tail latency recorded for every leg.
+
+```bash
+cargo test -p rustfs-ecstore --lib --features test-util \
+  inline_bitrot_borrowed_verification_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+For batch-delete codec acceptance, run `delete_versions_request_encoding_preserves_batches_and_fleet_guards` to verify the emitted fields, named-map options and encoded byte counts. Run `delete_versions_wire_roundtrip_preserves_json_and_binary_only_batches` in the `rustfs` library tests to exercise the actual remote sender, protobuf handler and disk mutation with both codec modes. Its retained-object oracle protects against deleting an unselected entry. Deploy JSON compatibility mode during mixed-version and old-reader tests, then confirm the homogeneous upgraded fleet before enabling binary-only batches as described in the [codec convergence runbook](internode-msgpack-json-convergence-runbook.md).
+
+```bash
+cargo nextest run -p rustfs-ecstore --lib --features test-util --no-tests fail \
+  -E 'test(delete_versions_request_encoding_preserves_batches_and_fleet_guards)'
+NO_PROXY='*' no_proxy='*' cargo nextest run -p rustfs --lib --features gateway-stack --no-tests fail \
+  -E 'test(delete_versions_wire_roundtrip_preserves_json_and_binary_only_batches)'
+```
 
 ### 5.2 GET
 

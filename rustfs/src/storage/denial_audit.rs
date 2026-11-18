@@ -20,6 +20,7 @@
 //! counted and the count is carried on the next entry that is let through.
 
 use crate::module_switches::is_audit_module_enabled;
+use crate::storage::authorization::{AuthorizationRequest, req_info_mut};
 use crate::storage::helper::{
     AuditRequestView, DenialRequest, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
     spawn_background_with_context,
@@ -27,6 +28,7 @@ use crate::storage::helper::{
 use crate::storage::request_context::RequestContext;
 use rustfs_audit::{AuditEntry, global::AuditLogger};
 use rustfs_policy::policy::action::Action;
+use rustfs_s3_types::S3Result;
 use serde_json::Value;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -212,6 +214,51 @@ impl DenialAuditor {
                 .insert(SUPPRESSED_DENIALS_TAG.to_string(), Value::from(suppressed));
         }
         (self.emit)(req.request_context(), entry);
+    }
+}
+
+/// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
+///
+/// `start_owned` marks the request so per-key denials are logged but not audited; `finish_owned` clears the
+/// mark and emits one entry per denied action with the number of keys refused for it.
+pub(crate) struct BulkDenialAudit {
+    denied: Vec<(Action, u64)>,
+}
+
+impl BulkDenialAudit {
+    pub(crate) fn start_owned<R: AuthorizationRequest + ?Sized>(request: &mut R) -> S3Result<Self> {
+        req_info_mut(request)?.suppress_denial_audit = true;
+        Ok(Self { denied: Vec::new() })
+    }
+
+    /// Counts one refused key for `action`.
+    pub(crate) fn denied(&mut self, action: Action) {
+        match self.denied.iter_mut().find(|(denied_action, _)| *denied_action == action) {
+            Some((_, count)) => *count += 1,
+            None => self.denied.push((action, 1)),
+        }
+    }
+
+    pub(crate) fn finish_owned<R: AuthorizationRequest + ?Sized>(
+        self,
+        request: &mut R,
+        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
+    ) -> S3Result<()> {
+        self.finish_owned_with(request, audit_view, DenialAuditor::global())
+    }
+
+    pub(crate) fn finish_owned_with<R: AuthorizationRequest + ?Sized>(
+        self,
+        request: &mut R,
+        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
+        auditor: &DenialAuditor,
+    ) -> S3Result<()> {
+        req_info_mut(request)?.suppress_denial_audit = false;
+        let view = audit_view(request);
+        for (action, keys) in self.denied {
+            auditor.audit_owned(&view, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
+        }
+        Ok(())
     }
 }
 

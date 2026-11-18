@@ -59,14 +59,17 @@ use crate::storage_api::table::{
     StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 
+mod background;
 mod cleanup_metadata;
 mod error;
 mod iceberg;
 mod identifier;
 mod maintenance;
 mod model;
+mod rename_recovery;
 mod store;
 
+pub(crate) use background::CatalogBackgroundTask;
 pub use error::{CatalogIdentifierError, TableObjectMutationError};
 pub(crate) use error::{TableCatalogStoreError, TableCatalogStoreResult};
 pub(crate) use iceberg::*;
@@ -82,6 +85,7 @@ pub(crate) use identifier::{
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;
+pub(crate) use rename_recovery::spawn_table_rename_recovery;
 pub(crate) use store::*;
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;

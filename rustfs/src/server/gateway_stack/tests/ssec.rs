@@ -30,6 +30,10 @@ struct KeyProbe(AtomicUsize);
 
 impl Handler<dto::GetObject> for KeyProbe {
     async fn call(&self, request: Req<dto::GetObject>) -> HandlerResult<dto::GetObject> {
+        // The builder has authorized this probe; answer its deferred refusal before reading the key.
+        if let Some(refusal) = request.sse().deferred_refusal() {
+            return Err(refusal.error().clone());
+        }
         let value = request.context().headers().iter_raw().find(|(name, _)| name.as_str() == KEY);
         let matches = value.is_some_and(|(_, value)| {
             base64_simd::STANDARD
@@ -55,9 +59,12 @@ fn ssec_deployment_policy_and_key_handoff() {
                     Arc::new(ScriptedIam { ready: true }),
                     root().source(),
                     rustfs_gateway::allow_when(|request| request.operation == "GetObject" && request.identity.is_some()),
+                    std::convert::identity,
                 )
                 .expect("the production builder assembles");
                 let stack = GatewayStack {
+                    keystone_auth: None,
+                    control_plane: false,
                     service: builder
                         .register::<dto::GetObject, _>(Arc::clone(&probe))
                         .build()
@@ -76,6 +83,12 @@ fn ssec_deployment_policy_and_key_handoff() {
                         (true, Some("missing"), true),
                         (false, None, false),
                         (true, None, false),
+                        (false, Some("malformed"), false),
+                        (true, Some("malformed"), false),
+                        (false, Some("digest"), false),
+                        (true, Some("digest"), false),
+                        (false, Some("missing"), false),
+                        (true, Some("missing"), false),
                     ] {
                         if !outer && secure {
                             continue;
@@ -152,18 +165,27 @@ fn ssec_deployment_policy_and_key_handoff() {
                         assert_eq!(
                             status,
                             expected_status,
-                            "outer={outer} setting={setting:?} secure={secure} invalid={invalid:?} authenticated={authenticated} code={observed_code} prior_handler_calls={before}"
+                            "outer={outer} setting={setting:?} secure={secure} invalid={invalid:?} authenticated={authenticated} code={observed_code} prior_key_handoffs={before}"
                         );
-                        assert_eq!(probe.0.load(Ordering::SeqCst) - before, usize::from(allowed), "handler invocation count");
+                        assert_eq!(probe.0.load(Ordering::SeqCst) - before, usize::from(allowed), "key handoff count");
                         if !allowed {
                             let code = if !secure && setting == Some("true") {
                                 "InvalidRequest"
                             } else if !authenticated {
                                 "AccessDenied"
                             } else {
-                                "InvalidArgument"
+                                "InvalidRequest"
                             };
                             assert_eq!(observed_code, code, "the refusal code");
+                            if authenticated && (secure || setting != Some("true")) {
+                                let message = match invalid {
+                                    Some("malformed") => "Invalid SSE-C key: not valid Base64.",
+                                    Some("digest") => "The calculated MD5 hash of the key did not match the hash that was provided.",
+                                    Some("missing") => "Missing SSE-C parameters. Algorithm, customer key and customer key MD5 are all required.",
+                                    _ => unreachable!("only invalid customer keys reach this refusal"),
+                                };
+                                assert!(text.contains(&format!("<Message>{message}</Message>")), "the refusal message");
+                            }
                         }
 
                         assert!(

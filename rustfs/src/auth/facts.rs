@@ -383,9 +383,17 @@ impl<'a> AuthzPrincipal<'a> {
     /// `root_access_key` is the deployment's root access key, empty when it is
     /// not known. A principal acting as that user is the `Account`.
     pub(crate) fn new(credentials: &'a Credentials, root_access_key: &str) -> Self {
-        // Temporary and service-account credentials act for their parent user.
-        // `is_temp` reads the clock, which is why this is resolved here.
-        let username = if credentials.is_temp() || credentials.is_service_account() {
+        Self::with_session_presence(credentials, root_access_key, None)
+    }
+
+    /// Uses the original session presence when the accepting edge erased the token bytes.
+    pub(crate) fn with_session_presence(
+        credentials: &'a Credentials,
+        root_access_key: &str,
+        original_session: Option<bool>,
+    ) -> Self {
+        let is_temp = original_session.map_or_else(|| credentials.is_temp(), |present| present && !credentials.is_expired());
+        let username = if is_temp || credentials.is_service_account() {
             credentials.parent_user.as_str()
         } else {
             credentials.access_key.as_str()
@@ -444,8 +452,10 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
         args.insert("Referer".to_owned(), vec![referer.to_str().unwrap_or("").to_owned()]);
     }
 
-    args.insert("userid".to_owned(), vec![principal.username.to_owned()]);
-    args.insert("username".to_owned(), vec![principal.username.to_owned()]);
+    if !principal.username.is_empty() {
+        args.insert("userid".to_owned(), vec![principal.username.to_owned()]);
+        args.insert("username".to_owned(), vec![principal.username.to_owned()]);
+    }
     args.insert("principaltype".to_owned(), vec![principal.principal_type.as_str().to_owned()]);
 
     if let Some(version_id) = facts.version_id.as_deref()
@@ -546,7 +556,7 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
                 .get(name)
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.is_empty() && !(name == IF_MATCH.as_str() && *value == "*"))
             {
                 args.insert(name.to_owned(), vec![value.to_owned()]);
             }

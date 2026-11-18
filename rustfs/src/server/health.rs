@@ -393,7 +393,7 @@ pub(crate) fn build_health_payload(ctx: HealthPayloadContext<'_>) -> Value {
     let mut payload = json!({
         "status": ctx.health.status,
         "service": ctx.service,
-        "timestamp": jiff::Zoned::now().to_string(),
+        "timestamp": jiff::ZonedDateTime::now().to_string(),
         "version": env!("CARGO_PKG_VERSION"),
     });
 

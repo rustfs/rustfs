@@ -76,6 +76,8 @@ pub const STATUS_ENABLED: &str = "enabled";
 pub const STATUS_DISABLED: &str = "disabled";
 
 pub const POLICYNAME: &str = "policy";
+/// Signed subset of the OIDC policy selection granted independently of IAM mappings.
+pub const OIDC_EXPLICIT_POLICIES_CLAIM: &str = "x-rustfs-internal-oidc-explicit-policies";
 pub const PLUGIN_ATTEMPT_CREDENTIAL_CLAIM: &str = "rustfs:plugin-attempt-v1";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
@@ -616,6 +618,9 @@ impl<T: Store> IamSys<T> {
     /// replicated edit's source time) instead of the local clock; see
     /// `IamCache::set_policy_at` (backlog#2291).
     pub async fn set_policy_at(&self, name: &str, policy: Policy, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
+        if name.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
+            return Err(IamError::InvalidArgument);
+        }
         let updated_at = self.store.set_policy_at(name, policy, updated_at).await?;
 
         if !self.has_watcher() {
@@ -975,6 +980,7 @@ impl<T: Store> IamSys<T> {
     ) -> Result<Credentials> {
         if !opts.access_key.is_empty()
             && (opts.access_key.trim() == "."
+                || opts.access_key.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX)
                 || opts.access_key.trim() == ".."
                 || opts.access_key.chars().any(|ch| ch.is_control() || matches!(ch, '/' | '\\')))
         {
@@ -1292,13 +1298,32 @@ impl<T: Store> IamSys<T> {
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
+        self.upsert_regular_user(access_key, args, updated_at, true).await
+    }
+
+    /// Create a regular user, or update its credentials without changing the stored account status.
+    pub async fn create_user_preserving_status(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
+        self.upsert_regular_user(access_key, args, OffsetDateTime::now_utc(), false)
+            .await
+    }
+
+    async fn upsert_regular_user(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+        allow_status_change: bool,
+    ) -> Result<OffsetDateTime> {
         let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
         let iam = self.clone();
         let access_key = access_key.to_string();
         let args = args.clone();
         #[cfg(test)]
         let notification_probe = crate::LOAD_USER_NOTIFICATION_PROBE.try_with(Arc::clone).ok();
-        let operation = async move { iam.create_user_at_inner(&access_key, &args, updated_at).await };
+        let operation = async move {
+            iam.create_user_at_inner(&access_key, &args, updated_at, allow_status_change)
+                .await
+        };
         #[cfg(test)]
         let task = runtime.spawn(async move {
             if let Some(probe) = notification_probe {
@@ -1316,12 +1341,13 @@ impl<T: Store> IamSys<T> {
         access_key: &str,
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
+        allow_status_change: bool,
     ) -> Result<OffsetDateTime> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength);
         }
 
-        if contains_reserved_chars(access_key) {
+        if contains_reserved_chars(access_key) || access_key.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
             return Err(IamError::ContainsReservedChars);
         }
 
@@ -1331,7 +1357,7 @@ impl<T: Store> IamSys<T> {
 
         let (updated_at, secret_changed, parent_guard) = self
             .store
-            .add_user_at_with_secret_change(access_key, args, updated_at)
+            .add_user_at_with_secret_change(access_key, args, updated_at, allow_status_change)
             .await?;
         if secret_changed {
             self.revoke_sts_sessions_for_parent(access_key).await?;
@@ -1495,7 +1521,7 @@ impl<T: Store> IamSys<T> {
         users: Vec<String>,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        if contains_reserved_chars(group) {
+        if contains_reserved_chars(group) || group.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
             return Err(IamError::GroupNameContainsReservedChars);
         }
         let updated_at = self.store.add_users_to_group_at(group, users, updated_at).await?;
@@ -1666,15 +1692,9 @@ impl<T: Store> IamSys<T> {
         parent_user: &str,
         groups: &Option<Vec<String>>,
     ) -> Result<Option<HashMap<String, Value>>> {
-        let Some(policy_names) = self.verified_federated_policy_names(claims, parent_user, groups).await? else {
+        let Some((resolved, _)) = self.verified_federated_policy(claims, parent_user, groups).await? else {
             return Ok(None);
         };
-
-        let (resolved, _) = self.store.merge_policies(&policy_names.join(",")).await;
-        let resolved_names = MappedPolicy::new(&resolved).to_slice();
-        if policy_names.iter().any(|policy_name| !resolved_names.contains(policy_name)) {
-            return Err(IamError::InvalidArgument);
-        }
 
         let boundary = match claims.get(SESSION_POLICY_NAME) {
             Some(Value::String(encoded)) => {
@@ -1691,6 +1711,9 @@ impl<T: Store> IamSys<T> {
         ]);
         if claims.get(OIDC_VIRTUAL_PARENT_CLAIM).and_then(Value::as_str) == Some(parent_user) {
             verified_claims.insert(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string()));
+        }
+        if let Some(explicit) = claims.get(OIDC_EXPLICIT_POLICIES_CLAIM) {
+            verified_claims.insert(OIDC_EXPLICIT_POLICIES_CLAIM.to_owned(), explicit.clone());
         }
         if let Some(boundary) = boundary {
             verified_claims.insert(FEDERATED_POLICY_BOUNDARY_CLAIM.to_string(), Value::String(boundary));
@@ -1873,20 +1896,24 @@ impl<T: Store> IamSys<T> {
         Ok(policy_names)
     }
 
-    fn signed_oidc_policy_names(claims: &HashMap<String, Value>, parent_user: &str) -> Result<Vec<String>> {
-        let policy_names = Self::safe_claim_policy_names(claims, parent_user);
-        if policy_names.is_empty() {
+    async fn resolve_oidc_policy(&self, names: &[String]) -> Result<(String, Policy)> {
+        if names.is_empty() || names.iter().any(|name| !is_safe_claim_policy_name(name)) {
             return Err(IamError::InvalidArgument);
         }
-        Ok(policy_names)
+        let (resolved, policy) = self.store.merge_policies(&names.join(",")).await;
+        let resolved_names = MappedPolicy::new(&resolved).to_slice();
+        if names.iter().any(|name| !resolved_names.contains(name)) {
+            return Err(IamError::InvalidArgument);
+        }
+        Ok((resolved, policy))
     }
 
-    async fn verified_federated_policy_names(
+    async fn verified_federated_policy(
         &self,
         claims: &HashMap<String, Value>,
         parent_user: &str,
         groups: &Option<Vec<String>>,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<Option<(String, Policy)>> {
         if !is_rustfs_oidc_claims(claims) {
             return Ok(None);
         }
@@ -1894,12 +1921,72 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidArgument);
         }
 
-        let policy_names = if is_verified_federated_session(claims, parent_user) {
-            Self::signed_oidc_policy_names(claims, parent_user)?
-        } else {
-            self.oidc_policy_names(claims, parent_user, groups).await?
+        let explicit = claims.get(OIDC_EXPLICIT_POLICIES_CLAIM);
+        if explicit.is_none() {
+            // Earlier grouped credentials cannot distinguish an explicit Deny from a detached grant.
+            if claims.contains_key("groups") || groups.as_ref().is_some_and(|groups| !groups.is_empty()) {
+                return Err(IamError::InvalidArgument);
+            }
+            if !is_verified_federated_session(claims, parent_user) && !has_verified_federated_policy(claims) {
+                let names = self.oidc_policy_names(claims, parent_user, groups).await?;
+                return self.resolve_oidc_policy(&names).await.map(Some);
+            }
+        }
+        let issued: Vec<String> = claims
+            .get(POLICYNAME)
+            .and_then(Value::as_str)
+            .ok_or(IamError::InvalidArgument)?
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect();
+        if issued.iter().any(|name| !is_safe_claim_policy_name(name)) {
+            return Err(IamError::InvalidArgument);
+        }
+        let Some(explicit) = explicit else {
+            return self.resolve_oidc_policy(&issued).await.map(Some);
         };
-        Ok(Some(policy_names))
+        if !is_verified_federated_session(claims, parent_user) {
+            return Err(IamError::InvalidArgument);
+        }
+        let explicit: HashSet<&str> = explicit
+            .as_array()
+            .ok_or(IamError::InvalidArgument)?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .filter(|name| issued.iter().any(|n| n == name))
+                    .ok_or(IamError::InvalidArgument)
+            })
+            .collect::<Result<_>>()?;
+        // Use the issuer's signed group list, including on replicated and derived credentials.
+        let signed_groups: Option<Vec<String>> = claims
+            .get("groups")
+            .map(serde::Deserialize::deserialize)
+            .transpose()
+            .map_err(|_| IamError::InvalidArgument)?;
+        if signed_groups.is_none() && groups.as_ref().is_some_and(|groups| !groups.is_empty()) {
+            return Err(IamError::InvalidArgument);
+        }
+        let current = self.store.sts_policy_db_get(parent_user, &signed_groups).await?;
+        let active: Vec<_> = issued
+            .iter()
+            .filter(|name| explicit.contains(name.as_str()) || current.contains(name))
+            .cloned()
+            .collect();
+        let (resolved, mut policy) = self.resolve_oidc_policy(&active).await?;
+        // Later attachments can restrict the credential, but cannot widen its issuance ceiling.
+        let new: Vec<_> = current.into_iter().filter(|name| !issued.contains(name)).collect();
+        if !new.is_empty() {
+            let (_, restrictions) = self.resolve_oidc_policy(&new).await?;
+            policy.statements.extend(
+                restrictions
+                    .statements
+                    .into_iter()
+                    .filter(|s| s.effect == rustfs_policy::policy::Effect::Deny),
+            );
+        }
+        Ok(Some((resolved, policy)))
     }
 
     /// Compatibility wrapper for service-account authorization entry points.
@@ -1929,6 +2016,9 @@ impl<T: Store> IamSys<T> {
         let state = Self::policy_plugin_state().await;
         if marked {
             if args.is_owner
+                // Plugin-attempt sessions are confined to their allowlisted work;
+                // they cannot use a default permission to manage the parent identity.
+                || self_service_deny_check(args)
                 || args.claims.get(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM) != Some(&Value::Bool(true))
                 || !matches!(state, PolicyPluginState::Disabled)
             {
@@ -2077,10 +2167,10 @@ impl<T: Store> IamSys<T> {
                 session_policy,
             } => {
                 let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
-                if let Some(ok) = session_ok {
-                    return Ok(ok && (*is_owner || combined_policy.is_allowed(args).await));
+                if session_ok == Some(false) && is_rustfs_oidc_claims(args.claims) {
+                    return Err(Error::IAMActionNotAllowed);
                 }
-                *is_owner || combined_policy.is_allowed(args).await
+                session_ok != Some(false) && (*is_owner || derived_policy_allowed(combined_policy, args).await?)
             }
             PreparedIamMode::ServiceAccount {
                 is_owner,
@@ -2101,12 +2191,18 @@ impl<T: Store> IamSys<T> {
                     true
                 };
 
+                if !boundary_allowed {
+                    return Err(Error::IAMActionNotAllowed);
+                }
                 let parent_allowed =
-                    (*bypass_parent_policy || *is_owner || combined_policy.is_allowed(&parent_args).await) && boundary_allowed;
+                    *bypass_parent_policy || *is_owner || derived_policy_allowed(combined_policy, &parent_args).await?;
                 match mode {
                     PreparedServicePolicyMode::Inherited => parent_allowed,
                     PreparedServicePolicyMode::SessionBound => {
                         let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
+                        if session_ok == Some(false) && is_rustfs_oidc_claims(args.claims) {
+                            return Err(Error::IAMActionNotAllowed);
+                        }
                         if let Some(ok) = session_ok {
                             return Ok(ok && parent_allowed);
                         }
@@ -2126,9 +2222,24 @@ impl<T: Store> IamSys<T> {
         };
 
         if policies.is_empty() {
+            // The policy lookup also returns an empty set for an inactive user.
+            // Only a live identity gets the default for its own credential changes.
+            let mode = if self_service_deny_check(args)
+                && self
+                    .store
+                    .get_user(args.account)
+                    .await
+                    .is_some_and(|u| u.credentials.is_valid())
+            {
+                PreparedIamMode::Regular {
+                    combined_policy: Policy::default(),
+                }
+            } else {
+                PreparedIamMode::Deny
+            };
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
-                mode: PreparedIamMode::Deny,
+                mode,
             };
         }
 
@@ -2155,24 +2266,19 @@ impl<T: Store> IamSys<T> {
     }
 
     pub(crate) async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
-        let federated_policy_names = match self
-            .verified_federated_policy_names(args.claims, parent_user, args.groups)
-            .await
-        {
-            Ok(policy_names) => policy_names,
+        let federated_policy = match self.verified_federated_policy(args.claims, parent_user, args.groups).await {
+            Ok(policy) => policy,
             Err(_) => {
                 return PreparedIamAuth {
                     needs_existing_object_tag: false,
-                    mode: PreparedIamMode::Deny,
+                    mode: PreparedIamMode::TerminalDeny,
                 };
             }
         };
-        let federated_session = federated_policy_names.is_some();
-        let verified_federated_session = is_verified_federated_session(args.claims, parent_user);
         let is_owner = !is_rustfs_oidc_claims(args.claims) && crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
-        let (effective_groups, groups_source, policies) = if federated_session {
+        let (effective_groups, groups_source, mut policy_names) = if federated_policy.is_some() {
             (args.groups.clone(), "oidc_claims", Vec::new())
         } else if is_owner {
             (None, "owner", Vec::new())
@@ -2204,21 +2310,27 @@ impl<T: Store> IamSys<T> {
                     }
                 },
             };
-            let p = self.policy_db_get(parent_user, &effective_groups).await.unwrap_or_default();
+            let p = match self.policy_db_get(parent_user, &effective_groups).await {
+                Ok(policies) => policies,
+                Err(_) if self_service_deny_check(args) => {
+                    return PreparedIamAuth {
+                        needs_existing_object_tag: false,
+                        mode: PreparedIamMode::Deny,
+                    };
+                }
+                Err(_) => Vec::new(),
+            };
             (effective_groups, groups_source, p)
         };
 
-        let mut policy_names = if let Some(policy_names) = federated_policy_names {
-            policy_names
-        } else {
-            policies
-        };
         if !is_owner && policy_names.is_empty() && !is_rustfs_oidc_claims(args.claims) {
             policy_names = Self::safe_claim_policy_names(args.claims, parent_user);
         }
 
         let mut combined_policy = Policy::default();
-        if !is_owner {
+        if let Some((_, policy)) = federated_policy {
+            combined_policy = policy;
+        } else if !is_owner {
             if policy_names.is_empty() {
                 if args.deny_only {
                     combined_policy = Policy::default();
@@ -2237,7 +2349,7 @@ impl<T: Store> IamSys<T> {
                         requested_policies = %requested_policies,
                         "prepare_sts_auth: no STS policy names resolved"
                     );
-                    if args.deny_only && !verified_federated_session {
+                    if args.deny_only && !self_service_deny_check(args) {
                         combined_policy = Policy::default();
                     } else {
                         return PreparedIamAuth {
@@ -2251,7 +2363,7 @@ impl<T: Store> IamSys<T> {
                         .iter()
                         .any(|policy_name| !resolved_policy_names.iter().any(|resolved| resolved == policy_name));
                     if has_unresolved_policy_names {
-                        if verified_federated_session {
+                        if self_service_deny_check(args) {
                             return PreparedIamAuth {
                                 needs_existing_object_tag: false,
                                 mode: PreparedIamMode::Deny,
@@ -2328,14 +2440,14 @@ impl<T: Store> IamSys<T> {
         if is_rustfs_oidc_claims(args.claims) && !has_verified_federated_policy {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
-                mode: PreparedIamMode::Deny,
+                mode: PreparedIamMode::TerminalDeny,
             };
         }
         let federated_boundary = if has_verified_federated_policy {
             if !is_valid_verified_federated_policy(args.claims, parent_user) {
                 return PreparedIamAuth {
                     needs_existing_object_tag: false,
-                    mode: PreparedIamMode::Deny,
+                    mode: PreparedIamMode::TerminalDeny,
                 };
             }
             match federated_policy_boundary(args.claims) {
@@ -2343,7 +2455,7 @@ impl<T: Store> IamSys<T> {
                 Err(_) => {
                     return PreparedIamAuth {
                         needs_existing_object_tag: false,
-                        mode: PreparedIamMode::Deny,
+                        mode: PreparedIamMode::TerminalDeny,
                     };
                 }
             }
@@ -2362,10 +2474,8 @@ impl<T: Store> IamSys<T> {
         let is_owner = !is_rustfs_oidc_claims(args.claims) && crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
-        let svc_policies = if is_owner || bypass_parent_policy {
+        let svc_policies = if is_owner || bypass_parent_policy || has_verified_federated_policy {
             Vec::new()
-        } else if has_verified_federated_policy {
-            Self::safe_claim_policy_names(args.claims, parent_user)
         } else if role_arn.is_some() {
             let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else {
                 tracing::warn!(
@@ -2389,7 +2499,7 @@ impl<T: Store> IamSys<T> {
             policies
         };
 
-        if !is_owner && !bypass_parent_policy && svc_policies.is_empty() {
+        if !is_owner && !bypass_parent_policy && !has_verified_federated_policy && svc_policies.is_empty() {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
                 mode: PreparedIamMode::Deny,
@@ -2398,12 +2508,17 @@ impl<T: Store> IamSys<T> {
 
         let combined_policy = if is_owner || bypass_parent_policy {
             Policy::default()
+        } else if has_verified_federated_policy {
+            let Ok(Some((_, policy))) = self.verified_federated_policy(args.claims, parent_user, args.groups).await else {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::TerminalDeny,
+                };
+            };
+            policy
         } else {
             let (a, c) = self.store.merge_policies(&svc_policies.join(",")).await;
-            let resolved = MappedPolicy::new(&a).to_slice();
-            if a.is_empty()
-                || has_verified_federated_policy && svc_policies.iter().any(|policy_name| !resolved.contains(policy_name))
-            {
+            if a.is_empty() {
                 return PreparedIamAuth {
                     needs_existing_object_tag: false,
                     mode: PreparedIamMode::Deny,
@@ -2474,8 +2589,26 @@ async fn prepared_session_policy_needs_existing_object_tag_for_args(policy: &Pre
     }
 }
 
+fn self_service_deny_check(args: &Args<'_>) -> bool {
+    use rustfs_policy::policy::action::{Action, AdminAction};
+    args.deny_only
+        && matches!(
+            args.action,
+            Action::AdminAction(
+                AdminAction::ChangeOwnPasswordAdminAction
+                    | AdminAction::CreateUserAdminAction
+                    | AdminAction::ManageOwnMFAAdminAction
+            )
+        )
+}
+
 fn prepare_session_policy(args: &Args<'_>, empty_is_none: bool) -> PreparedSessionPolicy {
     let Some(policy_str) = extract_session_policy_text(args.claims) else {
+        if self_service_deny_check(args)
+            && (args.claims.contains_key(SESSION_POLICY_NAME) || args.claims.contains_key(SESSION_POLICY_NAME_EXTRACTED))
+        {
+            return PreparedSessionPolicy::DenyAll;
+        }
         return PreparedSessionPolicy::None;
     };
 
@@ -2548,6 +2681,7 @@ pub fn remove_verified_federated_policy(claims: &mut HashMap<String, Value>) -> 
     let removed = claims.remove(VERIFIED_FEDERATED_POLICY_CLAIM).is_some();
     claims.remove(FEDERATED_POLICY_BOUNDARY_CLAIM);
     claims.remove(OIDC_VIRTUAL_PARENT_CLAIM);
+    claims.remove(OIDC_EXPLICIT_POLICIES_CLAIM);
     removed
 }
 
@@ -2556,6 +2690,10 @@ fn merge_derived_service_account_claims(
     source_claims: &HashMap<String, Value>,
     verified_federated_policy: Option<HashMap<String, Value>>,
 ) -> Result<()> {
+    if verified_federated_policy.is_some() {
+        // Only the parent's signed groups may participate in federated policy resolution.
+        target_claims.remove("groups");
+    }
     for (key, value) in source_claims {
         if key != "exp" {
             target_claims.insert(key.clone(), value.clone());
@@ -2620,6 +2758,24 @@ fn extract_session_policy_text(claims: &HashMap<String, Value>) -> Option<String
     let encoded = claims.get(SESSION_POLICY_NAME).and_then(|v| v.as_str())?;
     let bytes = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(encoded.as_bytes()).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+async fn derived_policy_allowed(policy: &Policy, args: &Args<'_>) -> Result<bool> {
+    let allowed = policy.is_allowed(args).await;
+    // A bucket policy may supplement a missing Allow, but not override a live OIDC Deny.
+    if !allowed
+        && is_rustfs_oidc_claims(args.claims)
+        && (args.deny_only
+            || !policy
+                .is_allowed(&Args {
+                    deny_only: true,
+                    ..args.clone()
+                })
+                .await)
+    {
+        return Err(Error::IAMActionNotAllowed);
+    }
+    Ok(allowed)
 }
 
 async fn evaluate_prepared_session_policy(policy: &PreparedSessionPolicy, args: &Args<'_>) -> Option<bool> {
@@ -2708,7 +2864,7 @@ mod tests {
     use crate::cache::{Cache, CacheEntity};
     use crate::error::Error;
     use crate::manager::get_default_policies;
-    use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
+    use crate::store::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType};
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
@@ -3444,8 +3600,28 @@ mod tests {
         derived_save_started: Arc<tokio::sync::Notify>,
         release_derived_save: Arc<tokio::sync::Notify>,
         block_group_save: Arc<std::sync::atomic::AtomicBool>,
+        group_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+        saved_groups: Arc<Mutex<HashMap<String, GroupInfo>>>,
         group_save_started: Arc<tokio::sync::Notify>,
         group_save_release: Arc<tokio::sync::Notify>,
+    }
+
+    struct MockGroupEdit {
+        store: StsTestMockStore,
+        name: String,
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl GroupEdit for MockGroupEdit {
+        async fn save(&self, group: &GroupInfo) -> Result<()> {
+            self.store.save_group_info(&self.name, group.clone()).await
+        }
+
+        async fn delete_empty(&self) -> Result<()> {
+            self.store.delete_mapped_policy(&self.name, UserType::Reg, true).await?;
+            self.store.delete_group_info(&self.name).await
+        }
     }
 
     impl StsTestMockStore {
@@ -3468,6 +3644,12 @@ mod tests {
                 derived_save_started: Arc::new(tokio::sync::Notify::new()),
                 release_derived_save: Arc::new(tokio::sync::Notify::new()),
                 block_group_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                group_locks: Default::default(),
+                saved_groups: Arc::new(Mutex::new(if empty_policies {
+                    HashMap::new()
+                } else {
+                    HashMap::from([("testgroup".to_owned(), GroupInfo::new(vec!["sts-fallback-test-parent".to_owned()]))])
+                })),
                 group_save_started: Arc::new(tokio::sync::Notify::new()),
                 group_save_release: Arc::new(tokio::sync::Notify::new()),
             }
@@ -3610,15 +3792,36 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+        async fn begin_group_edit(&self, name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+            let lock = self
+                .group_locks
+                .lock()
+                .expect("group locks")
+                .entry(name.to_owned())
+                .or_default()
+                .clone();
+            let guard = lock.lock_owned().await;
+            Ok((
+                Box::new(MockGroupEdit {
+                    store: self.clone(),
+                    name: name.to_owned(),
+                    _guard: guard,
+                }),
+                self.saved_groups.lock().expect("saved groups").get(name).cloned(),
+            ))
+        }
+
+        async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()> {
             if self.block_group_save.load(std::sync::atomic::Ordering::SeqCst) {
                 self.group_save_started.notify_one();
                 self.group_save_release.notified().await;
             }
+            self.saved_groups.lock().expect("saved groups").insert(name.to_owned(), item);
             Ok(())
         }
 
-        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+        async fn delete_group_info(&self, name: &str) -> Result<()> {
+            self.saved_groups.lock().expect("saved groups").remove(name);
             Ok(())
         }
 
@@ -3671,11 +3874,14 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn delete_mapped_policy(&self, name: &str, user_type: UserType, _is_group: bool) -> Result<()> {
+        async fn delete_mapped_policy(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
             self.deleted_mapped_policies
                 .lock()
                 .expect("deleted_mapped_policies mutex poisoned")
                 .push((name.to_string(), user_type));
+            if is_group {
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
@@ -3784,9 +3990,7 @@ mod tests {
             users.insert(PARENT_USER.to_string(), parent_identity);
             users.extend(saved_users);
 
-            let group = GroupInfo::new(vec![PARENT_USER.to_string()]);
-            let mut groups = HashMap::new();
-            groups.insert(GROUP_NAME.to_string(), group);
+            let groups = self.saved_groups.lock().expect("saved groups").clone();
 
             let group_policy = MappedPolicy::new("readwrite");
             let mut group_policies = HashMap::new();
@@ -3817,6 +4021,82 @@ mod tests {
         let store = StsTestMockStore::new(false);
         let cache = IamCache::new(store).await.expect("IAM cache should initialize");
         IamSys::new(cache)
+    }
+
+    async fn shared_group_caches() -> (StsTestMockStore, Arc<IamCache<StsTestMockStore>>, Arc<IamCache<StsTestMockStore>>) {
+        let store = StsTestMockStore::new(false);
+        let (first, second) = temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+            (
+                IamCache::new(store.clone()).await.expect("first cache"),
+                IamCache::new(store.clone()).await.expect("second cache"),
+            )
+        })
+        .await;
+        (store, first, second)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn group_edit_status_and_removal_survive_shared_backend_reload() {
+        let (store, first, second) = shared_group_caches().await;
+        let group = "testgroup";
+        let member = "sts-fallback-test-parent";
+        second
+            .add_users_to_group("unrelated", vec![member.to_owned()])
+            .await
+            .expect("seed unrelated membership");
+        store.block_group_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut removal = Box::pin(first.remove_users_from_group(group, vec![member.to_owned()]));
+        assert!(futures::poll!(&mut removal).is_pending());
+        store.block_group_save.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut status = Box::pin(second.set_group_status(group, false));
+        assert!(futures::poll!(&mut status).is_pending(), "status must wait for the other writer");
+        store.group_save_release.notify_one();
+        removal.await.expect("commit removal");
+        status.await.expect("commit status");
+
+        store.load_all(&first.cache).await.expect("reload durable groups");
+        for node in [&first, &second] {
+            let state = node.cache.snapshot();
+            assert!(state.groups[group].members.is_empty());
+            assert_eq!(state.groups[group].status, "disabled");
+            assert_eq!(state.user_group_memberships[member], HashSet::from(["unrelated".to_owned()]));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn group_edit_delete_orders_emptiness_check_with_add() {
+        let (store, first, second) = shared_group_caches().await;
+        let group = "testgroup";
+        let member = "sts-fallback-test-parent";
+        second
+            .remove_users_from_group(group, vec![member.to_owned()])
+            .await
+            .expect("empty group");
+        store.block_group_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut add = Box::pin(first.add_users_to_group(group, vec![member.to_owned()]));
+        assert!(futures::poll!(&mut add).is_pending());
+        let mut delete = Box::pin(second.remove_users_from_group(group, vec![]));
+        assert!(futures::poll!(&mut delete).is_pending(), "delete must wait before checking emptiness");
+        store.group_save_release.notify_one();
+        add.await.expect("restore membership");
+        assert!(matches!(delete.await, Err(Error::GroupNotEmpty)));
+        assert!(store.deleted_mapped_policies.lock().expect("policy deletions").is_empty());
+        store.block_group_save.store(false, std::sync::atomic::Ordering::SeqCst);
+        second.set_group_status(group, false).await.expect("refresh from peer add");
+        assert!(second.cache.snapshot().user_group_memberships[member].contains(group));
+        first
+            .remove_users_from_group(group, vec![member.to_owned()])
+            .await
+            .expect("empty group");
+        second
+            .remove_users_from_group(group, vec![])
+            .await
+            .expect("delete empty group");
+        assert!(matches!(first.set_group_status(group, true).await, Err(Error::NoSuchGroup(_))));
+        assert!(!second.cache.snapshot().user_group_memberships.contains_key(member));
+        assert!(!store.saved_groups.lock().expect("durable groups").contains_key(group));
     }
 
     async fn assert_group_write_during_reload_is_published(remove: bool) {
@@ -4015,6 +4295,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_account_rejects_storage_directory_suffix() {
+        let iam = test_iam_sys().await;
+        let key = format!("example{}", rustfs_utils::path::GLOBAL_DIR_SUFFIX);
+        let err = iam
+            .new_service_account("parent", None, service_account_opts(&key, "test-secret"))
+            .await
+            .expect_err("directory marker cannot identify an IAM account");
+        assert_eq!(err, Error::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn new_service_account_rejects_parent_access_key() {
         ensure_test_global_credentials();
 
@@ -4204,6 +4495,11 @@ mod tests {
             policy: None,
             status: rustfs_madmin::AccountStatus::Enabled,
         };
+        let virtual_parent = base64_simd::URL_SAFE_NO_PAD.encode_to_string([42; 32]);
+        assert!(matches!(
+            iam.create_user(&virtual_parent, &args).await,
+            Err(IamError::AccessKeyAlreadyExists)
+        ));
         for service in [false, true] {
             for expired in [false, true] {
                 let key = format!("collision-{service}-{expired}");
@@ -4265,6 +4561,20 @@ mod tests {
         iam.create_user("regular-update", &args)
             .await
             .expect("regular user update remains supported");
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_invalid_storage_component() {
+        let iam = test_iam_sys().await;
+        let args = AddOrUpdateUserReq {
+            secret_key: "exampleSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+        for key in ["bad\0key", "not/a/component", "not\\a\\component"] {
+            assert!(matches!(iam.create_user(key, &args).await, Err(Error::InvalidArgument)));
+        }
+        iam.create_user("valid-key", &args).await.expect("ordinary key");
     }
 
     #[tokio::test]
@@ -5748,13 +6058,15 @@ mod tests {
             ("sub".to_string(), Value::String("subject-123".to_string())),
             ("parent".to_string(), Value::String(parent_user.to_string())),
             (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
-            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite,readonly".to_string())),
+            (OIDC_EXPLICIT_POLICIES_CLAIM.to_string(), serde_json::json!(["readonly"])),
+            ("groups".to_string(), serde_json::json!(["testgroup"])),
         ]);
         let conditions = HashMap::new();
         let sts_args = Args {
             account: "OIDCGROUPCALLER01",
             groups: &groups,
-            action: Action::S3Action(S3Action::GetObjectAction),
+            action: Action::S3Action(S3Action::PutObjectAction),
             bucket: "bucket",
             conditions: &conditions,
             is_owner: false,
@@ -5789,7 +6101,10 @@ mod tests {
             .await
             .expect("group-authorized OIDC caller should create a service account");
         assert_eq!(replication_claims.get(VERIFIED_FEDERATED_POLICY_CLAIM), Some(&Value::Bool(true)));
-        assert_eq!(replication_claims.get(POLICYNAME), Some(&Value::String("readwrite".to_string())));
+        assert_eq!(
+            replication_claims.get(OIDC_EXPLICIT_POLICIES_CLAIM),
+            claims.get(OIDC_EXPLICIT_POLICIES_CLAIM)
+        );
 
         let service_claims = iam_sys
             .get_claims_for_svc_acc(&service_account.access_key)
@@ -5805,6 +6120,83 @@ mod tests {
             iam_sys.is_allowed(&service_args).await,
             "OIDC service account must resolve the policy names selected at STS issuance"
         );
+
+        let now = OffsetDateTime::now_utc();
+        let deny_read = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#).expect("parse Deny");
+        iam_sys
+            .store
+            .cache
+            .add_or_update_policy_doc("deny-read", &PolicyDoc::new(deny_read), now);
+        for (mapping, enabled, read, write) in [
+            ("", true, true, false),
+            ("readwrite", false, true, false),
+            ("readwrite,deny-read", true, false, true),
+            ("readwrite,missing-deny", true, false, false),
+        ] {
+            if mapping.is_empty() {
+                iam_sys.store.cache.delete_group_policy("testgroup", now);
+            } else {
+                iam_sys
+                    .store
+                    .cache
+                    .add_or_update_group_policy("testgroup", &MappedPolicy::new(mapping), now);
+            }
+            let mut group = GroupInfo::new(Vec::new());
+            if !enabled {
+                group.status = STATUS_DISABLED.to_owned();
+            }
+            iam_sys.store.cache.add_or_update_group("testgroup", &group, now);
+            for (action, expected) in [(S3Action::GetObjectAction, read), (S3Action::PutObjectAction, write)] {
+                let sts = Args {
+                    action: Action::S3Action(action),
+                    ..sts_args.clone()
+                };
+                let service = Args {
+                    action: sts.action,
+                    ..service_args.clone()
+                };
+                let prepared = iam_sys.prepare_sts_auth(&sts, parent_user).await;
+                assert_eq!(
+                    iam_sys.eval_prepared(&prepared, &sts).await,
+                    expected,
+                    "STS: {mapping}, enabled={enabled}"
+                );
+                assert_eq!(
+                    iam_sys.is_allowed(&service).await,
+                    expected,
+                    "service account: {mapping}, enabled={enabled}"
+                );
+                if mapping == "readwrite,deny-read" && action == S3Action::GetObjectAction {
+                    let child = iam_sys.prepare_service_account_auth(&service, parent_user).await;
+                    for (prepared, args) in [(&prepared, &sts), (&child, &service)] {
+                        assert!(
+                            matches!(iam_sys.try_eval_prepared(prepared, args).await, Err(Error::IAMActionNotAllowed)),
+                            "a newly mapped Deny must stop bucket policy fallback"
+                        );
+                    }
+                }
+            }
+        }
+        iam_sys.store.cache.delete_group_policy("testgroup", now);
+        for (source, account) in [(&claims, sts_args.account), (&service_claims, service_args.account)] {
+            let mut legacy = source.clone();
+            legacy.remove(OIDC_EXPLICIT_POLICIES_CLAIM);
+            let args = Args {
+                claims: &legacy,
+                account,
+                deny_only: true,
+                ..sts_args.clone()
+            };
+            let prepared = if account == sts_args.account {
+                iam_sys.prepare_sts_auth(&args, parent_user).await
+            } else {
+                iam_sys.prepare_service_account_auth(&args, parent_user).await
+            };
+            assert!(
+                !iam_sys.eval_prepared(&prepared, &args).await,
+                "ambiguous legacy grouped credentials must be reissued"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5832,6 +6224,8 @@ mod tests {
             ("parent".to_string(), Value::String(parent_user.to_string())),
             (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
             (POLICYNAME.to_string(), Value::String("readonly,deny-delete".to_string())),
+            (OIDC_EXPLICIT_POLICIES_CLAIM.to_string(), serde_json::json!(["readonly", "deny-delete"])),
+            ("groups".to_string(), serde_json::json!(["testgroup"])),
         ]);
         let groups = Some(vec!["testgroup".to_string()]);
         let conditions = HashMap::new();
@@ -6036,7 +6430,7 @@ mod tests {
 
         let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
 
-        assert!(matches!(prepared.mode, PreparedIamMode::Deny));
+        assert!(matches!(prepared.mode, PreparedIamMode::TerminalDeny));
         assert!(!iam_sys.eval_prepared(&prepared, &args).await);
     }
 

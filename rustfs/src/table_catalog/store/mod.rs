@@ -1297,6 +1297,10 @@ impl Default for TableCatalogObjectPaths {
 }
 
 impl TableCatalogObjectPaths {
+    pub fn table_bucket_entries_prefix(&self) -> String {
+        format!("{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT)
+    }
+
     pub fn table_bucket_entry_path(&self, table_bucket: &str) -> String {
         format!("{}{}", self.table_bucket_root_prefix(table_bucket), TABLE_BUCKET_ENTRY_FILE)
     }
@@ -1623,7 +1627,7 @@ impl TableCatalogObjectPaths {
     }
 
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
-        format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
+        format!("{}{}/", self.table_bucket_entries_prefix(), table_catalog_path_hash(table_bucket))
     }
 }
 

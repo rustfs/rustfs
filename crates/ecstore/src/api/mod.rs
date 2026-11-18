@@ -393,7 +393,8 @@ pub mod cluster {
 
 pub mod compression {
     pub use crate::io_support::compress::{
-        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled, is_multipart_disk_compression_enabled,
+        DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES, MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled,
+        is_multipart_disk_compression_enabled,
     };
 }
 

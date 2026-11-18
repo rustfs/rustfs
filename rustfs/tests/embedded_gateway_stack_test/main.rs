@@ -56,8 +56,8 @@ const MATRIX_BUCKET: &str = "gateway-stack-matrix";
 const ENV_S3_STACK: &str = "RUSTFS_S3_STACK";
 const ENV_KEYSTONE_ENABLE: &str = "RUSTFS_KEYSTONE_ENABLE";
 const ENV_KEYSTONE_AUTH_URL: &str = "RUSTFS_KEYSTONE_AUTH_URL";
-/// A Keystone endpoint nothing listens on: these tests are about start-up, not about tokens.
-const UNREACHABLE_KEYSTONE: &str = "http://127.0.0.1:1/v3";
+/// A configuration-valid endpoint: these tests start up without sending token requests.
+const UNREACHABLE_KEYSTONE: &str = "https://keystone.example.test";
 const GATEWAY: Option<&str> = Some("gateway");
 const LEGACY: Option<&str> = None;
 
@@ -292,7 +292,9 @@ fn every_served_operation_has_one_matrix_row_and_every_row_a_served_operation() 
     assert_eq!(rows.len(), distinct.len(), "an operation has two rows: {rows:?}");
     assert_eq!(alike.len(), ANSWERS_EVERY_CALLER_ALIKE.len(), "an operation is listed twice: {alike:?}");
     assert!(distinct.is_disjoint(&alike), "{:?}", distinct.intersection(&alike));
-    assert_eq!(&distinct | &alike, gateway_operations().into_iter().collect());
+    let mut covered = &distinct | &alike;
+    assert!(covered.insert(object_write::BROWSER_POST), "browser POST has two inventory entries");
+    assert_eq!(covered, gateway_operations().into_iter().collect());
 }
 
 /// Every operation that answers every caller alike gives root, the user without a policy and the
@@ -596,29 +598,21 @@ fn the_legacy_stack_refuses_a_misplaced_capability_query() {
     with_stack(LEGACY, a_misplaced_capability_query_is_refused);
 }
 
-/// The pinned gateway admits a request that carries only `X-Auth-Token` as anonymous, while the
-/// RustFS code behind it reads the Keystone identity. Until the gateway authenticates the token
-/// (rustfs/gateway#1586) the two settings together refuse to start, and nothing is served.
 #[test]
-fn the_gateway_stack_refuses_to_start_with_keystone_enabled() {
-    let environment = [
+fn the_gateway_stack_starts_with_keystone_enabled() {
+    let environment = vec![
         (ENV_S3_STACK, GATEWAY),
         (ENV_KEYSTONE_ENABLE, Some("true")),
         (ENV_KEYSTONE_AUTH_URL, Some(UNREACHABLE_KEYSTONE)),
     ];
-    temp_env::with_vars(environment, || {
-        common::run_embedded_test(|| async {
-            let refusal = match start_server().await {
-                Ok(server) => {
-                    server.shutdown().await;
-                    panic!("the gateway stack started with Keystone enabled");
-                }
-                Err(refusal) => refusal,
-            };
-            for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE", "rustfs/gateway#1586"] {
-                assert!(refusal.contains(named), "{named} is missing from: {refusal}");
-            }
-        });
+    with_environment(environment, |server| async move {
+        let listing = s3_client(&server.endpoint(), server.access_key(), server.secret_key())
+            .list_buckets()
+            .send()
+            .await
+            .expect("signed ListBuckets with the Keystone bridge enabled");
+        assert!(listing.buckets().is_empty());
+        server.shutdown().await;
     });
 }
 

@@ -58,6 +58,25 @@ pub(crate) struct CopySourceObject<'a> {
     pub(crate) version_id: Option<&'a str>,
 }
 
+pub(crate) async fn authorize_upload_part_copy<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    server: &ServerContextSlot,
+    bucket: &str,
+    key: &str,
+    source: Option<CopySourceObject<'_>>,
+) -> S3Result<()> {
+    use super::super::{authorize_staged_multipart_part, load_bucket_generation};
+    let generation = load_bucket_generation(server, req, bucket).await;
+    authorize_copy_source(req, server, source).await?;
+    let info = req.req_info_mut().ok_or_else(missing_req_info_error)?;
+    info.bucket = Some(bucket.to_owned());
+    info.object = Some(key.to_owned());
+    info.version_id = None;
+    authorize_staged_multipart_part(req).await?;
+    req.install_bucket_generation(generation?);
+    Ok(())
+}
+
 /// The source half of a copy, which runs before anything about the destination is decided.
 ///
 /// `None` is an access-point or Outposts ARN source and is `NotImplemented` before any policy is
@@ -178,6 +197,28 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
     }
     req.install_bucket_generation(bucket_generation?);
+    check_copy_source_owner(req.headers())
+}
+
+/// Checks a copy's source-owner assertion against the owner RustFS reports.
+pub(crate) fn check_copy_source_owner(headers: &http::HeaderMap) -> S3Result<()> {
+    let mut values = headers.get_all("x-amz-source-expected-bucket-owner").iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(s3_error!(InvalidRequest, "Multiple source expected owner headers"));
+    }
+    let expected = value
+        .to_str()
+        .map_err(|_| s3_error!(InvalidRequest, "Invalid source expected owner header"))?
+        .trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    if expected != crate::storage::s3_api::common::RUSTFS_OWNER_ID {
+        return Err(s3_error!(AccessDenied));
+    }
     Ok(())
 }
 

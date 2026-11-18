@@ -34,7 +34,7 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier, ObjectLockLegalHoldStatus,
     ObjectLockMode, ObjectLockRetentionMode,
 };
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use tracing::info;
 
 /// Initialize test logging
@@ -67,7 +67,7 @@ async fn put_bucket_deny_policy(
 }
 
 fn retention_timestamp(days: i64) -> aws_sdk_s3::primitives::DateTime {
-    let retain_until = future_retain_until(days).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let retain_until = future_retain_until(days).strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
     aws_sdk_s3::primitives::DateTime::from_str(&retain_until, aws_sdk_s3::primitives::DateTimeFormat::DateTime)
         .expect("retention timestamp should parse")
 }
@@ -118,13 +118,14 @@ where
     );
 }
 
-fn parse_s3_datetime(value: &aws_sdk_s3::primitives::DateTime) -> DateTime<Utc> {
+fn parse_s3_datetime(value: &aws_sdk_s3::primitives::DateTime) -> Timestamp {
     let formatted = value
         .fmt(DateTimeFormat::DateTime)
         .expect("S3 timestamp should format as RFC3339");
-    DateTime::parse_from_rfc3339(&formatted)
-        .expect("S3 timestamp should parse as RFC3339")
-        .with_timezone(&Utc)
+    let normalized = formatted
+        .strip_suffix('Z')
+        .map_or(formatted.clone(), |prefix| format!("{prefix}+00:00"));
+    Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.f%:z", normalized).expect("S3 timestamp should parse as RFC3339")
 }
 
 // ============================================================================
@@ -470,7 +471,7 @@ async fn test_get_object_retention_returns_configured_values() {
     let bucket = "test-get-retention";
     let key = "retained-object";
     let retain_until = future_retain_until(30);
-    let retain_until_expected = retain_until.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let retain_until_expected = retain_until.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     env.create_object_lock_bucket(bucket).await.unwrap();
 
@@ -1924,7 +1925,7 @@ async fn test_copy_object_retention_uses_destination_policy() {
     .await
     .unwrap();
 
-    let copy_started = Utc::now();
+    let copy_started = Timestamp::now();
     client
         .copy_object()
         .copy_source(format!("{src_bucket}/{src_key}"))
@@ -1947,7 +1948,7 @@ async fn test_copy_object_retention_uses_destination_policy() {
     assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
     let retain_until = parse_s3_datetime(retention.retain_until_date().expect("retain-until date should be present"));
     assert!(
-        retain_until < copy_started + Duration::days(3),
+        retain_until < copy_started + SignedDuration::from_hours(3 * 24),
         "destination default retention should not inherit the source's longer retention"
     );
 
@@ -2008,7 +2009,7 @@ async fn test_copy_object_retention_uses_destination_policy() {
             .expect("explicit retain-until date should be present"),
     );
     assert!(
-        explicit_retain_until > Utc::now() + Duration::days(20),
+        explicit_retain_until > Timestamp::now() + SignedDuration::from_hours(20 * 24),
         "explicit retention should override the shorter bucket default"
     );
 
@@ -2088,7 +2089,7 @@ async fn test_multipart_default_retention_fixed_at_create() {
         .await
         .unwrap();
 
-    let create_started = Utc::now();
+    let create_started = Timestamp::now();
     let create_output = client.create_multipart_upload().bucket(bucket).key(key).send().await.unwrap();
     let upload_id = create_output.upload_id().unwrap();
 
@@ -2131,7 +2132,7 @@ async fn test_multipart_default_retention_fixed_at_create() {
     assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
     let retain_until = parse_s3_datetime(retention.retain_until_date().expect("retain-until date should be present"));
     assert!(
-        retain_until < create_started + Duration::days(3),
+        retain_until < create_started + SignedDuration::from_hours(3 * 24),
         "CompleteMultipartUpload should keep the default retention calculated at create time"
     );
 }

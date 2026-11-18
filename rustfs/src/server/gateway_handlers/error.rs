@@ -35,7 +35,7 @@ use http::header::{CACHE_CONTROL, CONTENT_LOCATION, CONTENT_RANGE, CONTENT_TYPE,
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rustfs_gateway::{
     ErrorHeader, HandlerError, HandlerErrorContext, HttpDate, LegacyRustfsFacts, LegacyRustfsRefusal, RedirectTarget,
-    RegionLabel, StoredHeaderValue, VersionIdLabel,
+    RegionLabel, RustfsErrorCause, StoredHeaderValue, VersionIdLabel,
 };
 use rustfs_gateway_types::{ETag, ErrorCode, Timestamp, TimestampFormat};
 use rustfs_s3_types::S3Error;
@@ -67,7 +67,8 @@ const DELETE_MARKER: &str = "x-amz-delete-marker";
 const VERSION_ID: &str = "x-amz-version-id";
 
 /// Converts a use-case error into the error the gateway answers with: the same code, status and
-/// message, and every response header it carries.
+/// message (the code's legacy default when the error carries none), and every response header it
+/// carries.
 pub(crate) fn handler_error(error: S3Error) -> HandlerError {
     let parts = error.into_parts();
     let Some(status) = parts.status.or_else(|| parts.code.status_code()) else {
@@ -76,11 +77,17 @@ pub(crate) fn handler_error(error: S3Error) -> HandlerError {
     // A declared code compares equal to the custom code of the same spelling and status.
     let code = ErrorCode::custom(parts.code.as_str().to_owned(), status);
     let headers = parts.headers.unwrap_or_default();
+    // A message-less error carries the text legacy RustFS writes for its code; a custom code has none.
+    let message = parts.message.or_else(|| parts.code.default_message().map(Cow::Borrowed));
     if LEGACY_SHAPED.contains(&code.as_str()) {
-        return legacy_refusal(code, parts.message, &headers).unwrap_or_else(HandlerError::internal_error);
+        return legacy_refusal(code, message, &headers).unwrap_or_else(HandlerError::internal_error);
     }
-    let mut mapped = HandlerError::new(code, parts.message.unwrap_or(Cow::Borrowed("")));
+    let mut mapped = HandlerError::new(code, message.unwrap_or(Cow::Borrowed("")));
     for (name, value) in &headers {
+        // The error document's `Content-Type` is the gateway's to write.
+        if name == CONTENT_TYPE {
+            continue;
+        }
         let Some(header) = error_header(name, value) else {
             return HandlerError::internal_error(UNWRITABLE_HEADER);
         };
@@ -176,6 +183,15 @@ fn error_header(name: &HeaderName, value: &HeaderValue) -> Option<ErrorHeader> {
         "retry-after" => Some(ErrorHeader::RetryAfter {
             seconds: value.parse().ok()?,
         }),
+        // The gateway spells the closed set of causes; an unknown one fails the whole error.
+        "x-rustfs-error-cause" => [
+            RustfsErrorCause::NamespaceLockTimeout,
+            RustfsErrorCause::NamespaceLockUnavailable,
+            RustfsErrorCause::StorageWriteQuorum,
+        ]
+        .into_iter()
+        .find(|cause| cause.as_str() == value)
+        .map(|cause| ErrorHeader::RustfsErrorCause { cause }),
         "x-amz-bucket-region" => Some(ErrorHeader::BucketRegion {
             region: RegionLabel::new(value).ok()?,
         }),
@@ -274,12 +290,63 @@ mod tests {
         assert_eq!(mapped.message(), MISSING_STATUS);
     }
 
+    /// Legacy RustFS builds every s3s error from its bare code, which attaches the code's default
+    /// message, so a message-less error carries that text on both stacks.
     #[test]
-    fn a_missing_message_is_not_invented() {
-        let mapped = handler_error(S3Error::new(S3ErrorCode::AccessDenied));
+    fn a_missing_message_is_the_one_legacy_rustfs_writes_for_the_code() {
+        for code in S3ErrorCode::NAMED {
+            if LEGACY_SHAPED.contains(&code.as_str()) || code.status_code().is_none() {
+                continue;
+            }
+            let mapped = handler_error(S3Error::new(code.clone()));
+
+            assert_eq!(mapped.code().as_str(), code.as_str());
+            assert_eq!(Some(mapped.message()), code.default_message(), "{code}");
+        }
+        let mapped = handler_error(S3Error::new(S3ErrorCode::NoSuchBucketPolicy));
+        assert_eq!(mapped.message(), "The specified bucket does not have a bucket policy.");
+    }
+
+    #[test]
+    fn an_explicit_status_does_not_drop_the_default_message() {
+        let mut error = S3Error::new(S3ErrorCode::AccessDenied);
+        error.set_status_code(StatusCode::CONFLICT);
+
+        assert_eq!(handler_error(error).message(), "Access Denied");
+    }
+
+    #[test]
+    fn an_explicit_message_is_not_replaced_by_the_default() {
+        let mapped = handler_error(S3Error::with_message(S3ErrorCode::NoSuchBucketPolicy, "no policy here"));
+
+        assert_eq!(mapped.message(), "no policy here");
+    }
+
+    /// Legacy RustFS writes an explicitly empty message as an empty `<Message>`, not the default.
+    #[test]
+    fn an_explicit_empty_message_stays_empty() {
+        let mapped = handler_error(S3Error::with_message(S3ErrorCode::NoSuchLifecycleConfiguration, ""));
+
+        assert_eq!(mapped.message(), "");
+    }
+
+    #[test]
+    fn a_custom_code_without_a_message_gets_no_default() {
+        let mut error = S3Error::new(S3ErrorCode::Custom("AccessDenied".into()));
+        error.set_status_code(StatusCode::FORBIDDEN);
+
+        let mapped = handler_error(error);
 
         assert_eq!(mapped.code().as_str(), "AccessDenied");
         assert_eq!(mapped.message(), "");
+    }
+
+    #[test]
+    fn a_custom_code_without_a_status_or_message_is_still_a_server_fault() {
+        let mapped = handler_error(S3Error::new(S3ErrorCode::Custom("RustFsOnly".into())));
+
+        assert_eq!(mapped.code(), &ErrorCode::INTERNAL_ERROR);
+        assert_eq!(mapped.message(), MISSING_STATUS);
     }
 
     #[test]
@@ -326,6 +393,52 @@ mod tests {
         assert!(mapped.headers().contains(&ErrorHeader::RetryAfter { seconds: 7 }));
         let rendered: Vec<String> = mapped.headers().iter().map(ErrorHeader::value).collect();
         assert_eq!(rendered[6], "Tue, 14 Nov 2023 22:13:20 GMT");
+    }
+
+    #[test]
+    fn a_content_type_the_raiser_set_is_left_to_the_gateway() {
+        let mapped = with_headers(
+            S3ErrorCode::SlowDown,
+            &[(header::CONTENT_TYPE, "application/xml"), (header::RETRY_AFTER, "1")],
+        );
+
+        assert_eq!(mapped.code().as_str(), "SlowDown");
+        assert_eq!(mapped.headers(), [ErrorHeader::RetryAfter { seconds: 1 }]);
+    }
+
+    #[test]
+    fn an_unavailable_error_states_its_cause_beside_the_retry_advice() {
+        let cause = HeaderName::from_static("x-rustfs-error-cause");
+        let mapped = with_headers(
+            S3ErrorCode::ServiceUnavailable,
+            &[(cause.clone(), "namespace_lock_timeout"), (header::RETRY_AFTER, "1")],
+        );
+
+        assert_eq!(mapped.code().as_str(), "ServiceUnavailable");
+        assert!(mapped.headers().contains(&ErrorHeader::RustfsErrorCause {
+            cause: RustfsErrorCause::NamespaceLockTimeout
+        }));
+        assert!(mapped.headers().contains(&ErrorHeader::RetryAfter { seconds: 1 }));
+        for (value, expected) in [
+            ("namespace_lock_unavailable", RustfsErrorCause::NamespaceLockUnavailable),
+            ("storage_write_quorum", RustfsErrorCause::StorageWriteQuorum),
+        ] {
+            let mapped = with_headers(S3ErrorCode::ServiceUnavailable, &[(cause.clone(), value)]);
+            assert_eq!(mapped.headers(), [ErrorHeader::RustfsErrorCause { cause: expected }], "{value}");
+        }
+    }
+
+    #[test]
+    fn a_cause_outside_the_closed_set_fails_the_whole_error() {
+        for value in ["storage_read_quorum", "NAMESPACE_LOCK_TIMEOUT", ""] {
+            let mapped = with_headers(
+                S3ErrorCode::ServiceUnavailable,
+                &[(HeaderName::from_static("x-rustfs-error-cause"), value)],
+            );
+
+            assert_eq!(mapped.code(), &ErrorCode::INTERNAL_ERROR, "{value:?}");
+            assert_eq!(mapped.message(), UNWRITABLE_HEADER, "{value:?}");
+        }
     }
 
     #[test]
@@ -517,10 +630,33 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_key_without_a_message_is_answered_without_one() {
-        let answer = answered(S3Error::new(S3ErrorCode::NoSuchKey)).expect("admitted");
+    fn a_legacy_shaped_code_without_a_message_states_the_legacy_default() {
+        for code in [S3ErrorCode::NoSuchKey, S3ErrorCode::NoSuchBucket, S3ErrorCode::InvalidRange] {
+            let answer = answered(S3Error::new(code.clone())).expect("admitted");
 
-        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+            assert_eq!(answer.code().map(ErrorCode::as_str), Some(code.as_str()));
+            assert_eq!(answer.message(), code.default_message(), "{code}");
+        }
+        let answer = answered(S3Error::new(S3ErrorCode::NoSuchKey)).expect("admitted");
+        assert_eq!(answer.message(), Some("The specified key does not exist."));
+    }
+
+    #[test]
+    fn a_legacy_shaped_code_keeps_an_explicit_empty_message() {
+        let answer = answered(S3Error::with_message(S3ErrorCode::NoSuchKey, "")).expect("admitted");
+
+        assert_eq!(answer.message(), Some(""));
+    }
+
+    /// A custom code spelled like a legacy-shaped one has no default: legacy RustFS writes no
+    /// `<Message>` element for it.
+    #[test]
+    fn a_custom_legacy_shaped_code_without_a_message_is_answered_without_one() {
+        let mut error = S3Error::new(S3ErrorCode::Custom("NoSuchKey".into()));
+        error.set_status_code(StatusCode::NOT_FOUND);
+
+        let answer = answered(error).expect("admitted");
+
         assert_eq!(answer.code().map(ErrorCode::as_str), Some("NoSuchKey"));
         assert_eq!(answer.message(), None);
     }

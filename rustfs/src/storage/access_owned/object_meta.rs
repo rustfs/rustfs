@@ -37,7 +37,9 @@ pub(crate) async fn authorize_object_tagging_request<R: AuthorizationRequest + ?
     version_id: Option<&str>,
     action: S3Action,
 ) -> S3Result<()> {
-    authorize_object_request(req, bucket, key, version_id, versioned_tagging_action(action, version_id)).await
+    authorize_object_request(req, bucket, key, version_id, versioned_tagging_action(action, version_id))
+        .await
+        .map_err(Into::into)
 }
 
 /// Authorize the version and tag conditions using the original query and XML tag set.

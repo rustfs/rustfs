@@ -56,7 +56,7 @@ type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
 
 #[instrument]
 pub fn print_server_info() {
-    let current_year = jiff::Zoned::now().year();
+    let current_year = jiff::ZonedDateTime::now().year();
     info!(
         target: "rustfs::init",
         event = "server_identity",
@@ -928,8 +928,7 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
 
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub(crate) fn protocol_storage_client_for_server(server_ctx: Arc<ServerContextSlot>) -> ProtocolStorageClient {
-    let fs = crate::storage_api::startup::init::ecfs::FS::with_server_ctx(server_ctx);
-    ProtocolStorageClient::new(fs)
+    ProtocolStorageClient::new(server_ctx)
 }
 
 /// Initialize the FTP system

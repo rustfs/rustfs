@@ -357,7 +357,7 @@ pub fn license_check() -> Result<()> {
 mod tests {
     use super::*;
     use rsa::{
-        RsaPrivateKey, RsaPublicKey,
+        PrivateKey, PublicKey,
         pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
     };
     use rustfs_crypto::sign_license_token;
@@ -433,8 +433,8 @@ mod tests {
     #[serial]
     fn appauth_verifier_accepts_signed_license_with_trimmed_public_key() {
         let mut rng = rand::rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("private key should be generated");
-        let public_key = RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, 2048).expect("private key should be generated");
+        let public_key = PublicKey::from(&private_key);
         let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).expect("private key should encode");
         let public_key_pem = public_key
             .to_public_key_pem(LineEnding::LF)

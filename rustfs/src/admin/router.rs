@@ -476,7 +476,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(current_region)
+        .or_else(|| current_region().map(Into::into))
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -886,7 +886,8 @@ async fn authorized_object_lambda_get_request(
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
-    s3s::access::S3Access::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), &mut get_req).await?;
+    let (bucket, key, version) = (get_req.input.bucket.clone(), get_req.input.key.clone(), get_req.input.version_id.clone());
+    crate::admin::storage_api::access::authorize_get_object(&slot, &mut get_req, &bucket, &key, version.as_deref()).await?;
     Ok(get_req)
 }
 
@@ -899,8 +900,57 @@ async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, o
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
-    let get_resp = s3s::S3::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), get_req).await?;
+    let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(slot.app_context());
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+    let envelope = crate::app::RequestEnvelope::from_s3s(&get_req);
+    let crate::app::Answered { output, status, headers } = usecase
+        .execute_get_object_fields(envelope, crate::app::object_usecase::GetObjectFields::from_s3s(get_req.input))
+        .await?;
+    let mut get_resp = S3Response::new(
+        output
+            .into_s3s()
+            .map_err(|error| S3Error::from(crate::app::dto_values::seam_error(error)))?,
+    );
+    get_resp.status = status;
+    get_resp.headers = headers;
     invoke_object_lambda_target(req, bucket, object, get_resp).await
+}
+
+#[cfg(feature = "gateway-stack")]
+/// The bucket and key of an Object Lambda request, which takes precedence over every other route
+/// this router claims; `None` for any other request.
+pub(crate) fn object_lambda_target(method: &Method, uri: &Uri) -> Option<(String, String)> {
+    parse_object_lambda_request(method, uri)
+}
+
+#[cfg(feature = "gateway-stack")]
+/// Serves an admitted Object Lambda request that another edge verified, through the same handler
+/// the legacy `call` runs.
+pub(crate) async fn serve_object_lambda(
+    envelope: crate::app::RequestEnvelope,
+    bucket: &str,
+    object: &str,
+) -> rustfs_s3_types::S3Result<AdminResponse> {
+    let mut req = S3Request {
+        input: Body::empty(),
+        method: envelope.method().clone(),
+        uri: envelope.uri().clone(),
+        headers: envelope.headers().clone(),
+        extensions: envelope.transport_extensions(),
+        credentials: envelope.credentials().map(|credentials| s3s::auth::Credentials {
+            access_key: credentials.access_key().to_owned(),
+            secret_key: credentials.secret_key().unwrap_or_default().to_owned().into(),
+        }),
+        region: envelope.region().and_then(|region| region.parse().ok()),
+        service: envelope.service().map(str::to_owned),
+        trailing_headers: None,
+    };
+    let response = Box::pin(handle_object_lambda_request(&mut req, bucket, object)).await?;
+    Ok(AdminResponse::with_headers(
+        response.status.unwrap_or_default(),
+        response.output.into(),
+        response.headers,
+    ))
 }
 
 pub struct S3Router<T> {
@@ -913,6 +963,14 @@ pub struct S3Router<T> {
     server_ctx: Option<Arc<ServerContextSlot>>,
 }
 
+/// Only control-plane routes may share the console's browser origin. Object Lambda and
+/// bucket extensions have dispatch precedence even when their paths resemble console assets.
+pub(crate) fn console_listener_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    is_control_plane_route(method, uri, headers)
+        && parse_object_lambda_request(method, uri).is_none()
+        && s3_extension::route_key(method, uri).is_none()
+}
+
 /// Whether this router answers the request itself rather than an S3 operation: the RustFS extension
 /// routes and every control-plane route.
 #[cfg(feature = "gateway-stack")]
@@ -920,6 +978,36 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
     s3_extension::route_key(method, uri).is_some()
         || parse_object_lambda_request(method, uri).is_some()
         || is_control_plane_route(method, uri, headers)
+}
+
+/// Signed system-status and catalog-configuration reads, after object-lambda routing.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
+    method == Method::GET
+        && matches!(
+            uri.path(),
+            "/rustfs/admin/v3/info"
+                | "/minio/admin/v3/info"
+                | "/rustfs/admin/v3/storageinfo"
+                | "/minio/admin/v3/storageinfo"
+                | "/rustfs/admin/v4/runtime/capabilities"
+                | "/minio/admin/v4/runtime/capabilities"
+                | "/rustfs/admin/v3/object-data-cache/stats"
+                | "/minio/admin/v3/object-data-cache/stats"
+                | "/rustfs/admin/v3/datausageinfo"
+                | "/minio/admin/v3/datausageinfo"
+                | "/rustfs/admin/v4/plugins/catalog"
+                | "/minio/admin/v4/plugins/catalog"
+                | "/rustfs/admin/v4/cluster/snapshot"
+                | "/minio/admin/v4/cluster/snapshot"
+                | "/rustfs/admin/v4/extensions/catalog"
+                | "/minio/admin/v4/extensions/catalog"
+                | "/rustfs/admin/v3/module-switches"
+                | "/minio/admin/v3/module-switches"
+                | "/iceberg/v1/config"
+                | "/_iceberg/v1/config"
+        )
+        && parse_object_lambda_request(method, uri).is_none()
 }
 
 /// Console paths whose requests do not belong to an earlier extension route.
@@ -934,21 +1022,23 @@ fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
-fn reject_unbound_custom_route_auth(req: &S3Request<Body>) -> S3Result<()> {
+fn reject_unbound_custom_route_auth(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    signed: bool,
+) -> rustfs_s3_types::S3Result<()> {
     // V2 does not bind custom route query arguments or payloads to the signer.
-    let signed_v2 = req
-        .headers
+    let signed_v2 = headers
         .get_all(http::header::AUTHORIZATION)
         .iter()
         .any(|value| value.to_str().is_ok_and(|value| value.starts_with("AWS ")));
-    let presigned_v2 = req
-        .uri
+    let presigned_v2 = uri
         .query()
         .is_some_and(|query| url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "Signature"));
-    let post_policy = req.method == Method::POST
-        && req.credentials.is_some()
-        && req
-            .headers
+    let post_policy = method == Method::POST
+        && signed
+        && headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| {
@@ -958,16 +1048,17 @@ fn reject_unbound_custom_route_auth(req: &S3Request<Body>) -> S3Result<()> {
                     .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("multipart/form-data"))
             });
     if signed_v2 || presigned_v2 || post_policy {
-        return Err(s3_error!(
-            AccessDenied,
-            "Header or query Signature Version 4 is required for this operation"
-        ));
+        return Err(access_denied("Header or query Signature Version 4 is required for this operation"));
     }
     Ok(())
 }
 
-fn server_context_not_ready_error() -> S3Error {
-    S3Error::with_message(S3ErrorCode::ServiceUnavailable, "server context is not ready")
+fn access_denied(message: &'static str) -> rustfs_s3_types::S3Error {
+    rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::AccessDenied, message)
+}
+
+fn server_context_not_ready_error() -> rustfs_s3_types::S3Error {
+    rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::ServiceUnavailable, "server context is not ready")
 }
 
 fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
@@ -1048,33 +1139,77 @@ where
         is_control_plane_route(method, uri, headers)
     }
 
-    // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
-        // GHSA-g8w9-qw9q-fghr: custom routes bypass `S3Access::check`, so the
-        // SigV4 signed-header rule is enforced here as well.
-        reject_unsigned_amz_headers_on_sigv4_request(&req.headers, req.uri.query())?;
+        if let Some(server_ctx) = &self.server_ctx {
+            req.extensions.insert(server_ctx.clone());
+        }
+        Ok(self.admit(&req.method, &req.uri, &req.headers, req.credentials.is_some())?)
+    }
 
+    async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
             if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
-                return Err(server_context_not_ready_error());
+                return Err(server_context_not_ready_error().into());
             }
         }
-        if s3_extension::route_key(&req.method, &req.uri).is_some()
-            || parse_object_lambda_request(&req.method, &req.uri).is_some()
-        {
-            reject_unbound_custom_route_auth(req)?;
-            return match req.credentials {
-                Some(_) => Ok(()),
-                None => Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required")),
-            };
+        if let Some((bucket, object)) = parse_object_lambda_request(&req.method, &req.uri) {
+            return Box::pin(handle_object_lambda_request(&mut req, &bucket, &object)).await;
+        }
+        // Extension routes are claimed ahead of the console.
+        // Console requests should be handled by console router first (including OPTIONS)
+        // Console has its own CORS layer configured
+        if s3_extension::route_key(&req.method, &req.uri).is_none() && self.console_enabled && is_console_path(req.uri.path()) {
+            if let Some(console_router) = &self.console_router {
+                let mut console_router = console_router.clone();
+                let req = convert_request(req);
+                let result = console_router.call(req).await;
+                return match result {
+                    Ok(resp) => Ok(convert_response(resp)),
+                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
+                };
+            }
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
         }
 
-        // Allow unauthenticated access to health check
-        let path = req.uri.path();
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let (status, headers, body) = dispatch(self, envelope, req.input.into()).await?.into_parts();
+        let mut response = S3Response::with_headers(body.into(), headers);
+        response.status = Some(status);
+        Ok(response)
+    }
+}
+
+impl<T> S3Router<T> {
+    /// The access rule of every route this router claims, whichever edge verified the request:
+    /// `signed` is whether a signature was verified for it. The legacy `check_access` and the
+    /// gateway stack's control-plane host both decide by this one function.
+    pub(crate) fn admit(&self, method: &Method, uri: &Uri, headers: &HeaderMap, signed: bool) -> rustfs_s3_types::S3Result<()> {
+        // GHSA-g8w9-qw9q-fghr: custom routes bypass `S3Access::check`, so the
+        // SigV4 signed-header rule is enforced here as well.
+        reject_unsigned_amz_headers_on_sigv4_request(headers, uri.query())?;
+
+        let path = uri.path();
+        if let Some(server_ctx) = &self.server_ctx
+            && !is_public_health_path(path)
+            && server_ctx.installed_app_context().is_none()
+        {
+            return Err(server_context_not_ready_error());
+        }
+        let signature_required = || {
+            if signed {
+                Ok(())
+            } else {
+                Err(access_denied("Signature is required"))
+            }
+        };
+        if s3_extension::route_key(method, uri).is_some() || parse_object_lambda_request(method, uri).is_some() {
+            reject_unbound_custom_route_auth(method, uri, headers, signed)?;
+            return signature_required();
+        }
 
         // Health check
-        if (req.method == Method::HEAD || req.method == Method::GET) && is_public_health_path(path) {
+        if (method == Method::HEAD || method == Method::GET) && is_public_health_path(path) {
             return Ok(());
         }
 
@@ -1090,7 +1225,7 @@ where
 
         // Object ZIP downloads are browser-navigated with a short-lived token;
         // the handler validates the token before returning any bytes.
-        if is_object_zip_download_token_path(&req.method, &req.uri) {
+        if is_object_zip_download_token_path(method, uri) {
             return Ok(());
         }
 
@@ -1099,67 +1234,33 @@ where
         // The handler dispatches on the Action parameter: AssumeRole will reject if
         // credentials are missing, AssumeRoleWithWebIdentity will validate the JWT.
         // Require application/x-www-form-urlencoded Content-Type to narrow the bypass.
-        if req.credentials.is_none() && is_sts_query_request(&req.method, &req.uri, &req.headers) {
+        if !signed && is_sts_query_request(method, uri, headers) {
             return Ok(());
         }
 
         // For non-RPC admin requests, check credentials
-        reject_unbound_custom_route_auth(req)?;
-        match req.credentials {
-            Some(_) => Ok(()),
-            None => Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required")),
-        }
+        reject_unbound_custom_route_auth(method, uri, headers, signed)?;
+        signature_required()
     }
+}
 
-    async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        if let Some(server_ctx) = &self.server_ctx {
-            req.extensions.insert(server_ctx.clone());
-            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
-                return Err(server_context_not_ready_error());
-            }
-        }
-        if let Some((bucket, object)) = parse_object_lambda_request(&req.method, &req.uri) {
-            return Box::pin(handle_object_lambda_request(&mut req, &bucket, &object)).await;
-        }
-        // Extension routes are claimed ahead of the console.
-        let extension_key = s3_extension::route_key(&req.method, &req.uri);
-
-        // Console requests should be handled by console router first (including OPTIONS)
-        // Console has its own CORS layer configured
-        if extension_key.is_none() && self.console_enabled && is_console_path(req.uri.path()) {
-            if let Some(console_router) = &self.console_router {
-                let mut console_router = console_router.clone();
-                let req = convert_request(req);
-                let result = console_router.call(req).await;
-                return match result {
-                    Ok(resp) => Ok(convert_response(resp)),
-                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
-                };
-            }
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
-        }
-
-        let key = extension_key.unwrap_or_else(|| route_key_canonical(&req.method, req.uri.path()));
-
-        if let Ok(mat) = self.table.at(&key) {
-            let op: &T = mat.value;
-            let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-            let request = AdminRequest::new(envelope, req.input.into());
-            let (status, headers, body) = op.call(request, mat.params).await?.into_parts();
-            let mut response = S3Response::with_headers(body.into(), headers);
-            response.status = Some(status);
-
-            return Ok(response);
-        }
-
-        if is_admin_v4_fallback_path(req.uri.path()) {
-            let mut resp = S3Response::new(Body::empty());
-            resp.status = Some(StatusCode::UPGRADE_REQUIRED);
-            return Ok(resp);
-        }
-
-        Err(S3Error::new(S3ErrorCode::NotImplemented))
+/// Answers a request `router` admitted from its route table: an extension route by its key,
+/// every other route by its canonical path, an unknown v4 admin path `426`, and anything else
+/// `NotImplemented`. Object Lambda and the console are each edge's own.
+pub(crate) async fn dispatch<T: OwnedOperation>(
+    router: &S3Router<T>,
+    envelope: crate::app::RequestEnvelope,
+    body: rustfs_s3_types::Body,
+) -> rustfs_s3_types::S3Result<AdminResponse> {
+    let key = s3_extension::route_key(envelope.method(), envelope.uri())
+        .unwrap_or_else(|| route_key_canonical(envelope.method(), envelope.uri().path()));
+    if let Ok(mat) = router.table.at(&key) {
+        return mat.value.call(AdminRequest::new(envelope, body), mat.params).await;
     }
+    if is_admin_v4_fallback_path(envelope.uri().path()) {
+        return Ok(AdminResponse::new(StatusCode::UPGRADE_REQUIRED, rustfs_s3_types::Body::empty()));
+    }
+    Err(rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::NotImplemented))
 }
 
 /// Registers one owned admin operation with the legacy router. The router
@@ -1173,6 +1274,9 @@ impl OwnedOperation for AdminOperation {
         self.0.call(req, params).await
     }
 }
+
+#[cfg(test)]
+mod admission_tests;
 
 #[cfg(test)]
 mod s3_extension_tests;
@@ -2041,7 +2145,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: current_region(),
+            region: current_region().map(Into::into),
             service: None,
             trailing_headers: None,
         };

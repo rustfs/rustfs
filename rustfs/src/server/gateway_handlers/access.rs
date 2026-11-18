@@ -34,7 +34,9 @@ use rustfs_gateway::sig::{SigFamily, SigLocation};
 use rustfs_gateway::{RequestContextView, RequestPrincipal};
 use rustfs_policy::policy::action::Action;
 use rustfs_s3_types::S3Result;
+use std::future::Future;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Runs the shared access phase for one accepted request and returns its envelope.
 ///
@@ -43,20 +45,40 @@ use std::sync::Arc;
 /// What the legacy access check answers: the credential refusals of the key lookup,
 /// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
 /// `InternalError` when IAM or the license cannot be read or the request cannot be read back.
-pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &RequestContextView) -> S3Result<RequestEnvelope> {
+pub(super) fn admit<'a>(
+    server_ctx: &'a Arc<ServerContextSlot>,
+    context: &RequestContextView,
+) -> impl Future<Output = S3Result<RequestEnvelope>> + Send + use<'a> {
     let signature = verified_signature(context);
-    let mut envelope = RequestEnvelope::from_gateway(context, server_ctx, signature)?;
-    let credentials = envelope.credentials();
-    let access_key = credentials.map(|credentials| credentials.access_key().to_owned());
-    let session_token = credentials
-        .and_then(|credentials| credentials.session_token())
-        .unwrap_or_default()
-        .to_owned();
-    let req_info =
-        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?;
-    envelope.install_req_info(req_info);
-    admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)?;
-    Ok(envelope)
+    let operation = context.operation();
+    let envelope = RequestEnvelope::from_gateway(context, server_ctx, signature);
+    let keystone = context.header_token_principal().map(|_| {
+        super::envelope::keystone_identity(context).map(|identity| (identity.credentials().clone(), identity.had_session_token()))
+    });
+    async move {
+        let mut envelope = envelope?;
+        let credentials = envelope.credentials();
+        let access_key = credentials.map(|credentials| credentials.access_key().to_owned());
+        let session_token = Zeroizing::new(
+            credentials
+                .and_then(|credentials| credentials.session_token())
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        let req_info = if let Some(identity) = keystone {
+            let (credentials, had_session_token) = identity?;
+            let mut info = resolve_req_info(server_ctx, None, "", envelope.request_context().cloned()).await?;
+            info.is_owner = crate::auth::keystone_is_owner(&credentials);
+            info.cred = Some(credentials);
+            info.keystone_session_present = Some(had_session_token);
+            info
+        } else {
+            resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?
+        };
+        envelope.install_req_info(req_info);
+        admit_operation(envelope.headers(), envelope.uri().query(), operation, signature)?;
+        Ok(envelope)
+    }
 }
 
 /// The bucket-configuration mutation shape on the gateway edge: the shared function the legacy
@@ -72,12 +94,12 @@ pub(super) async fn authorize_bucket_config_mutation(
     action: Action,
 ) -> S3Result<()> {
     let server_ctx = require_server_context(envelope)?;
-    Ok(authorize_config_mutation(&server_ctx, envelope, bucket, action).await?)
+    authorize_config_mutation(&server_ctx, envelope, bucket, action).await
 }
 
 pub(super) async fn authorize_bucket_tag_deletion(envelope: &mut RequestEnvelope, bucket: &str) -> S3Result<()> {
     let server_ctx = require_server_context(envelope)?;
-    Ok(authorize_tag_deletion(&server_ctx, envelope, bucket).await?)
+    authorize_tag_deletion(&server_ctx, envelope, bucket).await
 }
 
 fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerContextSlot>> {
@@ -89,7 +111,7 @@ fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerCont
 
 /// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the
 /// query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
-pub(super) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
+pub(in crate::server) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
     match context.principal().map(RequestPrincipal::scheme) {
         Some(scheme) if scheme.family() == SigFamily::V4 => VerifiedSignature {
             sigv4: matches!(scheme.location(), SigLocation::Header | SigLocation::Query),

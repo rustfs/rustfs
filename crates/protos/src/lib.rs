@@ -67,6 +67,18 @@ impl std::fmt::Debug for proto_gen::node_service::RenameDataResponse {
     }
 }
 
+impl std::fmt::Debug for proto_gen::node_service::RenameDataBatchResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenameDataBatchResult")
+            .field("item_index", &self.item_index)
+            .field("success", &self.success)
+            .field("error", &self.error)
+            .field("rename_data_resp_msgpack", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1171,6 +1183,23 @@ pub fn canonical_rename_data_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_rename_data_batch_request_body(
+    request: &proto_gen::node_service::RenameDataBatchRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-data-batch-request-v1\0");
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_count(request.items.len())?;
+    for item in &request.items {
+        body.push_u32(item.item_index);
+        body.push_str(&item.disk)?;
+        body.push_bytes(&item.file_info_msgpack)?;
+    }
+    Ok(body.finish())
+}
+
 /// The fixed-MPU recovery method authenticates every wire field in its own domain.
 pub fn canonical_recover_multipart_source_request_body(
     request: &proto_gen::node_service::RecoverMultipartSourceRequest,
@@ -1690,9 +1719,10 @@ pub fn canonical_make_volumes_request_body(
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
         CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
-        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
-        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataBatchItem,
+        RenameDataBatchRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest,
+        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest,
+        WriteMetadataRequest,
     };
     use super::*;
 
@@ -1841,6 +1871,51 @@ mod disk_mutation_canonical_tests {
         assert_ne!(
             canonical_rename_data_request_body(&shifted_left).unwrap(),
             canonical_rename_data_request_body(&shifted_right).unwrap(),
+        );
+    }
+
+    #[test]
+    fn rename_data_batch_canonical_body_binds_every_field_and_item_order() {
+        let baseline = RenameDataBatchRequest {
+            src_volume: "src-vol".into(),
+            src_path: "src-path".into(),
+            dst_volume: "dst-vol".into(),
+            dst_path: "dst-path".into(),
+            items: vec![
+                RenameDataBatchItem {
+                    item_index: 1,
+                    disk: "disk-a".into(),
+                    file_info_msgpack: vec![0x81, 0x01].into(),
+                },
+                RenameDataBatchItem {
+                    item_index: 2,
+                    disk: "disk-b".into(),
+                    file_info_msgpack: vec![0x81, 0x02].into(),
+                },
+            ],
+        };
+        let mut bodies = vec![canonical_rename_data_batch_request_body(&baseline).expect("baseline batch body")];
+        for mutate in [
+            |r: &mut RenameDataBatchRequest| r.src_volume = "src-vol2".into(),
+            |r: &mut RenameDataBatchRequest| r.src_path = "src-path2".into(),
+            |r: &mut RenameDataBatchRequest| r.dst_volume = "dst-vol2".into(),
+            |r: &mut RenameDataBatchRequest| r.dst_path = "dst-path2".into(),
+            |r: &mut RenameDataBatchRequest| r.items[0].item_index = 3,
+            |r: &mut RenameDataBatchRequest| r.items[0].disk = "disk-c".into(),
+            |r: &mut RenameDataBatchRequest| r.items[0].file_info_msgpack = vec![0x81, 0x03].into(),
+            |r: &mut RenameDataBatchRequest| r.items.swap(0, 1),
+            |r: &mut RenameDataBatchRequest| {
+                r.items.pop();
+            },
+        ] {
+            let mut changed = baseline.clone();
+            mutate(&mut changed);
+            bodies.push(canonical_rename_data_batch_request_body(&changed).expect("changed batch body"));
+        }
+        assert_all_distinct(&bodies);
+        assert_ne!(
+            canonical_rename_data_batch_request_body(&baseline).expect("batch body"),
+            canonical_rename_data_request_body(&RenameDataRequest::default()).expect("unary body"),
         );
     }
 
@@ -3655,7 +3730,12 @@ fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bo
 }
 
 // Limits transport response futures; client RPC metrics separately cover unary body decoding.
-const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+pub const INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT: usize = 64;
+
+// Quorum reads cancel surplus metadata RPCs in bursts. Keep bounded reset state
+// for their in-flight replies without spending the connection's protocol-error
+// budget (h2 remembers only 50 resets by default).
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
 
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
@@ -4104,12 +4184,13 @@ async fn dial_channel(
             rustfs_config::DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT,
         ))?
     } else {
-        INTERNODE_RPC_CONCURRENCY_LIMIT
+        INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT
     };
     let stream_window = checked_rpc_window(stream_window)?;
     let conn_window = checked_rpc_window(conn_window)?;
     let mut endpoint = Endpoint::from_shared(dial_addr.to_string())?
         .concurrency_limit(concurrency_limit)
+        .http2_max_concurrent_reset_streams(INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS)
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -4265,6 +4346,9 @@ pub async fn evict_failed_connection_with_reason(
         }
     }
 }
+
+#[cfg(test)]
+mod reset_stream_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4660,8 +4744,8 @@ mod tests {
                 ),
                 ("DeleteVersionRequest", "file_info", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
                 ("DeleteVersionRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero),
-                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
-                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("ReadMultipleRequest", "read_multiple_req", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("ReadVersionRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("RenameDataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
@@ -5871,6 +5955,7 @@ mod lock_release_tests {
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                cache_fence_stamp: None,
             };
             let result = GenerallyLockResult {
                 success,
@@ -5925,5 +6010,43 @@ mod lock_release_tests {
         let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
         assert_eq!(decoded.acquire_status, 99);
         assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
+    }
+
+    #[test]
+    fn cache_fence_stamp_is_additive_for_single_and_batch_lock_responses() {
+        let stamp = prost::bytes::Bytes::from_static(b"fixed-width-cache-fence-proof");
+        let response = GenerallyLockResponse {
+            success: true,
+            cache_fence_stamp: Some(stamp.clone()),
+            ..Default::default()
+        };
+        let result = GenerallyLockResult {
+            success: true,
+            cache_fence_stamp: Some(stamp),
+            ..Default::default()
+        };
+        for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
+            let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive cache proof");
+            assert!(legacy.success);
+        }
+
+        let legacy = LegacyReleaseResponse {
+            success: true,
+            error_info: None,
+            lock_info: None,
+        }
+        .encode_to_vec();
+        assert!(
+            GenerallyLockResponse::decode(legacy.as_slice())
+                .expect("new single response decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
+        assert!(
+            GenerallyLockResult::decode(legacy.as_slice())
+                .expect("new batch result decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
     }
 }

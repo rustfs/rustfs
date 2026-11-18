@@ -77,7 +77,9 @@ pub(crate) async fn authorize_get_object_attributes<R: AuthorizationRequest + ?S
         S3Action::GetObjectAttributesAction
     };
     authorize_object_request(req, bucket, key, version_id, Action::S3Action(attributes)).await?;
-    authorize_request(req, versioned_read_action(version_id)).await
+    authorize_request(req, versioned_read_action(version_id))
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

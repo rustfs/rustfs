@@ -26,7 +26,7 @@ use aws_sdk_s3::types::{
     DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
     ObjectLockRule,
 };
-use chrono::{Duration as ChronoDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 fn delete_denied(error: &SdkError<DeleteObjectError>, context: &str) -> TestResult {
     let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
@@ -66,7 +66,7 @@ async fn four_node_four_drive_object_lock_worm_blocks_delete() -> TestResult {
         .send()
         .await?;
 
-    let retain_until = Utc::now() + ChronoDuration::days(1);
+    let retain_until = Timestamp::now() + SignedDuration::from_hours(24);
 
     let compliance_key = "compliance.bin";
     let compliance_version = put_object_with_retention(
@@ -176,7 +176,10 @@ async fn four_node_default_retention_is_visible_and_non_lock_bucket_rejects_conf
     let retain_until = retention
         .retain_until_date()
         .ok_or("default retention omitted retain-until date")?;
-    assert!(retain_until.secs() > Utc::now().timestamp(), "default retention is not in the future");
+    assert!(
+        retain_until.secs() > Timestamp::now().as_second(),
+        "default retention is not in the future"
+    );
 
     let versioning = reader.get_bucket_versioning().bucket(&bucket).send().await?;
     assert_eq!(versioning.status().map(|status| status.as_str()), Some("Enabled"));
