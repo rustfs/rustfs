@@ -20,7 +20,7 @@
 //! counted and the count is carried on the next entry that is let through.
 
 use crate::module_switches::is_audit_module_enabled;
-use crate::storage::access::{AuthorizationRequest, req_info_mut};
+use crate::storage::authorization::{AuthorizationRequest, req_info_mut};
 use crate::storage::helper::{
     AuditRequestView, DenialRequest, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
     spawn_background_with_context,

@@ -75,7 +75,8 @@ use super::storage_api::ecstore_object::{
     ReadEncryptionMode, ReadEncryptionRequest,
 };
 use crate::runtime_sources::current_kms_runtime_service_manager;
-use crate::storage::access::{AuthorizationRequest, request_context_from_req, resource_free_condition_values};
+use crate::storage::access::resource_free_condition_values;
+use crate::storage::authorization::{AuthorizationRequest, request_context_from_req};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;

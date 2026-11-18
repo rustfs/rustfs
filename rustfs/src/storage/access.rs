@@ -23,17 +23,23 @@ use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
 use crate::auth::{
-    AuthType, OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION,
-    RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
-    check_key_valid_with_context, get_request_auth_type_with_query, get_session_token,
-    parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
-    reject_unsigned_amz_headers_on_sigv4_request,
+    OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, get_request_auth_type_with_query,
+    get_session_token, reject_unsigned_amz_headers_on_sigv4_request,
 };
 use crate::error::ApiError;
-use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 pub(crate) use crate::storage::authorization_actions::{
     delete_object_authorize_action, versioned_read_action, versioned_tagging_action,
+};
+// `app::metadata_route` still imports this path.
+pub(crate) use crate::storage::authorization::req_info_mut;
+#[cfg(test)]
+use crate::storage::authorization::{AMZ_WRITE_OFFSET_BYTES_HEADER, replication_request_authorized, request_context_from_req};
+use crate::storage::authorization::{
+    AccessMarkers, AuthorizationRequest, VerifiedSignature, admit_operation, has_bypass_governance_header,
+    has_write_offset_bytes_header, invalid_force_delete_header, missing_req_info_error, object_store_not_initialized_error,
+    recursive_force_delete_has_authenticated_caller, req_info_ref, request_iam_store, request_object_store, resolve_req_info,
+    set_requested_object_lock_retain_until,
 };
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
@@ -68,9 +74,9 @@ use rustfs_policy::policy::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
-    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, force_delete_header, get_header,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG,
+    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID,
+    get_header,
 };
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
@@ -108,10 +114,6 @@ const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
 const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
 
-pub(crate) fn replication_request_authorized<R: AuthorizationRequest + ?Sized>(req: &R) -> bool {
-    req.req_info().is_some_and(|req_info| req_info.replication_request_authorized)
-}
-
 fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
     headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS)
         || get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).is_some()
@@ -135,21 +137,6 @@ pub(crate) async fn authorize_replication_only_put_headers<R: AuthorizationReque
     authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
     req_info_mut(req)?.replication_request_authorized = true;
     Ok(())
-}
-
-pub(crate) fn recursive_force_delete_has_authenticated_caller(
-    headers: &HeaderMap,
-    authenticated: bool,
-    replica_request: bool,
-) -> bool {
-    match force_delete_header(headers) {
-        Ok(Some(true)) => authenticated || replica_request,
-        _ => true,
-    }
-}
-
-fn invalid_force_delete_header() -> S3Error {
-    S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")
 }
 
 #[derive(Clone, Debug)]
@@ -759,26 +746,6 @@ fn apply_generation_fence<R: AuthorizationRequest + ?Sized>(
     Ok(())
 }
 
-fn missing_req_info_error() -> S3Error {
-    s3_error!(InternalError, "ReqInfo not found in request extensions")
-}
-
-pub(crate) fn req_info_ref<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<&ReqInfo> {
-    req.req_info().ok_or_else(missing_req_info_error)
-}
-
-pub(crate) fn req_info_mut<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<&mut ReqInfo> {
-    req.req_info_mut().ok_or_else(missing_req_info_error)
-}
-
-/// Extract the canonical `RequestContext` from a request, checking both
-/// the request extensions directly and the `ReqInfo.request_context` field.
-pub(crate) fn request_context_from_req<R: AuthorizationRequest + ?Sized>(req: &R) -> Option<RequestContext> {
-    req.request_context()
-        .cloned()
-        .or_else(|| req.req_info().and_then(|req_info| req_info.request_context.clone()))
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectTagConditions {
     bucket: String,
@@ -858,12 +825,6 @@ pub(crate) mod envelope_payloads {
     pub(crate) fn object_tag_conditions(bucket: &str) -> ObjectTagConditions {
         ObjectTagConditions::new(bucket, "object", None, HashMap::new())
     }
-}
-
-const AMZ_WRITE_OFFSET_BYTES_HEADER: &str = "x-amz-write-offset-bytes";
-
-fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
-    headers.contains_key(AMZ_WRITE_OFFSET_BYTES_HEADER)
 }
 
 /// True when the bucket policy may evaluate `s3:ExistingObjectTag` for this request (statement
@@ -996,73 +957,6 @@ fn merge_request_object_tag_conditions(
     }
     conditions.insert("RequestObjectTagKeys".to_string(), tag_keys);
     Ok(())
-}
-
-/// The request facts the shared authorization core reads. Both edges feed the
-/// same policy evaluation without constructing another request type; the
-/// owned `RequestEnvelope` implements it in the app layer.
-pub(crate) trait AuthorizationRequest {
-    fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
-        None
-    }
-    fn permission_probe_request_fact_known(&self, _fact: PermissionProbeRequestFact) -> bool {
-        false
-    }
-    fn permission_probe_auth_type(&self) -> Option<crate::auth::facts::AuthTypeCondition> {
-        None
-    }
-    fn permission_probe(&self) -> bool {
-        false
-    }
-    fn headers(&self) -> &HeaderMap;
-    fn headers_mut(&mut self) -> &mut HeaderMap;
-    fn uri(&self) -> &http::Uri;
-    fn remote_addr(&self) -> Option<std::net::SocketAddr>;
-    fn client_info(&self) -> Option<&ClientInfo>;
-    fn server_context(&self) -> Option<&Arc<ServerContextSlot>>;
-    fn req_info(&self) -> Option<&ReqInfo>;
-    fn req_info_mut(&mut self) -> Option<&mut ReqInfo>;
-    fn request_context(&self) -> Option<&RequestContext>;
-    fn bucket_generation(&self) -> Option<&BucketGenerationGuard>;
-    fn install_bucket_generation(&mut self, guard: BucketGenerationGuard);
-    fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard>;
-    fn install_pending_delete_bucket_generation(&mut self, guard: PendingDeleteBucketGenerationGuard);
-    fn copy_source_bucket_generation(&self) -> Option<&CopySourceBucketGenerationGuard>;
-    fn odm_read_generation(&self) -> Option<&OdmReadGenerationGuard>;
-    fn install_odm_read_generation(&mut self, guard: OdmReadGenerationGuard);
-    fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot>;
-    fn install_bucket_config_mutation(&mut self, snapshot: BucketConfigMutationSnapshot);
-    /// The extensions no typed accessor covers, for test-only payloads.
-    #[cfg(test)]
-    fn test_extensions(&self) -> &http::Extensions;
-    fn internal_object_authorization(&self) -> bool;
-    fn multipart_staging(&self) -> bool;
-    fn staged_multipart_part(&self) -> bool;
-    fn set_staged_multipart_part(&mut self, staged: bool);
-    fn requested_retention(&self) -> Option<&RequestedObjectLockRetention>;
-    fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil>;
-    fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold>;
-    fn requested_object_tags(&self) -> Option<&RequestedObjectTags>;
-    fn take_requested_object_tags(&mut self) -> Option<RequestedObjectTags>;
-    fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention);
-    fn install_requested_retain_until(&mut self, retain_until: Option<RequestedObjectLockRetainUntil>);
-    fn install_requested_legal_hold(&mut self, legal_hold: RequestedObjectLegalHold);
-    fn install_requested_object_tags(&mut self, tags: RequestedObjectTags);
-    fn requested_copy_source(&self) -> Option<&RequestedCopySource>;
-    fn install_requested_copy_source(&mut self, source: RequestedCopySource);
-    fn install_copy_source_bucket_generation(&mut self, guard: CopySourceBucketGenerationGuard);
-    /// The headers that describe what the request stores: a POST upload's form
-    /// fields when present, otherwise the request headers.
-    fn policy_headers(&self) -> &HeaderMap;
-    fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders);
-    fn install_post_object_marker(&mut self);
-    fn object_tag_conditions(&self) -> Option<&ObjectTagConditions>;
-    fn take_object_tag_conditions(&mut self) -> Option<ObjectTagConditions>;
-    fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions);
-    fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards>;
-    fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards);
-    fn install_table_list_access(&mut self, access: TableDataPlaneListAccess);
-    fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str);
 }
 
 impl<T> AuthorizationRequest for S3Request<T> {
@@ -1385,16 +1279,6 @@ fn authorization_conditions_with_internal<R: AuthorizationRequest + ?Sized>(
     Ok(conditions)
 }
 
-/// Records the retain-until date a request asks to set, or clears it when the
-/// request sets none. Call it before `authorize_request` with the parsed date from
-/// headers, form fields, the PutObjectRetention XML body, or an archive member.
-pub(crate) fn set_requested_object_lock_retain_until<R: AuthorizationRequest + ?Sized>(
-    req: &mut R,
-    retain_until: Option<OffsetDateTime>,
-) {
-    req.install_requested_retain_until(retain_until.map(RequestedObjectLockRetainUntil));
-}
-
 /// Keep the XML value literal for IAM; endpoint aliases are resolved later.
 fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<String> {
     input
@@ -1537,255 +1421,6 @@ pub(crate) fn resource_free_condition_values<R: AuthorizationRequest + ?Sized>(
     let mut conditions = build_conditions(&principal, &facts);
     forward_secret_headers(req.headers(), &mut conditions);
     conditions
-}
-
-fn request_object_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<ECStore>> {
-    match req.server_context() {
-        Some(server_ctx) => server_ctx
-            .installed_object_store()
-            .ok_or_else(object_store_not_initialized_error),
-        None => runtime_sources::current_object_store_handle().ok_or_else(object_store_not_initialized_error),
-    }
-}
-
-fn object_store_not_initialized_error() -> S3Error {
-    S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized")
-}
-
-fn request_iam_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<IamSys<ObjectStore>>> {
-    let iam_store = match req.server_context() {
-        Some(server_ctx) => server_ctx
-            .installed_app_context()
-            .filter(|context| context.iam().is_ready())
-            .map(|context| context.iam().handle())
-            .ok_or(IamError::IamSysNotInitialized),
-        None => runtime_sources::current_ready_iam_handle(),
-    };
-    iam_store.map_err(|_| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("authorize_request {:?}", IamError::IamSysNotInitialized),
-        )
-    })
-}
-
-/// What an edge's signature verification established about a request, as the access phase
-/// records it for the readers of [`VerifiedSigV4Request`] and [`VerifiedPresignedRequest`].
-///
-/// Each edge derives it from its own verdict; the legacy edge from the signature form s3s verified.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct VerifiedSignature {
-    /// A SigV4 signature covered the request line, in the header or the query.
-    pub(crate) sigv4: bool,
-    /// The SigV4 signature was carried in the query.
-    pub(crate) presigned: bool,
-}
-
-impl VerifiedSignature {
-    /// The legacy edge's reading: s3s verified the signature form these headers name.
-    pub(crate) fn from_auth_type(auth_type: AuthType) -> Self {
-        Self {
-            sigv4: matches!(auth_type, AuthType::Presigned | AuthType::Signed),
-            presigned: matches!(auth_type, AuthType::Presigned),
-        }
-    }
-}
-
-/// The payloads the access phase hands every later reader of a request: the signature markers
-/// and, for an operation that stages an upload, [`MultipartStagingOperation`].
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AccessMarkers {
-    staging: Option<MultipartStagingOperation>,
-    signature: VerifiedSignature,
-}
-
-impl AccessMarkers {
-    /// The markers of the S3 operation named `operation`, signed as `signature` says.
-    pub(crate) fn new(operation: &str, signature: VerifiedSignature) -> Self {
-        Self {
-            staging: MultipartStagingOperation::for_operation(operation),
-            signature,
-        }
-    }
-
-    pub(crate) fn install(self, extensions: &mut http::Extensions) {
-        if let Some(staging) = self.staging {
-            extensions.insert(staging);
-        }
-        if self.signature.presigned {
-            extensions.insert(VerifiedPresignedRequest);
-        }
-        if self.signature.sigv4 {
-            extensions.insert(VerifiedSigV4Request);
-        }
-    }
-}
-
-/// Resolves the caller of one request as the access phase of either edge needs it: the credential
-/// IAM holds for `access_key` (validated against `session_token`), whether it owns the deployment,
-/// and the request-scoped facts later authorization steps read.
-///
-/// `access_key` is the key whose signature the edge verified; `None` is an anonymous request.
-/// Resolved against `server_ctx` so each embedded server reads its own IAM domain.
-///
-/// # Errors
-///
-/// What [`check_key_valid_with_context`] refuses: an unknown, disabled or expired credential, a
-/// session token that does not belong to it, or an IAM system that is not initialized.
-pub(crate) async fn resolve_req_info(
-    server_ctx: &Arc<ServerContextSlot>,
-    access_key: Option<&str>,
-    session_token: &str,
-    request_context: Option<RequestContext>,
-) -> S3Result<ReqInfo> {
-    let app_context = server_ctx.app_context();
-    let (cred, is_owner) = match access_key {
-        Some(access_key) => {
-            let (cred, is_owner) = check_key_valid_with_context(session_token, access_key, app_context.as_deref()).await?;
-            (Some(cred), is_owner)
-        }
-        None => (None, false),
-    };
-    let region = match app_context.as_deref() {
-        Some(context) => context.region().get(),
-        None => runtime_sources::current_region(),
-    };
-    Ok(ReqInfo {
-        cred,
-        is_owner,
-        region,
-        request_context,
-        ..Default::default()
-    })
-}
-
-// POST policies cover multipart fields, not the surrounding HTTP request.
-// Check before authorization can hoist query metadata into the wire headers.
-fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -> S3Result<()> {
-    fn object_property(name: &str) -> bool {
-        name == "x-amz-storage-class"
-            || name == "x-amz-snowball-auto-extract"
-            || ["x-amz-meta-", "x-minio-meta-", "x-rustfs-meta-"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-    }
-    if headers.keys().any(|name| object_property(name.as_str()))
-        || raw_query.is_some_and(|query| {
-            url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| object_property(&name.to_ascii_lowercase()))
-        })
-    {
-        return Err(s3_error!(AccessDenied, "POST object properties must be supplied as form fields"));
-    }
-    Ok(())
-}
-
-/// The operation-aware admission every S3 request passes after its caller is resolved and before
-/// its own authorization: a signed upload-size capability is refused on any operation but the one
-/// it is scoped to, and the license must be valid.
-///
-/// # Errors
-///
-/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
-/// `InternalError` when the license cannot be checked.
-pub(crate) fn admit_operation(
-    headers: &HeaderMap,
-    raw_query: Option<&str>,
-    operation: &str,
-    signature: VerifiedSignature,
-) -> S3Result<()> {
-    if operation == "PostObject" {
-        validate_post_object_metadata(headers, raw_query)?;
-    }
-    // The size capability is intentionally scoped to the single-object
-    // PutObject operation. Validate this at the operation-aware access
-    // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
-    // ignore a signed capability query.
-    if parse_presigned_put_max_content_length(headers, raw_query, signature.presigned)?.is_some() && operation != "PutObject" {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
-        ));
-    }
-    if parse_presigned_multipart_max_total_object_size(headers, raw_query, signature.sigv4)?.is_some()
-        && operation != "CreateMultipartUpload"
-    {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
-        ));
-    }
-    license_check().map_err(|er| match er.kind() {
-        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
-        _ => {
-            tracing::error!("license check failed due to unexpected error: {er}");
-            s3_error!(InternalError, "License validation failed")
-        }
-    })
-}
-
-#[cfg(test)]
-mod access_phase_tests {
-    use super::{
-        AccessMarkers, AuthType, MultipartStagingOperation, VerifiedPresignedRequest, VerifiedSigV4Request, VerifiedSignature,
-    };
-
-    #[test]
-    fn post_object_metadata_checks_only_out_of_form_object_properties() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONTENT_TYPE, "multipart/form-data; boundary=test".parse().unwrap());
-        super::validate_post_object_metadata(&headers, Some("client=browser")).unwrap();
-        for query in ["X-Amz-Meta-Label=test", "X%2DAmz-Storage-Class=STANDARD"] {
-            assert!(super::validate_post_object_metadata(&headers, Some(query)).is_err());
-        }
-        for name in [
-            "x-amz-meta-label",
-            "x-minio-meta-label",
-            "x-rustfs-meta-label",
-            "x-amz-storage-class",
-        ] {
-            headers.insert(name, "test".parse().unwrap());
-            assert!(super::validate_post_object_metadata(&headers, None).is_err());
-            headers.remove(name);
-        }
-    }
-
-    #[test]
-    fn only_a_sigv4_header_or_query_signature_is_marked_verified() {
-        for (auth_type, expected) in [
-            (AuthType::Signed, (true, false)),
-            (AuthType::Presigned, (true, true)),
-            (AuthType::SignedV2, (false, false)),
-            (AuthType::PresignedV2, (false, false)),
-            (AuthType::StreamingSigned, (false, false)),
-            (AuthType::PostPolicy, (false, false)),
-            (AuthType::Anonymous, (false, false)),
-        ] {
-            let signature = VerifiedSignature::from_auth_type(auth_type.clone());
-            assert_eq!((signature.sigv4, signature.presigned), expected, "{auth_type:?}");
-        }
-    }
-
-    #[test]
-    fn each_marker_is_installed_exactly_when_its_fact_holds() {
-        for (operation, sigv4, presigned) in [
-            ("ListBuckets", false, false),
-            ("ListBuckets", true, false),
-            ("ListBuckets", true, true),
-            ("CreateMultipartUpload", false, false),
-            ("UploadPart", true, true),
-            ("UploadPartCopy", true, false),
-            ("CompleteMultipartUpload", true, false),
-            ("PutObject", true, true),
-        ] {
-            let mut extensions = http::Extensions::new();
-            AccessMarkers::new(operation, VerifiedSignature { sigv4, presigned }).install(&mut extensions);
-
-            let staging = matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy");
-            assert_eq!(extensions.get::<MultipartStagingOperation>().is_some(), staging, "{operation}");
-            assert_eq!(extensions.get::<VerifiedSigV4Request>().is_some(), sigv4, "{operation}");
-            assert_eq!(extensions.get::<VerifiedPresignedRequest>().is_some(), presigned, "{operation}");
-        }
-    }
 }
 
 pub(crate) struct ListBucketsIamAuthorization {
@@ -2748,15 +2383,6 @@ pub(crate) async fn authorize_staged_multipart_part<R: AuthorizationRequest + ?S
     result
 }
 
-/// Check if the request has the x-amz-bypass-governance-retention header set to true
-pub fn has_bypass_governance_header(headers: &http::HeaderMap) -> bool {
-    headers
-        .get(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 fn legal_hold_write_requested(object_lock_legal_hold_status: Option<&ObjectLockLegalHoldStatus>) -> bool {
     object_lock_legal_hold_status.is_some()
 }
@@ -3217,7 +2843,7 @@ impl S3Access for FS {
         ext.insert(req_info);
         markers.install(ext);
 
-        admit_operation(cx.headers(), cx.uri().query(), cx.s3_op().name(), signature)
+        admit_operation(cx.headers(), cx.uri().query(), cx.s3_op().name(), signature).map_err(Into::into)
     }
 
     /// Checks whether the CreateBucket request has accesses to the resources.
@@ -4212,7 +3838,7 @@ pub(crate) mod parity_test_support {
     }
 
     pub(crate) fn request_object_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<ECStore>> {
-        super::request_object_store(req)
+        super::request_object_store(req).map_err(Into::into)
     }
 
     /// The cached tag evidence as `(bucket, object, version_id, values)`.

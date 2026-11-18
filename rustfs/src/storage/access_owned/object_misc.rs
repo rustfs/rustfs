@@ -129,7 +129,7 @@ async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
 
     let force_delete = match force_delete_header(req.headers()) {
         Ok(value) => value.unwrap_or(false),
-        Err(_) => return Err(invalid_force_delete_header()),
+        Err(_) => return Err(invalid_force_delete_header().into()),
     };
     // The REPLICA header is caller-supplied, so it does not skip this check; `s3:*` does not
     // grant `s3:ForceDeleteObject`.
