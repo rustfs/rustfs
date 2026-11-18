@@ -411,9 +411,7 @@ impl ProtocolStorageClient {
             .map_err(rustfs_s3_types::S3Error::from)?;
         let mut envelope =
             self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
-        authorize_request(&mut envelope, protocol_policy_action(action))
-            .await
-            .map_err(rustfs_s3_types::S3Error::from)
+        authorize_request(&mut envelope, protocol_policy_action(action)).await
     }
 
     /// The retired s3s request builder, kept as the oracle of differential tests.

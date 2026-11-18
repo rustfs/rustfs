@@ -52,7 +52,7 @@ async fn authorize_object(
     (bucket, key, version_id): (&BucketName, &ObjectKey, Option<&str>),
     action: S3Action,
 ) -> S3Result<()> {
-    Ok(authorize_object_request(envelope, bucket.as_str(), key.as_str(), version_id, Action::S3Action(action)).await?)
+    authorize_object_request(envelope, bucket.as_str(), key.as_str(), version_id, Action::S3Action(action)).await
 }
 
 impl Served for dto::GetObjectTorrent {

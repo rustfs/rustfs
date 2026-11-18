@@ -17,9 +17,11 @@
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values::stored_etag;
+use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
 use crate::app::storage_api::s3::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
 };
+use http::HeaderValue;
 use http::StatusCode;
 use rustfs_gateway_types::dto::{
     ChecksumType, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ServerSideEncryption,
@@ -670,8 +672,14 @@ impl DefaultMultipartUsecase {
         };
         let complete_extra_checksum_headers = classified.extra;
 
+        let effective_ec_block_size = obj_info.effective_ec_block_size();
         let mut answer_headers = HeaderMap::new();
         crate::app::object_usecase::inject_additional_checksum_headers(&mut answer_headers, &complete_extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            answer_headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
         if let Some(algorithm) = ssec_algorithm.as_deref() {
             let value = HeaderValue::from_str(algorithm)
                 .map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C algorithm metadata"))?;
