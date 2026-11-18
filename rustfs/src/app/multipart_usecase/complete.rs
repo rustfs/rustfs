@@ -563,7 +563,7 @@ impl DefaultMultipartUsecase {
                         && decision.replicate_any()
                     {
                         warn!("need multipart replication");
-                        schedule_object_replication(obj_info.clone(), store, decision).await;
+                        schedule_object_replication(obj_info.clone(), store, decision, opts.expected_bucket_incarnation_id).await;
                     }
 
                     rustfs_scanner::record_dirty_usage_object_from_producer(

@@ -1097,8 +1097,13 @@ impl DefaultObjectUsecase {
             let bucket_for_replication = bucket.clone();
             let replication_task = tokio::spawn(async move {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-                schedule_replication_deletes(replication_deletes, bucket_for_replication, REPLICATE_INCOMING_DELETE.to_string())
-                    .await;
+                schedule_replication_deletes(
+                    replication_deletes,
+                    bucket_for_replication,
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                    incarnation_id,
+                )
+                .await;
             });
             // The spawned task owns every locally committed delete. Dropping the
             // join handle on request cancellation therefore cannot lose the tail.
@@ -1501,6 +1506,7 @@ impl DefaultObjectUsecase {
                     },
                     bucket.clone(),
                     REPLICATE_INCOMING_DELETE.to_string(),
+                    opts.expected_bucket_incarnation_id,
                 )
                 .await;
             } else if replicate_force_delete {
@@ -1523,7 +1529,13 @@ impl DefaultObjectUsecase {
                 ) {
                     set_deleted_object_replication_state(&mut delete_object, &replication_state);
                 }
-                schedule_replication_delete(delete_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
+                schedule_replication_delete(
+                    delete_object,
+                    bucket.clone(),
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                    opts.expected_bucket_incarnation_id,
+                )
+                .await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
@@ -1604,7 +1616,13 @@ impl DefaultObjectUsecase {
                 set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
                 enrich_delete_replication_state_if_needed(&delete_config_snapshot, &mut deleted_object, replication_state_source);
             }
-            schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
+            schedule_replication_delete(
+                deleted_object,
+                bucket.clone(),
+                REPLICATE_INCOMING_DELETE.to_string(),
+                opts.expected_bucket_incarnation_id,
+            )
+            .await;
         }
 
         let delete_marker = obj_info.delete_marker;

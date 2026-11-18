@@ -24,6 +24,8 @@ pub(crate) use crate::object_api::{
 };
 #[cfg(test)]
 pub(crate) use crate::object_api::{NamespaceLockFence, NamespaceLockSignalTestFence};
+#[cfg(test)]
+pub(crate) use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
 pub(crate) use crate::storage_api_contracts::list::{
     ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
 };

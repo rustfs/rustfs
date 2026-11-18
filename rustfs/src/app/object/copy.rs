@@ -821,7 +821,8 @@ impl DefaultObjectUsecase {
                 // the persisted pending marker and the schedule always agree, mirroring
                 // the PUT path.
                 if dsc.replicate_any() {
-                    schedule_object_replication(oi.clone(), Arc::clone(&store), dsc).await;
+                    schedule_object_replication(oi.clone(), Arc::clone(&store), dsc, dst_opts.expected_bucket_incarnation_id)
+                        .await;
                 }
 
                 maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;

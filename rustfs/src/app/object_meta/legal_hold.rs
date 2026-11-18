@@ -132,7 +132,7 @@ impl ObjectMetaUsecase {
 
         // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_metadata_replication(info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(info.clone(), store.clone(), dsc, popts.expected_bucket_incarnation_id).await;
         }
 
         let output = PutObjectLegalHoldOutput {

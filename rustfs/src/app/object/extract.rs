@@ -740,7 +740,8 @@ async fn complete_extract_member_post_commit(
     let _ = invalidate_object_data_cache_after_put_success(&context.cache_adapter, &context.bucket, &key).await;
 
     if replication.replicate_any() {
-        schedule_object_replication(obj_info.clone(), context.store.clone(), replication).await;
+        schedule_object_replication(obj_info.clone(), context.store.clone(), replication, opts.expected_bucket_incarnation_id)
+            .await;
     }
 
     let actual_version_id = extract_notification_version_id(obj_info.version_id, opts.versioned, opts.version_suspended);

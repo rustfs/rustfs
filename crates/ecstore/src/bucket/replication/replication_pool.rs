@@ -1016,7 +1016,9 @@ async fn replay_mrf_metadata_entry<S: ReplicationStorage>(
 /// admitted targets, carrying over the entry's retry count.
 fn admitted_mrf_replicate_object(oi: ObjectInfo, entry: &MrfReplicateEntry, op_type: ReplicationType) -> ReplicateObjectInfo {
     let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
-    let mut roi = replicate_object_info_from_object_info(oi, dsc, op_type);
+    // The journal does not bind this task to a bucket instance. Keep external
+    // notifications unbound instead of attaching an old task to a reused name.
+    let mut roi = replicate_object_info_from_object_info(oi, dsc, op_type, None);
     roi.retry_count = entry.retry_count.max(0) as u32;
     roi
 }
@@ -3171,12 +3173,13 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     o: Arc<S>,
     dsc: ReplicateDecision,
     op_type: ReplicationType,
+    notification_bucket_incarnation: Option<uuid::Uuid>,
 ) {
     let (synchronous, asynchronous) = dsc.partition_by_sync();
     let mut async_oi = oi;
 
     if synchronous.replicate_any() {
-        let ri = replicate_object_info_from_object_info(async_oi.clone(), synchronous, op_type);
+        let ri = replicate_object_info_from_object_info(async_oi.clone(), synchronous, op_type, notification_bucket_incarnation);
         let state = replicate_object(ri, o.clone()).await;
         async_oi.replication_status_internal = state.replication_status_internal;
         async_oi.version_purge_status_internal = state.version_purge_status_internal;
@@ -3185,7 +3188,7 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     if asynchronous.replicate_any()
         && let Some(pool) = runtime_sources::replication_pool()
     {
-        let ri = replicate_object_info_from_object_info(async_oi, asynchronous, op_type);
+        let ri = replicate_object_info_from_object_info(async_oi, asynchronous, op_type, notification_bucket_incarnation);
         let _ = pool.queue_replica_task(ri).await;
     }
 }
@@ -3194,6 +3197,7 @@ fn replicate_object_info_from_object_info(
     oi: ObjectInfo,
     dsc: ReplicateDecision,
     op_type: ReplicationType,
+    notification_bucket_incarnation: Option<uuid::Uuid>,
 ) -> ReplicateObjectInfo {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
@@ -3209,7 +3213,7 @@ fn replicate_object_info_from_object_info(
     let checksum = if ssec { oi.checksum.clone() } else { None };
 
     ReplicateObjectInfo {
-        notification_bucket_incarnation: None,
+        notification_bucket_incarnation,
         name: oi.name,
         size: oi.size,
         actual_size: asz,
@@ -3351,7 +3355,7 @@ pub async fn queue_replication_metadata(bucket: &str, oi: ObjectInfo, retry_coun
         return ReplicationQueueAdmission::Skipped;
     }
 
-    let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata);
+    let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata, None);
     roi.retry_count = retry_count;
     if let Some(pool) = runtime_sources::replication_pool() {
         pool.queue_replica_task(roi).await
@@ -5207,6 +5211,117 @@ mod tests {
     }
 
     #[test]
+    fn replication_admission_keeps_original_incarnation_and_mrf_replay_does_not_guess() {
+        let incarnation = Uuid::new_v4();
+        let target = "arn:rustfs:replication:target-a";
+        for op_type in [ReplicationType::Object, ReplicationType::Metadata] {
+            let object = ObjectInfo {
+                bucket: "source".to_string(),
+                name: "object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                ..Default::default()
+            };
+            let admitted = replicate_object_info_from_object_info(
+                object.clone(),
+                test_replicate_decision(&[target]),
+                op_type,
+                Some(incarnation),
+            );
+            assert_eq!(admitted.notification_bucket_incarnation, Some(incarnation));
+            let encoded = encode_mrf_file(&[admitted.to_mrf_entry()]).expect("encode queued replication");
+            let entries = decode_mrf_file(&encoded).expect("decode queued replication");
+            let replayed = admitted_mrf_replicate_object(object, &entries[0], op_type);
+            assert_eq!(
+                replayed.notification_bucket_incarnation, None,
+                "MRF replay must not infer a bucket instance from a reused name"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn queued_delete_notifications_keep_origin_across_bucket_recreation() {
+        use super::super::replication_event_sink::test_recorder;
+        use super::super::replication_metadata_boundary::{
+            bucket_metadata_sys_of, init_bucket_metadata_sys, set_bucket_metadata_in,
+            test_support::isolated_store_over_temp_disks,
+        };
+        use super::super::replication_storage_boundary::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        runtime_sources::set_test_object_layer(store.clone()).await;
+        test_recorder::install();
+        let bucket = "queued-delete-notification-origin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create original bucket");
+        let original = store.bucket_incarnation_id(bucket).await.expect("original incarnation");
+        let queued = DeletedObjectReplicationInfo {
+            notification_bucket_incarnation: Some(original),
+            bucket: bucket.to_string(),
+            target_arn: "arn:rustfs:replication:target-a".to_string(),
+            delete_object: ReplicationDeletedObject {
+                object_name: "original-object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                replication_state: Some(ReplicationState {
+                    replicate_decision_str: "malformed-decision".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let encoded = encode_mrf_file(&[queued.to_mrf_entry()]).expect("persist old delete task");
+        let entries = decode_mrf_file(&encoded).expect("recover old delete task");
+        let mut replayed = reconstructed_heal_delete_info(
+            &entries[0],
+            &ObjectInfo::default(),
+            &replicate_decision_for_admitted_targets(&entries[0].target_arns),
+        );
+        replayed
+            .delete_object
+            .replication_state
+            .as_mut()
+            .expect("reconstructed replication state")
+            .replicate_decision_str = "malformed-decision".to_string();
+
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete original bucket");
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create replacement bucket");
+        let replacement = store.bucket_incarnation_id(bucket).await.expect("replacement incarnation");
+        assert_ne!(original, replacement);
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let mut metadata = (*sys.read().await.get(bucket).await.expect("replacement metadata")).clone();
+        metadata.notification_config_xml = br#"<NotificationConfiguration><QueueConfiguration><Id>replacement</Id><Queue>arn:rustfs:sqs:us-east-1:replacement:webhook</Queue><Event>s3:Replication:*</Event></QueueConfiguration></NotificationConfiguration>"#.to_vec();
+        set_bucket_metadata_in(&store.ctx, metadata)
+            .await
+            .expect("install replacement notification configuration");
+
+        assert!(!replicate_delete_with_outcome(queued, store.clone()).await);
+        assert!(!replicate_delete_with_outcome(replayed, store).await);
+        let events = test_recorder::recorded_for_bucket(bucket);
+        assert_eq!(events.len(), 2, "both worker failures must emit an observable local event");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.object == "original-object" && event.event_name == "s3:Replication:OperationNotTracked")
+        );
+        assert_eq!(events[0].bucket_incarnation_id, Some(original));
+        assert_eq!(
+            events[1].bucket_incarnation_id, None,
+            "a replay without provenance must not acquire the replacement bucket's identity"
+        );
+        assert!(events.iter().all(|event| event.bucket_incarnation_id != Some(replacement)));
+    }
+
+    #[test]
     fn replicate_object_info_from_object_info_preserves_ssec_checksum() {
         let checksum = bytes::Bytes::from_static(b"ssec-checksum");
         let oi = ObjectInfo {
@@ -5220,7 +5335,7 @@ mod tests {
             ..Default::default()
         };
 
-        let ri = replicate_object_info_from_object_info(oi, ReplicateDecision::default(), ReplicationType::Object);
+        let ri = replicate_object_info_from_object_info(oi, ReplicateDecision::default(), ReplicationType::Object, None);
 
         assert!(ri.ssec);
         assert_eq!(ri.checksum, Some(checksum));
@@ -5236,8 +5351,12 @@ mod tests {
             user_tags: Arc::new("owner=a3".to_string()),
             ..Default::default()
         };
-        let live =
-            replicate_object_info_from_object_info(object.clone(), test_replicate_decision(&[target]), ReplicationType::Metadata);
+        let live = replicate_object_info_from_object_info(
+            object.clone(),
+            test_replicate_decision(&[target]),
+            ReplicationType::Metadata,
+            None,
+        );
         let persisted = live.to_mrf_entry();
         let encoded = encode_mrf_file(std::slice::from_ref(&persisted)).expect("metadata MRF entry should encode");
         let decoded = decode_mrf_file(&encoded).expect("metadata MRF entry should decode");

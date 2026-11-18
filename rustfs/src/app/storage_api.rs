@@ -1385,42 +1385,67 @@ pub(crate) mod bucket {
             oi: crate::storage::storage_api::StorageObjectInfo,
             store: Arc<crate::storage::storage_api::ECStore>,
             dsc: ReplicateDecision,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
-            ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Object).await;
+            ReplicationObjectBridge::schedule_object(
+                oi,
+                store,
+                dsc,
+                replication_contracts::ReplicationType::Object,
+                notification_bucket_incarnation,
+            )
+            .await;
         }
 
         pub(crate) async fn schedule_metadata_replication(
             oi: crate::storage::storage_api::StorageObjectInfo,
             store: Arc<crate::storage::storage_api::ECStore>,
             dsc: ReplicateDecision,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
-            ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Metadata).await;
+            ReplicationObjectBridge::schedule_object(
+                oi,
+                store,
+                dsc,
+                replication_contracts::ReplicationType::Metadata,
+                notification_bucket_incarnation,
+            )
+            .await;
         }
 
         pub(crate) async fn schedule_replication_delete(
             delete_object: crate::storage::storage_api::StorageDeletedObject,
             bucket: String,
             event_type: String,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
             #[cfg(test)]
             SCHEDULED_REPLICATION_DELETES
                 .lock()
                 .expect("scheduled replication delete lock should not be poisoned")
                 .push(delete_object.clone());
-            ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type).await;
+            ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type, notification_bucket_incarnation)
+                .await;
         }
 
         pub(crate) async fn schedule_replication_deletes(
             delete_objects: Vec<crate::storage::storage_api::StorageDeletedObject>,
             bucket: String,
             event_type: String,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
             #[cfg(test)]
             SCHEDULED_REPLICATION_DELETES
                 .lock()
                 .expect("scheduled replication delete lock should not be poisoned")
                 .extend(delete_objects.iter().cloned());
-            ReplicationObjectBridge::schedule_storage_deletes(delete_objects, bucket, event_type).await;
+            ReplicationObjectBridge::schedule_storage_deletes(
+                delete_objects,
+                bucket,
+                event_type,
+                notification_bucket_incarnation,
+            )
+            .await;
         }
 
         pub(crate) fn set_deleted_object_replication_state(

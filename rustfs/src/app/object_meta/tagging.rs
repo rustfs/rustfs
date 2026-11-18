@@ -29,6 +29,7 @@ use crate::app::storage_api::object_meta_usecase::{
 };
 use crate::app::storage_api::object_usecase::ECStore;
 use crate::app::storage_api::object_usecase::StorageObjectOptions as ObjectOptions;
+use crate::app::storage_api::object_usecase::access::apply_bucket_generation_guard;
 use crate::app::storage_api::object_usecase::bucket::replication::{must_replicate_metadata, schedule_metadata_replication};
 use crate::app::storage_api::object_usecase::bucket::versioning_sys::BucketVersioningSys;
 use crate::app::storage_api::object_usecase::error::{is_err_object_not_found, is_err_version_not_found};
@@ -208,6 +209,7 @@ impl ObjectMetaUsecase {
         let mut opts = get_opts(bucket, object, version_id.clone(), None, envelope.headers())
             .await
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
         let existing = match store.get_object_info(bucket, object, &opts).await {
             Ok(info) => info,
             Err(error) => {
@@ -264,7 +266,7 @@ impl ObjectMetaUsecase {
             ApiError::from(error)
         })?;
         if decision.replicate_any() {
-            schedule_metadata_replication(info.clone(), Arc::clone(&store), decision).await;
+            schedule_metadata_replication(info.clone(), Arc::clone(&store), decision, opts.expected_bucket_incarnation_id).await;
         }
         counter!("rustfs_put_object_tagging_success").increment(1);
 
@@ -328,6 +330,7 @@ impl ObjectMetaUsecase {
         let mut opts = get_opts(bucket, object, version_id.clone(), None, envelope.headers())
             .await
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
         let existing_object_info = match store.get_object_info(bucket, object, &opts).await {
             Ok(info) => info,
             Err(e) => {
@@ -388,7 +391,8 @@ impl ObjectMetaUsecase {
             .or_else(|| object_info.version_id.map(|version_id| version_id.to_string()))
             .unwrap_or_default();
         if dsc.replicate_any() {
-            schedule_metadata_replication(object_info.clone(), Arc::clone(&store), dsc).await;
+            schedule_metadata_replication(object_info.clone(), Arc::clone(&store), dsc, opts.expected_bucket_incarnation_id)
+                .await;
         }
         counter!("rustfs_delete_object_tagging_success").increment(1);
         helper = helper.object(object_info).version_id(event_version_id);

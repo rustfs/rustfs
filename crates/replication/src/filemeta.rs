@@ -891,7 +891,8 @@ pub struct ReplicationGenerationSnapshot {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
-    /// The bucket bound to this attempt's in-process notifications.
+    /// The originating mutation's bucket instance, retained across in-process retries.
+    /// Replay without this identity leaves it absent and cannot deliver external notifications.
     #[serde(skip)]
     pub notification_bucket_incarnation: Option<Uuid>,
     pub name: String,

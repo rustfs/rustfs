@@ -24,7 +24,8 @@ use crate::{
 
 #[derive(Debug, Clone, Default)]
 pub struct DeletedObjectReplicationInfo {
-    /// The bucket bound to this attempt's in-process notifications.
+    /// The originating mutation's bucket instance, retained across in-process retries.
+    /// Replay without this identity leaves it absent and cannot deliver external notifications.
     pub notification_bucket_incarnation: Option<Uuid>,
     pub delete_object: DeletedObject,
     pub bucket: String,
@@ -184,6 +185,7 @@ pub fn resync_existing_delete_replication_info(roi: &ReplicateObjectInfo, target
     };
 
     DeletedObjectReplicationInfo {
+        notification_bucket_incarnation: roi.notification_bucket_incarnation,
         delete_object: DeletedObject {
             object_name: roi.name.clone(),
             delete_marker_version_id: dm_version_id,
@@ -521,7 +523,9 @@ mod tests {
     /// pin that this shape flows into purge — not marker-creation — semantics.
     #[test]
     fn resync_rebuilt_purge_entry_keeps_versioned_delete_semantics() {
+        let incarnation = Uuid::new_v4();
         let roi = ReplicateObjectInfo {
+            notification_bucket_incarnation: Some(incarnation),
             bucket: "bucket".to_string(),
             name: "object".to_string(),
             version_id: Some(Uuid::new_v4()),
@@ -532,6 +536,7 @@ mod tests {
 
         let info = resync_existing_delete_replication_info(&roi, "arn:target-a");
 
+        assert_eq!(info.notification_bucket_incarnation, Some(incarnation));
         assert!(is_version_delete_replication(&info.delete_object));
         assert!(
             !delete_replication_creates_marker(&info.delete_object),

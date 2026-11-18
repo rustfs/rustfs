@@ -5122,7 +5122,7 @@ async fn expire_transitioned_object_with_lock_lost_signal(
         }
     };
 
-    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj, bucket_incarnation_id).await;
 
     // The transitioned version is gone; evict any cached body for this object
     // so it does not linger until TTL (ODC-26).
@@ -6035,7 +6035,7 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     {
         accounting.commit(size).await;
     }
-    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj, bucket_incarnation_id).await;
 
     // The object (or all its versions, for delete_all) was expired; evict any
     // cached body so dead bytes do not sit resident until TTL (ODC-26). The
@@ -6203,12 +6203,12 @@ fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject
     }
 }
 
-async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo) {
+async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo, bucket_incarnation_id: Uuid) {
     let delete_object = lifecycle_deleted_object(oi, dobj);
     if delete_object.replication_state.is_none() {
         return;
     }
-    replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
+    replication_sink::schedule_delete(oi.bucket.clone(), delete_object, Some(bucket_incarnation_id)).await;
 }
 
 async fn lifecycle_delete_config_snapshot(api: &ECStore, oi: &ObjectInfo) -> Result<DeleteReplicationConfigSnapshot, Error> {

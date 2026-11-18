@@ -748,7 +748,13 @@ impl DefaultObjectUsecase {
                 enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
 
                 if completion_replication_decision.replicate_any() {
-                    schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
+                    schedule_object_replication(
+                        obj_info.clone(),
+                        store,
+                        completion_replication_decision,
+                        opts.expected_bucket_incarnation_id,
+                    )
+                    .await;
                 }
 
                 rustfs_scanner::record_dirty_usage_object_from_producer(

@@ -9294,7 +9294,12 @@ impl SetDisks {
             )
             .await?;
             if let Some((_, deleted_object)) = replication_delete {
-                ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
+                ReplicationLifecycleBridge::schedule_delete(
+                    bucket.to_string(),
+                    deleted_object,
+                    opts.expected_bucket_incarnation_id,
+                )
+                .await;
             }
             deleted += 1;
         }
@@ -11563,7 +11568,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             )
                             .await?;
                             if let Some((_, deleted_object)) = replication_delete {
-                                ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
+                                ReplicationLifecycleBridge::schedule_delete(
+                                    bucket.to_string(),
+                                    deleted_object,
+                                    opts.expected_bucket_incarnation_id,
+                                )
+                                .await;
                             }
                         }
                     } else {

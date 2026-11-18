@@ -137,7 +137,7 @@ pub async fn delete_object_versions(
             {
                 continue;
             }
-            replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
+            replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone(), Some(bucket_incarnation_id)).await;
         }
 
         for (i, err) in errors.iter().enumerate() {

@@ -2414,10 +2414,9 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
 }
 
 pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
-    mut dobj: DeletedObjectReplicationInfo,
+    dobj: DeletedObjectReplicationInfo,
     storage: Arc<S>,
 ) -> bool {
-    dobj.notification_bucket_incarnation = ReplicationMetadataStore::notification_bucket_incarnation(&dobj.bucket).await;
     if dobj.delete_object.force_delete {
         return replicate_force_delete_to_targets(&dobj, storage).await;
     }
@@ -4223,7 +4222,7 @@ async fn persist_replication_state_if_current<S: ReplicationStorage>(
 }
 
 pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
-    mut roi: ReplicateObjectInfo,
+    roi: ReplicateObjectInfo,
     storage: Arc<S>,
 ) -> (ReplicationState, ReplicationAttemptDisposition) {
     // Conflicting compatibility aliases, empty opaque timestamps, and invalid
@@ -4233,8 +4232,6 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     if let Some(outcome) = replication_attempt_preflight(&roi) {
         return outcome;
     }
-
-    roi.notification_bucket_incarnation = ReplicationMetadataStore::notification_bucket_incarnation(&roi.bucket).await;
 
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();

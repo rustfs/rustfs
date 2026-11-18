@@ -2317,7 +2317,7 @@ impl DefaultObjectUsecase {
 
                 if dsc.replicate_any() {
                     let replication_schedule_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                    schedule_object_replication(obj_info.clone(), store, dsc, opts.expected_bucket_incarnation_id).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_post_store_replication_schedule",
                         replication_schedule_stage_start,
