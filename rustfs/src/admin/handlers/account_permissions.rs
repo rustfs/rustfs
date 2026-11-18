@@ -28,10 +28,10 @@ use crate::app::RequestEnvelope;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::access::{
-    AuthorizationRequest, ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
-    RequestedObjectLockRetention, RequestedObjectTags, authorize_request_core, query_list_buckets_permission,
-    s3_action_potential,
+    ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
+    RequestedObjectTags, authorize_request_core, query_list_buckets_permission, s3_action_potential,
 };
+use crate::storage::authorization::AuthorizationRequest;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use matchit::Params;
 use rustfs_credentials::Credentials;
@@ -303,7 +303,7 @@ impl PermissionCheck {
     }
 
     fn install_operation_facts(&self, probe: &mut RequestEnvelope) -> S3Result<()> {
-        use crate::storage::access::PermissionProbeRequestFact;
+        use crate::storage::request_markers::PermissionProbeRequestFact;
         for (present, fact) in [
             (self.copy_source.is_some(), PermissionProbeRequestFact::CopySource),
             (self.if_match.is_some(), PermissionProbeRequestFact::IfMatch),
@@ -646,7 +646,7 @@ mod tests {
     use crate::admin::storage_api::contract::object::ObjectOperations as _;
     use crate::admin::storage_api::runtime::ECStore;
     use crate::app::{RequestCredentials, RequestHead};
-    use crate::storage::access::AuthorizationRequest;
+    use crate::storage::authorization::AuthorizationRequest;
     use rustfs_iam::store::object::ObjectStore;
     use rustfs_iam::store::{Store, UserType};
     use rustfs_iam::sys::IamSys;

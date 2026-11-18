@@ -21,7 +21,7 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
 impl ProtocolStorageClient {
     pub(super) fn owned_multipart_usecase(&self) -> crate::app::multipart_usecase::DefaultMultipartUsecase {
-        crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.fs.server_ctx().app_context())
+        crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.server_ctx.app_context())
     }
 }
 
@@ -315,9 +315,11 @@ pub(super) fn upload_part_copy_input(
         .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_unmodified_since"))
         .transpose()?;
     Ok(crate::app::multipart_usecase::UploadPartCopyWriteInput {
-        bucket: input.bucket.as_str().to_owned(),
-        key: input.key.as_str().to_owned(),
-        upload_id: super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id),
+        target: crate::app::multipart_usecase::UploadPartTarget::Legacy {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            upload_id: super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id),
+        },
         part_number: input.part_number,
         copy_source: input.copy_source,
         copy_source_range: nonempty(input.copy_source_range),

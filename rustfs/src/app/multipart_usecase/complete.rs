@@ -501,7 +501,7 @@ impl DefaultMultipartUsecase {
                 insert_str(
                     &mut completion_replication_metadata,
                     SUFFIX_REPLICATION_TIMESTAMP,
-                    jiff::Zoned::now().to_string(),
+                    jiff::ZonedDateTime::now().to_string(),
                 );
                 insert_str(
                     &mut completion_replication_metadata,
@@ -1029,7 +1029,7 @@ mod tests {
         create_request
             .headers
             .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
-        create_request.extensions.insert(crate::storage::access::ReqInfo {
+        create_request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
@@ -1063,7 +1063,7 @@ mod tests {
         complete_request
             .headers
             .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
-        complete_request.extensions.insert(crate::storage::access::ReqInfo {
+        complete_request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });

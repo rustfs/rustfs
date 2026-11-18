@@ -13,19 +13,24 @@
 // limitations under the License.
 
 #[cfg(test)]
+mod authorization_test;
+#[cfg(test)]
 mod copy_test;
 mod multipart;
 mod owned;
 #[cfg(test)]
 mod upload_copy_test;
 
+#[cfg(test)]
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
 use crate::shared_types::RemoteAddr;
+#[cfg(test)]
+use crate::storage_api::protocols::client::FS;
 #[cfg(feature = "webdav")]
 use crate::storage_api::protocols::client::capacity;
-use crate::storage_api::protocols::client::{FS, MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
+use crate::storage_api::protocols::client::{MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
@@ -44,10 +49,13 @@ use rustfs_utils::MaskedAccessKey;
 #[cfg(test)]
 use s3s::S3;
 #[cfg(test)]
+use s3s::S3Request;
+#[cfg(test)]
+use s3s::S3Result;
+#[cfg(test)]
 use s3s::dto::*;
 #[cfg(test)]
 use s3s::{S3Error as LegacyS3Error, S3ErrorCode as LegacyS3ErrorCode};
-use s3s::{S3Request, S3Result};
 use std::fmt::Display;
 use tracing::trace;
 
@@ -101,9 +109,13 @@ fn append_query_param(uri: &mut String, first: &mut bool, key: &str, value: Opti
     }
 }
 
-fn parse_protocol_uri(uri: String, context: String) -> S3Result<http::Uri> {
-    uri.parse()
-        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("invalid URI for {context}: {e}")))
+fn parse_protocol_uri(uri: String, context: String) -> rustfs_s3_types::S3Result<http::Uri> {
+    uri.parse().map_err(|e| {
+        rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::InvalidRequest,
+            format!("invalid URI for {context}: {e}"),
+        )
+    })
 }
 
 fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3Error {
@@ -308,7 +320,7 @@ async fn cluster_usable_capacity() -> Option<(u64, u64)> {
     Some(value)
 }
 
-fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
+fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> rustfs_s3_types::S3Result<http::Uri> {
     let mut uri = format!("/{}", encode_path_segment(bucket));
     let mut first = true;
     for (key, value) in query {
@@ -317,7 +329,7 @@ fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<ht
     parse_protocol_uri(uri, format!("bucket={bucket}"))
 }
 
-fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
+fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> rustfs_s3_types::S3Result<http::Uri> {
     let mut uri = format!("/{}/{}", encode_path_segment(bucket), encode_object_key_path(key));
     let mut first = true;
     for (query_key, value) in query {
@@ -326,7 +338,7 @@ fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> 
     parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
 }
 
-fn build_list_objects_uri(input: &gateway_dto::ListObjectsV2Input) -> S3Result<http::Uri> {
+fn build_list_objects_uri(input: &gateway_dto::ListObjectsV2Input) -> rustfs_s3_types::S3Result<http::Uri> {
     let max_keys = input.max_keys.map(|value| value.to_string());
     let query: Vec<_> = [
         ("list-type", Some("2")),
@@ -350,17 +362,34 @@ struct RequestParams<'a> {
     credentials: &'a rustfs_credentials::Credentials,
 }
 
+/// The policy action a protocol operation is authorized as; HeadBucket is judged as ListBucket.
+fn protocol_policy_action(action: &S3Action) -> rustfs_policy::policy::action::Action {
+    if matches!(action, S3Action::HeadBucket) {
+        S3Action::ListBucket.into()
+    } else {
+        action.clone().into()
+    }
+}
+
 /// Protocol storage client that implements the StorageBackend trait
 #[derive(Clone, Debug)]
 pub struct ProtocolStorageClient {
-    /// FS instance for storage operations
-    fs: FS,
+    /// This server's late-bound application-context slot.
+    server_ctx: std::sync::Arc<crate::runtime_sources::ServerContextSlot>,
 }
 
 impl ProtocolStorageClient {
-    /// Create a new protocol storage client
-    pub fn new(fs: FS) -> Self {
-        Self { fs }
+    /// Create a protocol storage client bound to this server's context slot.
+    pub fn new(server_ctx: std::sync::Arc<crate::runtime_sources::ServerContextSlot>) -> Self {
+        rustfs_io_metrics::init_s3_metrics();
+        rustfs_io_metrics::init_list_objects_metrics();
+        Self { server_ctx }
+    }
+
+    /// The legacy storage service over the same context slot, the oracle of differential tests.
+    #[cfg(test)]
+    fn legacy_fs(&self) -> FS {
+        FS::with_server_ctx(self.server_ctx.clone())
     }
 
     async fn authorize_protocol_request(
@@ -370,53 +399,31 @@ impl ProtocolStorageClient {
         bucket: &str,
         object: Option<&str>,
         listing: Option<&gateway_dto::ListObjectsV2Input>,
-    ) -> S3Result<()> {
-        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+    ) -> rustfs_s3_types::S3Result<()> {
+        let context = self.server_ctx.installed_app_context().ok_or_else(|| {
+            rustfs_s3_types::S3Error::with_message(
+                rustfs_s3_types::S3ErrorCode::InternalError,
+                "protocol server application context is not initialized",
+            )
         })?;
-        let (credentials, is_owner) =
-            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
-        let uri = if let Some(input) = listing {
-            build_list_objects_uri(input)?
-        } else if let Some(key) = object {
-            build_object_uri(bucket, key, &[])?
-        } else {
-            build_bucket_uri(bucket, &[])?
-        };
-        let mut request = Self::create_request(
-            (),
-            Method::GET,
-            uri,
-            RequestParams {
-                bucket: Some(bucket.to_owned()),
-                object: object.map(str::to_owned),
-                credentials: &credentials,
-            },
-        )?;
-        request.extensions.insert(self.fs.server_ctx().clone());
-        if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
-            info.is_owner = is_owner;
-        }
-        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
-        request.extensions.insert(Some(RemoteAddr(remote_addr)));
-        let mut client_info = ClientInfo::direct(remote_addr);
-        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
-        request.extensions.insert(client_info);
-        request.headers = session.request_headers.clone();
-        // Preserve staging semantics before distinct operations collapse to PutObject.
-        if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
-            request.extensions.insert(MultipartStagingOperation);
-        }
-        let policy_action = if matches!(action, S3Action::HeadBucket) {
-            S3Action::ListBucket.into()
-        } else {
-            action.clone().into()
-        };
-        authorize_request(&mut request, policy_action).await
+        let (credentials, is_owner) = crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref()))
+            .await
+            .map_err(rustfs_s3_types::S3Error::from)?;
+        let mut envelope =
+            self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
+        authorize_request(&mut envelope, protocol_policy_action(action))
+            .await
+            .map_err(rustfs_s3_types::S3Error::from)
     }
 
-    /// Create a proper S3Request with ReqInfo extension for authorization
-    fn create_request<T>(input: T, method: Method, uri: http::Uri, params: RequestParams<'_>) -> S3Result<S3Request<T>> {
+    /// The retired s3s request builder, kept as the oracle of differential tests.
+    #[cfg(test)]
+    fn create_request<T>(
+        input: T,
+        method: Method,
+        uri: http::Uri,
+        params: RequestParams<'_>,
+    ) -> rustfs_s3_types::S3Result<S3Request<T>> {
         let mut extensions = http::Extensions::default();
 
         let is_owner = if let Some(global_cred) = current_action_credentials() {
@@ -457,6 +464,65 @@ impl ProtocolStorageClient {
         };
         Ok(req)
     }
+
+    /// The request the policy engine judges for one protocol operation: the session's peer,
+    /// transport and policy headers, the re-validated key and owner flag, and the operation's
+    /// bucket, key and listing query.
+    fn protocol_authorization_envelope(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+        listing: Option<&gateway_dto::ListObjectsV2Input>,
+        (credentials, is_owner): (rustfs_credentials::Credentials, bool),
+    ) -> rustfs_s3_types::S3Result<crate::app::RequestEnvelope> {
+        let uri = if let Some(input) = listing {
+            build_list_objects_uri(input)?
+        } else if let Some(key) = object {
+            build_object_uri(bucket, key, &[])?
+        } else {
+            build_bucket_uri(bucket, &[])?
+        };
+        let request_credentials =
+            crate::app::RequestCredentials::new(credentials.access_key.clone(), credentials.secret_key.clone(), None)
+                .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), None));
+        let mut extensions = http::Extensions::default();
+        extensions.insert(ReqInfo {
+            cred: Some(credentials),
+            is_owner,
+            keystone_session_present: None,
+            bucket: Some(bucket.to_owned()),
+            object: object.map(str::to_owned),
+            version_id: None,
+            replication_request_authorized: false,
+            region: None,
+            request_context: Some(RequestContext::fallback()),
+            suppress_denial_log: false,
+            suppress_denial_audit: false,
+        });
+        extensions.insert(self.server_ctx.clone());
+        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
+        extensions.insert(Some(RemoteAddr(remote_addr)));
+        let mut client_info = ClientInfo::direct(remote_addr);
+        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
+        extensions.insert(client_info);
+        // Preserve staging semantics before distinct operations collapse to PutObject.
+        if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
+            extensions.insert(MultipartStagingOperation);
+        }
+        Ok(crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::GET,
+                uri,
+                headers: session.request_headers.clone(),
+                credentials: Some(request_credentials),
+                region: None,
+                service: None,
+            },
+            extensions,
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -477,7 +543,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         self.authorize_protocol_request(session, action, bucket, object, None)
             .await
             .map_err(|error| match error.code() {
-                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                rustfs_s3_types::S3ErrorCode::AccessDenied | rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
+                    AuthorizationError::AccessDenied
+                }
                 _ => AuthorizationError::IamUnavailable,
             })
     }
@@ -493,7 +561,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         self.authorize_protocol_request(session, &S3Action::ListBucket, input.bucket.as_str(), None, Some(input))
             .await
             .map_err(|error| match error.code() {
-                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                rustfs_s3_types::S3ErrorCode::AccessDenied | rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
+                    AuthorizationError::AccessDenied
+                }
                 _ => AuthorizationError::IamUnavailable,
             })
     }
@@ -714,8 +784,11 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+        let context = self.server_ctx.installed_app_context().ok_or_else(|| {
+            rustfs_s3_types::S3Error::with_message(
+                rustfs_s3_types::S3ErrorCode::InternalError,
+                "protocol server application context is not initialized",
+            )
         })?;
         // The session identity is captured at login. Re-check the key as
         // authorize_protocol_request does for every other operation, so a key
@@ -724,12 +797,15 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let (credentials, is_owner) =
             crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
                 .await
+                .map_err(rustfs_s3_types::S3Error::from)
                 .map_err(|e| match e.code() {
-                    s3s::S3ErrorCode::InvalidAccessKeyId => s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied),
+                    rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
+                        rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied)
+                    }
                     _ => e,
                 })?;
         let envelope = session_list_buckets_envelope(
-            self.fs.server_ctx().clone(),
+            self.server_ctx.clone(),
             session_context,
             request_headers,
             secure_transport,
@@ -771,11 +847,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                     None
                 }
                 Err(e) => {
-                    return Err(s3s::S3Error::with_message(
-                        s3s::S3ErrorCode::InternalError,
+                    return Err(rustfs_s3_types::S3Error::with_message(
+                        rustfs_s3_types::S3ErrorCode::InternalError,
                         format!("Failed to read bucket quota config: {e}"),
-                    )
-                    .into());
+                    ));
                 }
             };
             let usage = match capacity::get_bucket_usage_memory(&name).await {
@@ -1106,9 +1181,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
+        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let input = multipart::upload_part_copy_input(input)?;
         let part_number = input.part_number;
-        let upload_id = input.upload_id.clone();
         let part_number = part_number.to_string();
         let uri = build_object_uri(
             &bucket,
@@ -1467,7 +1542,7 @@ mod tests {
             let slot = ServerContextSlot::new();
             assert!(slot.install(context));
             let fs = FS::with_server_ctx(slot);
-            let backend = ProtocolStorageClient::new(fs.clone());
+            let backend = ProtocolStorageClient::new(fs.server_ctx().clone());
             for (bucket, key, data, versioned) in [
                 ("protocol-version-oracle", "versioned-key", b"versioned data".as_slice(), true),
                 ("protocol-marker-oracle", "folder/", b"".as_slice(), false),
@@ -2161,13 +2236,13 @@ mod put_tests {
             .expect("create bucket");
         let slot = ServerContextSlot::new();
         assert!(slot.install(context));
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let backend = ProtocolStorageClient::new(slot);
         let mut observations = Vec::new();
         for (case, expected) in cases.iter().cloned() {
             let old_key = format!("old/{case}");
             let current_key = format!("current/{case}");
             let before = put_count();
-            let old = legacy_put(&backend.fs, case_input(case, &old_key), &root).await;
+            let old = legacy_put(&backend.legacy_fs(), case_input(case, &old_key), &root).await;
             let old_count = put_count() - before;
             let old_state = object_state(&backend, &old_key, &root).await;
             let before = put_count();
@@ -2260,7 +2335,7 @@ mod bucket_tests {
             let (_target_temp, target, _target_iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
             let slot = ServerContextSlot::new();
             assert!(slot.install(target.clone()));
-            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let backend = ProtocolStorageClient::new(slot);
             let mut observations = Vec::new();
             for name in [
                 "protocol-created",
@@ -2284,7 +2359,7 @@ mod bucket_tests {
                 .get_bucket_info("protocol-created", &Default::default())
                 .await
                 .is_ok();
-            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled = ProtocolStorageClient::new(ServerContextSlot::new());
             let before = count(S3Operation::CreateBucket);
             let fallback = outcome(
                 &uninstalled
@@ -2329,7 +2404,7 @@ mod bucket_tests {
                 .expect("seed object");
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let backend = ProtocolStorageClient::new(slot);
             let mut observations = Vec::new();
             for bucket in [
                 "protocol-bucket-full",
@@ -2430,7 +2505,7 @@ mod bucket_tests {
                 .expect("seed ambient-only bucket");
             let slot = ServerContextSlot::new();
             assert!(slot.install(target.clone()));
-            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let backend = ProtocolStorageClient::new(slot);
             backend.head_bucket(bucket, &root).await.expect("bound bucket exists");
             assert_eq!(
                 backend
@@ -2452,7 +2527,7 @@ mod bucket_tests {
                 .await
                 .is_ok();
             assert_eq!((target_absent, ambient_present), (true, true), "only the bound store is changed");
-            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled = ProtocolStorageClient::new(ServerContextSlot::new());
             let mut heads = Vec::new();
             for name in [bucket, ""] {
                 heads.push((name, outcome(&uninstalled.head_bucket(name, &root).await)));
@@ -2474,7 +2549,7 @@ mod bucket_tests {
 
     #[tokio::test]
     async fn protocol_bucket_invalid_delete_names_match_legacy() {
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+        let backend = ProtocolStorageClient::new(ServerContextSlot::new());
         let credentials = rustfs_credentials::Credentials::default();
         let mut observations = Vec::new();
         for name in ["a", "a/b", "bad_bucket", "127.0.0.1", "bucket-"] {
@@ -2551,7 +2626,7 @@ mod listing_tests {
         }
         let slot = ServerContextSlot::new();
         assert!(slot.install(context));
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let backend = ProtocolStorageClient::new(slot);
         (temp, root, backend)
     }
 
@@ -2671,7 +2746,7 @@ mod listing_tests {
                 .expect("create other bucket");
             let other_slot = ServerContextSlot::new();
             assert!(other_slot.install(other_context));
-            let other = ProtocolStorageClient::new(FS::with_server_ctx(other_slot));
+            let other = ProtocolStorageClient::new(other_slot);
             let other_buckets = other.list_buckets(&root).await.expect("bound bucket inventory");
             assert_eq!(
                 other_buckets
@@ -2681,7 +2756,7 @@ mod listing_tests {
                     .collect::<Vec<_>>(),
                 ["listing-context-other"]
             );
-            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled = ProtocolStorageClient::new(ServerContextSlot::new());
             let uninstalled_buckets = uninstalled.list_buckets(&root).await.expect("ambient bucket inventory");
             assert_eq!(
                 uninstalled_buckets

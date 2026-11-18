@@ -138,7 +138,6 @@ hotpath = [
     "rustfs-kms/hotpath",
     "rustfs-lock/hotpath",
     "rustfs-log-analyzer/hotpath",
-    "rustfs-madmin/hotpath",
     "rustfs-notify/hotpath",
     "rustfs-object-capacity/hotpath",
     "rustfs-object-data-cache/hotpath",
@@ -183,7 +182,6 @@ hotpath-alloc = [
     "rustfs-kms/hotpath-alloc",
     "rustfs-lock/hotpath-alloc",
     "rustfs-log-analyzer/hotpath-alloc",
-    "rustfs-madmin/hotpath-alloc",
     "rustfs-notify/hotpath-alloc",
     "rustfs-object-capacity/hotpath-alloc",
     "rustfs-object-data-cache/hotpath-alloc",
@@ -228,7 +226,6 @@ hotpath-cpu = [
     "rustfs-kms/hotpath-cpu",
     "rustfs-lock/hotpath-cpu",
     "rustfs-log-analyzer/hotpath-cpu",
-    "rustfs-madmin/hotpath-cpu",
     "rustfs-notify/hotpath-cpu",
     "rustfs-object-capacity/hotpath-cpu",
     "rustfs-object-data-cache/hotpath-cpu",
@@ -367,7 +364,7 @@ zstd.workspace = true
 ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
-rustix = { workspace = true, features = ["param"] }
+rustix = { workspace = true, features = ["param", "fs"] }
 x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
@@ -381,7 +378,7 @@ async_zip = { workspace = true, default-features = false, features = ["tokio", "
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
-rsa = { workspace = true, features = ["sha2"] }
+rsa = { workspace = true, features = ["pkcs1v15"] }
 base64-simd.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 const-str = { workspace = true, features = ["std", "proc"] }
@@ -407,7 +404,7 @@ zip = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 regex = { workspace = true }
-aes-gcm = { workspace = true, features = ["rand_core"] }
+aes-gcm = { workspace = true, features = ["rand_core", "zeroize"] }
 chacha20poly1305 = { workspace = true }
 
 # Observability and Metrics

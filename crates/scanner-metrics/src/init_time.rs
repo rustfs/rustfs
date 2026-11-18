@@ -12,23 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::sync::LazyLock;
 use tokio::sync::RwLock;
 
 /// Global initialization time of the RustFS node.
-pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
+pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<Timestamp>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Set the global RustFS initialization time to the current UTC time.
 pub async fn set_global_init_time_now() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     *GLOBAL_INIT_TIME.write().await = Some(now);
 }
 
 /// Get the global RustFS initialization time.
 ///
 /// # Returns
-/// * `Option<DateTime<Utc>>` - The initialization time if set.
-pub async fn get_global_init_time() -> Option<DateTime<Utc>> {
+/// * `Option<Timestamp>` - The initialization time if set.
+pub async fn get_global_init_time() -> Option<Timestamp> {
     *GLOBAL_INIT_TIME.read().await
 }

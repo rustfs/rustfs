@@ -22,6 +22,7 @@ use self::commit::lock_rename_commit_directories;
 
 mod commit;
 pub(super) mod delete_recovery;
+mod delete_reserve;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
@@ -8256,6 +8257,7 @@ pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
     publication_history: Option<os::NativePublicationRegistration>,
+    delete_reserve: Arc<delete_reserve::DeleteReserve>,
     multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
     pub(crate) usage_watch_binding: Arc<super::usage_watch::DiskUsageWatchBinding>,
     multipart_index: Arc<multipart_index::IndexOwner>,
@@ -8671,6 +8673,16 @@ impl LocalDisk {
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
+        // A persisted reserve can also make a full disk writable after restart.
+        let reserve_root = io_root.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&io_root, None).await;
+        let delete_reserve = os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            let reserve = delete_reserve::DeleteReserve::acquire(&reserve_root)?;
+            let _ = reserve.release_if_low();
+            Ok(reserve)
+        })
+        .await
+        .map_err(DiskError::from)?;
         Self::check_startup_writable(&publication_root, &root).await?;
         multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
         multipart_source_state::invalidate_active_multipart_sources_under(&root);
@@ -8686,6 +8698,16 @@ impl LocalDisk {
             .inspect_err(|err| {
                 log_startup_disk_error("ensure_data_usage_layout", &root, err);
             })?;
+
+        let reserve = delete_reserve.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&io_root, None).await;
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            // Reservation is best effort: a legacy full disk must remain readable.
+            let _ = reserve.initialize();
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)?;
 
         let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
         let startup_cleanup_notify = Arc::new(Notify::new());
@@ -8818,6 +8840,7 @@ impl LocalDisk {
         let multipart_index = multipart_index::IndexOwner::acquire(&publication_root, &root, &io_root)?;
         let blocking_queue = multipart_index.attach_blocking_queue(&root, &io_root);
         let mut disk = Self {
+            delete_reserve,
             multipart_index,
             root: root.clone(),
             publication_root,
@@ -11405,6 +11428,20 @@ impl LocalDisk {
         Ok(data)
     }
 
+    fn part_path_resolver(&self) -> impl Fn(&str, &str) -> Result<PathBuf> + Send + use<> {
+        let root = self.io_root().to_owned();
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        move |bucket, key| {
+            let (bucket_path, path) = build_local_disk_object_path(&root, bucket, key);
+            #[cfg(target_os = "linux")]
+            check_local_disk_valid_object_path_at(&root, &mount_lease, &bucket_path, &path)?;
+            #[cfg(not(target_os = "linux"))]
+            check_local_disk_valid_object_path(&root, &bucket_path, &path)?;
+            Ok(path)
+        }
+    }
+
     async fn read_part_metadata(&self, bucket: &str, volume_dir: &Path, path_str: &str) -> Result<ObjectPartInfo> {
         let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
         let path = Path::new(path_str);
@@ -11417,8 +11454,10 @@ impl LocalDisk {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_default();
         let parent_str = path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy();
-        let data_path = self.io_get_object_path(bucket, &path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]))?;
-        let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
+        let data_key = path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]);
+        let metadata_key = path_str.to_owned();
+        let volume = bucket.to_owned();
+        let resolve = self.part_path_resolver();
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
         let root = self.publication_root.clone();
@@ -11428,12 +11467,13 @@ impl LocalDisk {
                 error: Some(error),
                 ..Default::default()
             };
+            let data_path = resolve(&volume, &data_key)?;
             if let Err(err) = std::fs::metadata(data_path) {
                 return Ok(Ok(part_error(err.to_string())));
             }
             // Invalid metadata paths remain request errors, but missing data wins
             // first, as it does in the serial reader.
-            let metadata_path = metadata_path?;
+            let metadata_path = resolve(&volume, &metadata_key)?;
             Ok(read_all_data_std(root.open_readonly(&metadata_path))
                 .map(|(data, _)| ObjectPartInfo::unmarshal(&data).unwrap_or_else(|err| part_error(err.to_string()))))
         })
@@ -12926,7 +12966,10 @@ impl LocalDisk {
                     let name = entry.trim_end_matches(SLASH_SEPARATOR);
                     let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
-                    if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    if opts.limit <= 0
+                        || (opts.forward_to.as_ref().is_none_or(|marker| &name >= marker)
+                            && metadata_counts_toward_limit(&metadata))
+                    {
                         *objs_returned += 1;
                     }
 
@@ -13196,7 +13239,9 @@ impl LocalDisk {
 
                         meta.metadata = read.bytes;
 
-                        if opts.limit <= 0 || read.counts_toward_limit {
+                        if opts.limit <= 0
+                            || (opts.forward_to.as_ref().is_none_or(|marker| &meta.name >= marker) && read.counts_toward_limit)
+                        {
                             *objs_returned += 1;
                         }
 
@@ -15513,42 +15558,36 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         if bucket == RUSTFS_META_MULTIPART_BUCKET && !paths.is_empty() {
-            let mut cached_parts = Vec::with_capacity(paths.len());
-            let mut all_cached = true;
-            let mut verified_source: Option<(&str, PathBuf)> = None;
-            for path_str in paths {
-                let Some(num) = Path::new(path_str)
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .and_then(|v| v.strip_prefix("part."))
-                    .and_then(|v| v.strip_suffix(".meta"))
-                    .and_then(|v| v.parse::<usize>().ok())
-                else {
-                    all_cached = false;
-                    break;
-                };
-                let scope_root = multipart_staging::upload_scope_root(path_str, true);
-                let (source, head_already_verified) = match verified_source.as_ref() {
-                    Some((prev_root, prev_source)) if *prev_root == scope_root => (prev_source, true),
-                    _ => {
-                        let Ok(source) = self.io_get_object_open_path(bucket, scope_root) else {
-                            all_cached = false;
-                            break;
-                        };
-                        verified_source = Some((scope_root, source));
-                        (&verified_source.as_ref().expect("just initialized").1, false)
+            let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+            let resolve = self.part_path_resolver();
+            let keys = paths.to_owned();
+            let cached = spawn_blocking_with_disk_io_permit(permit, move || {
+                let mut parts = Vec::with_capacity(keys.len());
+                let mut verified = None;
+                for key in &keys {
+                    let num = Path::new(key)
+                        .file_name()?
+                        .to_str()?
+                        .strip_prefix("part.")?
+                        .strip_suffix(".meta")?
+                        .parse()
+                        .ok()?;
+                    let scope = multipart_staging::upload_scope_root(key, true);
+                    let same_head = verified.as_ref().is_some_and(|(prev, _)| *prev == scope);
+                    if !same_head {
+                        verified = Some((scope, resolve(RUSTFS_META_MULTIPART_BUCKET, scope).ok()?));
                     }
-                };
-                let Some(part) =
-                    multipart_source_state::get_active_multipart_source_part_with_head(source, num, head_already_verified)
-                else {
-                    all_cached = false;
-                    break;
-                };
-                cached_parts.push(part);
-            }
-            if all_cached {
-                return Ok(cached_parts);
+                    let (_, source) = verified.as_ref()?;
+                    parts.push(multipart_source_state::get_active_multipart_source_part_with_head(
+                        source, num, same_head,
+                    )?);
+                }
+                Some(parts)
+            })
+            .await
+            .map_err(DiskError::from)?;
+            if let Some(parts) = cached {
+                return Ok(parts);
             }
         }
         let volume_dir = self.io_get_bucket_path(bucket)?;
@@ -17983,10 +18022,13 @@ fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::c
     }
 
     let part = &fi.parts[0];
-    if !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
+    if part.size > fi.erasure.block_size || !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
         return false;
     }
-    let shard_size = fi.shard_file_size(part.actual_size);
+    let Ok(stored_size) = i64::try_from(part.size) else {
+        return false;
+    };
+    let shard_size = fi.shard_file_size(stored_size.max(part.actual_size));
     let versioned = fi.versioned || fi.version_id.is_some_and(|version_id| !version_id.is_nil());
     storage_class_config.should_inline(shard_size, fi.erasure.data_blocks, versioned)
 }
@@ -18752,6 +18794,8 @@ mod test {
             ec12.shard_file_size(1024 * 1024 + 1) < 128 * 1024,
             "a multi-block external object can still fit the per-shard budget"
         );
+        assert!(!should_read_legacy_inline_part(&ec12, &config));
+        ec12.parts[0].actual_size = 1;
         assert!(!should_read_legacy_inline_part(&ec12, &config));
     }
 
@@ -31807,13 +31851,14 @@ mod test {
             Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str, limit: i32) -> (Vec<String>, i32) {
             let (reader, mut writer) = tokio::io::duplex(4096);
             let mut out = MetacacheWriter::new(&mut writer);
             let opts = WalkDirOptions {
                 bucket: bucket.to_string(),
                 base_dir: base_dir.to_string(),
                 recursive: true,
+                limit,
                 forward_to: Some(forward_to.to_string()),
                 ..Default::default()
             };
@@ -31838,7 +31883,7 @@ mod test {
         }
 
         let (engineering_names, engineering_count) =
-            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001").await;
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             engineering_names,
@@ -31854,7 +31899,7 @@ mod test {
         assert_eq!(engineering_count as usize, engineering_names.len());
 
         let (different_names, different_count) =
-            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001").await;
+            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001", 0).await;
 
         assert_eq!(
             different_names,
@@ -31866,7 +31911,8 @@ mod test {
         );
         assert_eq!(different_count as usize, different_names.len());
 
-        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001").await;
+        let (double_names, double_count) =
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             double_names,
@@ -31878,6 +31924,13 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+
+        fs::write(bucket_dir.join("engineering/engineering").join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("write ancestor metadata");
+        let (names, count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 2).await;
+        assert_eq!(count, 2);
+        assert!(names.iter().any(|name| name == "engineering/engineering/repo-0002"));
     }
 
     #[tokio::test]

@@ -17485,8 +17485,12 @@ mod tests {
         source.metadata_only = true;
         source.etag = Some("metadata-copy-etag".to_string());
 
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..opts.clone()
+        };
         let copied = set_disks
-            .copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            .copy_object(bucket, object, bucket, object, &mut source, &opts, &dst_opts)
             .await
             .expect("metadata self-copy should succeed");
         assert_eq!(copied.user_defined.get("x-amz-meta-copy-check").map(String::as_str), Some("present"));

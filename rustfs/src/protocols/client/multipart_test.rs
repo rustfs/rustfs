@@ -249,7 +249,7 @@ fn multipart_refusals_match_original_client_errors() {
                     )
                     .expect("request");
                     backend
-                        .fs
+                        .legacy_fs()
                         .complete_multipart_upload(request)
                         .await
                         .err()
@@ -363,9 +363,13 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
         use crate::storage_api::protocols::client::StorageObjectOptions;
         let bucket = "multipart-bound-store";
         let (_foreign_temp, root, foreign_client, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let foreign = foreign_client.fs.server_ctx().app_context().expect("foreign context");
+        let foreign = foreign_client
+            .legacy_fs()
+            .server_ctx()
+            .app_context()
+            .expect("foreign context");
         let (_temp, _, backend, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let bound = backend.fs.server_ctx().app_context().expect("bound context");
+        let bound = backend.legacy_fs().server_ctx().app_context().expect("bound context");
         let ambient = crate::runtime_sources::current_app_context().expect("published foreign context");
         assert!(std::sync::Arc::ptr_eq(&ambient, &foreign));
         assert!(!std::sync::Arc::ptr_eq(&ambient, &bound));
@@ -385,7 +389,7 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
                     .expect("original input");
                 let request = ProtocolStorageClient::create_request(input, Method::POST, uri, params()).expect("request");
                 let output = backend
-                    .fs
+                    .legacy_fs()
                     .create_multipart_upload(request)
                     .await
                     .expect("original bound create")
@@ -423,7 +427,7 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
                 let input = compat::generated::ops::abort_multipart_upload::input_to_s3s(input).expect("original input");
                 let request = ProtocolStorageClient::create_request(input, Method::DELETE, uri, params()).expect("request");
                 backend
-                    .fs
+                    .legacy_fs()
                     .abort_multipart_upload(request)
                     .await
                     .expect("original bound abort");
@@ -466,7 +470,7 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
                 server_side_encryption: None,
                 checksum_algorithm: None,
                 checksum_type: None,
-                response_headers: http::HeaderMap::new()
+                response_headers: http::HeaderMap::new(),
             });
             let snapshot = |output: dto::CreateMultipartUploadOutput| {
                 (

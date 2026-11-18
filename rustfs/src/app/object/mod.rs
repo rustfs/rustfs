@@ -236,6 +236,10 @@ pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
 mod native_body;
 mod on_demand_migration_put;
+#[cfg(feature = "gateway-stack")]
+pub(crate) mod post_body;
+#[cfg(feature = "gateway-stack")]
+pub(crate) mod post_headers;
 mod put;
 mod put_input;
 pub(crate) use native_body::from_legacy as legacy_put_body;

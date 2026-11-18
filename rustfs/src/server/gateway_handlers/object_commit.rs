@@ -16,11 +16,13 @@
 
 use super::object_write::{request_version_id, retain_until};
 use super::{OpRow, Served, row};
+use crate::app::multipart_usecase::{UploadPartCopyWriteInput, UploadPartTarget};
 use crate::app::object_usecase::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase};
 use crate::app::{RequestEnvelope, dto_values, multipart_usecase::DefaultMultipartUsecase};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::object_commit::{
     CopyObjectAuthorization, CopySourceObject, authorize_complete_multipart_upload, authorize_copy_object,
+    authorize_upload_part_copy, check_copy_source_owner,
 };
 use rustfs_gateway::{CopySourceForm, Req, Resp, dto};
 use rustfs_gateway_types::{CopySourceValue, ETag};
@@ -28,7 +30,11 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::CompleteMultipartUpload>(), row::<dto::CopyObject>()];
+pub(super) const ROWS: &[OpRow] = &[
+    row::<dto::CompleteMultipartUpload>(),
+    row::<dto::CopyObject>(),
+    row::<dto::UploadPartCopy>(),
+];
 
 impl Served for dto::CompleteMultipartUpload {
     const METRIC: S3Operation = S3Operation::CompleteMultipartUpload;
@@ -97,7 +103,77 @@ impl Served for dto::CopyObject {
     }
 }
 
-fn copy_source(request: &Req<dto::CopyObject>) -> S3Result<Option<CopySourceValue>> {
+impl Served for dto::UploadPartCopy {
+    const METRIC: S3Operation = S3Operation::UploadPartCopy;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let server = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
+        let source = copy_source(request)?;
+        let source = match &source {
+            Some(CopySourceValue::Bucket { bucket, key, version_id }) => Some(CopySourceObject {
+                bucket,
+                key,
+                version_id: version_id.as_deref(),
+            }),
+            _ => None,
+        };
+        let input = request.input();
+        authorize_upload_part_copy(envelope, &server, input.bucket.as_str(), input.key.as_str(), source).await?;
+        Ok(check_copy_source_owner(envelope.headers())?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let source = copy_source(&request)?.ok_or_else(|| s3_error!(NotImplemented))?;
+        let input = request.into_input();
+        let input = UploadPartCopyWriteInput {
+            target: UploadPartTarget::Gateway {
+                bucket: input.bucket,
+                key: input.key,
+                upload_id: input.upload_id,
+            },
+            part_number: input.part_number,
+            copy_source: source,
+            copy_source_range: input.copy_source_range,
+            copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
+            copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+            copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+            copy_source_sse_customer_key: input.copy_source_sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+        };
+        let output = DefaultMultipartUsecase::with_context(context)
+            .execute_upload_part_copy_owned(envelope, input)
+            .await?;
+        let tag = output
+            .e_tag
+            .as_deref()
+            .ok_or_else(|| s3_error!(InternalError, "copy part result is missing its ETag"))?;
+        Ok(Resp::new(dto::UploadPartCopyOutput {
+            e_tag: dto_values::stored_etag(tag),
+            last_modified: output.last_modified.map(dto_values::timestamp),
+            copy_source_version_id: output.copy_source_version_id,
+            server_side_encryption: output.server_side_encryption.map(dto::ServerSideEncryption::custom),
+            ssekms_key_id: output.ssekms_key_id,
+            sse_customer_algorithm: output.sse_customer_algorithm,
+            sse_customer_key_md5: output.sse_customer_key_md5,
+            checksum_crc32: output.checksum_crc32,
+            checksum_crc32c: output.checksum_crc32c,
+            checksum_sha1: output.checksum_sha1,
+            checksum_sha256: output.checksum_sha256,
+            checksum_crc64nvme: output.checksum_crc64nvme,
+            ..Default::default()
+        }))
+    }
+}
+
+fn copy_source<O: rustfs_gateway::Operation<DerivedResources = rustfs_gateway::CopySourceResources>>(
+    request: &Req<O>,
+) -> S3Result<Option<CopySourceValue>> {
     // The gateway clears the source in the DTO once it binds the authorized resources.
     let source = request
         .resources()
@@ -195,5 +271,49 @@ fn copy_output(output: CopyObjectWriteOutput) -> dto::CopyObjectOutput {
         checksum_xxhash128: output.checksum_xxhash128,
         checksum_type: output.checksum_type,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod source_owner_tests {
+    use super::*;
+    use crate::app::RequestHead;
+    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+
+    #[test]
+    fn source_owner_header_accepts_only_the_reported_owner() {
+        let owner = dto_values::owner().id.expect("reported owner");
+        for (values, expected) in [
+            (vec![], None),
+            (vec![HeaderValue::from_static("")], None),
+            (vec![HeaderValue::from_str(&owner).expect("owner header")], None),
+            (vec![HeaderValue::from_static("different")], Some("AccessDenied")),
+            (
+                vec![
+                    HeaderValue::from_str(&owner).expect("owner header"),
+                    HeaderValue::from_static("different"),
+                ],
+                Some("InvalidRequest"),
+            ),
+            (vec![HeaderValue::from_bytes(&[0xff]).expect("opaque header")], Some("InvalidRequest")),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append("x-amz-source-expected-bucket-owner", value);
+            }
+            let envelope = RequestEnvelope::from_parts(
+                RequestHead {
+                    method: Method::PUT,
+                    uri: Uri::from_static("/bucket/key"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                Extensions::new(),
+            );
+            let actual = check_copy_source_owner(envelope.headers());
+            assert_eq!(actual.as_ref().err().map(|error| error.code().as_str()), expected);
+        }
     }
 }

@@ -296,6 +296,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_retention_metadata_does_not_suppress_bucket_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        for name in [AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER] {
+            let mut metadata = HashMap::from([(name.to_string(), String::new())]);
+            assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&config)), &mut metadata));
+            assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+            assert!(!metadata[AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER].is_empty());
+        }
+    }
+
+    #[test]
     fn test_apply_bucket_default_lock_retention_preserves_explicit_retention_path() {
         let config = ObjectLockConfiguration {
             object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
@@ -677,21 +697,24 @@ mod tests {
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
         assert_eq!(governance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "GOVERNANCE");
 
-        // [4] Normal case: Retention with None mode (empty string for mode, date not validated)
+        // A retention update is either empty or has both fields.
         let none_mode_retention = ObjectLockRetention {
             mode: None,
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
-        let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
-        assert_eq!(none_mode_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "");
+        assert_eq!(
+            parse_object_lock_retention(Some(none_mode_retention)).unwrap_err().code(),
+            &S3ErrorCode::MalformedXML
+        );
 
-        // [5] Normal case: Retention with None retain_until_date (empty string for date)
         let none_date_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
             retain_until_date: None,
         };
-        let none_date_metadata = parse_object_lock_retention(Some(none_date_retention)).unwrap();
-        assert_eq!(none_date_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(), "");
+        assert_eq!(
+            parse_object_lock_retention(Some(none_date_retention)).unwrap_err().code(),
+            &S3ErrorCode::MalformedXML
+        );
 
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
         let invalid_mode_retention = ObjectLockRetention {
@@ -752,10 +775,9 @@ mod tests {
         let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
         assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
 
-        // [4] Normal case: Legal hold with None status (empty string for status)
         let none_status_legal_hold = ObjectLockLegalHold { status: None };
-        let none_status_metadata = parse_object_lock_legal_hold(Some(none_status_legal_hold)).unwrap();
-        assert_eq!(none_status_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "");
+        let err = parse_object_lock_legal_hold(Some(none_status_legal_hold)).expect_err("Status is required");
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
 
         // [5] Error case: Legal hold with invalid status (non ON/OFF)
         let invalid_status_legal_hold = ObjectLockLegalHold {

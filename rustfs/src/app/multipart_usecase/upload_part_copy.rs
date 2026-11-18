@@ -28,9 +28,7 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 // No Debug: source and destination customer encryption keys are bearer material.
 pub(crate) struct UploadPartCopyWriteInput {
-    pub(crate) bucket: String,
-    pub(crate) key: String,
-    pub(crate) upload_id: String,
+    pub(crate) target: UploadPartTarget,
     pub(crate) part_number: i32,
     pub(crate) copy_source: CopySourceValue,
     pub(crate) copy_source_range: Option<String>,
@@ -114,9 +112,11 @@ impl DefaultMultipartUsecase {
             crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
         };
         let input = UploadPartCopyWriteInput {
-            bucket: input.bucket,
-            key: input.key,
-            upload_id: input.upload_id,
+            target: UploadPartTarget::Legacy {
+                bucket: input.bucket,
+                key: input.key,
+                upload_id: input.upload_id,
+            },
             part_number: input.part_number,
             copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
             copy_source_range: input.copy_source_range,
@@ -150,7 +150,7 @@ impl DefaultMultipartUsecase {
         }))
     }
 
-    /// Copies plaintext into the existing legacy upload without changing its recorded owner.
+    /// Copies plaintext into an existing upload without changing its recorded owner.
     #[instrument(level = "debug", skip(self, envelope, input))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub(crate) async fn execute_upload_part_copy_owned(
@@ -177,16 +177,16 @@ impl DefaultMultipartUsecase {
         let mut source_generation_opts = ObjectOptions::default();
         apply_copy_source_bucket_generation_guard(&envelope, &source_bucket, &mut source_generation_opts)?;
         let expected_source_incarnation_id = source_generation_opts.expected_bucket_incarnation_id;
+        let (bucket, key) = input.target.resource();
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
         let mut destination_generation_opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&envelope, &input.bucket, &mut destination_generation_opts)?;
+        apply_bucket_generation_guard(&envelope, &bucket, &mut destination_generation_opts)?;
         let expected_destination_incarnation_id = destination_generation_opts.expected_bucket_incarnation_id;
         let UploadPartCopyWriteInput {
-            bucket,
-            key,
+            target,
             copy_source,
             copy_source_range,
             part_number,
-            upload_id,
             copy_source_if_match,
             copy_source_if_none_match,
             sse_customer_algorithm,
@@ -252,6 +252,7 @@ impl DefaultMultipartUsecase {
             .into());
         }
         let mut dst_opts = ObjectOptions {
+            multipart_copy_source_locked: true,
             expected_bucket_incarnation_id: Some(current_destination_incarnation_id),
             ..Default::default()
         };
@@ -260,10 +261,32 @@ impl DefaultMultipartUsecase {
         }
         destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
-        let mp_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
-            .await
-            .map_err(multipart_upload_api_error)?;
+        let (upload_id, mp_info) = match target {
+            UploadPartTarget::Legacy { upload_id, .. } => {
+                let info = store
+                    .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
+                    .await
+                    .map_err(multipart_upload_api_error)?;
+                (upload_id, info)
+            }
+            #[cfg(any(feature = "gateway-stack", test))]
+            UploadPartTarget::Gateway {
+                bucket: bound_bucket,
+                key: bound_key,
+                upload_id,
+            } => {
+                let (id, upload) = rustfs_gateway_types::resolve_upload_async(&upload_id, &bound_bucket, &bound_key, |id| {
+                    let store = &store;
+                    let opts = &dst_opts;
+                    let bucket = &bucket;
+                    let key = &key;
+                    async move { super::upload_part::lookup_recorded_part_upload(store, bucket, key, id, opts).await }
+                })
+                .await?
+                .map_err(|rejection| S3Error::with_message(S3ErrorCode::NoSuchUpload, rejection.reason()))?;
+                (id.id().to_owned(), upload.info)
+            }
+        };
         authorize_sse_kms_multipart_write(copy_principal.as_ref(), &mp_info.user_defined).await?;
         let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {

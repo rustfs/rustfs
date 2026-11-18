@@ -208,6 +208,11 @@ fn buffer_local_shard_stream(reader: ShardReader, length: usize) -> disk::error:
         return Ok(reader);
     };
     let limit = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
+    if disk::has_resource_io_scope() {
+        // ResourceFileReader reserves its buffer on demand. Prefetching here would
+        // enlarge that reservation and allocate a second, unaccounted buffer.
+        return Ok(ShardReader::Stream(Box::new(reader.take(limit))));
+    }
     // Small layout stripes otherwise dispatch a blocking file read per frame.
     // Short ranges keep direct reads: the caller's conservative stream span
     // can include an extra stripe beyond the final requested block. Long
@@ -1367,6 +1372,41 @@ mod tests {
         .expect("local disk should be created");
 
         (disk, dir)
+    }
+
+    #[tokio::test]
+    async fn resource_scoped_local_shard_reads_on_demand_within_its_window() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        let (disk, _dir) = local_test_disk().await;
+        let window = MIN_BUFFERED_STREAM_BYTES;
+        disk.make_volume("test-bucket").await.expect("create volume");
+        disk.write_all("test-bucket", "obj/shard", Bytes::from(vec![37; window + 1]))
+            .await
+            .expect("write shard with a byte beyond the window");
+        let budget = BackgroundMemoryBudget::new();
+        budget.set_sampled_limit(128 * 1024, std::time::Duration::from_secs(60));
+        let (resources, _) = test_resource_units(1);
+        let mut reader = with_optional_resource_unit(
+            Some(resources.with_memory_budget(budget.clone())),
+            open_reader_source(None, Some(&disk), "test-bucket", "obj/shard", 0, window, true, false, None),
+        )
+        .await
+        .expect("open resource-scoped shard")
+        .expect("local reader");
+        let mut chunk = [0u8; 8192];
+        let mut total = 0;
+        loop {
+            let n = reader.read(&mut chunk).await.expect("read without a 256 KiB prefetch grant");
+            if n == 0 {
+                break;
+            }
+            assert!(chunk[..n].iter().all(|&byte| byte == 37));
+            total += n;
+        }
+        assert_eq!(total, window);
+        drop(reader);
+        assert_eq!(budget.snapshot().used, 0);
     }
 
     #[tokio::test]

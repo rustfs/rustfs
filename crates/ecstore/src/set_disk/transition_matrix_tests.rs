@@ -386,17 +386,24 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .expect("the restore operation generation should be installed");
     let barrier = RestoreFinalizeBarrier::install_before_lock(bucket, object);
     let restore_set = Arc::clone(&set_disks);
-    let restore = tokio::spawn(async move {
+    let mut restore = tokio::spawn(async move {
         let mut opts = ObjectOptions {
             user_defined: operation_metadata,
+            // This fixture calls SetDisks directly for a bucket created without Object Lock.
+            object_lock_config_snapshot: Some(Arc::new(super::ObjectLockConfigSnapshot::new(
+                super::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
             ..Default::default()
         };
         opts.transition.restore_request.days = Some(1);
         restore_set.restore_transitioned_object(bucket, object, &opts).await
     });
-    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
-        .await
-        .expect("copy-back must reach the gap before finalization acquires its lock");
+    tokio::select! {
+        result = &mut restore => panic!("restore finished before the finalization barrier: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused()) => {
+            result.expect("copy-back must reach the gap before finalization acquires its lock");
+        }
+    }
     let pending = set_disks
         .get_object_info(bucket, object, &ObjectOptions::default())
         .await

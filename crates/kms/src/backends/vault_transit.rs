@@ -33,7 +33,7 @@ use crate::policy::{self, AttemptError, OpClass, OwnWrite, OwnWrites, RetryPolic
 use crate::types::*;
 use async_trait::async_trait;
 use base64_simd::STANDARD as BASE64;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -141,8 +141,8 @@ struct TransitKeyMetadata {
     description: Option<String>,
     tags: HashMap<String, String>,
     key_state: KeyState,
-    created_at: Zoned,
-    deletion_date: Option<Zoned>,
+    created_at: ZonedDateTime,
+    deletion_date: Option<ZonedDateTime>,
     origin: String,
     created_by: Option<String>,
     current_version: u32,
@@ -160,8 +160,8 @@ struct TransitKeyMetadataPersisted {
     description: Option<String>,
     tags: HashMap<String, String>,
     key_state: KeyState,
-    created_at: Zoned,
-    deletion_date: Option<Zoned>,
+    created_at: ZonedDateTime,
+    deletion_date: Option<ZonedDateTime>,
     origin: String,
     created_by: Option<String>,
     current_version: u32,
@@ -336,7 +336,7 @@ impl TransitKeyMetadata {
             description: request.description.clone(),
             tags: request.tags.clone(),
             key_state: KeyState::Enabled,
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             deletion_date: None,
             origin: request.origin.clone().unwrap_or_else(|| "VAULT_TRANSIT".to_string()),
             created_by: None,
@@ -360,7 +360,7 @@ impl TransitKeyMetadata {
             description: None,
             tags: HashMap::new(),
             key_state: KeyState::Enabled,
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             deletion_date: None,
             origin: "VAULT_TRANSIT".to_string(),
             created_by: None,
@@ -1055,7 +1055,7 @@ impl VaultTransitKmsClient {
             encrypted_key: encrypted_key.into_bytes(),
             nonce: Vec::new(),
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             // Transit ciphertext already self-describes its key version
             // ("vault:vN:..."), so the envelope never carries one.
             master_key_version: None,
@@ -1100,7 +1100,7 @@ impl VaultTransitKmsClient {
             encrypted_key: encrypted.into_bytes(),
             nonce: Vec::new(),
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             // Transit ciphertext already self-describes its key version
             // ("vault:vN:..."), so the envelope never carries one.
             master_key_version: None,
@@ -1543,7 +1543,7 @@ impl VaultTransitKmsClient {
         pending_window_days: u32,
         _context: Option<&OperationContext>,
     ) -> Result<()> {
-        let deletion_date = Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400);
+        let deletion_date = ZonedDateTime::now() + Duration::from_secs(pending_window_days as u64 * 86400);
         self.mutate_key_metadata(key_id, |metadata| {
             ensure_key_state_permits(key_id, &metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
             metadata.key_state = KeyState::PendingDeletion;
@@ -1592,7 +1592,7 @@ impl VaultTransitKmsClient {
             description: metadata.description,
             metadata: metadata.tags,
             created_at: metadata.created_at,
-            rotated_at: Some(Zoned::now()),
+            rotated_at: Some(ZonedDateTime::now()),
             created_by: metadata.created_by,
             deletion_date: None,
         })
@@ -1810,7 +1810,7 @@ impl KmsBackend for VaultTransitKmsBackend {
             // Transit key is destroyed leaves a key that is already unusable.
             // Re-checked against every fresh snapshot: a concurrent
             // cancellation that commits first fails this removal.
-            let now = Zoned::now();
+            let now = ZonedDateTime::now();
             self.client
                 .mutate_key_metadata(&key_id, |metadata| match metadata.key_state {
                     KeyState::PendingDeletion | KeyState::Unavailable => {
@@ -1844,7 +1844,7 @@ impl KmsBackend for VaultTransitKmsBackend {
                 )));
             }
 
-            let scheduled = Zoned::now() + Duration::from_secs(days as u64 * 86400);
+            let scheduled = ZonedDateTime::now() + Duration::from_secs(days as u64 * 86400);
             self.client
                 .mutate_key_metadata(&key_id, |metadata| {
                     // Re-run the gate against every fresh snapshot: the check
@@ -1934,7 +1934,7 @@ impl KmsBackend for VaultTransitKmsBackend {
             .with_production_supported(true)
     }
 
-    async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
+    async fn remove_expired_key(&self, key_id: &str, now: &ZonedDateTime) -> Result<ExpiredKeyRemoval> {
         // The transit key's existence anchors "already removed": once it is
         // gone only stale scheduling metadata can remain, so clean that up.
         match self.client.read_transit_key(key_id).await {
@@ -3220,7 +3220,7 @@ mod tests {
             encrypted_key: b"vault:v1:AAAA".to_vec(),
             nonce: Vec::new(),
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: Some(1),
             context_binding: None,
         };
@@ -3297,7 +3297,7 @@ mod tests {
     async fn wired_immediate_deletion_of_a_pending_key_destroys_it() {
         let mut pending = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
         pending.key_state = KeyState::PendingDeletion;
-        pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+        pending.deletion_date = Some(ZonedDateTime::now() + Duration::from_secs(7 * 86400));
         let vault = ScriptedVault::serve(vec![
             // Current key metadata for the response.
             ScriptedResponse::ok(transit_key_read_data("wired-key")),
@@ -3354,7 +3354,7 @@ mod tests {
     async fn wired_expired_sweep_backs_off_when_cancel_wins_the_cas_race() {
         let mut pending = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
         pending.key_state = KeyState::PendingDeletion;
-        pending.deletion_date = Some(Zoned::now());
+        pending.deletion_date = Some(ZonedDateTime::now());
         let cancelled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
         let vault = ScriptedVault::serve(vec![
             // The transit key still exists.
@@ -3378,7 +3378,7 @@ mod tests {
             .await
             .expect("vault transit backend should build");
 
-        let now = Zoned::now() + Duration::from_secs(3600);
+        let now = ZonedDateTime::now() + Duration::from_secs(3600);
         let outcome = backend
             .remove_expired_key("wired-key", &now)
             .await

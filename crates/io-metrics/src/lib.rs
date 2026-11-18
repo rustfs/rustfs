@@ -59,6 +59,7 @@ use std::sync::{
     LazyLock, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 /// Global switch for detailed per-stage PUT metrics (path label, stage durations).
 /// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
@@ -449,6 +450,125 @@ pub const PUT_RENAME_QUORUM_FANOUT_STATE_PANIC: &str = "panic";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST: &str = "quorum_first";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL: &str = "quorum_tail";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR: &str = "error";
+pub const ECSTORE_RENAME_RPC_KIND_ORDINARY: &str = "ordinary";
+pub const ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE: &str = "quota_fence";
+pub const ECSTORE_RENAME_RPC_KIND_INCARNATION: &str = "incarnation";
+pub const ECSTORE_RENAME_RPC_KIND_MULTIPART: &str = "multipart";
+pub const ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE: &str = "scanner_lease";
+pub const ECSTORE_RENAME_RPC_KIND_POOL_META_CAS: &str = "pool_meta_cas";
+pub const ECSTORE_RENAME_RPC_KINDS: [&str; 6] = [
+    ECSTORE_RENAME_RPC_KIND_ORDINARY,
+    ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE,
+    ECSTORE_RENAME_RPC_KIND_INCARNATION,
+    ECSTORE_RENAME_RPC_KIND_MULTIPART,
+    ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE,
+    ECSTORE_RENAME_RPC_KIND_POOL_META_CAS,
+];
+pub const ECSTORE_RENAME_PEER_WIDTHS: [&str; 18] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "gt16",
+];
+pub const ECSTORE_RENAME_COVERAGE: [&str; 3] = ["none", "partial", "full"];
+pub const ECSTORE_RENAME_BATCH_EXECUTION: [&str; 10] = [
+    "planned_groups",
+    "planned_items",
+    "stream_groups",
+    "stream_items",
+    "completed_items",
+    "fallback_groups",
+    "fallback_items",
+    "not_dispatched_items",
+    "may_have_published_items",
+    "terminal_missing_items",
+];
+pub const ECSTORE_RENAME_ADMISSION: [&str; 10] = [
+    "unary_attempts",
+    "unary_items",
+    "unary_wait_ns_total",
+    "unary_wait_ns_max",
+    "unary_timeouts",
+    "batch_attempts",
+    "batch_items",
+    "batch_wait_ns_total",
+    "batch_wait_ns_max",
+    "batch_timeouts",
+];
+pub const ECSTORE_RENAME_QUARANTINE: [&str; 12] = [
+    "unary_events",
+    "unary_items",
+    "unary_hold_ns_total",
+    "unary_hold_ns_max",
+    "unary_released_items",
+    "unary_no_runtime_items",
+    "batch_events",
+    "batch_items",
+    "batch_hold_ns_total",
+    "batch_hold_ns_max",
+    "batch_released_items",
+    "batch_no_runtime_items",
+];
+pub const ECSTORE_RENAME_BATCH_TIMING: [&str; 4] = [
+    "client_stream_to_first",
+    "client_first_to_last",
+    "server_dispatch_to_first",
+    "server_first_to_last",
+];
+
+static ECSTORE_RENAME_RPC_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static ECSTORE_RENAME_REMOTE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static ECSTORE_RENAME_COVERAGE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static ECSTORE_RENAME_BATCH_EXECUTION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static ECSTORE_RENAME_ADMISSION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static ECSTORE_RENAME_QUARANTINE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static ECSTORE_RENAME_BATCH_TIMING_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ECSTORE_RENAME_BATCH_TIMING_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcstoreRenameDiagnosticsSnapshot {
+    pub rpc_counts: [u64; 6],
+    pub remote_width_counts: [u64; 18],
+    pub batchable_width_counts: [u64; 18],
+    pub coverage_counts: [u64; 3],
+    pub batch_execution_counts: [u64; 10],
+    pub admission_counts: [u64; 10],
+    pub quarantine_counts: [u64; 12],
+    pub batch_timing_counts: [u64; 4],
+    pub batch_timing_total_ns: [u64; 4],
+    pub batch_timing_max_ns: [u64; 4],
+}
+
+impl EcstoreRenameDiagnosticsSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.rpc_counts
+            .iter()
+            .chain(self.remote_width_counts.iter())
+            .chain(self.batchable_width_counts.iter())
+            .chain(self.coverage_counts.iter())
+            .chain(self.batch_execution_counts.iter())
+            .chain(self.admission_counts.iter())
+            .chain(self.quarantine_counts.iter())
+            .chain(self.batch_timing_counts.iter())
+            .chain(self.batch_timing_total_ns.iter())
+            .chain(self.batch_timing_max_ns.iter())
+            .all(|count| *count == 0)
+    }
+}
+
+pub fn snapshot_ecstore_rename_diagnostics() -> EcstoreRenameDiagnosticsSnapshot {
+    EcstoreRenameDiagnosticsSnapshot {
+        rpc_counts: std::array::from_fn(|index| ECSTORE_RENAME_RPC_COUNTS[index].load(Ordering::Relaxed)),
+        remote_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
+        batchable_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
+        coverage_counts: std::array::from_fn(|index| ECSTORE_RENAME_COVERAGE_COUNTS[index].load(Ordering::Relaxed)),
+        batch_execution_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].load(Ordering::Relaxed)),
+        admission_counts: std::array::from_fn(|index| ECSTORE_RENAME_ADMISSION_COUNTS[index].load(Ordering::Relaxed)),
+        quarantine_counts: std::array::from_fn(|index| ECSTORE_RENAME_QUARANTINE_COUNTS[index].load(Ordering::Relaxed)),
+        batch_timing_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_COUNTS[index].load(Ordering::Relaxed)),
+        batch_timing_total_ns: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS[index].load(Ordering::Relaxed)),
+        batch_timing_max_ns: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_MAX_NS[index].load(Ordering::Relaxed)),
+    }
+}
 
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
@@ -2812,6 +2932,169 @@ pub fn record_put_rename_quorum_wait_fanout(
     }
 }
 
+/// Records a rename RPC after its canonical request digest has been attached.
+///
+/// This uses the PUT-stage diagnostics switch because it is temporary hot-path
+/// evidence, but the metric is ECStore-scoped: scanner and pool metadata
+/// renames are not S3 PutObject operations.
+#[inline(always)]
+pub fn record_ecstore_rename_remote_rpc(kind: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let Some(index) = ECSTORE_RENAME_RPC_KINDS.iter().position(|candidate| *candidate == kind) else {
+        return;
+    };
+    ECSTORE_RENAME_RPC_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn rename_peer_width_index(width: usize) -> usize {
+    width.min(17)
+}
+
+/// Records the per-peer opportunity for a future body-bound rename batch.
+#[inline(always)]
+pub fn record_ecstore_rename_batch_candidate_peer(remote_disks: usize, batchable_disks: usize) {
+    if !put_stage_metrics_enabled() || remote_disks == 0 {
+        return;
+    }
+    ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[rename_peer_width_index(remote_disks)].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[rename_peer_width_index(batchable_disks)].fetch_add(1, Ordering::Relaxed);
+    let coverage_index = if batchable_disks == 0 {
+        0
+    } else if batchable_disks == remote_disks {
+        2
+    } else {
+        1
+    };
+    ECSTORE_RENAME_COVERAGE_COUNTS[coverage_index].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn record_ecstore_rename_batch_execution(index: usize, count: usize) {
+    if put_stage_metrics_enabled() {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_planned(items: usize) {
+    record_ecstore_rename_batch_execution(0, 1);
+    record_ecstore_rename_batch_execution(1, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_stream_started(items: usize) {
+    record_ecstore_rename_batch_execution(2, 1);
+    record_ecstore_rename_batch_execution(3, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_item_completed() {
+    record_ecstore_rename_batch_execution(4, 1);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_fallback(items: usize) {
+    record_ecstore_rename_batch_execution(5, 1);
+    record_ecstore_rename_batch_execution(6, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_not_dispatched(items: usize) {
+    record_ecstore_rename_batch_execution(7, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_may_have_published(items: usize) {
+    record_ecstore_rename_batch_execution(8, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_terminal_missing(items: usize) {
+    record_ecstore_rename_batch_execution(9, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_admission(batch: bool, items: usize, wait: Duration, timed_out: bool) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let base = usize::from(batch) * 5;
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    let wait_ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base + 1].fetch_add(items, Ordering::Relaxed);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base + 2].fetch_add(wait_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base + 3].fetch_max(wait_ns, Ordering::Relaxed);
+    if timed_out {
+        ECSTORE_RENAME_ADMISSION_COUNTS[base + 4].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_quarantine(batch: bool, items: usize, hold: Duration) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let base = usize::from(batch) * 6;
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    let hold_ns = u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base + 1].fetch_add(items, Ordering::Relaxed);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base + 2].fetch_add(hold_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base + 3].fetch_max(hold_ns, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_quarantine_released(batch: bool, items: usize) {
+    if put_stage_metrics_enabled() {
+        let base = usize::from(batch) * 6;
+        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 4].fetch_add(u64::try_from(items).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_quarantine_no_runtime(batch: bool, items: usize) {
+    if put_stage_metrics_enabled() {
+        let base = usize::from(batch) * 6;
+        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 5].fetch_add(u64::try_from(items).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn record_ecstore_rename_batch_timing(index: usize, duration: Duration) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let duration_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_BATCH_TIMING_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS[index].fetch_add(duration_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCH_TIMING_MAX_NS[index].fetch_max(duration_ns, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_client_stream_to_first(duration: Duration) {
+    record_ecstore_rename_batch_timing(0, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_client_first_to_last(duration: Duration) {
+    record_ecstore_rename_batch_timing(1, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_server_dispatch_to_first(duration: Duration) {
+    record_ecstore_rename_batch_timing(2, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_server_first_to_last(duration: Duration) {
+    record_ecstore_rename_batch_timing(3, duration);
+}
+
 /// Record generic internal operation stage duration (non-PUT paths).
 /// Use this for metacache walks, listing, lifecycle, and other background
 /// operations that are NOT part of the PUT object hot path.
@@ -4762,6 +5045,85 @@ mod tests {
                 PUT_RENAME_QUORUM_FANOUT_STATE_PANIC.to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn ecstore_rename_batch_candidate_metrics_are_gated_and_bounded() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        let disabled_before = snapshot_ecstore_rename_diagnostics();
+        record_ecstore_rename_remote_rpc(ECSTORE_RENAME_RPC_KIND_ORDINARY);
+        record_ecstore_rename_batch_candidate_peer(4, 4);
+        record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
+        record_ecstore_rename_quarantine(true, 4, Duration::from_nanos(30));
+        record_ecstore_rename_batch_client_stream_to_first(Duration::from_nanos(10));
+        assert_eq!(snapshot_ecstore_rename_diagnostics(), disabled_before);
+
+        set_put_stage_metrics_enabled(true);
+        let before = snapshot_ecstore_rename_diagnostics();
+        for kind in ECSTORE_RENAME_RPC_KINDS {
+            record_ecstore_rename_remote_rpc(kind);
+        }
+        record_ecstore_rename_batch_candidate_peer(4, 4);
+        record_ecstore_rename_batch_candidate_peer(4, 3);
+        record_ecstore_rename_batch_candidate_peer(4, 0);
+        record_ecstore_rename_batch_candidate_peer(20, 20);
+        record_ecstore_rename_batch_planned(4);
+        record_ecstore_rename_batch_stream_started(4);
+        record_ecstore_rename_batch_item_completed();
+        record_ecstore_rename_batch_fallback(3);
+        record_ecstore_rename_batch_not_dispatched(2);
+        record_ecstore_rename_batch_may_have_published(4);
+        record_ecstore_rename_batch_terminal_missing(1);
+        record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
+        record_ecstore_rename_admission(true, 4, Duration::from_nanos(20), true);
+        record_ecstore_rename_quarantine(true, 4, Duration::from_nanos(30));
+        record_ecstore_rename_quarantine_released(true, 3);
+        record_ecstore_rename_quarantine_no_runtime(true, 1);
+        record_ecstore_rename_batch_client_stream_to_first(Duration::from_nanos(10));
+        record_ecstore_rename_batch_client_first_to_last(Duration::from_nanos(20));
+        record_ecstore_rename_batch_server_dispatch_to_first(Duration::from_nanos(30));
+        record_ecstore_rename_batch_server_first_to_last(Duration::from_nanos(40));
+        set_put_stage_metrics_enabled(false);
+
+        let after = snapshot_ecstore_rename_diagnostics();
+        for index in 0..ECSTORE_RENAME_RPC_KINDS.len() {
+            assert_eq!(after.rpc_counts[index] - before.rpc_counts[index], 1);
+        }
+        assert_eq!(after.remote_width_counts[4] - before.remote_width_counts[4], 3);
+        assert_eq!(after.remote_width_counts[17] - before.remote_width_counts[17], 1);
+        assert_eq!(after.batchable_width_counts[0] - before.batchable_width_counts[0], 1);
+        assert_eq!(after.batchable_width_counts[3] - before.batchable_width_counts[3], 1);
+        assert_eq!(after.batchable_width_counts[4] - before.batchable_width_counts[4], 1);
+        assert_eq!(after.batchable_width_counts[17] - before.batchable_width_counts[17], 1);
+        assert_eq!(after.coverage_counts[0] - before.coverage_counts[0], 1);
+        assert_eq!(after.coverage_counts[1] - before.coverage_counts[1], 1);
+        assert_eq!(after.coverage_counts[2] - before.coverage_counts[2], 2);
+        assert_eq!(
+            std::array::from_fn::<_, 10, _>(|index| {
+                after.batch_execution_counts[index] - before.batch_execution_counts[index]
+            }),
+            [1, 4, 1, 4, 1, 1, 3, 2, 4, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 10, _>(|index| after.admission_counts[index] - before.admission_counts[index]),
+            [1, 1, 10, 10, 0, 1, 4, 20, 20, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 12, _>(|index| after.quarantine_counts[index] - before.quarantine_counts[index]),
+            [0, 0, 0, 0, 0, 0, 1, 4, 30, 30, 3, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|index| after.batch_timing_counts[index] - before.batch_timing_counts[index]),
+            [1, 1, 1, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|index| { after.batch_timing_total_ns[index] - before.batch_timing_total_ns[index] }),
+            [10, 20, 30, 40]
+        );
+        for (actual, expected) in after.batch_timing_max_ns.into_iter().zip([10, 20, 30, 40]) {
+            assert!(actual >= expected);
+        }
     }
 
     #[test]

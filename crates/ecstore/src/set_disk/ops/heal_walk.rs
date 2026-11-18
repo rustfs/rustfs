@@ -76,7 +76,7 @@ struct HealWalkCollector {
     /// The local walker emits the base directory marker before applying its
     /// relative filter, so the boundary must also be checked on the decoded key.
     prefix: String,
-    /// Inclusive full object-key cursor for the current page.
+    /// Last object key returned for the current page.
     forward_to: Option<String>,
     batch_objects: usize,
     version_budget: usize,
@@ -90,7 +90,7 @@ struct HealWalkCollector {
 
 impl HealWalkCollector {
     fn accepts_name(&self, name: &str) -> bool {
-        name.starts_with(&self.prefix) && self.forward_to.as_deref().is_none_or(|forward_to| name >= forward_to)
+        name.starts_with(&self.prefix) && self.forward_to.as_deref().is_none_or(|forward_to| name > forward_to)
     }
 
     fn lock_objects(&self) -> disk::error::Result<std::sync::MutexGuard<'_, Vec<HealWalkObject>>> {
@@ -438,7 +438,10 @@ mod tests {
             !collector.accepts_name("a/b/before"),
             "objects before the inclusive cursor must be ignored"
         );
-        assert!(collector.accepts_name("a/b/child"), "the cursor boundary is inclusive");
+        assert!(
+            !collector.accepts_name("a/b/child"),
+            "the completed boundary must not consume the next page budget"
+        );
         assert!(collector.accepts_name("a/b/child/deep"), "descendants after the cursor must be included");
     }
 
@@ -503,7 +506,7 @@ mod tests {
             let mut pages = 0;
             loop {
                 let (versions, next, truncated) = set_disks
-                    .heal_walk_versions_page(bucket, prefix, forward.as_deref(), 2, 100, false)
+                    .heal_walk_versions_page(bucket, prefix, forward.as_deref(), 2, 1, false)
                     .await
                     .expect("prefix disk walk should succeed");
                 pages += 1;

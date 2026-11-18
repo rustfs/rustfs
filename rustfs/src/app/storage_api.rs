@@ -77,7 +77,6 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     pub(crate) use s3s::header;
-    pub(crate) use s3s::region;
     pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
@@ -253,7 +252,7 @@ pub(crate) mod runtime {
         crate::storage::storage_api::get_global_lock_clients()
     }
 
-    pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
+    pub(crate) fn get_global_region() -> Option<rustfs_s3_types::Region> {
         crate::storage::storage_api::get_global_region()
     }
 
@@ -1602,6 +1601,8 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use crate::storage::storage_api::ecstore_compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use crate::storage::storage_api::ecstore_compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
     };

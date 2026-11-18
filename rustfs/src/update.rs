@@ -16,7 +16,7 @@ use crate::version;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Update check related errors
 #[derive(Error, Debug)]
@@ -54,13 +54,11 @@ pub struct UpdateCheckResult {
     /// Latest version information
     pub latest_version: Option<VersionInfo>,
     /// Check time
-    pub check_time: jiff::Zoned,
+    pub check_time: jiff::ZonedDateTime,
 }
 
 /// Version checker
 pub struct VersionChecker {
-    /// HTTP client
-    client: reqwest::Client,
     /// Version server URL
     version_url: String,
     /// Request timeout
@@ -73,52 +71,40 @@ impl Default for VersionChecker {
     }
 }
 
-/// Build the update-check HTTP client without panicking when the host has no
-/// system CA bundle (issue #6734): `reqwest::Client::new()` panics for the
-/// same reason a builder `build()` fails, so falling back to it turned a
-/// degraded environment into a process abort. With an explicit empty trust
-/// store the HTTPS version check fails closed per request instead.
-fn version_check_client(timeout: Duration) -> reqwest::Client {
-    let builder = || {
-        reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(format!("RustFS/{}", get_current_version()))
-    };
-    builder().build().unwrap_or_else(|error| {
-        warn!("update-check HTTP client could not load system TLS roots ({error}); continuing with an empty trust store");
-        builder()
-            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
-            .build()
-            .expect("HTTP client construction must succeed with an explicit empty trust store")
-    })
+fn version_check_client(timeout: Duration, version: &str) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(format!("RustFS/{version}"))
+        .build()
 }
 
 impl VersionChecker {
     /// Create a new version checker
     pub fn new() -> Self {
-        Self {
-            client: version_check_client(Duration::from_secs(10)),
-            version_url: "https://version.rustfs.com/latest.json".to_string(),
-            timeout: Duration::from_secs(10),
-        }
+        Self::with_config("https://version.rustfs.com/latest.json".to_string(), Duration::from_secs(10))
     }
 
     /// Create version checker with custom configuration
     pub fn with_config(url: String, timeout: Duration) -> Self {
         Self {
-            client: version_check_client(timeout),
             version_url: url,
             timeout,
         }
     }
 
-    /// Check for updates
+    /// Check for updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be initialized, the request
+    /// fails, or the response does not contain usable version information.
     pub async fn check_for_updates(&self) -> Result<UpdateCheckResult, UpdateCheckError> {
         let current_version = get_current_version();
+        let client = version_check_client(self.timeout, &current_version)?;
         debug!("Checking for updates, current version: {}", current_version);
 
         // Send HTTP GET request to get latest version information
-        let response = self.client.get(&self.version_url).timeout(self.timeout).send().await?;
+        let response = client.get(&self.version_url).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -152,7 +138,7 @@ impl VersionChecker {
             update_available,
             current_version,
             latest_version: Some(version_info),
-            check_time: jiff::Zoned::now(),
+            check_time: jiff::ZonedDateTime::now(),
         };
 
         if result.update_available {
@@ -190,16 +176,10 @@ pub async fn check_updates_with_url(url: String) -> Result<UpdateCheckResult, Up
 mod tests {
     use super::*;
 
-    // The startup panic fix for hosts without a CA bundle (issue #6734) rests
-    // on the constructor never panicking and its degraded fallback — an
-    // explicit empty trust store — always building.
     #[test]
-    fn version_check_client_construction_never_panics() {
-        let _ = version_check_client(Duration::from_secs(1));
-        reqwest::Client::builder()
-            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
-            .build()
-            .expect("empty-trust-store client build must succeed without touching system roots");
+    fn invalid_version_header_does_not_panic() {
+        let error = version_check_client(Duration::from_secs(1), "refs/tags/1.0.6\u{7f}").unwrap_err();
+        assert!(error.is_builder());
     }
 
     #[tokio::test]
@@ -219,7 +199,7 @@ mod tests {
             download_url: Some("https://github.com/rustfs/rustfs/releases/tag/v1.2.0".to_string()),
         };
 
-        let check_time = jiff::Zoned::now();
+        let check_time = jiff::ZonedDateTime::now();
         let result = UpdateCheckResult {
             update_available: true,
             current_version: "1.1.0".to_string(),
@@ -268,7 +248,7 @@ mod tests {
                 release_notes: None,
                 download_url: None,
             }),
-            check_time: jiff::Zoned::now(),
+            check_time: jiff::ZonedDateTime::now(),
         };
 
         assert!(!no_update_result.update_available);
@@ -279,7 +259,7 @@ mod tests {
             update_available: false,
             current_version: "1.1.0".to_string(),
             latest_version: None,
-            check_time: jiff::Zoned::now(),
+            check_time: jiff::ZonedDateTime::now(),
         };
 
         assert!(!error_result.update_available);
