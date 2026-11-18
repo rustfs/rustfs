@@ -4134,7 +4134,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4449,7 +4449,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5846,7 +5846,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7127,7 +7127,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9080,7 +9080,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10324,7 +10324,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway"
 version = "0.66.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -10371,7 +10371,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-core"
 version = "0.63.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "bytes",
  "futures-core",
@@ -10392,7 +10392,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-dialect-rustfs-admin"
 version = "0.13.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -10406,7 +10406,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10424,7 +10424,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10434,7 +10434,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-sig"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10449,7 +10449,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10460,7 +10460,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-types"
 version = "0.42.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10483,7 +10483,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=ab5242b092f60c22a6cbace3950117f4702de36a#ab5242b092f60c22a6cbace3950117f4702de36a"
+source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
 dependencies = [
  "quick-xml 0.41.0",
 ]
@@ -11706,7 +11706,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11788,7 +11788,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13067,7 +13067,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14180,7 +14180,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

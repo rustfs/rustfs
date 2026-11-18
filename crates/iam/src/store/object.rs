@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{GroupInfo, MappedPolicy, Store, UserType};
+use super::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType};
 use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
+use crate::storage_api::object_store::WriteCommitGuard;
 use crate::{
     IAM_CONFIG_ROOT_PREFIX, IamStorageError, IamStore, classify_iam_system_path_failure_reason, delete_iam_config,
     read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config, save_iam_config_with_opts,
@@ -41,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::storage_api::object_store::{
-    HTTPPreconditions, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
-    read_config_preserve_empty_with_metadata_opts,
+    HTTPPreconditions, ListOperations, NamespaceLocking, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+    get_lock_acquire_timeout, read_config_preserve_empty_with_metadata_opts,
 };
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
@@ -206,6 +207,53 @@ pub(crate) fn decrypt_iam_blob(data: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<IamStore>,
+}
+
+struct ObjectGroupEdit {
+    api: Arc<IamStore>,
+    path: String,
+    policy_path: String,
+    guard: WriteCommitGuard,
+}
+
+impl ObjectGroupEdit {
+    fn fenced(&self, mut opts: IamObjectOptions) -> Result<IamObjectOptions> {
+        if self.guard.is_lock_lost() {
+            return Err(Error::other("group transaction lock lost"));
+        }
+        if let Some(signal) = self.guard.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        Ok(opts)
+    }
+}
+
+#[async_trait::async_trait]
+impl GroupEdit for ObjectGroupEdit {
+    async fn save(&self, group: &GroupInfo) -> Result<()> {
+        let data = ObjectStore::prepare_data_for_storage(&serde_json::to_vec(group)?)?;
+        let opts = self.fenced(IamObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        })?;
+        save_iam_config_with_opts(self.api.clone(), &self.path, data, &opts).await?;
+        Ok(())
+    }
+
+    async fn delete_empty(&self) -> Result<()> {
+        for path in [&self.policy_path, &self.path] {
+            let opts = self.fenced(IamObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                ..Default::default()
+            })?;
+            match self.api.delete_object(ObjectStore::BUCKET_NAME, path, opts).await {
+                Ok(_) | Err(IamStorageError::FileNotFound | IamStorageError::ObjectNotFound(_, _)) => (),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ObjectStore {
@@ -951,6 +999,28 @@ impl Store for ObjectStore {
             })?;
 
         Ok(u.credentials.secret_key)
+    }
+
+    async fn begin_group_edit(&self, name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+        let path = get_group_info_path(name);
+        // Take the transaction lock before any object locks. A distinct key lets ordinary
+        // config reads, writes and deletes keep taking their own namespace locks.
+        let lock = self.object_api.new_ns_lock(Self::BUCKET_NAME, &format!("{path}.txn")).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
+            .await
+            .map_err(Error::other)?;
+        let group = match self.load_iam_config_strict(&path).await {
+            Ok(gi) => Some(gi),
+            Err(Error::ConfigNotFound) => None,
+            Err(err) => return Err(err),
+        };
+        let edit = ObjectGroupEdit {
+            api: self.object_api.clone(),
+            path,
+            policy_path: get_mapped_policy_path(name, UserType::Reg, true),
+            guard,
+        };
+        Ok((Box::new(edit), group))
     }
 
     async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()> {
