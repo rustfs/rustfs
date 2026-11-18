@@ -49,7 +49,7 @@ impl RequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{RequestCredentials, RequestEnvelope, S3Request};
-    use crate::app::metadata_route::WebsiteRead;
+    use crate::app::context::WebsiteRead;
     use crate::app::object::request_body::BodyReadControl;
     use crate::app::storage_api::s3::Credentials as S3sCredentials;
     use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};

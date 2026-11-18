@@ -26,7 +26,7 @@
 //! envelope lives in `storage/s3_compat/envelope.rs`.
 
 use super::ServerContextSlot;
-use crate::app::metadata_route::WebsiteRead;
+use crate::app::context::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
