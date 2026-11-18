@@ -168,6 +168,26 @@ async fn a_presigned_put_is_served_when_its_header_is_signed() {
 }
 
 #[tokio::test]
+async fn the_header_cloudfront_adds_after_signing_is_served_and_its_lookalikes_are_refused() {
+    // CloudFront stamps `x-amz-cf-id` on the origin request after the client signed it; the layer
+    // let exactly that name through, on header-signed and presigned requests alike.
+    let probe = Probe::new();
+    let stack = probe_stack(&probe);
+    for request in [header_signed_put(HeaderMap::new()), presigned_put(HeaderMap::new())] {
+        let answer = observe(&stack, with_header(request, "x-amz-cf-id", "edge-request")).await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    }
+    assert_eq!(probe.calls(), 2);
+    for name in ["x-amz-cf-id-2", "x-amz-cf", "x-amz-cf-idx"] {
+        for request in [header_signed_put(HeaderMap::new()), presigned_put(HeaderMap::new())] {
+            let answer = observe(&stack, with_header(request, name, "edge-request")).await;
+            assert_refused_as_the_layer_refuses(&answer, UNSIGNED, name);
+        }
+    }
+    assert_eq!(probe.calls(), 2, "no lookalike reached a handler");
+}
+
+#[tokio::test]
 async fn a_swapped_or_unreadable_authorization_is_refused_before_routing() {
     let probe = Probe::new();
     let stack = probe_stack(&probe);
