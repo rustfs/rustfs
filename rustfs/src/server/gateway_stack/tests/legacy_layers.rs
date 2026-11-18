@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod double_slash_list_buckets_compat;
 mod empty_body_content_length_compat;
+mod object_attributes_etag_fix;
 mod s3_error_message_compat;
 mod sigv4_header_guard;
 mod virtual_host_style_hint;
@@ -45,6 +46,13 @@ impl Probe {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             etag: None,
+        })
+    }
+
+    pub(super) fn with_etag(etag: rustfs_gateway_types::ETag) -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            etag: Some(etag),
         })
     }
 
