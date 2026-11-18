@@ -90,7 +90,9 @@ fn remote_credentials(credentials: &Credentials, account_id: &str) -> RemoteCred
         access_key: credentials.access_key.clone(),
         secret_key: credentials.secret_key.clone(),
         session_token: credentials.effective_session_token().map(str::to_string),
-        expiration: credentials.effective_expiration().map(SystemTime::from),
+        expiration: credentials
+            .effective_expiration()
+            .and_then(|timestamp| SystemTime::try_from(timestamp).ok()),
         account_id: account_id.to_string(),
     }
 }

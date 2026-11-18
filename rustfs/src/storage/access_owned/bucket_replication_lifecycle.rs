@@ -83,7 +83,7 @@ fn replication_deny_edit_error() -> S3Error {
 pub(crate) fn prepare_replication_config_edit<R: AuthorizationRequest + ?Sized>(
     request: &R,
 ) -> impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send + use<R> {
-    let is_owner = req_info_ref(request).map(|info| info.is_owner).map_err(S3Error::from);
+    let is_owner = req_info_ref(request).map(|info| info.is_owner);
     async move {
         if !is_owner? && site_replication_gate_enabled().await? {
             return Err(replication_deny_edit_error());

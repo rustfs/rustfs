@@ -58,6 +58,15 @@ pub fn make_admin_route(
     console_enabled: bool,
     server_ctx: std::sync::Arc<crate::admin::runtime_sources::ServerContextSlot>,
 ) -> std::io::Result<impl S3Route> {
+    make_admin_router(console_enabled, server_ctx)
+}
+
+/// The admin router with every route registered, bound to `server_ctx`: what the legacy stack
+/// mounts as its custom route and the gateway stack's control-plane host dispatches through.
+pub(crate) fn make_admin_router(
+    console_enabled: bool,
+    server_ctx: std::sync::Arc<crate::admin::runtime_sources::ServerContextSlot>,
+) -> std::io::Result<S3Router<AdminOperation>> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
     r.set_server_ctx(server_ctx);
     register_admin_routes(&mut r)?;

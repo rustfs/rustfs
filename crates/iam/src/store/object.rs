@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{GroupInfo, MappedPolicy, Store, UserType};
+use super::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType};
 use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
+use crate::storage_api::object_store::WriteCommitGuard;
 use crate::{
     IAM_CONFIG_ROOT_PREFIX, IamStorageError, IamStore, classify_iam_system_path_failure_reason, delete_iam_config,
     read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config, save_iam_config_with_opts,
@@ -41,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::storage_api::object_store::{
-    HTTPPreconditions, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
-    read_config_preserve_empty_with_metadata_opts,
+    HTTPPreconditions, ListOperations, NamespaceLocking, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+    get_lock_acquire_timeout, read_config_preserve_empty_with_metadata_opts,
 };
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
@@ -83,6 +84,29 @@ fn get_user_identity_path(user: &str, user_type: UserType) -> String {
 
 fn get_group_info_path(group: &str) -> String {
     path_join_buf(&[&IAM_CONFIG_GROUPS_PREFIX, group, IAM_GROUP_MEMBERS_FILE])
+}
+
+fn unchanged_status_precondition(
+    previous: &UserIdentity,
+    item: &UserIdentity,
+    etag: Option<String>,
+) -> Result<(HTTPPreconditions, bool)> {
+    if previous.credentials.status != item.credentials.status
+        || previous.credentials.is_temp()
+        || previous.credentials.is_service_account()
+    {
+        return Err(Error::IAMActionNotAllowed);
+    }
+    let tag = etag
+        .filter(|tag| !tag.is_empty() && tag != "*")
+        .ok_or_else(|| Error::other("missing IAM identity revision"))?;
+    Ok((
+        HTTPPreconditions {
+            if_match: Some(tag),
+            ..Default::default()
+        },
+        previous.credentials.secret_key != item.credentials.secret_key,
+    ))
 }
 
 fn get_policy_doc_path(name: &str) -> String {
@@ -206,6 +230,53 @@ pub(crate) fn decrypt_iam_blob(data: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<IamStore>,
+}
+
+struct ObjectGroupEdit {
+    api: Arc<IamStore>,
+    path: String,
+    policy_path: String,
+    guard: WriteCommitGuard,
+}
+
+impl ObjectGroupEdit {
+    fn fenced(&self, mut opts: IamObjectOptions) -> Result<IamObjectOptions> {
+        if self.guard.is_lock_lost() {
+            return Err(Error::other("group transaction lock lost"));
+        }
+        if let Some(signal) = self.guard.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        Ok(opts)
+    }
+}
+
+#[async_trait::async_trait]
+impl GroupEdit for ObjectGroupEdit {
+    async fn save(&self, group: &GroupInfo) -> Result<()> {
+        let data = ObjectStore::prepare_data_for_storage(&serde_json::to_vec(group)?)?;
+        let opts = self.fenced(IamObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        })?;
+        save_iam_config_with_opts(self.api.clone(), &self.path, data, &opts).await?;
+        Ok(())
+    }
+
+    async fn delete_empty(&self) -> Result<()> {
+        for path in [&self.policy_path, &self.path] {
+            let opts = self.fenced(IamObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                ..Default::default()
+            })?;
+            match self.api.delete_object(ObjectStore::BUCKET_NAME, path, opts).await {
+                Ok(_) | Err(IamStorageError::FileNotFound | IamStorageError::ObjectNotFound(_, _)) => (),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ObjectStore {
@@ -897,6 +968,34 @@ impl Store for ObjectStore {
             e
         })
     }
+    async fn save_regular_user_preserving_status(&self, name: &str, item: &UserIdentity) -> Result<bool> {
+        let path = get_user_identity_path(name, UserType::Reg);
+        let existing =
+            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await;
+        let (conditions, rotated) = match existing.map_err(Error::from) {
+            Ok((data, metadata)) => {
+                let previous: UserIdentity = Self::decode_iam_config_strict(&data)?;
+                unchanged_status_precondition(&previous, item, metadata.etag)?
+            }
+            Err(err) if is_err_config_not_found(&err) => (
+                HTTPPreconditions {
+                    if_none_match: Some("*".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            Err(err) => return Err(err),
+        };
+        let opts = IamObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(conditions),
+            ..Default::default()
+        };
+        let data = Self::prepare_data_for_storage(&serde_json::to_vec(item)?)?;
+        save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await?;
+        Ok(rotated)
+    }
+
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
         self.delete_iam_config(get_user_identity_path(name, user_type))
             .await
@@ -951,6 +1050,28 @@ impl Store for ObjectStore {
             })?;
 
         Ok(u.credentials.secret_key)
+    }
+
+    async fn begin_group_edit(&self, name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+        let path = get_group_info_path(name);
+        // Take the transaction lock before any object locks. A distinct key lets ordinary
+        // config reads, writes and deletes keep taking their own namespace locks.
+        let lock = self.object_api.new_ns_lock(Self::BUCKET_NAME, &format!("{path}.txn")).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
+            .await
+            .map_err(Error::other)?;
+        let group = match self.load_iam_config_strict(&path).await {
+            Ok(gi) => Some(gi),
+            Err(Error::ConfigNotFound) => None,
+            Err(err) => return Err(err),
+        };
+        let edit = ObjectGroupEdit {
+            api: self.object_api.clone(),
+            path,
+            policy_path: get_mapped_policy_path(name, UserType::Reg, true),
+            guard,
+        };
+        Ok((Box::new(edit), group))
     }
 
     async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()> {
@@ -1501,6 +1622,78 @@ mod tests {
     fn missing_user_identity_delete_maps_to_no_such_user() {
         let err = map_delete_user_identity_error("missing-sts", Error::ConfigNotFound);
         assert!(matches!(err, Error::NoSuchUser(name) if name == "missing-sts"));
+    }
+
+    #[test]
+    fn restricted_user_upsert_requires_unchanged_status_and_exact_revision() {
+        let old = super::UserIdentity::from(Credentials {
+            status: "off".into(),
+            secret_key: "old-fixture".into(),
+            ..Default::default()
+        });
+        let mut new = old.clone();
+        new.credentials.secret_key = "new-fixture".into();
+        let (predicate, rotated) =
+            super::unchanged_status_precondition(&old, &new, Some("rev1".into())).expect("status remains disabled");
+        assert!(rotated);
+        assert_eq!(predicate.if_match.as_deref(), Some("rev1"));
+        assert!(super::unchanged_status_precondition(&old, &new, None).is_err());
+        new.credentials.status = "on".into();
+        assert!(matches!(
+            super::unchanged_status_precondition(&old, &new, Some("rev1".into())),
+            Err(crate::error::Error::IAMActionNotAllowed)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restricted_user_upsert_checks_durable_status_before_replacing_credentials() {
+        use crate::store::{Store, UserType};
+        let _credentials = test_cred();
+        let temp = tempfile::tempdir().expect("IAM fixture directory");
+        let env = Box::pin(
+            rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(temp.path())
+                .init_bucket_metadata(false)
+                .build(),
+        )
+        .await;
+        let store = ObjectStore::new(env.ecstore);
+        let name = "status-fixture";
+        let mut entry = super::UserIdentity::from(Credentials {
+            access_key: name.into(),
+            status: "off".into(),
+            secret_key: "first-fixture".into(),
+            ..Default::default()
+        });
+        assert!(
+            !store
+                .save_regular_user_preserving_status(name, &entry)
+                .await
+                .expect("create absent account")
+        );
+        entry.credentials.status = "on".into();
+        entry.credentials.secret_key = "second-fixture".into();
+        assert!(matches!(
+            store.save_regular_user_preserving_status(name, &entry).await,
+            Err(Error::IAMActionNotAllowed)
+        ));
+        let persisted = store
+            .load_user_identity(name, UserType::Reg)
+            .await
+            .expect("reload denied write");
+        assert_eq!(persisted.credentials.status, "off");
+        assert_eq!(persisted.credentials.secret_key, "first-fixture");
+        entry.credentials.status = "off".into();
+        assert!(
+            store
+                .save_regular_user_preserving_status(name, &entry)
+                .await
+                .expect("rotate while disabled")
+        );
+        let persisted = store.load_user_identity(name, UserType::Reg).await.expect("reload rotation");
+        assert_eq!(persisted.credentials.status, "off");
+        assert_eq!(persisted.credentials.secret_key, "second-fixture");
     }
 
     fn test_cred() -> Credentials {

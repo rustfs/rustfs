@@ -23,13 +23,13 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
-use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{
     Compression,
     write::{GzEncoder, ZlibEncoder},
 };
 use http::HeaderValue;
 use http::header::{CONTENT_TYPE, HOST};
+use jiff::{SignedDuration, Timestamp};
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_s3_types::Body;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -42,8 +42,8 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
-    let expiration = (Utc::now() + ChronoDuration::hours(1))
-        .format("%Y-%m-%dT%H:%M:%S.000Z")
+    let expiration = (Timestamp::now() + SignedDuration::from_hours(1))
+        .strftime("%Y-%m-%dT%H:%M:%S.000Z")
         .to_string();
     let policy = serde_json::json!({
         "expiration": expiration,

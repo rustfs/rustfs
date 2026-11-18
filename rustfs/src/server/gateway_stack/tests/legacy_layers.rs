@@ -124,6 +124,7 @@ pub(super) fn probe_stack_for(probe: &Arc<Probe>, assembly: GatewayAssembly) -> 
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
         allow_when(|request| request.identity.is_some()),
+        std::convert::identity,
     )
     .expect("the production builder assembles");
     let service = builder
@@ -139,6 +140,7 @@ pub(super) fn probe_stack_for(probe: &Arc<Probe>, assembly: GatewayAssembly) -> 
     GatewayStack {
         service,
         keystone_auth: None,
+        control_plane: false,
     }
 }
 

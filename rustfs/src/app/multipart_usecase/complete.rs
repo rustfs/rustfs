@@ -499,7 +499,7 @@ impl DefaultMultipartUsecase {
                 insert_str(
                     &mut completion_replication_metadata,
                     SUFFIX_REPLICATION_TIMESTAMP,
-                    jiff::Zoned::now().to_string(),
+                    jiff::ZonedDateTime::now().to_string(),
                 );
                 insert_str(
                     &mut completion_replication_metadata,

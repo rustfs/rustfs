@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod access;
+pub(crate) mod authorization;
 pub(crate) mod authorization_actions;
 pub mod concurrency;
 pub mod deadlock_detector;
