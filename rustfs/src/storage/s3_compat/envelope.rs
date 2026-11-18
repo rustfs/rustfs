@@ -54,9 +54,9 @@ mod tests {
     use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
     use crate::runtime_sources::ServerContextSlot;
     use crate::shared_types::{NativeTlsTransport, RemoteAddr};
-    use crate::storage::access::envelope_payloads;
     use crate::storage::access::{PostObjectRequestMarker, ReqInfo};
     use crate::storage::authorization::TableDataPlanePublicationGuards;
+    use crate::storage::authorization::envelope_payloads;
     use crate::storage::request_context::RequestContext;
     use crate::storage::request_markers::WebsiteRead;
     use http::{Extensions, HeaderMap, HeaderValue, Method};

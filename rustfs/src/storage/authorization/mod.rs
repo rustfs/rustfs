@@ -27,6 +27,8 @@ mod admission;
 mod conditions;
 mod decision;
 mod discovery;
+#[cfg(test)]
+pub(crate) mod envelope_payloads;
 mod guards;
 mod request;
 mod table_data_plane;

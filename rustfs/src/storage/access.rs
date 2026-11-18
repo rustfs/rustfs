@@ -177,64 +177,6 @@ fn copy_source_object<'a>(
     access_owned::object_commit::CopySourceObject { bucket, key, version_id }
 }
 
-/// Authorization-phase payloads for request-envelope tests, which cannot reach
-/// the private fields. Production code builds them only through the
-/// authorization paths in this module.
-#[cfg(test)]
-pub(crate) mod envelope_payloads {
-    use super::{
-        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, HashMap, ObjectTagConditions,
-        OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, TableDataPlaneListAccess,
-    };
-
-    fn incarnation() -> uuid::Uuid {
-        uuid::Uuid::from_u128(0x7107)
-    }
-
-    pub(crate) fn bucket_generation(bucket: &str) -> BucketGenerationGuard {
-        BucketGenerationGuard {
-            bucket: bucket.to_owned(),
-            incarnation_id: incarnation(),
-        }
-    }
-
-    pub(crate) fn pending_delete_bucket_generation(bucket: &str) -> PendingDeleteBucketGenerationGuard {
-        PendingDeleteBucketGenerationGuard::Ready(bucket_generation(bucket))
-    }
-
-    pub(crate) fn copy_source_bucket_generation(bucket: &str) -> CopySourceBucketGenerationGuard {
-        CopySourceBucketGenerationGuard {
-            bucket: bucket.to_owned(),
-            incarnation_id: incarnation(),
-        }
-    }
-
-    pub(crate) fn odm_read_generation(bucket: &str) -> OdmReadGenerationGuard {
-        OdmReadGenerationGuard::Ready(bucket_generation(bucket))
-    }
-
-    pub(crate) fn bucket_config_mutation(bucket: &str) -> BucketConfigMutationSnapshot {
-        BucketConfigMutationSnapshot {
-            bucket: bucket.to_owned(),
-            incarnation_id: incarnation(),
-        }
-    }
-
-    pub(crate) fn table_list_access(bucket: &str) -> TableDataPlaneListAccess {
-        TableDataPlaneListAccess {
-            bucket: bucket.to_owned(),
-            principal_fingerprint: String::new(),
-            snapshot_fingerprint: String::new(),
-            cursor_key: [0; 32],
-            resources: Vec::new(),
-        }
-    }
-
-    pub(crate) fn object_tag_conditions(bucket: &str) -> ObjectTagConditions {
-        ObjectTagConditions::new(bucket, "object", None, HashMap::new())
-    }
-}
-
 impl<T> AuthorizationRequest for S3Request<T> {
     fn headers(&self) -> &HeaderMap {
         &self.headers
@@ -1640,9 +1582,9 @@ impl S3Access for FS {
 /// parity tests, which live next to the envelope's facts impl.
 #[cfg(test)]
 pub(crate) mod parity_test_support {
-    pub(crate) use super::envelope_payloads::bucket_config_mutation;
     use super::{Action, Arc, CreateBucketInput, S3Request, S3Result};
     use super::{AuthorizationRequest, AuthzFacts, AuthzPrincipal, AuthzTarget, ECStore, HashMap};
+    pub(crate) use crate::storage::authorization::envelope_payloads::bucket_config_mutation;
     /// Whether `guards` retains `key`, and how many lock guards it holds.
     pub(crate) fn publication_guard_holds(
         guards: &super::TableDataPlanePublicationGuards,
