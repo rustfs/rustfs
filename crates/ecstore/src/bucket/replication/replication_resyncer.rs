@@ -16,7 +16,7 @@ use super::replication_bandwidth_boundary;
 use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
-use super::replication_event_sink::{EventArgs, capture_event_bucket_incarnation, send_event, send_local_event};
+use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 #[cfg(test)]
 use super::replication_filemeta_boundary::ReplicationGenerationSnapshot;
 use super::replication_filemeta_boundary::metadata_keys;
@@ -2417,7 +2417,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     mut dobj: DeletedObjectReplicationInfo,
     storage: Arc<S>,
 ) -> bool {
-    dobj.notification_bucket_incarnation = capture_event_bucket_incarnation(&dobj.bucket).await;
+    dobj.notification_bucket_incarnation = ReplicationMetadataStore::notification_bucket_incarnation(&dobj.bucket).await;
     if dobj.delete_object.force_delete {
         return replicate_force_delete_to_targets(&dobj, storage).await;
     }
@@ -4234,7 +4234,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         return outcome;
     }
 
-    roi.notification_bucket_incarnation = capture_event_bucket_incarnation(&roi.bucket).await;
+    roi.notification_bucket_incarnation = ReplicationMetadataStore::notification_bucket_incarnation(&roi.bucket).await;
 
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();

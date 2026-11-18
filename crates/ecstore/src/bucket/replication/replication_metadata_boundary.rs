@@ -54,6 +54,17 @@ impl ReplicationMetadataStore {
         Ok(config)
     }
 
+    /// Bind an attempt's status events to the bucket visible when the attempt starts.
+    pub(crate) async fn notification_bucket_incarnation(bucket: &str) -> Option<uuid::Uuid> {
+        let sys = metadata_sys::get_global_bucket_metadata_sys()?;
+        let sys = sys.read().await.clone();
+        if sys.get(bucket).await.ok()?.notification_config_xml.is_empty() {
+            return None;
+        }
+        let store = sys.object_store();
+        store.bucket_incarnation_id_from_disk(bucket).await.ok()
+    }
+
     pub(crate) async fn delete_metadata(bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::get_bucket_metadata_sys()?;
         let sys = sys.read().await;
