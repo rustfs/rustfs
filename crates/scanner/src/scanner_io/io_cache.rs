@@ -1082,7 +1082,7 @@ impl ScannerIOCache for SetDisks {
                     );
                     let assigned_disk = &disk;
                     let disk = if assigned_disk.is_local() {
-                        match current_local_scanner_disk(&store_clone_clone, assigned_disk).await {
+                        match current_local_scanner_disk(&store_clone_clone, assigned_disk, &ctx_clone, &budget_clone).await {
                             Some(current) => current,
                             None => {
                                 drop(_active_guard);

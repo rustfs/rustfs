@@ -61,27 +61,47 @@ pub(super) fn retain_interrupted_local_cache(cache: &mut DataUsageCache) {
     cache.info.scan_bucket_value_origins.clear();
 }
 
+const LOCAL_SCANNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Bind the assigned local topology slot to its currently usable instance.
 /// The format identity fences resume across a physical drive replacement.
-pub(super) async fn current_local_scanner_disk(set: &SetDisks, assigned: &Arc<Disk>) -> Option<Arc<Disk>> {
-    let location = EcstoreDiskAPI::get_disk_location(assigned.as_ref());
-    let expected_id = location
-        .disk_idx
-        .and_then(|index| set.format.erasure.sets.get(set.set_index)?.get(index))
-        .copied()
-        .filter(|id| !id.is_nil());
-    let expected_id = expected_id?;
-    let candidate = scanner_set_disk_inventory(set).await.into_iter().find(|candidate| {
-        EcstoreDiskAPI::is_local(candidate.as_ref())
-            && EcstoreDiskAPI::endpoint(candidate.as_ref()) == EcstoreDiskAPI::endpoint(assigned.as_ref())
-    });
-    let candidate = candidate?;
-    if candidate.local_retirement_token().is_some_and(|token| token.is_cancelled()) || !candidate.is_online().await {
-        return None;
-    }
-    match candidate.get_disk_id().await {
-        Ok(Some(id)) if id == expected_id => Some(candidate),
-        Ok(_) | Err(_) => None,
+pub(super) async fn current_local_scanner_disk(
+    set: &SetDisks,
+    assigned: &Arc<Disk>,
+    ctx: &CancellationToken,
+    budget: &ScannerCycleBudget,
+) -> Option<Arc<Disk>> {
+    // This also bounds the first binding, while the coordinator owns a scan
+    // permit. Waiting for a format probe must respect source cancellation and its turn.
+    let lookup = async {
+        let location = EcstoreDiskAPI::get_disk_location(assigned.as_ref());
+        let expected_id = location
+            .disk_idx
+            .and_then(|index| set.format.erasure.sets.get(set.set_index)?.get(index))
+            .copied()
+            .filter(|id| !id.is_nil());
+        let expected_id = expected_id?;
+        let candidate = scanner_set_disk_inventory(set).await.into_iter().find(|candidate| {
+            EcstoreDiskAPI::is_local(candidate.as_ref())
+                && EcstoreDiskAPI::endpoint(candidate.as_ref()) == EcstoreDiskAPI::endpoint(assigned.as_ref())
+        });
+        let candidate = candidate?;
+        #[cfg(test)]
+        super::tests::local_drive_recovery::before_binding_probe().await;
+        if candidate.local_retirement_token().is_some_and(|token| token.is_cancelled()) || !candidate.is_online().await {
+            return None;
+        }
+        match candidate.get_disk_id().await {
+            Ok(Some(id)) if id == expected_id => Some(candidate),
+            Ok(_) | Err(_) => None,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = ctx.cancelled() => None,
+        _ = budget.wait_for_stop() => None,
+        _ = tokio::time::sleep(LOCAL_SCANNER_LOOKUP_TIMEOUT) => None,
+        disk = lookup => disk,
     }
 }
 
@@ -112,7 +132,7 @@ pub(super) async fn wait_for_local_scanner_recovery(
                     _ = ctx.cancelled() => return None,
                     _ = budget.wait_for_stop() => return None,
                     _ = tokio::time::sleep_until(deadline) => return None,
-                    disk = current_local_scanner_disk(set, assigned) => disk,
+                    disk = current_local_scanner_disk(set, assigned, ctx, budget) => disk,
                 };
                 if let Some(disk) = current {
                     return Some(disk);
