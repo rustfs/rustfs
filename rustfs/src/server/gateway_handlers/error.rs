@@ -84,6 +84,10 @@ pub(crate) fn handler_error(error: S3Error) -> HandlerError {
     }
     let mut mapped = HandlerError::new(code, message.unwrap_or(Cow::Borrowed("")));
     for (name, value) in &headers {
+        // The error document's `Content-Type` is the gateway's to write.
+        if name == CONTENT_TYPE {
+            continue;
+        }
         let Some(header) = error_header(name, value) else {
             return HandlerError::internal_error(UNWRITABLE_HEADER);
         };
@@ -380,6 +384,17 @@ mod tests {
         assert!(mapped.headers().contains(&ErrorHeader::RetryAfter { seconds: 7 }));
         let rendered: Vec<String> = mapped.headers().iter().map(ErrorHeader::value).collect();
         assert_eq!(rendered[6], "Tue, 14 Nov 2023 22:13:20 GMT");
+    }
+
+    #[test]
+    fn a_content_type_the_raiser_set_is_left_to_the_gateway() {
+        let mapped = with_headers(
+            S3ErrorCode::SlowDown,
+            &[(header::CONTENT_TYPE, "application/xml"), (header::RETRY_AFTER, "1")],
+        );
+
+        assert_eq!(mapped.code().as_str(), "SlowDown");
+        assert_eq!(mapped.headers(), [ErrorHeader::RetryAfter { seconds: 1 }]);
     }
 
     #[test]
