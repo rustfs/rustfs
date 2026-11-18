@@ -4292,27 +4292,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             return Err(Error::PartMissingOrCorrupt);
         }
         if let Some(wtcs) = opts.want_checksum.as_ref() {
-            if !checksum_type.is_set() {
-                if !wtcs.encoded.is_empty() {
-                    debug!(
-                        target: "rustfs_ecstore::set_disk",
-                        event = EVENT_SET_DISK_MULTIPART,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        result = "checksum_mismatch",
-                        op = "complete_multipart_upload",
-                        bucket = %bucket,
-                        object = %object,
-                        upload_id = %upload_id,
-                        want = %wtcs.encoded,
-                        "Set disk multipart completion checksum unconfigured"
-                    );
-                    return Err(Error::other(rustfs_rio::ChecksumMismatch {
-                        want: wtcs.encoded.clone(),
-                        got: String::new(),
-                    }));
-                }
-            } else if checksum_type.full_object_requested() {
+            if checksum_type.full_object_requested() {
                 if (!wtcs.encoded.is_empty() && wtcs.encoded != checksum.encoded) || wtcs.want_parts != 0 {
                     let want = if wtcs.want_parts != 0 {
                         format!("{}-{}", wtcs.encoded, wtcs.want_parts)
@@ -18054,7 +18034,8 @@ mod tests {
 
         let (plain_upload_id, plain_parts, _) =
             stage_checksummed_multipart_upload(&set, bucket, "plain-obj", None, &[payload]).await;
-        let empty_sha256 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, b"").expect("empty sha256");
+        let payload_sha256 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, payload).expect("payload sha256");
         let unconfigured_err = set
             .clone()
             .complete_multipart_upload(
@@ -18063,19 +18044,31 @@ mod tests {
                 &plain_upload_id,
                 plain_parts.clone(),
                 &ObjectOptions {
-                    want_checksum: Some(empty_sha256),
+                    want_checksum: Some(payload_sha256),
                     ..Default::default()
                 },
             )
             .await
-            .expect_err("unconfigured upload must reject checksum header with ChecksumMismatch");
+            .expect_err("unconfigured upload with mismatched digest must fail with ChecksumMismatch");
         let _mismatch = unwrap_checksum_mismatch(unconfigured_err);
 
+        // Legacy stack compatibility (pinned by embedded_gateway_stack_test): an unconfigured
+        // upload compares want_checksum against the empty combined part-digest buffer.
+        let empty_crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"").expect("empty crc32");
         let completed_plain = set
             .clone()
-            .complete_multipart_upload(bucket, "plain-obj", &plain_upload_id, plain_parts, &ObjectOptions::default())
+            .complete_multipart_upload(
+                bucket,
+                "plain-obj",
+                &plain_upload_id,
+                plain_parts,
+                &ObjectOptions {
+                    want_checksum: Some(empty_crc32),
+                    ..Default::default()
+                },
+            )
             .await
-            .expect("unconfigured upload without completion checksum should succeed");
+            .expect("unconfigured upload with empty-buffer CRC32 should preserve legacy compatibility");
         assert_eq!(completed_plain.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
     }
 }
