@@ -52,7 +52,7 @@ type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
 
 #[instrument]
 pub fn print_server_info() {
-    let current_year = jiff::Zoned::now().year();
+    let current_year = jiff::ZonedDateTime::now().year();
     info!(
         target: "rustfs::init",
         event = "server_identity",

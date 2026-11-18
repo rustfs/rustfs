@@ -134,13 +134,14 @@ pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::Prepar
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
-pub(crate) use super::ecfs_extend::{
+pub(crate) use super::s3_support::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
     get_buffer_size_opt_in, get_validated_store, get_validated_store_owned, has_read_preconditions,
     load_bucket_object_lock_config_state, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
-    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
-    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
+    parse_object_version_id, parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations,
+    process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
+    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
+    validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -152,18 +153,12 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
-    pub(crate) use super::super::access::access_owned;
-    pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
-    pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
-    pub(crate) use super::super::access::access_owned::object_read::authorize_get_object;
-    pub(crate) use super::super::access::{
-        ObjectTagConditions, StagedMultipartPartAuthorization, authorize_copy_object_tags, authorize_request,
-        authorize_request_core, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
-    };
-    #[cfg(feature = "gateway-stack")]
-    pub(crate) use super::super::access::{
-        authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
-    };
+    pub(crate) use super::super::access_owned;
+    pub(crate) use super::super::access_owned::bucket_core::requested_bucket_force_delete;
+    pub(crate) use super::super::access_owned::object_commit::CopySourceObject;
+    pub(crate) use super::super::access_owned::object_commit::authorize_copy_object_tags;
+    pub(crate) use super::super::access_owned::object_read::authorize_get_object;
+    pub(crate) use super::super::authorization::ObjectTagConditions;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
     pub(crate) use super::super::authorization::{
@@ -180,10 +175,18 @@ pub(crate) mod access_consumer {
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards,
     };
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use super::super::authorization::{
+        authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
+    };
+    pub(crate) use super::super::authorization::{
+        authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+    };
     pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
     pub(crate) use super::super::req_info::ReqInfo;
+    pub(crate) use super::super::request_markers::StagedMultipartPartAuthorization;
     pub(crate) use super::super::request_markers::{
         MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
@@ -192,14 +195,16 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
-    pub(crate) use super::super::access::{
-        ObjectTagConditions, authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers,
-        authorize_request, authorize_staged_multipart_part, authorize_write_etag_condition, parity_test_support,
-    };
+    pub(crate) use super::super::access::parity_test_support;
+    pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
+    pub(crate) use super::super::authorization::ObjectTagConditions;
     pub(crate) use super::super::authorization::TableDataPlanePublicationGuards;
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
     pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
+    pub(crate) use super::super::authorization::{
+        authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
+        authorize_staged_multipart_part, authorize_write_etag_condition,
+    };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
     pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
@@ -245,7 +250,7 @@ pub(crate) mod ecfs_consumer {
     pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
 }
 
-pub(crate) mod ecfs_extend_consumer {
+pub(crate) mod s3_support_consumer {
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
@@ -713,16 +718,24 @@ pub(crate) mod ecstore_object {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
-        GetObjectReadCondition, GetObjectReadMetadata, ObjectEncryptionResolver, ObjectMutationHook,
-        PrepareSelectObjectSnapshotError, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY,
+        EC_BLOCK_SIZE_HINT_REASON_HEADER, EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER,
+        EcBlockSizeHintOutcome, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
+        GetObjectBodyCacheHookLookup, GetObjectReadCondition, GetObjectReadMetadata, ObjectEncryptionResolver,
+        ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SelectObjectSnapshot, WriteCommitGuard, WriteCompletion, get_object_body_cache_plaintext_len,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook, with_get_object_read_condition,
+        resolve_ec_block_size_hint, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        with_get_object_read_condition,
     };
     #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) use rustfs_ecstore::api::object::{GetObjectSink, GetObjectSinkSegments, GetObjectSinkWriter};
 }
+
+pub(crate) use ecstore_object::{
+    DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY, EC_BLOCK_SIZE_HINT_REASON_HEADER,
+    EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, EcBlockSizeHintOutcome, resolve_ec_block_size_hint,
+};
 
 #[cfg(all(test, feature = "rio-v2"))]
 pub(crate) mod ecstore_test_support {
@@ -851,7 +864,6 @@ pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
-pub(crate) use super::ecfs::parse_object_version_id;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;

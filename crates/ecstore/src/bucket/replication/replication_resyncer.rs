@@ -251,10 +251,10 @@ const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_id
 /// the condition discoverable in any recent window.
 const VERSION_IDENTITY_DRIFT_LOG_INTERVAL: TokioDuration = TokioDuration::from_secs(600);
 
-/// When each target last reported version-identity drift, by ARN. Throttling is
+/// When each source bucket and ARN last reported version-identity drift. Throttling is
 /// advisory only — the metric still counts every drifting PUT.
-static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashMap<String, Instant>>> =
-    LazyLock::new(|| StdMutex::new(HashMap::new()));
+type SourceTargetDriftTimes = HashMap<String, HashMap<String, Instant>>;
+static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<SourceTargetDriftTimes>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// Version purges a target refused for a reason a retry cannot change on its
 /// own. Two shapes today:
@@ -395,13 +395,13 @@ fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &
     // below (`replica_head_fallback`) knows whether a 404 on a
     // version-addressed HEAD can mean "replica missing" on this target.
     if let Some(capability) = version_identity_capability_from_put(source_version_id, assigned_version_id) {
-        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, capability);
+        tgt_client.record_version_identity_capability(capability);
     }
     if !version_identity_drifted(source_version_id, assigned_version_id) {
         return;
     }
     counter!(METRIC_VERSION_IDENTITY_DRIFT_TOTAL).increment(1);
-    if !version_identity_drift_log_due(&tgt_client.arn, Instant::now()) {
+    if !version_identity_drift_log_due(&tgt_client.source_bucket, &tgt_client.arn, Instant::now()) {
         return;
     }
     // `error`, not `warn`: the target silently refuses the addressing scheme
@@ -424,14 +424,14 @@ fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &
 /// Whether this ARN's version-identity drift is due to be logged again at
 /// `now`, re-arming the throttle when it is. Split out from the audit so the
 /// interval policy is testable without a target client.
-fn version_identity_drift_log_due(arn: &str, now: Instant) -> bool {
+fn version_identity_drift_log_due(bucket: &str, arn: &str, now: Instant) -> bool {
     let mut warned = VERSION_IDENTITY_WARNED_ARNS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match warned.get(arn) {
+    match warned.get(bucket).and_then(|entries| entries.get(arn)) {
         Some(last) if now.duration_since(*last) < VERSION_IDENTITY_DRIFT_LOG_INTERVAL => false,
         _ => {
-            warned.insert(arn.to_string(), now);
+            warned.entry(bucket.to_owned()).or_default().insert(arn.to_owned(), now);
             true
         }
     }
@@ -697,7 +697,7 @@ async fn replica_head_fallback(
     if let Some(ledger_version_id) = ledger_version_id {
         // A ledger entry is direct evidence of the identity contract; it
         // survives a restart while the runtime verdict cache does not.
-        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+        tgt_client.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         match head_object_for_worker(tgt_client, &tgt_client.bucket, object, Some(ledger_version_id.to_string())).await {
             Ok(head) => {
                 return Some(Ok(Some(LocatedReplica {
@@ -717,7 +717,7 @@ async fn replica_head_fallback(
         if !(encrypted && content_identity.is_some()) {
             return Some(head_object_fallback(tgt_client, object).await);
         }
-    } else if !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
+    } else if !tgt_client.version_identity_capability().version_addressing_unreliable() {
         return None;
     }
     let siblings = content_identity?;
@@ -989,14 +989,14 @@ async fn sync_drifted_replica_metadata(
 /// (no PUT is ever sent — the object stays on the normal MRF retry channel
 /// and re-audits once the verdict's TTL expires or replication-check
 /// re-probes the target) and returns `None`.
-async fn resolve_ssec_passthrough_gate(
+fn resolve_ssec_passthrough_gate(
     ssec: bool,
     tgt_client: &TargetClient,
     bucket: &str,
     object: &str,
     rinfo: &mut ReplicatedTargetInfo,
 ) -> Option<bool> {
-    let (capability, expired) = ReplicationTargetStore::ssec_passthrough_capability(&tgt_client.arn).await;
+    let (capability, expired) = tgt_client.ssec_passthrough_capability();
     match ssec_passthrough_gate(ssec, capability, expired) {
         SsecPassthroughGate::Proceed => Some(false),
         SsecPassthroughGate::ProceedWithAudit => Some(true),
@@ -1023,7 +1023,7 @@ async fn resolve_ssec_passthrough_gate(
 /// capability verdict for the target. Returns true when the SSE-C material
 /// provably survived; otherwise records `Unsupported` and settles `rinfo` as
 /// FAILED so the attempt never reports a silently unreadable COMPLETED.
-async fn settle_ssec_passthrough_evidence(
+fn settle_ssec_passthrough_evidence(
     head: &HeadObjectOutput,
     tgt_client: &TargetClient,
     bucket: &str,
@@ -1031,10 +1031,10 @@ async fn settle_ssec_passthrough_evidence(
     rinfo: &mut ReplicatedTargetInfo,
 ) -> bool {
     if ssec_passthrough_evidence_present(head) {
-        ReplicationTargetStore::record_ssec_passthrough_capability(&tgt_client.arn, SsecPassthroughCapability::Supported).await;
+        tgt_client.record_ssec_passthrough_capability(SsecPassthroughCapability::Supported);
         return true;
     }
-    ReplicationTargetStore::record_ssec_passthrough_capability(&tgt_client.arn, SsecPassthroughCapability::Unsupported).await;
+    tgt_client.record_ssec_passthrough_capability(SsecPassthroughCapability::Unsupported);
     rinfo.replication_status = ReplicationStatusType::Failed;
     rinfo.error = Some(ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED.to_string());
     warn!(
@@ -1070,7 +1070,7 @@ async fn audit_ssec_passthrough_replica(
     // version, so the audit HEAD does not 4xx-loop on those objects.
     let version_id = resolve_read_api_version_id(version_id);
     match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, version_id).await {
-        Ok(head) => settle_ssec_passthrough_evidence(&head, tgt_client, bucket, object, rinfo).await,
+        Ok(head) => settle_ssec_passthrough_evidence(&head, tgt_client, bucket, object, rinfo),
         Err(e) => {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(format!("SSE-C passthrough audit HEAD failed: {e}"));
@@ -1967,8 +1967,7 @@ async fn verify_resync_head_result(
                     // source marker id; verify the marker on the latest version.
                     DeleteMarkerHeadOutcome::Ambiguous => {
                         let mints_own = rejects_source_version_id(&err)
-                            || ReplicationTargetStore::version_identity_capability(&target_client.arn)
-                                .version_addressing_unreliable();
+                            || target_client.version_identity_capability().version_addressing_unreliable();
                         !(mints_own && latest_target_version_is_delete_marker(target_client, &roi.name).await)
                     }
                     DeleteMarkerHeadOutcome::Exists | DeleteMarkerHeadOutcome::Missing => false,
@@ -3681,10 +3680,10 @@ async fn resolve_purge_replica(
         return PurgeReplicaResolution::LedgerCorrupt;
     }
     if let Some(assigned) = source.ledger.get(&tgt_client.arn) {
-        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+        tgt_client.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         return PurgeReplicaResolution::Resolved(assigned.clone());
     }
-    if !force_lookup && !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
+    if !force_lookup && !tgt_client.version_identity_capability().version_addressing_unreliable() {
         return PurgeReplicaResolution::SourceVersion;
     }
     let etag = source.etag.as_deref().filter(|etag| !etag.trim().is_empty());
@@ -3844,8 +3843,7 @@ async fn replicate_delete_to_target(
     // A target that mints its own version ids never holds the source marker
     // id, so a version-addressed pre-check cannot succeed there; the marker
     // is created by the versionless DELETE below.
-    let version_addressable =
-        !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable();
+    let version_addressable = !tgt_client.version_identity_capability().version_addressing_unreliable();
     if version_addressable
         && !is_version_purge
         && dobj.delete_object.delete_marker
@@ -3862,7 +3860,7 @@ async fn replicate_delete_to_target(
             // The verdict is not known yet (e.g. no PUT since restart) and the
             // target rejected the source id: learn it as the PUT path does.
             Err(e) if rejects_source_version_id(e.as_ref()) => {
-                ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+                tgt_client.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
             }
             Ok(head) if head.delete_marker == Some(true) => {
                 // Some targets expose an existing marker as a successful HEAD
@@ -3938,7 +3936,7 @@ async fn replicate_delete_to_target(
         let object = &dobj.delete_object.object_name;
         match resolve_purge_replica(&tgt_client, object, source, true).await {
             PurgeReplicaResolution::Resolved(assigned) => {
-                ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+                tgt_client.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
                 counter!(METRIC_VERSION_PURGE_REPLICA_TOTAL, "resolution" => "resolved").increment(1);
                 version_id = Some(assigned);
                 removed = tgt_client
@@ -4647,7 +4645,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         // N2 fail-closed: never PUT SSE-C ciphertext at a target known to drop
         // the passthrough transport headers, and never trust a convergence HEAD
         // against such a target — a previous broken replica matches by ETag.
-        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
+        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo)
         else {
             send_local_event(EventArgs {
                 bucket_incarnation_id: self.notification_bucket_incarnation,
@@ -4772,9 +4770,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // An SSE-C replica only counts as converged when the same
                     // HEAD proves its decryption material survived; a broken
                     // ciphertext copy from an earlier attempt matches by ETag.
-                    if ssec_audit_required
-                        && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
-                    {
+                    if ssec_audit_required && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo) {
                         return rinfo;
                     }
                     rinfo.replication_status = ReplicationStatusType::Completed;
@@ -4809,7 +4805,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         Ok(Some(located)) if located_replica_matches(identity.as_ref(), &located) => {
                             if ssec_audit_required
                                 && !settle_ssec_passthrough_evidence(&located.head, &tgt_client, &bucket, &object, &mut rinfo)
-                                    .await
                             {
                                 return rinfo;
                             }
@@ -5011,7 +5006,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         // N2 fail-closed: see the gate in `replicate_object` — the same policy
         // applies to the metadata/existing-object transport.
-        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
+        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo)
         else {
             send_local_event(EventArgs {
                 bucket_incarnation_id: self.notification_bucket_incarnation,
@@ -5408,7 +5403,7 @@ async fn resolve_replicate_all_action(
                 // An SSE-C replica only counts as converged when the same HEAD
                 // proves its decryption material survived; a broken ciphertext
                 // copy from an earlier attempt matches by ETag.
-                if ssec_audit_required && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await {
+                if ssec_audit_required && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo) {
                     rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
                     return None;
                 }
@@ -5484,7 +5479,7 @@ async fn resolve_replicate_all_action(
                         }
                         if replica_matches
                             && ssec_audit_required
-                            && !settle_ssec_passthrough_evidence(oi, tgt_client, bucket, object, rinfo).await
+                            && !settle_ssec_passthrough_evidence(oi, tgt_client, bucket, object, rinfo)
                         {
                             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
                             return None;
@@ -6762,6 +6757,8 @@ mod tests {
             .build();
 
         Arc::new(TargetClient {
+            source_bucket: "source".to_owned(),
+            capabilities: Default::default(),
             endpoint,
             credentials: None,
             bucket: "target-bucket".to_string(),
@@ -6966,7 +6963,7 @@ mod tests {
     async fn heal_redrive_locates_replica_by_etag_on_target_that_mints_own_version_ids() {
         let (endpoint, server) = spawn_drifted_target_server(3);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = drifted_roi_and_object();
         let mut rinfo = replicate_all_target_info(&roi, &target);
 
@@ -7035,7 +7032,7 @@ mod tests {
     async fn resync_verification_counts_drifted_replica_as_replicated() {
         let (endpoint, server) = spawn_drifted_target_server(3);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, _) = drifted_roi_and_object();
         let mut st = TargetReplicationResyncStatus::default();
 
@@ -7149,7 +7146,7 @@ mod tests {
         static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
         let (endpoint, server) = spawn_computed_etag_target(3, VERSIONS);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
         let mut rinfo = replicate_all_target_info(&roi, &target);
 
@@ -7171,7 +7168,7 @@ mod tests {
         static OTHER_SIZE: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 36)];
         let (endpoint, server) = spawn_computed_etag_target(2, OTHER_SIZE);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
         let mut rinfo = replicate_all_target_info(&roi, &target);
         let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
@@ -7182,7 +7179,7 @@ mod tests {
         static SAME_SIZE: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
         let (endpoint, server) = spawn_computed_etag_target(2, SAME_SIZE);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() + 1);
         let mut rinfo = replicate_all_target_info(&roi, &target);
         let action = resolve_heal_action(&target, &roi, object_info, &mut rinfo).await;
@@ -7195,7 +7192,7 @@ mod tests {
         static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4), ("another-minted-id", 4)];
         let (endpoint, server) = spawn_computed_etag_target(2, VERSIONS);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
         let mut rinfo = replicate_all_target_info(&roi, &target);
 
@@ -7217,7 +7214,7 @@ mod tests {
         static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
         let (endpoint, server) = spawn_computed_etag_target(2, VERSIONS);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, mut object_info) = drifted_roi_and_object();
         object_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(replica_written_secs() - 1).expect("valid timestamp"));
         let mut rinfo = replicate_all_target_info(&roi, &target);
@@ -7235,7 +7232,7 @@ mod tests {
         static VERSIONS: &[(&str, i64)] = &[("null", 4)];
         let (endpoint, server) = spawn_computed_etag_target(2, VERSIONS);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
         let mut rinfo = replicate_all_target_info(&roi, &target);
 
@@ -7320,7 +7317,7 @@ mod tests {
         static VERSIONS: &[(&str, i64)] = &[(DRIFTED_ASSIGNED_VERSION_ID, 4)];
         let (endpoint, server) = spawn_computed_etag_target(3, VERSIONS);
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = encrypted_roi_and_object(replica_written_secs() - 1);
         let mut st = TargetReplicationResyncStatus::default();
 
@@ -7360,7 +7357,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = version_purge_dobj(&target.arn);
 
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(encrypted_purge_source())).await;
@@ -7386,7 +7383,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = version_purge_dobj(&target.arn);
 
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(encrypted_purge_source())).await;
@@ -7533,10 +7530,7 @@ mod tests {
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
 
         assert_eq!(rinfo.replication_status, ReplicationStatusType::Completed, "{rinfo:?}");
-        assert_eq!(
-            ReplicationTargetStore::version_identity_capability(&target.arn),
-            VersionIdentityCapability::MintsOwn
-        );
+        assert_eq!(target.version_identity_capability(), VersionIdentityCapability::MintsOwn);
         let seen = server.join().expect("test HTTP server should finish");
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[0].starts_with("HEAD "), "{seen:?}");
@@ -7565,10 +7559,7 @@ mod tests {
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
 
         assert_eq!(rinfo.replication_status, ReplicationStatusType::Failed, "{rinfo:?}");
-        assert_ne!(
-            ReplicationTargetStore::version_identity_capability(&target.arn),
-            VersionIdentityCapability::MintsOwn
-        );
+        assert_ne!(target.version_identity_capability(), VersionIdentityCapability::MintsOwn);
         let seen = server.join().expect("test HTTP server should finish");
         assert_eq!(seen.len(), 1, "a denied HEAD must not trigger DELETE: {seen:?}");
         assert!(seen[0].starts_with("HEAD "), "{seen:?}");
@@ -7587,7 +7578,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = marker_creation_dobj(&target.arn);
 
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
@@ -7949,7 +7940,7 @@ mod tests {
             seen[0]
         );
         assert!(
-            ReplicationTargetStore::version_identity_capability(&target.arn).version_addressing_unreliable(),
+            target.version_identity_capability().version_addressing_unreliable(),
             "a ledger entry proves the target mints its own ids"
         );
     }
@@ -7967,7 +7958,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = version_purge_dobj(&target.arn);
 
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[]))).await;
@@ -7994,7 +7985,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = version_purge_dobj(&target.arn);
         assert!(!purge_backoff_active(&dobj));
 
@@ -8022,7 +8013,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = version_purge_dobj(&target.arn);
 
         let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[]))).await;
@@ -8094,7 +8085,7 @@ mod tests {
         assert!(seen[1].starts_with("GET "), "{}", seen[1]);
         assert!(seen[2].contains(DRIFTED_ASSIGNED_VERSION_ID), "{}", seen[2]);
         assert!(
-            ReplicationTargetStore::version_identity_capability(&target.arn).version_addressing_unreliable(),
+            target.version_identity_capability().version_addressing_unreliable(),
             "the located replica proves the target mints its own ids"
         );
     }
@@ -8114,7 +8105,7 @@ mod tests {
         });
         let target = test_target_client(endpoint);
         register_test_target(&target).await;
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let dobj = version_purge_dobj(&target.arn);
         let source = Arc::new(VersionPurgeSource {
             etag: Some(DRIFTED_ETAG.to_string()),
@@ -8155,7 +8146,7 @@ mod tests {
             }
         });
         let target = test_target_client(endpoint);
-        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        target.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         let (roi, object_info) = drifted_roi_and_object();
         let mut rinfo = replicate_all_target_info(&roi, &target);
 
@@ -8306,21 +8297,12 @@ mod tests {
         let target = test_target_client("http://127.0.0.1:1".to_string());
         let source = Uuid::new_v4().to_string();
         audit_target_version_identity(&target, &source, Some(DRIFTED_ASSIGNED_VERSION_ID));
-        assert_eq!(
-            ReplicationTargetStore::version_identity_capability(&target.arn),
-            VersionIdentityCapability::MintsOwn
-        );
+        assert_eq!(target.version_identity_capability(), VersionIdentityCapability::MintsOwn);
         audit_target_version_identity(&target, &source, Some(&source));
-        assert_eq!(
-            ReplicationTargetStore::version_identity_capability(&target.arn),
-            VersionIdentityCapability::Adopts
-        );
+        assert_eq!(target.version_identity_capability(), VersionIdentityCapability::Adopts);
         // An unversioned write carries no contract and must not overwrite it.
         audit_target_version_identity(&target, "null", None);
-        assert_eq!(
-            ReplicationTargetStore::version_identity_capability(&target.arn),
-            VersionIdentityCapability::Adopts
-        );
+        assert_eq!(target.version_identity_capability(), VersionIdentityCapability::Adopts);
     }
 
     #[test]
@@ -9506,13 +9488,13 @@ mod tests {
         let arn = "arn:replication::drift-throttle-test";
         let start = Instant::now();
 
-        assert!(version_identity_drift_log_due(arn, start), "first drift must be reported");
+        assert!(version_identity_drift_log_due("source", arn, start), "first drift must be reported");
         assert!(
-            !version_identity_drift_log_due(arn, start + VERSION_IDENTITY_DRIFT_LOG_INTERVAL / 2),
+            !version_identity_drift_log_due("source", arn, start + VERSION_IDENTITY_DRIFT_LOG_INTERVAL / 2),
             "a second drift inside the interval must stay throttled"
         );
         assert!(
-            version_identity_drift_log_due(arn, start + VERSION_IDENTITY_DRIFT_LOG_INTERVAL),
+            version_identity_drift_log_due("source", arn, start + VERSION_IDENTITY_DRIFT_LOG_INTERVAL),
             "drift must become visible again once the interval elapses, instead of \
              going silent for the rest of the process lifetime"
         );
@@ -9522,9 +9504,10 @@ mod tests {
     fn version_identity_drift_throttles_each_target_independently() {
         let now = Instant::now();
 
-        assert!(version_identity_drift_log_due("arn:replication::drift-a", now));
+        assert!(version_identity_drift_log_due("source", "arn:replication::drift-a", now));
+        assert!(version_identity_drift_log_due("other-source", "arn:replication::drift-a", now));
         assert!(
-            version_identity_drift_log_due("arn:replication::drift-b", now),
+            version_identity_drift_log_due("source", "arn:replication::drift-b", now),
             "one target's report must not silence another's"
         );
     }

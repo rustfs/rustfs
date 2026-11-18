@@ -326,6 +326,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key_md5: None,
             },
             user_metadata,
+            ec_block_size_hint: None,
             internal_metadata,
             content: internal_put_content_input(&headers, tags),
             object_lock: PutObjectLockInput {
@@ -435,7 +436,11 @@ impl DefaultObjectUsecase {
         .await;
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::ZonedDateTime::now().to_string(),
+            );
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_REPLICATION_STATUS,
@@ -693,7 +698,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut completion_replication_metadata,
                 SUFFIX_REPLICATION_TIMESTAMP,
-                jiff::Zoned::now().to_string(),
+                jiff::ZonedDateTime::now().to_string(),
             );
             insert_str(
                 &mut completion_replication_metadata,

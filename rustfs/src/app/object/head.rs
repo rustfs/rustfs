@@ -104,10 +104,7 @@ async fn head_metadata_action_allowed(req: &RequestEnvelope, action: S3Action) -
     };
     info.suppress_denial_log = true;
     info.suppress_denial_audit = true;
-    match authorize_request(&mut probe, Action::S3Action(action))
-        .await
-        .map_err(S3Error::from)
-    {
+    match authorize_request(&mut probe, Action::S3Action(action)).await {
         Ok(()) => Ok(true),
         Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
         Err(err) => Err(err),
@@ -283,7 +280,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(req, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(Err(err.into())),
+            Err(err) => return Some(Err(err)),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
@@ -693,6 +690,7 @@ impl DefaultObjectUsecase {
         } else {
             0
         };
+        let effective_ec_block_size = info.effective_ec_block_size();
         let dto = gateway_dto::HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -749,6 +747,11 @@ impl DefaultObjectUsecase {
         // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
         // carry on the typed HeadObjectOutput (#1257).
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist

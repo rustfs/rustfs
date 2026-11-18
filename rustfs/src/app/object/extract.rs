@@ -1080,7 +1080,7 @@ fn is_legacy_null_directory(header: &tokio_tar::Header, path: &str) -> bool {
     header.as_bytes()[TAR_TYPEFLAG_OFFSET] == b'\0' && path.as_bytes().ends_with(b"/")
 }
 
-fn is_snowball_transport_header(key: &str) -> bool {
+pub(super) fn is_snowball_transport_header(key: &str) -> bool {
     if key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT) || key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT_COMPAT) {
         return true;
     }
@@ -1623,8 +1623,8 @@ async fn authorized_extract_member_mod_time<R: AuthorizationRequest + ?Sized>(
     }
     match authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await {
         Ok(()) => Ok(archive_time),
-        Err(err) if !replication_required && err.code() == &S3ErrorCode::AccessDenied => Ok(None),
-        Err(err) => Err(err),
+        Err(err) if !replication_required && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -2630,7 +2630,11 @@ impl DefaultObjectUsecase {
             .await;
             if replication.replicate_any() {
                 insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-                insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+                insert_str(
+                    &mut opts.user_defined,
+                    SUFFIX_REPLICATION_TIMESTAMP,
+                    jiff::ZonedDateTime::now().to_string(),
+                );
                 insert_str(
                     &mut opts.user_defined,
                     SUFFIX_REPLICATION_STATUS,

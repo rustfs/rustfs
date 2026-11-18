@@ -58,3 +58,15 @@ pub(crate) fn versioned_tagging_action(action: S3Action, version_id: Option<&str
     };
     Action::S3Action(action)
 }
+
+pub(crate) fn post_object_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAction)
+}
+
+pub(crate) fn complete_multipart_upload_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAction)
+}
+
+pub(crate) fn list_parts_authorize_action() -> Action {
+    Action::S3Action(S3Action::ListMultipartUploadPartsAction)
+}

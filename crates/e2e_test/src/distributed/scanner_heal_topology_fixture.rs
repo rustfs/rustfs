@@ -38,8 +38,8 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
     VersioningConfiguration,
 };
-use chrono::{DateTime, Utc};
 use http::{Method, StatusCode};
+use jiff::Timestamp;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -526,8 +526,8 @@ async fn put_multipart(client: &Client, bucket: &str, key: &str) -> TestResult<V
     Ok(body)
 }
 
-fn retention_deadline() -> TestResult<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp(Utc::now().timestamp() + 24 * 3600, 0).ok_or_else(|| "retention deadline out of range".into())
+fn retention_deadline() -> TestResult<Timestamp> {
+    Ok(Timestamp::now() + jiff::SignedDuration::from_hours(24))
 }
 
 /// Seed the deterministic inventory into the seed pool and record it.
@@ -654,7 +654,7 @@ pub(crate) async fn seed_manifest(run: &TopologyRun) -> TestResult<TopologyManif
         let mut entry = ManifestEntry::body(&locked, &key, "compliance", Some(version_id.clone()), Some(version_id), &body);
         entry.retention = Some(RetentionRecord {
             mode: "COMPLIANCE".to_string(),
-            retain_until_unix: retain_until.timestamp(),
+            retain_until_unix: retain_until.as_second(),
         });
         entries.push(entry);
     }

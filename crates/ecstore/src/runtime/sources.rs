@@ -604,10 +604,10 @@ pub(crate) async fn initialize_local_disk_maps(
 
             let disk = match new_disk(ep, opt).await {
                 Ok(disk) => disk,
-                Err(crate::disk::error::DiskError::FileAccessDenied) => {
-                    // LocalDisk already logged the filesystem cause and repair
-                    // hint. Keep this slot unavailable so ECStore initialization
-                    // can apply its existing fatal-error and quorum rules.
+                Err(crate::disk::error::DiskError::FileAccessDenied | crate::disk::error::DiskError::VolumeNotFound) => {
+                    // Preserve the configured slot when a local volume is unavailable.
+                    // LocalDisk logs the cause; format loading retains authority
+                    // over fatal errors and quorum. Never create a missing root.
                     global_local_disk_map.insert(ep.to_string(), None);
                     continue;
                 }
@@ -888,6 +888,95 @@ mod tests {
             disk_map.keys().collect::<Vec<_>>()
         );
     }
+    #[tokio::test]
+    async fn missing_local_volume_preserves_offline_slot_without_creating_root() {
+        use crate::disk::{DiskOption, error::DiskError};
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        for drive_count in [2, 3, 4] {
+            let directory = tempfile::tempdir().expect("create volume parent");
+            let mut endpoints = Vec::new();
+            for index in 0..drive_count {
+                let path = directory.path().join(format!("disk{index}"));
+                if index != 0 {
+                    std::fs::create_dir(&path).expect("create surviving volume");
+                }
+                let mut endpoint = Endpoint::try_from(path.to_str().expect("UTF-8 path")).expect("local endpoint");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(index);
+                endpoints.push(endpoint);
+            }
+            let missing = endpoints[0].to_string();
+            let pools = EndpointServerPools(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: drive_count,
+                endpoints: endpoints.into(),
+                cmd_line: "missing-volume".into(),
+                platform: "test".into(),
+            }]);
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let options = DiskOption {
+                cleanup: true,
+                health_check: false,
+            };
+            super::initialize_local_disk_maps(&ctx, pools.clone(), &options)
+                .await
+                .expect("missing volume should remain offline for quorum evaluation");
+            let map = ctx.local_disk_map();
+            let map = map.read().await;
+            assert_eq!(map.len(), drive_count);
+            assert!(matches!(map.get(&missing), Some(None)));
+            assert_eq!(map.values().flatten().count(), drive_count - 1);
+            drop(map);
+            let drives = ctx.local_disk_set_drives();
+            let drives = drives.read().await;
+            assert_eq!(drives[0][0].len(), drive_count);
+            assert!(drives[0][0][0].is_none());
+            assert!(drives[0][0][1..].iter().all(Option::is_some));
+            drop(drives);
+
+            let (disks, errors) = crate::store::init_format::init_disks(&ctx, &pools.0[0].endpoints, &options).await;
+            assert!(disks[0].is_none());
+            assert_eq!(errors[0], Some(DiskError::VolumeNotFound));
+            assert!(disks[1..].iter().all(Option::is_some));
+            assert!(errors[1..].iter().all(Option::is_none));
+            assert!(!directory.path().join("disk0").exists(), "startup must not create a missing mount root");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_local_volume_still_fails_registry_initialization() {
+        use crate::disk::DiskOption;
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        let directory = tempfile::tempdir().expect("create volume parent");
+        let path = directory.path().join("regular-file");
+        std::fs::write(&path, b"preserve existing file").expect("create invalid volume");
+        let mut endpoint = Endpoint::try_from(path.to_str().expect("UTF-8 path")).expect("local endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: vec![endpoint].into(),
+            cmd_line: "invalid-volume".into(),
+            platform: "test".into(),
+        }]);
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let options = DiskOption {
+            cleanup: true,
+            health_check: false,
+        };
+        super::initialize_local_disk_maps(&ctx, pools, &options)
+            .await
+            .expect_err("a non-directory volume must retain its initialization error");
+        assert_eq!(std::fs::read(&path).expect("read existing file"), b"preserve existing file");
+    }
+
     #[tokio::test]
     async fn multipart_invalid_registry_pool_index_has_no_authority_or_registry_effect() {
         use crate::disk::DiskOption;

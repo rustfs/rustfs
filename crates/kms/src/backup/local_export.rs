@@ -63,7 +63,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use rand::RngExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -454,7 +454,7 @@ async fn build_and_write_bundle(
         // Normalized to UTC so the stored spelling is host-independent: the
         // local zone's name (or a POSIX TZ string in minimal containers) has
         // no business inside a portable bundle.
-        created_at: Zoned::now().with_time_zone(jiff::tz::TimeZone::UTC),
+        created_at: ZonedDateTime::now().with_time_zone(jiff::tz::TimeZone::UTC),
         rustfs_version: request.rustfs_version.clone(),
         deployment_identity: request.deployment_identity.clone(),
         backend: BackupBackendKind::Local,

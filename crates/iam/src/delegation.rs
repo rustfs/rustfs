@@ -87,6 +87,91 @@ struct Tombstone {
     owner_access_key: String,
 }
 
+// Separate from the public immutable restriction envelope so v1/v2 API shapes
+// stay unchanged. Missing legacy bindings must never be inferred from a name.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OwnerBinding {
+    version: u32,
+    id: String,
+    owner_access_key: String,
+    epoch: String,
+}
+
+/// Request-bound registration authority, obtainable only by checking the actual signing secret.
+/// Not serializable: clients must not supply, persist or reuse it for another request.
+pub struct RegistrationOwner {
+    access_key: String,
+    epoch: String,
+    revision: String,
+}
+
+pub(crate) async fn prepare_owner<T: Store>(
+    store: &T,
+    access_key: &str,
+    signing_secret: &str,
+) -> Result<RegistrationOwner, DelegationError> {
+    let (epoch, revision) = store
+        .authenticate_plugin_delegation_owner(access_key, signing_secret)
+        .await
+        .map_err(|error| match error {
+            crate::error::Error::ConfigNotFound
+            | crate::error::Error::NoSuchUser(_)
+            | crate::error::Error::IAMActionNotAllowed => DelegationError::OwnerRejected,
+            _ => DelegationError::Unavailable,
+        })?;
+    Ok(RegistrationOwner {
+        access_key: access_key.to_owned(),
+        epoch,
+        revision,
+    })
+}
+
+fn check_registration_owner(owner: &RegistrationOwner, current: (String, String)) -> Result<(), DelegationError> {
+    if current.0 != owner.epoch || current.1 != owner.revision {
+        return Err(DelegationError::Revoked);
+    }
+    Ok(())
+}
+
+async fn current_owner<T: Store>(store: &T, name: &str) -> Result<(String, String), DelegationError> {
+    store
+        .plugin_delegation_owner_revision(name)
+        .await
+        .map_err(|error| match error {
+            crate::error::Error::ConfigNotFound
+            | crate::error::Error::NoSuchUser(_)
+            | crate::error::Error::IAMActionNotAllowed => DelegationError::Revoked,
+            _ => DelegationError::Unavailable,
+        })
+}
+
+async fn check_owner<T: Store>(store: &T, record: &Delegation) -> Result<(String, String), DelegationError> {
+    let binding: OwnerBinding = store
+        .load_iam_config_strict(format!("{PREFIX}/{}/owner.json", record.id))
+        .await
+        .map_err(|error| {
+            if is_err_config_not_found(&error) {
+                DelegationError::Revoked
+            } else {
+                DelegationError::Unavailable
+            }
+        })?;
+    if binding.version != 1
+        || binding.id != record.id
+        || binding.owner_access_key != record.owner_access_key
+        || binding.epoch.len() != 32
+        || !binding.epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DelegationError::Unavailable);
+    }
+    let current = current_owner(store, &record.owner_access_key).await?;
+    if current.0 != binding.epoch {
+        return Err(DelegationError::Revoked);
+    }
+    Ok(current)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DelegationError {
     #[error("invalid delegation restriction")]
@@ -135,14 +220,12 @@ async fn load<T: Store>(store: &T, id: &str) -> Result<Delegation, DelegationErr
 
 pub(crate) async fn create<T: Store>(
     store: &T,
-    owner: &str,
+    owner: RegistrationOwner,
     restrictions: Restrictions,
     now: u64,
 ) -> Result<Delegation, DelegationError> {
     restrictions.validate(now)?;
-    if owner.is_empty() {
-        return Err(DelegationError::OwnerRejected);
-    }
+    check_registration_owner(&owner, current_owner(store, &owner.access_key).await?)?;
     // IDs are generated exclusively here; no update operation accepts an ID.
     let id = format!("{:032x}", rand::random::<u128>());
     let path = record_path(&id)?;
@@ -154,10 +237,33 @@ pub(crate) async fn create<T: Store>(
         version: restrictions.version.unwrap_or(1),
         revision: id.clone(),
         id,
-        owner_access_key: owner.to_owned(),
+        owner_access_key: owner.access_key.clone(),
         created_at_unix_seconds: now,
         restrictions,
     };
+    let binding = OwnerBinding {
+        version: 1,
+        id: record.id.clone(),
+        owner_access_key: owner.access_key.clone(),
+        epoch: owner.epoch.clone(),
+    };
+    let owner_path = format!("{PREFIX}/{}/owner.json", record.id);
+    store
+        .save_iam_config(&binding, &owner_path)
+        .await
+        .map_err(|_| DelegationError::Unavailable)?;
+    let saved: OwnerBinding = store
+        .load_iam_config_strict(owner_path)
+        .await
+        .map_err(|_| DelegationError::Unavailable)?;
+    if saved != binding {
+        return Err(DelegationError::Unavailable);
+    }
+    #[cfg(test)]
+    if let Ok(barrier) = REGISTRATION_PUBLICATION_BARRIER.try_with(std::sync::Arc::clone) {
+        barrier.0.notify_one();
+        barrier.1.notified().await;
+    }
     store
         .save_iam_config(&record, path)
         .await
@@ -165,7 +271,13 @@ pub(crate) async fn create<T: Store>(
     if load(store, &record.id).await? != record {
         return Err(DelegationError::Unavailable);
     }
+    check_registration_owner(&owner, check_owner(store, &record).await?)?;
     Ok(record)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static REGISTRATION_PUBLICATION_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
 }
 
 pub(crate) async fn revoke<T: Store>(store: &T, owner: &str, id: &str) -> Result<(), DelegationError> {
@@ -208,6 +320,7 @@ pub(crate) async fn read_owned<T: Store>(store: &T, owner: &str, id: &str) -> Re
     if record.owner_access_key != owner {
         return Err(DelegationError::OwnerRejected);
     }
+    check_owner(store, &record).await?;
     Ok(record)
 }
 
@@ -228,6 +341,7 @@ async fn check_active<T: Store>(store: &T, record: Delegation, now: u64) -> Resu
     if now >= record.restrictions.expires_at_unix_seconds {
         return Err(DelegationError::Expired);
     }
+    check_owner(store, &record).await?;
     Ok(record)
 }
 

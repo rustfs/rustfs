@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod access;
+pub(crate) mod access_owned;
 pub(crate) mod authorization;
 pub(crate) mod authorization_actions;
 pub mod concurrency;
@@ -35,7 +36,6 @@ pub mod tonic_service;
 mod concurrent_fix_test;
 #[cfg(test)]
 mod concurrent_get_object_test;
-mod ecfs_extend;
 #[cfg(test)]
 mod ecfs_test;
 pub(crate) mod head_prefix;
@@ -44,12 +44,13 @@ mod minio_generated_read_test;
 #[cfg(test)]
 mod multi_factor_scheduler_integration_test;
 pub(crate) mod runtime_sources;
+mod s3_support;
 pub(crate) mod scanner_dirty_journal;
 #[cfg(test)]
 mod sse_test;
 pub(crate) mod storage_api;
 
-pub(crate) use ecfs_extend::*;
+pub(crate) use s3_support::*;
 #[allow(unused_imports)]
 pub(crate) use storage_api::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
@@ -66,10 +67,10 @@ pub(crate) use storage_api::{
     WorkloadAdmissionSnapshotProviderRef, WriteEncryption, WritePlan, access_consumer, add_object_lock_years, all_local_disk,
     all_local_disk_path, collect_local_metrics, compression_metadata_value, contract, decode_tags, decode_tags_to_map,
     delete_bucket_metadata_config, delete_bucket_metadata_config_if_incarnation, disk_drive_path, disk_endpoint, ecfs_consumer,
-    ecfs_extend_consumer, ecstore_admin, ecstore_bucket, ecstore_capacity, ecstore_client, ecstore_cluster, ecstore_compression,
-    ecstore_config, ecstore_data_usage, ecstore_disk, ecstore_error, ecstore_event, ecstore_layout, ecstore_metrics,
-    ecstore_notification, ecstore_rebalance, ecstore_rio, ecstore_rpc, ecstore_set_disk, ecstore_storage, ecstore_tier,
-    encode_tags, find_local_disk_by_ref, get_bucket_cors_config, get_bucket_metadata, get_bucket_sse_config,
+    ecstore_admin, ecstore_bucket, ecstore_capacity, ecstore_client, ecstore_cluster, ecstore_compression, ecstore_config,
+    ecstore_data_usage, ecstore_disk, ecstore_error, ecstore_event, ecstore_layout, ecstore_metrics, ecstore_notification,
+    ecstore_rebalance, ecstore_rio, ecstore_rpc, ecstore_set_disk, ecstore_storage, ecstore_tier, encode_tags,
+    find_local_disk_by_ref, get_bucket_cors_config, get_bucket_metadata, get_bucket_sse_config,
     get_bucket_website_config_for_store, get_local_server_property, get_lock_acquire_timeout, head_prefix_consumer,
     helper_consumer, init_background_replication, init_bucket_metadata_sys, init_ecstore_config,
     init_local_disks_with_instance_ctx, init_lock_clients, is_err_bucket_not_found, is_err_object_not_found,

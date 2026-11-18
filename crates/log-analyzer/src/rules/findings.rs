@@ -18,7 +18,7 @@
 
 use super::model::{Rule, Severity};
 use crate::model::LogEvent;
-use chrono::{DateTime, FixedOffset};
+use jiff::ZonedDateTime;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,8 +44,8 @@ pub struct Finding {
     pub suggestion: String,
     pub count: u64,
     /// Earliest / latest timestamps among hits that carry one.
-    pub first_seen: Option<DateTime<FixedOffset>>,
-    pub last_seen: Option<DateTime<FixedOffset>>,
+    pub first_seen: Option<ZonedDateTime>,
+    pub last_seen: Option<ZonedDateTime>,
     /// Node labels of hits; label-less events are recorded as "-".
     pub nodes: BTreeSet<String>,
     /// The earliest `max_samples` hit events (timestamp-less ones sort last).
@@ -79,28 +79,28 @@ pub struct FindingsCollector {
 /// Sort key for sample selection: earliest first, timestamp-less last,
 /// (file, line) as the deterministic tiebreaker — line numbers alone are only
 /// unique within one file, so ties across inputs would be order-dependent.
-fn sample_key(event: &LogEvent) -> (bool, Option<DateTime<FixedOffset>>, &str, u64) {
-    (event.timestamp.is_none(), event.timestamp, &event.source.file, event.source.line)
+fn sample_key(event: &LogEvent) -> (bool, Option<ZonedDateTime>, &str, u64) {
+    (event.timestamp.is_none(), event.timestamp.clone(), &event.source.file, event.source.line)
 }
 
-/// `DateTime<FixedOffset>` orders by instant, so two equal instants carrying
+/// `ZonedDateTime` orders by instant, so two equal instants carrying
 /// different offsets compare equal and `min`/`max` keep whichever arrived
 /// first — an input-order dependency that then leaks into the serialized
 /// RFC3339 offset. Break the tie on the offset itself to stay deterministic.
-fn earliest(a: DateTime<FixedOffset>, b: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+fn earliest(a: ZonedDateTime, b: ZonedDateTime) -> ZonedDateTime {
     match a.cmp(&b) {
         std::cmp::Ordering::Less => a,
         std::cmp::Ordering::Greater => b,
-        std::cmp::Ordering::Equal if a.offset().local_minus_utc() <= b.offset().local_minus_utc() => a,
+        std::cmp::Ordering::Equal if crate::time::offset_seconds(&a) <= crate::time::offset_seconds(&b) => a,
         std::cmp::Ordering::Equal => b,
     }
 }
 
-fn latest(a: DateTime<FixedOffset>, b: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+fn latest(a: ZonedDateTime, b: ZonedDateTime) -> ZonedDateTime {
     match a.cmp(&b) {
         std::cmp::Ordering::Greater => a,
         std::cmp::Ordering::Less => b,
-        std::cmp::Ordering::Equal if a.offset().local_minus_utc() >= b.offset().local_minus_utc() => a,
+        std::cmp::Ordering::Equal if crate::time::offset_seconds(&a) >= crate::time::offset_seconds(&b) => a,
         std::cmp::Ordering::Equal => b,
     }
 }
@@ -140,9 +140,9 @@ impl FindingsCollector {
         let finding = &mut acc.finding;
         finding.count += 1;
 
-        if let Some(ts) = event.timestamp {
-            finding.first_seen = Some(finding.first_seen.map_or(ts, |cur| earliest(cur, ts)));
-            finding.last_seen = Some(finding.last_seen.map_or(ts, |cur| latest(cur, ts)));
+        if let Some(ts) = event.timestamp.clone() {
+            finding.first_seen = Some(finding.first_seen.take().map_or(ts.clone(), |cur| earliest(cur, ts.clone())));
+            finding.last_seen = Some(finding.last_seen.take().map_or(ts.clone(), |cur| latest(cur, ts)));
         }
 
         finding.nodes.insert(event.node.as_deref().unwrap_or("-").to_string());

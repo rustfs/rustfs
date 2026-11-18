@@ -105,7 +105,7 @@ pub(super) fn assemble(
             Decision::Deny
         }
     });
-    let builder = GatewayStack::configured_builder(&assembly, iam, root, gate)?;
+    let builder = GatewayStack::configured_builder(&assembly, iam, root, gate, std::convert::identity)?;
     let service = builder
         .dialect(&dialect()?)
         .register::<GetIcebergConfig, _>(Arc::new(AdminBridge {
@@ -153,6 +153,7 @@ pub(super) fn assemble(
     Ok(GatewayStack {
         service,
         keystone_auth: assembly.keystone_auth,
+        control_plane: false,
     })
 }
 

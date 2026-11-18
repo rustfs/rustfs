@@ -24,17 +24,50 @@
 //! policy, IAM and table-catalog systems.
 
 mod admission;
+mod conditions;
+mod decision;
+mod discovery;
+#[cfg(test)]
+pub(crate) mod envelope_payloads;
 mod guards;
+#[cfg(test)]
+mod permission_probe_test;
 mod request;
 mod table_data_plane;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
+pub(crate) use conditions::existing_object_tag_conditions;
+#[cfg(test)]
+pub(crate) use conditions::{
+    BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, classify_bucket_policy_raw_load_error,
+    merge_request_object_tag_conditions, remaining_retention_days,
+};
+pub(crate) use conditions::{
+    ObjectTagConditions, authorization_conditions, get_or_fetch_object_tag_conditions, request_authz_facts, request_principal,
+    resource_free_condition_values, root_access_key,
+};
+#[cfg(test)]
+pub(crate) use conditions::{
+    bucket_policy_needs_existing_object_tag_from_hint, load_bucket_policy_existing_object_tag_hint,
+    maybe_merge_object_tag_conditions,
+};
+#[cfg(test)]
+pub(crate) use decision::{DenialContext, owner_can_bypass_policy_deny};
+pub(crate) use decision::{
+    audit_request_denial, authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion,
+    authorize_object_request, authorize_replication_only_put_headers, authorize_request, authorize_request_core,
+    authorize_request_with_location_constraint, authorize_staged_multipart_part, authorize_write_etag_condition,
+    iam_authorization_error,
+};
+pub(crate) use discovery::{
+    log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, query_list_buckets_permission,
+    s3_action_potential,
+};
 pub(crate) use guards::{
     BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
     PendingDeleteBucketGenerationGuard, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-    bucket_config_mutation_incarnation, capture_odm_read_generation, load_bucket_config_mutation_snapshot,
-    load_bucket_generation, load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
-    retained_table_data_plane_publication_guards,
+    bucket_config_mutation_incarnation, capture_odm_read_generation, load_bucket_generation, load_bucket_generation_from_store,
+    odm_read_generation, prepare_odm_read_generation, retained_table_data_plane_publication_guards,
 };
 #[cfg(test)]
 pub(crate) use guards::{
@@ -56,7 +89,6 @@ pub(crate) use table_data_plane::{
 };
 pub(crate) use table_data_plane::{
     TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlaneListResource,
-    TableDataPlanePublicationGuards, TablePermissionConditions, authorize_table_data_plane_if_needed,
-    deny_anonymous_table_data_plane_if_needed, retain_table_bucket_publication_guard, table_bucket_enabled_for_data_plane,
+    TableDataPlanePublicationGuards, retain_table_bucket_publication_guard, table_bucket_enabled_for_data_plane,
     table_catalog_store_for_data_plane, table_data_plane_list_internal_error, table_list_catalog_error,
 };

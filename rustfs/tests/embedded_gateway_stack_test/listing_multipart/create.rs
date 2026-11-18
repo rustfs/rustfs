@@ -682,10 +682,10 @@ async fn create_multipart_encryption(server: RustFSServer, legacy: bool) {
         let response = ssec(supplied_md5).send().await;
         assert!(uploads().await.expect("list after a refused digest").uploads.is_empty());
         let error = response.expect_err("the gateway refuses a nonmatching customer-key digest");
-        assert_eq!(super::super::refusal(&error), (Some("InvalidArgument".to_owned()), Some(400)));
+        assert_eq!(super::super::refusal(&error), (Some("InvalidRequest".to_owned()), Some(400)));
         assert_eq!(
             error.message(),
-            Some("the customer-provided encryption key and its MD5 must be base64 of 32 and 16 bytes and must agree")
+            Some("The calculated MD5 hash of the key did not match the hash that was provided.")
         );
         assert_eq!(count(), before);
     }

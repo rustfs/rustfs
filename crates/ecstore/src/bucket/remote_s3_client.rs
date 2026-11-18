@@ -1070,8 +1070,8 @@ mod tests {
             .unwrap_or_else(|| panic!("signed request must contain {name}"))
     }
 
-    fn signing_time(headers: &[(String, String)]) -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str(recorded_header(headers, "x-amz-date"), "%Y%m%dT%H%M%SZ")
+    fn signing_time(headers: &[(String, String)]) -> jiff::Timestamp {
+        jiff::Timestamp::strptime("%Y%m%dT%H%M%SZ", recorded_header(headers, "x-amz-date"))
             .expect("SDK signing timestamp must use the SigV4 format")
     }
 
@@ -1086,8 +1086,8 @@ mod tests {
                     .map(|(key, value)| (key.to_string(), value.to_string()))
                     .collect(),
             );
-            let server_time = chrono::DateTime::<chrono::Utc>::from(self.clock.now()).naive_utc()
-                + chrono::Duration::seconds(self.skew_seconds);
+            let server_time = jiff::Timestamp::try_from(self.clock.now()).expect("clock timestamp")
+                + jiff::SignedDuration::from_secs(self.skew_seconds);
             let (status, body) = if headers.len() == 1 {
                 (
                     403,
@@ -1098,7 +1098,7 @@ mod tests {
             };
             let response = http::Response::builder()
                 .status(status)
-                .header("date", server_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+                .header("date", server_time.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string())
                 .header("content-type", "application/xml")
                 .header("content-length", body.len())
                 .body(SdkBody::from(body))
@@ -1136,7 +1136,7 @@ mod tests {
         for error_code in ["RequestTimeTooSkewed", "SignatureDoesNotMatch"] {
             for skew_seconds in [-600, 600] {
                 let (client, headers, clock) = clock_skew_client(error_code, skew_seconds, REPLICATION_TARGET_RETRY_POLICY).await;
-                let initial = chrono::DateTime::<chrono::Utc>::from(clock.now()).naive_utc();
+                let initial = jiff::Timestamp::try_from(clock.now()).expect("clock timestamp");
                 client
                     .get_object()
                     .bucket("bucket")
@@ -1163,12 +1163,12 @@ mod tests {
                 assert_eq!(signing_time(&headers[0]), initial, "the first attempt must use the injected clock");
                 assert_eq!(
                     signing_time(&headers[1]),
-                    initial + chrono::Duration::seconds(skew_seconds),
+                    initial + jiff::SignedDuration::from_secs(skew_seconds),
                     "{error_code}: retry must apply the measured offset exactly"
                 );
                 assert_eq!(
                     signing_time(&headers[2]),
-                    initial + chrono::Duration::seconds(skew_seconds + 17),
+                    initial + jiff::SignedDuration::from_secs(skew_seconds + 17),
                     "{error_code}: the next operation must apply cached skew to the advanced signing clock"
                 );
                 let signature = |index: usize| {
