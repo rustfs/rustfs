@@ -15511,18 +15511,30 @@ impl DiskAPI for LocalDisk {
                 let mut parts = Vec::with_capacity(keys.len());
                 let mut verified = None;
                 for key in &keys {
-                    let num = Path::new(key).file_name()?.to_str()?.strip_prefix("part.")?.strip_suffix(".meta")?.parse().ok()?;
+                    let num = Path::new(key)
+                        .file_name()?
+                        .to_str()?
+                        .strip_prefix("part.")?
+                        .strip_suffix(".meta")?
+                        .parse()
+                        .ok()?;
                     let scope = multipart_staging::upload_scope_root(key, true);
                     let same_head = verified.as_ref().is_some_and(|(prev, _)| *prev == scope);
                     if !same_head {
                         verified = Some((scope, resolve(RUSTFS_META_MULTIPART_BUCKET, scope).ok()?));
                     }
                     let (_, source) = verified.as_ref()?;
-                    parts.push(multipart_source_state::get_active_multipart_source_part_with_head(source, num, same_head)?);
+                    parts.push(multipart_source_state::get_active_multipart_source_part_with_head(
+                        source, num, same_head,
+                    )?);
                 }
                 Some(parts)
-            }).await.map_err(DiskError::from)?;
-            if let Some(parts) = cached { return Ok(parts); }
+            })
+            .await
+            .map_err(DiskError::from)?;
+            if let Some(parts) = cached {
+                return Ok(parts);
+            }
         }
         let volume_dir = self.io_get_bucket_path(bucket)?;
         stream::iter(0..paths.len())
