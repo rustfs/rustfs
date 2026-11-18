@@ -163,30 +163,31 @@ pub(crate) mod access_consumer {
     };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
-        MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
-        PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
-        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
+        ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, StagedMultipartPartAuthorization,
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
         authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
-        delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
-        log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
-        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized,
-        req_info_mut, req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
+        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
+    pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
     pub(crate) use super::super::req_info::ReqInfo;
+    pub(crate) use super::super::request_markers::{
+        MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
+        RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
+    };
 }
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::{
-        AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
-        RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
-        TableDataPlanePublicationGuards, authorize_bucket_config_mutation, authorize_object_request,
-        authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+        AuthorizationRequest, ObjectTagConditions, TableDataPlanePublicationGuards, authorize_bucket_config_mutation,
+        authorize_object_request, authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
         authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
@@ -194,6 +195,10 @@ pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_context::RequestContext;
+    pub(crate) use super::super::request_markers::{
+        PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
+        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
+    };
 }
 
 pub(crate) mod concurrency_consumer {

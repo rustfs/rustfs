@@ -33,10 +33,17 @@ use crate::auth::{
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
+pub(crate) use crate::storage::authorization_actions::{
+    delete_object_authorize_action, versioned_read_action, versioned_tagging_action,
+};
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
 pub(crate) use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
+pub(crate) use crate::storage::request_markers::{
+    MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
+    RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
+};
 use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
@@ -146,23 +153,7 @@ fn invalid_force_delete_header() -> S3Error {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PostObjectRequestMarker;
-
-#[derive(Clone, Debug)]
 struct InternalObjectAuthorization;
-
-/// Retain-until date the request asks to set. `authorization_conditions` turns it
-/// into `object-lock-remaining-retention-days`.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestedObjectLockRetainUntil(pub(crate) OffsetDateTime);
-
-/// Retention a standalone PutObjectRetention applies from its XML body. Owned, so both request
-/// forms carry it; each edge converts its decoded body once.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestedObjectLockRetention {
-    pub(crate) mode: Option<String>,
-    pub(crate) retain_until: Option<OffsetDateTime>,
-}
 
 impl From<&ObjectLockRetention> for RequestedObjectLockRetention {
     fn from(retention: &ObjectLockRetention) -> Self {
@@ -173,20 +164,11 @@ impl From<&ObjectLockRetention> for RequestedObjectLockRetention {
     }
 }
 
-/// Legal hold status a standalone PutObjectLegalHold applies from its XML body.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestedObjectLegalHold(pub(crate) Option<String>);
-
 impl From<&ObjectLockLegalHold> for RequestedObjectLegalHold {
     fn from(legal_hold: &ObjectLockLegalHold) -> Self {
         Self(legal_hold.status.as_ref().map(|status| status.as_str().to_owned()))
     }
 }
-
-/// Tag set a standalone PutObjectTagging applies from its XML body, as the key/value pairs a
-/// policy condition can name: a tag without a key or a value names none.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestedObjectTags(pub(crate) Vec<(String, String)>);
 
 impl From<&Tagging> for RequestedObjectTags {
     fn from(tagging: &Tagging) -> Self {
@@ -199,48 +181,6 @@ impl From<&Tagging> for RequestedObjectTags {
         )
     }
 }
-
-/// Request headers with the object policy inputs a POST upload applies from its
-/// form fields, so header-derived condition keys describe what is stored.
-#[derive(Clone)]
-pub(crate) struct PostObjectPolicyHeaders(pub(crate) http::HeaderMap);
-
-// The map is a clone of the request headers, so it can carry `Authorization`
-// and session tokens; its debug form names the headers without their values.
-impl std::fmt::Debug for PostObjectPolicyHeaders {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PostObjectPolicyHeaders")
-            .field(&self.0.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-/// Copy source as the handler resolves it (percent-decoded, versionId canonical).
-#[derive(Clone)]
-pub(crate) struct RequestedCopySource(pub(crate) String);
-
-impl RequestedCopySource {
-    pub(crate) fn from_object(bucket: &str, key: &str, version_id: Option<&str>) -> Self {
-        Self(match version_id {
-            Some(version) => format!("{bucket}/{key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
-            None => format!("{bucket}/{key}"),
-        })
-    }
-}
-
-/// These operations stage upload state without publishing an object. Keep this
-/// separate from the marker controlling multipart publication fences.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MultipartStagingOperation;
-
-impl MultipartStagingOperation {
-    pub(crate) fn for_operation(operation: &str) -> Option<Self> {
-        matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy").then_some(Self)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct StagedMultipartPartAuthorization;
 
 #[derive(Clone, Default)]
 pub(crate) struct TableDataPlanePublicationGuards {
@@ -2009,46 +1949,6 @@ pub(crate) fn log_list_buckets_iam_implicit_deny<R: AuthorizationRequest + ?Size
     };
     denial.log("iam_implicit_deny", Action::S3Action(S3Action::ListAllMyBucketsAction));
     Ok(())
-}
-
-pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action {
-    Action::S3Action(if version_id.is_some() {
-        S3Action::DeleteObjectVersionAction
-    } else {
-        S3Action::DeleteObjectAction
-    })
-}
-
-/// GHSA-3ppv: select the IAM action for an object read by whether the request
-/// names an explicit object version. A read that targets a specific version must
-/// authorize against `s3:GetObjectVersion`; a current-object read authorizes
-/// against `s3:GetObject`. Reading a historical version while only holding
-/// `s3:GetObject` is an information-disclosure bypass, so the two must not be
-/// conflated at the authorization boundary.
-///
-/// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
-/// `s3:GetObject` request. It only broadens a Version grant toward current
-/// reads, never the reverse.
-pub(crate) fn versioned_read_action(version_id: Option<&str>) -> Action {
-    if version_id.is_some() {
-        Action::S3Action(S3Action::GetObjectVersionAction)
-    } else {
-        Action::S3Action(S3Action::GetObjectAction)
-    }
-}
-
-pub(crate) fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
-    let action = if version_id.is_some() {
-        match action {
-            S3Action::GetObjectTaggingAction => S3Action::GetObjectVersionTaggingAction,
-            S3Action::PutObjectTaggingAction => S3Action::PutObjectVersionTaggingAction,
-            S3Action::DeleteObjectTaggingAction => S3Action::DeleteObjectVersionTaggingAction,
-            action => action,
-        }
-    } else {
-        action
-    };
-    Action::S3Action(action)
 }
 
 async fn get_or_fetch_object_tag_conditions<R: AuthorizationRequest + ?Sized>(
