@@ -12961,7 +12961,10 @@ impl LocalDisk {
                     let name = entry.trim_end_matches(SLASH_SEPARATOR);
                     let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
-                    if opts.limit <= 0 || (opts.forward_to.as_ref().is_none_or(|marker| &name >= marker) && metadata_counts_toward_limit(&metadata)) {
+                    if opts.limit <= 0
+                        || (opts.forward_to.as_ref().is_none_or(|marker| &name >= marker)
+                            && metadata_counts_toward_limit(&metadata))
+                    {
                         *objs_returned += 1;
                     }
 
@@ -13231,7 +13234,9 @@ impl LocalDisk {
 
                         meta.metadata = read.bytes;
 
-                        if opts.limit <= 0 || (opts.forward_to.as_ref().is_none_or(|marker| &meta.name >= marker) && read.counts_toward_limit) {
+                        if opts.limit <= 0
+                            || (opts.forward_to.as_ref().is_none_or(|marker| &meta.name >= marker) && read.counts_toward_limit)
+                        {
                             *objs_returned += 1;
                         }
 
@@ -31857,7 +31862,8 @@ mod test {
         );
         assert_eq!(different_count as usize, different_names.len());
 
-        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 0).await;
+        let (double_names, double_count) =
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             double_names,
@@ -31870,7 +31876,9 @@ mod test {
         );
         assert_eq!(double_count as usize, double_names.len());
 
-        fs::write(bucket_dir.join("engineering/engineering").join(STORAGE_FORMAT_FILE), b"meta").await.expect("write ancestor metadata");
+        fs::write(bucket_dir.join("engineering/engineering").join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("write ancestor metadata");
         let (names, count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 2).await;
         assert_eq!(count, 2);
         assert!(names.iter().any(|name| name == "engineering/engineering/repo-0002"));
