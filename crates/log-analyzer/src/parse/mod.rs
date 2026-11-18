@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(ev.target.as_deref(), Some("rustfs::scanner::io"));
         assert_eq!(ev.message, "Disk health check marked disk faulty");
         let ts = ev.timestamp.as_ref().expect("timestamp");
-        assert_eq!(crate::time::offset_seconds(&ts), 8 * 3600);
+        assert_eq!(crate::time::offset_seconds(ts), 8 * 3600);
         assert_eq!(ev.field_str("reason"), Some("faulty_disk"));
         assert_eq!(ev.field_str("disk"), Some("/data/disk3"));
         assert!(ev.fields.contains_key("filename"));

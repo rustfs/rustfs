@@ -491,7 +491,7 @@ mod tests {
         Endpoint,
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
-    use chrono::SecondsFormat;
+    use jiff::Timestamp;
     use rustfs_heal::{HealOperationsSnapshot, ReplacementRecoveryRecord, ReplacementRecoverySnapshot, ReplacementRecoveryState};
     use rustfs_scanner::scanner::BackgroundHealInfo;
 
@@ -806,13 +806,13 @@ mod tests {
         assert_eq!(
             info.bitrot_start_time
                 .expect("bitrot start time should be preserved")
-                .to_rfc3339_opts(SecondsFormat::Micros, true),
+                .strftime("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string(),
             "2023-11-14T22:13:20.123456Z"
         );
 
-        let started_at = chrono::DateTime::parse_from_rfc3339("2023-11-14T22:13:20.123456Z")
-            .expect("fixture timestamp should parse")
-            .with_timezone(&chrono::Utc);
+        let started_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.f%:z", "2023-11-14T22:13:20.123456+00:00")
+            .expect("fixture timestamp should parse");
         let snapshot = NodeHealStatusSnapshot::for_test(
             true,
             true,

@@ -155,9 +155,9 @@ mod tests {
     fn parse_time_arg_accepts_rfc3339_and_relative() {
         assert!(parse_time_arg("2026-07-15T03:00:00+08:00").is_ok());
         let day_ago = parse_time_arg("24h").expect("relative");
-        let now = Local::now().fixed_offset();
-        let delta = now.signed_duration_since(day_ago).num_minutes();
-        assert!((delta - 24 * 60).abs() <= 1, "got {delta} minutes");
+        let now = ZonedDateTime::now();
+        let delta = now.duration_since(&day_ago).as_secs_f64() / 60.0;
+        assert!((delta - 24.0 * 60.0).abs() <= 1.0, "got {delta} minutes");
         assert!(parse_time_arg("7x").is_err());
         assert!(parse_time_arg("").is_err());
         assert!(parse_time_arg("h").is_err());
