@@ -1238,11 +1238,14 @@ impl DefaultObjectUsecase {
         // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&envelope)
             && get_header(envelope.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+        #[cfg(feature = "gateway-stack")]
         let extract_headers = if envelope.is_gateway_post() {
             super::post_headers::post_effective_headers(&envelope)
         } else {
             envelope.headers()
         };
+        #[cfg(not(feature = "gateway-stack"))]
+        let extract_headers = envelope.headers();
         if max_content_length.is_some() && is_put_object_extract_requested(extract_headers) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,

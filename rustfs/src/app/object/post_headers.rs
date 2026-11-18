@@ -311,14 +311,15 @@ mod tests {
     #[test]
     fn post_archive_checksum_projection_preserves_closed_guard_and_rejects_md5_conflicts() {
         let mut wire = HeaderMap::new();
-        wire.insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
         wire.insert("content-md5", HeaderValue::from_static("XUFAKrxLKna5cZ2REBfFkg=="));
+        let mut policy = HeaderMap::new();
+        policy.insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
         let fields = PostObjectFields {
             content_md5: Some("XUFAKrxLKna5cZ2REBfFkg==".to_owned()),
             checksum_crc32: Some("NhCmhg==".to_owned()),
             ..Default::default()
         };
-        let envelope = request(wire.clone(), HeaderMap::new());
+        let envelope = request(wire.clone(), policy.clone());
         assert_eq!(
             post_checksum_headers(&envelope, &fields)
                 .expect_err("closed archive refuses checksums")
@@ -335,7 +336,7 @@ mod tests {
         );
 
         wire.insert("content-md5", HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="));
-        let conflict = request(wire.clone(), HeaderMap::new());
+        let conflict = request(wire.clone(), policy.clone());
         assert_eq!(
             post_archive_content_md5(&conflict, &fields)
                 .expect_err("different MD5 sources")
@@ -343,7 +344,7 @@ mod tests {
             &S3ErrorCode::InvalidRequest
         );
         wire.append("content-md5", HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="));
-        let duplicate = request(wire, HeaderMap::new());
+        let duplicate = request(wire, policy);
         assert_eq!(
             post_archive_content_md5(&duplicate, &PostObjectFields::default())
                 .expect_err("duplicate MD5")
