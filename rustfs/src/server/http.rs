@@ -28,9 +28,8 @@ use crate::server::{
         RequestLoggingLayer, redact_sensitive_uri_query,
     },
     legacy_compat::{
-        BodylessStatusFixLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer,
-        StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
+        BodylessStatusFixLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer,
+        StsQueryApiCompatLayer,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
@@ -2082,7 +2081,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
 macro_rules! external_service_stack {
     ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
      $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
-     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr, $vh_domain_hosts:expr) => {{
+     $compression_config:expr, $server_ctx:expr, $vh_domain_hosts:expr) => {{
         let remote_addr = $remote_addr;
         let trusted_proxy_layer = $trusted_proxy_layer;
         let is_console = $is_console;
@@ -2092,7 +2091,6 @@ macro_rules! external_service_stack {
         let keystone_auth = $keystone_auth;
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
-        let server_domains_configured = $server_domains_configured;
         let vh_domain_hosts = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -2210,17 +2208,12 @@ macro_rules! external_service_stack {
             .layer(RequestLoggingLayer)
             .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
             .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
-            .layer(S3ErrorMessageCompatLayer)
             .layer(IcebergRestErrorCompatLayer)
-            .layer(ObjectAttributesEtagFixLayer)
             .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
             .layer(HeadRequestBodyFixLayer)
             .layer(PublicHealthEndpointLayer::new(server_ctx, readiness))
-            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-            .layer(DoubleSlashListBucketsCompatLayer)
-            .layer(SigV4HeaderGuardLayer)
             .service($service)
     }};
 }
@@ -2672,7 +2665,6 @@ async fn start_http_server_inner(
         let h3_rate_limit = api_rate_limit_layer.clone();
         let h3_compression = compression_config.clone();
         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
-        let h3_domains_configured = !config.server_domains.is_empty();
         let h3_vh_domain_hosts = vh_domain_hosts.clone();
 
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
@@ -2700,7 +2692,6 @@ async fn start_http_server_inner(
                 h3_keystone.clone(),
                 h3_compression.clone(),
                 h3_server_ctx.clone(),
-                h3_domains_configured,
                 h3_vh_domain_hosts.clone()
             ))
         };
@@ -2744,7 +2735,6 @@ async fn start_http_server_inner(
     };
 
     let is_console = config.console_enable;
-    let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -2995,7 +2985,6 @@ async fn start_http_server_inner(
                 s3_service: s3_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
-                server_domains_configured,
                 vh_domain_hosts: vh_domain_hosts.clone(),
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
@@ -3104,8 +3093,6 @@ struct ConnectionContext {
     s3_service: S3EdgeService,
     compression_config: HttpCompressionConfig,
     is_console: bool,
-    /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
-    server_domains_configured: bool,
     /// Port-stripped virtual-hosted-style domains, for bucket-level CORS resolution.
     vh_domain_hosts: Arc<[String]>,
     readiness: Arc<GlobalReadiness>,
@@ -3240,7 +3227,6 @@ fn process_connection(
             s3_service,
             compression_config,
             is_console,
-            server_domains_configured,
             vh_domain_hosts,
             readiness,
             keystone_auth,
@@ -3344,20 +3330,15 @@ fn process_connection(
         // 12. RequestLoggingLayer                    — single completion event per request
         // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
         // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
-        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 18. ConditionalCorsLayer                   — S3 API CORS
-        // 19. RedirectLayer                          — console redirect (conditional)
-        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
-        // 25. SigV4HeaderGuardLayer                  — GHSA-xm99/-g8w9 unsigned x-amz-* rules, ahead of s3s signature dispatch
+        // 15. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        // 16. ConditionalCorsLayer                   — S3 API CORS
+        // 17. RedirectLayer                          — console redirect (conditional)
+        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 20. PublicHealthEndpointLayer              — handles public health before the stack
         // `tests::stack_census` pins this order against the real `external_service_stack!`
-        // expansion. Layers 5, 6, 15, 16, 17, 20, 21, 23, 24 and 25 patch s3s and live in
-        // `server::legacy_compat`; T2.12 (rustfs/backlog#2771) removes them.
+        // expansion. Layers 5, 6, 15, 18 and 19 live in `server::legacy_compat`;
+        // T2.12 (rustfs/backlog#2771) removes them.
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -3373,7 +3354,6 @@ fn process_connection(
                 keystone_auth.clone(),
                 compression_config.clone(),
                 server_ctx.clone(),
-                server_domains_configured,
                 vh_domain_hosts.clone()
             )
         };
@@ -6214,7 +6194,6 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false,
             Arc::default()
         ))
     }
@@ -9819,7 +9798,7 @@ mod tests {
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
                     Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
-                    HttpCompressionConfig::default(), ServerContextSlot::new(), false, Arc::default()))
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), Arc::default()))
             }, 0, Duration::from_secs(1), receiver)?;
             let client_endpoint = client_endpoint(vec![cert])?;
             let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
@@ -9879,7 +9858,6 @@ mod tests {
                     None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
                     HttpCompressionConfig::default(),
                     ServerContextSlot::new(),
-                    false,
                     Arc::default()
                 ))
             },
@@ -10016,10 +9994,8 @@ mod tests {
     /// Optional layers (`option_layer`, `Either`) are listed because their type
     /// is part of the chain whether or not the layer is installed at runtime.
     /// The fixture's own inner service is not part of it. `legacy_compat` marks
-    /// the s3s patch layers that `server::legacy_compat` groups; T2.12
-    /// (rustfs/backlog#2771) reuses this test to prove which layers the gateway
-    /// stack keeps.
-    const EXTERNAL_STACK_CENSUS: [&str; 28] = [
+    /// the patch layers that `server::legacy_compat` still groups.
+    const EXTERNAL_STACK_CENSUS: [&str; 23] = [
         "AddExtension",                        // Option<RemoteAddr>
         "AddExtension",                        // SocketAddr (optional)
         "TrustedProxyMiddleware",              // TrustedProxyLayer (optional)
@@ -10037,17 +10013,12 @@ mod tests {
         "RequestLoggingService",               //
         "Compression",                         //
         "PathCategoryInjectionService",        // optional
-        "S3ErrorMessageCompatService",         // legacy_compat
         "IcebergRestErrorCompatService",       // legacy_compat
-        "ObjectAttributesEtagFixService",      // legacy_compat
         "ConditionalCorsService",              //
         "RedirectService",                     // optional
         "BodylessStatusFixService",            // legacy_compat
         "HeadRequestBodyFixService",           // legacy_compat
         "PublicHealthEndpointService",         //
-        "VirtualHostStyleHintService",         // legacy_compat, optional
-        "DoubleSlashListBucketsCompatService", // legacy_compat
-        "SigV4HeaderGuardService",             // legacy_compat
     ];
 
     /// Walks a `type_name` string along its service chain: at every node the
@@ -10145,7 +10116,6 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false,
             Arc::default()
         );
         fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}

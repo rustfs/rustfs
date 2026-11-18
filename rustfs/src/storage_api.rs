@@ -285,7 +285,7 @@ pub(crate) mod server {
     /// files stay off the direct s3s surface (s3s footprint ratchet). T2.12
     /// (rustfs/backlog#2771) removes the layers and with them this module.
     pub(crate) mod legacy_compat {
-        pub(crate) use s3s::{S3Error, S3ErrorCode};
+        pub(crate) use s3s::S3ErrorCode;
     }
 
     pub(crate) mod module_switch {
