@@ -18,7 +18,9 @@ use super::bucket_usecase::DefaultBucketUsecase;
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::storage::access::access_owned::listing_multipart::authorize_bucket_listing;
-use crate::storage::access::{ReqInfo, req_info_mut};
+use crate::storage::access::req_info_mut;
+use crate::storage::req_info::ReqInfo;
+use crate::storage::request_markers::WebsiteRead;
 use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
@@ -422,9 +424,6 @@ async fn website_head_redirect(
     let response = s3s::S3::head_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), request).await?;
     Ok(response.output.website_redirect_location)
 }
-
-#[derive(Clone)]
-pub(crate) struct WebsiteRead;
 
 fn response_to_website(response: S3Response<GetObjectOutput>, head: bool) -> S3Result<S3Response<Body>> {
     let output = response.output;

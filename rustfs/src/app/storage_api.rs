@@ -77,7 +77,6 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     pub(crate) use s3s::header;
-    pub(crate) use s3s::region;
     pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
@@ -253,7 +252,7 @@ pub(crate) mod runtime {
         crate::storage::storage_api::get_global_lock_clients()
     }
 
-    pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
+    pub(crate) fn get_global_region() -> Option<rustfs_s3_types::Region> {
         crate::storage::storage_api::get_global_region()
     }
 

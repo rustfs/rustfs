@@ -1218,6 +1218,8 @@ impl std::fmt::Debug for GetObjectSink {
 
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    /// Part copies retain source locks and cannot queue for capped upload staging.
+    pub multipart_copy_source_locked: bool,
     #[doc(hidden)]
     pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
     /// Caller-provided destination for a GET body: when set, the legacy
@@ -1232,6 +1234,9 @@ pub struct ObjectOptions {
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: Option<usize>,
 
+    /// Exact logical versions authorized under the recursive delete bucket write lock.
+    /// An empty request plan must not dispatch any disk mutation. Never serialized.
+    pub recursive_delete_targets: Option<Arc<[(String, Uuid)]>>,
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,

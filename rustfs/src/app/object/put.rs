@@ -984,7 +984,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -4158,6 +4158,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_object_metadata_cannot_dispatch_legacy_archive_extraction() {
+        let mut req = build_request(PutObjectInput::default(), Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        let err = Box::pin(DefaultObjectUsecase::without_context().execute_put_object_extract(req))
+            .await
+            .expect_err("a legacy form cannot authorize archive replay");
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
     async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
@@ -4729,7 +4739,7 @@ mod tests {
         request
             .headers
             .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::access::ReqInfo {
+        request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });

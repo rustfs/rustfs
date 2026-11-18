@@ -23,7 +23,7 @@
 use super::{
     Action, AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, HashMap,
     HeaderMap, ObjectOptions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, RemoteAddr, ReqInfo, RequestContext,
-    S3Action, S3ErrorCode, S3Request, S3Result, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
+    S3Action, S3ErrorCode, S3Request, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
     apply_copy_source_bucket_generation_guard, authorize_object_request, bucket_config_mutation_incarnation,
     capture_odm_read_generation, odm_read_generation, replication_request_authorized, request_context_from_req,
     resource_free_condition_values, retained_table_data_plane_publication_guards,
@@ -69,10 +69,10 @@ fn server_request(extensions: &mut http::Extensions) {
 /// The incarnation a reader bound, or the refusal's code and message.
 type Answer = Result<Option<uuid::Uuid>, (S3ErrorCode, String)>;
 
-fn answer<T>(result: S3Result<T>, bound: impl FnOnce(T) -> Option<uuid::Uuid>) -> Answer {
+fn answer<T>(result: rustfs_s3_types::S3Result<T>, bound: impl FnOnce(T) -> Option<uuid::Uuid>) -> Answer {
     result
         .map(bound)
-        .map_err(|err| (err.code().clone(), err.message().unwrap_or_default().to_owned()))
+        .map_err(|err| (err.code().clone().into(), err.message().unwrap_or_default().to_owned()))
 }
 
 fn refused(code: S3ErrorCode, message: &str) -> Answer {
@@ -147,7 +147,7 @@ fn bucket_generation_guard_reads_the_same_through_both_forms() {
                 legacy(|ext| {
                     ext.insert(guard(BUCKET));
                     ext.insert(PendingDeleteBucketGenerationGuard::Failed {
-                        code: S3ErrorCode::NoSuchBucket,
+                        code: S3ErrorCode::NoSuchBucket.into(),
                         message: "bucket is gone".to_owned(),
                     });
                 }),
@@ -227,7 +227,7 @@ fn odm_read_generation_reads_the_same_through_both_forms() {
                 "failed capture surfaces its error",
                 legacy(|ext| {
                     ext.insert(OdmReadGenerationGuard::Failed {
-                        code: S3ErrorCode::SlowDown,
+                        code: S3ErrorCode::SlowDown.into(),
                         message: "capture failed".to_owned(),
                     });
                 }),
@@ -292,7 +292,7 @@ fn installed_state_reads_back_through_the_envelope() {
     envelope.install_bucket_generation(guard(BUCKET));
     assert_eq!(bucket_fence(&envelope), Ok(Some(incarnation())));
     envelope.install_pending_delete_bucket_generation(PendingDeleteBucketGenerationGuard::Failed {
-        code: S3ErrorCode::NoSuchBucket,
+        code: S3ErrorCode::NoSuchBucket.into(),
         message: "bucket is gone".to_owned(),
     });
     assert_eq!(bucket_fence(&envelope), refused(S3ErrorCode::NoSuchBucket, "bucket is gone"));
