@@ -3702,9 +3702,9 @@ fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bo
 // Limits transport response futures; client RPC metrics separately cover unary body decoding.
 const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
 // Quorum reads cancel surplus metadata RPCs in bursts. Keep bounded reset state
-// for their in-flight replies without spending the connection's protocol-error
-// budget (h2 remembers only 50 resets by default).
-const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
+// for their in-flight replies through the HTTP/2 grace period without spending
+// the connection's protocol-error budget (h2 remembers only 50 resets by default).
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 8192;
 
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
