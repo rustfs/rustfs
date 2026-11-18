@@ -1136,6 +1136,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_removal_targets_survive_withdrawal_without_routing_recreated_objects() {
+        let engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), engine.clone());
+        let target = MockTarget::new("removed-bucket", "webhook");
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        let mut rules = RulesMap::new();
+        rules.add_rule_config(
+            &[EventName::BucketRemoved, EventName::ObjectCreatedPut],
+            "*".to_owned(),
+            target.target_id(),
+        );
+        engine.publish_bucket_rules("bucket", Some(old_id), rules);
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target.clone()))
+            .expect("register target");
+
+        let targets = notifier.bucket_removed_targets("bucket", old_id);
+        assert!(targets.contains(&target.target_id()));
+        engine.withdraw_bucket_rules("bucket");
+
+        let mut removed = Event::new_test_event("bucket", "", EventName::BucketRemoved);
+        removed.bucket_incarnation_id = Some(old_id);
+        removed.bucket_removed_targets = Some(targets);
+        let encoded = serde_json::to_value(&removed).expect("serialize webhook event");
+        assert!(encoded.get("bucketIncarnationId").is_none());
+        assert!(encoded.get("bucketRemovedTargets").is_none());
+        notifier.send(Arc::new(removed)).await;
+        assert_eq!(target.save_call_count(), 1, "the deleted bucket earns its final removal event");
+
+        let mut created = Event::new_test_event("bucket", "fresh.txt", EventName::ObjectCreatedPut);
+        created.bucket_incarnation_id = Some(new_id);
+        notifier.send(Arc::new(created)).await;
+        assert_eq!(target.save_call_count(), 1, "the new bucket has no subscription");
+    }
+
+    #[tokio::test]
     async fn send_event_respects_prefix_suffix_filters() {
         let rule_engine = NotifyRuleEngine::new();
         let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine.clone());
