@@ -1953,6 +1953,9 @@ impl<T: Store> IamSys<T> {
         let state = Self::policy_plugin_state().await;
         if marked {
             if args.is_owner
+                // Plugin-attempt sessions are confined to their allowlisted work;
+                // they cannot use a default permission to manage the parent identity.
+                || self_service_deny_check(args)
                 || args.claims.get(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM) != Some(&Value::Bool(true))
                 || !matches!(state, PolicyPluginState::Disabled)
             {
@@ -2150,9 +2153,24 @@ impl<T: Store> IamSys<T> {
         };
 
         if policies.is_empty() {
+            // The policy lookup also returns an empty set for an inactive user.
+            // Only a live identity gets the default for its own credential changes.
+            let mode = if self_service_deny_check(args)
+                && self
+                    .store
+                    .get_user(args.account)
+                    .await
+                    .is_some_and(|u| u.credentials.is_valid())
+            {
+                PreparedIamMode::Regular {
+                    combined_policy: Policy::default(),
+                }
+            } else {
+                PreparedIamMode::Deny
+            };
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
-                mode: PreparedIamMode::Deny,
+                mode,
             };
         }
 
@@ -2228,7 +2246,16 @@ impl<T: Store> IamSys<T> {
                     }
                 },
             };
-            let p = self.policy_db_get(parent_user, &effective_groups).await.unwrap_or_default();
+            let p = match self.policy_db_get(parent_user, &effective_groups).await {
+                Ok(policies) => policies,
+                Err(_) if self_service_deny_check(args) => {
+                    return PreparedIamAuth {
+                        needs_existing_object_tag: false,
+                        mode: PreparedIamMode::Deny,
+                    };
+                }
+                Err(_) => Vec::new(),
+            };
             (effective_groups, groups_source, p)
         };
 
@@ -2261,7 +2288,7 @@ impl<T: Store> IamSys<T> {
                         requested_policies = %requested_policies,
                         "prepare_sts_auth: no STS policy names resolved"
                     );
-                    if args.deny_only && !verified_federated_session {
+                    if args.deny_only && !verified_federated_session && !self_service_deny_check(args) {
                         combined_policy = Policy::default();
                     } else {
                         return PreparedIamAuth {
@@ -2275,7 +2302,7 @@ impl<T: Store> IamSys<T> {
                         .iter()
                         .any(|policy_name| !resolved_policy_names.iter().any(|resolved| resolved == policy_name));
                     if has_unresolved_policy_names {
-                        if verified_federated_session {
+                        if verified_federated_session || self_service_deny_check(args) {
                             return PreparedIamAuth {
                                 needs_existing_object_tag: false,
                                 mode: PreparedIamMode::Deny,
@@ -2498,8 +2525,26 @@ async fn prepared_session_policy_needs_existing_object_tag_for_args(policy: &Pre
     }
 }
 
+fn self_service_deny_check(args: &Args<'_>) -> bool {
+    use rustfs_policy::policy::action::{Action, AdminAction};
+    args.deny_only
+        && matches!(
+            args.action,
+            Action::AdminAction(
+                AdminAction::ChangeOwnPasswordAdminAction
+                    | AdminAction::CreateUserAdminAction
+                    | AdminAction::ManageOwnMFAAdminAction
+            )
+        )
+}
+
 fn prepare_session_policy(args: &Args<'_>, empty_is_none: bool) -> PreparedSessionPolicy {
     let Some(policy_str) = extract_session_policy_text(args.claims) else {
+        if self_service_deny_check(args)
+            && (args.claims.contains_key(SESSION_POLICY_NAME) || args.claims.contains_key(SESSION_POLICY_NAME_EXTRACTED))
+        {
+            return PreparedSessionPolicy::DenyAll;
+        }
         return PreparedSessionPolicy::None;
     };
 
