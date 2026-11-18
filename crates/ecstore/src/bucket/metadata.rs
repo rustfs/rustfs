@@ -2090,6 +2090,23 @@ mod test {
     }
 
     #[test]
+    fn bucket_config_size_limit_preserves_last_accepted_policy() {
+        let mut metadata = BucketMetadata::new("policy-size-limit");
+        let stamp = OffsetDateTime::now_utc();
+        let mut policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        policy.resize(2 * 1024 * 1024, b' ');
+        metadata
+            .update_config_at(BUCKET_POLICY_CONFIG, policy.clone(), stamp)
+            .expect("accept a policy exactly at the size limit");
+        let mut oversized = policy.clone();
+        oversized.push(b' ');
+        let result = metadata.update_config_at(BUCKET_POLICY_CONFIG, oversized, stamp + time::Duration::seconds(1));
+        assert!(matches!(result, Err(Error::InvalidArgument(..))));
+        assert!(metadata.policy_config_json == policy, "rejection must preserve the accepted policy");
+        assert_eq!(metadata.policy_config_updated_at, stamp);
+    }
+
+    #[test]
     fn admission_configs_leave_logging_unparsed() {
         let mut bm = BucketMetadata::new("bucket");
         bm.logging_config_xml = b"<BucketLoggingStatus/>".to_vec();
