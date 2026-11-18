@@ -49,15 +49,16 @@ impl RequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{RequestCredentials, RequestEnvelope, S3Request};
-    use crate::app::metadata_route::WebsiteRead;
     use crate::app::object::request_body::BodyReadControl;
     use crate::app::storage_api::s3::Credentials as S3sCredentials;
     use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
     use crate::runtime_sources::ServerContextSlot;
     use crate::shared_types::{NativeTlsTransport, RemoteAddr};
     use crate::storage::access::envelope_payloads;
-    use crate::storage::access::{PostObjectRequestMarker, ReqInfo, TableDataPlanePublicationGuards};
+    use crate::storage::access::{PostObjectRequestMarker, ReqInfo};
+    use crate::storage::authorization::TableDataPlanePublicationGuards;
     use crate::storage::request_context::RequestContext;
+    use crate::storage::request_markers::WebsiteRead;
     use http::{Extensions, HeaderMap, HeaderValue, Method};
     use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
     use std::fmt::Debug;
