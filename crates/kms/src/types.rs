@@ -14,7 +14,7 @@
 
 //! Core type definitions for KMS operations
 
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ pub struct DataKeyInfo {
     /// Associated metadata
     pub metadata: HashMap<String, String>,
     /// Key creation timestamp
-    pub created_at: Zoned,
+    pub created_at: ZonedDateTime,
 }
 
 impl DataKeyInfo {
@@ -61,7 +61,7 @@ impl DataKeyInfo {
             ciphertext,
             key_spec,
             metadata: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
         }
     }
 
@@ -112,14 +112,14 @@ pub struct MasterKeyInfo {
     /// Associated metadata
     pub metadata: HashMap<String, String>,
     /// Key creation timestamp
-    pub created_at: Zoned,
+    pub created_at: ZonedDateTime,
     /// Key last rotation timestamp
-    pub rotated_at: Option<Zoned>,
+    pub rotated_at: Option<ZonedDateTime>,
     /// Key creator/owner
     pub created_by: Option<String>,
     /// Scheduled deletion deadline while the key is pending deletion
     #[serde(default)]
-    pub deletion_date: Option<Zoned>,
+    pub deletion_date: Option<ZonedDateTime>,
 }
 
 impl MasterKeyInfo {
@@ -142,7 +142,7 @@ impl MasterKeyInfo {
             status: KeyStatus::Active,
             description: None,
             metadata: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             rotated_at: None,
             created_by,
             deletion_date: None,
@@ -174,7 +174,7 @@ impl MasterKeyInfo {
             status: KeyStatus::Active,
             description,
             metadata: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             rotated_at: None,
             created_by,
             deletion_date: None,
@@ -247,9 +247,9 @@ pub struct KeyInfo {
     /// Key tags
     pub tags: HashMap<String, String>,
     /// Key creation timestamp
-    pub created_at: Zoned,
+    pub created_at: ZonedDateTime,
     /// Key last rotation timestamp
-    pub rotated_at: Option<Zoned>,
+    pub rotated_at: Option<ZonedDateTime>,
     /// Key creator
     pub created_by: Option<String>,
     /// Whether the key has outlived the configured rotation age.
@@ -690,7 +690,7 @@ pub struct EncryptionMetadata {
     /// Encryption context
     pub encryption_context: HashMap<String, String>,
     /// Timestamp when encrypted
-    pub encrypted_at: Zoned,
+    pub encrypted_at: ZonedDateTime,
     /// Size of original data
     pub original_size: u64,
     /// Encrypted data key
@@ -789,9 +789,9 @@ pub struct KeyMetadata {
     /// Key description
     pub description: Option<String>,
     /// Key creation timestamp
-    pub creation_date: Zoned,
+    pub creation_date: ZonedDateTime,
     /// Key deletion timestamp
-    pub deletion_date: Option<Zoned>,
+    pub deletion_date: Option<ZonedDateTime>,
     /// Key origin
     pub origin: String,
     /// Key manager

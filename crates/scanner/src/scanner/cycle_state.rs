@@ -653,7 +653,7 @@ pub(super) fn record_scanner_cycle_recovery_retry(attempt: u32, cycle_interval: 
 }
 
 fn unix_now_secs() -> u64 {
-    u64::try_from(Utc::now().timestamp()).unwrap_or(0)
+    u64::try_from(Timestamp::now().as_second()).unwrap_or(0)
 }
 
 pub(super) fn sha256_hex(parts: &[&[u8]]) -> String {

@@ -2446,7 +2446,7 @@ async fn start_http_server_inner(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip_str}:{local_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{local_port}");
-    let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
+    let now_time = jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if config.console_enable {
         admin::console::init_console_cfg(local_ip, local_port);
         let console_prefix = crate::server::console_prefix();

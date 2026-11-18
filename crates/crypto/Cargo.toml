@@ -36,7 +36,7 @@ jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 base64-simd = { workspace = true }
 pbkdf2 = { workspace = true, optional = true }
 rand = { workspace = true, features = ["serde"] }
-rsa = { workspace = true, features = ["sha2"] }
+rsa = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true, optional = true }
 thiserror.workspace = true

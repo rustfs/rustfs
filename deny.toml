@@ -26,6 +26,19 @@ ignore = [
     # in-process RSA decryption oracles are removed.
     # owner: rustfs-maintainers  review: 2026-07
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel; no fixed upstream version; tracked separately" },
+    # `chrono` is retained only at compatibility boundaries while the project
+    # migrates its internal time model to jiff. The advisory reports no safe
+    # upgrade for any chrono release.
+    # owner: rustfs-maintainers  review: 2026-11
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; temporary exception during jiff migration" },
+    # `chrono-tz` is retained by a narrow compatibility path during the same
+    # migration and has no safe upstream upgrade.
+    # owner: rustfs-maintainers  review: 2026-11
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained; temporary exception during jiff migration" },
+    # humantime wraps chrono and is retained transitively while the chrono
+    # graph is being removed.
+    # owner: rustfs-maintainers  review: 2026-11
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained through chrono; temporary exception during jiff migration" },
 ]
 
 [sources]
