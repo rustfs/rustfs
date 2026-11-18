@@ -59,8 +59,7 @@ use super::storage_api::multipart_usecase::options::{
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
-    ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-    parse_upload_part_number,
+    ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
@@ -90,9 +89,10 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
 use crate::app::table_list_isolation;
+#[cfg(test)]
+use crate::auth::VerifiedPresignedRequest;
 use crate::auth::{
-    VerifiedPresignedRequest, VerifiedSigV4Request, parse_presigned_multipart_max_total_object_size,
-    reject_presigned_multipart_max_total_object_size_for_other_operation,
+    parse_presigned_multipart_max_total_object_size, reject_presigned_multipart_max_total_object_size_for_other_operation,
     reject_presigned_put_max_content_length_for_other_operation,
 };
 use crate::capacity::record_capacity_write;
@@ -103,7 +103,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Uri};
 use metrics::counter;
-use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -127,15 +126,20 @@ use urlencoding::encode;
 use uuid::Uuid;
 
 mod abort;
+pub(crate) use abort::{AbortMultipartUploadTarget, reject_abort_capabilities};
 mod complete;
 mod create;
 mod create_values;
 pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
+#[cfg(feature = "gateway-stack")]
+pub(crate) use list::ListPartsInfo;
+pub(crate) use list::{ListPartsFields, ListPartsTarget};
 #[cfg(test)]
 mod test_support;
 mod upload_part;
 mod upload_part_copy;
+pub(crate) use upload_part_copy::{UploadPartCopyWriteInput, UploadPartCopyWriteOutput};
 mod upload_values;
 pub(crate) use upload_values::{UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput};
 

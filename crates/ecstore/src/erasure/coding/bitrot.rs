@@ -303,6 +303,24 @@ fn log_read_error(error: &std::io::Error) {
     }
 }
 
+/// Verify one borrowed `[hash][data]` frame before exposing its payload.
+/// A short digest prefix and a digest mismatch both fail without copying data.
+pub(crate) fn verified_bitrot_frame<'a>(
+    hash_algo: &HashAlgorithm,
+    skip_verify: bool,
+    block: &'a [u8],
+) -> std::io::Result<&'a [u8]> {
+    let hash_size = hash_algo.size();
+    if block.len() < hash_size {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot frame digest"));
+    }
+    let (hash, data) = block.split_at(hash_size);
+    if !skip_verify && hash_algo.hash_encode(data).as_ref() != hash {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
+    }
+    Ok(data)
+}
+
 /// Split a `[hash][data]` block, verify the hash (unless `skip_verify`), and
 /// return the data slice plus the time spent hashing. The caller writes `data`
 /// into its sink **only after** this returns `Ok`, so a shard that fails the
@@ -310,17 +328,13 @@ fn log_read_error(error: &std::io::Error) {
 /// rather than stored so this stays a free function usable while `self` is
 /// borrowed for the block.
 fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a [u8]) -> std::io::Result<(&'a [u8], Duration)> {
-    let (hash, data) = block.split_at(hash_algo.size());
-    if skip_verify {
-        return Ok((data, Duration::ZERO));
-    }
-    let verify_start = std::time::Instant::now();
-    let actual_hash = hash_algo.hash_encode(data);
-    let verify = verify_start.elapsed();
-    if actual_hash.as_ref() != hash {
-        log_hash_mismatch(data.len());
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
-    }
+    let verify_start = (!skip_verify).then(std::time::Instant::now);
+    let data = verified_bitrot_frame(hash_algo, skip_verify, block).inspect_err(|err| {
+        if err.kind() == std::io::ErrorKind::InvalidData {
+            log_hash_mismatch(block.len().saturating_sub(hash_algo.size()));
+        }
+    })?;
+    let verify = verify_start.map_or(Duration::ZERO, |start| start.elapsed());
     Ok((data, verify))
 }
 
@@ -965,10 +979,11 @@ pub struct InlineBuffer {
     foreground: Vec<u8>,
     background: Option<crate::disk::background_memory::BackgroundBuffer>,
     filled: usize,
+    max_len: Option<usize>,
 }
 
 impl InlineBuffer {
-    fn new() -> Self {
+    fn new(max_len: Option<usize>) -> Self {
         let background = crate::disk::current_resource_unit()
             .and_then(|unit| unit.memory_budget())
             .map(|budget| crate::disk::background_memory::BackgroundBuffer::new(Some(budget)));
@@ -976,6 +991,7 @@ impl InlineBuffer {
             foreground: Vec::new(),
             background,
             filled: 0,
+            max_len,
         }
     }
 
@@ -990,10 +1006,22 @@ impl InlineBuffer {
         let total = bufs
             .iter()
             .try_fold(0usize, |length, buf| length.checked_add(buf.len()).ok_or(std::io::ErrorKind::OutOfMemory))?;
+        let length = self
+            .as_slice()
+            .len()
+            .checked_add(total)
+            .ok_or(std::io::ErrorKind::OutOfMemory)?;
+        if self.max_len.is_some_and(|limit| length > limit) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "inline shard exceeds its admitted buffer limit",
+            ));
+        }
         if let Some(buffer) = &mut self.background {
-            let length = self.filled.checked_add(total).ok_or(std::io::ErrorKind::OutOfMemory)?;
             if length > buffer.as_slice().len() {
-                let capacity = buffer.as_slice().len().checked_mul(2).unwrap_or(length).max(length);
+                let capacity = self
+                    .max_len
+                    .unwrap_or_else(|| buffer.as_slice().len().checked_mul(2).unwrap_or(length).max(length));
                 // Admission includes both allocations until the prefix has been copied.
                 buffer.grow(capacity, self.filled)?;
             }
@@ -1004,6 +1032,13 @@ impl InlineBuffer {
             }
             self.filled = length;
         } else {
+            if let Some(limit) = self.max_len
+                && length > self.foreground.capacity()
+            {
+                self.foreground
+                    .try_reserve_exact(limit - self.foreground.len())
+                    .map_err(std::io::Error::other)?;
+            }
             for buf in bufs {
                 self.foreground.extend_from_slice(buf);
             }
@@ -1022,7 +1057,11 @@ impl InlineBuffer {
 impl CustomWriter {
     /// Create a new inline buffer writer
     pub fn new_inline_buffer() -> Self {
-        Self::InlineBuffer(InlineBuffer::new())
+        Self::InlineBuffer(InlineBuffer::new(None))
+    }
+
+    pub(crate) fn new_bounded_inline_buffer(max_len: usize) -> Self {
+        Self::InlineBuffer(InlineBuffer::new(Some(max_len)))
     }
 
     /// Create a new disk writer from any AsyncWrite implementation
@@ -1474,6 +1513,80 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    #[test]
+    fn borrowed_bitrot_frame_verification_preserves_slices_and_rejects_short_prefixes() {
+        for algo in [
+            HashAlgorithm::HighwayHash256S,
+            HashAlgorithm::HighwayHash256SLegacy,
+            HashAlgorithm::SHA256,
+            HashAlgorithm::None,
+        ] {
+            let payload = b"borrowed frame";
+            let mut frame = algo.hash_encode(payload).as_ref().to_vec();
+            frame.extend_from_slice(payload);
+            let verified = super::verified_bitrot_frame(&algo, false, &frame).expect("valid borrowed frame");
+            assert_eq!(verified, payload);
+            assert_eq!(verified.as_ptr(), frame[algo.size()..].as_ptr());
+            for prefix_len in 0..algo.size() {
+                for skip_verify in [false, true] {
+                    assert_eq!(
+                        super::split_and_verify(&algo, skip_verify, &frame[..prefix_len])
+                            .expect_err("short prefix must be an error")
+                            .kind(),
+                        io::ErrorKind::UnexpectedEof
+                    );
+                }
+            }
+            if algo.size() != 0 {
+                frame[0] ^= 1;
+                assert_eq!(
+                    super::verified_bitrot_frame(&algo, false, &frame)
+                        .expect_err("damaged digest")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    super::verified_bitrot_frame(&algo, true, &frame).expect("explicit diagnostic skip"),
+                    payload
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual ABBA comparison of borrowed and streaming verification kernels"]
+    async fn inline_bitrot_borrowed_verification_benchmark() {
+        let algo = HashAlgorithm::HighwayHash256S;
+        for (part_size, shard_size, iterations) in [(4096, 4096, 20_000), (128 * 1024, 64 * 1024, 2000)] {
+            let data = vec![0x7b; part_size];
+            let mut encoded = Vec::new();
+            for part in data.chunks(shard_size) {
+                encoded.extend_from_slice(algo.hash_encode(part).as_ref());
+                encoded.extend_from_slice(part);
+            }
+            for borrowed in [false, true, true, false] {
+                let start = std::time::Instant::now();
+                for _ in 0..iterations {
+                    let encoded = std::hint::black_box(encoded.as_slice());
+                    if borrowed {
+                        for frame in encoded.chunks(shard_size + algo.size()) {
+                            std::hint::black_box(super::verified_bitrot_frame(&algo, false, frame).expect("borrowed frame"));
+                        }
+                    } else {
+                        bitrot_verify(Cursor::new(encoded), encoded.len(), part_size, algo.clone(), shard_size)
+                            .await
+                            .expect("streamed frame");
+                    }
+                }
+                println!(
+                    "inline_verify debug={} size={part_size} borrowed={borrowed} iterations={iterations} elapsed_ns={}",
+                    cfg!(debug_assertions),
+                    start.elapsed().as_nanos()
+                );
+            }
+        }
+    }
 
     #[test]
     fn bitrot_damage_preserves_typed_repair_evidence() {
@@ -2943,6 +3056,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bounded_inline_buffer_rejects_vectored_overflow_atomically() {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = CustomWriter::new_bounded_inline_buffer(64);
+        writer.write_all(&[7; 32]).await.expect("initial inline prefix");
+        let error = writer
+            .write_vectored(&[IoSlice::new(&[8; 16]), IoSlice::new(&[9; 17])])
+            .await
+            .expect_err("combined vectored data exceeds the bound");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.get_inline_data(), Some(&[7; 32][..]));
+        writer.write_all(&[8; 32]).await.expect("fill exactly to the bound");
+        assert!(writer.write_all(&[1]).await.is_err());
+        if let CustomWriter::InlineBuffer(buffer) = &writer {
+            assert!(buffer.foreground.capacity() <= 64);
+        }
+        assert_eq!(writer.into_inline_data().expect("export bounded bytes").len(), 64);
+    }
+
     mod inline_memory_regressions {
         use super::*;
         use crate::disk::background_memory::is_memory_pressure;
@@ -2955,6 +3087,25 @@ mod tests {
             let (resources, _) = test_resource_units(1);
             with_optional_resource_unit(Some(resources.with_memory_budget(memory)), async { CustomWriter::new_inline_buffer() })
                 .await
+        }
+
+        #[tokio::test]
+        async fn bounded_inline_writer_retains_its_memory_receipt() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(256, Duration::from_secs(30));
+            let (resources, _) = test_resource_units(1);
+            let mut writer = with_optional_resource_unit(Some(resources.with_memory_budget(Arc::clone(&memory))), async {
+                CustomWriter::new_bounded_inline_buffer(64)
+            })
+            .await;
+            writer.write_all(&[3; 32]).await.expect("bounded background write");
+            let bytes = writer.into_inline_data().expect("bounded bytes");
+            let clone = bytes.clone();
+            assert_eq!(memory.snapshot().used, 64);
+            drop(bytes);
+            assert_eq!(memory.snapshot().used, 64);
+            drop(clone);
+            assert_eq!(memory.snapshot().used, 0);
         }
 
         #[tokio::test]

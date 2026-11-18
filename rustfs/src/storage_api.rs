@@ -143,6 +143,7 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
+        #[cfg(test)]
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
@@ -238,8 +239,8 @@ pub(crate) mod server {
             /// The per-batch authorization shapes, one module per migration batch.
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
             pub(crate) use crate::storage::storage_api::access_consumer::{
-                AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
-                authorize_object_request, resolve_req_info,
+                AccessMarkers, ReqInfo, VerifiedSignature, admit_operation, authorize_bucket_config_mutation,
+                authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request, resolve_req_info,
             };
 
             #[cfg(test)]
@@ -251,7 +252,8 @@ pub(crate) mod server {
                 pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
                 pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
-                    FS, StorageObjectOptions as ObjectOptions, get_bucket_metadata, set_bucket_metadata,
+                    FS, StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
+                    set_bucket_metadata,
                 };
                 pub(crate) use s3s::{
                     S3Request,
@@ -471,10 +473,6 @@ pub(crate) mod startup {
 
         pub(crate) mod concurrency {
             pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
-        }
-
-        pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::storage_api::FS;
         }
     }
 

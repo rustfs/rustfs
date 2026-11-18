@@ -25,15 +25,40 @@ use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{MultipartOperations as _, ObjectIO as _};
 
+mod abort;
 mod create;
+mod parts;
 
 pub(crate) const MATRIX: &[MatrixRow] = &[
+    MatrixRow {
+        operation: "AbortMultipartUpload",
+        metric: S3Operation::AbortMultipartUpload,
+        has_error_body: true,
+        call: abort::matrix_abort,
+    },
     MatrixRow {
         operation: "CreateMultipartUpload",
         metric: S3Operation::CreateMultipartUpload,
         has_error_body: true,
         call: |client, bucket| {
-            Box::pin(async move { outcome(client.create_multipart_upload().bucket(bucket).key("matrix").send().await) })
+            Box::pin(async move {
+                let key = "matrix";
+                let response = client.create_multipart_upload().bucket(bucket).key(key).send().await;
+                if let Ok(upload) = &response {
+                    get_global_app_context()
+                        .expect("embedded context")
+                        .object_store()
+                        .abort_multipart_upload(
+                            bucket,
+                            key,
+                            upload.upload_id().expect("matrix upload ID"),
+                            &ObjectOptions::default(),
+                        )
+                        .await
+                        .expect("remove the matrix upload");
+                }
+                outcome(response)
+            })
         },
     },
     MatrixRow {
@@ -60,6 +85,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: list_multipart_uploads,
     },
+    MatrixRow {
+        operation: "ListParts",
+        metric: S3Operation::ListParts,
+        has_error_body: true,
+        call: list_parts,
+    },
 ];
 
 fn list_objects_v2<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -76,6 +107,32 @@ fn list_object_versions<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a
 
 fn list_multipart_uploads<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.list_multipart_uploads().bucket(bucket).send().await) })
+}
+
+fn list_parts<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let key = "matrix-list-parts";
+        let options = ObjectOptions::default();
+        let store = get_global_app_context().expect("embedded context").object_store();
+        let upload = store
+            .new_multipart_upload(bucket, key, &options)
+            .await
+            .expect("stage the matrix session");
+        let answer = outcome(
+            client
+                .list_parts()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload.upload_id)
+                .send()
+                .await,
+        );
+        store
+            .abort_multipart_upload(bucket, key, &upload.upload_id, &options)
+            .await
+            .expect("remove the matrix session");
+        answer
+    })
 }
 
 const LISTED_BUCKET: &str = "gateway-stack-listing";

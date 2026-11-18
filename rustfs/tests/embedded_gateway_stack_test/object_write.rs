@@ -66,16 +66,18 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct WireClient<'a> {
-    endpoint: &'a str,
-    access_key: &'a str,
-    secret_key: &'a str,
+const POST_BOUNDARY: &str = "native-put-form";
+
+pub(super) struct WireClient<'a> {
+    pub(super) endpoint: &'a str,
+    pub(super) access_key: &'a str,
+    pub(super) secret_key: &'a str,
 }
 
-struct WireAnswer {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: String,
+pub(super) struct WireAnswer {
+    pub(super) status: u16,
+    pub(super) headers: BTreeMap<String, String>,
+    pub(super) body: String,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -86,6 +88,31 @@ fn mac(key: &[u8], value: &str) -> Vec<u8> {
     let mut state = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     state.update(value.as_bytes());
     state.finalize().into_bytes().to_vec()
+}
+
+fn parse_wire_answer(raw: Vec<u8>) -> WireAnswer {
+    let raw = String::from_utf8(raw).expect("text fixture response");
+    let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response head");
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .expect("status line")
+        .split_whitespace()
+        .nth(1)
+        .expect("status")
+        .parse()
+        .expect("status number");
+    let headers = lines
+        .map(|line| {
+            let (name, value) = line.split_once(':').expect("response header");
+            (name.to_ascii_lowercase(), value.trim().to_owned())
+        })
+        .collect();
+    WireAnswer {
+        status,
+        headers,
+        body: body.to_owned(),
+    }
 }
 
 impl WireClient<'_> {
@@ -140,31 +167,10 @@ impl WireClient<'_> {
         })
         .await
         .expect("wire request must finish");
-        let raw = String::from_utf8(raw).expect("text fixture response");
-        let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response head");
-        let mut lines = head.split("\r\n");
-        let status = lines
-            .next()
-            .expect("status line")
-            .split_whitespace()
-            .nth(1)
-            .expect("status")
-            .parse()
-            .expect("status number");
-        let headers = lines
-            .map(|line| {
-                let (name, value) = line.split_once(':').expect("response header");
-                (name.to_ascii_lowercase(), value.trim().to_owned())
-            })
-            .collect();
-        WireAnswer {
-            status,
-            headers,
-            body: body.to_owned(),
-        }
+        parse_wire_answer(raw)
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         method: &str,
         path: &str,
@@ -237,27 +243,73 @@ impl WireClient<'_> {
     }
 
     async fn post(&self, bucket: &str, status: Option<&str>, redirect: Option<&str>) -> WireAnswer {
+        let mut fields = vec![("key", "post-object")];
+        fields.extend(status.map(|value| ("success_action_status", value)));
+        fields.extend(redirect.map(|value| ("success_action_redirect", value)));
+        self.post_form(bucket, &fields, &[], true, true).await
+    }
+
+    async fn post_form(
+        &self,
+        bucket: &str,
+        fields: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        known_length: bool,
+        complete: bool,
+    ) -> WireAnswer {
+        self.post_form_contents(bucket, fields, headers, "hello", known_length, complete)
+            .await
+    }
+
+    async fn post_form_contents(
+        &self,
+        bucket: &str,
+        fields: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        contents: &str,
+        known_length: bool,
+        complete: bool,
+    ) -> WireAnswer {
+        let mut body = self.post_prelude(bucket, fields);
+        body.push_str(contents);
+        if complete {
+            body.push_str(&format!("\r\n--{POST_BOUNDARY}--\r\n"));
+        }
+        let mut wire_headers =
+            BTreeMap::from([("content-type".to_owned(), format!("multipart/form-data; boundary={POST_BOUNDARY}"))]);
+        wire_headers.extend(headers.iter().map(|&(name, value)| (name.to_owned(), value.to_owned())));
+        self.exchange(
+            "POST",
+            &format!("/{bucket}"),
+            wire_headers,
+            body.as_bytes(),
+            known_length.then_some(body.len()),
+        )
+        .await
+    }
+
+    fn post_prelude(&self, bucket: &str, fields: &[(&str, &str)]) -> String {
         let format = time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
             .expect("fixed date format");
         let now = time::OffsetDateTime::now_utc();
         let stamp = now.format(&format).expect("form date");
         let scope = format!("{}/us-east-1/s3/aws4_request", &stamp[..8]);
-        let mut fields = BTreeMap::from([
+        let mut form = BTreeMap::from([
             ("bucket".to_owned(), bucket.to_owned()),
-            ("key".to_owned(), "post-object".to_owned()),
             ("x-amz-algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
             ("x-amz-credential".to_owned(), format!("{}/{scope}", self.access_key)),
             ("x-amz-date".to_owned(), stamp.clone()),
         ]);
-        if let Some(status) = status {
-            fields.insert("success_action_status".to_owned(), status.to_owned());
-        }
-        if let Some(redirect) = redirect {
-            fields.insert("success_action_redirect".to_owned(), redirect.to_owned());
-        }
-        let conditions: Vec<_> = fields
+        form.extend(fields.iter().map(|&(name, value)| (name.to_owned(), value.to_owned())));
+        let conditions: Vec<_> = form
             .iter()
-            .map(|(name, value)| serde_json::json!({(name): value}))
+            .map(|(name, value)| {
+                if *name == "key" && value.ends_with("${filename}") {
+                    serde_json::json!(["starts-with", "$key", value.trim_end_matches("${filename}")])
+                } else {
+                    serde_json::json!({(name): value})
+                }
+            })
             .collect();
         let policy = serde_json::json!({
             "expiration": (now + time::Duration::minutes(5)).format(&time::format_description::well_known::Rfc3339).expect("policy expiry"),
@@ -265,24 +317,19 @@ impl WireClient<'_> {
         });
         let encoded = base64_simd::STANDARD.encode_to_string(policy.to_string().as_bytes());
         let signature = hex(&mac(&self.signing_key(&stamp[..8]), &encoded));
-        fields.insert("policy".to_owned(), encoded);
-        fields.insert("x-amz-signature".to_owned(), signature);
-        let boundary = "native-put-form";
+        form.insert("policy".to_owned(), encoded);
+        form.insert("x-amz-signature".to_owned(), signature);
+        if self.access_key.is_empty() {
+            form.retain(|name, _| name == "bucket" || fields.iter().any(|(field, _)| *field == name.as_str()));
+        }
         let mut body = String::new();
-        for (name, value) in fields {
+        for (name, value) in form {
             body.push_str(&format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                "--{POST_BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
             ));
         }
-        body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\nhello\r\n--{boundary}--\r\n"));
-        self.exchange(
-            "POST",
-            &format!("/{bucket}"),
-            BTreeMap::from([("content-type".to_owned(), format!("multipart/form-data; boundary={boundary}"))]),
-            body.as_bytes(),
-            Some(body.len()),
-        )
-        .await
+        body.push_str(&format!("--{POST_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\n"));
+        body
     }
 }
 
@@ -663,3 +710,6 @@ impl WireClient<'_> {
 
 #[path = "upload_part.rs"]
 mod upload_part;
+
+mod post_object;
+pub(super) use post_object::BROWSER_POST;

@@ -476,7 +476,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(current_region)
+        .or_else(|| current_region().map(Into::into))
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -852,7 +852,7 @@ async fn authorize_object_lambda_request(req: &mut S3Request<Body>, bucket: &str
         bucket: Some(bucket.to_owned()),
         object: Some(object.to_owned()),
         version_id: None,
-        region: current_region(),
+        region: current_region().map(Into::into),
         ..Default::default()
     });
 
@@ -886,7 +886,8 @@ async fn authorized_object_lambda_get_request(
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
-    s3s::access::S3Access::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), &mut get_req).await?;
+    let (bucket, key, version) = (get_req.input.bucket.clone(), get_req.input.key.clone(), get_req.input.version_id.clone());
+    crate::admin::storage_api::access::authorize_get_object(&slot, &mut get_req, &bucket, &key, version.as_deref()).await?;
     Ok(get_req)
 }
 
@@ -899,7 +900,19 @@ async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, o
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
-    let get_resp = s3s::S3::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), get_req).await?;
+    let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(slot.app_context());
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+    let envelope = crate::app::RequestEnvelope::from_s3s(&get_req);
+    let crate::app::Answered { output, status, headers } = usecase
+        .execute_get_object_fields(envelope, crate::app::object_usecase::GetObjectFields::from_s3s(get_req.input))
+        .await?;
+    let mut get_resp = S3Response::new(
+        output
+            .into_s3s()
+            .map_err(|error| S3Error::from(crate::app::dto_values::seam_error(error)))?,
+    );
+    get_resp.status = status;
+    get_resp.headers = headers;
     invoke_object_lambda_target(req, bucket, object, get_resp).await
 }
 
@@ -913,6 +926,14 @@ pub struct S3Router<T> {
     server_ctx: Option<Arc<ServerContextSlot>>,
 }
 
+/// Only control-plane routes may share the console's browser origin. Object Lambda and
+/// bucket extensions have dispatch precedence even when their paths resemble console assets.
+pub(crate) fn console_listener_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    is_control_plane_route(method, uri, headers)
+        && parse_object_lambda_request(method, uri).is_none()
+        && s3_extension::route_key(method, uri).is_none()
+}
+
 /// Whether this router answers the request itself rather than an S3 operation: the RustFS extension
 /// routes and every control-plane route.
 #[cfg(feature = "gateway-stack")]
@@ -920,6 +941,44 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
     s3_extension::route_key(method, uri).is_some()
         || parse_object_lambda_request(method, uri).is_some()
         || is_control_plane_route(method, uri, headers)
+}
+
+/// Signed system-status and catalog-configuration reads, after object-lambda routing.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
+    method == Method::GET
+        && matches!(
+            uri.path(),
+            "/rustfs/admin/v3/info"
+                | "/minio/admin/v3/info"
+                | "/rustfs/admin/v3/storageinfo"
+                | "/minio/admin/v3/storageinfo"
+                | "/rustfs/admin/v4/runtime/capabilities"
+                | "/minio/admin/v4/runtime/capabilities"
+                | "/rustfs/admin/v3/object-data-cache/stats"
+                | "/minio/admin/v3/object-data-cache/stats"
+                | "/rustfs/admin/v3/datausageinfo"
+                | "/minio/admin/v3/datausageinfo"
+                | "/rustfs/admin/v4/plugins/catalog"
+                | "/minio/admin/v4/plugins/catalog"
+                | "/rustfs/admin/v4/cluster/snapshot"
+                | "/minio/admin/v4/cluster/snapshot"
+                | "/rustfs/admin/v4/extensions/catalog"
+                | "/minio/admin/v4/extensions/catalog"
+                | "/rustfs/admin/v3/module-switches"
+                | "/minio/admin/v3/module-switches"
+                | "/iceberg/v1/config"
+                | "/_iceberg/v1/config"
+        )
+        && parse_object_lambda_request(method, uri).is_none()
+}
+
+/// Console paths whose requests do not belong to an earlier extension route.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_native_console_route(method: &Method, uri: &Uri) -> bool {
+    is_console_path(uri.path())
+        && parse_object_lambda_request(method, uri).is_none()
+        && s3_extension::route_key(method, uri).is_none()
 }
 
 fn is_public_health_path(path: &str) -> bool {
@@ -2033,7 +2092,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: current_region(),
+            region: current_region().map(Into::into),
             service: None,
             trailing_headers: None,
         };

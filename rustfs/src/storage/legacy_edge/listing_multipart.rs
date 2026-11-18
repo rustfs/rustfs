@@ -23,10 +23,10 @@
 //! operations onto the gateway owns this file and is the only one that edits it.
 
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api::bucket::encode_list_output_value;
 use crate::storage::s3_api::{
-    self, CreateMultipartUploadFields, DefaultMultipartUsecase, mark_on_demand_migration_list_local_only,
+    self, AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
+    mark_on_demand_migration_list_local_only, multipart::build_list_parts_output, reject_abort_capabilities,
 };
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
     list_multipart_uploads, list_object_versions, list_objects, list_objects_v2,
@@ -86,8 +86,18 @@ impl FS {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let usecase = s3_api::multipart_usecase_for(self);
-        audit_only_operation(req, S3Operation::AbortMultipartUpload, |req| usecase.execute_abort_multipart_upload(req)).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let target = reject_abort_capabilities(&envelope).map(|()| {
+            record_s3_op(S3Operation::AbortMultipartUpload);
+            let AbortMultipartUploadInput {
+                bucket, key, upload_id, ..
+            } = req.input;
+            AbortMultipartUploadTarget::Legacy { bucket, key, upload_id }
+        });
+        s3_api::multipart_usecase_for(self)
+            .execute_abort_multipart_upload(envelope, target)
+            .await?;
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
     #[instrument(name = "create_multipart_upload", level = "debug", skip(self, req))]
@@ -178,7 +188,22 @@ impl FS {
     ) -> S3Result<S3Response<ListPartsOutput>> {
         record_s3_op(S3Operation::ListParts);
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_list_parts(req).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let ListPartsInput {
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            ..
+        } = req.input;
+        let fields = ListPartsFields {
+            target: ListPartsTarget::Legacy { bucket, key, upload_id },
+            part_number_marker: part_number_marker.map(|marker| marker.to_string()),
+            max_parts,
+        };
+        let page = usecase.execute_list_parts(envelope, fields).await?;
+        Ok(S3Response::new(build_list_parts_output(page)))
     }
 }
 

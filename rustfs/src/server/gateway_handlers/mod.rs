@@ -15,7 +15,7 @@
 //! The S3 operations the gateway stack serves, and the one way an operation is served
 //! (rustfs/backlog#2734).
 //!
-//! Responsible for: [`Served`], what one operation supplies; the only `impl Handler` in RustFS,
+//! Responsible for: [`Served`], what one operation supplies; the S3 `impl Handler`,
 //! which runs every request through the same sequence; and [`OPERATIONS`], the table that both
 //! registers the handlers and is what the gateway's early gate consults. An operation without a
 //! row has no handler, and the gateway answers it `501 NotImplemented`.
@@ -23,8 +23,8 @@
 //! routing a request (the gateway), or any S3 behaviour (the use cases in `crate::app`).
 //! Upstream: the gateway's dispatch. Downstream: `crate::app` use cases.
 //!
-//! An operation is one `impl Served` and one row of `ROWS` in the family file named after its
-//! migration batch, the stem `storage/legacy_edge/` uses for the same operations.
+//! Every operation has one `ROWS` entry. Standard operations implement `Served`; browser POST
+//! uses the gateway’s two-stage PostObject registration.
 
 mod access;
 mod envelope;
@@ -41,11 +41,15 @@ mod object_meta;
 mod object_misc;
 mod object_read;
 mod object_write;
+#[cfg(test)]
+mod post_archive_diagnostic_tests;
+mod post_object;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use self::error::handler_error;
+pub(super) use self::access::verified_signature;
+pub(super) use self::error::handler_error;
 use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use rustfs_gateway::{Handler, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};

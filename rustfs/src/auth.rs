@@ -269,6 +269,20 @@ fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
     s3_error!(InternalError, "IAM user lookup failed")
 }
 
+/// Owner status of a validated Keystone identity, shared by both request edges.
+pub(crate) fn keystone_is_owner(credentials: &Credentials) -> bool {
+    credentials
+        .claims
+        .as_ref()
+        .and_then(|claims| claims.get("keystone_roles"))
+        .and_then(|roles| roles.as_array())
+        .is_some_and(|roles| {
+            roles
+                .iter()
+                .any(|role| matches!(role.as_str(), Some("admin" | "reseller_admin")))
+        })
+}
+
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
 pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
     check_key_valid_with_context(session_token, access_key, None).await
@@ -338,20 +352,7 @@ pub async fn check_key_valid_with_context(
             "Keystone task-local credentials validated"
         );
 
-        // Determine if user is admin (owner-level access)
-        // Users with "admin" or "reseller_admin" role have owner permissions
-        // Roles are stored in claims["keystone_roles"] by the middleware
-        let is_owner = credentials
-            .claims
-            .as_ref()
-            .and_then(|claims| claims.get("keystone_roles"))
-            .and_then(|roles| roles.as_array())
-            .map(|roles| {
-                roles
-                    .iter()
-                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
-            })
-            .unwrap_or(false);
+        let is_owner = keystone_is_owner(&credentials);
 
         debug!(
             event = EVENT_KEYSTONE_CREDENTIALS_VALIDATED,
@@ -600,7 +601,7 @@ pub fn get_condition_values(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
     get_condition_values_with_client_info(header, cred, version_id, region, remote_addr, None)
@@ -611,7 +612,7 @@ pub fn get_condition_values_with_client_info(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
     client_info: Option<&ClientInfo>,
 ) -> HashMap<String, Vec<String>> {
@@ -634,7 +635,7 @@ pub fn get_condition_values_with_query(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
     query: Option<&str>,
 ) -> HashMap<String, Vec<String>> {
@@ -648,7 +649,7 @@ fn condition_values(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
     query: Option<&str>,
     client_info: Option<&ClientInfo>,
@@ -3547,7 +3548,7 @@ pub(crate) mod legacy_condition_oracle {
         header: &HeaderMap,
         cred: &Credentials,
         version_id: Option<&str>,
-        region: Option<s3s::region::Region>,
+        region: Option<rustfs_s3_types::Region>,
         remote_addr: Option<SocketAddr>,
         query: Option<&str>,
         client_info: Option<&ClientInfo>,

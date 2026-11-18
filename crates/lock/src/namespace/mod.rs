@@ -89,6 +89,18 @@ impl NamespaceLockWrapper {
         self.lock.get_read_lock(self.resource.clone(), &self.owner, timeout).await
     }
 
+    /// Acquire a shared lock and request cache-fence proof from capable voters.
+    /// Lock admission is unchanged; legacy or insufficient proof is represented
+    /// by [`NamespaceLockGuard::cache_fence_proof`] returning `None`.
+    pub async fn get_read_lock_with_cache_fence(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        self.lock
+            .get_read_lock_with_cache_fence(self.resource.clone(), &self.owner, timeout)
+            .await
+    }
+
     /// Acquire write locks for `resources` in one batched round using this
     /// wrapper's owner; see [`NamespaceLock::acquire_write_locks_batch`].
     /// One guard or error per resource, in `resources` order.
@@ -106,6 +118,15 @@ impl NamespaceLockGuard {
     pub fn lock_id(&self) -> Option<&LockId> {
         match self {
             Self::Standard(guard) => Some(guard.lock_id()),
+            Self::Fast(_) => None,
+        }
+    }
+
+    /// Read-quorum cache-fence proof supplied by distributed lock voters.
+    /// Local fast locks and mixed/legacy cohorts return `None`.
+    pub fn cache_fence_proof(&self) -> Option<&crate::CacheFenceProof> {
+        match self {
+            Self::Standard(guard) => guard.cache_fence_proof(),
             Self::Fast(_) => None,
         }
     }
@@ -298,6 +319,27 @@ impl NamespaceLock {
         }
     }
 
+    /// Convenience: acquire a shared guard with optional cache-fence proof.
+    /// Missing proof never changes whether the underlying lock reaches quorum.
+    pub async fn rlock_guard_with_cache_fence(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Result<Option<NamespaceLockGuard>> {
+        match self {
+            Self::Distributed(lock) => lock
+                .rlock_guard_with_cache_fence(resource, owner, timeout, ttl)
+                .await
+                .map(|opt| opt.map(NamespaceLockGuard::Standard)),
+            Self::Local(lock) => lock
+                .rlock_guard(resource, owner, timeout, ttl)
+                .await
+                .map(|opt| opt.map(NamespaceLockGuard::Fast)),
+        }
+    }
+
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(
@@ -357,6 +399,23 @@ impl NamespaceLock {
             Ok(Some(guard)) => Ok(guard),
             Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Acquire a shared lock while requesting a cache-fence proof from the
+    /// existing distributed quorum. Missing proof never changes lock success.
+    pub async fn get_read_lock_with_cache_fence(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        let resource_str = format!("{}", resource);
+        match self.rlock_guard_with_cache_fence(resource, owner, timeout, ttl).await {
+            Ok(Some(guard)) => Ok(guard),
+            Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+            Err(error) => Err(error),
         }
     }
 

@@ -166,7 +166,7 @@ pub fn action_credentials() -> Option<Credentials> {
     get_global_action_cred()
 }
 
-pub fn region() -> Option<s3s::region::Region> {
+pub fn region() -> Option<rustfs_s3_types::Region> {
     get_global_region()
 }
 

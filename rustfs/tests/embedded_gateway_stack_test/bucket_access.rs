@@ -20,7 +20,7 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::put_bucket_versioning::{
     PutBucketVersioningError, PutBucketVersioningOutput, builders::PutBucketVersioningFluentBuilder,
 };
-use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::types::{AccessControlPolicy, BucketCannedAcl, BucketVersioningStatus, VersioningConfiguration};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
@@ -58,12 +58,75 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: get_bucket_acl,
     },
     MatrixRow {
+        operation: "PutBucketAcl",
+        metric: S3Operation::PutBucketAcl,
+        has_error_body: true,
+        call: put_bucket_acl,
+    },
+    MatrixRow {
         operation: "GetBucketNotificationConfiguration",
         metric: S3Operation::GetBucketNotificationConfiguration,
         has_error_body: true,
         call: get_bucket_notification,
     },
+    MatrixRow {
+        operation: "PutBucketNotificationConfiguration",
+        metric: S3Operation::PutBucketNotificationConfiguration,
+        has_error_body: true,
+        call: put_empty_bucket_notification,
+    },
+    MatrixRow {
+        operation: "PutBucketPolicy",
+        metric: S3Operation::PutBucketPolicy,
+        has_error_body: true,
+        call: put_bucket_policy,
+    },
+    MatrixRow {
+        operation: "DeleteBucketPolicy",
+        metric: S3Operation::DeleteBucketPolicy,
+        has_error_body: true,
+        call: delete_bucket_policy,
+    },
 ];
+
+fn put_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    use md5::{Digest as _, Md5};
+
+    Box::pin(async move {
+        let status = super::bucket_configs::StatusCapture::default();
+        let content_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest(INERT_POLICY.as_bytes()));
+        outcome(
+            client
+                .put_bucket_policy()
+                .bucket(bucket)
+                .policy(INERT_POLICY)
+                .content_md5(content_md5)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| assert_eq!(status.take(), Some(204))),
+        )
+    })
+}
+
+pub(super) fn delete_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let status = super::bucket_configs::StatusCapture::default();
+        outcome(
+            client
+                .delete_bucket_policy()
+                .bucket(bucket)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| {
+                    assert_eq!(status.take(), Some(204));
+                }),
+        )
+    })
+}
 
 fn get_bucket_versioning<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_versioning().bucket(bucket).send().await) })
@@ -86,6 +149,10 @@ fn get_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, O
 
 fn get_bucket_policy_status<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_policy_status().bucket(bucket).send().await) })
+}
+
+fn put_bucket_acl<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.put_bucket_acl().bucket(bucket).send().await) })
 }
 
 fn get_bucket_acl<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -262,6 +329,82 @@ fn the_gateway_stack_answers_the_bucket_acl() {
 #[test]
 fn the_legacy_stack_answers_the_bucket_acl() {
     with_stack(LEGACY, get_bucket_acl_answers_the_owner_with_full_control);
+}
+
+async fn bucket_acl_mutations(server: RustFSServer) {
+    use super::{USER_SECRET_KEY, anonymous_client, create_user_allowed_on_one_bucket};
+
+    const BUCKET: &str = "bucket-acl-write-s3alias";
+    const OTHER: &str = "bucket-acl-write-other";
+    const MISSING: &str = "bucket-acl-write-missing";
+    const WRITER: &str = "bucketaclwriter";
+    const READER: &str = "bucketaclreader";
+    const UNSUPPORTED: &str = "ACL XML grants are not supported; use canned ACL headers or omit ACL";
+
+    for bucket in [BUCKET, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketAcl", BUCKET).await;
+    create_user_allowed_on_one_bucket(READER, "s3:GetBucketAcl", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+    let anonymous = anonymous_client(&endpoint).await;
+
+    let before = root.get_bucket_acl().bucket(BUCKET).send().await.expect("original ACL");
+    assert_eq!(put_bucket_acl(&writer, BUCKET).await, Ok(()));
+    writer
+        .put_bucket_acl()
+        .bucket(BUCKET)
+        .acl(BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .expect("accept canned ACL header");
+    writer
+        .put_bucket_acl()
+        .bucket(BUCKET)
+        .grant_read("id=\"fixture-owner\"")
+        .send()
+        .await
+        .expect("accept grant header");
+
+    for (client, bucket) in [(&writer, OTHER), (&reader, BUCKET), (&anonymous, BUCKET)] {
+        let err = put_bucket_acl(client, bucket).await.expect_err("permission required");
+        assert_eq!((err.code.as_deref(), err.status), (Some("AccessDenied"), Some(403)));
+    }
+    for (client, bucket, expected) in [
+        (&writer, BUCKET, ("NotImplemented", 501)),
+        (&root, MISSING, ("NoSuchBucket", 404)),
+        (&reader, BUCKET, ("AccessDenied", 403)),
+    ] {
+        let error = client
+            .put_bucket_acl()
+            .bucket(bucket)
+            .access_control_policy(AccessControlPolicy::builder().build())
+            .send()
+            .await
+            .expect_err("XML policy");
+        assert_eq!(refusal(&error), (Some(expected.0.to_owned()), Some(expected.1)));
+        if expected.1 == 501 {
+            assert_eq!(error.as_service_error().and_then(|error| error.meta().message()), Some(UNSUPPORTED));
+        }
+    }
+    let after = root.get_bucket_acl().bucket(BUCKET).send().await.expect("current ACL");
+    assert_eq!(after.owner(), before.owner());
+    assert_eq!(after.grants(), before.grants());
+
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_preserves_bucket_acl_write_behavior() {
+    with_stack(GATEWAY, bucket_acl_mutations);
+}
+
+#[test]
+fn the_legacy_stack_preserves_bucket_acl_write_behavior() {
+    with_stack(LEGACY, bucket_acl_mutations);
 }
 
 const QUEUE_NOTIFICATION: &str = r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><QueueConfiguration><Id>a2-queue</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#;
@@ -564,4 +707,283 @@ fn legacy_put_versioning_preserves_refusal_order_and_stored_bytes() {
 #[test]
 fn gateway_put_versioning_preserves_refusal_order_and_stored_bytes() {
     with_stack(GATEWAY, versioning_writes_preserve_refusal_order_and_stored_bytes);
+}
+
+pub(super) fn with_notification_stack<F, Fut>(stack: Option<&'static str>, test: F)
+where
+    F: FnOnce(RustFSServer) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind webhook fixture");
+    listener.set_nonblocking(true).expect("set webhook listener nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("webhook fixture address"));
+    temp_env::with_var(rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS, Some(endpoint.clone()), || {
+        with_stack(stack, move |server| async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("register webhook listener");
+            let router = axum::Router::new().route("/", axum::routing::get(|| async { http::StatusCode::OK }));
+            let health = tokio::spawn(async move { axum::serve(listener, router).await.expect("serve webhook fixture") });
+            let queue = tempfile::tempdir().expect("webhook queue");
+            let mut target = rustfs_config::server_config::KVS::new();
+            target.insert(rustfs_config::ENABLE_KEY.to_owned(), "on".to_owned());
+            target.insert(rustfs_config::WEBHOOK_ENDPOINT.to_owned(), endpoint);
+            target.insert(
+                rustfs_config::WEBHOOK_QUEUE_DIR.to_owned(),
+                queue.path().to_str().expect("valid queue path").to_owned(),
+            );
+            let notify = rustfs_notify::notification_system().expect("embedded notification runtime");
+            let mut config = notify.config_snapshot().await;
+            config
+                .0
+                .entry(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS.to_owned())
+                .or_default()
+                .insert("notification-http".to_owned(), target);
+            notify
+                .set_targets_enabled(true, Some(config))
+                .await
+                .expect("register loopback webhook target");
+            assert!(
+                notify
+                    .get_active_targets()
+                    .await
+                    .iter()
+                    .any(|target| target.id == "notification-http")
+            );
+            test(server).await;
+            health.abort();
+        });
+    });
+}
+
+fn put_empty_bucket_notification<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(put_notification(client, bucket).send().await) })
+}
+
+const EMPTY_NOTIFICATION: &str = "<NotificationConfiguration></NotificationConfiguration>";
+const EVENT_BRIDGE_NOTIFICATION: &str =
+    "<NotificationConfiguration><EventBridgeConfiguration></EventBridgeConfiguration></NotificationConfiguration>";
+
+fn put_notification(
+    client: &Client,
+    bucket: &str,
+) -> aws_sdk_s3::operation::put_bucket_notification_configuration::builders::PutBucketNotificationConfigurationFluentBuilder {
+    client
+        .put_bucket_notification_configuration()
+        .bucket(bucket)
+        .notification_configuration(aws_sdk_s3::types::NotificationConfiguration::builder().build())
+}
+
+async fn put_notification_document(
+    client: &Client,
+    bucket: &str,
+    document: &'static str,
+) -> Result<
+    aws_sdk_s3::operation::put_bucket_notification_configuration::PutBucketNotificationConfigurationOutput,
+    Box<SdkError<aws_sdk_s3::operation::put_bucket_notification_configuration::PutBucketNotificationConfigurationError>>,
+> {
+    use md5::{Digest as _, Md5};
+
+    let content_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest(document.as_bytes()));
+    put_notification(client, bucket)
+        .customize()
+        .mutate_request(move |request| {
+            *request.body_mut() = aws_smithy_types::body::SdkBody::from(document);
+            let headers = request.headers_mut();
+            headers.remove("content-length");
+            headers.remove("x-amz-sdk-checksum-algorithm");
+            headers.remove("x-amz-checksum-crc32");
+            headers.insert("content-md5", content_md5.clone());
+        })
+        .send()
+        .await
+        .map_err(Box::new)
+}
+
+async fn stored_notification(bucket: &str) -> Vec<u8> {
+    rustfs_ecstore::api::bucket::metadata_sys::get_config_from_disk(bucket)
+        .await
+        .expect("bucket metadata on disk")
+        .notification_config_xml
+}
+
+async fn notification_writes_preserve_authorization_and_stored_bytes(server: RustFSServer) {
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
+
+    const ALLOWED: &str = "notification-put-allowed";
+    const READABLE: &str = "notification-put-readable";
+    const MISSING: &str = "notification-put-missing";
+    const WRITER: &str = "notificationwriter";
+    const READER: &str = "notificationreader";
+    const NO_POLICY: &str = "notificationnopolicy";
+    const DENIED: &str = "notificationexplicitdeny";
+
+    for bucket in [ALLOWED, READABLE, "sthree-x", "a-s3alias"] {
+        create_bucket_in_the_store(bucket).await;
+        store_bucket_config(bucket, "notification.xml", EMPTY_NOTIFICATION).await;
+    }
+    super::create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketNotification", ALLOWED).await;
+    super::create_user_allowed_on_one_bucket(READER, "s3:GetBucketNotification", READABLE).await;
+    super::create_user_without_a_policy(NO_POLICY).await;
+    super::create_user_without_a_policy(DENIED).await;
+    let policy = rustfs_policy::policy::Policy::parse_config(
+        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutBucketNotification"],"Resource":["arn:aws:s3:::notification-put-readable"]},{"Effect":"Deny","Action":["s3:PutBucketNotification"],"Resource":["arn:aws:s3:::notification-put-readable"]}]}"#,
+    ).expect("parse explicit deny");
+    let iam = get_global_app_context().expect("embedded server context").iam().handle();
+    iam.set_policy(DENIED, policy).await.expect("store policy");
+    iam.policy_db_set(DENIED, rustfs_iam::store::UserType::Reg, false, DENIED)
+        .await
+        .expect("attach policy");
+
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, super::USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, super::USER_SECRET_KEY);
+    let unprivileged = s3_client(&endpoint, NO_POLICY, super::USER_SECRET_KEY);
+    let denied = s3_client(&endpoint, DENIED, super::USER_SECRET_KEY);
+
+    let metric = S3Operation::PutBucketNotificationConfiguration.as_str();
+    let handled = || {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .iter()
+            .find(|counter| counter.op == metric)
+            .map_or(0, |counter| counter.total)
+    };
+    let handled_before = handled();
+    let before = super::s3_request_counts();
+    put_notification_document(&writer, ALLOWED, EVENT_BRIDGE_NOTIFICATION)
+        .await
+        .expect("authorized notification update");
+    assert_eq!(stored_notification(ALLOWED).await, EVENT_BRIDGE_NOTIFICATION.as_bytes());
+    assert_eq!(super::counted_since(&before), [(("PUT", metric, "2xx"), 1)].into());
+    assert_eq!(handled() - handled_before, 1, "the admitted edge counts once");
+    let stored = root
+        .get_bucket_notification_configuration()
+        .bucket(ALLOWED)
+        .send()
+        .await
+        .expect("Get after Put");
+    assert!(stored.event_bridge_configuration().is_some());
+
+    reader
+        .get_bucket_notification_configuration()
+        .bucket(READABLE)
+        .send()
+        .await
+        .expect("reader can Get");
+    const BAD_FILTER: &str = "<NotificationConfiguration><QueueConfiguration><Id>queue</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>../secret</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>";
+    for (client, bucket, document) in [
+        (&reader, READABLE, EVENT_BRIDGE_NOTIFICATION),
+        (&reader, READABLE, BAD_FILTER),
+        (&unprivileged, READABLE, EVENT_BRIDGE_NOTIFICATION),
+        (&denied, READABLE, EVENT_BRIDGE_NOTIFICATION),
+        (&reader, MISSING, EVENT_BRIDGE_NOTIFICATION),
+    ] {
+        let before = super::s3_request_counts();
+        let handled_before = handled();
+        let result = put_notification_document(client, bucket, document).await;
+        if bucket == READABLE {
+            assert_eq!(stored_notification(bucket).await, EMPTY_NOTIFICATION.as_bytes());
+        }
+        assert_eq!(
+            refusal(result.expect_err(bucket).as_ref()),
+            (Some("AccessDenied".into()), Some(403)),
+            "{bucket}"
+        );
+        let counts = super::counted_since(&before);
+        assert_eq!(counts.len(), 1, "{bucket}: {counts:?}");
+        assert_eq!(counts.values().sum::<u64>(), 1, "{bucket}: {counts:?}");
+        assert!(
+            counts
+                .keys()
+                .all(|(method, _, outcome)| *method == "PUT" && *outcome == "4xx")
+        );
+        assert_eq!(handled(), handled_before);
+    }
+
+    let before = super::s3_request_counts();
+    let handled_before = handled();
+    let invalid = put_notification_document(&root, READABLE, BAD_FILTER)
+        .await
+        .expect_err("invalid filter");
+    assert_eq!(refusal(invalid.as_ref()), (Some("InvalidArgument".into()), Some(400)));
+    assert_eq!(
+        invalid.message(),
+        Some("invalid notification filter value (len=9) (QueueConfiguration id=queue)")
+    );
+    assert_eq!(stored_notification(READABLE).await, EMPTY_NOTIFICATION.as_bytes());
+    assert_eq!(super::counted_since(&before), [(("PUT", metric, "4xx"), 1)].into());
+    assert_eq!(handled() - handled_before, 1, "the admitted edge counts once");
+
+    for bucket in ["sthree-x", "a-s3alias"] {
+        put_notification_document(&root, bucket, EVENT_BRIDGE_NOTIFICATION)
+            .await
+            .expect(bucket);
+        assert_eq!(stored_notification(bucket).await, EVENT_BRIDGE_NOTIFICATION.as_bytes());
+    }
+    server.shutdown().await;
+}
+
+#[test]
+fn legacy_put_notification_preserves_authorization_and_stored_bytes() {
+    with_notification_stack(LEGACY, notification_writes_preserve_authorization_and_stored_bytes);
+}
+
+#[test]
+fn gateway_put_notification_preserves_authorization_and_stored_bytes() {
+    with_notification_stack(GATEWAY, notification_writes_preserve_authorization_and_stored_bytes);
+}
+
+#[test]
+fn gateway_put_notification_rejects_get_only_before_writing() {
+    with_notification_stack(GATEWAY, |server| async move {
+        const BUCKET: &str = "notification-get-only";
+        const READER: &str = "notificationgetonly";
+        create_bucket_in_the_store(BUCKET).await;
+        store_bucket_config(BUCKET, "notification.xml", EMPTY_NOTIFICATION).await;
+        super::create_user_allowed_on_one_bucket(READER, "s3:GetBucketNotification", BUCKET).await;
+        let reader = s3_client(&server.endpoint(), READER, super::USER_SECRET_KEY);
+        reader
+            .get_bucket_notification_configuration()
+            .bucket(BUCKET)
+            .send()
+            .await
+            .expect("the Get-only principal can read this bucket");
+        let result = put_notification_document(&reader, BUCKET, EVENT_BRIDGE_NOTIFICATION).await;
+        assert_eq!(
+            stored_notification(BUCKET).await,
+            EMPTY_NOTIFICATION.as_bytes(),
+            "a Get-only principal must not change stored notification bytes"
+        );
+        assert_eq!(
+            refusal(result.expect_err("Get-only Put must be denied").as_ref()),
+            (Some("AccessDenied".into()), Some(403))
+        );
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn gateway_put_notification_rejects_other_bucket_writer_before_writing() {
+    with_notification_stack(GATEWAY, |server| async move {
+        const ALLOWED: &str = "notification-scope-allowed";
+        const DENIED: &str = "notification-scope-denied";
+        const WRITER: &str = "notificationscopewriter";
+        for bucket in [ALLOWED, DENIED] {
+            create_bucket_in_the_store(bucket).await;
+            store_bucket_config(bucket, "notification.xml", EMPTY_NOTIFICATION).await;
+        }
+        super::create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketNotification", ALLOWED).await;
+        let writer = s3_client(&server.endpoint(), WRITER, super::USER_SECRET_KEY);
+        let result = put_notification_document(&writer, DENIED, EVENT_BRIDGE_NOTIFICATION).await;
+        assert_eq!(
+            stored_notification(DENIED).await,
+            EMPTY_NOTIFICATION.as_bytes(),
+            "permission on another bucket must not allow changing this bucket"
+        );
+        assert_eq!(
+            refusal(result.expect_err("another bucket's writer must be denied").as_ref()),
+            (Some("AccessDenied".into()), Some(403))
+        );
+        assert_eq!(stored_notification(ALLOWED).await, EMPTY_NOTIFICATION.as_bytes());
+        server.shutdown().await;
+    });
 }
