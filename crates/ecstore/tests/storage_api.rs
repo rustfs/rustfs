@@ -94,3 +94,8 @@ pub(crate) mod pinned_erasure_fixtures {
         storage::init_local_disks_with_instance_ctx,
     };
 }
+
+pub(crate) mod local_drive_retirement {
+    pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::Disk;
+}
