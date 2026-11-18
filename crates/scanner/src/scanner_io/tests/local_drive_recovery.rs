@@ -185,12 +185,18 @@ async fn issue_9469_binding_rejects_changed_format_identity_and_cancelled_recove
         .into_iter()
         .next()
         .expect("local drive");
-    let current = current_local_scanner_disk(&set, &disk).await.expect("matching drive binding");
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let current = current_local_scanner_disk(&set, &disk, &ctx, &budget)
+        .await
+        .expect("matching drive binding");
     assert!(Arc::ptr_eq(&current, &disk));
     let mut different_format = set.as_ref().clone();
     different_format.format.erasure.sets[0][0] = Uuid::new_v4();
     assert!(
-        current_local_scanner_disk(&different_format, &disk).await.is_none(),
+        current_local_scanner_disk(&different_format, &disk, &ctx, &budget)
+            .await
+            .is_none(),
         "different physical identity cannot resume this slot"
     );
     let ctx = CancellationToken::new();
@@ -200,4 +206,93 @@ async fn issue_9469_binding_rejects_changed_format_identity_and_cancelled_recove
         wait_for_local_scanner_recovery(&set, &disk, &ctx, &budget).await.is_none(),
         "cancelled source must not admit recovery"
     );
+}
+
+tokio::task_local! {
+    static BLOCK_BINDING_PROBE: Arc<tokio::sync::Notify>;
+}
+
+pub(crate) async fn before_binding_probe() {
+    if let Ok(entered) = BLOCK_BINDING_PROBE.try_with(Arc::clone) {
+        entered.notify_one();
+        std::future::pending::<()>().await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BindingStop {
+    Timeout,
+    Cancellation,
+    Budget,
+}
+
+async fn blocked_binding_fixture(stop: BindingStop) {
+    let (_dir, store) = setup_local_scanner_store(1, 1).await;
+    let set = store.pools[0].disk_set[0].clone();
+    let disk = scanner_set_disk_inventory(&set)
+        .await
+        .into_iter()
+        .next()
+        .expect("local drive");
+    // Real filesystem setup completes before using controlled time.
+    tokio::time::pause();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: matches!(stop, BindingStop::Budget).then_some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let started = tokio::time::Instant::now();
+    BLOCK_BINDING_PROBE
+        .scope(entered.clone(), async {
+            let lookup = current_local_scanner_disk(&set, &disk, &ctx, &budget);
+            tokio::pin!(lookup);
+            tokio::select! {
+                biased;
+                _ = &mut lookup => panic!("the controlled probe must block before binding finishes"),
+                _ = entered.notified() => {},
+            }
+            if matches!(stop, BindingStop::Cancellation) {
+                ctx.cancel();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(6), &mut lookup)
+                    .await
+                    .expect("initial binding must stop even when metadata I/O never returns")
+                    .is_none()
+            );
+        })
+        .await;
+    let expected = match stop {
+        BindingStop::Timeout => Duration::from_secs(5),
+        BindingStop::Cancellation => Duration::ZERO,
+        BindingStop::Budget => Duration::from_secs(1),
+    };
+    let elapsed = started.elapsed();
+    // Tokio timers round to millisecond ticks; no wall-clock sleeps are used.
+    assert!(
+        (expected..=expected + Duration::from_millis(1)).contains(&elapsed),
+        "the binding must respect the earliest bound: expected {expected:?}, elapsed {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn issue_9469_initial_binding_metadata_probe_has_a_timeout() {
+    blocked_binding_fixture(BindingStop::Timeout).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn issue_9469_initial_binding_metadata_probe_observes_cancellation() {
+    blocked_binding_fixture(BindingStop::Cancellation).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn issue_9469_initial_binding_metadata_probe_observes_budget() {
+    blocked_binding_fixture(BindingStop::Budget).await;
 }
