@@ -24,11 +24,23 @@
 //! policy, IAM and table-catalog systems.
 
 mod admission;
+mod conditions;
 mod guards;
 mod request;
 mod table_data_plane;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
+#[cfg(test)]
+pub(crate) use conditions::{
+    BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, classify_bucket_policy_raw_load_error,
+    merge_request_object_tag_conditions, remaining_retention_days,
+};
+pub(crate) use conditions::{
+    ObjectTagConditions, authorization_conditions, authorization_conditions_with_internal,
+    bucket_policy_needs_existing_object_tag_from_hint, get_or_fetch_object_tag_conditions,
+    load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions, request_authz_facts, request_principal,
+    resource_free_condition_values, root_access_key,
+};
 pub(crate) use guards::{
     BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
     PendingDeleteBucketGenerationGuard, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
