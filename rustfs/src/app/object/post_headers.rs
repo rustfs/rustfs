@@ -20,6 +20,13 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_gateway::dto::PostObjectFields;
 use rustfs_s3_types::{S3Result, s3_error};
 
+pub(crate) fn post_effective_headers(envelope: &RequestEnvelope) -> &HeaderMap {
+    envelope
+        .post_object_policy_headers()
+        .map(|headers| &headers.0)
+        .unwrap_or_else(|| envelope.headers())
+}
+
 pub(crate) fn post_metadata_headers(
     envelope: &RequestEnvelope,
     content_type: Option<&str>,
@@ -138,7 +145,7 @@ fn post_checksum_headers_inner(
     }
     let selected = form.or(wire);
     if !allow_archive
-        && super::is_put_object_extract_requested(headers)
+        && super::is_put_object_extract_requested(post_effective_headers(envelope))
         && (selected.is_some()
             || algorithm.is_some()
             || header_algorithm.is_some()
