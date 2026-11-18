@@ -261,12 +261,14 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Git workspaces may contain generated Rust files left by an earlier quality
 # check. They are not part of the submitted tree and must not change the
-# commit-to-base ratchet. Keep fixture/self-test behavior unchanged while
-# making repository measurements deterministic over tracked Rust files.
+# commit-to-base ratchet. A Git work tree is sufficient to select tracked-file
+# scanning; the checkout need not retain a remote configuration. Self-test
+# fixtures opt out with their marker so their deliberately tiny repositories
+# continue to exercise the directory-scan path.
 declare -a SCANNED_RUST_PATHS ECSTORE_RUST_PATHS
 if [[ -e "$REPO_ROOT/.git" ]] \
     && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-    && [[ -n "$(git -C "$REPO_ROOT" config --get remote.origin.url || true)" ]]; then
+    && [[ ! -e "$REPO_ROOT/.s3s-footprint-self-test" ]]; then
     while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && SCANNED_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
     while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && ECSTORE_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
     echo "s3s footprint scan: tracked Rust files=${#SCANNED_RUST_PATHS[@]}" >&2
@@ -380,6 +382,7 @@ SELF_TEST_STDIN="$TMP_DIR/self-test-stdin.txt"
 self_test_tree() {
     local root="$SELF_TEST_DIR/$1"
     mkdir -p "$root/scripts" "$root/.config" "$root/crates/ecstore/src" "$root/crates/control/src"
+    : >"$root/.s3s-footprint-self-test"
     cp "$SCRIPT_PATH" "$root/scripts/check_s3s_footprint.sh"
     printf '%s\n' 'use s3s::s3_error;' 'fn control() -> E { s3_error!(InternalError) }' \
         >"$root/crates/control/src/lib.rs"
