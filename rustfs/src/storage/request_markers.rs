@@ -86,3 +86,16 @@ impl MultipartStagingOperation {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StagedMultipartPartAuthorization;
+
+/// A request fact a permission probe is told the caller already supplied, as a bit in
+/// the probe's known-facts mask.
+#[derive(Clone, Copy)]
+pub(crate) enum PermissionProbeRequestFact {
+    CopySource = 1,
+    IfMatch = 2,
+    IfNoneMatch = 4,
+}
+
+/// Marks a request as an internal website-hosting read.
+#[derive(Clone)]
+pub(crate) struct WebsiteRead;

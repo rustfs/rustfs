@@ -19,7 +19,6 @@ use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
-use crate::app::context::PermissionProbeRequestFact;
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
@@ -40,6 +39,7 @@ use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
 pub(crate) use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
+use crate::storage::request_markers::PermissionProbeRequestFact;
 pub(crate) use crate::storage::request_markers::{
     MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
     RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,

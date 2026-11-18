@@ -15,12 +15,12 @@
 //! MinIO-compatible metadata listing extension routes.
 
 use super::bucket_usecase::DefaultBucketUsecase;
-use crate::app::context::WebsiteRead;
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::storage::access::access_owned::listing_multipart::authorize_bucket_listing;
 use crate::storage::access::req_info_mut;
 use crate::storage::req_info::ReqInfo;
+use crate::storage::request_markers::WebsiteRead;
 use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;

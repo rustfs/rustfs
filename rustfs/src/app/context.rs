@@ -20,11 +20,9 @@ mod envelope;
 mod global;
 mod handles;
 mod interfaces;
-mod probe_fact;
 mod runtime_sources;
 mod server_slot;
 mod startup;
-mod website_read;
 
 pub(crate) use envelope::RequestHead;
 pub use envelope::{RequestCredentials, RequestEnvelope};
@@ -32,9 +30,7 @@ pub(crate) use envelope::{authorize_owned_internal_object_request, authorize_own
 pub use global::*;
 pub use handles::*;
 pub use interfaces::*;
-pub(crate) use probe_fact::PermissionProbeRequestFact;
 pub use server_slot::ServerContextSlot;
-pub(crate) use website_read::WebsiteRead;
 
 use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::storage_api::context::runtime::{
