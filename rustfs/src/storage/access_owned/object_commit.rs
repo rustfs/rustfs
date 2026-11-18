@@ -22,8 +22,9 @@
 //! Downstream: the shared shapes in `storage/access.rs`.
 
 use super::super::{
-    AuthorizationRequest, CopySourceBucketGenerationGuard, RequestedCopySource, S3Result, ServerContextSlot, authorize_request,
-    missing_req_info_error, s3_error, versioned_read_action,
+    Action, AuthorizationRequest, CopySourceBucketGenerationGuard, ObjectTagConditions, RequestedCopySource, RequestedObjectTags,
+    S3Action, S3Result, ServerContextSlot, authorize_request, missing_req_info_error, req_info_mut, req_info_ref, s3_error,
+    versioned_read_action, versioned_tagging_action,
 };
 use crate::error::ApiError;
 
@@ -119,6 +120,63 @@ pub(crate) struct CopyObjectAuthorization<'a> {
     pub(crate) retention: bool,
 }
 
+/// Authorize the exact tag set selected by CopyObject's source reader before publication.
+/// The access hook also calls this with a preliminary snapshot, so tag-dependent
+/// destination Allow statements can be evaluated before opening either object.
+pub(crate) async fn authorize_copy_object_tags<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    source: CopySourceObject<'_>,
+    copies_tags: bool,
+    source_tags: &str,
+    effective_tags: &str,
+) -> S3Result<()> {
+    // Direct internal use-case calls with no tags retain their existing contract.
+    // Public CopyObject requests always carry the access hook's requested-tag snapshot.
+    if effective_tags.is_empty() && req.requested_object_tags().is_none() {
+        return Ok(());
+    }
+    let tag_set = crate::storage::s3_api::tagging::parse_object_tag_header(effective_tags)?;
+    if copies_tags && !tag_set.is_empty() {
+        let destination = req_info_ref(req)?.clone();
+        // Reuse the reader's metadata instead of reopening the source under its
+        // read guard (or the self-copy write guard). These are the tags being copied.
+        let source_conditions = crate::storage::s3_api::tagging::parse_object_tag_header(source_tags)?
+            .into_iter()
+            .filter_map(|tag| Some((format!("ExistingObjectTag/{}", tag.key?), vec![tag.value?])))
+            .collect();
+        let destination_tags = req.take_object_tag_conditions();
+        let destination_requested_tags = req.take_requested_object_tags();
+        req.install_object_tag_conditions(ObjectTagConditions::new(
+            source.bucket,
+            source.key,
+            source.version_id,
+            source_conditions,
+        ));
+        let info = req_info_mut(req)?;
+        info.bucket = Some(source.bucket.to_owned());
+        info.object = Some(source.key.to_owned());
+        info.version_id = source.version_id.map(str::to_owned);
+        let result = authorize_request(req, versioned_tagging_action(S3Action::GetObjectTaggingAction, source.version_id)).await;
+        *req_info_mut(req)? = destination;
+        req.take_object_tag_conditions();
+        if let Some(tags) = destination_tags {
+            req.install_object_tag_conditions(tags);
+        }
+        if let Err(error) = result {
+            if let Some(tags) = destination_requested_tags {
+                req.install_requested_object_tags(tags);
+            }
+            return Err(error.into());
+        }
+    }
+    req.install_requested_object_tags(RequestedObjectTags(
+        tag_set.into_iter().filter_map(|tag| Some((tag.key?, tag.value?))).collect(),
+    ));
+    authorize_request(req, Action::S3Action(S3Action::PutObjectAction))
+        .await
+        .map_err(Into::into)
+}
+
 /// Authorizes both resources and records the generation and tag snapshots for the copy.
 pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
@@ -126,9 +184,8 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
     facts: CopyObjectAuthorization<'_>,
 ) -> S3Result<()> {
     use super::super::{
-        Action, ObjectOptions, RequestedObjectTags, S3Action, authorize_copy_object_tags, authorize_replication_only_put_headers,
-        get_or_fetch_object_tag_conditions, load_bucket_generation, req_info_mut, request_object_store,
-        set_requested_object_lock_retain_until,
+        ObjectOptions, authorize_replication_only_put_headers, get_or_fetch_object_tag_conditions, load_bucket_generation,
+        req_info_mut, request_object_store, set_requested_object_lock_retain_until,
     };
     use crate::storage::storage_api::contract::object::ObjectOperations as _;
 

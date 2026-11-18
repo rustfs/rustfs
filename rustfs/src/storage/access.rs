@@ -386,61 +386,6 @@ fn set_post_object_policy_headers(req: &mut S3Request<PutObjectInput>) -> S3Resu
     Ok(())
 }
 
-/// Authorize the exact tag set selected by CopyObject's source reader before publication.
-/// The access hook also calls this with a preliminary snapshot, so tag-dependent
-/// destination Allow statements can be evaluated before opening either object.
-pub(crate) async fn authorize_copy_object_tags<R: AuthorizationRequest + ?Sized>(
-    req: &mut R,
-    source: access_owned::object_commit::CopySourceObject<'_>,
-    copies_tags: bool,
-    source_tags: &str,
-    effective_tags: &str,
-) -> S3Result<()> {
-    // Direct internal use-case calls with no tags retain their existing contract.
-    // Public CopyObject requests always carry the access hook's requested-tag snapshot.
-    if effective_tags.is_empty() && req.requested_object_tags().is_none() {
-        return Ok(());
-    }
-    let tag_set = crate::storage::s3_api::tagging::parse_object_tag_header(effective_tags)?;
-    if copies_tags && !tag_set.is_empty() {
-        let destination = req_info_ref(req)?.clone();
-        // Reuse the reader's metadata instead of reopening the source under its
-        // read guard (or the self-copy write guard). These are the tags being copied.
-        let source_conditions = crate::storage::s3_api::tagging::parse_object_tag_header(source_tags)?
-            .into_iter()
-            .filter_map(|tag| Some((format!("ExistingObjectTag/{}", tag.key?), vec![tag.value?])))
-            .collect();
-        let destination_tags = req.take_object_tag_conditions();
-        let destination_requested_tags = req.take_requested_object_tags();
-        req.install_object_tag_conditions(ObjectTagConditions::new(
-            source.bucket,
-            source.key,
-            source.version_id,
-            source_conditions,
-        ));
-        let info = req_info_mut(req)?;
-        info.bucket = Some(source.bucket.to_owned());
-        info.object = Some(source.key.to_owned());
-        info.version_id = source.version_id.map(str::to_owned);
-        let result = authorize_request(req, versioned_tagging_action(S3Action::GetObjectTaggingAction, source.version_id)).await;
-        *req_info_mut(req)? = destination;
-        req.take_object_tag_conditions();
-        if let Some(tags) = destination_tags {
-            req.install_object_tag_conditions(tags);
-        }
-        if let Err(error) = result {
-            if let Some(tags) = destination_requested_tags {
-                req.install_requested_object_tags(tags);
-            }
-            return Err(error.into());
-        }
-    }
-    req.install_requested_object_tags(RequestedObjectTags::from(&Tagging { tag_set }));
-    authorize_request(req, Action::S3Action(S3Action::PutObjectAction))
-        .await
-        .map_err(Into::into)
-}
-
 fn legal_hold_write_requested(object_lock_legal_hold_status: Option<&ObjectLockLegalHoldStatus>) -> bool {
     object_lock_legal_hold_status.is_some()
 }
