@@ -1699,6 +1699,8 @@ pub struct ScannerDiskScanOptions {
     pub scan_mode: HealScanMode,
     pub prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
     pub checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
+    /// Local interruption state shared with the coordinator; not part of RPC or cache formats.
+    pub local_stop: Option<Arc<ScannerLocalStop>>,
 }
 
 #[async_trait::async_trait]
@@ -2131,6 +2133,9 @@ pub(crate) use usage_watch::ScannerUsageWatchReleaseGuard;
 use usage_watch::{ScannerUsageWatchCohort, admit_scanner_usage_watch, record_completed_usage_watch};
 pub(crate) use usage_watch::{bind_usage_watch_to_checkpoint, invalidate_completed_usage_watch_cache};
 mod io_disk;
+mod local_drive;
+use local_drive::*;
+pub use local_drive::{ScannerLocalStop, ScannerLocalStopReason};
 #[cfg(test)]
 mod publish_gate_tests;
 #[cfg(test)]

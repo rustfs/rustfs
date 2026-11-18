@@ -392,6 +392,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
         local_disk: disk,
+        local_stop: None,
         tier_registry: crate::TierRegistrySnapshot {
             generation: 0,
             names: Arc::new([]),
