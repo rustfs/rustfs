@@ -35,7 +35,7 @@ use http::header::{CACHE_CONTROL, CONTENT_LOCATION, CONTENT_RANGE, CONTENT_TYPE,
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rustfs_gateway::{
     ErrorHeader, HandlerError, HandlerErrorContext, HttpDate, LegacyRustfsFacts, LegacyRustfsRefusal, RedirectTarget,
-    RegionLabel, StoredHeaderValue, VersionIdLabel,
+    RegionLabel, RustfsErrorCause, StoredHeaderValue, VersionIdLabel,
 };
 use rustfs_gateway_types::{ETag, ErrorCode, Timestamp, TimestampFormat};
 use rustfs_s3_types::S3Error;
@@ -183,6 +183,15 @@ fn error_header(name: &HeaderName, value: &HeaderValue) -> Option<ErrorHeader> {
         "retry-after" => Some(ErrorHeader::RetryAfter {
             seconds: value.parse().ok()?,
         }),
+        // The gateway spells the closed set of causes; an unknown one fails the whole error.
+        "x-rustfs-error-cause" => [
+            RustfsErrorCause::NamespaceLockTimeout,
+            RustfsErrorCause::NamespaceLockUnavailable,
+            RustfsErrorCause::StorageWriteQuorum,
+        ]
+        .into_iter()
+        .find(|cause| cause.as_str() == value)
+        .map(|cause| ErrorHeader::RustfsErrorCause { cause }),
         "x-amz-bucket-region" => Some(ErrorHeader::BucketRegion {
             region: RegionLabel::new(value).ok()?,
         }),
@@ -395,6 +404,41 @@ mod tests {
 
         assert_eq!(mapped.code().as_str(), "SlowDown");
         assert_eq!(mapped.headers(), [ErrorHeader::RetryAfter { seconds: 1 }]);
+    }
+
+    #[test]
+    fn an_unavailable_error_states_its_cause_beside_the_retry_advice() {
+        let cause = HeaderName::from_static("x-rustfs-error-cause");
+        let mapped = with_headers(
+            S3ErrorCode::ServiceUnavailable,
+            &[(cause.clone(), "namespace_lock_timeout"), (header::RETRY_AFTER, "1")],
+        );
+
+        assert_eq!(mapped.code().as_str(), "ServiceUnavailable");
+        assert!(mapped.headers().contains(&ErrorHeader::RustfsErrorCause {
+            cause: RustfsErrorCause::NamespaceLockTimeout
+        }));
+        assert!(mapped.headers().contains(&ErrorHeader::RetryAfter { seconds: 1 }));
+        for (value, expected) in [
+            ("namespace_lock_unavailable", RustfsErrorCause::NamespaceLockUnavailable),
+            ("storage_write_quorum", RustfsErrorCause::StorageWriteQuorum),
+        ] {
+            let mapped = with_headers(S3ErrorCode::ServiceUnavailable, &[(cause.clone(), value)]);
+            assert_eq!(mapped.headers(), [ErrorHeader::RustfsErrorCause { cause: expected }], "{value}");
+        }
+    }
+
+    #[test]
+    fn a_cause_outside_the_closed_set_fails_the_whole_error() {
+        for value in ["storage_read_quorum", "NAMESPACE_LOCK_TIMEOUT", ""] {
+            let mapped = with_headers(
+                S3ErrorCode::ServiceUnavailable,
+                &[(HeaderName::from_static("x-rustfs-error-cause"), value)],
+            );
+
+            assert_eq!(mapped.code(), &ErrorCode::INTERNAL_ERROR, "{value:?}");
+            assert_eq!(mapped.message(), UNWRITABLE_HEADER, "{value:?}");
+        }
     }
 
     #[test]
