@@ -23,8 +23,7 @@ use crate::global::{
     METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES, METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
     METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL, METRIC_LOG_CLEANER_ROTATION_TOTAL,
 };
-use chrono::{Local, TimeZone as _};
-use jiff::Zoned;
+use jiff::{Timestamp, ZonedDateTime, tz::TimeZone};
 use metrics::{counter, gauge, histogram};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -58,8 +57,12 @@ impl Rotation {
             Rotation::Minutely => now / 60 != last / 60,
             Rotation::Hourly => now / 3600 != last / 3600,
             Rotation::Daily => {
-                let last_day = Local.timestamp_opt(last, 0).single().map(|ts| ts.date_naive());
-                let now_day = Local.timestamp_opt(now, 0).single().map(|ts| ts.date_naive());
+                let last_day = Timestamp::new(last, 0)
+                    .ok()
+                    .map(|ts| ts.to_zoned_datetime(TimeZone::system()).date());
+                let now_day = Timestamp::new(now, 0)
+                    .ok()
+                    .map(|ts| ts.to_zoned_datetime(TimeZone::system()).date());
 
                 match (last_day, now_day) {
                     (Some(last_day), Some(now_day)) => last_day != now_day,
@@ -131,7 +134,7 @@ impl RollingAppender {
             match_mode,
             file: None,
             size: 0,
-            last_roll_ts: Zoned::now().timestamp().as_second(),
+            last_roll_ts: ZonedDateTime::now().timestamp().as_second(),
             rotation_retry_cooldown_until: None,
             roll_signal: None,
         };
@@ -225,7 +228,7 @@ impl RollingAppender {
 
         // 2. Time-based check
         // We check this after size check to avoid unnecessary time calls if size forces a roll.
-        let now = Zoned::now().timestamp().as_second();
+        let now = ZonedDateTime::now().timestamp().as_second();
 
         self.rotation.check_should_roll(self.last_roll_ts, now)
     }
@@ -249,7 +252,7 @@ impl RollingAppender {
         // 2. Generate archive name.
         // Format: YYYYMMDDHHMMSS.uuuuuu (Microsecond/Nanosecond precision)
         // We use jiff's strftime. "%Y%m%d%H%M%S%.6f" gives microsecond precision.
-        let now = Zoned::now();
+        let now = ZonedDateTime::now();
         let timestamp_str = now.strftime("%Y%m%d%H%M%S%.6f").to_string();
 
         // Add a unique counter to prevent collisions in high-concurrency/fast-rotation scenarios.
@@ -667,11 +670,12 @@ mod tests {
     /// The fixtures below use mid-January dates, which sit on no DST or
     /// offset transition in any zone, so every wall-clock time exists exactly once.
     fn local_ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
-        Local
-            .with_ymd_and_hms(year, month, day, hour, min, sec)
-            .single()
+        jiff::civil::DateTime::new(year as i16, month as i8, day as i8, hour as i8, min as i8, sec as i8, 0)
+            .expect("fixture local time must be valid")
+            .to_zoned_datetime(TimeZone::system())
             .expect("fixture local time must exist exactly once")
             .timestamp()
+            .as_second()
     }
 
     #[test]

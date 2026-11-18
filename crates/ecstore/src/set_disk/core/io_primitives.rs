@@ -72,6 +72,7 @@ pub(in crate::set_disk) use super::metadata_read::{
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::cluster::rpc::remote_disk::{RenameBatchClientItem, RenameBatchStartError};
 #[cfg(test)]
 use crate::diagnostics::get::GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD;
 #[cfg(test)]
@@ -101,6 +102,7 @@ use crate::diagnostics::get::{
 };
 #[cfg(test)]
 use crate::disk::CHECK_PART_FILE_NOT_FOUND;
+use crate::disk::Disk;
 use crate::disk::DiskAPI;
 #[cfg(test)]
 use crate::disk::DiskOption;
@@ -145,7 +147,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
@@ -3062,6 +3064,134 @@ enum RenameDispatchState {
     MayHavePublished,
 }
 
+struct SlotRenameOutcome {
+    slot: usize,
+    dispatch_state: RenameDispatchState,
+    completion: std::thread::Result<disk::error::Result<disk::RenameDataResp>>,
+}
+
+#[derive(Default)]
+struct RenameFanoutPlan {
+    batch_slot_mask: u16,
+    batch_groups: Vec<RenameBatchGroup>,
+}
+
+struct RenameBatchGroup {
+    addr: String,
+    representative: DiskStore,
+    slots: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct RenameSlotPaths {
+    src_bucket: Arc<String>,
+    src_object: Arc<String>,
+    dst_bucket: Arc<String>,
+    dst_object: Arc<String>,
+}
+
+struct RenameSlotContext {
+    slot: usize,
+    disk: Option<DiskStore>,
+    file_infos: Arc<Vec<FileInfo>>,
+    scanner_token: Option<Uuid>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    paths: RenameSlotPaths,
+    successful_completion_rank: Option<Arc<AtomicUsize>>,
+    write_quorum: usize,
+}
+
+struct RenameOutcomeProducerArgs {
+    disks: Arc<Vec<Option<DiskStore>>>,
+    file_infos: Arc<Vec<FileInfo>>,
+    fence_tokens: Arc<Vec<Option<Uuid>>>,
+    paths: RenameSlotPaths,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    write_quorum: usize,
+    allow_batch: bool,
+}
+
+struct RenameOutcomeProducers {
+    outcomes: mpsc::Receiver<SlotRenameOutcome>,
+    tasks: JoinSet<()>,
+}
+
+struct PreparedRenameSlot {
+    context: RenameSlotContext,
+    indexed_file_info: Option<FileInfo>,
+}
+
+#[cfg(test)]
+type RenameSlotTaskGuard = rename_fanout_barrier::TaskGuard;
+#[cfg(not(test))]
+type RenameSlotTaskGuard = ();
+
+struct AdmittedRenameSlot {
+    prepared: PreparedRenameSlot,
+    _task_guard: RenameSlotTaskGuard,
+}
+
+struct RenameSlotObservation {
+    started_at: Option<Instant>,
+    _foreground_guard: RenameForegroundActiveGuard,
+    disk_wait_stage: &'static str,
+    successful_completion_rank: Option<Arc<AtomicUsize>>,
+    write_quorum: usize,
+}
+
+impl PreparedRenameSlot {
+    fn file_info(&self) -> &FileInfo {
+        self.indexed_file_info
+            .as_ref()
+            .unwrap_or(&self.context.file_infos[self.context.slot])
+    }
+}
+
+impl RenameSlotObservation {
+    fn start(prepared: &PreparedRenameSlot) -> disk::error::Result<Self> {
+        let disk = prepared.context.disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        Ok(Self {
+            started_at: rustfs_io_metrics::put_stage_timer(),
+            _foreground_guard: rename_foreground_active_guard(prepared.context.slot),
+            disk_wait_stage: if disk.is_local() {
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
+            } else {
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
+            },
+            successful_completion_rank: prepared.context.successful_completion_rank.clone(),
+            write_quorum: prepared.context.write_quorum,
+        })
+    }
+
+    fn finish(self, result: &disk::error::Result<disk::RenameDataResp>) {
+        if let Some(started_at) = self.started_at {
+            let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+                duration_ms,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration(self.disk_wait_stage, duration_ms);
+            let position = if result.is_ok() {
+                let rank = self
+                    .successful_completion_rank
+                    .as_ref()
+                    .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
+                    .unwrap_or(1);
+                if rank <= self.write_quorum {
+                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
+                } else {
+                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
+                }
+            } else {
+                rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
+            };
+            rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RenameRollbackOutcome {
     NotAttempted(DiskError),
@@ -3980,6 +4110,497 @@ impl SetDisks {
             .collect()
     }
 
+    fn ordinary_rename_batch_eligible(
+        file_info: &FileInfo,
+        scanner_lease: Option<Uuid>,
+        multipart: bool,
+        incarnation_bound: bool,
+    ) -> bool {
+        !multipart
+            && !incarnation_bound
+            && scanner_lease.is_none()
+            && !rustfs_utils::http::metadata_compat::contains_key_str(
+                &file_info.metadata,
+                crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+            )
+            && !rustfs_utils::http::metadata_compat::contains_key_str(
+                &file_info.metadata,
+                crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            )
+    }
+
+    fn prepare_rename_slot(context: RenameSlotContext) -> disk::error::Result<PreparedRenameSlot> {
+        if context.disk.is_none() {
+            return Err(DiskError::DiskNotFound);
+        }
+        let file_info = &context.file_infos[context.slot];
+        let is_delete_marker = file_info.is_canonical_delete_marker();
+        let indexed_file_info = if file_info.erasure.index == 0 {
+            let mut indexed = file_info.clone();
+            indexed.erasure.index = context.slot + 1;
+            Some(indexed)
+        } else {
+            None
+        };
+        let prepared = PreparedRenameSlot {
+            context,
+            indexed_file_info,
+        };
+        let file_info = prepared.file_info();
+        if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(prepared)
+    }
+
+    async fn admit_rename_slot(prepared: PreparedRenameSlot) -> disk::error::Result<PreparedRenameSlot> {
+        let slot = prepared.context.slot;
+        let dst_object = &prepared.context.paths.dst_object;
+        Self::rename_fanout_barrier(dst_object, slot, rename_fanout_barrier_phase::RENAME).await;
+        if let Some(error) = Self::rename_injected_error(dst_object, slot) {
+            return Err(error);
+        }
+        Ok(prepared)
+    }
+
+    async fn prepare_and_admit_rename_slot(context: RenameSlotContext) -> disk::error::Result<AdmittedRenameSlot> {
+        #[allow(clippy::let_unit_value)]
+        let task_guard = Self::rename_fanout_task_guard(&context.paths.dst_object);
+        let prepared = Self::prepare_rename_slot(context)?;
+        let prepared = Self::admit_rename_slot(prepared).await?;
+        Ok(AdmittedRenameSlot {
+            prepared,
+            _task_guard: task_guard,
+        })
+    }
+
+    async fn execute_prepared_unary_slot(
+        admitted: AdmittedRenameSlot,
+        dispatch_state: &mut RenameDispatchState,
+        observation: Option<RenameSlotObservation>,
+    ) -> disk::error::Result<disk::RenameDataResp> {
+        let prepared = &admitted.prepared;
+        let context = &prepared.context;
+        if let Some(scope) = context.publication_scope.as_ref()
+            && !scope.can_commit()
+        {
+            let _ = scope.mark_indeterminate();
+            return Err(DiskError::other("scanner publication commit scope deadline or cancellation reached"));
+        }
+        let disk = context.disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        let observation = match observation {
+            Some(observation) => observation,
+            None => RenameSlotObservation::start(prepared)?,
+        };
+        *dispatch_state = RenameDispatchState::MayHavePublished;
+        let observed = disk
+            .rename_data_borrowed_with_fence_observed(
+                &context.paths.src_bucket,
+                &context.paths.src_object,
+                prepared.file_info(),
+                &context.paths.dst_bucket,
+                &context.paths.dst_object,
+                disk::RenameDataGuards {
+                    scanner_publication_lease_token: context.scanner_token,
+                    namespace_owner: context.namespace_owner.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let rejected_before_publication = observed.rejected_before_publication();
+        let result = observed.result;
+        #[cfg(test)]
+        if result.is_ok() {
+            rollback_fault_injection::after_rename(&context.paths.dst_object, context.slot)?;
+        }
+        observation.finish(&result);
+        if rejected_before_publication {
+            *dispatch_state = RenameDispatchState::RejectedBeforePublication;
+        }
+        result
+    }
+
+    async fn run_unary_rename_slot(context: RenameSlotContext) -> SlotRenameOutcome {
+        let slot = context.slot;
+        let mut dispatch_state = RenameDispatchState::NotDispatched;
+        let completion = std::panic::AssertUnwindSafe(async {
+            let admitted = Self::prepare_and_admit_rename_slot(context).await?;
+            Self::execute_prepared_unary_slot(admitted, &mut dispatch_state, None).await
+        })
+        .catch_unwind()
+        .await;
+        SlotRenameOutcome {
+            slot,
+            dispatch_state,
+            completion,
+        }
+    }
+
+    async fn run_admitted_unary_slot(admitted: AdmittedRenameSlot, observation: RenameSlotObservation) -> SlotRenameOutcome {
+        let slot = admitted.prepared.context.slot;
+        let mut dispatch_state = RenameDispatchState::NotDispatched;
+        let completion =
+            std::panic::AssertUnwindSafe(Self::execute_prepared_unary_slot(admitted, &mut dispatch_state, Some(observation)))
+                .catch_unwind()
+                .await;
+        SlotRenameOutcome {
+            slot,
+            dispatch_state,
+            completion,
+        }
+    }
+
+    fn finish_batch_slot(
+        admitted: AdmittedRenameSlot,
+        observation: RenameSlotObservation,
+        result: disk::error::Result<disk::RenameDataResp>,
+    ) -> SlotRenameOutcome {
+        let slot = admitted.prepared.context.slot;
+        #[cfg(test)]
+        if result.is_ok()
+            && let Err(error) = rollback_fault_injection::after_rename(&admitted.prepared.context.paths.dst_object, slot)
+        {
+            return SlotRenameOutcome {
+                slot,
+                dispatch_state: RenameDispatchState::MayHavePublished,
+                completion: Ok(Err(error)),
+            };
+        }
+        observation.finish(&result);
+        SlotRenameOutcome {
+            slot,
+            dispatch_state: RenameDispatchState::MayHavePublished,
+            completion: Ok(result),
+        }
+    }
+
+    fn plan_rename_fanout(
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        scanner_publication_lease_tokens: &[Option<Uuid>],
+        src_bucket: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+    ) -> RenameFanoutPlan {
+        let batch_enabled = disks
+            .iter()
+            .flatten()
+            .any(|disk| matches!(disk.as_ref(), Disk::Remote(remote) if remote.rename_stream_batch_enabled()));
+        if !batch_enabled {
+            return RenameFanoutPlan::default();
+        }
+        let multipart = src_bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        let incarnation_bound = crate::store::bucket_heal_scope_for_object(dst_bucket, dst_object).is_some();
+        let mut groups: Vec<RenameBatchGroup> = Vec::new();
+        for (slot, ((disk, file_info), scanner_lease)) in disks
+            .iter()
+            .zip(file_infos.iter())
+            .zip(scanner_publication_lease_tokens.iter())
+            .enumerate()
+        {
+            let Some(disk) = disk.as_ref() else {
+                continue;
+            };
+            let Disk::Remote(remote) = disk.as_ref() else {
+                continue;
+            };
+            if !remote.rename_stream_batch_enabled()
+                || !Self::ordinary_rename_batch_eligible(file_info, *scanner_lease, multipart, incarnation_bound)
+            {
+                continue;
+            }
+            if let Some(group) = groups.iter_mut().find(|group| group.addr == remote.addr) {
+                group.slots.push(slot);
+            } else {
+                groups.push(RenameBatchGroup {
+                    addr: remote.addr.clone(),
+                    representative: disk.clone(),
+                    slots: vec![slot],
+                });
+            }
+        }
+        groups.retain(|group| group.slots.len() >= 2);
+        debug_assert!(groups.iter().all(|group| !group.representative.is_local()));
+        let batch_slot_mask = groups
+            .iter()
+            .flat_map(|group| group.slots.iter())
+            .fold(0_u16, |mask, slot| mask | (1_u16 << slot));
+        RenameFanoutPlan {
+            batch_slot_mask,
+            batch_groups: groups,
+        }
+    }
+
+    fn record_rename_batch_candidates(
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        scanner_publication_lease_tokens: &[Option<Uuid>],
+        src_bucket: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+    ) {
+        if !rustfs_io_metrics::put_stage_metrics_enabled() {
+            return;
+        }
+        let multipart = src_bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        let incarnation_bound = crate::store::bucket_heal_scope_for_object(dst_bucket, dst_object).is_some();
+        let mut peers: Vec<(&str, usize, usize)> = Vec::new();
+        for ((disk, file_info), scanner_lease) in disks
+            .iter()
+            .zip(file_infos.iter())
+            .zip(scanner_publication_lease_tokens.iter())
+        {
+            let Some(disk) = disk.as_deref() else {
+                continue;
+            };
+            let Disk::Remote(remote) = disk else {
+                continue;
+            };
+            let batchable = Self::ordinary_rename_batch_eligible(file_info, *scanner_lease, multipart, incarnation_bound);
+            if let Some((_, remote_disks, batchable_disks)) = peers.iter_mut().find(|(addr, _, _)| *addr == remote.addr) {
+                *remote_disks += 1;
+                *batchable_disks += usize::from(batchable);
+            } else {
+                peers.push((&remote.addr, 1, usize::from(batchable)));
+            }
+        }
+        for (_, remote_disks, batchable_disks) in peers {
+            rustfs_io_metrics::record_ecstore_rename_batch_candidate_peer(remote_disks, batchable_disks);
+        }
+    }
+
+    fn spawn_rename_outcome_producers(args: RenameOutcomeProducerArgs) -> RenameOutcomeProducers {
+        let RenameOutcomeProducerArgs {
+            disks,
+            file_infos,
+            fence_tokens,
+            paths,
+            namespace_owner,
+            publication_scope,
+            write_quorum,
+            allow_batch,
+        } = args;
+        debug_assert!(!allow_batch || publication_scope.is_none());
+        let disk_count = disks.len();
+        let fanout_plan = if allow_batch {
+            Self::plan_rename_fanout(
+                disks.as_slice(),
+                file_infos.as_slice(),
+                fence_tokens.as_slice(),
+                &paths.src_bucket,
+                &paths.dst_bucket,
+                &paths.dst_object,
+            )
+        } else {
+            RenameFanoutPlan::default()
+        };
+        let successful_completion_rank = rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
+        let resource_unit = crate::disk::current_resource_unit();
+        let mut tasks = JoinSet::new();
+        let (outcome_tx, outcome_rx) = mpsc::channel(disk_count.max(1));
+        for (slot, (disk, scanner_token)) in disks.iter().cloned().zip(fence_tokens.iter().copied()).enumerate() {
+            if fanout_plan.batch_slot_mask & (1_u16 << slot) != 0 {
+                continue;
+            }
+            let outcome_tx = outcome_tx.clone();
+            let context = RenameSlotContext {
+                slot,
+                disk,
+                file_infos: file_infos.clone(),
+                scanner_token,
+                namespace_owner: namespace_owner.clone(),
+                publication_scope: publication_scope.clone(),
+                paths: paths.clone(),
+                successful_completion_rank: successful_completion_rank.clone(),
+                write_quorum,
+            };
+            let resource_unit = resource_unit.clone();
+            tasks.spawn(crate::disk::with_optional_resource_unit(resource_unit, async move {
+                let outcome = Self::run_unary_rename_slot(context).await;
+                let _ = outcome_tx.send(outcome).await;
+            }));
+        }
+        for group in fanout_plan.batch_groups {
+            let outcome_tx = outcome_tx.clone();
+            let paths = paths.clone();
+            let file_infos = file_infos.clone();
+            let successful_completion_rank = successful_completion_rank.clone();
+            let namespace_owner = namespace_owner.clone();
+            let group_disks = disks.clone();
+            let group_tokens = fence_tokens.clone();
+            let resource_unit = resource_unit.clone();
+            tasks.spawn(crate::disk::with_optional_resource_unit(resource_unit, async move {
+                let prepared = join_all(group.slots.into_iter().map(|slot| {
+                    let context = RenameSlotContext {
+                        slot,
+                        disk: group_disks[slot].clone(),
+                        file_infos: file_infos.clone(),
+                        scanner_token: group_tokens[slot],
+                        namespace_owner: namespace_owner.clone(),
+                        publication_scope: None,
+                        paths: paths.clone(),
+                        successful_completion_rank: successful_completion_rank.clone(),
+                        write_quorum,
+                    };
+                    async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
+                }))
+                .await;
+                let mut admitted = Vec::with_capacity(prepared.len());
+                for (slot, result) in prepared {
+                    match result {
+                        Ok(slot) => admitted.push(slot),
+                        Err(error) => {
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(Err(error)),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                let mut entries = Vec::with_capacity(admitted.len());
+                for slot in admitted {
+                    match RenameSlotObservation::start(&slot.prepared) {
+                        Ok(observation) => entries.push((slot, observation)),
+                        Err(error) => {
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(Err(error)),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                if entries.len() < 2 {
+                    for outcome in join_all(
+                        entries
+                            .into_iter()
+                            .map(|(slot, observation)| Self::run_admitted_unary_slot(slot, observation)),
+                    )
+                    .await
+                    {
+                        let _ = outcome_tx.send(outcome).await;
+                    }
+                    return;
+                }
+                rustfs_io_metrics::record_ecstore_rename_batch_planned(entries.len());
+                let start = {
+                    let items = entries
+                        .iter()
+                        .map(|(slot, _)| RenameBatchClientItem {
+                            slot: slot.prepared.context.slot,
+                            disk: slot
+                                .prepared
+                                .context
+                                .disk
+                                .as_ref()
+                                .map(|disk| disk.endpoint().to_string())
+                                .unwrap_or_default(),
+                            file_info: slot.prepared.file_info(),
+                        })
+                        .collect();
+                    match group.representative.as_ref() {
+                        Disk::Remote(remote) => {
+                            remote
+                                .start_rename_data_batch(
+                                    &paths.src_bucket,
+                                    &paths.src_object,
+                                    &paths.dst_bucket,
+                                    &paths.dst_object,
+                                    items,
+                                )
+                                .await
+                        }
+                        Disk::Local(_) => Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected)),
+                    }
+                };
+                match start {
+                    Ok(mut stream) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_stream_started(entries.len());
+                        let mut remaining = entries.into_iter().map(Some).collect::<Vec<_>>();
+                        loop {
+                            match stream.next_outcome().await {
+                                Ok(Some(batch_outcome)) => {
+                                    if let Some(entry) = remaining.iter_mut().find(|entry| {
+                                        entry
+                                            .as_ref()
+                                            .is_some_and(|(slot, _)| slot.prepared.context.slot == batch_outcome.slot)
+                                    }) && let Some((slot, observation)) = entry.take()
+                                    {
+                                        let outcome = Self::finish_batch_slot(slot, observation, batch_outcome.result);
+                                        let _ = outcome_tx.send(outcome).await;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => break,
+                            }
+                        }
+                        let remaining_items = remaining.iter().flatten().count();
+                        rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(remaining_items);
+                        for (slot, observation) in remaining.into_iter().flatten() {
+                            let result = Err(DiskError::Unexpected);
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::MayHavePublished,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(RenameBatchStartError::UnsupportedBeforeStream) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_fallback(entries.len());
+                        let mut fallbacks = FuturesUnordered::new();
+                        for (slot, observation) in entries {
+                            fallbacks.push(Self::run_admitted_unary_slot(slot, observation));
+                        }
+                        while let Some(outcome) = fallbacks.next().await {
+                            let _ = outcome_tx.send(outcome).await;
+                        }
+                    }
+                    Err(RenameBatchStartError::NotDispatched(error)) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_not_dispatched(entries.len());
+                        for (slot, observation) in entries {
+                            let result = Err(error.clone());
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(RenameBatchStartError::MayHavePublished(error)) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(entries.len());
+                        for (slot, observation) in entries {
+                            let result = Err(error.clone());
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::MayHavePublished,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }));
+        }
+        drop(outcome_tx);
+        RenameOutcomeProducers {
+            outcomes: outcome_rx,
+            tasks,
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
     async fn rename_data_owned_early_ack_with_fence(
         disks: &[Option<DiskStore>],
@@ -3993,7 +4614,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
-            scanner_publication_commit_scope: _scanner_publication_commit_scope,
+            scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
             multipart_proof_authority: _,
@@ -4013,8 +4634,10 @@ impl SetDisks {
         let file_infos = Arc::new(file_infos);
 
         let disk_count = disks.len();
-        let fanout_disks = disks.to_vec();
-        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
+        let fanout_disks = Arc::new(disks.to_vec());
+        let fanout_fence_tokens =
+            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
+        Self::record_rename_batch_candidates(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
         let coordinator_disks = fanout_disks.clone();
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -4030,119 +4653,33 @@ impl SetDisks {
             let fanout_dst_bucket = dst_bucket.clone();
             let fanout_dst_object = dst_object.clone();
             async move {
-                let successful_rename_completion_rank =
-                    rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-                let mut tasks = JoinSet::new();
-                for (i, (disk, scanner_publication_lease_token)) in
-                    fanout_disks.into_iter().zip(fanout_fence_tokens.into_iter()).enumerate()
-                {
-                    let src_bucket = fanout_src_bucket.clone();
-                    let src_object = fanout_src_object.clone();
-                    let dst_bucket = fanout_dst_bucket.clone();
-                    let dst_object = fanout_dst_object.clone();
-                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
-                    let namespace_commit_guard = namespace_commit_guard.clone();
-                    let file_infos = file_infos.clone();
-                    tasks.spawn(async move {
-                        let _namespace_commit_guard = namespace_commit_guard.clone();
-                        let mut dispatch_state = RenameDispatchState::NotDispatched;
-                        let result = std::panic::AssertUnwindSafe(async {
-                            #[allow(clippy::let_unit_value)]
-                            let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
-
-                            let Some(disk) = disk else {
-                                return Err(DiskError::DiskNotFound);
-                            };
-                            let disk_wait_location_stage = if disk.is_local() {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
-                            } else {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
-                            };
-
-                            let file_info = &file_infos[i];
-                            let is_delete_marker = file_info.is_canonical_delete_marker();
-                            let mut indexed_file_info;
-                            let file_info = if file_info.erasure.index == 0 {
-                                indexed_file_info = file_info.clone();
-                                indexed_file_info.erasure.index = i + 1;
-                                &indexed_file_info
-                            } else {
-                                file_info
-                            };
-                            if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
-                                return Err(DiskError::FileCorrupt);
-                            }
-
-                            Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
-
-                            if let Some(err) = Self::rename_injected_error(&dst_object, i) {
-                                return Err(err);
-                            }
-
-                            let disk_wait_started = rustfs_io_metrics::put_stage_timer();
-                            dispatch_state = RenameDispatchState::MayHavePublished;
-                            let _foreground_active_guard = rename_foreground_active_guard(i);
-                            let observed = disk
-                                .rename_data_borrowed_with_fence_observed(
-                                    &src_bucket,
-                                    &src_object,
-                                    file_info,
-                                    &dst_bucket,
-                                    &dst_object,
-                                    disk::RenameDataGuards {
-                                        scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-                            let rejected_before_publication = observed.rejected_before_publication();
-                            let result = observed.result;
-                            #[cfg(test)]
-                            if result.is_ok() {
-                                rollback_fault_injection::after_rename(&dst_object, i)?;
-                            }
-                            if let Some(disk_wait_started) = disk_wait_started {
-                                let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
-                                rustfs_io_metrics::record_put_object_stage_duration(
-                                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
-                                    duration_ms,
-                                );
-                                rustfs_io_metrics::record_put_object_stage_duration(disk_wait_location_stage, duration_ms);
-                                let position = if result.is_ok() {
-                                    let rank = successful_rename_completion_rank
-                                        .as_ref()
-                                        .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
-                                        .unwrap_or(1);
-                                    if rank <= write_quorum {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
-                                    } else {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
-                                    }
-                                } else {
-                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
-                                };
-                                rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
-                            }
-                            if rejected_before_publication {
-                                dispatch_state = RenameDispatchState::RejectedBeforePublication;
-                            }
-                            result
-                        })
-                        .catch_unwind()
-                        .await;
-                        (i, dispatch_state, result)
-                    });
-                }
+                let allow_batch = scanner_publication_commit_scope.is_none();
+                let RenameOutcomeProducers {
+                    outcomes: mut outcome_rx,
+                    mut tasks,
+                } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                    disks: fanout_disks.clone(),
+                    file_infos: file_infos.clone(),
+                    fence_tokens: fanout_fence_tokens.clone(),
+                    paths: RenameSlotPaths {
+                        src_bucket: fanout_src_bucket.clone(),
+                        src_object: fanout_src_object.clone(),
+                        dst_bucket: fanout_dst_bucket.clone(),
+                        dst_object: fanout_dst_object.clone(),
+                    },
+                    namespace_owner: namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>),
+                    publication_scope: scanner_publication_commit_scope,
+                    write_quorum,
+                    allow_batch,
+                });
 
                 let mut commit_tx = Some(commit_tx);
                 let mut sent_commit = false;
                 let mut success_count = 0usize;
                 let mut fanout_panic = 0usize;
                 let mut results_seen = 0usize;
-                let mut errs = vec![Some(DiskError::DiskNotFound); disk_count];
+                let mut seen_slots = vec![false; disk_count];
+                let mut errs = vec![Some(DiskError::Unexpected); disk_count];
                 // Missing task results cannot prove that a disk mutation never ran.
                 let mut dispatch_states = vec![RenameDispatchState::MayHavePublished; disk_count];
                 let mut disk_versions = vec![None; disk_count];
@@ -4155,40 +4692,48 @@ impl SetDisks {
                 let mut cleanup_at_snapshot = vec![false; disk_count];
 
                 let mut tail_after_quorum_started = None;
-                while let Some(joined) = tasks.join_next().await {
-                    results_seen += 1;
-                    match joined {
-                        Ok((idx, dispatch_state, Ok(Ok(res)))) => {
-                            dispatch_states[idx] = dispatch_state;
-                            data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
-                            cleanup_data_dirs[idx] = res.cleanup_data_dir;
-                            disk_versions[idx] = res.sign;
-                            old_current_sizes[idx] = res.old_current_size;
-                            old_current_source_checked[idx] = res.old_current_source_checked;
-                            old_current_sources[idx] = res.old_current_source;
-                            errs[idx] = None;
-                            success_count += 1;
+                while let Some(outcome) = outcome_rx.recv().await {
+                    match outcome {
+                        outcome if outcome.slot < disk_count && !seen_slots[outcome.slot] => {
+                            let idx = outcome.slot;
+                            seen_slots[idx] = true;
+                            results_seen += 1;
+                            let dispatch_state = outcome.dispatch_state;
+                            match outcome.completion {
+                                Ok(Ok(res)) => {
+                                    dispatch_states[idx] = dispatch_state;
+                                    data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
+                                    cleanup_data_dirs[idx] = res.cleanup_data_dir;
+                                    disk_versions[idx] = res.sign;
+                                    old_current_sizes[idx] = res.old_current_size;
+                                    old_current_source_checked[idx] = res.old_current_source_checked;
+                                    old_current_sources[idx] = res.old_current_source;
+                                    errs[idx] = None;
+                                    success_count += 1;
+                                }
+                                Ok(Err(err)) => {
+                                    dispatch_states[idx] = dispatch_state;
+                                    errs[idx] = Some(err);
+                                }
+                                Err(_) => {
+                                    dispatch_states[idx] = dispatch_state;
+                                    errs[idx] = Some(DiskError::Unexpected);
+                                    fanout_panic += 1;
+                                }
+                            }
                         }
-                        Ok((idx, dispatch_state, Ok(Err(err)))) => {
-                            dispatch_states[idx] = dispatch_state;
-                            errs[idx] = Some(err);
-                        }
-                        Ok((idx, dispatch_state, Err(_))) => {
-                            dispatch_states[idx] = dispatch_state;
-                            errs[idx] = Some(DiskError::Unexpected);
-                            fanout_panic += 1;
-                        }
-                        Err(_) => {
-                            fanout_panic += 1;
-                        }
+                        _ => fanout_panic += 1,
                     }
 
-                    let pending_tasks = tasks.len();
+                    // Transport tasks may represent multiple disk slots once
+                    // ordinary peer batches are enabled. Quorum stability is
+                    // defined by unseen disk results, never scheduler tasks.
+                    let pending_slots = disk_count.saturating_sub(results_seen);
                     let checked_count = old_current_source_checked.iter().filter(|checked| **checked).count();
                     let max_source_votes = Self::max_common_old_current_source_votes(&old_current_sources);
                     let can_change_old_current_source = (checked_count < write_quorum
-                        && checked_count + pending_tasks >= write_quorum)
-                        || (max_source_votes < write_quorum && max_source_votes + pending_tasks >= write_quorum);
+                        && checked_count + pending_slots >= write_quorum)
+                        || (max_source_votes < write_quorum && max_source_votes + pending_slots >= write_quorum);
 
                     if !sent_commit && success_count >= write_quorum && !can_change_old_current_source {
                         let snapshot_commit = Self::rename_data_commit_from_observations(
@@ -4217,6 +4762,11 @@ impl SetDisks {
                         tail_after_quorum_started = rustfs_io_metrics::put_stage_timer();
                     }
                 }
+                while let Some(joined) = tasks.join_next().await {
+                    if joined.is_err() {
+                        fanout_panic += 1;
+                    }
+                }
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_AFTER_QUORUM_WAIT,
                     tail_after_quorum_started,
@@ -4228,7 +4778,7 @@ impl SetDisks {
                     let fanout_success = errs.iter().filter(|err| err.is_none()).count();
                     let fanout_error = errs.len().saturating_sub(fanout_success + fanout_panic);
                     rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
-                        results_seen,
+                        disk_count,
                         write_quorum,
                         fanout_success,
                         fanout_error,
@@ -4462,7 +5012,7 @@ impl SetDisks {
         } else {
             None
         };
-        let mut errs = Vec::with_capacity(disks.len());
+        let mut errs = vec![Some(DiskError::Unexpected); disks.len()];
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -4470,9 +5020,18 @@ impl SetDisks {
         let dst_object = Arc::new(dst_object.to_string());
 
         let disk_count = disks.len();
-        let fanout_disks = disks.to_vec();
-        let fanout_file_infos = file_infos;
-        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
+        let fanout_disks = Arc::new(disks.to_vec());
+        let fanout_file_infos = Arc::new(file_infos);
+        let fanout_fence_tokens =
+            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
+        Self::record_rename_batch_candidates(
+            disks,
+            &fanout_file_infos,
+            &fanout_fence_tokens,
+            src_bucket.as_str(),
+            dst_bucket.as_str(),
+            dst_object.as_str(),
+        );
         let fanout_src_bucket = src_bucket.clone();
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
@@ -4487,133 +5046,38 @@ impl SetDisks {
             .or_else(|| namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>));
         let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
-        // completed disk mutations. Per-disk futures stay ordered in `join_all`,
-        // preserving slot-indexed quorum and convergence accounting without a
-        // scheduler task for every disk.
+        // completed disk mutations. Producers may complete out of order, while
+        // their stable slot indexes preserve quorum and convergence accounting.
         let fanout_future = async move {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
             let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
-            let successful_rename_completion_rank =
-                rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-            let futures = fanout_disks
-                .into_iter()
-                .zip(fanout_file_infos.iter())
-                .zip(fanout_fence_tokens.into_iter())
-                .enumerate()
-                .map(|(i, ((disk, file_info), scanner_publication_lease_token))| {
-                    let src_bucket = fanout_src_bucket.clone();
-                    let src_object = fanout_src_object.clone();
-                    let dst_object = fanout_dst_object.clone();
-                    let dst_bucket = fanout_dst_bucket.clone();
-                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
-                    let publication_scope = scanner_publication_commit_scope.clone();
-                    let namespace_owner = fanout_namespace_owner.clone();
-
-                    async move {
-                        let mut dispatch_state = RenameDispatchState::NotDispatched;
-                        let result = std::panic::AssertUnwindSafe(async {
-                            // Test-only introspection guard: counts this operation as
-                            // in-flight for the whole body. Compiles to `()` in production.
-                            #[allow(clippy::let_unit_value)]
-                            let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
-
-                            let Some(disk) = disk else {
-                                return Err(DiskError::DiskNotFound);
-                            };
-                            let disk_wait_location_stage = if disk.is_local() {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
-                            } else {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
-                            };
-
-                            let is_delete_marker = file_info.is_canonical_delete_marker();
-                            let mut local_file_info;
-                            let file_info = if file_info.erasure.index == 0 {
-                                local_file_info = file_info.clone();
-                                local_file_info.erasure.index = i + 1;
-                                &local_file_info
-                            } else {
-                                file_info
-                            };
-                            if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
-                                return Err(DiskError::FileCorrupt);
-                            }
-
-                            // Test-only awaitable pause point right before the disk rename.
-                            // A no-op immediately-ready future in production.
-                            Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
-
-                            if let Some(err) = Self::rename_injected_error(&dst_object, i) {
-                                return Err(err);
-                            }
-
-                            if let Some(scope) = publication_scope.as_ref()
-                                && !scope.can_commit()
-                            {
-                                let _ = scope.mark_indeterminate();
-                                return Err(DiskError::other(
-                                    "scanner publication commit scope deadline or cancellation reached",
-                                ));
-                            }
-
-                            let disk_wait_started = rustfs_io_metrics::put_stage_timer();
-                            dispatch_state = RenameDispatchState::MayHavePublished;
-                            let _foreground_active_guard = rename_foreground_active_guard(i);
-                            let observed = disk
-                                .rename_data_borrowed_with_fence_observed(
-                                    &src_bucket,
-                                    &src_object,
-                                    file_info,
-                                    &dst_bucket,
-                                    &dst_object,
-                                    disk::RenameDataGuards {
-                                        scanner_publication_lease_token,
-                                        namespace_owner: namespace_owner.clone(),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-                            let rejected_before_publication = observed.rejected_before_publication();
-                            let result = observed.result;
-                            #[cfg(test)]
-                            if result.is_ok() {
-                                rollback_fault_injection::after_rename(&dst_object, i)?;
-                            }
-                            if let Some(disk_wait_started) = disk_wait_started {
-                                let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
-                                rustfs_io_metrics::record_put_object_stage_duration(
-                                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
-                                    duration_ms,
-                                );
-                                rustfs_io_metrics::record_put_object_stage_duration(disk_wait_location_stage, duration_ms);
-                                let position = if result.is_ok() {
-                                    let rank = successful_rename_completion_rank
-                                        .as_ref()
-                                        .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
-                                        .unwrap_or(1);
-                                    if rank <= write_quorum {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
-                                    } else {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
-                                    }
-                                } else {
-                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
-                                };
-                                rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
-                            }
-                            if rejected_before_publication {
-                                dispatch_state = RenameDispatchState::RejectedBeforePublication;
-                            }
-                            result
-                        })
-                        .catch_unwind()
-                        .await;
-                        (dispatch_state, result)
-                    }
-                });
-            let results = join_all(futures).await;
+            let paths = RenameSlotPaths {
+                src_bucket: fanout_src_bucket,
+                src_object: fanout_src_object,
+                dst_bucket: fanout_dst_bucket,
+                dst_object: fanout_dst_object.clone(),
+            };
+            let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
+            let RenameOutcomeProducers {
+                outcomes: mut outcome_rx,
+                mut tasks,
+            } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                disks: fanout_disks,
+                file_infos: fanout_file_infos.clone(),
+                fence_tokens: fanout_fence_tokens,
+                paths,
+                namespace_owner: fanout_namespace_owner,
+                publication_scope: scanner_publication_commit_scope,
+                write_quorum,
+                allow_batch,
+            });
+            let mut results = Vec::with_capacity(disk_count);
+            while let Some(outcome) = outcome_rx.recv().await {
+                results.push(outcome);
+            }
+            while tasks.join_next().await.is_some() {}
             #[cfg(test)]
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
@@ -4645,26 +5109,27 @@ impl SetDisks {
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
             quorum_wait_started,
         );
-        let (results, mut file_infos) = match fanout_result {
+        let (results, file_infos) = match fanout_result {
             Ok(result) => result,
             Err(_) => {
                 record_indeterminate_rename(disks, (&dst_bucket, &dst_object), rollback_receipt).await;
                 return Err(DiskError::Unexpected);
             }
         };
+        let mut file_infos = Arc::try_unwrap(file_infos).unwrap_or_else(|file_infos| file_infos.as_ref().clone());
         if rustfs_io_metrics::put_stage_metrics_enabled() {
             let mut fanout_success = 0;
             let mut fanout_error = 0;
             let mut fanout_panic = 0;
-            for (_, result) in &results {
-                match result {
+            for outcome in &results {
+                match &outcome.completion {
                     Ok(Ok(_)) => fanout_success += 1,
                     Ok(Err(_)) => fanout_error += 1,
                     Err(_) => fanout_panic += 1,
                 }
             }
             rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
-                results.len(),
+                disk_count,
                 write_quorum,
                 fanout_success,
                 fanout_error,
@@ -4672,13 +5137,18 @@ impl SetDisks {
             );
         }
 
-        let mut multipart_capabilities = multipart_proof_authority.map(|authority| {
-            PublishingMultipartCapabilities::new(results.len(), authority, multipart_commit_owner, logical_guards)
-        });
-        let mut dispatch_states = Vec::with_capacity(results.len());
-        for (idx, (dispatch_state, result)) in results.into_iter().enumerate() {
-            dispatch_states.push(dispatch_state);
-            match result {
+        let mut multipart_capabilities = multipart_proof_authority
+            .map(|authority| PublishingMultipartCapabilities::new(disk_count, authority, multipart_commit_owner, logical_guards));
+        let mut dispatch_states = vec![RenameDispatchState::MayHavePublished; disk_count];
+        let mut seen_slots = vec![false; disk_count];
+        for outcome in results {
+            let idx = outcome.slot;
+            if idx >= disk_count || seen_slots[idx] {
+                continue;
+            }
+            seen_slots[idx] = true;
+            dispatch_states[idx] = outcome.dispatch_state;
+            match outcome.completion {
                 Ok(Ok(mut res)) => {
                     if let Some(owner) = multipart_capabilities.as_mut() {
                         let publication = res.multipart_source.take().map(|result| *result);
@@ -4705,7 +5175,7 @@ impl SetDisks {
                                     == Some(&(idx + 1))
                         });
                         if !valid {
-                            errs.push(Some(DiskError::FileCorrupt));
+                            errs[idx] = Some(DiskError::FileCorrupt);
                             continue;
                         }
                         owner.publications[idx] = publication;
@@ -4716,13 +5186,13 @@ impl SetDisks {
                     old_current_sizes[idx] = res.old_current_size;
                     old_current_source_checked[idx] = res.old_current_source_checked;
                     old_current_sources[idx] = res.old_current_source;
-                    errs.push(None);
+                    errs[idx] = None;
                 }
                 Ok(Err(e)) => {
-                    errs.push(Some(e));
+                    errs[idx] = Some(e);
                 }
                 Err(_) => {
-                    errs.push(Some(DiskError::Unexpected));
+                    errs[idx] = Some(DiskError::Unexpected);
                 }
             }
         }
@@ -7642,6 +8112,51 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_fanout_plan_batches_only_multi_slot_ordinary_peers() {
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            let mut disks = Vec::new();
+            for endpoint in [
+                "http://127.0.0.1:19000/disk1",
+                "http://127.0.0.1:19000/disk2",
+                "http://127.0.0.1:19000/disk3",
+                "http://127.0.0.1:19001/disk4",
+            ] {
+                let mut endpoint = Endpoint::try_from(endpoint).expect("remote planner endpoint");
+                endpoint.is_local = false;
+                disks.push(Some(
+                    new_disk(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("remote planner disk"),
+                ));
+            }
+            let file_infos = vec![FileInfo::default(); disks.len()];
+            let tokens = vec![None; disks.len()];
+            let plan = SetDisks::plan_rename_fanout(&disks, &file_infos, &tokens, "src", "dst", "object");
+            assert_eq!(plan.batch_slot_mask, 0b0111);
+            assert_eq!(plan.batch_groups.len(), 1);
+            assert_eq!(plan.batch_groups[0].slots, vec![0, 1, 2]);
+
+            let mut protected = file_infos;
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut protected[1].metadata,
+                crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                Uuid::new_v4().to_string(),
+            );
+            let plan = SetDisks::plan_rename_fanout(&disks, &protected, &tokens, "src", "dst", "object");
+            assert_eq!(plan.batch_slot_mask, 0b0101);
+            assert_eq!(plan.batch_groups[0].slots, vec![0, 2]);
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn commit_fault_schedule_keeps_multiple_disk_phases_independent() {

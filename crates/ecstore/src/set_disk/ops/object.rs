@@ -17182,7 +17182,12 @@ mod metadata_mutation_generation_tests {
                 copy_object,
                 &mut copy_info,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
             )
             .await
             .expect("metadata COPY should succeed");
@@ -17360,7 +17365,11 @@ mod metadata_mutation_generation_tests {
         let metadata = Arc::make_mut(&mut source.user_defined);
         metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "new=value".to_string());
         metadata.insert("expires".to_string(), expires.format(&Rfc3339).expect("expiry"));
-        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &opts)
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &dst_opts)
             .await
             .expect("explicit metadata wins over externalized fields");
         let mut copied = set.get_object_info(bucket, "object", &opts).await.expect("copied metadata");
@@ -17371,7 +17380,7 @@ mod metadata_mutation_generation_tests {
         copied.metadata_only = true;
         copied.user_tags = Arc::new(String::new());
         copied.expires = None;
-        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &opts)
+        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &dst_opts)
             .await
             .expect("explicit empty replacement");
         let cleared = set.get_object_info(bucket, "object", &opts).await.expect("cleared metadata");
@@ -17388,6 +17397,10 @@ mod metadata_mutation_generation_tests {
         }
 
         let valid_object = "valid-sidecar";
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
         let (mut valid_source, _) = put_and_prime(&set_disks, bucket, valid_object, b"valid sidecar body").await;
         persist_part_checksum_sidecar(&set_disks, bucket, valid_object, r#"[[1,[["CRC32C","AAAAAA=="]]]]"#).await;
         valid_source.metadata_only = true;
@@ -17400,7 +17413,7 @@ mod metadata_mutation_generation_tests {
                 valid_object,
                 &mut valid_source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &dst_opts,
             )
             .await
             .expect("metadata-only copy should preserve a valid checksum sidecar");
@@ -17473,7 +17486,7 @@ mod metadata_mutation_generation_tests {
                 conflicting_object,
                 &mut conflicting_source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &dst_opts,
             )
             .await
             .expect_err("metadata-only copy must reject conflicting checksum aliases");
@@ -25519,6 +25532,9 @@ mod put_object_tmp_cleanup_tests {
                 &ObjectOptions {
                     no_lock: true,
                     namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )

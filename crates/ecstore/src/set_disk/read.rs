@@ -11043,7 +11043,12 @@ mod dangling_read_tests {
                 object,
                 &mut source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
             )
             .await
             .expect("a CopyObject source without a version id must resolve like a latest GET");

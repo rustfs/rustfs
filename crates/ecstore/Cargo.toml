@@ -154,7 +154,6 @@ arc-swap.workspace = true
 async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 byteorder = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
 jiff = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 flatbuffers.workspace = true

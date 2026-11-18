@@ -866,6 +866,8 @@ mod tests {
             .authorization
             .oidc_virtual_parent()
             .expect("test authorization should have a virtual parent");
+      
+        // Virtual parent IDs cannot be registered as users, but a legacy mapping can still exist.
         iam.policy_db_set(&parent, UserType::Reg, false, "readonly")
             .await
             .expect("store colliding regular policy mapping");

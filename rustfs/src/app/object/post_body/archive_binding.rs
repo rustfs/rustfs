@@ -74,13 +74,14 @@ impl PreflightedPostArchive {
         let identity = envelope
             .gateway_post_identity()
             .ok_or_else(|| s3_error!(AccessDenied, "The POST archive request identity is missing"))?;
-        let options = super::super::extract::resolve_put_object_extract_options(envelope.headers())
+        let effective_headers = super::super::post_headers::post_effective_headers(envelope);
+        let options = super::super::extract::resolve_put_object_extract_options(effective_headers)
             .map_err(rustfs_s3_types::S3Error::from)?;
         if !Arc::ptr_eq(identity, &self.request_identity)
             || bucket != self.bucket
             || key != self.key
             || options != self.options
-            || !super::super::extract::is_put_object_extract_requested(envelope.headers())
+            || !super::super::extract::is_put_object_extract_requested(effective_headers)
         {
             return Err(s3_error!(AccessDenied, "The POST archive does not match its preflight"));
         }
@@ -117,7 +118,8 @@ async fn stage_post_archive_with_resources(
     policy: VerifiedPostArchivePolicy,
     resources: &StagingResources,
 ) -> S3Result<PreflightedPostArchive> {
-    if bucket != policy.bucket || key != policy.key || !super::super::extract::is_put_object_extract_requested(envelope.headers())
+    let effective_headers = super::super::post_headers::post_effective_headers(envelope);
+    if bucket != policy.bucket || key != policy.key || !super::super::extract::is_put_object_extract_requested(effective_headers)
     {
         return Err(s3_error!(AccessDenied, "The POST archive does not match its verified policy"));
     }
@@ -127,7 +129,7 @@ async fn stage_post_archive_with_resources(
             .ok_or_else(|| s3_error!(AccessDenied, "The POST archive request identity is missing"))?,
     );
     let options =
-        super::super::extract::resolve_put_object_extract_options(envelope.headers()).map_err(rustfs_s3_types::S3Error::from)?;
+        super::super::extract::resolve_put_object_extract_options(effective_headers).map_err(rustfs_s3_types::S3Error::from)?;
     if resources.archive_snapshot_budget.is_closed() {
         return Err(staging_capacity_error());
     }
@@ -146,7 +148,7 @@ async fn stage_post_archive_with_resources(
         let replay_length = u64::try_from(length).map_err(|_| staging_io_error())?;
         let snapshot = ArchiveSnapshot::capture(file, replay_length, Arc::clone(&resources.archive_snapshot_budget)).await?;
         let snapshot = snapshot
-            .preflight(&policy.key, envelope.headers(), policy.permits.as_ref())
+            .preflight(&policy.key, effective_headers, policy.permits.as_ref())
             .await?;
         Ok(PreflightedPostArchive {
             snapshot,

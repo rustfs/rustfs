@@ -138,7 +138,6 @@ hotpath = [
     "rustfs-kms/hotpath",
     "rustfs-lock/hotpath",
     "rustfs-log-analyzer/hotpath",
-    "rustfs-madmin/hotpath",
     "rustfs-notify/hotpath",
     "rustfs-object-capacity/hotpath",
     "rustfs-object-data-cache/hotpath",
@@ -183,7 +182,6 @@ hotpath-alloc = [
     "rustfs-kms/hotpath-alloc",
     "rustfs-lock/hotpath-alloc",
     "rustfs-log-analyzer/hotpath-alloc",
-    "rustfs-madmin/hotpath-alloc",
     "rustfs-notify/hotpath-alloc",
     "rustfs-object-capacity/hotpath-alloc",
     "rustfs-object-data-cache/hotpath-alloc",
@@ -228,7 +226,6 @@ hotpath-cpu = [
     "rustfs-kms/hotpath-cpu",
     "rustfs-lock/hotpath-cpu",
     "rustfs-log-analyzer/hotpath-cpu",
-    "rustfs-madmin/hotpath-cpu",
     "rustfs-notify/hotpath-cpu",
     "rustfs-object-capacity/hotpath-cpu",
     "rustfs-object-data-cache/hotpath-cpu",
@@ -381,7 +378,7 @@ async_zip = { workspace = true, default-features = false, features = ["tokio", "
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
-rsa = { workspace = true, features = ["sha2"] }
+rsa = { workspace = true, features = ["pkcs1v15"] }
 base64-simd.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 const-str = { workspace = true, features = ["std", "proc"] }

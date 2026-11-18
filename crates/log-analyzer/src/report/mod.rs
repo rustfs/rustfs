@@ -74,13 +74,13 @@ mod tests {
     use crate::ingest::IngestReport;
     use crate::model::{EventKind, LogEvent, LogLevel, SourceRef};
     use crate::rules::{RuleEngine, seed_rule_set};
-    use chrono::DateTime;
+    use crate::time::parse_rfc3339;
     use std::sync::Arc;
 
     fn fixed_report() -> AnalysisReport {
         let mut analyzer = Analyzer::new(RuleEngine::new(seed_rule_set()), AnalyzeOptions::default());
         let mut ev = LogEvent {
-            timestamp: Some(DateTime::parse_from_rfc3339("2026-07-15T03:12:44+08:00").expect("ts")),
+            timestamp: Some(parse_rfc3339("2026-07-15T03:12:44+08:00").expect("ts")),
             level: Some(LogLevel::Error),
             target: Some("rustfs_ecstore".to_string() + "::erasure"),
             message: "erasure write quorum (required=8, achieved=5, failed=3)".to_string(),
@@ -96,11 +96,11 @@ mod tests {
             .insert("required".to_string(), serde_json::Value::String("8".into()));
         analyzer.observe(ev.clone());
         analyzer.observe(LogEvent {
-            timestamp: Some(DateTime::parse_from_rfc3339("2026-07-15T03:20:44+08:00").expect("ts")),
+            timestamp: Some(parse_rfc3339("2026-07-15T03:20:44+08:00").expect("ts")),
             ..ev
         });
         analyzer.observe(LogEvent {
-            timestamp: Some(DateTime::parse_from_rfc3339("2026-07-15T03:25:00+08:00").expect("ts")),
+            timestamp: Some(parse_rfc3339("2026-07-15T03:25:00+08:00").expect("ts")),
             level: Some(LogLevel::Error),
             target: None,
             message: "failed to sync /data/x9 after 5 retries".to_string(),

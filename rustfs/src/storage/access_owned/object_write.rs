@@ -27,7 +27,7 @@ use super::super::{
     has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error, post_object_authorize_action,
     set_requested_object_lock_retain_until,
 };
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 use time::OffsetDateTime;
 
 pub(crate) async fn authorize_upload_part<R: AuthorizationRequest + ?Sized>(
@@ -136,7 +136,7 @@ pub(crate) struct PostObjectPolicyFields<'a> {
 }
 
 /// Owns validated form values while authorization waits for IAM or bucket state.
-pub(crate) struct PostObjectFormPolicy(Vec<(&'static str, Option<HeaderValue>)>);
+pub(crate) struct PostObjectFormPolicy(Vec<(HeaderName, Option<HeaderValue>)>);
 
 impl PostObjectFormPolicy {
     pub(crate) fn new(fields: PostObjectPolicyFields<'_>) -> S3Result<Self> {
@@ -167,16 +167,29 @@ impl PostObjectFormPolicy {
                 .map(HeaderValue::from_str)
                 .transpose()
                 .map_err(|_| invalid_post_form_field())?;
-            values.push((name, value));
+            values.push((HeaderName::from_static(name), value));
         }
-        values.extend([("if-match", fields.if_match), ("if-none-match", fields.if_none_match)]);
+        values.extend([
+            (HeaderName::from_static("if-match"), fields.if_match),
+            (HeaderName::from_static("if-none-match"), fields.if_none_match),
+        ]);
         Ok(Self(values))
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn with_metadata(mut self, metadata: &[(String, String)]) -> S3Result<Self> {
+        for (name, value) in metadata {
+            let name = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()).map_err(|_| invalid_post_form_field())?;
+            let value = HeaderValue::from_str(value).map_err(|_| invalid_post_form_field())?;
+            self.0.push((name, Some(value)));
+        }
+        Ok(self)
     }
 
     pub(crate) fn install<R: AuthorizationRequest + ?Sized>(self, req: &mut R) {
         let mut headers = req.headers().clone();
         for (name, value) in self.0 {
-            headers.remove(name);
+            headers.remove(&name);
             if let Some(value) = value {
                 headers.insert(name, value);
             }
@@ -187,10 +200,10 @@ impl PostObjectFormPolicy {
     #[cfg(feature = "gateway-stack")]
     pub(crate) fn install_gateway<R: AuthorizationRequest + ?Sized>(mut self, req: &mut R) {
         for (name, value) in &mut self.0 {
-            match *name {
-                "if-match" | "if-none-match" => *value = req.headers().get(*name).cloned(),
+            match name.as_str() {
+                "if-match" | "if-none-match" => *value = req.headers().get(&*name).cloned(),
                 "x-amz-server-side-encryption" | "x-amz-server-side-encryption-customer-algorithm" if value.is_none() => {
-                    *value = req.headers().get(*name).cloned();
+                    *value = req.headers().get(&*name).cloned();
                 }
                 _ => {}
             }
