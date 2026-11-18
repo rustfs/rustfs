@@ -536,13 +536,9 @@ async fn evaluate_check(
         if missing {
             (Decision::Unknown, Some(s3_action_potential(&probe, action).await.unwrap_or(false)))
         } else if check.action == "s3:ListAllMyBuckets" {
-            (classify(query_list_buckets_permission(&probe).await.map_err(Into::into)), None)
+            (classify(query_list_buckets_permission(&probe).await), None)
         } else {
-            let decision = classify(
-                authorize_request_core(&mut probe, action, None, false)
-                    .await
-                    .map_err(Into::into),
-            );
+            let decision = classify(authorize_request_core(&mut probe, action, None, false).await);
             let potential = if decision == Decision::Unknown {
                 Some(s3_action_potential(&probe, action).await.unwrap_or(false))
             } else {

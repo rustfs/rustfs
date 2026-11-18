@@ -823,9 +823,7 @@ pub(crate) async fn authorize_owned_request(
     location_constraint: Option<String>,
 ) -> rustfs_s3_types::S3Result<()> {
     prepare_owned_authorization(req, action)?;
-    authorize_request_core(req, action, location_constraint, false)
-        .await
-        .map_err(Into::into)
+    authorize_request_core(req, action, location_constraint, false).await
 }
 
 /// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
@@ -836,7 +834,7 @@ pub(crate) async fn authorize_owned_internal_object_request(
     action: Action,
 ) -> rustfs_s3_types::S3Result<()> {
     prepare_owned_authorization(req, action)?;
-    authorize_request_core(req, action, None, true).await.map_err(Into::into)
+    authorize_request_core(req, action, None, true).await
 }
 
 fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {

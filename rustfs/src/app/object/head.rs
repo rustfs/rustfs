@@ -104,10 +104,7 @@ async fn head_metadata_action_allowed(req: &RequestEnvelope, action: S3Action) -
     };
     info.suppress_denial_log = true;
     info.suppress_denial_audit = true;
-    match authorize_request(&mut probe, Action::S3Action(action))
-        .await
-        .map_err(S3Error::from)
-    {
+    match authorize_request(&mut probe, Action::S3Action(action)).await {
         Ok(()) => Ok(true),
         Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
         Err(err) => Err(err),
