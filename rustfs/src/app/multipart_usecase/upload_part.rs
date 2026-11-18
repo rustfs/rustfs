@@ -514,6 +514,7 @@ mod tests {
     use crate::app::object::legacy_put_body;
     use crate::app::storage_api::s3::S3ErrorCode as LegacyErrorCode;
     use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+    use http::HeaderValue;
 
     fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
         let mut req = build_request(UploadPartInput::default(), Method::PUT);

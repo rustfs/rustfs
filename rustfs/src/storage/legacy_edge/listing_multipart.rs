@@ -65,7 +65,7 @@ impl DefaultMultipartUsecase {
         let output = self
             .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
             .await?;
-        Ok(S3Response::new(CreateMultipartUploadOutput {
+        let mut response = S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(output.bucket),
             key: Some(output.key),
             upload_id: Some(output.upload_id),
@@ -76,7 +76,9 @@ impl DefaultMultipartUsecase {
             checksum_algorithm: output.checksum_algorithm.map(Into::into),
             checksum_type: output.checksum_type.map(Into::into),
             ..Default::default()
-        }))
+        });
+        response.headers.extend(output.response_headers);
+        Ok(response)
     }
 }
 

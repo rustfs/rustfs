@@ -162,7 +162,9 @@ pub(crate) async fn authorize_select_object_content<R: AuthorizationRequest + ?S
     let req_info = req_info_mut(req)?;
     req_info.bucket = Some(bucket.to_owned());
     req_info.object = Some(key.to_owned());
-    authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
+    authorize_request(req, Action::S3Action(S3Action::GetObjectAction))
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

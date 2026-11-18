@@ -120,6 +120,56 @@ distribution[i-1] = 1 + ((start + i) % N)   for i in 1..=N   // a cyclic rotatio
 ### 4.1 Block size and shard sizing
 
 - **INVARIANT — block size.** New objects use `BLOCK_SIZE_V2 = 1 MiB` ([object_api/mod.rs](../../crates/ecstore/src/object_api/mod.rs)); it is stored per version in `ErasureInfo.block_size` and must be read back from metadata, never assumed.
+
+#### 4.1.1 Client block-size hint (RustFS V1)
+
+The default remains 1 MiB. During the staged rollout, a direct `PutObject` or
+`CreateMultipartUpload` may request one of the supported sizes (64 KiB, 256
+KiB, 1 MiB, or 4 MiB) with the user metadata key
+`x-amz-meta-rustfs-ec-block-size-hint`. The feature is applied only when both
+`RUSTFS_EC_BLOCK_SIZE_HINT_ENABLE=true` and
+`RUSTFS_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED=true`; both flags default to
+`false`. Restart server processes after changing either environment flag.
+Values are ASCII decimal digits, 1–20 digits, and greater than zero.
+Malformed values or duplicate raw headers/case-variant metadata names return
+`InvalidArgument` after authentication. An unsupported numeric value is
+ignored and uses the default. Before both rollout flags are true, the value is
+ordinary user metadata and is not parsed for layout selection.
+
+The hint is ignored for compression, server-side encryption, protected shard
+integrity, replication/data-movement, recovery, and other internal writes.
+Successful and ignored writes expose the decision through
+`x-rustfs-layout-hint-status` and, when ignored,
+`x-rustfs-layout-hint-reason`; all committed writes expose the actual value in
+`x-rustfs-effective-ec-block-size`. The selected value is persisted in
+`ErasureInfo.block_size` and is authoritative for every later read, range, and
+healing operation. Multipart uploads select the value once at creation;
+`UploadPart` hints are ignored and all parts use the stored upload geometry.
+
+Metadata quorum identity includes the decode geometry, including block size,
+while the legacy compatibility hash remains available for callers that need
+it. No performance target is implied without measurements on the target
+workload.
+
+#### 4.1.2 Bounded bitrot read quantum (RustFS V1)
+
+New, eligible EC writes may split each shard into smaller authenticated bitrot
+frames to reduce the amount of shard data read for small ranges. The selected
+frame size is recorded in the internal `ec-read-quantum` metadata pair; an
+absent marker means the historical one-frame-per-shard layout. Enable writes
+only after every reader and writer in the fleet understands this marker and
+frame format, using both `RUSTFS_EC_READ_QUANTUM_ENABLE=true` and
+`RUSTFS_EC_READ_QUANTUM_FLEET_CONFIRMED=true`. Both flags default to `false`.
+Restart server processes after changing either environment flag.
+Protected-integrity and inline writes retain their existing framing.
+
+This changes the physical bitrot frame boundaries. Older RustFS readers do not
+interpret the marker and cannot read objects written with bounded frames.
+Disabling the write gate prevents additional objects from using that format;
+it does not make existing bounded-frame objects readable by an older binary.
+Keep compatible readers available or rewrite/export those objects before a
+rollback to a version without this reader support.
+
 - **INVARIANT — shard-size formulas (frozen for on-disk compatibility).** Two formulas exist and must both be preserved:
   - Modern ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)): `calc_shard_size(block_size, data_shards) = block_size.div_ceil(data_shards)` — plain ceiling division, no even rounding. This is the MinIO-compatible sizing (MinIO's `Erasure.ShardSize` is the same plain `ceil(block_size / data_shards)`); the modern GF(2⁸) path uses it for all new and MinIO-migrated data.
   - Legacy ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)): `calc_shard_size_legacy = (block_size.div_ceil(data_shards) + 1) & !1` — round the ceiling **up to the nearest even number**. This even-padded form is **RustFS-legacy-only** and matches `filemeta`'s own even-padded `calc_shard_size` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)); it is **not** MinIO's sizing and the two differ by one byte at typical geometries (for `block_size = 1 MiB`, `data_shards = 6`, plain `div_ceil` yields `174763` bytes whereas the legacy even-padded form yields `174764`). Because MinIO-migrated data is decoded by the modern path (§1), this legacy even-padding never applies to MinIO objects.
