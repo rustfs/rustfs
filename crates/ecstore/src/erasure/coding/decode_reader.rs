@@ -49,6 +49,7 @@ pub(crate) fn test_single_inflight_construction_count() -> u64 {
 }
 
 type FillTask = oneshot::Receiver<FillResult>;
+type FillBatch = (Vec<u8>, VecDeque<Vec<u8>>);
 
 struct FillWorker {
     tx: mpsc::Sender<FillRequest>,
@@ -293,7 +294,7 @@ where
         Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, fill_policy)
     }
 
-    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<(Vec<u8>, VecDeque<Vec<u8>>)>>> {
+    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<FillBatch>>> {
         if self.fill.is_none() {
             let fill_worker_tx = match self.fill_worker_tx() {
                 Ok(tx) => tx,
