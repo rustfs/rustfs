@@ -1218,6 +1218,8 @@ impl std::fmt::Debug for GetObjectSink {
 
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    /// Part copies retain source locks and cannot queue for capped upload staging.
+    pub multipart_copy_source_locked: bool,
     #[doc(hidden)]
     pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
     /// Caller-provided destination for a GET body: when set, the legacy
