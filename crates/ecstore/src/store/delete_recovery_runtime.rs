@@ -131,12 +131,15 @@ struct RecoveryAttempt {
     key: Arc<DeleteRecoveryKey>,
     generation: Uuid,
     retry: Option<RetryBackoff>,
+    observed_drive_return: Option<Uuid>,
 }
 
 #[derive(Debug)]
 struct HintState {
     pending: HashMap<Arc<DeleteRecoveryKey>, PendingHint>,
     order: VecDeque<(Arc<DeleteRecoveryKey>, Uuid)>,
+    // One marker per configured set observed returning by local inventory.
+    drive_returns: HashMap<(usize, usize), Uuid>,
     rescan: Option<Uuid>,
     started: HashSet<Uuid>,
     #[cfg(test)]
@@ -185,6 +188,7 @@ impl DeleteRecoveryHints {
             state: Arc::new(Mutex::new(HintState {
                 pending: HashMap::new(),
                 order: VecDeque::new(),
+                drive_returns: HashMap::new(),
                 rescan: Some(Uuid::new_v4()),
                 started: HashSet::new(),
                 #[cfg(test)]
@@ -280,8 +284,14 @@ impl DeleteRecoveryHints {
                 }
                 let generation = entry.generation.unwrap_or(slot);
                 let retry = entry.retry;
+                let observed_drive_return = state.drive_returns.get(&(key.pool, key.set)).copied();
                 state.pending.remove(&key);
-                return Some(RecoveryAttempt { key, generation, retry });
+                return Some(RecoveryAttempt {
+                    key,
+                    generation,
+                    retry,
+                    observed_drive_return,
+                });
             }
         }
         None
@@ -294,11 +304,19 @@ impl DeleteRecoveryHints {
     }
 
     fn requeue(&self, attempt: RecoveryAttempt, failure: Option<FailureReason>) {
-        let retry = match failure {
+        let mut retry = match failure {
             Some(reason) => Some(RetryBackoff::after(reason, attempt.retry)),
             None => attempt.retry,
         };
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A drive may have returned after admission but before this attempt
+        // reported missing quorum. Check under the same lock as wake and enqueue.
+        if let Some(retry) = &mut retry
+            && retry.reason == FailureReason::MissingQuorum
+            && attempt.observed_drive_return != state.drive_returns.get(&(attempt.key.pool, attempt.key.set)).copied()
+        {
+            retry.next_eligible = Instant::now();
+        }
         if let Some(entry) = state.pending.get_mut(&attempt.key) {
             if entry.generation.is_none() {
                 // A raw scan saw the same key while it was in flight. Preserve
@@ -321,6 +339,10 @@ impl DeleteRecoveryHints {
     fn wake_quorum_waiters(&self, returning_sets: &HashSet<(usize, usize)>) {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = Uuid::new_v4();
+        state
+            .drive_returns
+            .extend(returning_sets.iter().map(|&set| (set, generation)));
         for (key, entry) in &mut state.pending {
             if let Some(retry) = &mut entry.retry
                 && retry.reason == FailureReason::MissingQuorum
@@ -1032,6 +1054,62 @@ mod tests {
         assert_eq!(runnable.len(), 1);
         assert_eq!(runnable[0].key.object, "quorum");
         assert_eq!(hints.pending_len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_drive_return_between_take_and_requeue_survives_rediscovery() {
+        use FailureReason::{Corrupt, MissingQuorum};
+        let hints = DeleteRecoveryHints::with_capacity(5);
+        for (set, object) in [
+            (0, "in-flight"),
+            (0, "rediscovered"),
+            (0, "superseded"),
+            (0, "corrupt"),
+            (1, "other-set"),
+        ] {
+            assert!(hints.register_discovered(DeleteRecoveryKey { set, ..key(object) }));
+        }
+        for _ in 0..7 {
+            for attempt in hints.take(5) {
+                hints.requeue(attempt, Some(MissingQuorum));
+            }
+            tokio::time::advance(RETRY_CAP).await;
+        }
+        let admitted = hints.take(5);
+        assert_eq!(admitted.len(), 5);
+        hints.wake_quorum_waiters(&HashSet::from([(0, 0)]));
+        assert!(hints.register_discovered(key("rediscovered")));
+        let newer = hints.register(key("superseded")).expect("new foreground request");
+        for attempt in admitted {
+            let reason = if attempt.key.object == "corrupt" {
+                Corrupt
+            } else {
+                MissingQuorum
+            };
+            hints.requeue(attempt, Some(reason));
+        }
+
+        let ready = hints.take(5);
+        assert_eq!(
+            ready
+                .iter()
+                .map(|attempt| attempt.key.object.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["in-flight", "rediscovered", "superseded"]),
+            "the set return is not lost while absent from pending or coalescing with raw evidence"
+        );
+        for attempt in ready {
+            if attempt.key.object == "superseded" {
+                assert_eq!(attempt.generation, newer.generation);
+                assert!(attempt.retry.is_none(), "old failure cannot attach to the new generation");
+            }
+            hints.requeue(attempt, Some(MissingQuorum));
+        }
+        assert!(
+            hints.take(5).is_empty(),
+            "attempts admitted after the drive return cannot reuse that signal"
+        );
+        assert_eq!(hints.pending_len(), 5);
     }
 
     #[test]
