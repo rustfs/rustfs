@@ -65,11 +65,11 @@ impl ProtocolStorageClient {
     }
 
     pub(super) fn owned_bucket_usecase(&self) -> crate::app::bucket_usecase::DefaultBucketUsecase {
-        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.fs.server_ctx().app_context())
+        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.server_ctx.app_context())
     }
 
     pub(super) fn owned_usecase(&self) -> DefaultObjectUsecase {
-        DefaultObjectUsecase::with_context(self.fs.server_ctx().app_context())
+        DefaultObjectUsecase::with_context(self.server_ctx.app_context())
     }
 
     pub(super) fn create_envelope(method: Method, uri: Uri, params: RequestParams<'_>) -> RequestEnvelope {
@@ -227,10 +227,14 @@ pub(super) fn put_input(input: dto::PutObjectInput) -> S3Result<crate::app::obje
         bucket: input.bucket.as_str().to_owned(),
         key: input.key.as_str().to_owned(),
         body: input.body.map(|body| body.into_body()),
+        #[cfg(feature = "gateway-stack")]
+        post_archive: None,
         trailing_headers: None,
         frame_trailers: None,
         content_length: (input.content_length >= 0).then_some(input.content_length),
         metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
+        metadata_headers: None,
+        checksum_headers: None,
         specific_if_none_match,
         object_lock_retain_until_date: retain_until,
         cache_control: nonempty(input.cache_control),

@@ -155,6 +155,7 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::access_owned;
     pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
     pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
+    pub(crate) use super::super::access::access_owned::object_read::authorize_get_object;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
         AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
@@ -509,6 +510,8 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use rustfs_ecstore::api::compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use rustfs_ecstore::api::compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
     };
@@ -2392,8 +2395,8 @@ pub(crate) fn get_global_deployment_id() -> Option<String> {
     ecstore_runtime::deployment_id()
 }
 
-pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
-    ecstore_runtime::region().map(Into::into)
+pub(crate) fn get_global_region() -> Option<rustfs_s3_types::Region> {
+    ecstore_runtime::region()
 }
 
 pub(crate) fn global_rustfs_port() -> u16 {

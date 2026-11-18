@@ -110,7 +110,7 @@ async fn original(
             credentials,
         },
     )?;
-    let response = backend.fs.upload_part(LegacyRequest { headers, ..request }).await?;
+    let response = backend.legacy_fs().upload_part(LegacyRequest { headers, ..request }).await?;
     compat::generated::ops::upload_part::output_from_s3s(response.output)
         .map_err(|error| super::super::super::conversion_error("UploadPart output", error))
 }
@@ -139,7 +139,12 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
             )
             .await
             .expect("create upload");
-        let store = backend.fs.server_ctx().app_context().expect("context").object_store();
+        let store = backend
+            .legacy_fs()
+            .server_ctx()
+            .app_context()
+            .expect("context")
+            .object_store();
         let probe = crate::app::storage_api::helper::MutationCompletionProbe::install(bucket);
         let mut observations = Vec::new();
         let mut controls = Vec::new();
@@ -243,9 +248,13 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
         use http_body_util::BodyExt;
         let bucket = "protocol-upload-part-bound";
         let (_foreign_temp, root, foreign_client, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let foreign = foreign_client.fs.server_ctx().app_context().expect("foreign context");
+        let foreign = foreign_client
+            .legacy_fs()
+            .server_ctx()
+            .app_context()
+            .expect("foreign context");
         let (_temp, _, backend, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let bound = backend.fs.server_ctx().app_context().expect("bound context");
+        let bound = backend.legacy_fs().server_ctx().app_context().expect("bound context");
         assert!(Arc::ptr_eq(&crate::runtime_sources::current_app_context().expect("ambient"), &foreign));
         let created = backend
             .create_multipart_upload(

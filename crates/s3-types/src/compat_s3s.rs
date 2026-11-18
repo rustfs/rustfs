@@ -239,6 +239,25 @@ mod tests {
     }
 
     #[test]
+    fn every_code_matches_the_s3s_default_message() {
+        let mut mismatches = Vec::new();
+        for code in S3ErrorCode::NAMED {
+            let legacy = oracle(code.as_str()).default_message();
+            if legacy.is_none() {
+                mismatches.push(format!("{code}: s3s has no default message"));
+            }
+            if code.default_message() != legacy {
+                mismatches.push(format!("{code}: s3s {legacy:?}, ours {:?}", code.default_message()));
+            }
+        }
+        assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+        for custom in ["TierNotFound", "NoSuchKey", ""] {
+            assert_eq!(legacy_s3s::S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+            assert_eq!(S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+        }
+    }
+
+    #[test]
     fn parsing_matches_s3s_for_exact_case_folded_unknown_and_invalid_input() {
         let mut inputs: Vec<Vec<u8>> = Vec::new();
         for code in S3ErrorCode::NAMED {

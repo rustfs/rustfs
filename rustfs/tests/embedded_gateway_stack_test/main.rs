@@ -292,7 +292,9 @@ fn every_served_operation_has_one_matrix_row_and_every_row_a_served_operation() 
     assert_eq!(rows.len(), distinct.len(), "an operation has two rows: {rows:?}");
     assert_eq!(alike.len(), ANSWERS_EVERY_CALLER_ALIKE.len(), "an operation is listed twice: {alike:?}");
     assert!(distinct.is_disjoint(&alike), "{:?}", distinct.intersection(&alike));
-    assert_eq!(&distinct | &alike, gateway_operations().into_iter().collect());
+    let mut covered = &distinct | &alike;
+    assert!(covered.insert(object_write::BROWSER_POST), "browser POST has two inventory entries");
+    assert_eq!(covered, gateway_operations().into_iter().collect());
 }
 
 /// Every operation that answers every caller alike gives root, the user without a policy and the

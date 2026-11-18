@@ -69,7 +69,7 @@ use rustfs_gateway::{
     AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr,
     DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces,
     PlaintextCustomerKeyAck, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig,
-    TransportSecurity, decide_with,
+    TransportSecurity, UnreadBodyDrain, decide_with,
 };
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, KeystoneEstablished, KeystoneVerifier, RequestIdCarrier, RootCredentials, RootCredentialsError,
@@ -215,8 +215,9 @@ impl GatewayStack {
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
             .map_err(GatewayAssemblyError::RootCredentials)?;
+        // `RUSTFS_REGION` may list several regions; a request may be signed for any of them.
         let region = assembly.region.as_deref().unwrap_or(RUSTFS_REGION);
-        let regions = RegionSet::new([region]).map_err(|_| GatewayAssemblyError::Region {
+        let regions = RegionSet::new(region.split(',').map(str::trim)).map_err(|_| GatewayAssemblyError::Region {
             region: region.to_owned(),
         })?;
         let hosts = rustfs_host_resolver(&assembly.server_domains).map_err(GatewayAssemblyError::ServerDomains)?;
@@ -225,6 +226,8 @@ impl GatewayStack {
         let credentials = Arc::new(IamCredentials::new(iam, root));
         let builder = ServiceBuilder::new()
             .rustfs_profile()
+            // Keep the profile's inner drain aligned with the host's configured idle bound.
+            .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
             .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))

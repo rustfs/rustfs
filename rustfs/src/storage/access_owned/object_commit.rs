@@ -197,6 +197,28 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
     }
     req.install_bucket_generation(bucket_generation?);
+    check_copy_source_owner(req.headers())
+}
+
+/// Checks a copy's source-owner assertion against the owner RustFS reports.
+pub(crate) fn check_copy_source_owner(headers: &http::HeaderMap) -> S3Result<()> {
+    let mut values = headers.get_all("x-amz-source-expected-bucket-owner").iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(s3_error!(InvalidRequest, "Multiple source expected owner headers"));
+    }
+    let expected = value
+        .to_str()
+        .map_err(|_| s3_error!(InvalidRequest, "Invalid source expected owner header"))?
+        .trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    if expected != crate::storage::s3_api::common::RUSTFS_OWNER_ID {
+        return Err(s3_error!(AccessDenied));
+    }
     Ok(())
 }
 
