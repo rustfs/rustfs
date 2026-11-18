@@ -101,3 +101,50 @@ pub(crate) fn signed_request_with_headers(
     }
     builder.body(Empty::new()).expect("a request")
 }
+
+/// `method path?query` carrying `body`, header-signed now over the body's SHA-256.
+pub(crate) fn signed_body_request(
+    method: Method,
+    path: &str,
+    query: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Bytes,
+) -> Request<http_body_util::Full<Bytes>> {
+    use sha2::{Digest as _, Sha256};
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::HOST, HeaderValue::from_static("localhost"));
+    let probe = Request::builder()
+        .method(method.clone())
+        .uri(path)
+        .header(http::header::HOST, "localhost")
+        .body(Bytes::new())
+        .expect("static request");
+    let accepted = WireRequest::accept(probe, &Limits::default()).expect("an acceptable host");
+    let stamp = AmzDate::parse(&chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()).expect("a stamp");
+    let scope = SigningScope::new(stamp.day(), "us-east-1", SigService::S3).expect("a scope");
+    let credentials = SigningCredentials::new(access_key, secret_key.as_bytes()).expect("credentials");
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    headers.insert("x-amz-content-sha256", HeaderValue::from_str(&hex).expect("hex is a header value"));
+    let signing = SigningRequest::new(
+        &method,
+        path,
+        query,
+        &headers,
+        accepted.host().raw_for_signing(),
+        PayloadMode::ExactSha256(digest),
+        stamp,
+    );
+    let signed = SigV4Signer::new(credentials, scope)
+        .sign_headers(&signing)
+        .expect("a signable request");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(signed.target())
+        .header(http::header::CONTENT_LENGTH, body.len());
+    for (name, value) in signed.headers() {
+        builder = builder.header(name, value);
+    }
+    builder.body(http_body_util::Full::new(body)).expect("a request")
+}

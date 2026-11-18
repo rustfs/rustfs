@@ -357,9 +357,14 @@ fn probe_stack<H: rustfs_gateway::Handler<rustfs_gateway::dto::ListBuckets>>(
         keystone_auth: Some(provider),
         ..assembly()
     };
-    let mut builder =
-        GatewayStack::configured_builder(&a, Arc::new(ScriptedIam { ready: true }), root().source(), early_gate(OPERATIONS))
-            .unwrap();
+    let mut builder = GatewayStack::configured_builder(
+        &a,
+        Arc::new(ScriptedIam { ready: true }),
+        root().source(),
+        early_gate(OPERATIONS),
+        std::convert::identity,
+    )
+    .unwrap();
     if let Some(now) = now {
         builder = builder.clock_with_skew_ack(
             rustfs_gateway::FixedClock::at_unix_seconds(now),
@@ -458,9 +463,14 @@ async fn keystone_envelope_refuses_missing_and_mismatched_owned_identity() {
             keystone_auth: Some(Arc::clone(&stub.provider)),
             ..assembly()
         };
-        let builder =
-            GatewayStack::configured_builder(&a, Arc::new(ScriptedIam { ready: true }), root().source(), early_gate(OPERATIONS))
-                .unwrap();
+        let builder = GatewayStack::configured_builder(
+            &a,
+            Arc::new(ScriptedIam { ready: true }),
+            root().source(),
+            early_gate(OPERATIONS),
+            std::convert::identity,
+        )
+        .unwrap();
         let service = builder
             .register::<rustfs_gateway::dto::ListBuckets, _>(Arc::clone(&probe))
             .build()

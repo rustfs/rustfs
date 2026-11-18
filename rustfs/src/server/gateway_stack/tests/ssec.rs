@@ -59,6 +59,7 @@ fn ssec_deployment_policy_and_key_handoff() {
                     Arc::new(ScriptedIam { ready: true }),
                     root().source(),
                     rustfs_gateway::allow_when(|request| request.operation == "GetObject" && request.identity.is_some()),
+                    std::convert::identity,
                 )
                 .expect("the production builder assembles");
                 let stack = GatewayStack {

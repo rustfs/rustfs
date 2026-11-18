@@ -53,6 +53,7 @@
 compile_error!("gateway-stack is restricted to debug builds");
 
 mod admin;
+mod control_plane;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -188,13 +189,25 @@ impl GatewayStack {
         admin::assemble(assembly, iam, root)
     }
 
+    /// Assembles the control-plane host over `router`: every other route the admin router claims.
+    pub(crate) fn assemble_control_plane(
+        assembly: GatewayAssembly,
+        router: Arc<crate::admin::router::S3Router<crate::admin::router::AdminOperation>>,
+    ) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        control_plane::assemble(assembly, iam, root, router)
+    }
+
     fn assemble_with(
         assembly: GatewayAssembly,
         iam: Arc<dyn IamKeyLookup>,
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
-        let builder = Self::configured_builder(&assembly, iam, root, authorizer)?;
+        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?;
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
         let service = register(OPERATIONS, builder, &backend)
             .build()
@@ -210,6 +223,7 @@ impl GatewayStack {
         iam: Arc<dyn IamKeyLookup>,
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
+        authenticator: impl FnOnce(SigV4Authenticator) -> SigV4Authenticator,
     ) -> Result<ServiceBuilder, GatewayAssemblyError> {
         // A root the gateway could not verify a signature with is a startup error, never a
         // server that silently has no root. Requests read the live root from `root`.
@@ -231,7 +245,7 @@ impl GatewayStack {
             .defer_encryption_header_refusals_to_handlers()
             // Keep the profile's inner drain aligned with the host's configured idle bound.
             .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
-            .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
+            .authenticator(authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile()))
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
             // Both gates follow the deployment setting; transport facts remain per request.

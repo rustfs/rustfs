@@ -16,6 +16,7 @@
 
 #[path = "admin/tests.rs"]
 mod admin;
+mod control_plane;
 mod keystone;
 mod legacy_layers;
 mod ssec;
