@@ -52,6 +52,7 @@ mod collector_lifecycle;
 mod cycle_collector_diagnostics;
 mod expiry_lock;
 mod listing_window_scope;
+pub(super) mod local_drive_recovery;
 mod node_admission;
 mod partial_bucket_carry;
 mod per_bucket_certification;
