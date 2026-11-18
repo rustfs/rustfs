@@ -262,8 +262,16 @@ impl DefaultBucketUsecase {
         // same-name make while it waits for repair coordination.
         let operation_bucket = bucket.clone();
         let operation_store = store.clone();
-        with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
+        let removed_targets = with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
             let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;
+            let removed_targets = match rustfs_notify::notification_system() {
+                Some(system) => operation_store
+                    .bucket_incarnation_id(&operation_bucket)
+                    .await
+                    .ok()
+                    .map(|id| system.notifier.bucket_removed_targets(&operation_bucket, id)),
+                None => None,
+            };
             let delete_result = operation_store
                 .delete_bucket(
                     &operation_bucket,
@@ -281,7 +289,7 @@ impl DefaultBucketUsecase {
                     {
                         warn!(bucket = %operation_bucket, error = ?err, "site replication delete bucket hook failed");
                     }
-                    Ok::<(), S3Error>(())
+                    Ok::<_, S3Error>(removed_targets)
                 }
                 Err(err) => {
                     if let Some(intent) = intent {
@@ -306,6 +314,10 @@ impl DefaultBucketUsecase {
         // Notify peers to drop their cached metadata for the now-deleted bucket.
         notify_bucket_metadata_delete(bucket, envelope.request_context().cloned());
 
+        let helper = match removed_targets {
+            Some(targets) => helper.with_bucket_removed_targets(targets),
+            None => helper,
+        };
         let result = Ok(gateway_dto::DeleteBucketOutput::default());
         let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
         result

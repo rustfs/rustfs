@@ -12732,6 +12732,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         send_event(EventArgs {
             event_name: event_name.to_string(),
+            bucket_incarnation_id: opts.expected_bucket_incarnation_id,
             bucket_name: bucket.to_string(),
             object: obj_info,
             user_agent: "Internal: [ILM-Transition]".to_string(),
@@ -12878,6 +12879,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
                 send_event(EventArgs {
                     event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                    bucket_incarnation_id: opts.expected_bucket_incarnation_id,
                     bucket_name: bucket.to_string(),
                     object: restored_info,
                     user_agent: "Internal: [Restore-Completed]".to_string(),
@@ -13014,6 +13016,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
             send_event(EventArgs {
                 event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                bucket_incarnation_id: opts.expected_bucket_incarnation_id,
                 bucket_name: bucket.to_string(),
                 object: restored_info,
                 user_agent: "Internal: [Restore-Completed]".to_string(),

@@ -187,6 +187,11 @@ impl InternalPutObjectEvent {
             .req_param("principalId", principal_id)
     }
 
+    pub(super) fn with_bucket_incarnation(mut self, incarnation_id: Option<Uuid>) -> Self {
+        self.builder = self.builder.bucket_incarnation_id(incarnation_id);
+        self
+    }
+
     pub(super) fn object(self, obj_info: ObjectInfo) -> Self {
         let Self {
             builder,
@@ -709,6 +714,7 @@ impl DefaultObjectUsecase {
                 &key,
                 ctx.principal_id,
             )
+            .map(|event| event.with_bucket_incarnation(opts.expected_bucket_incarnation_id))
         });
 
         // The spawned task owns the commit so a cancelled caller cannot leave

@@ -3209,6 +3209,7 @@ fn replicate_object_info_from_object_info(
     let checksum = if ssec { oi.checksum.clone() } else { None };
 
     ReplicateObjectInfo {
+        notification_bucket_incarnation: None,
         name: oi.name,
         size: oi.size,
         actual_size: asz,

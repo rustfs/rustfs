@@ -16,9 +16,13 @@ use crate::rules::{RulesMap, TargetIdSet};
 use percent_encoding::percent_decode_str;
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
-use starshard::{AsyncShardedHashMap, DEFAULT_SHARDS, SnapshotMode};
-use std::sync::Arc;
+use starshard::{DEFAULT_SHARDS, ShardedHashMap, SnapshotMode};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tracing::info;
+use uuid::Uuid;
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_RULE_ENGINE: &str = "rule_engine";
@@ -33,34 +37,56 @@ fn decoded_object_key_for_matching(object_key: &str) -> Option<String> {
     (decoded != object_key).then(|| decoded.into_owned())
 }
 
+struct BucketRules {
+    incarnation_id: Option<Uuid>,
+    rules: RulesMap,
+    refresh_requested: Arc<AtomicBool>,
+}
+
 #[derive(Clone)]
 pub struct NotifyRuleEngine {
-    bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
+    bucket_rules_map: Arc<ShardedHashMap<String, Arc<BucketRules>, rustc_hash::FxBuildHasher>>,
 }
 
 impl NotifyRuleEngine {
     pub fn new() -> Self {
         Self {
-            bucket_rules_map: Arc::new(AsyncShardedHashMap::with_snapshot_mode(DEFAULT_SHARDS, SnapshotMode::Cached)),
+            bucket_rules_map: Arc::new(ShardedHashMap::with_snapshot_mode(DEFAULT_SHARDS, SnapshotMode::Cached)),
         }
     }
 
     pub async fn is_target_bound_to_any_bucket(&self, target_id: &TargetID) -> bool {
-        let items = self.bucket_rules_map.iter().await;
-        for (_bucket, rules_map) in items {
-            if rules_map.contains_target_id(target_id) {
-                return true;
-            }
-        }
-        false
+        self.bucket_rules_map
+            .iter()
+            .any(|(_, snapshot)| snapshot.rules.contains_target_id(target_id))
     }
 
     pub async fn set_bucket_rules(&self, bucket: &str, rules_map: RulesMap) {
+        self.publish_bucket_rules(bucket, None, rules_map);
+    }
+
+    /// Atomically publishes the rules and the identity used by event dispatch.
+    pub(crate) fn publish_bucket_rules(&self, bucket: &str, incarnation_id: Option<Uuid>, rules_map: RulesMap) {
         let event_count = rules_map.iter_events().count();
+        let bucket_key = bucket.to_owned();
         if rules_map.is_empty() {
-            self.bucket_rules_map.remove(&bucket.to_string()).await;
+            self.bucket_rules_map.remove(&bucket_key);
         } else {
-            self.bucket_rules_map.insert(bucket.to_string(), rules_map).await;
+            // A reload that confirms the current incarnation must not re-arm
+            // the refresh triggered by delayed events from an older bucket.
+            let refresh_requested = self
+                .bucket_rules_map
+                .get(&bucket_key)
+                .filter(|current| current.incarnation_id == incarnation_id)
+                .map_or_else(|| Arc::new(AtomicBool::new(false)), |current| current.refresh_requested.clone());
+            self.bucket_rules_map.insert(
+                bucket_key,
+                Arc::new(BucketRules {
+                    incarnation_id,
+                    rules: rules_map,
+                    refresh_requested,
+                }),
+            );
         }
         info!(
             event = EVENT_NOTIFY_RULES_UPDATED,
@@ -74,11 +100,17 @@ impl NotifyRuleEngine {
     }
 
     pub async fn get_bucket_rules(&self, bucket: &str) -> Option<RulesMap> {
-        self.bucket_rules_map.get(&bucket.to_string()).await
+        self.bucket_rules_map
+            .get(&bucket.to_string())
+            .map(|snapshot| snapshot.rules.clone())
     }
 
     pub async fn clear_bucket_rules(&self, bucket: &str) {
-        if self.bucket_rules_map.remove(&bucket.to_string()).await.is_some() {
+        self.withdraw_bucket_rules(bucket);
+    }
+
+    pub(crate) fn withdraw_bucket_rules(&self, bucket: &str) {
+        if self.bucket_rules_map.remove(&bucket.to_string()).is_some() {
             info!(
                 event = EVENT_NOTIFY_RULES_UPDATED,
                 component = LOG_COMPONENT_NOTIFY,
@@ -91,21 +123,43 @@ impl NotifyRuleEngine {
     }
 
     pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
-        self.get_bucket_rules(bucket)
-            .await
-            .is_some_and(|rules_map| rules_map.has_subscriber(event))
+        self.bucket_rules_map
+            .get(&bucket.to_string())
+            .is_some_and(|snapshot| snapshot.rules.has_subscriber(event))
     }
 
     pub async fn match_targets(&self, bucket: &str, event_name: EventName, object_key: &str) -> TargetIdSet {
-        self.get_bucket_rules(bucket)
-            .await
-            .map_or_else(TargetIdSet::new, |rules_map| {
-                let mut target_ids = rules_map.match_rules(event_name, object_key);
-                if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
-                    target_ids.extend(rules_map.match_rules(event_name, &decoded_key));
-                }
-                target_ids
-            })
+        self.match_bucket_targets(bucket, None, event_name, object_key)
+    }
+
+    /// Allow one targeted reload per installed bucket incarnation. The ordinary
+    /// metadata refresh loop can still recover a failed or interrupted reload.
+    pub(crate) fn request_incarnation_refresh(&self, bucket: &str, incarnation_id: Uuid) -> bool {
+        self.bucket_rules_map.get(&bucket.to_string()).is_some_and(|snapshot| {
+            snapshot.incarnation_id.is_some_and(|current| current != incarnation_id)
+                && !snapshot.refresh_requested.swap(true, Ordering::Relaxed)
+        })
+    }
+
+    pub(crate) fn match_bucket_targets(
+        &self,
+        bucket: &str,
+        incarnation_id: Option<Uuid>,
+        event_name: EventName,
+        object_key: &str,
+    ) -> TargetIdSet {
+        let Some(snapshot) = self
+            .bucket_rules_map
+            .get(&bucket.to_string())
+            .filter(|snapshot| snapshot.incarnation_id == incarnation_id)
+        else {
+            return TargetIdSet::new();
+        };
+        let mut targets = snapshot.rules.match_rules(event_name, object_key);
+        if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
+            targets.extend(snapshot.rules.match_rules(event_name, &decoded_key));
+        }
+        targets
     }
 }
 
@@ -121,6 +175,35 @@ mod tests {
     use crate::rules::RulesMap;
     use rustfs_s3_types::EventName;
     use rustfs_targets::arn::TargetID;
+
+    #[test]
+    fn bucket_rules_route_events_only_with_the_matching_incarnation() {
+        let engine = NotifyRuleEngine::new();
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        let old_target = TargetID::new("old".to_string(), "webhook".to_string());
+        let new_target = TargetID::new("new".to_string(), "webhook".to_string());
+        let rules = |target: TargetID| {
+            let mut rules = RulesMap::new();
+            rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_owned(), target);
+            rules
+        };
+        let matched = |id| engine.match_bucket_targets("bucket", id, EventName::ObjectCreatedPut, "object");
+
+        engine.publish_bucket_rules("bucket", Some(old_id), rules(old_target.clone()));
+        assert!(matched(Some(old_id)).contains(&old_target));
+        assert!(matched(Some(new_id)).is_empty(), "a peer may still have the old rules");
+        assert!(engine.request_incarnation_refresh("bucket", new_id));
+        assert!(!engine.request_incarnation_refresh("bucket", new_id));
+        assert!(matched(None).is_empty());
+
+        engine.withdraw_bucket_rules("bucket");
+        assert!(matched(Some(old_id)).is_empty());
+        assert!(matched(Some(new_id)).is_empty());
+        engine.publish_bucket_rules("bucket", Some(new_id), rules(new_target.clone()));
+        assert!(matched(Some(old_id)).is_empty());
+        assert!(matched(Some(new_id)).contains(&new_target));
+    }
 
     #[tokio::test]
     async fn rule_engine_tracks_bucket_rule_lifecycle() {

@@ -68,11 +68,11 @@ pub(crate) async fn init_embedded_startup_runtime_services(
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<EmbeddedStartupServiceRuntime> {
     init_embedded_optional_service_runtime(config, store.clone()).await;
-    let buckets = init_embedded_bucket_metadata_runtime(store.clone(), &ctx).await?;
+    init_embedded_bucket_metadata_runtime(store.clone(), &ctx).await?;
     let iam_bootstrap = init_embedded_iam_runtime(store, ctx.clone(), readiness, server_ctx.clone())
         .await
         .map_err(|err| std::io::Error::other(format!("IAM bootstrap setup: {err}")))?;
-    init_embedded_notification_runtime(endpoint_pools, buckets).await;
+    init_embedded_notification_runtime(endpoint_pools).await;
 
     Ok(EmbeddedStartupServiceRuntime {
         iam_bootstrap,
@@ -108,7 +108,7 @@ pub(crate) async fn init_startup_runtime_services(
     init_buffer_profile_system(config);
     init_deadlock_detector_runtime();
 
-    let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
+    init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
     let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx.clone()).await?;
 
     // Audit initialization requires the AppContext (server config + object store)
@@ -120,7 +120,7 @@ pub(crate) async fn init_startup_runtime_services(
     // bucket metadata itself, and its first pass runs off this path.
     spawn_site_replication_reconcile_task(ctx.clone());
     let oidc_recovery = init_auth_integrations(ctx.child_token()).await?;
-    init_notification_runtime(endpoint_pools, buckets).await?;
+    init_notification_runtime(endpoint_pools).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
     init_observability_runtime(store.clone(), ctx.clone()).await;
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;

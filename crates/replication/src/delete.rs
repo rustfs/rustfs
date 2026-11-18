@@ -24,6 +24,8 @@ use crate::{
 
 #[derive(Debug, Clone, Default)]
 pub struct DeletedObjectReplicationInfo {
+    /// The bucket bound to this attempt's in-process notifications.
+    pub notification_bucket_incarnation: Option<Uuid>,
     pub delete_object: DeletedObject,
     pub bucket: String,
     pub event_type: String,

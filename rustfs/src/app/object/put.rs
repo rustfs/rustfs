@@ -2023,6 +2023,7 @@ impl DefaultObjectUsecase {
                         &key,
                         principal_id,
                     )
+                    .map(|event| event.with_bucket_incarnation(opts.expected_bucket_incarnation_id))
                 });
                 (PutObjectCompletion::Internal(event.flatten().map(Box::new)), Some(request_context))
             }

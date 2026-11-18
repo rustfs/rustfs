@@ -82,6 +82,8 @@ impl EventNotifier {
 
 #[derive(Debug, Default)]
 pub struct EventArgs {
+    /// Bucket instance verified by storage when producing this event.
+    pub bucket_incarnation_id: Option<uuid::Uuid>,
     pub event_name: String,
     pub bucket_name: String,
     pub object: ObjectInfo,

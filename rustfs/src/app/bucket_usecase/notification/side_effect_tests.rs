@@ -51,22 +51,18 @@ enum Callback {
     Validate,
     ReloadStarted,
     ReloadCompleted,
-    Clear,
-    Add,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
     Rules(Callback, String, Vec<RuntimeRule>, Vec<u8>),
     Reload(Callback, &'static str, bool),
-    Clear(Vec<u8>),
 }
 
 struct RecordingNotify {
     bucket: String,
     fail_at: Option<Callback>,
     calls: Arc<Mutex<Vec<Observation>>>,
-    active_rules: Mutex<Vec<RuntimeRule>>,
 }
 
 async fn read_notification_xml(bucket: &str) -> Vec<u8> {
@@ -112,22 +108,6 @@ impl NotifyInterface for RecordingNotify {
     ) -> Result<(), NotificationError> {
         self.record_rules(Callback::Validate, bucket, region, rules).await;
         self.maybe_fail(Callback::Validate)
-    }
-
-    async fn add_event_specific_rules(&self, bucket: &str, region: &str, rules: &[RuntimeRule]) -> Result<(), NotificationError> {
-        self.record_rules(Callback::Add, bucket, region, rules).await;
-        self.maybe_fail(Callback::Add)?;
-        *self.active_rules.lock().unwrap() = rules.to_vec();
-        Ok(())
-    }
-
-    async fn clear_bucket_notification_rules(&self, bucket: &str) -> Result<(), NotificationError> {
-        assert_eq!(bucket, self.bucket);
-        let xml = read_notification_xml(bucket).await;
-        self.calls.lock().unwrap().push(Observation::Clear(xml));
-        self.maybe_fail(Callback::Clear)?;
-        self.active_rules.lock().unwrap().clear();
-        Ok(())
     }
 }
 
@@ -219,7 +199,7 @@ fn check_notification_write_order() {
     run_large_stack_test("notification-write-order", || async {
         let ambient = shared_gating_ambient().await;
         let store = ambient.object_store();
-        for fail_at in [None, Some(Callback::Validate), Some(Callback::Clear), Some(Callback::Add)] {
+        for fail_at in [None, Some(Callback::Validate)] {
             let bucket = format!("notify-order-{}", uuid::Uuid::new_v4().simple());
             store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
             store
@@ -241,7 +221,6 @@ fn check_notification_write_order() {
                 bucket: bucket.clone(),
                 fail_at,
                 calls: calls.clone(),
-                active_rules: Mutex::new(expected_rules()),
             });
             let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder.clone()));
             let region = context
@@ -268,11 +247,7 @@ fn check_notification_write_order() {
                 timeline.extend([
                     Observation::Reload(Callback::ReloadStarted, "put bucket notification", false),
                     Observation::Reload(Callback::ReloadCompleted, "put bucket notification", false),
-                    Observation::Clear(NEW_XML.to_vec()),
                 ]);
-                if fail_at != Some(Callback::Clear) {
-                    timeline.push(Observation::Rules(Callback::Add, region.clone(), expected.clone(), NEW_XML.to_vec()));
-                }
             }
             assert_eq!(*calls.lock().unwrap(), timeline);
             let stored = if fail_at == Some(Callback::Validate) {
@@ -282,7 +257,6 @@ fn check_notification_write_order() {
             };
             assert_eq!(read_notification_xml(&bucket).await, stored);
             let error_message = match fail_at {
-                Some(Callback::Clear) => Some("Failed to clear rules: Rule configuration error: fixture failure"),
                 Some(_) => Some("Failed to add rules: Rule configuration error: fixture failure"),
                 None => None,
             };
@@ -304,7 +278,6 @@ fn check_notification_write_order() {
             assert!(audit.events.lock().unwrap().is_empty());
 
             if fail_at.is_none() {
-                assert_eq!(*recorder.active_rules.lock().unwrap(), expected);
                 let mut invalid = configuration();
                 invalid.lambda_function_configurations.as_mut().unwrap()[0].lambda_function_arn = "invalid-arn".into();
                 let mut invalid = notification_request(&bucket, invalid, &slot);
@@ -350,12 +323,9 @@ fn check_notification_write_order() {
                         Observation::Rules(Callback::Validate, region.clone(), Vec::new(), NEW_XML.to_vec()),
                         Observation::Reload(Callback::ReloadStarted, "put bucket notification", false),
                         Observation::Reload(Callback::ReloadCompleted, "put bucket notification", false),
-                        Observation::Clear(EMPTY_XML.to_vec()),
-                        Observation::Rules(Callback::Add, region, Vec::new(), EMPTY_XML.to_vec()),
                     ]
                 );
                 assert_eq!(read_notification_xml(&bucket).await, EMPTY_XML);
-                assert!(recorder.active_rules.lock().unwrap().is_empty());
             }
         }
     });
@@ -412,7 +382,6 @@ fn legacy_put_notification_does_not_write_after_the_bucket_is_recreated() {
             bucket: bucket.clone(),
             fail_at: None,
             calls: calls.clone(),
-            active_rules: Mutex::new(Vec::new()),
         });
         let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder));
         let slot = ServerContextSlot::new();

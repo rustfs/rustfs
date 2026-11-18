@@ -16,12 +16,9 @@
 use crate::protocols::ProtocolStorageClient;
 use crate::runtime_sources::current_region;
 use crate::server::ShutdownHandle;
-use crate::server::runtime_sources::current_notify_interface;
-use crate::storage_api::error::{StorageError, is_unreadable_config_error};
-use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::init::notification_config_to_s3s;
 use crate::storage_api::startup::init::{
-    get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    deserialize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
 use crate::storage_api::startup::services::ECStore;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
@@ -32,8 +29,7 @@ use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
-use rustfs_notify::NotificationError;
-use rustfs_s3_types::{EventName, s3_error};
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
 use rustfs_utils::get_env_usize;
 use std::env;
@@ -174,148 +170,44 @@ fn notification_config_to_event_rules(
     Ok(event_rules)
 }
 
-/// One bucket's persisted notification configuration as startup sees it.
-#[derive(Debug)]
-enum BucketNotificationLookup {
-    Configured(rustfs_gateway_types::persistence::PersistedNotificationConfiguration),
-    Missing,
-    /// Stored bytes cannot be parsed. Deterministic, so a retry cannot help,
-    /// and reading it as missing would clear the bucket's rules.
-    Unreadable,
-}
-
-fn classify_bucket_notification_lookup(
-    bucket: &str,
-    lookup: Result<Option<rustfs_gateway_types::persistence::PersistedNotificationConfiguration>, StorageError>,
-) -> Result<BucketNotificationLookup, NotificationError> {
-    match lookup {
-        Ok(Some(cfg)) => Ok(BucketNotificationLookup::Configured(cfg)),
-        Ok(None) => Ok(BucketNotificationLookup::Missing),
-        Err(err) if is_unreadable_config_error(&err) => {
+/// Publishes the complete, current configuration under the bucket metadata publication lock.
+pub(crate) fn publish_bucket_notification_configuration(bucket: &str, stored: Option<(&[u8], uuid::Uuid)>) {
+    let Some((bytes, incarnation_id)) = stored else {
+        if let Some(system) = rustfs_notify::notification_system() {
+            system.publish_bucket_notification_config(bucket, None);
+        }
+        return;
+    };
+    let parsed = (|| {
+        let config = deserialize::<rustfs_gateway_types::persistence::PersistedNotificationConfiguration>(bytes)
+            .map_err(|_| "invalid_xml")?;
+        let config = notification_config_to_s3s(&config).map_err(|_| "invalid_configuration")?;
+        notification_config_to_event_rules(&config).map_err(|_| "invalid_target_arn")
+    })();
+    match parsed {
+        Ok(rules) => {
+            let config = rustfs_notify::notifier_global::bucket_notification_config_for_rules(&notification_region(), &rules);
+            rustfs_notify::ensure_live_events().publish_bucket_notification_config(bucket, Some((incarnation_id, &config)));
+        }
+        Err(reason) => {
             error!(
                 target: "rustfs::init",
                 event = "notification_config_unreadable",
                 component = LOG_COMPONENT_INIT,
                 subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                 bucket = %bucket,
-                error = %err,
+                reason,
                 "Bucket notification configuration is unreadable; leaving its rules unchanged"
             );
-            Ok(BucketNotificationLookup::Unreadable)
-        }
-        Err(err) => Err(NotificationError::StorageNotAvailable(format!(
-            "load bucket notification config for {bucket}: {err}"
-        ))),
-    }
-}
-
-/// Apply one bucket's persisted notification rules. An unreadable config is
-/// isolated to its bucket: it neither aborts setup for the other buckets nor
-/// clears the bucket's rules as if it had none.
-async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
-    match classify_bucket_notification_lookup(bucket, get_bucket_notification_config(bucket).await)? {
-        BucketNotificationLookup::Unreadable => Ok(false),
-        BucketNotificationLookup::Configured(cfg) => {
-            let cfg = notification_config_to_s3s(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
-            info!(
-                target: "rustfs::init",
-                event = "notification_config_loaded",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                bucket = %bucket,
-                queue_configuration_count = cfg.queue_configurations.as_ref().map_or(0, Vec::len),
-                topic_configuration_count = cfg.topic_configurations.as_ref().map_or(0, Vec::len),
-                lambda_configuration_count = cfg.lambda_function_configurations.as_ref().map_or(0, Vec::len),
-                "Loaded bucket notification configuration"
-            );
-
-            let event_rules =
-                notification_config_to_event_rules(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
-            current_notify_interface()
-                .add_event_specific_rules(bucket, region, &event_rules)
-                .await?;
-            Ok(true)
-        }
-        BucketNotificationLookup::Missing => {
-            info!(
-                target: "rustfs::init",
-                event = "notification_config_missing",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                bucket = %bucket,
-                "Bucket notification configuration not found"
-            );
-            current_notify_interface().clear_bucket_notification_rules(bucket).await?;
-            Ok(false)
         }
     }
-}
-
-/// Add existing bucket notification configurations to the global notifier system.
-/// This function retrieves notification configurations for each bucket
-/// and registers the corresponding event rules with the notifier system.
-///  It processes queue, topic, and lambda configurations and maps them to event rules.
-///  # Arguments
-/// * `buckets` - A vector of bucket names to process
-#[instrument(skip_all)]
-pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let region = notification_region();
-    for bucket in buckets.iter() {
-        if let Err(err) = apply_bucket_notification_configuration(bucket, region.as_str()).await {
-            let err = s3_error!(InternalError, "Failed to add rules: {err}");
-            error!(
-                target: "rustfs::init",
-                event = "notification_rules_registration_failed",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                bucket = %bucket,
-                region,
-                error = ?err,
-                "Failed to register bucket notification rules"
-            );
-        }
-    }
-}
-
-pub(crate) async fn reconcile_persisted_bucket_notification_configurations(
-    store: Arc<rustfs_notify::NotifyStore>,
-) -> Result<usize, NotificationError> {
-    let bucket_infos = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(|err| NotificationError::StorageNotAvailable(format!("list buckets for notification reconciliation: {err}")))?;
-    let region = notification_region();
-    let mut configured_bucket_count = 0;
-
-    for bucket in bucket_infos {
-        if apply_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
-            configured_bucket_count += 1;
-        }
-    }
-
-    Ok(configured_bucket_count)
 }
 
 fn notification_region() -> String {
-    let global_region = current_region();
-    global_region
+    current_region()
         .as_ref()
-        .filter(|r| !r.as_str().is_empty())
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| {
-            warn!(
-                target: "rustfs::init",
-                event = "notification_region_fallback",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                fallback_region = RUSTFS_REGION,
-                "Notification configuration falling back to default region"
-            );
-            RUSTFS_REGION.to_string()
-        })
+        .filter(|region| !region.as_str().is_empty())
+        .map_or_else(|| RUSTFS_REGION.to_owned(), ToString::to_string)
 }
 
 /// Build KMS configuration for local backend
@@ -1423,41 +1315,15 @@ pub async fn init_sftp_system(
 #[cfg(test)]
 mod tests {
     use super::{
-        BucketNotificationLookup, build_aws_kms_config, build_vault_kms_config, build_vault_transit_kms_config,
-        classify_bucket_notification_lookup, notification_config_to_event_rules, resolve_buffer_profile_config,
+        build_aws_kms_config, build_vault_kms_config, build_vault_transit_kms_config, notification_config_to_event_rules,
+        resolve_buffer_profile_config,
     };
     use crate::config::{BufferConfig, WorkloadProfile};
-    use crate::storage_api::error::{StorageError, UnreadableBucketConfig};
     use rustfs_config::KI_B;
     use rustfs_s3_types::EventName;
     use s3s::dto::{
         FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter,
     };
-
-    /// rustfs/backlog#1734: an unreadable notification config is isolated to
-    /// its bucket. It must not abort setup for every other bucket (a storage
-    /// fault still does, so reconciliation retries) and must not read as
-    /// missing, which would clear the bucket's rules.
-    #[test]
-    fn unreadable_notification_config_is_isolated_to_its_bucket() {
-        let unreadable = StorageError::other(UnreadableBucketConfig {
-            bucket: "b".to_string(),
-            config_file: "notification.xml".to_string(),
-            raw_len: 5,
-        });
-        assert!(matches!(
-            classify_bucket_notification_lookup("b", Err(unreadable)),
-            Ok(BucketNotificationLookup::Unreadable)
-        ));
-        assert!(matches!(
-            classify_bucket_notification_lookup("b", Ok(None)),
-            Ok(BucketNotificationLookup::Missing)
-        ));
-        assert!(matches!(
-            classify_bucket_notification_lookup("b", Err(StorageError::ErasureReadQuorum)),
-            Err(rustfs_notify::NotificationError::StorageNotAvailable(_))
-        ));
-    }
 
     #[test]
     fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
@@ -1486,6 +1352,21 @@ mod tests {
         let resolved = resolve_buffer_profile_config(invalid.clone(), invalid);
 
         assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn corrupt_notification_config_keeps_same_incarnation_rules_until_withdrawn() {
+        let bucket = "unreadable-notify-config";
+        let id = uuid::Uuid::new_v4();
+        let xml = br#"<NotificationConfiguration><QueueConfiguration><Id>test</Id><Queue>arn:rustfs:sqs:us-east-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>"#;
+        super::publish_bucket_notification_configuration(bucket, Some((xml, id)));
+        let system = rustfs_notify::notification_system().expect("notification system created by metadata install");
+        assert!(system.has_subscriber(bucket, &EventName::ObjectCreatedPut).await);
+        super::publish_bucket_notification_configuration(bucket, Some((b"malformed xml", id)));
+        assert!(system.has_subscriber(bucket, &EventName::ObjectCreatedPut).await);
+
+        super::publish_bucket_notification_configuration(bucket, None);
+        assert!(!system.has_subscriber(bucket, &EventName::ObjectCreatedPut).await);
     }
 
     #[test]

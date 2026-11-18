@@ -16,6 +16,17 @@ pub(crate) use crate::services::event_notification::EventArgs;
 
 use super::runtime_boundary;
 
+/// Bind an attempt's status events to the bucket visible when the attempt starts.
+pub(crate) async fn capture_event_bucket_incarnation(bucket: &str) -> Option<uuid::Uuid> {
+    let sys = crate::bucket::metadata_sys::get_global_bucket_metadata_sys()?;
+    let sys = sys.read().await.clone();
+    if sys.get(bucket).await.ok()?.notification_config_xml.is_empty() {
+        return None;
+    }
+    let store = sys.object_store();
+    store.bucket_incarnation_id_from_disk(bucket).await.ok()
+}
+
 pub(crate) fn send_event(args: EventArgs) {
     crate::services::event_notification::send_event(args);
 }

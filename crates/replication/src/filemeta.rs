@@ -891,6 +891,9 @@ pub struct ReplicationGenerationSnapshot {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
+    /// The bucket bound to this attempt's in-process notifications.
+    #[serde(skip)]
+    pub notification_bucket_incarnation: Option<Uuid>,
     pub name: String,
     pub size: i64,
     pub actual_size: i64,

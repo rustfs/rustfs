@@ -432,12 +432,10 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod bucket_metadata {
-        pub(crate) mod contract {
-            pub(crate) mod bucket {
-                pub(crate) use super::super::super::super::storage_contracts::{BucketOperations, BucketOptions};
-            }
-        }
-
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::{
+            metadata::{BUCKET_NOTIFICATION_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG},
+            metadata_sys::BUCKET_CONFIG_PUBLISH_HOOK,
+        };
         pub(crate) use crate::storage::storage_api::{
             ECStore, Error, Result, get_global_replication_pool, init_bucket_metadata_sys,
             reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
@@ -466,9 +464,9 @@ pub(crate) mod startup {
         }
 
         pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::deserialize;
         pub(crate) use crate::storage::storage_api::{
-            get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,
-            process_topic_configurations,
+            process_lambda_configurations, process_queue_configurations, process_topic_configurations,
         };
 
         pub(crate) mod concurrency {
@@ -589,9 +587,8 @@ pub(crate) mod on_demand_migration {
     pub(crate) use crate::storage::storage_api::contract::{
         namespace::NamespaceLocking, object::HTTPPreconditions, object::ObjectOperations, range::HTTPRangeSpec,
     };
-    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
-        BUCKET_CONFIG_PUBLISH_HOOK, get_on_demand_migration_config, get_on_demand_migration_config_in,
+        get_on_demand_migration_config, get_on_demand_migration_config_in,
     };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::remote_s3_client;
     pub(crate) use crate::storage::storage_api::ecstore_config::com::{read_config_with_metadata, save_config_with_opts};

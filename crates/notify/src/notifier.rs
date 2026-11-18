@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::error::NotificationError;
-use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
+use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine, rules::TargetIdSet};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
+use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
@@ -235,6 +236,12 @@ impl EventNotifier {
         );
     }
 
+    /// Captures the deleted bucket's final delivery targets before its rules are withdrawn.
+    pub fn bucket_removed_targets(&self, bucket: &str, incarnation_id: uuid::Uuid) -> TargetIdSet {
+        self.rule_engine
+            .match_bucket_targets(bucket, Some(incarnation_id), EventName::BucketRemoved, "")
+    }
+
     /// Sends an event to the appropriate targets based on the bucket rules
     ///
     /// # Arguments
@@ -245,7 +252,25 @@ impl EventNotifier {
         let object_key = &event.s3.object.key;
         let event_name = event.event_name;
 
-        let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
+        let target_ids = match &event.bucket_removed_targets {
+            Some(targets) if event_name == EventName::BucketRemoved => targets.clone(),
+            _ => {
+                let match_targets = || {
+                    self.rule_engine
+                        .match_bucket_targets(bucket_name, event.bucket_incarnation_id, event_name, object_key)
+                };
+                let targets = match_targets();
+                if targets.is_empty()
+                    && let Some(id) = event.bucket_incarnation_id
+                    && self.rule_engine.request_incarnation_refresh(bucket_name, id)
+                    && crate::storage_api::refresh_notify_bucket_metadata(bucket_name).await
+                {
+                    match_targets()
+                } else {
+                    targets
+                }
+            }
+        };
         if target_ids.is_empty() {
             debug!(
                 event = EVENT_NOTIFY_DISPATCH_SKIPPED,

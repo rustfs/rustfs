@@ -747,6 +747,8 @@ async fn complete_extract_member_post_commit(
     let mut event_object = convert_ecstore_object_info(obj_info);
     event_object.version_id = (!actual_version_id.is_empty()).then_some(actual_version_id.clone());
     let event = rustfs_notify::EventArgs {
+        bucket_incarnation_id: opts.expected_bucket_incarnation_id,
+        bucket_removed_targets: None,
         event_name: put_event_name_for_post_object(false),
         bucket_name: context.bucket.clone(),
         object: event_object,
@@ -2856,19 +2858,6 @@ mod tests {
             _region: &str,
             _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
         ) -> Result<(), rustfs_notify::NotificationError> {
-            Ok(())
-        }
-
-        async fn add_event_specific_rules(
-            &self,
-            _bucket_name: &str,
-            _region: &str,
-            _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
-        ) -> Result<(), rustfs_notify::NotificationError> {
-            Ok(())
-        }
-
-        async fn clear_bucket_notification_rules(&self, _bucket_name: &str) -> Result<(), rustfs_notify::NotificationError> {
             Ok(())
         }
     }

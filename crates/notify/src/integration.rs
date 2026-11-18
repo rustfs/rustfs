@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::{EventNotifier, TargetList};
 use crate::services::NotifyServices;
 use crate::{
@@ -182,7 +181,6 @@ impl NotificationSystem {
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         let (live_event_sender, _) = broadcast::channel(1024);
         let metrics = Arc::new(NotificationMetrics::new());
-        let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
         let rule_engine = NotifyRuleEngine::new();
         let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let target_list = notifier.target_list();
@@ -200,7 +198,6 @@ impl NotificationSystem {
             stream_cancellers,
             concurrency_limiter,
             metrics,
-            subscriber_view,
             live_event_sender,
             live_event_history,
         );
@@ -411,6 +408,13 @@ impl NotificationSystem {
             .bucket_config_manager
             .load_bucket_notification_config(bucket, cfg)
             .await
+    }
+
+    /// Applies the current committed bucket rules while the caller holds the metadata publication fence.
+    pub fn publish_bucket_notification_config(&self, bucket: &str, cfg: Option<(uuid::Uuid, &BucketNotificationConfig)>) {
+        self.services
+            .bucket_config_manager
+            .publish_bucket_notification_config(bucket, cfg);
     }
 
     /// Sends an event

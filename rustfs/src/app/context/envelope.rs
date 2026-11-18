@@ -849,6 +849,7 @@ impl RequestEnvelope {
             self.client_info(),
             self.remote_addr(),
             self.request_context(),
+            self.bucket_generation(),
         )
     }
 }

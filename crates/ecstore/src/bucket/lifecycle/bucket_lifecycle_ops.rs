@@ -2166,9 +2166,10 @@ impl TransitionState {
                             ..Default::default()
                         };
 
-                        if let Err(err) =
+                        let (incarnation_id, transition_result) =
                             transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone()))
-                                .await
+                                .await;
+                        if let Err(err) = transition_result
                         {
                             if let (Some(job_id), Some(result_key)) = (task.manual_job_id, task.manual_result_key.as_deref()) {
                                 record_manual_transition_worker_result_for_task_with_reason(
@@ -2195,7 +2196,7 @@ impl TransitionState {
                                     "Lifecycle tier operation failed"
                                 );
                             }
-                            emit_transition_failed_event(obj_info_for_event);
+                            emit_transition_failed_event(obj_info_for_event, incarnation_id);
                         } else {
                             if let (Some(job_id), Some(result_key)) = (task.manual_job_id, task.manual_result_key.as_deref()) {
                                 record_manual_transition_worker_result_for_task(
@@ -2217,7 +2218,7 @@ impl TransitionState {
                             }
                             transition_state.add_lastday_stats(&task.event.storage_class, ts);
 
-                            emit_transition_complete_event(obj_info_for_event);
+                            emit_transition_complete_event(obj_info_for_event, incarnation_id);
                         }
                         // Release the dedup claim so a later lifecycle pass can
                         // re-transition this object if needed (rustfs/backlog#1268).
@@ -5134,7 +5135,7 @@ async fn expire_transitioned_object_with_lock_lost_signal(
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
-    emit_transitioned_expiration_event(oi, &dobj);
+    emit_transitioned_expiration_event(oi, &dobj, bucket_incarnation_id);
 
     Ok(dobj)
 }
@@ -5152,12 +5153,12 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     Ok(obj)
 }
 
-pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
+async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> (Option<Uuid>, Result<(), Error>) {
     let time_ilm = Metrics::time_ilm(lae.event.action);
 
-    let (publication_guard, bucket_incarnation_id) = lifecycle_transition_publication_guard(&api, oi)
-        .await
-        .ok_or_else(|| Error::other("lifecycle transition is not allowed for this bucket"))?;
+    let Some((publication_guard, bucket_incarnation_id)) = lifecycle_transition_publication_guard(&api, oi).await else {
+        return (None, Err(Error::other("lifecycle transition is not allowed for this bucket")));
+    };
 
     let etag = if let Some(etag) = &oi.etag { etag } else { "" };
     let etag = etag.to_string();
@@ -5180,7 +5181,7 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     opts.add_namespace_lock_guard(&publication_guard);
     let result = api.transition_object(&oi.bucket, &oi.name, &opts).await;
     time_ilm(1)();
-    result
+    (Some(bucket_incarnation_id), result)
 }
 
 #[allow(
@@ -6050,7 +6051,7 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    emit_non_transitioned_expiration_event(lc_event.action, oi, dobj);
+    emit_non_transitioned_expiration_event(lc_event.action, oi, dobj, bucket_incarnation_id);
 
     if lc_event.action != IlmAction::NoneAction {
         let mut num_versions = 1_u64;

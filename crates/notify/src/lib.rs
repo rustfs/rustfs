@@ -26,7 +26,6 @@ pub mod factory;
 mod global;
 pub mod integration;
 mod lifecycle;
-mod notification_system_subscriber;
 pub mod notifier;
 mod pipeline;
 pub mod registry;

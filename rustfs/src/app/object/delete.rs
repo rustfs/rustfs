@@ -945,6 +945,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
         apply_bucket_generation_guard(&envelope, &bucket, &mut storage_delete_opts)?;
+        let incarnation_id = storage_delete_opts.expected_bucket_incarnation_id;
         let storage_started = std::time::Instant::now();
         let (dobjs, errs, accounting) = store
             .delete_objects_with_tier_delete_journal_and_accounting(&bucket, object_to_delete.clone(), storage_delete_opts)
@@ -1158,6 +1159,7 @@ impl DefaultObjectUsecase {
                             ..Default::default()
                         },
                     )
+                    .bucket_incarnation_id(incarnation_id)
                     .version_id(version_id.unwrap_or_default())
                     .req_params(req_params.clone())
                     .resp_elements(resp_elements.clone())

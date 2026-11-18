@@ -48,6 +48,7 @@ use tracing::{Instrument, info_span, warn};
 
 /// The request fields used to build an audit entry, shared by both request edges.
 pub(crate) struct AuditRequestView<'a> {
+    bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     headers: &'a HeaderMap,
     uri: &'a Uri,
     pub(crate) req_info: Option<&'a ReqInfo>,
@@ -59,6 +60,7 @@ pub(crate) struct AuditRequestView<'a> {
 impl<'a> AuditRequestView<'a> {
     pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
         Self {
+            bucket_generation: req.extensions.get(),
             headers: &req.headers,
             uri: &req.uri,
             req_info: req.extensions.get::<ReqInfo>(),
@@ -79,8 +81,10 @@ impl<'a> AuditRequestView<'a> {
         client_info: Option<&'a ClientInfo>,
         remote_addr: Option<SocketAddr>,
         request_context: Option<&'a RequestContext>,
+        bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     ) -> Self {
         Self {
+            bucket_generation,
             headers,
             uri,
             req_info,
@@ -495,7 +499,12 @@ impl OperationHelper {
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = if notify_enabled {
+            let incarnation_id = req
+                .bucket_generation
+                .filter(|guard| guard.bucket == bucket)
+                .map(|guard| guard.incarnation_id);
             let mut event_builder = EventArgsBuilder::new(event, bucket, convert_ecstore_object_info(event_object))
+                .bucket_incarnation_id(incarnation_id)
                 .host(get_request_host(req.headers))
                 .port(get_request_port(req.headers))
                 .user_agent(get_request_user_agent(req.headers))
@@ -543,6 +552,16 @@ impl OperationHelper {
             Self::Enabled(state) => state.event_builder.clone().map(|builder| builder.build()),
             Self::Disabled => None,
         }
+    }
+
+    pub(crate) fn with_bucket_removed_targets(mut self, targets: rustfs_notify::rules::TargetIdSet) -> Self {
+        if let Self::Enabled(state) = &mut self {
+            state.event_builder = state
+                .event_builder
+                .take()
+                .map(|builder| builder.bucket_removed_targets(targets));
+        }
+        self
     }
 
     /// Sets the ObjectInfo for event notification.

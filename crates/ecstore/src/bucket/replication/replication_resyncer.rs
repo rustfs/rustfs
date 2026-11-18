@@ -16,7 +16,7 @@ use super::replication_bandwidth_boundary;
 use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
-use super::replication_event_sink::{EventArgs, send_event, send_local_event};
+use super::replication_event_sink::{EventArgs, capture_event_bucket_incarnation, send_event, send_local_event};
 #[cfg(test)]
 use super::replication_filemeta_boundary::ReplicationGenerationSnapshot;
 use super::replication_filemeta_boundary::metadata_keys;
@@ -2275,6 +2275,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     let replication_generation = oi.replication_generation_snapshot();
 
     Ok(ReplicateObjectInfo {
+        notification_bucket_incarnation: None,
         name: oi.name.clone(),
         size: oi.size,
         actual_size,
@@ -2413,9 +2414,10 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
 }
 
 pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
-    dobj: DeletedObjectReplicationInfo,
+    mut dobj: DeletedObjectReplicationInfo,
     storage: Arc<S>,
 ) -> bool {
+    dobj.notification_bucket_incarnation = capture_event_bucket_incarnation(&dobj.bucket).await;
     if dobj.delete_object.force_delete {
         return replicate_force_delete_to_targets(&dobj, storage).await;
     }
@@ -2449,6 +2451,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 "Failed to parse replicate decision"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: dobj.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2530,6 +2533,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                     "Failed to verify source delete-marker state before replication"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: dobj.notification_bucket_incarnation,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -2564,6 +2568,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 "Skipping replication delete"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: dobj.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2594,6 +2599,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 "Skipping replication delete"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: dobj.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2693,6 +2699,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                     "Replication resync task failed"
                 );
                 send_event(EventArgs {
+                    bucket_incarnation_id: dobj.notification_bucket_incarnation,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -2801,6 +2808,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     {
         Ok(object) => {
             send_event(EventArgs {
+                bucket_incarnation_id: dobj.notification_bucket_incarnation,
                 event_name,
                 bucket_name: bucket.clone(),
                 object,
@@ -2826,6 +2834,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 );
             }
             send_event(EventArgs {
+                bucket_incarnation_id: dobj.notification_bucket_incarnation,
                 event_name,
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -3157,6 +3166,7 @@ async fn purge_stale_delete_marker_targets(bucket: &str, dobj: &DeletedObjectRep
 }
 
 async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) -> bool {
+    let incarnation_id = dobj.notification_bucket_incarnation;
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
     let admitted_target_arns = dobj.admitted_target_arns();
@@ -3177,6 +3187,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     "Skipping replication force-delete because replication config is missing"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: incarnation_id,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -3200,6 +3211,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     "Skipping replication force-delete because replication config lookup failed"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: incarnation_id,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -3234,6 +3246,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 "Skipping replication force-delete"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: incarnation_id,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -3262,6 +3275,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 "Skipping replication force-delete"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: incarnation_id,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -3309,6 +3323,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 "Skipping replication force-delete because target client is unavailable"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: incarnation_id,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -3339,6 +3354,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     "Skipping replication force-delete"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: incarnation_id,
                     event_name: EventName::ObjectReplicationFailed.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -3375,6 +3391,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     "Replication target operation failed"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: incarnation_id,
                     event_name: EventName::ObjectReplicationFailed.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -4206,7 +4223,7 @@ async fn persist_replication_state_if_current<S: ReplicationStorage>(
 }
 
 pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
-    roi: ReplicateObjectInfo,
+    mut roi: ReplicateObjectInfo,
     storage: Arc<S>,
 ) -> (ReplicationState, ReplicationAttemptDisposition) {
     // Conflicting compatibility aliases, empty opaque timestamps, and invalid
@@ -4216,6 +4233,8 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     if let Some(outcome) = replication_attempt_preflight(&roi) {
         return outcome;
     }
+
+    roi.notification_bucket_incarnation = capture_event_bucket_incarnation(&roi.bucket).await;
 
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
@@ -4239,6 +4258,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
                 "Skipping replication object"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: roi.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
@@ -4262,6 +4282,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
                 "Skipping replication object"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: roi.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
@@ -4328,6 +4349,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
                     "Replication resync task failed"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: roi.notification_bucket_incarnation,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: roi.to_object_info(),
@@ -4472,6 +4494,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
 
     if publication.emit_event {
         send_local_event(EventArgs {
+            bucket_incarnation_id: roi.notification_bucket_incarnation,
             event_name,
             bucket_name: bucket.clone(),
             object: object_info,
@@ -4614,6 +4637,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 "Skipping replication object target"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: self.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
@@ -4629,6 +4653,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
         else {
             send_local_event(EventArgs {
+                bucket_incarnation_id: self.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
@@ -4672,6 +4697,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     );
 
                     send_local_event(EventArgs {
+                        bucket_incarnation_id: self.notification_bucket_incarnation,
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
@@ -4703,6 +4729,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     "Skipping replication object target"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: self.notification_bucket_incarnation,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
@@ -4728,6 +4755,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 "Skipping replication object target"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: self.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
@@ -4862,6 +4890,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     "Replication target operation failed"
                 );
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: self.notification_bucket_incarnation,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
@@ -4890,6 +4919,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 "Replication target operation failed"
             );
             send_local_event(EventArgs {
+                bucket_incarnation_id: self.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
@@ -4987,6 +5017,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
         else {
             send_local_event(EventArgs {
+                bucket_incarnation_id: self.notification_bucket_incarnation,
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
@@ -5020,7 +5051,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let size = match object_info.get_actual_size() {
             Ok(size) => size,
             Err(e) => {
-                note_replicate_all_size_unavailable(&bucket, &tgt_client, object_info, &e);
+                note_replicate_all_size_unavailable(&bucket, &tgt_client, object_info, &e, self.notification_bucket_incarnation);
                 return rinfo;
             }
         };
@@ -5029,7 +5060,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let transfer_size = if self.ssec { object_info.size } else { size };
 
         if tgt_client.bucket.is_empty() {
-            note_replicate_all_target_bucket_empty(&bucket, &tgt_client, object_info);
+            note_replicate_all_target_bucket_empty(&bucket, &tgt_client, object_info, self.notification_bucket_incarnation);
             return rinfo;
         }
 
@@ -5075,7 +5106,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let (put_opts, is_multipart) = match replication_put_object_options_for_target(&tgt_client, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
-                fail_replicate_all_put_options(&mut rinfo, &tgt_client, &bucket, object_info, &e, start_time);
+                fail_replicate_all_put_options(
+                    &mut rinfo,
+                    &tgt_client,
+                    &bucket,
+                    object_info,
+                    &e,
+                    start_time,
+                    self.notification_bucket_incarnation,
+                );
                 return rinfo;
             }
         };
@@ -5179,6 +5218,7 @@ fn note_replicate_all_target_offline(roi: &ReplicateObjectInfo, bucket: &str, tg
         "Skipped replication because target is offline"
     );
     send_local_event(EventArgs {
+        bucket_incarnation_id: roi.notification_bucket_incarnation,
         event_name: EventName::ObjectReplicationNotTracked.to_string(),
         bucket_name: bucket.to_string(),
         object: roi.to_object_info(),
@@ -5217,6 +5257,7 @@ fn note_replicate_all_reader_unavailable(roi: &ReplicateObjectInfo, bucket: &str
             "Skipped replication because object reader is unavailable"
         );
         send_local_event(EventArgs {
+            bucket_incarnation_id: roi.notification_bucket_incarnation,
             event_name: EventName::ObjectReplicationNotTracked.to_string(),
             bucket_name: bucket.to_string(),
             object: roi.to_object_info(),
@@ -5228,7 +5269,13 @@ fn note_replicate_all_reader_unavailable(roi: &ReplicateObjectInfo, bucket: &str
 
 /// Log and notify that replication was skipped because the actual object size
 /// is unavailable.
-fn note_replicate_all_size_unavailable(bucket: &str, tgt_client: &TargetClient, object_info: ObjectInfo, e: &std::io::Error) {
+fn note_replicate_all_size_unavailable(
+    bucket: &str,
+    tgt_client: &TargetClient,
+    object_info: ObjectInfo,
+    e: &std::io::Error,
+    incarnation_id: Option<uuid::Uuid>,
+) {
     debug!(
         event = EVENT_RESYNC_RUNTIME_SKIPPED,
         component = LOG_COMPONENT_ECSTORE,
@@ -5241,6 +5288,7 @@ fn note_replicate_all_size_unavailable(bucket: &str, tgt_client: &TargetClient, 
         "Skipped replication because actual object size is unavailable"
     );
     send_local_event(EventArgs {
+        bucket_incarnation_id: incarnation_id,
         event_name: EventName::ObjectReplicationNotTracked.to_string(),
         bucket_name: bucket.to_string(),
         object: object_info,
@@ -5251,7 +5299,12 @@ fn note_replicate_all_size_unavailable(bucket: &str, tgt_client: &TargetClient, 
 
 /// Log and notify that replication was skipped because the target bucket is
 /// empty.
-fn note_replicate_all_target_bucket_empty(bucket: &str, tgt_client: &TargetClient, object_info: ObjectInfo) {
+fn note_replicate_all_target_bucket_empty(
+    bucket: &str,
+    tgt_client: &TargetClient,
+    object_info: ObjectInfo,
+    incarnation_id: Option<uuid::Uuid>,
+) {
     debug!(
         event = EVENT_RESYNC_RUNTIME_SKIPPED,
         component = LOG_COMPONENT_ECSTORE,
@@ -5263,6 +5316,7 @@ fn note_replicate_all_target_bucket_empty(bucket: &str, tgt_client: &TargetClien
         "Skipped replication because target bucket is empty"
     );
     send_local_event(EventArgs {
+        bucket_incarnation_id: incarnation_id,
         event_name: EventName::ObjectReplicationNotTracked.to_string(),
         bucket_name: bucket.to_string(),
         object: object_info,
@@ -5376,6 +5430,7 @@ async fn resolve_replicate_all_action(
                         "Skipping replication because newer target version exists"
                     );
                     send_local_event(EventArgs {
+                        bucket_incarnation_id: roi.notification_bucket_incarnation,
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.to_string(),
                         object: object_info.clone(),
@@ -5499,6 +5554,7 @@ async fn resolve_replicate_all_action(
                             "Failed replication head-object fallback"
                         );
                         send_local_event(EventArgs {
+                            bucket_incarnation_id: roi.notification_bucket_incarnation,
                             event_name: EventName::ObjectReplicationNotTracked.to_string(),
                             bucket_name: bucket.to_string(),
                             object: object_info,
@@ -5531,6 +5587,7 @@ async fn resolve_replicate_all_action(
                 );
 
                 send_local_event(EventArgs {
+                    bucket_incarnation_id: roi.notification_bucket_incarnation,
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.to_string(),
                     object: object_info,
@@ -5559,6 +5616,7 @@ fn fail_replicate_all_put_options(
     object_info: ObjectInfo,
     e: &Error,
     start_time: OffsetDateTime,
+    incarnation_id: Option<uuid::Uuid>,
 ) {
     rinfo.replication_status = ReplicationStatusType::Failed;
     rinfo.error = Some(e.to_string());
@@ -5574,6 +5632,7 @@ fn fail_replicate_all_put_options(
         "Replication target operation failed"
     );
     send_local_event(EventArgs {
+        bucket_incarnation_id: incarnation_id,
         event_name: EventName::ObjectReplicationNotTracked.to_string(),
         bucket_name: bucket.to_string(),
         object: object_info,

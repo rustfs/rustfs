@@ -16,8 +16,9 @@ use crate::app::object::OnDemandMigrationWriteBack;
 use crate::module_switches::{on_demand_migration_enabled_from_env, set_on_demand_migration_module_enabled};
 use crate::on_demand_migration::OnDemandMigrationSys;
 use crate::storage_api::startup::bucket_metadata::{
-    ECStore, Error as StorageError, Result as StorageResult, get_global_replication_pool, init_bucket_metadata_sys,
-    reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
+    BUCKET_CONFIG_PUBLISH_HOOK, BUCKET_NOTIFICATION_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, ECStore, Error as StorageError,
+    Result as StorageResult, get_global_replication_pool, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents,
+    try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use std::{
     future::Future,
@@ -55,7 +56,7 @@ const STARTUP_BACKGROUND_STATUS_SUCCEEDED: f64 = 1.0;
 const STARTUP_BACKGROUND_STATUS_RUNNING: f64 = 2.0;
 const STARTUP_BACKGROUND_STATUS_CANCELED: f64 = 3.0;
 
-pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, ctx: &CancellationToken) -> IoResult<Vec<String>> {
+pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, ctx: &CancellationToken) -> IoResult<()> {
     let buckets_list = retry_metadata_startup(ctx, "list_buckets", || async {
         store.list_buckets_for_metadata_startup().await.map_err(IoError::other)
     })
@@ -67,12 +68,12 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, c
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
     retry_metadata_startup(ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
-    spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx.clone(), false);
+    spawn_bucket_resync_startup_reconcile(buckets, ctx.clone(), false);
 
-    Ok(buckets)
+    Ok(())
 }
 
-pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> IoResult<Vec<String>> {
+pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> IoResult<()> {
     let buckets_list = retry_metadata_startup(&ctx, "list_buckets", || async {
         store.list_buckets_for_metadata_startup().await.map_err(IoError::other)
     })
@@ -85,9 +86,9 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     retry_metadata_startup(&ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
     init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store, buckets.clone()).await;
-    spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx, true);
+    spawn_bucket_resync_startup_reconcile(buckets, ctx, true);
 
-    Ok(buckets)
+    Ok(())
 }
 
 async fn retry_metadata_startup<T, Operation, OperationFuture>(
@@ -166,7 +167,16 @@ fn init_on_demand_migration_runtime() {
     let sys = OnDemandMigrationSys::get();
     sys.set_module_enabled(enabled);
     sys.set_write_back(Arc::new(OnDemandMigrationWriteBack::new()));
-    let hook_registered = sys.register_config_hook();
+    let hook_registered = BUCKET_CONFIG_PUBLISH_HOOK
+        .set(Box::new(move |bucket, file, stored| {
+            let stored = stored.map(|(bytes, _, incarnation_id)| (bytes, incarnation_id));
+            match file {
+                BUCKET_ON_DEMAND_MIGRATION_CONFIG => sys.publish_stored(bucket, stored),
+                BUCKET_NOTIFICATION_CONFIG => crate::init::publish_bucket_notification_configuration(bucket, stored),
+                _ => {}
+            }
+        }))
+        .is_ok();
     tracing::info!(
         event = EVENT_ON_DEMAND_MIGRATION_RUNTIME_INITIALIZED,
         component = LOG_COMPONENT_STARTUP_BUCKET_METADATA,
