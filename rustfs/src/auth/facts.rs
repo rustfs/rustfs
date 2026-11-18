@@ -556,7 +556,7 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
                 .get(name)
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.is_empty() && !(name == IF_MATCH.as_str() && *value == "*"))
             {
                 args.insert(name.to_owned(), vec![value.to_owned()]);
             }

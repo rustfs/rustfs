@@ -410,14 +410,11 @@ mod tests {
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
     use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
-    use crate::app::storage_api::s3::dto;
-    use crate::app::storage_api::s3::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
-        PutBucketLifecycleConfigurationInput, Transition, TransitionStorageClass,
-    };
+    use crate::app::storage_api::s3::dto::PutBucketLifecycleConfigurationInput;
     use crate::site_replication::hooks::{BUCKET_META_HOOK_CALLS, BucketMetaHookCall};
     use http::Method;
     use rustfs_credentials::Credentials;
+    use rustfs_gateway_types::persistence::{PersistedAbortIncompleteMultipartUpload, PersistedNoncurrentVersionTransition};
     use rustfs_policy::policy::action::{Action, S3Action};
     use serial_test::serial;
     use std::cell::RefCell;
@@ -614,62 +611,38 @@ mod tests {
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
+    fn persisted_rule(id: Option<&str>, status: &str) -> PersistedLifecycleRule {
+        PersistedLifecycleRule {
+            status: status.to_owned(),
+            expiration: None,
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            filter: None,
+            id: id.map(str::to_owned),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }
+    }
+
+    fn persisted_config(rule: PersistedLifecycleRule) -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![rule],
+        }
+    }
+
     #[test]
     fn normalize_lifecycle_rules_generate_rule_ids_for_missing_values() {
-        let rules = vec![
-            LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    days: Some(30),
-                    ..Default::default()
-                }),
-                abort_incomplete_multipart_upload: None,
-                del_marker_expiration: None,
-                filter: None,
-                id: None,
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: None,
-            },
-            LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    days: Some(60),
-                    ..Default::default()
-                }),
-                abort_incomplete_multipart_upload: None,
-                del_marker_expiration: None,
-                filter: None,
-                id: Some("rule-1".to_string()),
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: None,
-            },
-            LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
-                    days: Some(90),
-                    ..Default::default()
-                }),
-                abort_incomplete_multipart_upload: None,
-                del_marker_expiration: None,
-                filter: None,
-                id: None,
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: None,
-            },
-        ];
-
-        let mut rules = crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(BucketLifecycleConfiguration {
-            rules,
-            ..Default::default()
-        })
-        .unwrap()
-        .rules;
+        let expiring = |id: Option<&str>, days| PersistedLifecycleRule {
+            expiration: Some(rustfs_gateway_types::persistence::PersistedLifecycleExpiration {
+                days: Some(days),
+                ..Default::default()
+            }),
+            ..persisted_rule(id, "Enabled")
+        };
+        let mut rules = vec![expiring(None, 30), expiring(Some("rule-1"), 60), expiring(None, 90)];
         assign_lifecycle_rule_ids(&mut rules);
 
         assert_eq!(rules[0].id.as_deref(), Some("rule-0"));
@@ -756,84 +729,43 @@ mod tests {
 
     #[test]
     fn lifecycle_has_transition_rules_ignores_disabled_rules() {
-        let config = BucketLifecycleConfiguration {
-            expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::DISABLED),
-                expiration: None,
-                abort_incomplete_multipart_upload: None,
-                del_marker_expiration: None,
-                filter: None,
-                id: Some("disabled-transition".to_string()),
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: Some(vec![Transition {
-                    days: Some(1),
-                    date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
-                }]),
-            }],
-        };
+        let config = persisted_config(PersistedLifecycleRule {
+            transitions: Some(vec![rustfs_gateway_types::persistence::PersistedTransition {
+                days: Some(1),
+                date: None,
+                storage_class: Some("WARM".to_owned()),
+            }]),
+            ..persisted_rule(Some("disabled-transition"), "Disabled")
+        });
 
-        assert!(!lifecycle_has_transition_rules(
-            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
-        ));
+        assert!(!lifecycle_has_transition_rules(&config));
     }
 
     #[test]
     fn lifecycle_has_transition_rules_accepts_enabled_noncurrent_transitions() {
-        let config = BucketLifecycleConfiguration {
-            expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: None,
-                abort_incomplete_multipart_upload: None,
-                del_marker_expiration: None,
-                filter: None,
-                id: Some("enabled-noncurrent-transition".to_string()),
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
-                    noncurrent_days: Some(1),
-                    newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
-                }]),
-                prefix: None,
-                transitions: None,
-            }],
-        };
+        let config = persisted_config(PersistedLifecycleRule {
+            noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
+                noncurrent_days: Some(1),
+                newer_noncurrent_versions: None,
+                storage_class: Some("WARM".to_owned()),
+            }]),
+            ..persisted_rule(Some("enabled-noncurrent-transition"), "Enabled")
+        });
 
-        assert!(lifecycle_has_transition_rules(
-            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
-        ));
+        assert!(lifecycle_has_transition_rules(&config));
     }
 
     #[test]
     fn lifecycle_has_abort_multipart_rules_accepts_enabled_abort_rule() {
-        let config = BucketLifecycleConfiguration {
-            expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: None,
-                abort_incomplete_multipart_upload: Some(dto::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(0),
-                }),
-                del_marker_expiration: None,
-                filter: None,
-                id: Some("enabled-abort".to_string()),
-                noncurrent_version_expiration: None,
-                noncurrent_version_transitions: None,
-                prefix: None,
-                transitions: None,
-            }],
-        };
+        let config = persisted_config(PersistedLifecycleRule {
+            abort_incomplete_multipart_upload: Some(PersistedAbortIncompleteMultipartUpload {
+                days_after_initiation: Some(0),
+            }),
+            ..persisted_rule(Some("enabled-abort"), "Enabled")
+        });
 
-        assert!(lifecycle_has_abort_multipart_rules(
-            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config.clone()).unwrap()
-        ));
-        assert!(!lifecycle_has_expiry_rules(
-            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
-        ));
+        assert!(lifecycle_has_abort_multipart_rules(&config));
+        assert!(!lifecycle_has_expiry_rules(&config));
     }
 
     #[tokio::test]

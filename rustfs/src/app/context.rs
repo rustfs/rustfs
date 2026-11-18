@@ -267,7 +267,7 @@ pub fn resolve_action_credentials() -> Option<Credentials> {
 }
 
 /// Resolve region using AppContext-first precedence.
-pub fn resolve_region() -> Option<s3s::region::Region> {
+pub fn resolve_region() -> Option<rustfs_s3_types::Region> {
     resolve_region_with(get_global_app_context())
 }
 
@@ -484,7 +484,7 @@ fn resolve_action_credentials_with(context: Arc<AppContext>) -> Option<Credentia
     context.action_credentials().get()
 }
 
-fn resolve_region_with(context: Option<Arc<AppContext>>) -> Option<s3s::region::Region> {
+fn resolve_region_with(context: Option<Arc<AppContext>>) -> Option<rustfs_s3_types::Region> {
     context.and_then(|context| context.region().get())
 }
 
@@ -847,11 +847,11 @@ mod tests {
     }
 
     struct TestRegionInterface {
-        region: Option<s3s::region::Region>,
+        region: Option<rustfs_s3_types::Region>,
     }
 
     impl RegionInterface for TestRegionInterface {
-        fn get(&self) -> Option<s3s::region::Region> {
+        fn get(&self) -> Option<rustfs_s3_types::Region> {
             self.region.clone()
         }
     }
@@ -1049,7 +1049,7 @@ mod tests {
             access_key: "context-access-key".to_string(),
             ..Default::default()
         };
-        let context_region: s3s::region::Region = "context-region".parse().expect("test region");
+        let context_region: rustfs_s3_types::Region = "context-region".parse().expect("test region");
         let context_oidc_sys = match OidcSys::empty() {
             Ok(sys) => sys,
             Err(err) => unreachable!("test OIDC sys should initialize: {err}"),

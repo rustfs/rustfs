@@ -65,11 +65,11 @@ impl ProtocolStorageClient {
     }
 
     pub(super) fn owned_bucket_usecase(&self) -> crate::app::bucket_usecase::DefaultBucketUsecase {
-        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.fs.server_ctx().app_context())
+        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.server_ctx.app_context())
     }
 
     pub(super) fn owned_usecase(&self) -> DefaultObjectUsecase {
-        DefaultObjectUsecase::with_context(self.fs.server_ctx().app_context())
+        DefaultObjectUsecase::with_context(self.server_ctx.app_context())
     }
 
     pub(super) fn create_envelope(method: Method, uri: Uri, params: RequestParams<'_>) -> RequestEnvelope {

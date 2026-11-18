@@ -1741,7 +1741,7 @@ pub(crate) async fn resolve_req_info(
     Ok(ReqInfo {
         cred,
         is_owner,
-        region,
+        region: region.map(Into::into),
         request_context,
         ..Default::default()
     })
