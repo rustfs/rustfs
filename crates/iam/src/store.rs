@@ -42,6 +42,11 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
 
     async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;
+    /// Create a regular identity or replace one without changing its persisted status.
+    /// Return whether a previous secret was replaced. Backends without conditional writes fail closed.
+    async fn save_regular_user_preserving_status(&self, _name: &str, _item: &UserIdentity) -> Result<bool> {
+        Err(crate::error::Error::IAMActionNotAllowed)
+    }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
 

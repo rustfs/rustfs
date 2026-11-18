@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::AdminRequest;
 use crate::app::{RequestCredentials, RequestEnvelope};
 use crate::auth::get_condition_values;
 use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
-use rustfs_policy::policy::{Args, action::Action};
+use rustfs_policy::policy::{
+    Args,
+    action::{Action, AdminAction},
+};
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 use tracing::debug;
@@ -82,6 +86,47 @@ pub async fn validate_admin_request(
     };
 
     evaluate_admin_actions(iam_store, &ctx, &actions, "", "").await
+}
+
+pub(crate) enum SelfServiceMutation {
+    Password,
+    Mfa,
+}
+
+impl SelfServiceMutation {
+    pub(crate) async fn check(&self, req: &AdminRequest, cred: &Credentials, is_owner: bool) -> S3Result<()> {
+        let context = crate::admin::runtime_sources::app_context_from_envelope(req.envelope())
+            .filter(|ctx| ctx.iam().is_ready())
+            .ok_or_else(|| s3_error!(ServiceUnavailable, "iam unavailable"))?;
+        self.check_for_iam(context.iam().handle(), req, cred, is_owner).await
+    }
+
+    async fn check_for_iam<S: Store>(
+        &self,
+        iam: Arc<IamSys<S>>,
+        req: &AdminRequest,
+        cred: &Credentials,
+        is_owner: bool,
+    ) -> S3Result<()> {
+        let ctx = AuthContext {
+            headers: req.headers(),
+            cred,
+            // Derived credentials must pass through session policy evaluation.
+            is_owner: is_owner && cred.session_token.is_empty() && !cred.is_service_account(),
+            deny_only: true,
+            remote_addr: req.policy_source_addr(),
+        };
+        // Password rotation also honors the existing add-user self-rotation deny.
+        // The ordinary multi-action admin gate is any-of; here every check must pass.
+        let actions: &[AdminAction] = match self {
+            Self::Password => &[AdminAction::ChangeOwnPasswordAdminAction, AdminAction::CreateUserAdminAction],
+            Self::Mfa => &[AdminAction::ManageOwnMFAAdminAction],
+        };
+        for action in actions {
+            check_admin_request_auth(iam.clone(), &ctx, Action::AdminAction(*action), "", "").await?;
+        }
+        Ok(())
+    }
 }
 
 /// Return `Ok(())` as soon as any of the candidate `actions` is allowed for the
@@ -755,6 +800,129 @@ mod tests {
     }
 
     const KMS_OPERATOR: &str = "kms-operator";
+
+    #[tokio::test]
+    async fn self_service_mutation_checks_each_applicable_deny() {
+        let cred = Credentials {
+            access_key: "self-service-user".into(),
+            ..Default::default()
+        };
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::POST, "/").build();
+        for (action, password_allowed, mfa_allowed) in [
+            ("admin:CreateUser", false, true),
+            ("admin:ChangeOwnPassword", false, true),
+            ("admin:ManageOwnMFA", true, false),
+            ("admin:*", false, false),
+        ] {
+            let document = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"admin:*","Resource":"*"}},{{"Effect":"Deny","Action":"{action}","Resource":"*"}}]}}"#
+            );
+            let iam = iam_sys_with_policy(&cred.access_key, &document);
+            for (mutation, allowed) in [
+                (SelfServiceMutation::Password, password_allowed),
+                (SelfServiceMutation::Mfa, mfa_allowed),
+            ] {
+                let result = mutation.check_for_iam(iam.clone(), &req, &cred, false).await;
+                if allowed {
+                    result.expect("unrelated deny should not block self-service");
+                } else {
+                    assert_access_denied(result);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn self_service_mutation_uses_request_conditions() {
+        use crate::admin::operation::test_support::TestRequest;
+        let cred = Credentials {
+            access_key: "conditional-user".into(),
+            ..Default::default()
+        };
+        let iam = iam_sys_with_policy(
+            &cred.access_key,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"admin:ManageOwnMFA","Condition":{"StringEquals":{"aws:UserAgent":"restricted-client"}}}]}"#,
+        );
+        let request = |agent| TestRequest::new(http::Method::POST, "/").header("user-agent", agent).build();
+        assert_access_denied(
+            SelfServiceMutation::Mfa
+                .check_for_iam(iam.clone(), &request("restricted-client"), &cred, false)
+                .await,
+        );
+        SelfServiceMutation::Mfa
+            .check_for_iam(iam, &request("other-client"), &cred, false)
+            .await
+            .expect("condition is not satisfied");
+    }
+
+    #[tokio::test]
+    async fn self_service_mutation_defaults_and_session_boundary() {
+        let store = iam_cache_with_empty_store();
+        let now = OffsetDateTime::now_utc();
+        let user = Credentials {
+            access_key: "self-service-user".into(),
+            secret_key: "user-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        store
+            .cache
+            .add_or_update_user(&user.access_key, &UserIdentity::new(user.clone()), now);
+        store
+            .cache
+            .add_or_update_user_policy(&user.access_key, &MappedPolicy::new(""), now);
+        let session = Credentials {
+            access_key: "session-user".into(),
+            parent_user: user.access_key.clone(),
+            session_token: "session".into(),
+            claims: Some(HashMap::from([(
+                rustfs_iam::sys::SESSION_POLICY_NAME_EXTRACTED.to_string(),
+                serde_json::json!(
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"admin:ManageOwnMFA","Resource":"*"}]}"#
+                ),
+            )])),
+            ..user.clone()
+        };
+        store
+            .cache
+            .add_or_update_sts_account(&session.access_key, &UserIdentity::new(session.clone()), now);
+        let iam = Arc::new(IamSys::new(Arc::new(store)));
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::POST, "/").build();
+        for mutation in [SelfServiceMutation::Password, SelfServiceMutation::Mfa] {
+            mutation
+                .check_for_iam(iam.clone(), &req, &user, false)
+                .await
+                .expect("active user with no policies may manage their own credentials");
+        }
+        let ordinary = ctx_for(req.headers(), &user, false);
+        assert_access_denied(
+            check_admin_request_auth(iam.clone(), &ordinary, Action::AdminAction(AdminAction::CreateUserAdminAction), "", "")
+                .await,
+        );
+        assert_access_denied(
+            SelfServiceMutation::Mfa
+                .check_for_iam(iam.clone(), &req, &session, true)
+                .await,
+        );
+        SelfServiceMutation::Password
+            .check_for_iam(iam.clone(), &req, &session, false)
+            .await
+            .expect("unrelated session deny permits password rotation");
+        for (claim, value) in [
+            (rustfs_iam::sys::SESSION_POLICY_NAME, serde_json::json!("invalid encoding")),
+            (rustfs_iam::sys::PLUGIN_ATTEMPT_CREDENTIAL_CLAIM, serde_json::json!(true)),
+        ] {
+            let restricted = Credentials {
+                claims: Some(HashMap::from([(claim.to_owned(), value)])),
+                ..session.clone()
+            };
+            assert_access_denied(
+                SelfServiceMutation::Password
+                    .check_for_iam(iam.clone(), &req, &restricted, false)
+                    .await,
+            );
+        }
+    }
 
     fn kms_disable_key_actions() -> Vec<Action> {
         vec![Action::KmsAction(KmsAction::DisableKeyAction)]

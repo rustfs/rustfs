@@ -20,7 +20,7 @@ use crate::admin::{
 use rustfs_iam::{
     federation::{FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM},
     store::{MappedPolicy, object::ObjectStore},
-    sys::{IamSys, OIDC_ISSUER_CLAIM, is_safe_claim_policy_name},
+    sys::{IamSys, OIDC_EXPLICIT_POLICIES_CLAIM, OIDC_ISSUER_CLAIM, is_safe_claim_policy_name},
 };
 use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::auth::get_new_credentials_with_metadata;
@@ -245,6 +245,7 @@ fn parent_user_is_reserved(parent_user: &str, root_access_key: Option<&str>) -> 
 fn issue_credentials(
     transaction: &FederatedSessionTransaction,
     selected_policy_names: &[String],
+    has_identity_mapping: bool,
     secret: Option<&str>,
 ) -> Result<rustfs_credentials::Credentials, FederatedSessionBindingError> {
     let authorization = &transaction.authorization;
@@ -288,6 +289,13 @@ fn issue_credentials(
 
     if !selected_policy_names.is_empty() {
         token_claims.insert("policy".to_string(), Value::String(selected_policy_names.join(",")));
+        let explicit = selected_policy_names
+            .iter()
+            .filter(|name| !has_identity_mapping && authorization.policies().contains(name));
+        token_claims.insert(
+            OIDC_EXPLICIT_POLICIES_CLAIM.to_string(),
+            Value::Array(explicit.cloned().map(Value::String).collect()),
+        );
     } else {
         token_claims.remove("policy");
     }
@@ -435,7 +443,7 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         let selected_policy_names = selection.usable;
 
         let secret = current_token_signing_key();
-        let credentials = issue_credentials(transaction, &selected_policy_names, secret.as_deref())?;
+        let credentials = issue_credentials(transaction, &selected_policy_names, has_identity_mapping, secret.as_deref())?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_oidc_policy_diagnostics(
                 &iam_store,
@@ -602,7 +610,7 @@ mod tests {
                 let mut transaction = transaction();
                 transaction.duration_seconds = rustfs_iam::oidc::console_session_duration_secs();
                 let before = OffsetDateTime::now_utc().unix_timestamp();
-                let credentials = issue_credentials(&transaction, &["readonly".to_string()], Some(secret))
+                let credentials = issue_credentials(&transaction, &["readonly".to_string()], false, Some(secret))
                     .expect("configured Console session should issue credentials");
                 let after = OffsetDateTime::now_utc().unix_timestamp();
                 let claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, secret)
@@ -633,8 +641,8 @@ mod tests {
         let secret = "federated-session-test-signing-secret";
         let selected_policy_names = vec!["readonly".to_string()];
 
-        let credentials =
-            issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
+        let credentials = issue_credentials(&transaction, &selected_policy_names, false, Some(secret))
+            .expect("credential issuance should succeed");
         assert_eq!(credentials.parent_user, expected_parent);
         assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
         assert_eq!(credentials.status, "on");
@@ -671,6 +679,7 @@ mod tests {
                 ("roles".to_string(), serde_json::json!(["admin", "reader"])),
                 ("parent".to_string(), serde_json::json!(expected_parent)),
                 (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), serde_json::json!(expected_parent)),
+                (OIDC_EXPLICIT_POLICIES_CLAIM.to_string(), serde_json::json!([])),
                 ("policy".to_string(), serde_json::json!("readonly")),
             ])
         );
@@ -721,7 +730,7 @@ mod tests {
         iam.add_users_to_group("claim-policy-group", Vec::new())
             .await
             .expect("create mapped group");
-        iam.policy_db_set("claim-policy-group", UserType::Reg, true, "readwrite")
+        iam.policy_db_set("claim-policy-group", UserType::Reg, true, "readwrite,writeonly")
             .await
             .expect("attach group Allow");
         let authorization = || {
@@ -738,6 +747,16 @@ mod tests {
         let claims = get_claims_for_test(&credentials);
         let selected = MappedPolicy::new(claims.get("policy").and_then(Value::as_str).expect("policy claim")).to_slice();
         assert!(selected.contains(&"claim-deny-payroll".to_string()));
+        assert!(selected.contains(&"writeonly".to_string()));
+        let explicit = claims[OIDC_EXPLICIT_POLICIES_CLAIM]
+            .as_array()
+            .expect("signed explicit policy names");
+        assert!(
+            explicit.contains(&Value::from("readwrite")),
+            "overlapping grants retain explicit provenance"
+        );
+        assert!(explicit.contains(&Value::from("claim-deny-payroll")));
+        assert!(!explicit.contains(&Value::from("writeonly")), "group-only names remain revocable");
         let conditions = HashMap::new();
         let args = Args {
             account: &credentials.access_key,
@@ -967,7 +986,7 @@ mod tests {
         let mut transaction = transaction();
         transaction.session_policy = Some("not-json".to_string());
 
-        let error = issue_credentials(&transaction, transaction.authorization.policies(), None)
+        let error = issue_credentials(&transaction, transaction.authorization.policies(), false, None)
             .expect_err("invalid policy should fail first");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
     }
@@ -1003,7 +1022,7 @@ mod tests {
         authorization.attributes.clear();
         let transaction = transaction_from_fixture(authorization);
 
-        let error = issue_credentials(&transaction, transaction.authorization.policies(), Some("signing-secret"))
+        let error = issue_credentials(&transaction, transaction.authorization.policies(), false, Some("signing-secret"))
             .expect_err("credential issuance should reject a missing issuer");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
     }

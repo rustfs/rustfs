@@ -1613,14 +1613,20 @@ fn select_s3_stack(
     assembly: impl FnOnce() -> Result<GatewayAssembly>,
 ) -> Result<S3EdgeService> {
     let mut native_admin = None;
+    let mut control_plane = None;
     let service = select_stack(config.s3_stack, legacy, || -> Result<GatewayEdgeService> {
         let assembly = assembly()?;
         native_admin = Some(GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?));
+        let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
+        control_plane = Some(GatewayEdgeService(
+            GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?,
+        ));
         let stack = GatewayStack::assemble(assembly).map_err(Error::other)?;
         Ok(GatewayEdgeService(stack))
     })?
     .with_native_console(NativeConsoleEdgeService::for_config(config))
-    .with_native_admin(native_admin);
+    .with_native_admin(native_admin)
+    .with_control_plane(control_plane);
     info!(
         event = EVENT_S3_STACK_ASSEMBLED,
         component = LOG_COMPONENT_SERVER,
@@ -4503,6 +4509,9 @@ mod tests {
         const ROOT_SECRET: &str = "rustfs-gateway-root-secret";
         const USER_SECRET: &str = "native-admin-user-secret";
 
+        #[path = "control_plane_tests.rs"]
+        mod control_plane_tests;
+
         struct UnusedS3;
         #[async_trait::async_trait]
         impl s3s::S3 for UnusedS3 {}
@@ -5352,7 +5361,12 @@ mod tests {
                                 new.0,
                                 refusal(&new.2)
                             );
-                            check(old.0 == new.0 && old.2 == new.2, format!("{method} {target} {host}: adjacent route"));
+                            // Adjacent routes now reach the control-plane host, whose error document
+                            // differs from legacy's only by the line break after the declaration.
+                            check(
+                                old.0 == new.0 && snapshot_error_xml(&old.2) == snapshot_error_xml(&new.2),
+                                format!("{method} {target} {host}: adjacent route"),
+                            );
                         }
                     }
                 }

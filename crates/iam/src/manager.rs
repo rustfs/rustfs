@@ -1122,7 +1122,9 @@ where
 
         let direct_policies = mapped_policy.to_slice();
         let has_identity_mapping = !direct_policies.is_empty();
-        let policies = self.policy_db_get_with_groups(direct_policies, groups).await?;
+        // An uncached group mapping can contain a Deny even when a direct policy exists.
+        let mut policies = direct_policies;
+        policies.extend(self.policy_db_get_with_groups(Vec::new(), groups).await?);
         Ok((policies, has_identity_mapping))
     }
 
@@ -1578,7 +1580,7 @@ where
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        self.add_user_at_with_secret_change(access_key, args, updated_at)
+        self.add_user_at_with_secret_change(access_key, args, updated_at, true)
             .await
             .map(|(updated_at, _, _guard)| updated_at)
     }
@@ -1589,6 +1591,7 @@ where
         access_key: &str,
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
+        allow_status_change: bool,
     ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
         // A virtual OIDC parent is a canonical base64url-encoded SHA-256 digest.
         // It has no stored user record to collide with in the checks below.
@@ -1646,9 +1649,14 @@ where
         });
         user_entry.update_at = Some(updated_at);
 
-        self.api
-            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
-            .await?;
+        let secret_changed = if allow_status_change {
+            self.api
+                .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
+                .await?;
+            secret_changed
+        } else {
+            self.api.save_regular_user_preserving_status(access_key, &user_entry).await?
+        };
 
         self.update_user_with_claims(access_key, user_entry)?;
 

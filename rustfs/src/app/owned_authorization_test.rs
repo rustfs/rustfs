@@ -30,8 +30,8 @@ use crate::app::storage_api::owned_parity::{
 use crate::app::storage_api::owned_parity::{authorize_create_bucket, authorize_delete_bucket};
 use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, S3Access, S3ErrorCode, S3Request, Tag,
-    Tagging,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, S3Access, S3Error, S3ErrorCode,
+    S3Request, Tag, Tagging,
 };
 use crate::auth::facts::{AuthzPrincipal, AuthzTarget};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -347,7 +347,9 @@ async fn owned_authorization_reloads_tags_when_version_changes() {
         legacy.extensions.get_mut::<ReqInfo>().expect("legacy info").version_id = Some(version.clone());
         owned.req_info_mut().expect("owned info").version_id = Some(version.clone());
         let action = Action::S3Action(S3Action::PutObjectAction);
-        let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action).await;
+        let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action)
+            .await
+            .map_err(S3Error::from);
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
         if allowed {
             legacy_result.expect("legacy version allowed");
@@ -1036,6 +1038,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
     let err =
         crate::app::storage_api::owned_parity::authorize_request(&mut request_b, Action::S3Action(S3Action::PutObjectAction))
             .await
+            .map_err(S3Error::from)
             .expect_err("store B policy must deny store B request");
     assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     let owned_err = crate::app::authorize_owned_request(&mut owned_b, Action::S3Action(S3Action::PutObjectAction), None)
@@ -1095,6 +1098,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         Action::S3Action(S3Action::PutObjectAction),
     )
     .await
+    .map_err(S3Error::from)
     .expect_err("store B public access block must restrict store B request");
     assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     let owned_err =
@@ -1205,6 +1209,7 @@ async fn owned_entry_points_reject_duplicate_signed_metadata_like_the_legacy_edg
     let mut legacy = signed_zip_request(query);
     let legacy_err = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, get_object())
         .await
+        .map_err(S3Error::from)
         .expect_err("legacy rejects a repeated metadata key");
     assert_eq!(legacy_err.code(), &S3ErrorCode::InvalidArgument);
 
@@ -1228,6 +1233,7 @@ async fn owned_entry_points_hoist_signed_metadata_into_the_headers_policy_reads(
     // Neither request carries ReqInfo, so both stop at the core after the hoist.
     let legacy_err = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, get_object())
         .await
+        .map_err(S3Error::from)
         .expect_err("no ReqInfo");
     assert_eq!(legacy_err.code(), &S3ErrorCode::InternalError);
     let mut owned = RequestEnvelope::from_s3s(&signed_zip_request(query));
@@ -1741,7 +1747,9 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         // member is authorized: it must reach the same decision.
         let mut owned_shape = RequestEnvelope::from_s3s(&legacy).fork_for_authorization();
         let action = Action::S3Action(case.action);
-        let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action).await;
+        let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action)
+            .await
+            .map_err(S3Error::from);
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
         let shape_result = crate::app::storage_api::owned_parity::authorize_object_request(
             &mut owned_shape,
@@ -1750,7 +1758,8 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             None,
             action,
         )
-        .await;
+        .await
+        .map_err(S3Error::from);
         let legacy_ok = match &legacy_result {
             Ok(()) => case.allowed,
             Err(err) => !case.allowed && err.code() == &S3ErrorCode::AccessDenied,
@@ -1894,8 +1903,12 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
         let mut owned = RequestEnvelope::from_s3s(&legacy);
         let action = Action::S3Action(action);
 
-        let legacy_result = authorize_bucket_config_mutation(&slot, &mut legacy, bucket, action).await;
-        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action).await;
+        let legacy_result = authorize_bucket_config_mutation(&slot, &mut legacy, bucket, action)
+            .await
+            .map_err(S3Error::from);
+        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action)
+            .await
+            .map_err(S3Error::from);
         let outcome = |result: Result<(), S3ErrorCode>, snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| match result {
             Ok(()) => MutationOutcome::Allowed(snapshot.ok().flatten()),
             Err(S3ErrorCode::AccessDenied) => MutationOutcome::Denied,

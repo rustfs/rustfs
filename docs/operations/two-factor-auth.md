@@ -124,7 +124,7 @@ A challenge is `HMAC-SHA256(root_secret, "rustfs-mfa-challenge:v1" ‖ access_ke
 | `DELETE /v3/user/mfa` | `admin:EnableUser` |
 | `PUT /v3/set-user-secret-key` | `admin:CreateUser` |
 
-The self-service routes carry no admin action and are registered as `CredentialOnly` in the route-policy matrix. Giving them one would be wrong in both directions: it would stop an ordinary user from changing their own password, and it would let any holder of that action change somebody else's.
+Eligible callers need no explicit Allow to rotate their password or manage their MFA. A matching Deny on `admin:ChangeOwnPassword` or `admin:CreateUser` blocks self-rotation (including via `add-user`); a Deny on `admin:ManageOwnMFA` blocks enrollment, activation, disabling and recovery-code replacement. The checks use the signing credential, including its applicable session policy. Administrative reset routes still require their ordinary admin permission and also honor the self-service deny when targeting the caller's own identity. Allowing a self-service action grants no authority over another identity.
 
 `POST /v3/account/password` and `POST /v3/account/mfa/disable` require a proof-of-knowledge step because a signature only proves a credential was used. The Console signs with a short-lived session, so without it a hijacked browser tab could rewrite the account's credentials or strip its second factor; requiring the password makes disabling the factor as hard as the thing the factor protects.
 

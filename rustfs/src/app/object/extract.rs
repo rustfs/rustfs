@@ -1620,8 +1620,8 @@ async fn authorized_extract_member_mod_time<R: AuthorizationRequest + ?Sized>(
     }
     match authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await {
         Ok(()) => Ok(archive_time),
-        Err(err) if !replication_required && err.code() == &S3ErrorCode::AccessDenied => Ok(None),
-        Err(err) => Err(err),
+        Err(err) if !replication_required && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
