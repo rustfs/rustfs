@@ -27,12 +27,13 @@ use crate::admin::runtime_sources::current_ready_iam_handle;
 use crate::app::RequestEnvelope;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
-use crate::storage::access::{
-    ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
-    RequestedObjectTags,
-};
 use crate::storage::authorization::AuthorizationRequest;
 use crate::storage::authorization::{authorize_request_core, query_list_buckets_permission, s3_action_potential};
+use crate::storage::req_info::ReqInfo;
+use crate::storage::request_markers::{
+    RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
+    RequestedObjectTags,
+};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use matchit::Params;
 use rustfs_credentials::Credentials;

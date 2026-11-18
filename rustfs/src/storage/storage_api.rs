@@ -156,7 +156,7 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
     pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
     pub(crate) use super::super::access::access_owned::object_read::authorize_get_object;
-    pub(crate) use super::super::access::{StagedMultipartPartAuthorization, authorize_copy_object_tags};
+    pub(crate) use super::super::access::authorize_copy_object_tags;
     pub(crate) use super::super::authorization::ObjectTagConditions;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
@@ -185,6 +185,7 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
     pub(crate) use super::super::req_info::ReqInfo;
+    pub(crate) use super::super::request_markers::StagedMultipartPartAuthorization;
     pub(crate) use super::super::request_markers::{
         MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
