@@ -66,6 +66,12 @@ pub const LEGACY_DATA_USAGE_OBJECT_NAME: &str = ".usage.json";
 /// stale tier names from growing persisted per-tier maps without bound.
 pub const UNKNOWN_TIER: &str = "UNKNOWN_TIER";
 
+/// Whether a remote tier name can be represented in scanner accounting.
+/// Local storage classes are checked separately by the configuration owner.
+pub fn is_scannable_tier_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 256 && !name.bytes().any(|byte| byte.is_ascii_control()) && name != UNKNOWN_TIER
+}
+
 /// Returns true when `existing_last_update` is ahead of `now` by more than
 /// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
 /// trusted for staleness comparisons and a fresh snapshot save must be allowed.

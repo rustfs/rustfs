@@ -166,11 +166,17 @@ async fn test_console_over_the_wire_smoke() -> TestResult {
     let admin_body = admin_response.text().await?;
     assert!(admin_body.contains("AccessDenied"), "admin denial must be AccessDenied: {admin_body}");
 
+    // The console listener serves no S3 surface at all: an object route is not found there,
+    // signed or not, instead of reaching the S3 service and being denied by it.
     let s3_root_response = client.get(format!("{console_base}/")).send().await?;
     assert_eq!(
         s3_root_response.status(),
         reqwest::StatusCode::NOT_FOUND,
-        "the console listener must not expose the S3 root"
+        "the S3 root must not be served on the console listener"
+    );
+    assert!(
+        s3_root_response.text().await?.is_empty(),
+        "the console listener must not answer an object route with an S3 document"
     );
 
     // --- console disabled on a listener means no console surface at all ------

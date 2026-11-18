@@ -2450,6 +2450,14 @@ fn is_restore_control_metadata(key: &str) -> bool {
             .is_some_and(|remainder| remainder.is_empty())
 }
 
+fn copy_overwrite_version_id(opts: &ObjectOptions, source_version: Option<Uuid>) -> Option<String> {
+    opts.overwrites_existing_version().then(|| {
+        opts.version_id
+            .clone()
+            .unwrap_or_else(|| source_version.unwrap_or_default().to_string())
+    })
+}
+
 fn restore_metadata_update_preserves_protected_metadata(
     existing: &HashMap<String, String>,
     replacement: &HashMap<String, String>,
@@ -2470,6 +2478,16 @@ fn restore_metadata_update_preserves_protected_metadata(
 #[cfg(test)]
 mod restore_metadata_update_tests {
     use super::*;
+
+    #[test]
+    fn copy_overwrite_selects_protected_null_version() {
+        assert_eq!(copy_overwrite_version_id(&ObjectOptions::default(), None), Some(Uuid::nil().to_string()));
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert_eq!(copy_overwrite_version_id(&opts, None), None);
+    }
 
     /// The restore keys in pre-`metadata_keys` xl.meta are exactly the ones
     /// a restore metadata update may change; every other persisted key is
@@ -9988,20 +10006,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(metadata_keys::RESTORE))
             && restore_metadata_update_preserves_protected_metadata(&fi.metadata, src_info.user_defined.as_ref());
-        if let Some(dst_version_id) = dst_opts.version_id.as_deref()
+        if let Some(dst_version_id) = copy_overwrite_version_id(dst_opts, src_info.version_id)
             && !is_meta_bucketname(dst_bucket)
             && !restore_metadata_update
         {
             let object_lock_config = dst_opts
                 .object_lock_config_snapshot
                 .as_deref()
-                .ok_or_else(|| Error::other("explicit-version copy is missing its Object Lock configuration snapshot"))?;
+                .ok_or_else(|| Error::other("destructive copy is missing its Object Lock configuration snapshot"))?;
             let current = self
                 .get_object_info(
                     dst_bucket,
                     dst_object,
                     &ObjectOptions {
-                        version_id: Some(dst_version_id.to_string()),
+                        version_id: Some(dst_version_id),
                         no_lock: true,
                         metadata_cache_safe: false,
                         versioned: dst_opts.versioned,
