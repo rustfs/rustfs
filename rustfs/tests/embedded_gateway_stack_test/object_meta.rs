@@ -791,8 +791,13 @@ fn the_legacy_stack_swaps_the_tagging_action_for_a_named_version() {
     with_stack(LEGACY, the_tagging_action_follows_the_named_version);
 }
 
-/// Checks boundary keys across bucket configurations.
-async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServer) {
+/// What a stack answers for a key outside the floor, independent of the operation and bucket.
+type UniformAnswers = (Answer, Answer);
+
+/// Checks boundary keys across bucket configurations. The legacy stack answers per operation and
+/// bucket from the table below; the gateway stack refuses the key before the bucket is consulted,
+/// so it answers every row with `uniform`: `(NUL key, 1025-byte key)`.
+async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServer, uniform: Option<UniformAnswers>) {
     const BUCKET: &str = "object-meta-keys";
     let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
     create_bucket_in_the_store(BUCKET).await;
@@ -817,14 +822,22 @@ async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServ
                 ("GetObjectRetention", _) => ("InternalError", 500, "Failed to load Object Lock configuration"),
                 _ => ("InvalidArgument", 400, "Invalid argument"),
             };
-            let expected = (Some(code.to_owned()), Some(status), Some(message.to_owned()));
+            let expected = match &uniform {
+                Some((nul, _)) => nul.clone(),
+                None => (Some(code.to_owned()), Some(status), Some(message.to_owned())),
+            };
             assert_eq!(call(&client, bucket, "a\0b").await, expected, "{operation} bucket {bucket}");
         }
-        let expected = (Some("KeyTooLongError".to_owned()), Some(400), Some("Your key is too long.".to_owned()));
+        let expected = match &uniform {
+            Some((_, long)) => long.clone(),
+            None => (Some("KeyTooLongError".to_owned()), Some(400), Some("Your key is too long.".to_owned())),
+        };
         assert_eq!(call(&client, BUCKET, &long_key).await, expected, "{operation} long key");
     }
     server.shutdown().await;
 }
+
+type Answer = (Option<String>, Option<u16>, Option<String>);
 
 type KeyCall = for<'a> fn(&'a Client, &'a str, &'a str) -> BoxFuture<'a, (Option<String>, Option<u16>, Option<String>)>;
 
@@ -865,7 +878,17 @@ fn answer<T, E: ProvideErrorMetadata>(result: Result<T, SdkError<E>>) -> (Option
 
 #[test]
 fn the_legacy_stack_refuses_keys_outside_the_floor() {
-    with_stack(LEGACY, keys_outside_the_floor_are_refused);
+    with_stack(LEGACY, |server| keys_outside_the_floor_are_refused(server, None));
+}
+
+#[test]
+fn the_gateway_stack_refuses_keys_outside_the_floor() {
+    let refused = |code: &str, message: &str| (Some(code.to_owned()), Some(400), Some(message.to_owned()));
+    let uniform = (
+        refused("InvalidArgument", "the name contains a NUL byte"),
+        refused("KeyTooLongError", "the name is longer than the maximum length in bytes"),
+    );
+    with_stack(GATEWAY, move |server| keys_outside_the_floor_are_refused(server, Some(uniform)));
 }
 
 fn legal_hold(status: &str) -> aws_sdk_s3::types::ObjectLockLegalHold {
