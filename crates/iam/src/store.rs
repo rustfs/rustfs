@@ -47,6 +47,8 @@ pub trait Store: Clone + Send + Sync + 'static {
         Err(crate::error::Error::IAMActionNotAllowed)
     }
     /// Commit only against the revision just read, or create only if absent. Never retry a stale edit.
+    /// Delegation-capable backends also replace the separate plugin owner epoch atomically,
+    /// without changing the caller-selected STS generation.
     async fn save_regular_user_revision(&self, _name: &str, _item: &UserIdentity, _revision: Option<&str>) -> Result<()> {
         Err(crate::error::Error::IAMActionNotAllowed)
     }

@@ -99,6 +99,21 @@ impl DelegationOwnerIdentity {
     }
 }
 
+fn validate_regular_user_identity(name: &str, identity: &mut UserIdentity) -> Result<()> {
+    // As in load_user_identity_with, legacy records may use the object name as their access key.
+    if identity.credentials.access_key.is_empty() {
+        identity.credentials.access_key = name.to_owned();
+    }
+    if identity.credentials.access_key != name
+        || !matches!(identity.credentials.status.as_str(), "on" | "off")
+        || !identity.credentials.session_token.is_empty()
+        || !identity.credentials.parent_user.is_empty()
+    {
+        return Err(Error::IAMActionNotAllowed);
+    }
+    Ok(())
+}
+
 fn get_user_identity_path(user: &str, user_type: UserType) -> String {
     let base_path: &str = match user_type {
         UserType::Svc => &IAM_CONFIG_SERVICE_ACCOUNTS_PREFIX,
@@ -685,6 +700,53 @@ impl ObjectStore {
         Ok(serde_json::from_slice(&outcome.plain)?)
     }
 
+    async fn read_regular_user_record<Item: DeserializeOwned>(&self, name: &str) -> Result<Option<(Item, String)>> {
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+            return Err(Error::InvalidArgument);
+        }
+        let path = get_user_identity_path(name, UserType::Reg);
+        let existing =
+            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await;
+        match existing.map_err(Error::from) {
+            Ok((data, metadata)) => {
+                let record = Self::decode_iam_config_strict(&data)?;
+                let etag = metadata
+                    .etag
+                    .filter(|tag| !tag.is_empty() && tag != "*")
+                    .ok_or_else(|| Error::other("missing IAM identity revision"))?;
+                Ok(Some((record, etag)))
+            }
+            Err(err) if is_err_config_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn save_regular_user_record(&self, name: &str, record: &DelegationOwnerIdentity, revision: Option<&str>) -> Result<()> {
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+            return Err(Error::InvalidArgument);
+        }
+        let path = get_user_identity_path(name, UserType::Reg);
+        let conditions = match revision {
+            Some("" | "*") => return Err(Error::IAMActionNotAllowed),
+            Some(tag) => HTTPPreconditions {
+                if_match: Some(tag.into()),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".into()),
+                ..Default::default()
+            },
+        };
+        let opts = IamObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(conditions),
+            ..Default::default()
+        };
+        let data = Self::prepare_data_for_storage(&serde_json::to_vec(record)?)?;
+        save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await?;
+        Ok(())
+    }
+
     /// Parameterized core of [`Store::load_user_identity`].
     async fn load_user_identity_with(&self, name: &str, user_type: UserType, mode: LoadMode) -> Result<UserIdentity> {
         let mut u: UserIdentity = self
@@ -975,89 +1037,33 @@ impl Store for ObjectStore {
         let path = get_user_identity_path(name, user_type);
         debug!("Saving IAM identity to path: {}", path);
 
-        let result = if matches!(user_type, UserType::Reg | UserType::None) {
-            self.save_iam_config(DelegationOwnerIdentity::new(user_identity), path).await
-        } else {
-            self.save_iam_config(user_identity, path).await
-        };
-        result.map_err(|e| {
+        self.save_iam_config(user_identity, path).await.map_err(|e| {
             error!(name, error = ?e, "IAM identity save failed");
             e
         })
     }
     async fn regular_user_revision(&self, name: &str) -> Result<Option<(UserIdentity, String)>> {
-        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
-            return Err(Error::InvalidArgument);
-        }
-        let path = get_user_identity_path(name, UserType::Reg);
-        let existing =
-            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await;
-        match existing.map_err(Error::from) {
-            Ok((data, metadata)) => {
-                let mut identity: UserIdentity = Self::decode_iam_config_strict(&data)?;
-                // As in load_user_identity_with, legacy records may use the object name as their access key.
-                if identity.credentials.access_key.is_empty() {
-                    identity.credentials.access_key = name.to_owned();
-                }
-                let etag = metadata
-                    .etag
-                    .filter(|tag| !tag.is_empty() && tag != "*")
-                    .ok_or_else(|| Error::other("missing IAM identity revision"))?;
-                if identity.credentials.access_key != name
-                    || !matches!(identity.credentials.status.as_str(), "on" | "off")
-                    || !identity.credentials.session_token.is_empty()
-                    || !identity.credentials.parent_user.is_empty()
-                {
-                    return Err(Error::IAMActionNotAllowed);
-                }
-                Ok(Some((identity, etag)))
-            }
-            Err(err) if is_err_config_not_found(&err) => Ok(None),
-            Err(err) => Err(err),
-        }
+        let Some((mut identity, revision)) = self.read_regular_user_record::<UserIdentity>(name).await? else {
+            return Ok(None);
+        };
+        validate_regular_user_identity(name, &mut identity)?;
+        Ok(Some((identity, revision)))
     }
 
     async fn save_regular_user_revision(&self, name: &str, item: &UserIdentity, revision: Option<&str>) -> Result<()> {
-        let path = get_user_identity_path(name, UserType::Reg);
-        let conditions = match revision {
-            Some("" | "*") => return Err(Error::IAMActionNotAllowed),
-            Some(tag) => HTTPPreconditions {
-                if_match: Some(tag.into()),
-                ..Default::default()
-            },
-            None => HTTPPreconditions {
-                if_none_match: Some("*".into()),
-                ..Default::default()
-            },
-        };
-        let opts = IamObjectOptions {
-            max_parity: true,
-            http_preconditions: Some(conditions),
-            ..Default::default()
-        };
-        let data = Self::prepare_data_for_storage(&serde_json::to_vec(&DelegationOwnerIdentity::new(item.clone()))?)?;
-        save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await?;
-        Ok(())
+        // Plugin consent is invalidated by every identity edit, independently of
+        // the narrower STS secret-generation policy chosen by the caller.
+        self.save_regular_user_record(name, &DelegationOwnerIdentity::new(item.clone()), revision)
+            .await
     }
 
     async fn load_plugin_delegation_owner_epoch(&self, name: &str, initialize: bool) -> Result<String> {
-        if name.contains(['\0', '/', '\\']) || matches!(name, "" | "." | "..") {
-            return Err(Error::IAMActionNotAllowed);
-        }
-        let path = get_user_identity_path(name, UserType::Reg);
-        let (data, metadata) =
-            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await?;
-        let mut owner: DelegationOwnerIdentity = Self::decode_iam_config_strict(&data)?;
-        let credentials = &mut owner.identity.credentials;
-        if credentials.access_key.is_empty() {
-            credentials.access_key = name.to_owned();
-        }
-        if credentials.access_key != name
-            || !credentials.is_valid()
-            || !credentials.session_token.is_empty()
-            || !credentials.parent_user.is_empty()
-            || credentials.is_service_account()
-        {
+        let (mut owner, revision) = self
+            .read_regular_user_record::<DelegationOwnerIdentity>(name)
+            .await?
+            .ok_or(Error::ConfigNotFound)?;
+        validate_regular_user_identity(name, &mut owner.identity)?;
+        if !owner.identity.credentials.is_valid() || owner.identity.credentials.is_service_account() {
             return Err(Error::IAMActionNotAllowed);
         }
         if let Some(epoch) = owner.plugin_delegation_epoch {
@@ -1069,21 +1075,8 @@ impl Store for ObjectStore {
         if !initialize {
             return Err(Error::IAMActionNotAllowed);
         }
-        let etag = metadata
-            .etag
-            .filter(|etag| !etag.is_empty() && etag != "*")
-            .ok_or_else(|| Error::other("missing IAM identity revision"))?;
         let owner = DelegationOwnerIdentity::new(owner.identity);
         let epoch = owner.plugin_delegation_epoch.clone().ok_or(Error::InvalidArgument)?;
-        let opts = IamObjectOptions {
-            max_parity: true,
-            http_preconditions: Some(HTTPPreconditions {
-                if_match: Some(etag),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let data = Self::prepare_data_for_storage(&serde_json::to_vec(&owner)?)?;
         // Never overwrite a rotation, deletion, or another initializer observed
         // after the legacy read. A lost/failed CAS requires a fresh registration.
         #[cfg(test)]
@@ -1091,7 +1084,7 @@ impl Store for ObjectStore {
             barrier.0.notify_one();
             barrier.1.notified().await;
         }
-        save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await?;
+        self.save_regular_user_record(name, &owner, Some(&revision)).await?;
         Ok(epoch)
     }
 
@@ -1914,6 +1907,162 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn plugin_delegation_epoch_is_independent_of_sts_generation() {
+        use crate::{delegation, manager::IamCache, store::Store, store::UserType};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+
+        temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+            let (_temp, store) = plugin_delegation_store().await;
+            for generation in [None, Some([7; 16])] {
+                let mut identity = plugin_delegation_identity();
+                identity.credentials.access_key = if generation.is_some() {
+                    "tracked-owner"
+                } else {
+                    "legacy-owner"
+                }
+                .into();
+                identity.sts_generation = generation;
+                let name = &identity.credentials.access_key;
+                store
+                    .save_iam_config(&identity, super::get_user_identity_path(name, UserType::Reg))
+                    .await
+                    .expect("owner without plugin epoch");
+                let (before_init, initial_revision) = store
+                    .regular_user_revision(name)
+                    .await
+                    .expect("read owner revision")
+                    .expect("persisted owner");
+                let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+                    .await
+                    .expect("initialize only plugin epoch");
+                let (initialized, _) = store
+                    .regular_user_revision(name)
+                    .await
+                    .expect("initialized owner")
+                    .expect("owner");
+                assert_eq!(
+                    initialized.sts_generation, generation,
+                    "plugin initialization preserves legacy and tracked STS"
+                );
+                assert!(
+                    store
+                        .save_regular_user_revision(name, &before_init, Some(&initial_revision))
+                        .await
+                        .is_err(),
+                    "epoch initialization consumes the same identity revision as other edits"
+                );
+                assert!(
+                    delegation::read_active_for_broker(&store, &record.id, 101).await.is_ok(),
+                    "failed CAS preserves consent"
+                );
+
+                let cache = IamCache::new(store.clone()).await.expect("IAM cache");
+                for edit in ["upsert", "preserving-status", "save-identity", "ssh", "status"] {
+                    let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+                        .await
+                        .expect("register before identity edit");
+                    let (before, revision) = store
+                        .regular_user_revision(name)
+                        .await
+                        .expect("pre-edit revision")
+                        .expect("owner");
+                    let epoch = store
+                        .load_plugin_delegation_owner_epoch(name, false)
+                        .await
+                        .expect("pre-edit epoch");
+                    match edit {
+                        "upsert" => {
+                            cache
+                                .add_user(
+                                    name,
+                                    &AddOrUpdateUserReq {
+                                        secret_key: identity.credentials.secret_key.clone(),
+                                        policy: None,
+                                        status: AccountStatus::Enabled,
+                                    },
+                                )
+                                .await
+                                .expect("same-secret manager upsert");
+                        }
+                        "preserving-status" => {
+                            assert!(
+                                !store
+                                    .save_regular_user_preserving_status(name, &before)
+                                    .await
+                                    .expect("same-secret restricted upsert")
+                            );
+                        }
+                        "save-identity" => {
+                            store
+                                .save_user_identity(name, UserType::Reg, before.clone(), None)
+                                .await
+                                .expect("same-secret direct save");
+                        }
+                        "ssh" => {
+                            cache
+                                .add_user_ssh_public_key(name, "ssh-ed25519 fixture-public-key")
+                                .await
+                                .expect("SSH edit");
+                        }
+                        "status" => {
+                            cache
+                                .set_user_status(name, AccountStatus::Disabled)
+                                .await
+                                .expect("disable owner");
+                            assert!(delegation::read_active_for_broker(&store, &record.id, 101).await.is_err());
+                            cache
+                                .set_user_status(name, AccountStatus::Enabled)
+                                .await
+                                .expect("re-enable owner");
+                        }
+                        _ => unreachable!("fixed identity edit matrix"),
+                    }
+                    let (after, _) = store
+                        .regular_user_revision(name)
+                        .await
+                        .expect("post-edit revision")
+                        .expect("owner");
+                    assert_eq!(after.sts_generation, generation, "{edit} must not rotate STS for an unchanged secret");
+                    assert_ne!(
+                        store
+                            .load_plugin_delegation_owner_epoch(name, false)
+                            .await
+                            .expect("post-edit epoch"),
+                        epoch,
+                        "{edit}"
+                    );
+                    assert!(
+                        matches!(
+                            delegation::read_active_for_broker(&store, &record.id, 101).await,
+                            Err(delegation::DelegationError::Revoked)
+                        ),
+                        "{edit}"
+                    );
+                    assert!(
+                        store
+                            .save_regular_user_revision(name, &before, Some(&revision))
+                            .await
+                            .is_err(),
+                        "stale {edit} write"
+                    );
+                    assert_eq!(
+                        store
+                            .regular_user_revision(name)
+                            .await
+                            .expect("owner after stale write")
+                            .expect("owner")
+                            .0
+                            .sts_generation,
+                        generation
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn plugin_delegation_owner_binding_is_required_and_strict() {
         use crate::{delegation, store::Store, store::UserType};
         let (_temp, store) = plugin_delegation_store().await;
@@ -1987,6 +2136,16 @@ mod tests {
             delegation::create(&store, name, plugin_delegation_restrictions(), 100)
                 .await
                 .is_err()
+        );
+        assert!(
+            store
+                .regular_user_revision(name)
+                .await
+                .expect("plugin corruption must not change STS identity decoding")
+                .expect("regular owner")
+                .0
+                .sts_generation
+                .is_none()
         );
         let mut disabled = identity.clone();
         disabled.credentials.status = "off".into();
