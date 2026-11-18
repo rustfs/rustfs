@@ -16,9 +16,10 @@
 
 use super::authorize_head_object;
 use crate::app::RequestEnvelope;
-use crate::storage::access::{ReqInfo, S3ErrorCode, S3Request, ServerContextSlot};
+use crate::storage::access::{ReqInfo, S3Request, ServerContextSlot};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+use rustfs_s3_types::S3ErrorCode;
 use std::sync::Arc;
 
 #[test]

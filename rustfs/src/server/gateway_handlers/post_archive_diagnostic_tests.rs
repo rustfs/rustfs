@@ -57,7 +57,7 @@ async fn authorize_form(
     bucket: &str,
     key: &str,
 ) -> Result<(), HandlerError> {
-    let form = PostObjectFormPolicy::new(PostObjectPolicyFields::default()).map_err(|error| handler_error(error.into()))?;
+    let form = PostObjectFormPolicy::new(PostObjectPolicyFields::default()).map_err(handler_error)?;
     let facts = PutObjectAuthorization {
         bucket,
         key,
@@ -73,10 +73,10 @@ async fn authorize_form(
         Ok(())
     })
     .await
-    .map_err(|error| handler_error(error.into()))?;
+    .map_err(handler_error)?;
     authorize_post_object(envelope, bucket, key, None)
         .await
-        .map_err(|error| handler_error(error.into()))
+        .map_err(handler_error)
 }
 
 impl Handler<dto::PostObject> for Probe {

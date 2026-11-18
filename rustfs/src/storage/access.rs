@@ -18,35 +18,35 @@ use self::access_owned::listing_multipart::{
 use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
 #[cfg(test)]
 use super::ECStore;
+#[cfg(test)]
 use super::ObjectOptions;
 #[cfg(test)]
 use super::StorageError;
 use super::ecfs::FS;
+#[cfg(test)]
 use crate::auth::facts::AuthzTarget;
 #[cfg(test)]
 use crate::auth::facts::{AuthzFacts, AuthzPrincipal, build_args, build_conditions};
 use crate::auth::{get_request_auth_type_with_query, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
-use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
+#[cfg(test)]
 pub(crate) use crate::storage::authorization_actions::{
     complete_multipart_upload_authorize_action, delete_object_authorize_action, list_parts_authorize_action,
     post_object_authorize_action, versioned_read_action, versioned_tagging_action,
 };
 // `app::metadata_route` still imports this path.
+use crate::storage::authorization::ObjectTagConditions;
 #[cfg(test)]
 use crate::storage::authorization::TableDataPlaneListCursorPosition;
+#[cfg(test)]
+use crate::storage::authorization::capture_odm_read_generation;
 pub(crate) use crate::storage::authorization::req_info_mut;
 #[cfg(test)]
 use crate::storage::authorization::{AMZ_WRITE_OFFSET_BYTES_HEADER, replication_request_authorized, request_context_from_req};
-use crate::storage::authorization::{
-    AccessMarkers, AuthorizationRequest, VerifiedSignature, admit_operation, has_bypass_governance_header,
-    has_write_offset_bytes_header, invalid_force_delete_header, missing_req_info_error,
-    recursive_force_delete_has_authenticated_caller, req_info_ref, request_iam_store, request_object_store, resolve_req_info,
-    set_requested_object_lock_retain_until,
-};
+use crate::storage::authorization::{AccessMarkers, AuthorizationRequest, VerifiedSignature, admit_operation, resolve_req_info};
 use crate::storage::authorization::{
     BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
-    PendingDeleteBucketGenerationGuard, capture_odm_read_generation, load_bucket_generation,
+    PendingDeleteBucketGenerationGuard,
 };
 #[cfg(test)]
 use crate::storage::authorization::{
@@ -57,39 +57,37 @@ use crate::storage::authorization::{
 use crate::storage::authorization::{
     DenialContext, authorize_request_core, iam_authorization_error, owner_can_bypass_policy_deny,
 };
-use crate::storage::authorization::{
-    ObjectTagConditions, authorization_conditions, get_or_fetch_object_tag_conditions, request_authz_facts, request_principal,
-    root_access_key,
-};
 #[cfg(test)]
-use crate::storage::authorization::{
-    PUT_GENERATION_READ_QUORUM_FAILURE, install_object_generation_test_hook, wait_for_object_generation_test_hook,
-};
+use crate::storage::authorization::{PUT_GENERATION_READ_QUORUM_FAILURE, install_object_generation_test_hook};
 #[cfg(test)]
 use crate::storage::authorization::{
     TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN, require_owned_reserved_table_object, table_catalog_backend_for_data_plane,
     table_data_plane_admin_action, table_data_plane_content_mutation, table_data_plane_resource_for_request,
     table_publication_guard_error,
 };
-use crate::storage::authorization::{
-    TableDataPlaneListAccess, TableDataPlaneListResource, TableDataPlanePublicationGuards, retain_table_bucket_publication_guard,
-    table_bucket_enabled_for_data_plane, table_catalog_store_for_data_plane, table_data_plane_list_internal_error,
-    table_list_catalog_error,
-};
+use crate::storage::authorization::{TableDataPlaneListAccess, TableDataPlanePublicationGuards};
+#[cfg(test)]
+use crate::storage::authorization::{TableDataPlaneListResource, retain_table_bucket_publication_guard};
 #[cfg(test)]
 use crate::storage::authorization::{
     apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, bucket_config_mutation_incarnation,
     odm_read_generation, retained_table_data_plane_publication_guards,
 };
+#[cfg(test)]
+use crate::storage::authorization::{audit_request_denial, authorize_request_with_location_constraint};
+#[cfg(test)]
+use crate::storage::authorization::{authorization_conditions, request_authz_facts};
 use crate::storage::authorization::{
-    audit_request_denial, authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion,
-    authorize_object_request, authorize_replication_only_put_headers, authorize_request,
-    authorize_request_with_location_constraint, authorize_staged_multipart_part, authorize_write_etag_condition,
+    authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
 };
 #[cfg(test)]
 use crate::storage::authorization::{
     bucket_policy_needs_existing_object_tag_from_hint, load_bucket_policy_existing_object_tag_hint,
     maybe_merge_object_tag_conditions,
+};
+#[cfg(test)]
+use crate::storage::authorization::{
+    has_write_offset_bytes_header, request_object_store, set_requested_object_lock_retain_until,
 };
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
@@ -100,17 +98,16 @@ pub(crate) use crate::storage::request_markers::{
     RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
 };
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
-use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use http::HeaderMap;
-use rustfs_policy::policy::Args;
 #[cfg(test)]
 use rustfs_policy::policy::BucketPolicyArgs;
-use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_trusted_proxies::ClientInfo;
-use rustfs_utils::http::get_header;
 use s3s::access::{S3Access, S3AccessContext};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use s3s::{S3Error, S3ErrorCode};
+use s3s::{S3Request, S3Result, dto::*, s3_error};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -503,6 +500,7 @@ impl S3Access for FS {
         let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
         access_owned::object_commit::authorize_complete_multipart_upload(req, self.server_ctx(), &bucket, &key, specific_etag)
             .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.
@@ -532,7 +530,7 @@ impl S3Access for FS {
             legal_hold: legal_hold_write_requested(input.object_lock_legal_hold_status.as_ref()),
             retention: retention_write_requested(input.object_lock_mode.as_ref(), input.object_lock_retain_until_date.as_ref()),
         };
-        authorize_copy_object(req, self.server_ctx(), facts).await
+        authorize_copy_object(req, self.server_ctx(), facts).await.map_err(Into::into)
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
@@ -692,7 +690,9 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
-        authorize_delete_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref()).await
+        authorize_delete_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
@@ -708,6 +708,7 @@ impl S3Access for FS {
             S3Action::DeleteObjectTaggingAction,
         )
         .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -715,7 +716,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        authorize_delete_objects(req, &bucket)
+        authorize_delete_objects(req, &bucket).map_err(Into::into)
     }
 
     /// Checks whether the DeletePublicAccessBlock request has accesses to the resources.
@@ -941,7 +942,9 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
         let (bucket, key, version) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
-        access_owned::object_read::authorize_get_object(self.server_ctx(), req, &bucket, &key, version.as_deref()).await
+        access_owned::object_read::authorize_get_object(self.server_ctx(), req, &bucket, &key, version.as_deref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.
@@ -959,7 +962,9 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_object_attributes(&self, req: &mut S3Request<GetObjectAttributesInput>) -> S3Result<()> {
         let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
-        access_owned::object_read::authorize_get_object_attributes(req, &bucket, &key, version_id.as_deref()).await
+        access_owned::object_read::authorize_get_object_attributes(req, &bucket, &key, version_id.as_deref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the GetObjectLegalHold request has accesses to the resources.
@@ -1017,6 +1022,7 @@ impl S3Access for FS {
             S3Action::GetObjectTaggingAction,
         )
         .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the GetObjectTorrent request has accesses to the resources.
@@ -1059,6 +1065,7 @@ impl S3Access for FS {
             input.version_id.as_deref(),
         )
         .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the ListBucketAnalyticsConfigurations request has accesses to the resources.
@@ -1158,7 +1165,9 @@ impl S3Access for FS {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let version = req.input.version_id.clone();
-        access_owned::object_write::authorize_post_object(req, &bucket, &key, version.as_deref()).await
+        access_owned::object_write::authorize_post_object(req, &bucket, &key, version.as_deref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the PutBucketAccelerateConfiguration request has accesses to the resources.
@@ -1368,7 +1377,11 @@ impl S3Access for FS {
             ),
             post: req.method == http::Method::POST,
         };
-        authorize_put_object(req, self.server_ctx(), input, set_post_object_policy_headers).await
+        authorize_put_object(req, self.server_ctx(), input, |req| {
+            set_post_object_policy_headers(req).map_err(Into::into)
+        })
+        .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -1401,6 +1414,7 @@ impl S3Access for FS {
             legal_hold,
         )
         .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the PutObjectLockConfiguration request has accesses to the resources.
@@ -1436,6 +1450,7 @@ impl S3Access for FS {
             retention,
         )
         .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.
@@ -1445,7 +1460,9 @@ impl S3Access for FS {
         let input = &req.input;
         let tags = RequestedObjectTags::from(&input.tagging);
         let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
-        access_owned::object_meta::authorize_put_object_tagging(req, &bucket, &key, version_id.as_deref(), tags).await
+        access_owned::object_meta::authorize_put_object_tagging(req, &bucket, &key, version_id.as_deref(), tags)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -1470,7 +1487,9 @@ impl S3Access for FS {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let version_id = req.input.version_id.clone();
-        access_owned::object_misc::authorize_restore_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref()).await
+        access_owned::object_misc::authorize_restore_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the SelectObjectContent request has accesses to the resources.
@@ -1479,7 +1498,9 @@ impl S3Access for FS {
     async fn select_object_content(&self, req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        access_owned::object_misc::authorize_select_object_content(req, &bucket, &key).await
+        access_owned::object_misc::authorize_select_object_content(req, &bucket, &key)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the UploadPart request has accesses to the resources.
@@ -1488,7 +1509,9 @@ impl S3Access for FS {
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        access_owned::object_write::authorize_upload_part(req, self.server_ctx(), &bucket, &key).await
+        access_owned::object_write::authorize_upload_part(req, self.server_ctx(), &bucket, &key)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the UploadPartCopy request has accesses to the resources.
@@ -1501,7 +1524,9 @@ impl S3Access for FS {
         let source = source
             .as_ref()
             .map(|(bucket, key, version_id)| copy_source_object(bucket, key, version_id.as_deref()));
-        access_owned::object_commit::authorize_upload_part_copy(req, self.server_ctx(), &bucket, &key, source).await
+        access_owned::object_commit::authorize_upload_part_copy(req, self.server_ctx(), &bucket, &key, source)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the WriteGetObjectResponse request has accesses to the resources.

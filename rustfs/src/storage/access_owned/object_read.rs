@@ -21,11 +21,13 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_read.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-use crate::storage::access::{
-    AuthorizationRequest, S3Result, ServerContextSlot, authorize_object_request, authorize_request, capture_odm_read_generation,
-    req_info_mut, versioned_read_action,
+use crate::storage::authorization::{
+    AuthorizationRequest, authorize_object_request, authorize_request, capture_odm_read_generation, req_info_mut,
 };
+use crate::storage::authorization_actions::versioned_read_action;
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::S3Result;
 use rustfs_utils::http::{SUFFIX_SOURCE_REPLICATION_CHECK, get_header};
 
 /// GET uses the same versioned read decision and ODM snapshot on both edges.
@@ -77,9 +79,7 @@ pub(crate) async fn authorize_get_object_attributes<R: AuthorizationRequest + ?S
         S3Action::GetObjectAttributesAction
     };
     authorize_object_request(req, bucket, key, version_id, Action::S3Action(attributes)).await?;
-    authorize_request(req, versioned_read_action(version_id))
-        .await
-        .map_err(Into::into)
+    authorize_request(req, versioned_read_action(version_id)).await
 }
 
 #[cfg(test)]

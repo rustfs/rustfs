@@ -21,13 +21,19 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_write.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-use super::super::{
-    Action, ApiError, AuthorizationRequest, PostObjectPolicyHeaders, S3Action, S3Error, S3ErrorCode, S3Result, ServerContextSlot,
-    authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part, authorize_write_etag_condition,
-    has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error, post_object_authorize_action,
+#[cfg(test)]
+use crate::error::ApiError;
+use crate::storage::authorization::{
+    AuthorizationRequest, authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+    authorize_write_etag_condition, has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error,
     set_requested_object_lock_retain_until,
 };
+use crate::storage::authorization_actions::post_object_authorize_action;
+use crate::storage::request_markers::PostObjectPolicyHeaders;
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use http::{HeaderName, HeaderValue};
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use time::OffsetDateTime;
 
 pub(crate) async fn authorize_upload_part<R: AuthorizationRequest + ?Sized>(
@@ -72,14 +78,17 @@ pub(crate) async fn authorize_put_object<R: AuthorizationRequest + ?Sized>(
     if has_write_offset_bytes_header(req.headers()) {
         return Err(S3Error::with_message(
             S3ErrorCode::NotImplemented,
-            ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
+            "A header you provided implies functionality that is not implemented".to_string(),
         ));
     }
     // Capture first, but let authorization refusals precede bucket-state failures.
     let generation = load_bucket_generation(server, req, input.bucket).await;
     #[cfg(test)]
-    let generation = if super::super::PUT_GENERATION_READ_QUORUM_FAILURE.try_with(|_| ()).is_ok() {
-        Err(ApiError::from(super::super::StorageError::ErasureReadQuorum).into())
+    let generation = if crate::storage::authorization::PUT_GENERATION_READ_QUORUM_FAILURE
+        .try_with(|_| ())
+        .is_ok()
+    {
+        Err(ApiError::from(crate::storage::StorageError::ErasureReadQuorum).into())
     } else {
         generation
     };
@@ -112,9 +121,7 @@ pub(crate) async fn authorize_post_object<R: AuthorizationRequest + ?Sized>(
     info.object = Some(key.to_owned());
     info.version_id = version_id.map(str::to_owned);
     req.install_post_object_marker();
-    authorize_request(req, post_object_authorize_action())
-        .await
-        .map_err(Into::into)
+    authorize_request(req, post_object_authorize_action()).await
 }
 
 /// Form fields that shadow wire headers in the PutObject policy decision.

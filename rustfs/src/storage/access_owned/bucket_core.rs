@@ -22,7 +22,7 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/bucket_core.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-use super::super::{
+use crate::storage::authorization::{
     AuthorizationRequest, authorize_request, authorize_request_with_location_constraint, invalid_force_delete_header,
     missing_req_info_error,
 };

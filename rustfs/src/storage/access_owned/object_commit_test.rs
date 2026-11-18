@@ -20,11 +20,12 @@ use crate::app::{RequestEnvelope, RequestHead};
 use crate::storage::access::tests::{TestKms, UnreadyIam, build_request, ensure_req_info};
 use crate::storage::access::{
     AuthorizationRequest, CopyObjectInput, CopySource, CopySourceBucketGenerationGuard, ECStore, FS, ReqInfo, S3Access as _,
-    S3ErrorCode, S3Result, UploadPartCopyInput,
+    UploadPartCopyInput,
 };
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage::storage_api::runtime_sources_consumer::{AppContext, ServerContextSlot};
 use http::{Extensions, HeaderMap, Method, Uri};
+use rustfs_s3_types::{S3ErrorCode, S3Result};
 use serial_test::serial;
 use std::sync::Arc;
 
@@ -291,7 +292,7 @@ async fn copy_hooks_source_first_inner() {
         ensure_req_info(&mut copy);
         copy.extensions.insert(fs.server_ctx().clone());
         let copy_error = fs.copy_object(&mut copy).await.expect_err(case);
-        assert_eq!(copy_error.code(), &copy_expected, "CopyObject: {case}");
+        assert_eq!(S3ErrorCode::from(copy_error.code().clone()), copy_expected, "CopyObject: {case}");
 
         let part = UploadPartCopyInput::builder()
             .bucket(closed.clone())
@@ -305,7 +306,7 @@ async fn copy_hooks_source_first_inner() {
         ensure_req_info(&mut part);
         part.extensions.insert(fs.server_ctx().clone());
         let part_error = fs.upload_part_copy(&mut part).await.expect_err(case);
-        assert_eq!(part_error.code(), &part_expected, "UploadPartCopy: {case}");
+        assert_eq!(S3ErrorCode::from(part_error.code().clone()), part_expected, "UploadPartCopy: {case}");
     }
 }
 
