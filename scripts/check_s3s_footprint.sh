@@ -160,6 +160,7 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
 
 usage() {
     echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run] [--base <rev>]" >&2
@@ -257,6 +258,24 @@ S3_ERROR_LABEL='s3s s3_error! lines'
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Git workspaces may contain generated Rust files left by an earlier quality
+# check. They are not part of the submitted tree and must not change the
+# commit-to-base ratchet. A Git work tree is sufficient to select tracked-file
+# scanning; the checkout need not retain a remote configuration. Self-test
+# fixtures opt out with their marker so their deliberately tiny repositories
+# continue to exercise the directory-scan path.
+declare -a SCANNED_RUST_PATHS ECSTORE_RUST_PATHS
+if [[ -e "$REPO_ROOT/.git" ]] \
+    && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && [[ ! -e "$REPO_ROOT/.s3s-footprint-self-test" ]]; then
+    while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && SCANNED_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
+    while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && ECSTORE_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
+    echo "s3s footprint scan: tracked Rust files=${#SCANNED_RUST_PATHS[@]}" >&2
+else
+    SCANNED_RUST_PATHS=("$E2E_TEST_GLOB" .)
+    ECSTORE_RUST_PATHS=(crates/ecstore/src)
+fi
 
 # Returns 0 when every s3s-referencing Rust file is allowlisted (or on a dry
 # run), 1 when files remain outside the allowlist; exits 1 on a broken input.
@@ -363,6 +382,7 @@ SELF_TEST_STDIN="$TMP_DIR/self-test-stdin.txt"
 self_test_tree() {
     local root="$SELF_TEST_DIR/$1"
     mkdir -p "$root/scripts" "$root/.config" "$root/crates/ecstore/src" "$root/crates/control/src"
+    : >"$root/.s3s-footprint-self-test"
     cp "$SCRIPT_PATH" "$root/scripts/check_s3s_footprint.sh"
     printf '%s\n' 'use s3s::s3_error;' 'fn control() -> E { s3_error!(InternalError) }' \
         >"$root/crates/control/src/lib.rs"
@@ -753,13 +773,13 @@ run_rg_to() {
 }
 
 # Explicit '.' path is load-bearing — see header. Never drop it.
-run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust "$E2E_TEST_GLOB" .
+run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust "${SCANNED_RUST_PATHS[@]}"
 run_rg_to "$TMP_DIR/error_lines" --with-filename --no-heading --no-line-number 's3_error!' \
-    --type rust "$E2E_TEST_GLOB" .
-run_rg_to "$TMP_DIR/s3s_macro_files" -l -U -e "$S3S_MACRO_IMPORT_PATTERN" --type rust "$E2E_TEST_GLOB" .
+    --type rust "${SCANNED_RUST_PATHS[@]}"
+run_rg_to "$TMP_DIR/s3s_macro_files" -l -U -e "$S3S_MACRO_IMPORT_PATTERN" --type rust "${SCANNED_RUST_PATHS[@]}"
 run_rg_to "$TMP_DIR/cleared_files" -l -U -e "$RUSTFS_MACRO_IMPORT_PATTERN" -e "$S3_ERROR_DEFINITION_PATTERN" \
-    --type rust "$E2E_TEST_GLOB" .
-run_rg_to "$TMP_DIR/ecstore_files" -l "$S3S_PATH_PATTERN" --type rust crates/ecstore/src
+    --type rust "${SCANNED_RUST_PATHS[@]}"
+run_rg_to "$TMP_DIR/ecstore_files" -l "$S3S_PATH_PATTERN" --type rust "${ECSTORE_RUST_PATHS[@]}"
 
 s3s_import_files="$(grep -c . "$TMP_DIR/import_files" || true)"
 # Rules 1-3 of the header, one rg output line ("path:text") at a time. The path

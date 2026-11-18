@@ -2450,6 +2450,14 @@ fn is_restore_control_metadata(key: &str) -> bool {
             .is_some_and(|remainder| remainder.is_empty())
 }
 
+fn copy_overwrite_version_id(opts: &ObjectOptions, source_version: Option<Uuid>) -> Option<String> {
+    opts.overwrites_existing_version().then(|| {
+        opts.version_id
+            .clone()
+            .unwrap_or_else(|| source_version.unwrap_or_default().to_string())
+    })
+}
+
 fn restore_metadata_update_preserves_protected_metadata(
     existing: &HashMap<String, String>,
     replacement: &HashMap<String, String>,
@@ -2470,6 +2478,16 @@ fn restore_metadata_update_preserves_protected_metadata(
 #[cfg(test)]
 mod restore_metadata_update_tests {
     use super::*;
+
+    #[test]
+    fn copy_overwrite_selects_protected_null_version() {
+        assert_eq!(copy_overwrite_version_id(&ObjectOptions::default(), None), Some(Uuid::nil().to_string()));
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert_eq!(copy_overwrite_version_id(&opts, None), None);
+    }
 
     /// The restore keys in pre-`metadata_keys` xl.meta are exactly the ones
     /// a restore metadata update may change; every other persisted key is
@@ -9988,20 +10006,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(metadata_keys::RESTORE))
             && restore_metadata_update_preserves_protected_metadata(&fi.metadata, src_info.user_defined.as_ref());
-        if let Some(dst_version_id) = dst_opts.version_id.as_deref()
+        if let Some(dst_version_id) = copy_overwrite_version_id(dst_opts, src_info.version_id)
             && !is_meta_bucketname(dst_bucket)
             && !restore_metadata_update
         {
             let object_lock_config = dst_opts
                 .object_lock_config_snapshot
                 .as_deref()
-                .ok_or_else(|| Error::other("explicit-version copy is missing its Object Lock configuration snapshot"))?;
+                .ok_or_else(|| Error::other("destructive copy is missing its Object Lock configuration snapshot"))?;
             let current = self
                 .get_object_info(
                     dst_bucket,
                     dst_object,
                     &ObjectOptions {
-                        version_id: Some(dst_version_id.to_string()),
+                        version_id: Some(dst_version_id),
                         no_lock: true,
                         metadata_cache_safe: false,
                         versioned: dst_opts.versioned,
@@ -17164,7 +17182,12 @@ mod metadata_mutation_generation_tests {
                 copy_object,
                 &mut copy_info,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
             )
             .await
             .expect("metadata COPY should succeed");
@@ -17342,7 +17365,11 @@ mod metadata_mutation_generation_tests {
         let metadata = Arc::make_mut(&mut source.user_defined);
         metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "new=value".to_string());
         metadata.insert("expires".to_string(), expires.format(&Rfc3339).expect("expiry"));
-        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &opts)
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &dst_opts)
             .await
             .expect("explicit metadata wins over externalized fields");
         let mut copied = set.get_object_info(bucket, "object", &opts).await.expect("copied metadata");
@@ -17353,7 +17380,7 @@ mod metadata_mutation_generation_tests {
         copied.metadata_only = true;
         copied.user_tags = Arc::new(String::new());
         copied.expires = None;
-        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &opts)
+        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &dst_opts)
             .await
             .expect("explicit empty replacement");
         let cleared = set.get_object_info(bucket, "object", &opts).await.expect("cleared metadata");
@@ -17370,6 +17397,10 @@ mod metadata_mutation_generation_tests {
         }
 
         let valid_object = "valid-sidecar";
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
         let (mut valid_source, _) = put_and_prime(&set_disks, bucket, valid_object, b"valid sidecar body").await;
         persist_part_checksum_sidecar(&set_disks, bucket, valid_object, r#"[[1,[["CRC32C","AAAAAA=="]]]]"#).await;
         valid_source.metadata_only = true;
@@ -17382,7 +17413,7 @@ mod metadata_mutation_generation_tests {
                 valid_object,
                 &mut valid_source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &dst_opts,
             )
             .await
             .expect("metadata-only copy should preserve a valid checksum sidecar");
@@ -17455,7 +17486,7 @@ mod metadata_mutation_generation_tests {
                 conflicting_object,
                 &mut conflicting_source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &dst_opts,
             )
             .await
             .expect_err("metadata-only copy must reject conflicting checksum aliases");
@@ -25501,6 +25532,9 @@ mod put_object_tmp_cleanup_tests {
                 &ObjectOptions {
                     no_lock: true,
                     namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )

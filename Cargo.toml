@@ -151,16 +151,16 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.5" }
 # engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
 # gateway in this workspace; no crate may enable a `compat-s3s*` feature except
 # the s3s-facing edge of the rustfs binary.
-rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "6096b9218ad78202c69367424c5ea1407bb49cc3", version = "0.42.0", default-features = false }
-rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "6096b9218ad78202c69367424c5ea1407bb49cc3", version = "0.2.0", default-features = false }
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "d6840d54187382d31526317e61369734c759e2cd", version = "0.42.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "d6840d54187382d31526317e61369734c759e2cd", version = "0.2.0", default-features = false }
 # The gateway framework itself, consumed for its extension traits by the ring-2
 # adapter. `default-features = false` keeps the `server` feature, and with it the
 # server crate, out of the build.
-rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "6096b9218ad78202c69367424c5ea1407bb49cc3", version = "0.66.0", default-features = false }
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "d6840d54187382d31526317e61369734c759e2cd", version = "0.66.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
-rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "6096b9218ad78202c69367424c5ea1407bb49cc3", default-features = false }
-rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "6096b9218ad78202c69367424c5ea1407bb49cc3", version = "0.63.0", default-features = false }
-rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "6096b9218ad78202c69367424c5ea1407bb49cc3", version = "0.13.0", default-features = false }
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "d6840d54187382d31526317e61369734c759e2cd", default-features = false }
+rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "d6840d54187382d31526317e61369734c759e2cd", version = "0.63.0", default-features = false }
+rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "d6840d54187382d31526317e61369734c759e2cd", version = "0.13.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -168,13 +168,13 @@ async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
 async-compression = { version = "0.4.52" }
 async-trait = "0.1.92"
-async-nats = { version = "0.52.0", default-features = false }
+async-nats = { version = "0.53.0", default-features = false }
 axum = "0.8.9"
 futures = "0.3.34"
 futures-core = "0.3.34"
 futures-lite = "2.6.1"
 futures-util = "0.3.34"
-pollster = "1.0.1"
+pollster = "1.0.2"
 pulsar = { default-features = false, version = "=6.9.0" }
 lapin = { default-features = false, version = "4.12.3" }
 hyper = { version = "1.12.0" }
@@ -209,8 +209,8 @@ quinn = { version = "0.11.12", default-features = false, features = [
 ] }
 
 # Serialization and Data Formats
-apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
-bytes = { version = "1.12.1" }
+apache-avro = { version = "0.23.0", features = ["snappy", "zstandard"] }
+bytes = { version = "1.12.2" }
 csv-core = "0.1.13"
 bytesize = "2.7.0"
 byteorder = "1.5.0"
@@ -242,7 +242,7 @@ jsonwebtoken = { version = "12.0.0" }
 openidconnect = { default-features = false, version = "4.1.0" }
 pbkdf2 = "0.13.0"
 p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
-rsa = { version = "=0.10.0-rc.18" }
+rsa = { version = "0.10.0", features = ["pkcs1v15"] }
 rustls = { default-features = false, version = "0.23.46" }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.16.0"
@@ -250,13 +250,13 @@ x509-parser = "0.18.1"
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 subtle = "2.6"
-zeroize = { version = "1.9.1" }
+zeroize = { version = "1.9.2" }
 proptest = "1"
 
 # Time and Date
 chrono = { version = "0.4.45" }
 humantime = "2.4.0"
-jiff = { version = "0.2.43" }
+jiff = { version = "1.0.1" }
 time = { version = "0.3.55" }
 
 # Database
@@ -273,18 +273,18 @@ tar-codec = "0.0.16"
 tar-framing = "0.0.16"
 atoi = "3.1.1"
 atomic_enum = "0.3.0"
-aws-config = { version = "1.13.2" }
+aws-config = { version = "1.13.3" }
 aws-credential-types = { version = "1.3.1" }
-aws-sdk-kms = { default-features = false, version = "1.131.0" }
-aws-sdk-s3 = { default-features = false, version = "1.159.0" }
-aws-sdk-sts = { default-features = false, version = "1.126.0" }
+aws-sdk-kms = { default-features = false, version = "1.133.0" }
+aws-sdk-s3 = { default-features = false, version = "1.160.0" }
+aws-sdk-sts = { default-features = false, version = "1.127.0" }
 aws-smithy-async = { version = "1.3.1" }
-aws-smithy-http-client = { default-features = false, version = "1.5.2" }
-aws-smithy-runtime-api = { version = "1.21.0" }
+aws-smithy-http-client = { default-features = false, version = "1.5.3" }
+aws-smithy-runtime-api = { version = "1.22.0" }
 aws-smithy-types = { version = "1.9.4" }
 base64-simd = "0.8.0"
-brotli = "9.1.1"
-clap = { version = "4.6.7" }
+brotli = "9.1.3"
+clap = { version = "4.6.8" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
 criterion = { version = "0.8" }
@@ -292,7 +292,7 @@ crossbeam-queue = "0.3.14"
 crossbeam-channel = "0.5.17"
 crossbeam-deque = "0.8.8"
 crossbeam-utils = "0.8.23"
-datafusion = { default-features = false, version = "55.2.0" }
+datafusion = { default-features = false, version = "55.3.0" }
 derive_builder = "0.20.2"
 ed25519-dalek = "3.0.0"
 enumset = "1.1.15"
@@ -318,7 +318,7 @@ log = "0.4"
 memmap2 = "0.9.12"
 nixl-sys = { git = "https://github.com/houseme/nixl", rev = "cc636c83f13d692e85b67e55aed092413d16fb41" }
 lz4 = "1.28.1"
-lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame"] }
+lz4_flex = { version = "0.14.2", default-features = false, features = ["std", "frame"] }
 matchit = "0.9.2"
 md-5 = "0.11.0"
 mime_guess = "2.0.5"
@@ -337,14 +337,14 @@ percent-encoding = "2.3.2"
 qrcode-rs = { version = "2.2.0", default-features = false, features = ["std", "svg"] }
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
-rand = { version = "0.10.3" }
+rand = { version = "0.10.4" }
 ratelimit = "2.0.0"
 rayon = "1.12.0"
 rustfs-erasure-codec = { version = "9.1.0" }
 reed-solomon-simd = "3.1.0"
-regex = { version = "1.13.1" }
+regex = { version = "1.13.2" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
-redis = { version = "1.8.1" }
+redis = { version = "1.8.2" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.6" }
 rust-embed = { version = "8.14.0" }
@@ -364,7 +364,7 @@ snap = "1.1.2"
 starshard = { version = "2.4.1" }
 strum = { version = "0.28.0" }
 sync_wrapper = "1.0.2"
-sysinfo = "0.40.3"
+sysinfo = "0.40.4"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.4.1"
@@ -378,15 +378,15 @@ tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.29.2" }
+uuid = { version = "1.29.3" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
 winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
-xxhash-rust = { version = "0.8.19" }
-zip = "9.5.1"
+xxhash-rust = { version = "0.8.21" }
+zip = "9.7.0"
 zstd = "0.14.4"
 
 # Observability and Metrics
@@ -405,9 +405,9 @@ pyroscope = { version = "2.1.5" }
 # FTP and SFTP
 libunftp = { version = "0.25.0" }
 unftp-core = "0.1.1"
-suppaftp = { version = "12.2.1" }
+suppaftp = { version = "13.0.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.65.1" }
+russh = { version = "0.65.2" }
 russh-sftp = "3.0.1"
 
 # WebDAV
@@ -416,7 +416,7 @@ dav-server = "0.12.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.4" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.31.2", default-features = false }
+hotpath = { version = "0.32.1", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 

@@ -26,7 +26,6 @@
 //! envelope lives in `storage/s3_compat/envelope.rs`.
 
 use super::ServerContextSlot;
-use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
@@ -41,6 +40,7 @@ use crate::app::storage_api::context::{
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
+use crate::storage::request_markers::WebsiteRead;
 use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
@@ -383,7 +383,10 @@ impl RequestEnvelope {
         }
     }
 
-    pub(crate) fn mark_permission_probe_request_fact_known(&mut self, fact: crate::storage::access::PermissionProbeRequestFact) {
+    pub(crate) fn mark_permission_probe_request_fact_known(
+        &mut self,
+        fact: crate::storage::request_markers::PermissionProbeRequestFact,
+    ) {
         if self.permission_probe {
             self.permission_probe_known_request_facts |= fact as u8;
         }
@@ -460,6 +463,36 @@ impl RequestEnvelope {
     /// migrated; nothing should read it in the meantime.
     pub fn residual_extensions(&self) -> &Extensions {
         &self.residual_extensions
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    /// The payloads the connection, request and signature layers attached, back in the extensions
+    /// they arrive in, for an edge that hands this request to a handler still taking those.
+    pub(crate) fn transport_extensions(&self) -> Extensions {
+        let mut extensions = self.residual_extensions.clone();
+        extensions.insert(self.remote_addr.map(RemoteAddr));
+        if let Some(client_info) = &self.client_info {
+            extensions.insert(client_info.clone());
+        }
+        if let Some(native_tls) = self.native_tls_transport {
+            extensions.insert(NativeTlsTransport(native_tls));
+        }
+        if let Some(request_context) = &self.request_context {
+            extensions.insert(request_context.clone());
+        }
+        if let Some(server_context) = &self.server_context {
+            extensions.insert(Arc::clone(server_context));
+        }
+        if let Some(body_read_control) = &self.body_read_control {
+            extensions.insert(body_read_control.clone());
+        }
+        if let Some(verified) = self.verified_sigv4 {
+            extensions.insert(verified);
+        }
+        if let Some(verified) = self.verified_presigned {
+            extensions.insert(verified);
+        }
+        extensions
     }
 }
 
@@ -620,7 +653,7 @@ impl AuthorizationRequest for RequestEnvelope {
     fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
         self.permission_probe_caller_authentication
     }
-    fn permission_probe_request_fact_known(&self, fact: crate::storage::access::PermissionProbeRequestFact) -> bool {
+    fn permission_probe_request_fact_known(&self, fact: crate::storage::request_markers::PermissionProbeRequestFact) -> bool {
         self.permission_probe_known_request_facts & (fact as u8) != 0
     }
     fn permission_probe(&self) -> bool {

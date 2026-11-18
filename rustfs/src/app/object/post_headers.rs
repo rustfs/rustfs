@@ -15,10 +15,53 @@
 //! Effective metadata and checksum inputs for an authorized browser upload.
 
 use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::access::AuthorizationRequest as _;
 use crate::app::storage_api::object_usecase::compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
 use http::{HeaderMap, HeaderValue};
 use rustfs_gateway::dto::PostObjectFields;
 use rustfs_s3_types::{S3Result, s3_error};
+
+/// Project archive controls from accepted form metadata after operation admission has refused raw wire/query metadata.
+///
+/// Ordinary metadata stays opaque unless the form's extract flag is affirmative.
+///
+/// # Errors
+///
+/// `InvalidArgument` when a requested archive control cannot be represented as a readable header.
+pub(crate) fn install_post_archive_form_metadata(envelope: &mut RequestEnvelope, metadata: &[(String, String)]) -> S3Result<()> {
+    let Some((_, flag)) = metadata
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("snowball-auto-extract"))
+    else {
+        return Ok(());
+    };
+    let Ok(flag) = HeaderValue::from_str(flag) else {
+        return Ok(());
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-amz-meta-snowball-auto-extract", flag);
+    if !super::is_put_object_extract_requested(&headers) {
+        return Ok(());
+    }
+    for (name, value) in metadata {
+        if name.eq_ignore_ascii_case("snowball-auto-extract") {
+            continue;
+        }
+        let name = format!("x-amz-meta-{name}");
+        if !super::extract::is_snowball_transport_header(&name) {
+            continue;
+        }
+        let name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid POST archive metadata"))?;
+        let value = HeaderValue::from_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid POST archive metadata"))?;
+        value
+            .to_str()
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid POST archive metadata"))?;
+        headers.insert(name, value);
+    }
+    envelope.headers_mut().extend(headers);
+    Ok(())
+}
 
 pub(crate) fn post_metadata_headers(
     envelope: &RequestEnvelope,
@@ -208,6 +251,47 @@ mod tests {
     use crate::app::storage_api::context::PostObjectPolicyHeaders;
     use http::{Extensions, Method, Uri};
     use rustfs_s3_types::S3ErrorCode;
+
+    #[test]
+    fn gateway_post_archive_controls_come_from_validated_form_metadata() {
+        let mut envelope = request(HeaderMap::new(), HeaderMap::new());
+        install_post_archive_form_metadata(
+            &mut envelope,
+            &[
+                ("snowball-auto-extract".to_owned(), "true".to_owned()),
+                ("rustfs-snowball-prefix".to_owned(), "allowed/".to_owned()),
+                ("purpose".to_owned(), "ordinary metadata".to_owned()),
+            ],
+        )
+        .expect("valid form controls");
+        assert!(super::super::is_put_object_extract_requested(envelope.headers()));
+        assert_eq!(envelope.headers()["x-amz-meta-rustfs-snowball-prefix"], "allowed/");
+        assert!(!envelope.headers().contains_key("x-amz-meta-purpose"));
+        for value in ["bad\r\nheader: value", "non-ascii-\u{80}"] {
+            let error = install_post_archive_form_metadata(
+                &mut envelope,
+                &[
+                    ("snowball-auto-extract".to_owned(), "true".to_owned()),
+                    ("snowball-prefix".to_owned(), value.to_owned()),
+                ],
+            )
+            .expect_err("archive controls must remain readable without header injection");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn gateway_post_ordinary_metadata_does_not_enable_archive_controls() {
+        for flag in [None, Some("false"), Some("not-a-boolean"), Some("\u{80}")] {
+            let mut envelope = request(HeaderMap::new(), HeaderMap::new());
+            let mut metadata = vec![("snowball-prefix".to_owned(), "\u{80}".to_owned())];
+            if let Some(flag) = flag {
+                metadata.push(("snowball-auto-extract".to_owned(), flag.to_owned()));
+            }
+            install_post_archive_form_metadata(&mut envelope, &metadata).expect("ordinary metadata remains opaque");
+            assert!(envelope.headers().is_empty());
+        }
+    }
 
     fn request(headers: HeaderMap, policy: HeaderMap) -> RequestEnvelope {
         let mut extensions = Extensions::new();

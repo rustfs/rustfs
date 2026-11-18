@@ -497,7 +497,7 @@ mod tests {
     };
     use http::Uri;
     use hyper::StatusCode;
-    use jiff::Zoned;
+    use jiff::ZonedDateTime;
     use rustfs_kms::{
         KeyImpactReport, KeyInfo, KeyMetadata, KeyReference, KeyReferenceKind, KeyState, KeyStatus, KeyUsage, KmsError,
         ReferenceScope, RotationDueReason,
@@ -1055,7 +1055,7 @@ mod tests {
         impact
     }
 
-    fn fixed_zoned(value: &str) -> Zoned {
+    fn fixed_zoned(value: &str) -> ZonedDateTime {
         value.parse().expect("snapshot timestamp should parse")
     }
 

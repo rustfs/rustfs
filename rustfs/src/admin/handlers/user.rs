@@ -18,7 +18,7 @@ use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::{
     admin::runtime_sources::current_action_credentials,
     admin::{
-        auth::{authorize_admin_envelope, validate_admin_request},
+        auth::{SelfServiceMutation, authorize_admin_envelope, validate_admin_request},
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
@@ -330,16 +330,19 @@ impl Operation for AddUser {
             "admin user state"
         );
 
-        // For eligible self operations, only explicit Deny should block the request.
-        validate_admin_request(
-            req.headers(),
-            &cred,
-            owner,
-            check_deny_only,
-            vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.policy_source_addr(),
-        )
-        .await?;
+        if check_deny_only {
+            SelfServiceMutation::Password.check(&req, &cred, owner).await?;
+        } else {
+            validate_admin_request(
+                req.headers(),
+                &cred,
+                owner,
+                false,
+                vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
+                req.policy_source_addr(),
+            )
+            .await?;
+        }
 
         let rotation_secret = self_rotation_secret(check_deny_only, input_secret.as_deref())?;
         let updated_at = if let Some(current_secret) = rotation_secret {
@@ -352,7 +355,15 @@ impl Operation for AddUser {
             args.policy = None;
             updated_at
         } else {
-            iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?
+            if authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::EnableUserAdminAction)])
+                .await
+                .is_ok()
+            {
+                iam_store.create_user(ak, &args).await
+            } else {
+                iam_store.create_user_preserving_status(ak, &args).await
+            }
+            .map_err(map_add_user_create_error)?
         };
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {

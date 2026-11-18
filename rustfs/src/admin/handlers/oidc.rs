@@ -270,6 +270,7 @@ pub struct PutOidcConfigHandler {}
 impl Operation for PutOidcConfigHandler {
     async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
+        authorize_oidc_config_request(&req, AdminAction::ManageOpenIDConfigAdminAction).await?;
 
         let provider_id = params
             .get("provider_id")
@@ -299,6 +300,7 @@ pub struct DeleteOidcConfigHandler {}
 impl Operation for DeleteOidcConfigHandler {
     async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
+        authorize_oidc_config_request(&req, AdminAction::ManageOpenIDConfigAdminAction).await?;
 
         let provider_id = params
             .get("provider_id")
@@ -1368,6 +1370,8 @@ mod tests {
             ("GetOidcConfigHandler", "AdminAction::ServerInfoAdminAction"),
             ("PutOidcConfigHandler", "AdminAction::ConfigUpdateAdminAction"),
             ("DeleteOidcConfigHandler", "AdminAction::ConfigUpdateAdminAction"),
+            ("PutOidcConfigHandler", "AdminAction::ManageOpenIDConfigAdminAction"),
+            ("DeleteOidcConfigHandler", "AdminAction::ManageOpenIDConfigAdminAction"),
             ("ValidateOidcConfigHandler", "AdminAction::ServerInfoAdminAction"),
         ] {
             let marker = format!("impl Operation for {handler}");

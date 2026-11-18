@@ -65,7 +65,7 @@ use aws_sdk_kms::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_kms::types::{DataKeySpec, KeySpec as AwsKeySpec, KeyState as AwsKeyState, KeyUsageType, Tag};
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_types::Blob;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use tokio_util::sync::CancellationToken;
 
 use super::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, empty_key_page, list_keys_page_size};
@@ -234,12 +234,12 @@ fn map_key_usage(usage: Option<&KeyUsageType>) -> KeyUsage {
     }
 }
 
-fn to_zoned(value: Option<&aws_smithy_types::DateTime>) -> Option<Zoned> {
+fn to_zoned(value: Option<&aws_smithy_types::DateTime>) -> Option<ZonedDateTime> {
     let value = value?;
     let nanos = i32::try_from(value.subsec_nanos()).ok()?;
     jiff::Timestamp::new(value.secs(), nanos)
         .ok()
-        .map(|timestamp| timestamp.to_zoned(jiff::tz::TimeZone::UTC))
+        .map(|timestamp| timestamp.to_zoned_datetime(jiff::tz::TimeZone::UTC))
 }
 
 /// `None` for an empty context so the request omits the field entirely rather
@@ -593,7 +593,7 @@ impl KmsBackend for AwsKmsBackend {
             encrypted_key: ciphertext.into_inner(),
             nonce: Vec::new(),
             encryption_context: request.encryption_context,
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             // AWS addresses backing keys internally and never exposes a version.
             master_key_version: None,
             // AWS binds the context into the blob itself; this field describes
@@ -876,7 +876,7 @@ impl KmsBackend for AwsKmsBackend {
     /// report what AWS has already done: a key that is gone counts as removed,
     /// a key that left `PendingDeletion` counts as a state change, and a key
     /// still pending is never expired by RustFS regardless of the deadline.
-    async fn remove_expired_key(&self, key_id: &str, _now: &Zoned) -> Result<ExpiredKeyRemoval> {
+    async fn remove_expired_key(&self, key_id: &str, _now: &ZonedDateTime) -> Result<ExpiredKeyRemoval> {
         match self.describe(key_id).await {
             Ok(metadata) => Ok(match metadata.key_state {
                 KeyState::PendingDeletion => ExpiredKeyRemoval::NotExpired,
@@ -1492,7 +1492,7 @@ mod tests {
         let (http_client, backend) = scripted_backend(vec![ok_event(key_metadata_json("test-key", "PendingDeletion"))]);
         assert_eq!(
             backend
-                .remove_expired_key("test-key", &Zoned::now())
+                .remove_expired_key("test-key", &ZonedDateTime::now())
                 .await
                 .expect("observation should succeed"),
             ExpiredKeyRemoval::NotExpired
@@ -1502,7 +1502,7 @@ mod tests {
         let (_http, backend) = scripted_backend(vec![error_event(400, "NotFoundException", "key does not exist")]);
         assert_eq!(
             backend
-                .remove_expired_key("test-key", &Zoned::now())
+                .remove_expired_key("test-key", &ZonedDateTime::now())
                 .await
                 .expect("a key AWS already removed is a completed removal"),
             ExpiredKeyRemoval::Removed
@@ -1511,7 +1511,7 @@ mod tests {
         let (_http, backend) = scripted_backend(vec![ok_event(key_metadata_json("test-key", "Enabled"))]);
         assert_eq!(
             backend
-                .remove_expired_key("test-key", &Zoned::now())
+                .remove_expired_key("test-key", &ZonedDateTime::now())
                 .await
                 .expect("observation should succeed"),
             ExpiredKeyRemoval::StateChanged

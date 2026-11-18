@@ -984,7 +984,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -2111,7 +2111,11 @@ impl DefaultObjectUsecase {
         if dsc.replicate_any() {
             opts.drop_lockless_cache_write();
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::ZonedDateTime::now().to_string(),
+            );
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_REPLICATION_STATUS,
@@ -4739,7 +4743,7 @@ mod tests {
         request
             .headers
             .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::access::ReqInfo {
+        request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });

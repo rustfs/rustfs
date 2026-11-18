@@ -21,7 +21,8 @@ use crate::app::object::post_body::{
     PostBodyIntegrity, VerifiedPostArchivePolicy, post_archive_admission_closed, stage_post_archive, stage_post_body,
 };
 use crate::app::object::post_headers::{
-    post_archive_checksum_headers, post_archive_content_md5, post_checksum_headers, post_metadata_headers,
+    install_post_archive_form_metadata, post_archive_checksum_headers, post_archive_content_md5, post_checksum_headers,
+    post_metadata_headers,
 };
 use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput};
 use crate::storage_api::server::http::access::access_owned::object_write::{
@@ -122,6 +123,7 @@ impl PostObjectHandler for GatewayBackend {
                 .map_err(|error| handler_error(error.into()))?;
             record_s3_op(S3Operation::PostObject);
 
+            install_post_archive_form_metadata(&mut envelope, &input.metadata).map_err(handler_error)?;
             let extract = crate::app::object::is_put_object_extract_requested(envelope.headers());
             let archive_open = extract && !post_archive_admission_closed();
             let checksum_headers = if archive_open {
