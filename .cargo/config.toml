@@ -31,3 +31,14 @@
 # the flag, so the two can no longer drift apart unnoticed.
 #
 # For CPU profiling, add `-C force-frame-pointers=yes` to that RUSTFLAGS value.
+
+# Exact internode HTTP/2 PING ACK timeout accounting is also deliberately
+# default-off. Hyper exposes the exact timeout only through its unstable tracing
+# event, so diagnostic builds must opt in to both the feature and cfg:
+#
+#     RUSTFLAGS="--cfg hyper_unstable_tracing" \
+#       cargo build -p rustfs --features diagnostic-internode-http2-ping
+#
+# `crates/protos/build.rs` and `crates/obs/build.rs` fail fast if the feature and
+# cfg drift apart. Do not move this cfg into global rustflags: doing so would
+# recompile every dependency under an unstable, non-semver build contract.

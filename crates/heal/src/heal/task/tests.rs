@@ -3227,11 +3227,41 @@ fn healthy_legacy_heal_item() -> HealResultItem {
     }];
     HealResultItem {
         legacy_identity_unverified: true,
+        resolved_version_id: Some([0; 16]),
+        disk_count: 1,
         detail: rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned(),
         before: Infos { drives: drives.clone() },
         after: Infos { drives },
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn mrf_legacy_repair_completes_unverified_without_second_deep() {
+    let mut item = healthy_legacy_heal_item();
+    item.before.drives[0].state = "missing".to_owned();
+    item.object_size = 8192;
+    let (task, storage) = mrf_task_for_item("legacy-repaired", item);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("physical repair cannot certify legacy identity");
+    assert!(matches!(error, Error::LegacyMrfUnverified { .. }), "{error:?}");
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.failed, 0);
+    assert!(matches!(outcome.objects[0].disposition, HealObjectDisposition::Unknown));
+    let items = task.get_seqed_result_items().await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1.drives_healed(), Some(1));
+    assert_eq!(items[0].1.object_size, 8192);
+    let opts = storage.object_heal_opts.lock().expect("physical repair options");
+    assert_eq!(opts.len(), 1, "the first completed repair must supply the terminal classification");
+    assert_eq!(opts[0].scan_mode, HealScanMode::Deep);
 }
 
 fn mrf_task_for_item(object: &str, item: HealResultItem) -> (HealTask, Arc<MockStorage>) {
@@ -3286,6 +3316,29 @@ async fn durable_mrf_unverified_object_names_cannot_change_retry_classification(
 }
 
 #[tokio::test]
+async fn mrf_legacy_verification_pending_is_a_completed_unverified_attempt() {
+    let (task, _) = mrf_task_for_item("legacy-pending", healthy_legacy_heal_item());
+    let error = task.execute().await.expect_err("unverified result must retain MRF ownership");
+    assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
+    assert!(!error.is_recoverable_heal());
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(outcome.counters.failed, 0);
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(matches!(outcome.objects[0].disposition, HealObjectDisposition::Unknown));
+    let (status, detail) = outcome.legacy_status("finished", None);
+    assert_eq!(status, "finished");
+    assert!(
+        detail
+            .expect("visible unverified result")
+            .contains("authoritative storage proof is unavailable")
+    );
+}
+
+#[tokio::test]
 async fn mrf_legacy_object_names_cannot_change_retry_classification() {
     for object in [
         "ordinary",
@@ -3304,7 +3357,9 @@ async fn mrf_legacy_object_names_cannot_change_retry_classification() {
         assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
         assert_eq!(
             error.to_string(),
-            format!("Heal task execution failed: Missing exact storage proof for durable MRF repair bucket-a/{object}")
+            format!(
+                "Independent verification unavailable for legacy object bucket-a/{object}; durable MRF responsibility retained"
+            )
         );
     }
 }
@@ -3318,11 +3373,18 @@ async fn mrf_legacy_pause_requires_storage_owned_healthy_deep_result() {
         "empty",
         "unhealthy",
         "unaligned",
+        "wrong_endpoint",
+        "wrong_disk_count",
+        "wrong_version",
+        "unknown_version",
+        "versioned",
+        "versioned_mismatch",
         "receipt",
         "storage_error",
         "dry_run",
     ] {
         let mut item = healthy_legacy_heal_item();
+        let requested_version = Uuid::new_v4();
         match case {
             "qualified" => item.detail = "updated diagnostic wording".to_owned(),
             "text_only" => item.legacy_identity_unverified = false,
@@ -3336,9 +3398,20 @@ async fn mrf_legacy_pause_requires_storage_owned_healthy_deep_result() {
                 item.after.drives[0].state = "missing".to_owned();
             }
             "unaligned" => item.before.drives.clear(),
+            "wrong_endpoint" => item.before.drives[0].endpoint = "another-disk".to_owned(),
+            "wrong_disk_count" => item.disk_count = 4,
+            "wrong_version" => item.resolved_version_id = Some(*Uuid::new_v4().as_bytes()),
+            "unknown_version" => item.resolved_version_id = None,
+            "versioned" => item.resolved_version_id = Some(*requested_version.as_bytes()),
+            "versioned_mismatch" => item.resolved_version_id = Some(*Uuid::new_v4().as_bytes()),
             _ => {}
         }
         let (mut task, storage) = mrf_task_for_item("object", item);
+        if matches!(case, "versioned" | "versioned_mismatch")
+            && let HealType::Object { version_id, .. } = &mut task.heal_type
+        {
+            *version_id = Some(requested_version.to_string());
+        }
         if case == "receipt" {
             storage.heal_object_receipts.lock().expect("receipt fixture").insert(
                 "object".to_owned(),
@@ -3358,15 +3431,21 @@ async fn mrf_legacy_pause_requires_storage_owned_healthy_deep_result() {
             .execute()
             .await
             .expect_err("legacy result cannot discharge a durable responsibility");
-        assert_eq!(matches!(error, Error::LegacyMrfUnverified { .. }), case == "qualified", "case={case}");
+        let qualifies = matches!(case, "qualified" | "repaired" | "versioned");
+        assert_eq!(matches!(error, Error::LegacyMrfUnverified { .. }), qualifies, "case={case}");
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.counters.healed, 0);
-        if case == "qualified" {
+        if qualifies {
+            assert_eq!(task.get_status().await, HealTaskStatus::Completed);
             assert_eq!(outcome.counters.unknown, 1);
-            assert_eq!(outcome.objects[0].detail.as_deref(), Some("updated diagnostic wording"));
+            if case == "qualified" {
+                assert_eq!(outcome.objects[0].detail.as_deref(), Some("updated diagnostic wording"));
+            }
             let opts = storage.object_heal_opts.lock().expect("storage options");
             assert_eq!(opts.len(), 1);
             assert_eq!(opts[0].scan_mode, HealScanMode::Deep);
+        } else {
+            assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }), "case={case}");
         }
     }
 }

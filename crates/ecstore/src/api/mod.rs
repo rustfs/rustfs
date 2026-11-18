@@ -66,6 +66,8 @@ pub mod bucket {
         }
 
         pub mod bucket_lifecycle_ops {
+            pub use rustfs_lifecycle::{RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging};
+
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
@@ -137,7 +139,7 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::lifecycle::{
                 Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
                 ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
-                object_opts_from_object_info,
+                format_lifecycle_date, object_opts_from_object_info, parse_lifecycle_date,
             };
         }
 
@@ -192,8 +194,8 @@ pub mod bucket {
             table_catalog_path_hash, unreadable_config_refusal,
         };
         pub use crate::bucket::metadata::{
-            BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, MAX_SWIFT_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE,
-            SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX, SWIFT_TAGGING_MARKER,
+            BUCKET_DURABILITY_CONFIG, BUCKET_ETAG_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, MAX_SWIFT_METADATA_COUNT,
+            MAX_SWIFT_METADATA_VALUE_SIZE, SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX, SWIFT_TAGGING_MARKER,
         };
         pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, is_swift_bucket_metadata_tag_key, validate_tag_set_entries};
     }
@@ -206,8 +208,19 @@ pub mod bucket {
 
     pub mod durability {
         pub use crate::bucket::durability::{
-            BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED, BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
+            BUCKET_DURABILITY_MODE_FILE_SYNC, BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED,
+            BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
         };
+    }
+
+    pub mod etag {
+        pub use crate::bucket::etag::{
+            BUCKET_ETAG_ALGORITHM_MD5, BUCKET_ETAG_ALGORITHM_XXH3, BucketEtagConfig, bucket_uses_xxh3_etag,
+        };
+    }
+
+    pub mod lockless_cache {
+        pub use crate::bucket::lockless_cache::is_lockless_cache_bucket;
     }
 
     pub mod metadata_sys {
@@ -218,7 +231,7 @@ pub mod bucket {
             acquire_scanner_bucket_incarnation_read_fence, capture_bucket_metadata_incarnation, delete, delete_if_incarnation,
             delete_if_incarnation_at, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
-            get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
+            get_etag_config, get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_s3_tagging_config, get_sse_config, get_tagging_config, get_versioning_config,
@@ -240,7 +253,7 @@ pub mod bucket {
     }
 
     pub mod object_lock {
-        pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+        pub use crate::bucket::object_lock::ObjectLockApi;
 
         pub mod types {
             pub use crate::bucket::object_lock::types::{
@@ -335,9 +348,9 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            check_bucket_and_object_names, check_list_objs_args, check_object_name_for_length_and_slash,
-            check_valid_bucket_name_strict, deserialize, has_bad_path_component, has_xml_invalid_control_characters,
-            is_meta_bucketname, is_valid_object_prefix, serialize,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
+            has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };
     }
 
@@ -364,7 +377,7 @@ pub mod capacity {
 }
 
 pub mod object_api_utils {
-    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
+    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader};
 }
 
 pub mod cluster {
@@ -380,7 +393,8 @@ pub mod cluster {
 
 pub mod compression {
     pub use crate::io_support::compress::{
-        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled, is_multipart_disk_compression_enabled,
+        DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES, MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled,
+        is_multipart_disk_compression_enabled,
     };
 }
 
@@ -490,7 +504,7 @@ pub mod disk {
         QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
-        validate_batch_read_version_item_count,
+        validate_batch_read_version_item_count, validate_format_control_path,
     };
     pub use crate::disk::{
         BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler,
@@ -553,6 +567,10 @@ pub mod runtime {
         global_lock_client, global_lock_clients, global_tier_config_mgr, local_disk_map_read, object_store_handle, region,
         rustfs_port, setup_is_dist_erasure, setup_is_erasure, setup_is_erasure_sd, transition_state_handle,
     };
+    pub use crate::runtime::usage_watch::{
+        SCANNER_USAGE_WATCH_COVERAGE_VERSION, SCANNER_USAGE_WATCH_LEASE_MS, ScannerUsageWatchKnown, ScannerUsageWatchObservation,
+        ScannerUsageWatchRequest,
+    };
 }
 
 pub mod layout {
@@ -592,9 +610,14 @@ pub mod integrity {
 }
 
 pub mod object {
+    pub use crate::erasure::codec::shard_buf::{
+        ArenaBlock, RegisteredSlabArena, ShardArena, ShardBuf, install_shard_arena, shard_arena,
+    };
+    pub use crate::erasure::codec::shard_emit::ShardEmitter;
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
         GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReadCondition, GetObjectReadMetadata, GetObjectReader,
+        GetObjectSink, GetObjectSinkSegmentFactory, GetObjectSinkSegments, GetObjectSinkStream, GetObjectSinkWriter,
         NamespaceLockFence, ObjectEncryptionResolver, ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions,
         PutObjReader, QuotaAdmission, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
@@ -630,31 +653,70 @@ pub mod rebalance {
 
 pub mod rio {
     pub use crate::io_support::rio::{
-        DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
-        boxed_reader, compression_metadata_value, validate_compression_scheme, wrap_reader,
+        DecryptReader, DynReader, EncryptReader, EtagAlgorithm, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption,
+        WritePlan, boxed_reader, compression_metadata_value, validate_compression_scheme, wrap_reader,
     };
 }
 
 pub mod rpc {
+    #[cfg(all(feature = "test-util", feature = "internode-transport"))]
+    pub mod test_util {
+        /// Build a remote disk using a controlled transport and no health monitor.
+        ///
+        /// # Errors
+        /// Returns the normal remote-disk construction error for the supplied endpoint.
+        pub async fn remote_disk_with_transport(
+            endpoint: &crate::layout::endpoint::Endpoint,
+            transport: std::sync::Arc<dyn super::InternodeDataTransport>,
+        ) -> crate::disk::error::Result<crate::disk::DiskStore> {
+            let options = crate::disk::DiskOption {
+                cleanup: false,
+                health_check: false,
+            };
+            let disk = crate::cluster::rpc::remote_disk::RemoteDisk::new(endpoint, &options, transport).await?;
+            Ok(std::sync::Arc::new(crate::disk::Disk::Remote(Box::new(disk))))
+        }
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub use crate::cluster::rpc::http_auth::ExternalStreamAuth;
     pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
+    #[cfg(feature = "internode-transport")]
+    pub use crate::cluster::rpc::internode_data_transport::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
+        ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
+    };
+    /// Internode shard reads over NIXL: the receive-pool seam the binary fills
+    /// and the wire names its serving handler shares with the transport.
+    pub mod nixl {
+        pub use crate::cluster::rpc::nixl_internode::{
+            NIXL_AGENT_QUERY, NIXL_BUFFER_QUERY, NIXL_BUFFERS_QUERY, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER,
+            NIXL_METADATA_SHA256_QUERY, NIXL_NONCE_QUERY, NixlRecvBuffer, NixlRecvPool, READ_FILE_NIXL_PATH,
+            WRITE_FILE_NIXL_PATH, install_nixl_recv_pool,
+        };
+    }
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
-        PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity,
-        ScannerPeerDirtyUsageBucket, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, ScannerScopedDirtyUsageAckEntry,
-        TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers,
-        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, rpc_background_admission,
-        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_ns_scanner_capability_with_checkpoint_coverage,
-        sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
-        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
-        verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
-        verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer, verify_put_file_capability,
-        verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,
-        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
+        PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, RpcReplayCacheAdmissionError, S3PeerSys,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerDirtyUsageAcknowledgement,
+        ScannerPeerActivity, ScannerPeerDirtyUsageBucket, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease,
+        ScannerScopedDirtyUsageAckEntry, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
+        check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        rpc_auth_is_resource_exhausted, rpc_background_admission, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
+        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_durable_progress,
+        sign_ns_scanner_capability_with_tier_registry_generation, sign_ns_scanner_capability_with_usage_capabilities,
+        sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_boot_epoch_response_headers_with_msgpack_capability,
+        tonic_msgpack_manifest_capability_requested, tonic_rpc_auth_failure_reason, verify_ns_scanner_capability,
+        verify_ns_scanner_capability_with_checkpoint_coverage, verify_ns_scanner_capability_with_durable_progress,
+        verify_ns_scanner_capability_with_tier_registry_generation, verify_ns_scanner_capability_with_usage_capabilities,
+        verify_ns_scanner_usage_watch_capability, verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature,
+        verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+        verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 
@@ -697,6 +759,8 @@ pub mod store_list {
 pub mod storage {
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
+    #[cfg(feature = "internode-transport")]
+    pub use crate::store::external_rpc_disk;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
         all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,

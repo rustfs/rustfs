@@ -306,6 +306,7 @@ pub(in crate::set_disk) struct CleanupSourceMetadata {
     pub metadata: Vec<rustfs_filemeta::FileInfo>,
     pub errors: Vec<Option<DiskError>>,
     pub certified_original: Option<rustfs_filemeta::FileInfo>,
+    pub inspection_error: Option<DiskError>,
 }
 
 /// A successful close is useful only to the guarded cleanup caller. Its owned
@@ -478,6 +479,10 @@ pub(in crate::set_disk) async fn cleanup_source_metadata(
     bind_multipart_proof_snapshot(disks, authority)?;
     let ids = disk_ids(disks).await;
     let inspections = cleanup_inspections(disks, path, None).await;
+    let inspection_error = inspections.iter().find_map(|inspection| match inspection {
+        Err(DiskError::UnsupportedDisk) | Ok(_) => None,
+        Err(error) => Some(error.clone()),
+    });
     if metadata.len() != disks.len() || errors.len() != disks.len() {
         return Err(DiskError::FileCorrupt);
     }
@@ -519,6 +524,7 @@ pub(in crate::set_disk) async fn cleanup_source_metadata(
             metadata,
             errors,
             certified_original: None,
+            inspection_error,
         });
     }
     for (slot, original) in originals.iter_mut().enumerate() {
@@ -564,6 +570,7 @@ pub(in crate::set_disk) async fn cleanup_source_metadata(
         metadata,
         errors,
         certified_original,
+        inspection_error,
     })
 }
 

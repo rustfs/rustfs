@@ -183,6 +183,40 @@ if os.environ.get("FAKE_BUILD_MUTATE"):
         result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=self.root, env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_nightly_workflow_builds_and_runs_matching_stack_features(self):
+        import re
+        import yaml
+
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/e2e-replication-nightly.yml"
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        for job_name, legacy_features in (("repl-nightly", set()), ("protocols-nightly", {"ftps", "webdav", "sftp"})):
+            job = jobs[job_name]
+            self.assertEqual(set(job["strategy"]["matrix"]["stack"]), {"legacy", "gateway"})
+            steps = {step["name"]: step for step in job["steps"]}
+            build = next(step for name, step in steps.items() if name.startswith("Build "))
+            run = next(step for name, step in steps.items() if name.startswith("Run "))
+            for stack in job["strategy"]["matrix"]["stack"]:
+                with self.subTest(job=job_name, stack=stack):
+                    features = job["env"].get("RUSTFS_BUILD_FEATURES", "")
+                    if features.startswith("${{"):
+                        expression = re.fullmatch(r"\$\{\{ matrix.stack == 'gateway' && '([^']*)' \|\| '([^']*)' \}\}", features)
+                        self.assertIsNotNone(expression, features)
+                        features = expression[1 if stack == "gateway" else 2]
+                    expected = legacy_features | ({"gateway-stack"} if stack == "gateway" else set())
+                    env = dict(self.env, RUSTFS_BUILD_FEATURES=features, RUSTFS_S3_STACK=stack,
+                               RUSTFS_E2E_LOG_DIR=str(self.root / "target/logs"))
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", build["run"]], cwd=self.root, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    manifest = json.loads(self.sidecar.read_text())
+                    self.assertEqual(set(manifest["requested_features"]), expected)
+                    self.assertEqual(set(manifest["features"]), expected | {"default", "ftps", "webdav"})
+                    for status in (0, 23):
+                        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", run["run"]], cwd=self.root, env=dict(env, FAKE_TEST_EXIT=str(status)), capture_output=True, text=True)
+                        self.assertEqual(result.returncode, status, result.stderr)
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", run["run"]], cwd=self.root, env=dict(env, RUSTFS_BUILD_FEATURES=features + ",unexpected-feature"), capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("build features/profile differ", result.stdout + result.stderr)
+
     def test_distributed_workflow_runs_both_filter_branches_with_receipts(self):
         from check_test_wiring import yaml_block
         from test_security_workflow import named_steps, shell_body

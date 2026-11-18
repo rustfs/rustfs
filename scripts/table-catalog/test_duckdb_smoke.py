@@ -201,7 +201,7 @@ class DuckDBSmokeTest(unittest.TestCase):
             row_count=2,
             cleanup_result="dropped-tables-and-namespace",
             checks={"canonical_rest_catalog": "pass"},
-            catalog_backing="durable-strong",
+            catalog_backing="object",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "evidence.json"
@@ -213,7 +213,7 @@ class DuckDBSmokeTest(unittest.TestCase):
         evidence = document["live_conformance_evidence"]
         self.assertEqual(evidence["client_name"], "DuckDB Iceberg")
         self.assertEqual(evidence["claim"], "automated-rest-catalog-smoke")
-        self.assertEqual(evidence["catalog_backing"], "durable-strong")
+        self.assertEqual(evidence["catalog_backing"], "object")
         self.assertIn("--secret-key '<redacted>'", evidence["command"])
         self.assertNotIn("--secret-key secret", evidence["command"])
         self.assertEqual(document["validation"]["status"], "accepted")

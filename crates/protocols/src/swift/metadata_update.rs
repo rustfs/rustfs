@@ -31,7 +31,7 @@
 
 use super::{MAX_METADATA_COUNT, MAX_METADATA_VALUE_SIZE, SwiftError, SwiftResult};
 use axum::http::HeaderMap;
-use s3s::dto::{Tag, Tagging};
+use rustfs_gateway_types::cors_tagging::{PersistedTag as Tag, PersistedTagging as Tagging};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Request header prefix carrying an account metadata item.

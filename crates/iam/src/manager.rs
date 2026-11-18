@@ -866,6 +866,74 @@ where
         }
 
         let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
+        self.save_new_service_account_locked(cred, updated_at).await
+    }
+
+    /// Order a cross-user issue with changes to either identity. Parent locks
+    /// are acquired by name, then the service-account lock, then the caller's
+    /// STS lock, matching user updates. Hold them through durable publication.
+    pub(crate) async fn add_delegated_service_account(&self, cred: &Credentials, caller: &Credentials) -> Result<OffsetDateTime> {
+        use subtle::ConstantTimeEq;
+
+        let target = cred.parent_user.as_str();
+        let principal = if caller.parent_user.is_empty() {
+            caller.access_key.as_str()
+        } else {
+            caller.parent_user.as_str()
+        };
+        if target == principal || target == caller.access_key || crate::is_root_access_key(target) {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        let mut parents = [principal, target];
+        parents.sort_unstable();
+        let _first = self.cache.parent_mutation_lock(parents[0]).lock_owned().await;
+        let _second = self.cache.parent_mutation_lock(parents[1]).lock_owned().await;
+        let _service = self.cache.service_account_mutation_lock().lock().await;
+        let _session = if !caller.session_token.is_empty() && !caller.is_service_account() {
+            Some(self.cache.sts_account_mutation_lock(&caller.access_key).lock_owned().await)
+        } else {
+            None
+        };
+
+        let active_local_user = |user: &UserIdentity| {
+            user.credentials.is_valid() && user.credentials.parent_user.is_empty() && user.credentials.session_token.is_empty()
+        };
+        let snapshot = self.cache.snapshot();
+        if !snapshot.users.get(target).is_some_and(active_local_user) {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        let root = crate::root_credentials::credentials().ok_or(Error::IAMActionNotAllowed)?;
+        let current = if caller.access_key == root.access_key {
+            &root
+        } else {
+            &snapshot
+                .users
+                .get(&caller.access_key)
+                .or_else(|| snapshot.sts_accounts.get(&caller.access_key))
+                .ok_or(Error::IAMActionNotAllowed)?
+                .credentials
+        };
+        if !current.is_valid()
+            || current.parent_user != caller.parent_user
+            || !bool::from(current.secret_key.as_bytes().ct_eq(caller.secret_key.as_bytes()))
+            || !bool::from(current.session_token.as_bytes().ct_eq(caller.session_token.as_bytes()))
+        {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        if !caller.parent_user.is_empty()
+            && principal != root.access_key
+            && !crate::sys::is_rustfs_oidc_claims(caller.claims_or_empty())
+            && !snapshot.users.get(principal).is_some_and(active_local_user)
+        {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        drop(snapshot);
+        self.save_new_service_account_locked(cred.clone(), OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// The caller holds the service-account mutation lock through cache publication.
+    async fn save_new_service_account_locked(&self, cred: Credentials, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         let cache = self.cache.snapshot();
         if cache.users.contains_key(&cred.access_key) || cache.sts_accounts.contains_key(&cred.access_key) {
             return Err(Error::AccessKeyAlreadyExists);
@@ -1522,6 +1590,20 @@ where
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
+        // A virtual OIDC parent is a canonical base64url-encoded SHA-256 digest.
+        // It has no stored user record to collide with in the checks below.
+        if access_key.len() == 43
+            && base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(access_key.as_bytes())
+                .is_ok_and(|bytes| bytes.len() == 32)
+        {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
+        // The access key is a single durable IAM path component. Reject
+        // unrepresentable keys before allocating or waiting on mutation locks.
+        if access_key.contains(['\0', '/', '\\']) || matches!(access_key, "" | "." | "..") {
+            return Err(Error::InvalidArgument);
+        }
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let parent_guard = parent_lock.lock_owned().await;
         let _service_guard = self.cache.service_account_mutation_lock().lock().await;

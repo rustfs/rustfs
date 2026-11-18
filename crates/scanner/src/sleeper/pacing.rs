@@ -43,6 +43,8 @@ pub(crate) struct PacingDebt {
     pub(crate) charged_objects: u64,
     #[cfg(test)]
     pub(crate) batches: u64,
+    #[cfg(test)]
+    pub(crate) charged_delay: Duration,
 }
 
 impl PacingDebt {
@@ -73,6 +75,7 @@ impl PacingDebt {
         #[cfg(test)]
         {
             self.charged_objects += 1;
+            self.charged_delay = self.charged_delay.saturating_add(delay);
         }
     }
 
@@ -132,7 +135,7 @@ impl DynamicSleeper {
         if let Some(elapsed) = elapsed {
             debt.charge(proportional_delay(elapsed, config), Instant::now());
         }
-        let foreground = foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
+        let foreground = self.foreground_backoff();
         let now = Instant::now();
         let folder_reaches_deadline = folder
             && debt.started.is_some_and(|start| {

@@ -68,11 +68,14 @@ env:
 
 jobs:
   minio-source:
-    name: MinIO source (read-through, list-through, backfill)
+    name: MinIO source (read-through, list-through, backfill, ${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
     # Keep this scheduled interoperability lane scoped to the upstream repo.
     if: github.repository == 'rustfs/rustfs'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The gateway leg is report-only until T2.10.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       NO_PROXY: 127.0.0.1,localhost
       # Fixed credentials of the container this job starts and throws away;
@@ -137,6 +140,11 @@ jobs:
       - name: Build the RustFS binary under test
         run: python3 scripts/e2e_binary.py build --bins
 
+      # A gateway binary that refuses to start skips the suite; the summary says why.
+      - name: Gateway preflight
+        if: matrix.stack == 'gateway'
+        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/leg/stack.json"
+
       # The lane selects tests by module, so a rename would quietly shrink it.
       # The committed digest in .config/e2e-odm-interop-selection.txt fails
       # closed on that.
@@ -146,7 +154,18 @@ jobs:
           python3 ./scripts/check_test_wiring.py --check-profile e2e-odm-interop "${NEXTEST_LISTING}"
 
       - name: Run the interop cases against MinIO
+        env:
+          RUSTFS_S3_STACK: ${{ matrix.stack }}
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-logs
         run: python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-odm-interop -p e2e_test --no-tests=fail
+
+      - name: Prove the stack and upload the leg
+        if: always()
+        uses: ./.github/actions/dual-stack-leg
+        with:
+          profile: e2e-odm-interop
+          stack: ${{ matrix.stack }}
+          logs: ${{ runner.temp }}/rustfs-e2e-logs
 
       - name: Build the MinIO interop report
         if: always()
@@ -171,7 +190,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: odm-interop-minio-${{ github.run_number }}-${{ github.run_attempt }}
+          name: odm-interop-minio-${{ github.run_number }}-${{ github.run_attempt }}-${{ matrix.stack }}
           path: |
             artifacts/odm-interop/minio
             target/nextest/e2e-odm-interop/junit.xml
@@ -296,6 +315,20 @@ jobs:
             artifacts/odm-interop/${{ matrix.provider }}
             target/nextest/e2e-odm-interop/junit.xml
           retention-days: 14
+
+  dual-stack-summary:
+    name: Both-stack diff summary
+    needs: [minio-source]
+    if: github.repository == 'rustfs/rustfs' && always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dual-stack-summary
+        with:
+          profiles: e2e-odm-interop
 
   alert-on-failure:
     name: Alert on scheduled failure

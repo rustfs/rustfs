@@ -68,10 +68,10 @@ def production_failure_matrix() -> list[dict[str, str]]:
             "external catalog sync must not advance pointer/token/generation on UUID mismatch or stale external metadata token",
         ),
         failure_case(
-            "backing-migration-blocked",
+            "backup-restore-blocked",
             "diagnostics-probe-required",
-            "blocked-until-recovery-and-replay-are-clean",
-            "catalog export and diagnostics must expose WAL/recovery blockers before any strong backing cutover",
+            "blocked-until-recovery-and-restore-are-clean",
+            "catalog export and diagnostics must expose recovery blockers before object backup or restore",
         ),
     ]
 
@@ -225,16 +225,16 @@ def disaster_recovery_rehearsal_plan(
         "mode": "manual-or-ci-optional",
         "ci_gate": "RUSTFS_TABLE_CATALOG_DR_REHEARSAL=1",
         "preconditions": [
-            "record the RustFS build and catalog backing mode before starting",
+            "record the RustFS build, object catalog mode, node count, and object backend before starting",
             "run against a disposable table or a backed-up table warehouse",
             "capture the current metadata location and version token from loadTable",
-            "keep object-backed catalog state available until durable backing cutover is accepted",
+            "keep the object catalog and referenced Iceberg objects available until restore validation is complete",
         ],
         "expected_invariants": [
             "current metadata pointer remains recoverable or deliberately rolled back",
             "recovery repair does not move the table pointer",
             "rollback/import actions require explicit operator-selected metadata locations",
-            "durable backing cutover remains blocked while migration blockers are present",
+            "object backup and restore remain blocked while recovery blockers or changed references are present",
             "post-recovery loadTable and table data-plane policy checks still succeed",
         ],
         "phases": [
@@ -319,22 +319,23 @@ def disaster_recovery_rehearsal_plan(
                 ],
             ),
             rehearsal_phase(
-                "migration-preflight",
-                "Verify durable backing cutover remains explainable and fail-closed.",
+                "backup-restore-preflight",
+                "Verify object catalog backup and restore remain explainable and fail-closed.",
                 [
                     probe_step(
-                        "durable-backing-migration-dry-run",
-                        "GET",
-                        warehouse_path(warehouse, "/catalog/migration", rest_path),
+                        "object-catalog-backup",
+                        "POST",
+                        warehouse_path(warehouse, "/catalog/backup", rest_path),
                         "200",
-                        "migration blockers must be empty and status must be READY_TO_SNAPSHOT before state transfer",
+                        "backup records the current pointer, recovery state, and complete referenced Iceberg object graph",
                     ),
                     probe_step(
-                        "durable-backing-migration-materialize",
+                        "object-catalog-restore",
                         "POST",
-                        warehouse_path(warehouse, "/catalog/migration", rest_path),
-                        "200",
-                        "source writes are fenced and the durable strong snapshot is materialized before cutover",
+                        warehouse_path(warehouse, "/catalog/restore", rest_path),
+                        "200-or-409",
+                        "restore validates the target and publishes through object-backed CAS or returns a retryable conflict",
+                        {"backup-id": "recorded-backup-id", "allow-replace": False},
                     ),
                 ],
             ),
@@ -379,7 +380,7 @@ def scale_fault_rehearsal_plan(
     writer_count: int = 8,
     maintenance_worker_count: int = 2,
     iteration_count: int = 50,
-    catalog_backing: str = "object-backed-or-durable-strong",
+    catalog_backing: str = "object",
 ) -> dict[str, Any]:
     table_endpoint = table_path(warehouse, namespace, table, rest_path=rest_path)
     table_warehouse_location = table_warehouse_location or f"s3://{warehouse}/tables/table-id"
@@ -394,7 +395,7 @@ def scale_fault_rehearsal_plan(
         },
         "preconditions": [
             "run against a disposable table or a table restored from backup",
-            "record the RustFS build, catalog backing mode, node count, and object backend before starting",
+            "record the RustFS build, object catalog mode, node count, and object backend before starting",
             "capture baseline loadTable metadata location, version token, generation, and warehouse prefix",
             "enable only opt-in clients and workers for this rehearsal run",
         ],
@@ -403,8 +404,8 @@ def scale_fault_rehearsal_plan(
             "each conflicting writer cohort has one winner and retryable conflicts for stale writers",
             "maintenance jobs never delete reachable table objects",
             "scheduler and worker leases recover without duplicate active jobs for the same table",
-            "durable backing migration stays blocked while recovery or replay blockers exist",
-            "rollback/import under load either commits a validated metadata location or conflicts without pointer movement",
+            "object backup and restore stay blocked while recovery or replay blockers exist",
+            "backup/restore under load either commits a validated metadata location or conflicts without pointer movement",
         ],
         "phases": [
             rehearsal_phase(
@@ -486,29 +487,31 @@ def scale_fault_rehearsal_plan(
                 ],
             ),
             rehearsal_phase(
-                "durable-backing-cutover-under-load",
-                "Verify durable backing cutover preflight remains explainable under recent write and maintenance churn.",
+                "object-backup-restore-under-load",
+                "Verify object catalog backup and restore remain explainable under recent write and maintenance churn.",
                 [
                     probe_step(
-                        "capture-cutover-backup",
-                        "OPERATOR",
-                        table_path(warehouse, namespace, table, "/catalog/export", rest_path),
-                        "catalog-backup-recorded",
-                        "record catalog-backup artifacts, current metadata location, idempotency indexes, and rollback mode before cutover",
-                    ),
-                    probe_step(
-                        "migration-dry-run-before-cutover",
-                        "GET",
-                        warehouse_path(warehouse, "/catalog/migration", rest_path),
-                        "200",
-                        "migration dry-run reports inventory, replay blockers, idempotency blockers, and recommended actions",
-                    ),
-                    probe_step(
-                        "materialize-durable-backing-before-cutover",
+                        "capture-object-catalog-backup",
                         "POST",
-                        warehouse_path(warehouse, "/catalog/migration", rest_path),
+                        warehouse_path(warehouse, "/catalog/backup", rest_path),
                         "200",
-                        "materialization drains in-flight writes and reports SNAPSHOT_MATERIALIZED before backing restart",
+                        "record the backup artifact, current metadata location, commit recovery state, and referenced Iceberg object watermarks",
+                    ),
+                    probe_step(
+                        "restore-object-catalog-backup",
+                        "POST",
+                        warehouse_path(warehouse, "/catalog/restore", rest_path),
+                        "200-or-409",
+                        "restore validates the target pointer, UUID, generation, and complete manifest/data/delete graph before publication",
+                        {"backup-id": "recorded-backup-id", "allow-replace": False},
+                    ),
+                    probe_step(
+                        "retry-object-catalog-restore",
+                        "POST",
+                        warehouse_path(warehouse, "/catalog/restore", rest_path),
+                        "200-or-409",
+                        "repeating the same restore after an interruption returns the committed result or a safe retryable conflict",
+                        {"backup-id": "recorded-backup-id", "allow-replace": False},
                     ),
                 ],
             ),
@@ -575,7 +578,7 @@ def scale_fault_rehearsal_plan(
                         "EVIDENCE",
                         "operator-recorded-artifacts",
                         "recorded",
-                        "record RustFS build, catalog backing, writer count, worker count, iteration count, final metadata location, observed conflicts, recovered leases, and failed-closed operations",
+                        "record RustFS build, object catalog mode, writer count, worker count, iteration count, final metadata location, observed conflicts, recovered leases, and failed-closed operations",
                     ),
                 ],
             ),
@@ -593,7 +596,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--writer-count", type=positive_int, default=8)
     parser.add_argument("--maintenance-worker-count", type=positive_int, default=2)
     parser.add_argument("--iteration-count", type=positive_int, default=50)
-    parser.add_argument("--catalog-backing", default="object-backed-or-durable-strong")
+    parser.add_argument("--catalog-backing", default="object")
     parser.add_argument("--print-failure-matrix", action="store_true")
     parser.add_argument("--print-failure-probes", action="store_true")
     parser.add_argument("--print-disaster-recovery-rehearsal", action="store_true")

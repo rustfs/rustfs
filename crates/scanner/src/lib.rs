@@ -63,6 +63,8 @@ pub mod data_usage_define;
 pub mod e2e_barrier;
 pub mod error;
 mod heal_completion;
+mod lifecycle_cache;
+mod object_lock_cache;
 pub mod prefix_usage;
 pub mod raw_page_index;
 mod remote_scanner;
@@ -362,19 +364,19 @@ pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<Disk
 
 pub(crate) async fn get_lifecycle_config(
     bucket: &str,
-) -> EcstoreResult<(s3s::dto::BucketLifecycleConfiguration, time::OffsetDateTime)> {
+) -> EcstoreResult<(rustfs_gateway_types::persistence::PersistedLifecycleConfiguration, time::OffsetDateTime)> {
     ecstore_get_lifecycle_config(bucket).await
 }
 
 pub(crate) async fn get_object_lock_config(
     bucket: &str,
-) -> EcstoreResult<(s3s::dto::ObjectLockConfiguration, time::OffsetDateTime)> {
+) -> EcstoreResult<(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration, time::OffsetDateTime)> {
     ecstore_get_object_lock_config(bucket).await
 }
 
 pub(crate) async fn get_replication_config(
     bucket: &str,
-) -> EcstoreResult<(s3s::dto::ReplicationConfiguration, time::OffsetDateTime)> {
+) -> EcstoreResult<(rustfs_gateway_types::persistence::PersistedReplicationConfiguration, time::OffsetDateTime)> {
     ecstore_get_replication_config(bucket).await
 }
 
@@ -382,9 +384,9 @@ pub(crate) trait ScannerLifecycleConfigExt {
     fn has_active_rules(&self, prefix: &str) -> bool;
 }
 
-impl ScannerLifecycleConfigExt for s3s::dto::BucketLifecycleConfiguration {
+impl ScannerLifecycleConfigExt for rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
     fn has_active_rules(&self, prefix: &str) -> bool {
-        <s3s::dto::BucketLifecycleConfiguration as EcstoreLifecycle>::has_active_rules(self, prefix)
+        <rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as EcstoreLifecycle>::has_active_rules(self, prefix)
     }
 }
 
@@ -392,9 +394,9 @@ pub(crate) trait ScannerReplicationConfigExt {
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
 }
 
-impl ScannerReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+impl ScannerReplicationConfigExt for rustfs_gateway_types::persistence::PersistedReplicationConfiguration {
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
-        <s3s::dto::ReplicationConfiguration as EcstoreReplicationConfigurationExt>::has_active_rules(self, prefix, recursive)
+        <rustfs_gateway_types::persistence::PersistedReplicationConfiguration as EcstoreReplicationConfigurationExt>::has_active_rules(self, prefix, recursive)
     }
 }
 
@@ -403,13 +405,15 @@ pub(crate) trait ScannerVersioningConfigExt {
     fn versioned(&self, prefix: &str) -> bool;
 }
 
-impl ScannerVersioningConfigExt for s3s::dto::VersioningConfiguration {
+impl ScannerVersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
     fn prefix_enabled(&self, prefix: &str) -> bool {
-        <s3s::dto::VersioningConfiguration as EcstoreVersioningApi>::prefix_enabled(self, prefix)
+        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as EcstoreVersioningApi>::prefix_enabled(
+            self, prefix,
+        )
     }
 
     fn versioned(&self, prefix: &str) -> bool {
-        <s3s::dto::VersioningConfiguration as EcstoreVersioningApi>::versioned(self, prefix)
+        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as EcstoreVersioningApi>::versioned(self, prefix)
     }
 }
 
@@ -471,7 +475,6 @@ pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
 /// How long the scanner caches the runtime tier-name list before re-reading
 /// the tier configuration manager.
 const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
-const MAX_TIER_REGISTRY_NAME_BYTES: usize = 256;
 
 /// Process-wide TTL cache of runtime tier names.
 ///
@@ -560,16 +563,10 @@ fn next_tier_registry_generation() -> u64 {
 }
 
 fn validate_tier_registry_names(mut names: Vec<String>) -> Result<Arc<[String]>, ()> {
-    if names.iter().any(|name| {
-        name.is_empty()
-            || name.len() > MAX_TIER_REGISTRY_NAME_BYTES
-            || name.bytes().any(|byte| byte.is_ascii_control())
-            || name == UNKNOWN_TIER
-            || name == storageclass::STANDARD
-            || name == storageclass::RRS
-    }) {
-        return Err(());
-    }
+    // Quarantine individual invalid names from older persisted configurations.
+    names.retain(|name| {
+        rustfs_data_usage::is_scannable_tier_name(name) && name != storageclass::STANDARD && name != storageclass::RRS
+    });
     names.sort_unstable();
     if names.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(());
@@ -1240,9 +1237,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tier_registry_names_fail_closed_for_refresh() {
-        assert!(validate_tier_registry_names(vec!["COLD\n".to_string()]).is_err());
-        assert!(validate_tier_registry_names(vec![UNKNOWN_TIER.to_string()]).is_err());
+    fn tier_registry_keeps_usable_names_on_refresh() {
+        assert_eq!(
+            validate_tier_registry_names(vec!["COLD\n".into(), UNKNOWN_TIER.into(), "WARM".into()])
+                .expect("valid subset")
+                .as_ref(),
+            &["WARM"]
+        );
         assert!(validate_tier_registry_names(vec!["COLD".to_string(), "COLD".to_string()]).is_err());
         assert_eq!(
             validate_tier_registry_names(vec!["WARM".to_string(), "COLD".to_string()])

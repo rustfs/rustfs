@@ -26,7 +26,6 @@ use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
 use super::utils::{HostAddrError, sign_v4_trim_all, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
-use s3s::Body;
 
 const SIGNING_KEY_CACHE_CAPACITY: usize = 1024;
 type SigningKeyCacheKey = ([u8; 32], String, String, String);
@@ -62,12 +61,12 @@ pub enum SignV4Error {
 pub type SignResult<T> = std::result::Result<T, SignV4Error>;
 
 #[derive(Debug)]
-struct SignFailure {
-    request: request::Request<Body>,
+struct SignFailure<B> {
+    request: request::Request<B>,
     error: SignV4Error,
 }
 
-type SignOutcome = std::result::Result<request::Request<Body>, Box<SignFailure>>;
+type SignOutcome<B> = std::result::Result<request::Request<B>, Box<SignFailure<B>>>;
 
 static V4_IGNORED_HEADERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     let mut s = HashSet::new();
@@ -77,7 +76,7 @@ static V4_IGNORED_HEADERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s
 });
 
-fn fail(request: request::Request<Body>, error: SignV4Error) -> SignOutcome {
+fn fail<B>(request: request::Request<B>, error: SignV4Error) -> SignOutcome<B> {
     Err(Box::new(SignFailure { request, error }))
 }
 
@@ -154,7 +153,7 @@ fn get_credential(access_key_id: &str, location: &str, t: OffsetDateTime, servic
     s
 }
 
-fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
+fn try_get_hashed_payload<B>(req: &request::Request<B>) -> SignResult<String> {
     let headers = req.headers();
     let mut hashed_payload = "";
     if let Some(payload) = headers.get("X-Amz-Content-Sha256") {
@@ -170,7 +169,7 @@ fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
 
 /// The headers signed here carry credential material (`x-amz-security-token`, SSE-C keys),
 /// so neither the names nor the values may be written to any log sink.
-fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> SignResult<String> {
+fn try_get_canonical_headers<B>(req: &request::Request<B>, ignored_headers: &HashSet<&'static str>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
     for k in req.headers().keys() {
@@ -245,7 +244,7 @@ fn header_exists(key: &str, headers: &[String]) -> bool {
     false
 }
 
-fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> String {
+fn get_signed_headers<B>(req: &request::Request<B>, ignored_headers: &HashSet<&'static str>) -> String {
     let mut headers = Vec::<String>::new();
     let headers_ref = req.headers();
     for (k, _) in headers_ref {
@@ -261,8 +260,8 @@ fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'
     headers.join(";")
 }
 
-fn try_get_canonical_request(
-    req: &request::Request<Body>,
+fn try_get_canonical_request<B>(
+    req: &request::Request<B>,
     ignored_headers: &HashSet<&'static str>,
     hashed_payload: &str,
 ) -> SignResult<String> {
@@ -327,15 +326,15 @@ fn try_get_string_to_sign_v4(
     Ok(string_to_sign)
 }
 
-fn pre_sign_v4_inner(
-    req: request::Request<Body>,
+fn pre_sign_v4_inner<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     expires: i64,
     t: OffsetDateTime,
-) -> SignOutcome {
+) -> SignOutcome<B> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return Ok(req);
     }
@@ -425,27 +424,27 @@ fn pre_sign_v4_inner(
     Ok(req)
 }
 
-pub fn try_pre_sign_v4(
-    req: request::Request<Body>,
+pub fn try_pre_sign_v4<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     expires: i64,
     t: OffsetDateTime,
-) -> SignResult<request::Request<Body>> {
+) -> SignResult<request::Request<B>> {
     pre_sign_v4_inner(req, access_key_id, secret_access_key, session_token, location, expires, t).map_err(|f| f.error)
 }
 
-pub fn pre_sign_v4(
-    req: request::Request<Body>,
+pub fn pre_sign_v4<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     expires: i64,
     t: OffsetDateTime,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match pre_sign_v4_inner(req, access_key_id, secret_access_key, session_token, location, expires, t) {
         Ok(request) => request,
         Err(failure) => {
@@ -461,12 +460,12 @@ fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_ac
     get_signature(signing_key, policy_base64)
 }
 
-fn _sign_v4_sts(
-    req: request::Request<Body>,
+fn _sign_v4_sts<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     location: &str,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new()) {
         Ok(request) => request,
         Err(failure) => {
@@ -477,8 +476,8 @@ fn _sign_v4_sts(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sign_v4_inner(
-    mut req: request::Request<Body>,
+fn sign_v4_inner<B>(
+    mut req: request::Request<B>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
@@ -486,7 +485,7 @@ fn sign_v4_inner(
     location: &str,
     service_type: &str,
     trailer: HeaderMap,
-) -> SignOutcome {
+) -> SignOutcome<B> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return Ok(req);
     }
@@ -632,14 +631,14 @@ fn sign_v4_inner(
     Ok(req)
 }
 
-pub fn sign_v4(
-    req: request::Request<Body>,
+pub fn sign_v4<B>(
+    req: request::Request<B>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match sign_v4_inner(
         req,
         content_len,
@@ -658,14 +657,14 @@ pub fn sign_v4(
     }
 }
 
-pub fn try_sign_v4(
-    req: request::Request<Body>,
+pub fn try_sign_v4<B>(
+    req: request::Request<B>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
-) -> SignResult<request::Request<Body>> {
+) -> SignResult<request::Request<B>> {
     sign_v4_inner(
         req,
         content_len,
@@ -687,19 +686,19 @@ pub fn try_sign_v4_headers(
     session_token: &str,
     location: &str,
 ) -> SignResult<HeaderMap> {
-    let request = request::Request::from_parts(parts, Body::empty());
+    let request = request::Request::from_parts(parts, ());
     try_sign_v4(request, content_len, access_key_id, secret_access_key, session_token, location)
         .map(|request| request.into_parts().0.headers)
 }
 
-pub fn sign_v4_trailer(
-    req: request::Request<Body>,
+pub fn sign_v4_trailer<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     trailer: HeaderMap,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match sign_v4_inner(
         req,
         0,
@@ -718,14 +717,14 @@ pub fn sign_v4_trailer(
     }
 }
 
-pub fn try_sign_v4_trailer(
-    req: request::Request<Body>,
+pub fn try_sign_v4_trailer<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     trailer: HeaderMap,
-) -> SignResult<request::Request<Body>> {
+) -> SignResult<request::Request<B>> {
     sign_v4_inner(
         req,
         0,
@@ -744,6 +743,7 @@ pub fn try_sign_v4_trailer(
 mod tests {
     use http::HeaderValue;
     use http::request;
+    use rustfs_s3_types::Body;
     use time::macros::datetime;
 
     use super::*;
@@ -1346,5 +1346,57 @@ mod tests {
         let output = logs.output();
         assert!(!output.contains(MARKER), "signed header value leaked into logs: {output}");
         assert!(!output.contains("x-amz-security-token"), "signed header name leaked into logs: {output}");
+    }
+
+    fn collect_in_memory_body(body: Body) -> Vec<u8> {
+        use http_body::Body as _;
+        let mut body = std::pin::pin!(body);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut bytes = Vec::new();
+        loop {
+            match body.as_mut().poll_frame(&mut cx) {
+                std::task::Poll::Ready(None) => return bytes,
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        bytes.extend_from_slice(&data);
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(err))) => panic!("an in-memory body cannot fail: {err}"),
+                std::task::Poll::Pending => panic!("an in-memory body is always ready"),
+            }
+        }
+    }
+
+    /// The known-answer tests above commit to the empty payload through the
+    /// `x-amz-content-sha256` header alone, because signing never reads the
+    /// body. This pins the other half of that contract: the signed request still
+    /// carries the body it was given, and an empty body hashes to exactly the
+    /// digest the signature commits to, so the wire cannot disagree with it.
+    #[test]
+    fn sign_v4_keeps_an_empty_body_that_matches_the_signed_empty_payload_hash() {
+        let req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/test.txt")
+            .header("host", "examplebucket.s3.amazonaws.com")
+            .header("x-amz-content-sha256", rustfs_utils::hash::EMPTY_STRING_SHA256_HASH)
+            .body(Body::empty())
+            .expect("request should build");
+
+        let signed = sign_v4(
+            req,
+            0,
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "",
+            "us-east-1",
+        );
+
+        let committed = signed.headers()["x-amz-content-sha256"]
+            .to_str()
+            .expect("the payload hash header is ASCII")
+            .to_owned();
+        assert_eq!(http_body::Body::size_hint(signed.body()).exact(), Some(0));
+        let sent = collect_in_memory_body(signed.into_body());
+        assert_eq!(hex_sha256(&sent, str::to_owned), committed);
     }
 }

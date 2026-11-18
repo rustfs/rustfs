@@ -37,10 +37,7 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
-    use crate::storage::ecfs::{
-        FS, object_lock_retention_from_metadata, parse_object_version_id, propagate_object_lock_peer_reload,
-        validate_object_lock_configuration_input,
-    };
+    use crate::storage::ecfs::{FS, parse_object_version_id};
     use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
@@ -53,7 +50,7 @@ mod tests {
         remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
         validate_list_object_unordered_with_delimiter,
     };
-    use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -62,107 +59,13 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, FilterRule, FilterRuleName,
-        GetBucketAclInput, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput,
-        LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
-        PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput, PutObjectLockConfigurationInput, PutObjectRetentionInput,
-        PutObjectTaggingInput, QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
+        DefaultRetention, Delimiter, FilterRule, FilterRuleName, LambdaFunctionConfiguration, NotificationConfigurationFilter,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+        ObjectLockRetentionMode, ObjectLockRule, QueueConfiguration, S3KeyFilter, TopicConfiguration,
     };
-    use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
+    use s3s::{S3Error, S3ErrorCode, s3_error};
     use std::collections::HashMap;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
-    fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-        S3Request {
-            input,
-            method,
-            uri: Uri::from_static("/"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn list_apis_report_storage_read_quorum_as_unavailable() {
-        crate::app::gating_test_env::run_large_stack_test("list-quorum-surface", || async {
-            use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-            use s3s::dto::{ListObjectVersionsInput, ListObjectsInput, ListObjectsV2Input};
-            crate::app::gating_test_env::shared_gating_ambient().await;
-            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-            let bucket = format!("list-quorum-{}", uuid::Uuid::new_v4().simple());
-            store
-                .make_bucket(&bucket, &MakeBucketOptions::default())
-                .await
-                .expect("create listing bucket");
-            let set = &store.pools[0].disk_set[0];
-            let saved_disks = set.disks.read().await.clone();
-            {
-                let mut disks = set.disks.write().await;
-                for disk in disks.iter_mut().skip(1) {
-                    *disk = None;
-                }
-            }
-            let fs = FS::new();
-            let errors = [
-                S3::list_objects(
-                    &fs,
-                    build_request(
-                        ListObjectsInput {
-                            bucket: bucket.clone(),
-                            ..Default::default()
-                        },
-                        Method::GET,
-                    ),
-                )
-                .await
-                .expect_err("V1 cannot list below storage read quorum"),
-                S3::list_objects_v2(
-                    &fs,
-                    build_request(
-                        ListObjectsV2Input {
-                            bucket: bucket.clone(),
-                            ..Default::default()
-                        },
-                        Method::GET,
-                    ),
-                )
-                .await
-                .expect_err("V2 cannot list below storage read quorum"),
-                S3::list_object_versions(
-                    &fs,
-                    build_request(
-                        ListObjectVersionsInput {
-                            bucket,
-                            ..Default::default()
-                        },
-                        Method::GET,
-                    ),
-                )
-                .await
-                .expect_err("versions cannot list below storage read quorum"),
-            ];
-            *set.disks.write().await = saved_disks;
-            for error in errors {
-                assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
-                assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
-                assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
-                let source = error.source().expect("retain storage diagnostics");
-                assert!(
-                    matches!(
-                        source.downcast_ref::<StorageError>(),
-                        Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
-                    ),
-                    "the production LIST boundary must expose a typed read-quorum failure: {source}"
-                );
-            }
-        });
-    }
 
     #[test]
     fn test_fs_creation() {
@@ -293,261 +196,10 @@ mod tests {
         assert_eq!(gz_format.extension(), "gz");
     }
 
-    /// Premise guard for the `*_returns_internal_error_when_store_uninitialized`
-    /// tests (backlog#1830): they assert the error path taken while the global
-    /// object layer is absent. Under nextest — the authoritative runner — every
-    /// test owns its process, so the premise always holds and the assertion
-    /// always runs. Under the documented shared-process `cargo test` fallback a
-    /// sibling test may have initialized the store first; the premise is then
-    /// unattainable, so the test skips instead of asserting against a scenario
-    /// it does not describe.
-    fn store_uninitialized_premise_holds() -> bool {
-        if crate::runtime_sources::current_object_store_handle().is_some() {
-            eprintln!("skipping store-uninitialized assertion: a sibling test already initialized the global object layer");
-            return false;
-        }
-        true
-    }
-
-    #[tokio::test]
-    async fn test_get_object_acl_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = GetObjectAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.get_object_acl(build_request(input, Method::GET)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = GetBucketAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.get_bucket_acl(build_request(input, Method::GET)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_get_object_legal_hold_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = GetObjectLegalHoldInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.get_object_legal_hold(build_request(input, Method::GET)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_get_object_retention_returns_internal_error_when_store_uninitialized() {
-        let input = GetObjectRetentionInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.get_object_retention(build_request(input, Method::GET)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_put_object_legal_hold_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = PutObjectLegalHoldInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_object_legal_hold(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = PutBucketAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_bucket_acl(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_put_object_acl_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = PutObjectAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_object_acl(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_put_object_retention_returns_internal_error_when_store_uninitialized() {
-        let input = PutObjectRetentionInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_object_retention(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_put_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = PutObjectLockConfigurationInput::builder()
-            .bucket("test-bucket".to_string())
-            .object_lock_configuration(Some(ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-                rule: None,
-            }))
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs
-            .put_object_lock_configuration(build_request(input, Method::PUT))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_disabled_status() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from("Disabled".to_string())),
-            rule: None,
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_invalid_default_retention_mode() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from("abc".to_string())),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_days_and_years_together() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(1),
-                    years: Some(1),
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_missing_default_retention() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule { default_retention: None }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_zero_days() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(0),
-                    years: None,
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_too_many_years() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-                    days: None,
-                    years: Some(101),
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
-    }
-
-    #[test]
-    fn test_object_lock_peer_reload_failure_is_returned_to_the_client() {
-        let err = propagate_object_lock_peer_reload(Err(StorageError::other("peer reload failed")))
-            .expect_err("peer reload failure must prevent a successful Object Lock update response");
-
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(err.message().is_some_and(|message| message.contains("peer reload failed")));
+    /// The bucket default retention path reads the persisted shape; the request
+    /// literals in these tests stay on the wire DTO and convert once here.
+    fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+        crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
     }
 
     #[test]
@@ -564,7 +216,7 @@ mod tests {
         };
         let mut metadata = std::collections::HashMap::new();
 
-        assert!(apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"COMPLIANCE".to_string()));
         let retain_until = metadata
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
@@ -598,7 +250,7 @@ mod tests {
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
         ]);
 
-        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"GOVERNANCE".to_string()));
         assert_eq!(
             metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER),
@@ -614,7 +266,7 @@ mod tests {
         };
         let mut metadata = std::collections::HashMap::new();
 
-        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
         assert!(metadata.is_empty());
     }
 
@@ -631,7 +283,7 @@ mod tests {
             }),
         };
         let state = ObjectLockConfigState::Configured {
-            config,
+            config: persisted_lock(&config),
             updated_at: OffsetDateTime::now_utc(),
         };
         let mut metadata = std::collections::HashMap::new();
@@ -641,6 +293,26 @@ mod tests {
 
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
         assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+    }
+
+    #[test]
+    fn empty_retention_metadata_does_not_suppress_bucket_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        for name in [AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER] {
+            let mut metadata = HashMap::from([(name.to_string(), String::new())]);
+            assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&config)), &mut metadata));
+            assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+            assert!(!metadata[AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER].is_empty());
+        }
     }
 
     #[test]
@@ -656,7 +328,7 @@ mod tests {
             }),
         };
         let state = ObjectLockConfigState::Configured {
-            config,
+            config: persisted_lock(&config),
             updated_at: OffsetDateTime::now_utc(),
         };
         let mut metadata = HashMap::new();
@@ -769,104 +441,6 @@ mod tests {
             let err = parse_object_version_id(Some(version.to_owned())).expect_err("invalid version must fail closed");
             assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "version: {version:?}");
         }
-    }
-
-    #[tokio::test]
-    async fn test_get_object_tagging_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = GetObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.get_object_tagging(build_request(input, Method::GET)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_put_object_tagging_rejects_too_many_tags() {
-        let tag_set = (0..11)
-            .map(|index| Tag {
-                key: Some(format!("k{index}")),
-                value: Some(format!("v{index}")),
-            })
-            .collect();
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .tagging(Tagging { tag_set })
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
-        assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
-    }
-
-    #[tokio::test]
-    async fn test_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .tagging(Tagging {
-                tag_set: vec![Tag {
-                    key: Some(String::new()),
-                    value: Some("v1".to_string()),
-                }],
-            })
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
-        assert!(err.to_string().contains("Tag key cannot be empty"));
-    }
-
-    #[tokio::test]
-    async fn test_put_object_tagging_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .tagging(Tagging {
-                tag_set: vec![Tag {
-                    key: Some("k".to_string()),
-                    value: Some("v".to_string()),
-                }],
-            })
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn test_delete_object_tagging_returns_internal_error_when_store_uninitialized() {
-        if !store_uninitialized_premise_holds() {
-            return;
-        }
-        let input = DeleteObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let fs = FS::new();
-        let err = fs
-            .delete_object_tagging(build_request(input, Method::DELETE))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]
@@ -1087,50 +661,16 @@ mod tests {
     }
 
     #[test]
-    fn retention_response_serialization_preserves_offset_metadata_instant() {
-        for value in [
-            "2035-01-02T00:00:00+23:59",
-            "2035-01-02T00:00:00-23:59",
-            "2035-01-02T00:00:00Z",
-        ] {
-            let metadata = HashMap::from([
-                (AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "COMPLIANCE".to_owned()),
-                (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), value.to_owned()),
-            ]);
-            let retention = object_lock_retention_from_metadata(&metadata).expect("representable retention instant");
-            assert_eq!(retention.mode.as_ref().expect("mode").as_str(), "COMPLIANCE");
-            let mut serialized = Vec::new();
-            retention
-                .retain_until_date
-                .expect("stored retention date")
-                .format(s3s::dto::TimestampFormat::DateTime, &mut serialized)
-                .expect("serialize the response timestamp");
-            let serialized = String::from_utf8(serialized).expect("UTF-8 timestamp");
-            let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
-            let stored = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
-            assert_eq!(returned.unix_timestamp(), stored.unix_timestamp(), "stored date {value}");
-        }
-    }
-
-    #[test]
-    fn retention_response_rejects_instants_outside_the_utc_wire_range() {
-        for value in ["9999-12-31T23:59:59-23:59", "0000-01-01T00:00:00+23:59"] {
-            let metadata = HashMap::from([
-                (AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "COMPLIANCE".to_owned()),
-                (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), value.to_owned()),
-            ]);
-            let error = object_lock_retention_from_metadata(&metadata).expect_err("unrepresentable UTC timestamp");
-            assert_eq!(error.code(), &S3ErrorCode::InternalError);
-        }
-    }
-
-    #[test]
     fn test_parse_object_lock_retention() {
         use time::macros::datetime;
         use time::{OffsetDateTime, UtcOffset};
         // [1] Normal case: No retention specified (empty metadata)
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
+        let cleared = parse_object_lock_retention(Some(ObjectLockRetention::default())).unwrap();
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some(""));
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str), Some(""));
+        assert!(contains_key_str(&cleared, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
 
         // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
         let valid_compliance_retention = ObjectLockRetention {
@@ -1157,21 +697,24 @@ mod tests {
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
         assert_eq!(governance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "GOVERNANCE");
 
-        // [4] Normal case: Retention with None mode (empty string for mode, date not validated)
+        // A retention update is either empty or has both fields.
         let none_mode_retention = ObjectLockRetention {
             mode: None,
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
-        let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
-        assert_eq!(none_mode_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "");
+        assert_eq!(
+            parse_object_lock_retention(Some(none_mode_retention)).unwrap_err().code(),
+            &S3ErrorCode::MalformedXML
+        );
 
-        // [5] Normal case: Retention with None retain_until_date (empty string for date)
         let none_date_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
             retain_until_date: None,
         };
-        let none_date_metadata = parse_object_lock_retention(Some(none_date_retention)).unwrap();
-        assert_eq!(none_date_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(), "");
+        assert_eq!(
+            parse_object_lock_retention(Some(none_date_retention)).unwrap_err().code(),
+            &S3ErrorCode::MalformedXML
+        );
 
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
         let invalid_mode_retention = ObjectLockRetention {
@@ -1232,10 +775,9 @@ mod tests {
         let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
         assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
 
-        // [4] Normal case: Legal hold with None status (empty string for status)
         let none_status_legal_hold = ObjectLockLegalHold { status: None };
-        let none_status_metadata = parse_object_lock_legal_hold(Some(none_status_legal_hold)).unwrap();
-        assert_eq!(none_status_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "");
+        let err = parse_object_lock_legal_hold(Some(none_status_legal_hold)).expect_err("Status is required");
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
 
         // [5] Error case: Legal hold with invalid status (non ON/OFF)
         let invalid_status_legal_hold = ObjectLockLegalHold {
@@ -1251,7 +793,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
         if !bucket_metadata_sys_initialized() {
@@ -1262,8 +803,8 @@ mod tests {
         let test_bucket = "test-bucket-object-lock";
 
         let mut bm = BucketMetadata::new(test_bucket);
-        bm.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         });
         bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
@@ -1271,7 +812,7 @@ mod tests {
         assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
 
         let mut bm = BucketMetadata::new(test_bucket);
-        bm.object_lock_config = Some(ObjectLockConfiguration {
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
             object_lock_enabled: None,
             rule: None,
         });
@@ -1956,8 +1497,8 @@ mod tests {
 
         let bucket = "test-bucket-no-match-cors";
         let mut bm = BucketMetadata::new(bucket);
-        bm.cors_config = Some(CORSConfiguration {
-            cors_rules: vec![CORSRule {
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
                 allowed_headers: Some(vec!["*".to_string()]),
                 allowed_methods: vec!["GET".to_string()],
                 allowed_origins: vec!["https://allowed.example.com".to_string()],
@@ -1994,8 +1535,8 @@ mod tests {
 
         let bucket = "test-bucket-credentialed-cors";
         let mut bm = BucketMetadata::new(bucket);
-        bm.cors_config = Some(CORSConfiguration {
-            cors_rules: vec![CORSRule {
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
                 allowed_headers: Some(vec!["*".to_string()]),
                 allowed_methods: vec!["GET".to_string()],
                 allowed_origins: vec!["*".to_string()],

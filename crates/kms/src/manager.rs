@@ -466,6 +466,8 @@ impl KmsManager {
     /// opt-in and a per-request confirmation that echoes the key id; without
     /// either, the request is refused rather than downgraded to a scheduled
     /// deletion, so a caller never believes a key is gone when it is not.
+    /// The backend adds the last condition under its own synchronization: the
+    /// key must already be pending deletion.
     fn check_deletion_request(&self, request: &DeleteKeyRequest) -> Result<()> {
         if !request.force_immediate.unwrap_or(false) {
             let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
@@ -493,7 +495,7 @@ impl KmsManager {
 
         warn!(
             key_id = %request.key_id,
-            "immediate KMS key deletion accepted; key material is destroyed without a waiting window and cannot be recovered"
+            "immediate KMS key deletion authorized; a key pending deletion is destroyed without waiting out its window and cannot be recovered"
         );
         Ok(())
     }
@@ -666,6 +668,11 @@ impl KmsManager {
     /// Report the capabilities of the configured backend
     pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
         self.backend.capabilities()
+    }
+
+    /// See [`KmsBackend::reads_bare_data_key_ciphertext`].
+    pub fn reads_bare_data_key_ciphertext(&self) -> bool {
+        self.backend.reads_bare_data_key_ciphertext()
     }
 
     /// Direct handle to the configured backend, bypassing the metadata cache.
@@ -1468,6 +1475,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let manager = deletion_manager(&temp_dir, true).await;
         let key_id = create_named_key(&manager, "confirmed-force-delete").await;
+        schedule_deletion(&manager, &key_id).await;
 
         manager
             .delete_key(DeleteKeyRequest {
@@ -1484,6 +1492,43 @@ mod tests {
             .await
             .expect_err("an immediately deleted key must be gone");
         assert!(matches!(error, KmsError::KeyNotFound { .. }), "expected KeyNotFound, got {error:?}");
+    }
+
+    async fn schedule_deletion(manager: &KmsManager, key_id: &str) {
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("scheduling the deletion must succeed");
+    }
+
+    /// Destruction always passes through the cancellable pending state: a
+    /// fully authorized immediate deletion of a key that was never scheduled
+    /// is refused, and leaves the key exactly as it was.
+    #[tokio::test]
+    async fn immediate_deletion_of_a_key_that_was_never_scheduled_is_refused() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true).await;
+        let key_id = create_named_key(&manager, "unscheduled-force-delete").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a key that is not pending deletion must not be destroyed in one request");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("not pending deletion")),
+            "got {error:?}"
+        );
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
     }
 
     /// Reference checker whose answer is fixed, standing in for the server's
@@ -1624,6 +1669,7 @@ mod tests {
             .await
             .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
         let key_id = create_named_key(&manager, "unreferenced-confirmed-force-delete").await;
+        schedule_deletion(&manager, &key_id).await;
 
         manager
             .delete_key(DeleteKeyRequest {

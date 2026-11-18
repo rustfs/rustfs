@@ -21,18 +21,34 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+#[cfg(test)]
+pub(crate) mod remote_transport_fixture {
+    pub(crate) use rustfs_ecstore::api::disk::error::{Error, Result};
+    pub(crate) use rustfs_ecstore::api::disk::{FileReader, FileWriter};
+    pub(crate) use rustfs_ecstore::api::rpc::test_util::remote_disk_with_transport;
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
+        ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
+    };
+    pub(crate) use rustfs_storage_api::{NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse};
+}
+
 pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
 pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::with_background_resource_unit as ecstore_with_background_resource_unit;
 
-pub(crate) use s3s::dto::{
-    BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
-    ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
-};
 #[cfg(test)]
-pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
+pub(crate) use rustfs_gateway_types::persistence::PersistedLifecycleRule as EcstoreLifecycleRule;
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedLifecycleConfiguration as EcstoreBucketLifecycleConfiguration,
+    PersistedLifecycleFilter as EcstoreLifecycleRuleFilter,
+};
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as EcstoreObjectLockConfiguration,
+    PersistedVersioningConfiguration as EcstoreVersioningConfiguration,
+};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
     MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
@@ -239,9 +255,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreExpirationStatus, EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints,
-        EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init,
-        ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints, EcstoreRebalStatus,
+        EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 
@@ -249,7 +265,10 @@ pub(crate) mod owner {
 pub struct ScannerReplicationConfig(EcstoreReplicationConfig);
 
 impl ScannerReplicationConfig {
-    pub(crate) fn new(config: Option<s3s::dto::ReplicationConfiguration>, remotes: Option<EcstoreBucketTargets>) -> Self {
+    pub(crate) fn new(
+        config: Option<rustfs_gateway_types::persistence::PersistedReplicationConfiguration>,
+        remotes: Option<EcstoreBucketTargets>,
+    ) -> Self {
         Self(EcstoreReplicationConfig::new(config, remotes))
     }
 
@@ -389,7 +408,7 @@ pub(crate) mod scan {
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
     };
     #[cfg(test)]
-    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO};
+    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO, StorageAdminApi};
     pub use super::storage_contracts::{
         SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
@@ -400,12 +419,20 @@ pub(crate) mod scan {
         EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
         EcstoreScannerPublicationLeaseGrant,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::new_global_notification_sys;
 }
 
 pub(crate) mod scanner_io {
-    pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
+    pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions, NsScannerCapabilities};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
+    pub(crate) use rustfs_ecstore::api::runtime::{
+        ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest,
+    };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::{
         bucket::{
@@ -441,6 +468,13 @@ pub(crate) trait ScannerStorage:
     fn scanner_data_movement_generation(&self) -> u64;
     fn scanner_data_movement_changed(&self) -> Arc<Notify>;
     fn scanner_notification_system(&self) -> Option<Arc<ScannerNotificationSys>>;
+    async fn scanner_usage_watch_store_handle(&self) -> Option<Arc<EcstoreStore>> {
+        None
+    }
+    /// Backends without producer watches cannot authorize nonempty proofs.
+    async fn scanner_verify_usage_watches(&self, proofs: &[crate::scanner_io::ScannerUsageWatchProof]) -> bool {
+        proofs.is_empty()
+    }
     async fn setup_is_erasure(&self) -> bool;
     async fn setup_is_dist_erasure(&self) -> bool;
     async fn setup_is_erasure_sd(&self) -> bool;
@@ -461,6 +495,19 @@ pub(crate) trait ScannerStorage:
 
 #[async_trait::async_trait]
 impl ScannerStorage for EcstoreStore {
+    async fn scanner_usage_watch_store_handle(&self) -> Option<Arc<EcstoreStore>> {
+        EcstoreStore::scanner_usage_watch_store_handle(self).await
+    }
+    async fn scanner_verify_usage_watches(&self, proofs: &[crate::scanner_io::ScannerUsageWatchProof]) -> bool {
+        for batch in proofs.chunks(4) {
+            let checks = batch.iter().map(|proof| proof.verify_with_store(self)).collect::<Vec<_>>();
+            if futures::future::join_all(checks).await.into_iter().any(|valid| !valid) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn scanner_topology_digest(&self) -> [u8; 32] {
         crate::scanner::scanner_topology_digest(self)
     }

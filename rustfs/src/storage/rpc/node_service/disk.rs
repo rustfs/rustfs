@@ -18,6 +18,7 @@ use crate::storage::storage_api::ecstore_disk::{
     MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
     PoolMetaNativeRecoveryRequest as NativeRecoveryRequest, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
     RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, is_quota_mutation_fence_path, require_source_condition,
+    validate_format_control_path,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
@@ -32,6 +33,7 @@ use crate::storage::storage_api::{
 };
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
+use rustfs_io_metrics::internode_metrics::InternodeRpcDurationGuard;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
     INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
@@ -75,6 +77,14 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: Bytes) -> Result<(), DiskError> {
+        match self {
+            Self::Ready(store) => store.write_local_format_control(disk_ref, path, data).await,
+            Self::Bootstrap(target) => target.write_local_format_control(disk_ref, path, data).await,
+            Self::Unbound => Err(DiskError::DiskNotFound),
+        }
+    }
+
     async fn recover_local_multipart_source(
         &self,
         disk_ref: &str,
@@ -235,6 +245,34 @@ fn decode_msgpack_or_json_with_source<T: DeserializeOwned>(
     }
 }
 
+fn decode_delete_versions_request_versions(
+    request: &DeleteVersionsRequest,
+) -> std::result::Result<Vec<FileInfoVersions>, DiskError> {
+    if request.versions_bin.is_empty() {
+        let mut versions = Vec::with_capacity(request.versions.len());
+        for version in &request.versions {
+            versions.push(decode_msgpack_or_json(&[], version, "FileInfoVersions")?);
+        }
+        return Ok(versions);
+    }
+
+    // The binary list owns both the batch length and its entries. A legacy
+    // JSON list may be absent or stale, so it cannot repair a malformed item.
+    let mut versions = Vec::with_capacity(request.versions_bin.len());
+    for version in &request.versions_bin {
+        if version.is_empty() {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                "FileInfoVersions",
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            return Err(DiskError::other("empty FileInfoVersions msgpack item"));
+        }
+        versions.push(decode_msgpack_or_json(version, "", "FileInfoVersions")?);
+    }
+    Ok(versions)
+}
+
 fn encode_msgpack_with_capacity<T: serde::Serialize>(
     value: &T,
     value_name: &str,
@@ -385,32 +423,6 @@ fn record_batch_read_version_stage(stage: &'static str, started_at: Option<Insta
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             stage,
             started_at.elapsed(),
-        );
-    }
-}
-
-/// Records the complete server-side lifetime of a unary internode RPC, including request
-/// decoding, disk work, response encoding, error paths, and cancellation.
-struct InternodeOperationDurationGuard {
-    operation: &'static str,
-    started_at: Instant,
-}
-
-impl InternodeOperationDurationGuard {
-    fn new(operation: &'static str) -> Self {
-        Self {
-            operation,
-            started_at: Instant::now(),
-        }
-    }
-}
-
-impl Drop for InternodeOperationDurationGuard {
-    fn drop(&mut self) {
-        global_internode_metrics().record_server_duration_for_operation_and_backend(
-            self.operation,
-            INTERNODE_TRANSPORT_BACKEND_GRPC,
-            self.started_at.elapsed(),
         );
     }
 }
@@ -762,7 +774,7 @@ impl NodeService {
         &self,
         request: Request<ReadMultipleRequest>,
     ) -> Result<Response<ReadMultipleResponse>, Status> {
-        let _duration = InternodeOperationDurationGuard::new(INTERNODE_OPERATION_GRPC_READ_MULTIPLE);
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_READ_MULTIPLE);
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
             let read_multiple_req = match decode_msgpack_or_json::<ReadMultipleReq>(
@@ -823,7 +835,7 @@ impl NodeService {
         &self,
         request: Request<BatchReadVersionRequest>,
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
-        let _duration = InternodeOperationDurationGuard::new(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION);
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION);
         let attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let request = request.into_inner();
         if attribution_enabled {
@@ -983,21 +995,17 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
-            let mut versions = Vec::with_capacity(request.versions.len());
-            for (index, version) in request.versions.iter().enumerate() {
-                let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
-                match decode_msgpack_or_json::<FileInfoVersions>(version_bin, version, "FileInfoVersions") {
-                    Ok(version) => versions.push(version),
-                    Err(err) => {
-                        return Ok(Response::new(DeleteVersionsResponse {
-                            success: false,
-                            errors: Vec::new(),
-                            error: Some(DiskError::other(format!("decode FileInfoVersions failed: {err}")).into()),
-                            item_errors: Vec::new(),
-                        }));
-                    }
-                };
-            }
+            let versions = match decode_delete_versions_request_versions(&request) {
+                Ok(versions) => versions,
+                Err(err) => {
+                    return Ok(Response::new(DeleteVersionsResponse {
+                        success: false,
+                        errors: Vec::new(),
+                        error: Some(err.into()),
+                        item_errors: Vec::new(),
+                    }));
+                }
+            };
             let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
                 Ok(opts) => opts,
                 Err(err) => {
@@ -2733,6 +2741,7 @@ impl NodeService {
     }
 
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_WRITE_ALL);
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_write_all_request_body(request.get_ref()), "write_all")?;
         let request = request.into_inner();
         let data_len = request.data.len();
@@ -2769,6 +2778,48 @@ impl NodeService {
                 success: false,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
+        }
+    }
+
+    pub(super) async fn handle_write_format_control(
+        &self,
+        request: Request<WriteFormatControlRequest>,
+    ) -> Result<Response<WriteAllResponse>, Status> {
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+        let canonical = rustfs_protos::canonical_write_format_control_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("format control request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("format control requires a signed canonical body"))?;
+        validate_format_control_path(&request.get_ref().path)
+            .map_err(|_| Status::invalid_argument("unsupported format control filename"))?;
+        let request = request.into_inner();
+        let metrics = runtime_sources::current_internode_metrics();
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            request.data.len(),
+        );
+        let target = self.local_mutation_target();
+        let result = target
+            .write_local_format_control(&request.disk, &request.path, request.data)
+            .await;
+        match result {
+            Ok(()) => Ok(Response::new(WriteAllResponse {
+                success: true,
+                error: None,
+            })),
+            Err(error) => {
+                metrics
+                    .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
+                Ok(Response::new(WriteAllResponse {
+                    success: false,
+                    error: Some(error.into()),
+                }))
+            }
         }
     }
 
@@ -2837,6 +2888,7 @@ impl NodeService {
     }
 
     pub(super) async fn handle_read_all(&self, request: Request<ReadAllRequest>) -> Result<Response<ReadAllResponse>, Status> {
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_READ_ALL);
         debug!("read all");
 
         let request = request.into_inner();
@@ -2886,19 +2938,20 @@ impl NodeService {
 mod tests {
     use super::{
         DeleteOptions, INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-        InternodeOperationDurationGuard, compat_response_json, decode_msgpack_or_json, decode_multipart_rename_request_file_info,
-        decode_rename_data_request_file_info, encode_batch_read_version_response_payloads, encode_delete_versions_errors,
-        encode_file_info_msgpack, encode_msgpack, encode_msgpack_named, encode_read_multiple_response_payloads,
-        encode_rename_data_response_payloads, rejects_legacy_delete_transaction,
+        InternodeRpcDurationGuard, compat_response_json, decode_delete_versions_request_versions, decode_msgpack_or_json,
+        decode_multipart_rename_request_file_info, decode_rename_data_request_file_info,
+        encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
+        rejects_legacy_delete_transaction,
     };
     use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
-    use rustfs_filemeta::FileInfo;
+    use rustfs_filemeta::{FileInfo, FileInfoVersions};
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-    use rustfs_protos::proto_gen::node_service::ReadVersionRequest;
+    use rustfs_protos::proto_gen::node_service::{DeleteVersionsRequest, ReadVersionRequest};
     use serde::{Deserialize, Serialize};
     use serial_test::serial;
     use tonic::Request;
@@ -2908,6 +2961,118 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    fn delete_versions_group(name: &str) -> FileInfoVersions {
+        FileInfoVersions {
+            volume: "bucket".to_string(),
+            name: name.to_string(),
+            versions: vec![FileInfo {
+                name: name.to_string(),
+                version_id: Some(Uuid::from_u128(1)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delete_versions_msgpack_only_decodes_every_binary_item() {
+        let groups = [delete_versions_group("first"), delete_versions_group("second")];
+        let request = DeleteVersionsRequest {
+            versions_bin: groups
+                .iter()
+                .map(|group| {
+                    encode_msgpack_named(group, "FileInfoVersions")
+                        .expect("encode delete group")
+                        .into()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let decoded = decode_delete_versions_request_versions(&request).expect("decode msgpack-only batch");
+        assert_eq!(decoded.len(), groups.len());
+        for (actual, expected) in decoded.iter().zip(&groups) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.versions, expected.versions);
+        }
+    }
+
+    #[test]
+    fn delete_versions_msgpack_list_controls_length_and_values_with_legacy_json_present() {
+        for json_count in [0, 1, 2, 3] {
+            let request = DeleteVersionsRequest {
+                versions: vec!["invalid legacy JSON".to_string(); json_count],
+                versions_bin: ["first", "second"]
+                    .iter()
+                    .map(|name| {
+                        encode_msgpack_named(&delete_versions_group(name), "FileInfoVersions")
+                            .expect("encode binary delete group")
+                            .into()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+
+            let decoded = decode_delete_versions_request_versions(&request).expect("binary batch must take precedence");
+            assert_eq!(decoded.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        }
+    }
+
+    #[test]
+    fn delete_versions_json_only_preserves_legacy_batch() {
+        let groups = [delete_versions_group("first"), delete_versions_group("second")];
+        let request = DeleteVersionsRequest {
+            versions: groups
+                .iter()
+                .map(|group| serde_json::to_string(group).expect("encode legacy delete group"))
+                .collect(),
+            ..Default::default()
+        };
+
+        let decoded = decode_delete_versions_request_versions(&request).expect("decode legacy JSON batch");
+        assert_eq!(decoded.len(), groups.len());
+        for (actual, expected) in decoded.iter().zip(&groups) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.versions, expected.versions);
+        }
+    }
+
+    #[test]
+    fn delete_versions_invalid_binary_item_never_uses_valid_json() {
+        let json = serde_json::to_string(&delete_versions_group("legacy")).expect("encode legacy group");
+        for invalid in [bytes::Bytes::new(), bytes::Bytes::from_static(b"invalid-msgpack")] {
+            let request = DeleteVersionsRequest {
+                versions: vec![json.clone(), json.clone()],
+                versions_bin: vec![
+                    encode_msgpack_named(&delete_versions_group("first"), "FileInfoVersions")
+                        .expect("encode valid first group")
+                        .into(),
+                    invalid,
+                ],
+                ..Default::default()
+            };
+
+            assert!(
+                decode_delete_versions_request_versions(&request).is_err(),
+                "malformed binary batch must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_versions_invalid_json_only_batch_fails_and_empty_batch_stays_empty() {
+        let invalid = DeleteVersionsRequest {
+            versions: vec!["invalid JSON".to_string()],
+            ..Default::default()
+        };
+        assert!(decode_delete_versions_request_versions(&invalid).is_err());
+        assert!(
+            decode_delete_versions_request_versions(&DeleteVersionsRequest::default())
+                .expect("empty legacy batch")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3008,7 +3173,7 @@ mod tests {
                     super::INTERNODE_TRANSPORT_BACKEND_GRPC,
                     std::time::Duration::from_secs(1),
                 );
-                drop(InternodeOperationDurationGuard::new(operation));
+                drop(InternodeRpcDurationGuard::handler(operation));
             }
         });
 
@@ -3053,9 +3218,87 @@ mod tests {
 
     #[test]
     #[serial]
+    fn format_control_handler_metrics_count_admitted_payload_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_protos::proto_gen::node_service::WriteFormatControlRequest;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let enabled = rustfs_io_metrics::metrics_enabled();
+        rustfs_io_metrics::set_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("handler metrics runtime");
+            runtime.block_on(async {
+                let server = make_server();
+                let message = WriteFormatControlRequest {
+                    disk: "missing-format-target".into(),
+                    path: "format.json.bootstrap".into(),
+                    data: bytes::Bytes::from_static(b"format-plan"),
+                };
+                let mut request = Request::new(message.clone());
+                let canonical =
+                    rustfs_protos::canonical_write_format_control_request_body(request.get_ref()).expect("canonical control");
+                crate::storage::storage_api::set_tonic_canonical_body_digest(&mut request, &canonical).expect("control digest");
+                request
+                    .metadata_mut()
+                    .insert("x-rustfs-rpc-auth-version", "2".parse().expect("v2 header"));
+                let response = server
+                    .handle_write_format_control(request)
+                    .await
+                    .expect("typed target failure")
+                    .into_inner();
+                assert!(!response.success);
+                let error = server
+                    .handle_write_format_control(Request::new(message))
+                    .await
+                    .expect_err("unsigned control rejection");
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            });
+        });
+        rustfs_io_metrics::set_metrics_enabled(enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let value = |name: &str| {
+            &entries
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "grpc_write_all")
+                })
+                .expect("format-control handler metric")
+                .3
+        };
+        for (name, expected) in [
+            ("rustfs_system_network_internode_operation_requests_incoming_total", 1),
+            ("rustfs_system_network_internode_operation_recv_bytes_total", 11),
+            ("rustfs_system_network_internode_operation_errors_total", 1),
+        ] {
+            assert!(matches!(value(name), DebugValue::Counter(count) if *count == expected), "{name}");
+        }
+        assert!(
+            matches!(value("rustfs_system_network_internode_operation_server_duration_ms"), DebugValue::Histogram(samples) if samples.len() == 2)
+        );
+        assert!(
+            matches!(value("rustfs_system_network_internode_rpc_active"), DebugValue::Gauge(active) if active.into_inner() == 0.0)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(key, _, _, _)| key.key().name() != "rustfs_system_network_internode_operation_duration_ms")
+        );
+    }
+
+    #[test]
+    #[serial]
     fn handlers_record_duration_on_missing_disk_errors() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-        use rustfs_protos::proto_gen::node_service::{BatchReadVersionRequest, ReadMultipleRequest};
+        use rustfs_protos::proto_gen::node_service::{
+            BatchReadVersionRequest, ReadAllRequest, ReadMultipleRequest, WriteAllRequest,
+        };
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -3087,6 +3330,25 @@ mod tests {
                     .expect("BatchReadVersion handler should return a response")
                     .into_inner();
                 assert!(!batch_read_version.success);
+                let read_all = server
+                    .handle_read_all(Request::new(ReadAllRequest {
+                        disk: "missing-disk".to_owned(),
+                        volume: "bucket".to_owned(),
+                        path: "key".to_owned(),
+                    }))
+                    .await
+                    .expect("ReadAll failure response")
+                    .into_inner();
+                assert!(!read_all.success);
+                let write_all = server
+                    .handle_write_all(Request::new(WriteAllRequest {
+                        disk: "missing-disk".to_owned(),
+                        volume: "bucket".to_owned(),
+                        path: "key".to_owned(),
+                        data: bytes::Bytes::new(),
+                    }))
+                    .await;
+                assert!(!write_all.is_ok_and(|response| response.into_inner().success));
             });
         });
 
@@ -3098,7 +3360,7 @@ mod tests {
                 composite.key().name() == "rustfs_system_network_internode_operation_server_duration_ms"
             })
             .collect::<Vec<_>>();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
         for (composite, _, _, value) in entries {
             let operation = composite
                 .key()
@@ -3107,7 +3369,13 @@ mod tests {
                 .map(|label| label.value().to_string())
                 .expect("handler duration metric should carry an operation label");
             assert!(
-                operation == INTERNODE_OPERATION_GRPC_READ_MULTIPLE || operation == INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
+                [
+                    INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+                    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+                    rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_GRPC_READ_ALL,
+                    rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                ]
+                .contains(&operation.as_str())
             );
             assert!(matches!(value, DebugValue::Histogram(samples) if !samples.is_empty()));
         }

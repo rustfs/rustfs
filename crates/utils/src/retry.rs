@@ -65,10 +65,10 @@ impl Stream for RetryTimer {
 
         let jitter = self.jitter.clamp(NO_JITTER, MAX_JITTER);
         let attempt = self.max_retry - self.rem;
-        let mut sleep = self.base_sleep * (1 << attempt);
-        if sleep > self.max_sleep {
-            sleep = self.max_sleep;
-        }
+        let mut sleep = u32::try_from(attempt)
+            .ok()
+            .and_then(|shift| 1_u32.checked_shl(shift))
+            .map_or(self.max_sleep, |factor| self.base_sleep.saturating_mul(factor).min(self.max_sleep));
         if (jitter - NO_JITTER).abs() > 1e-9 {
             let sleep_ms = sleep.as_millis();
             let reduction = ((sleep_ms as f64) * (self.random as f64 * jitter / 100_f64)).round() as u128;
@@ -253,6 +253,15 @@ mod tests {
         let mut retry_timer = RetryTimer::new(0, Duration::from_millis(1), Duration::from_millis(2), NO_JITTER, 0);
 
         assert_eq!(retry_timer.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn retry_timer_caps_backoff_for_large_attempt_budgets() {
+        let retry_timer = RetryTimer::new(40, Duration::from_millis(1), Duration::from_millis(2), NO_JITTER, 0);
+        let retries = timeout(Duration::from_secs(5), retry_timer.collect::<Vec<_>>())
+            .await
+            .expect("a large retry budget should finish without overflowing the backoff");
+        assert_eq!(retries.len(), 40);
     }
 
     #[test]

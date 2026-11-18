@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::common::{
-    parse_jetstream_ack_timeout_secs, parse_jetstream_enable, parse_target_bool, parse_url, validate_nats_server_config,
-    validate_outbound_http_url, validate_pulsar_broker_config,
+    parse_jetstream_ack_timeout_secs, parse_jetstream_enable, parse_target_bool, parse_url, queue_dir_or_default,
+    validate_nats_server_config, validate_outbound_http_url, validate_pulsar_broker_config,
 };
 use crate::error::TargetError;
 use crate::target::{
@@ -118,7 +118,7 @@ pub fn build_amqp_args(config: &KVS, default_queue_dir: &str, target_type: Targe
         tls_ca: config.lookup(AMQP_TLS_CA).unwrap_or_default(),
         tls_client_cert: config.lookup(AMQP_TLS_CLIENT_CERT).unwrap_or_default(),
         tls_client_key: config.lookup(AMQP_TLS_CLIENT_KEY).unwrap_or_default(),
-        queue_dir: config.lookup(AMQP_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, AMQP_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(AMQP_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -146,9 +146,7 @@ pub fn build_webhook_args(config: &KVS, default_queue_dir: &str, target_type: Ta
         enable: true,
         endpoint: endpoint_url,
         auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
-        queue_dir: config
-            .lookup(WEBHOOK_QUEUE_DIR)
-            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, WEBHOOK_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(WEBHOOK_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -180,9 +178,7 @@ pub fn validate_webhook_config(config: &KVS, default_queue_dir: &str) -> Result<
         ));
     }
 
-    let queue_dir = config
-        .lookup(WEBHOOK_QUEUE_DIR)
-        .unwrap_or_else(|| default_queue_dir.to_string());
+    let queue_dir = queue_dir_or_default(config, WEBHOOK_QUEUE_DIR, default_queue_dir);
     if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
         return Err(TargetError::Configuration("Webhook queue directory must be an absolute path".to_string()));
     }
@@ -234,7 +230,7 @@ pub fn build_mqtt_args(config: &KVS, default_queue_dir: &str, target_type: Targe
             config.lookup(MQTT_TLS_TRUST_LEAF_AS_CA).as_deref(),
             config.lookup(MQTT_WS_PATH_ALLOWLIST).as_deref(),
         )?,
-        queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, MQTT_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(MQTT_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -311,7 +307,7 @@ pub fn build_nats_args(config: &KVS, default_queue_dir: &str, target_type: Targe
         tls_client_cert: config.lookup(NATS_TLS_CLIENT_CERT).unwrap_or_default(),
         tls_client_key: config.lookup(NATS_TLS_CLIENT_KEY).unwrap_or_default(),
         tls_required: parse_target_bool(config.lookup(NATS_TLS_REQUIRED).as_deref()).unwrap_or(false),
-        queue_dir: config.lookup(NATS_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, NATS_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(NATS_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -353,9 +349,7 @@ pub fn build_pulsar_args(config: &KVS, default_queue_dir: &str, target_type: Tar
         tls_ca: config.lookup(PULSAR_TLS_CA).unwrap_or_default(),
         tls_allow_insecure: parse_target_bool(config.lookup(PULSAR_TLS_ALLOW_INSECURE).as_deref()).unwrap_or(false),
         tls_hostname_verification: parse_target_bool(config.lookup(PULSAR_TLS_HOSTNAME_VERIFICATION).as_deref()).unwrap_or(true),
-        queue_dir: config
-            .lookup(PULSAR_QUEUE_DIR)
-            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, PULSAR_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(PULSAR_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -405,9 +399,7 @@ pub fn build_redis_args(
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(15)),
-        queue_dir: config
-            .lookup(REDIS_QUEUE_DIR)
-            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, REDIS_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(REDIS_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -463,9 +455,7 @@ pub fn build_postgres_args(config: &KVS, default_queue_dir: &str, target_type: T
         tls_ca: config.lookup(POSTGRES_TLS_CA).unwrap_or_default(),
         tls_client_cert: config.lookup(POSTGRES_TLS_CLIENT_CERT).unwrap_or_default(),
         tls_client_key: config.lookup(POSTGRES_TLS_CLIENT_KEY).unwrap_or_default(),
-        queue_dir: config
-            .lookup(POSTGRES_QUEUE_DIR)
-            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, POSTGRES_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(POSTGRES_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -529,9 +519,7 @@ pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: Targ
         },
         sasl_username,
         sasl_password,
-        queue_dir: config
-            .lookup(KAFKA_QUEUE_DIR)
-            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, KAFKA_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(KAFKA_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -569,9 +557,7 @@ pub fn build_mysql_args(config: &KVS, default_queue_dir: &str, target_type: Targ
         tls_ca: config.lookup(MYSQL_TLS_CA).unwrap_or_default(),
         tls_client_cert: config.lookup(MYSQL_TLS_CLIENT_CERT).unwrap_or_default(),
         tls_client_key: config.lookup(MYSQL_TLS_CLIENT_KEY).unwrap_or_default(),
-        queue_dir: config
-            .lookup(MYSQL_QUEUE_DIR)
-            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_dir: queue_dir_or_default(config, MYSQL_QUEUE_DIR, default_queue_dir),
         queue_limit: config
             .lookup(MYSQL_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())

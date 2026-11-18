@@ -1,0 +1,133 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+name: Release candidate (Linux)
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Final product version (no preview suffix)
+        type: string
+        required: true
+      source_sha:
+        description: Full reviewed source commit
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-candidate-${{ inputs.version }}
+  cancel-in-progress: false
+jobs:
+  freeze:
+    if: github.repository == 'rustfs/rustfs' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      manifest: ${{ steps.freeze.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Freeze or recover original inputs
+        id: freeze
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 scripts/release/pipeline.py prepare --version "$VERSION" --source "$SOURCE_SHA" --directory frozen
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.freeze.outputs.reused != 'true'
+        with:
+          name: release-inputs
+          path: frozen/inputs.json
+          if-no-files-found: error
+          retention-days: 30
+  linux:
+    needs: freeze
+    uses: ./.github/workflows/build.yml
+    with:
+      candidate_manifest: ${{ needs.freeze.outputs.manifest }}
+      platforms: linux
+  upgrade:
+    needs: [freeze, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      RUSTUP_TOOLCHAIN: ${{ fromJson(needs.freeze.outputs.manifest).toolchain }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ fromJson(needs.freeze.outputs.manifest).workflow_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          rust-version: ${{ fromJson(needs.freeze.outputs.manifest).toolchain }}
+          cache-shared-key: release-upgrade-harness-hosted
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: "false"
+          install-test-tools: "false"
+      - name: Verify archived server against previous releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_MANIFEST: ${{ needs.freeze.outputs.manifest }}
+        run: |
+          python3 - <<'PYVERIFY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/release')
+          import candidate as c, pipeline, verify
+          inputs = pipeline.manifest_env()
+          run = pipeline.current_run('release-candidate.yml')
+          if any(a['name'] == 'release-upgrade' for a in c.artifact_list(run['id'])):
+              c.download_artifact(run, 'release-upgrade', 'receipts')
+              pipeline.verify_evidence(inputs, Path('receipts'), {run['id']: run})
+              c.emit_output('reused', 'true')
+          else:
+              target = 'linux-x86_64-gnu'
+              c.download_artifact(run, f"candidate-{inputs['candidate_id']}-{target}", 'binary')
+              verify.upgrade(inputs, Path('binary') / f"rustfs-{target}-v{inputs['version']}.zip", Path('receipts'))
+          PYVERIFY
+        id: verify
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.verify.outputs.reused != 'true'
+        with:
+          name: release-upgrade
+          path: receipts/*
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: release-upgrade-failure-${{ github.run_attempt }}
+          path: receipts/*
+          retention-days: 7
+  seal-linux:
+    needs: [freeze, linux, upgrade]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Collect trusted receipts and seal Linux bytes
+        id: seal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release/pipeline.py linux-seal --directory sealed
+          {
+            echo '## Linux acceptance'
+            echo 'Use this run ID and manifest SHA-256 when starting Release candidate (complete).'
+            sha256sum sealed/linux-manifest.json
+            echo 'Record cluster, performance, integrity and upgrade acceptance in backlog before continuing.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.seal.outputs.reused != 'true'
+        with:
+          name: release-linux
+          path: sealed/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

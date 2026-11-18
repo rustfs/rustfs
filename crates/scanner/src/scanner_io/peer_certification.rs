@@ -24,6 +24,27 @@ use crate::storage_api::EcstoreScannerPublicationLeaseGrant;
 /// or a cold bucket copied from the old set root is not a completion.
 pub(super) type ScannerBucketCompletions = HashMap<DataUsageCacheSource, HashMap<String, uuid::Uuid>>;
 
+/// ACK requires actual complete contributions from every physical source.
+/// A set-root value may be usable for display while failing this stronger gate.
+pub(super) fn bucket_completed_in_all_sources(
+    bucket: &str,
+    expected_sources: &HashSet<DataUsageCacheSource>,
+    completions: &ScannerBucketCompletions,
+) -> Option<uuid::Uuid> {
+    if expected_sources.is_empty() || completions.len() != expected_sources.len() {
+        return None;
+    }
+    let mut incarnation = None;
+    for source in expected_sources {
+        let value = completions.get(source)?.get(bucket).copied().filter(|id| !id.is_nil())?;
+        if incarnation.is_some_and(|previous| previous != value) {
+            return None;
+        }
+        incarnation = Some(value);
+    }
+    incarnation
+}
+
 #[derive(Debug)]
 pub(super) struct ScannerRemoteDirtyUsageWindow {
     pub(super) before: ScannerActivitySnapshot,
@@ -291,6 +312,55 @@ mod tests {
 
     const HOT: uuid::Uuid = uuid::Uuid::from_u128(71);
     const COLD: uuid::Uuid = uuid::Uuid::from_u128(72);
+
+    #[test]
+    fn fresh_bucket_ack_requires_the_exact_live_source_inventory() {
+        let source_a = DataUsageCacheSource::new(0, 0);
+        let source_b = DataUsageCacheSource::new(1, 0);
+        let expected = HashSet::from([source_a, source_b]);
+        let contribution = HashMap::from([("bucket".to_string(), COLD)]);
+        let complete = HashMap::from([(source_a, contribution.clone()), (source_b, contribution.clone())]);
+        assert_eq!(bucket_completed_in_all_sources("bucket", &expected, &complete), Some(COLD));
+        assert_eq!(bucket_completed_in_all_sources("bucket", &HashSet::new(), &HashMap::new()), None);
+        for (label, sources) in [
+            ("missing source", HashMap::from([(source_a, contribution.clone())])),
+            (
+                "missing bucket",
+                HashMap::from([(source_a, contribution.clone()), (source_b, HashMap::new())]),
+            ),
+            (
+                "nil incarnation",
+                HashMap::from([
+                    (source_a, contribution.clone()),
+                    (source_b, HashMap::from([("bucket".to_string(), uuid::Uuid::nil())])),
+                ]),
+            ),
+            (
+                "recreated bucket",
+                HashMap::from([
+                    (source_a, contribution.clone()),
+                    (source_b, HashMap::from([("bucket".to_string(), HOT)])),
+                ]),
+            ),
+            (
+                "wrong source",
+                HashMap::from([
+                    (source_a, contribution.clone()),
+                    (DataUsageCacheSource::new(2, 0), contribution.clone()),
+                ]),
+            ),
+            (
+                "unexpected source",
+                HashMap::from([
+                    (source_a, contribution.clone()),
+                    (source_b, contribution.clone()),
+                    (DataUsageCacheSource::new(2, 0), contribution),
+                ]),
+            ),
+        ] {
+            assert_eq!(bucket_completed_in_all_sources("bucket", &expected, &sources), None, "{label}");
+        }
+    }
 
     fn peers(generation: u64, hot_generation: u64) -> Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)> {
         ["peer-a", "peer-b"]

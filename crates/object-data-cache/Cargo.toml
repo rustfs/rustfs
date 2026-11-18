@@ -41,12 +41,11 @@ cache = [
     "dep:tracing",
     "sysinfo/multithread",
 ]
-hotpath = ["cache", "hotpath/hotpath", "hotpath/tokio"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath = ["cache"]
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
 
 [dependencies]
-hotpath.workspace = true
 bytes = { workspace = true, optional = true, features = ["serde"] }
 metrics = { workspace = true, optional = true }
 moka = { workspace = true, optional = true, features = ["future"] }

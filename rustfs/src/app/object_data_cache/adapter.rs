@@ -110,6 +110,16 @@ impl ObjectDataCacheAdapter {
         self.cache.materialize_fill_enabled()
     }
 
+    /// Returns true when the adapter accepts any fill.
+    pub(crate) fn fill_enabled(&self) -> bool {
+        self.cache.fill_enabled()
+    }
+
+    /// Largest body a fill can accept.
+    pub(crate) fn fill_size_ceiling_bytes(&self) -> u64 {
+        self.cache.fill_size_ceiling_bytes()
+    }
+
     /// Builds an engine-level GET plan.
     pub(crate) fn plan_get(&self, request: ObjectDataCacheGetRequest<'_>) -> ObjectDataCacheGetPlan {
         self.cache.plan_get(request)

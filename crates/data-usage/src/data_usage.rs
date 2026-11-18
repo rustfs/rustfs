@@ -66,6 +66,12 @@ pub const LEGACY_DATA_USAGE_OBJECT_NAME: &str = ".usage.json";
 /// stale tier names from growing persisted per-tier maps without bound.
 pub const UNKNOWN_TIER: &str = "UNKNOWN_TIER";
 
+/// Whether a remote tier name can be represented in scanner accounting.
+/// Local storage classes are checked separately by the configuration owner.
+pub fn is_scannable_tier_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 256 && !name.bytes().any(|byte| byte.is_ascii_control()) && name != UNKNOWN_TIER
+}
+
 /// Returns true when `existing_last_update` is ahead of `now` by more than
 /// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
 /// trusted for staleness comparisons and a fresh snapshot save must be allowed.
@@ -474,6 +480,12 @@ pub struct BucketTargetUsageInfo {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketUsageInfo {
     pub size: u64,
+    /// Provenance of this value. Missing and unknown states remain unproven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_value_state: Option<crate::BucketUsageValueState>,
+    /// Certification of this exact value, independent of aggregation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_certification: Option<crate::BucketUsageCertification>,
     /// Bucket identity certified by every set contributing to this snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_incarnation: Option<String>,
@@ -580,6 +592,18 @@ pub struct DataUsageInfo {
     /// which last-known-good generation contributed to the view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage_snapshot_set_states: Vec<DataUsageSnapshotSetState>,
+    /// Complete mixed observations for admin display only. Legacy bucket maps
+    /// and quota consumers continue to use the canonical values above.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "crate::usage_observation::deserialize_bucket_observations"
+    )]
+    pub usage_snapshot_bucket_observations: HashMap<String, crate::DataUsageBucketObservation>,
+    /// Response-only marker: a projected admin view must never be persisted or
+    /// admitted as a quota/cache baseline, including after serialization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_snapshot_admin_projection: bool,
     /// Buckets whose dirty-usage generation moved while this complete
     /// snapshot was being walked. Their `buckets_usage` values are the walk
     /// result, which the cycle could not certify as current; the next cycle
@@ -709,7 +733,8 @@ pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &Da
 /// This applies the structural, exact-baseline, and generation checks of
 /// [`observed_data_usage_is_newer`] without retaining the baseline's bucket maps.
 pub fn observed_data_usage_is_newer_than_identity(observed: &DataUsageInfo, authoritative: DataUsageSnapshotIdentity) -> bool {
-    observed.usage_snapshot_converged == Some(false)
+    !observed.usage_snapshot_admin_projection
+        && observed.usage_snapshot_converged == Some(false)
         && (observed.is_complete_bucket_usage_snapshot() || observed.is_valid_partial_snapshot())
         && observed.usage_snapshot_authoritative_baseline == Some(authoritative)
         && data_usage_identity_is_newer(observed.snapshot_identity(), authoritative)
@@ -1764,12 +1789,7 @@ impl DataUsageCache {
         let mut found = HashSet::new();
         found.insert(top);
         mark(self, &top_e, &mut found);
-        self.cache.retain(|k, _| {
-            if !found.contains(k) {
-                return false;
-            }
-            true
-        });
+        self.cache.retain(|k, _| found.contains(k));
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
@@ -2029,7 +2049,8 @@ impl DataUsageInfo {
 
     /// Whether this snapshot authoritatively covers every reported bucket.
     pub fn is_complete_bucket_usage_snapshot(&self) -> bool {
-        !self.usage_snapshot_bootstrap_pending
+        !self.usage_snapshot_admin_projection
+            && !self.usage_snapshot_bootstrap_pending
             && self.usage_snapshot_complete
             && self.last_update.is_some()
             && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
@@ -2039,7 +2060,8 @@ impl DataUsageInfo {
     /// admin display. Partial data is accepted only with unique set states,
     /// a plan digest for every state, and at least one usable generation.
     pub fn is_valid_partial_snapshot(&self) -> bool {
-        if self.usage_snapshot_bootstrap_pending
+        if self.usage_snapshot_admin_projection
+            || self.usage_snapshot_bootstrap_pending
             || !self.usage_snapshot_partial
             || self.usage_snapshot_converged != Some(false)
             || self.last_update.is_none()
@@ -2077,9 +2099,11 @@ impl DataUsageInfo {
             Ok(name) => name,
             Err(_) => return,
         };
+        self.usage_snapshot_bucket_observations.remove(&bucket_name);
 
         // Update bucket statistics
         if let Some(bucket_usage) = self.buckets_usage.get_mut(&bucket_name) {
+            bucket_usage.mark_observed();
             bucket_usage.size += meta_object.size as u64;
             bucket_usage.objects_count += 1;
             bucket_usage.versions_count += 1; // Simplified: assume 1 version per object
@@ -2132,6 +2156,7 @@ impl DataUsageInfo {
             Ok(name) => name,
             Err(_) => return,
         };
+        self.usage_snapshot_bucket_observations.remove(&bucket_name);
 
         // Calculate accurate statistics from all versions
         let mut total_size = 0u64;
@@ -2160,6 +2185,7 @@ impl DataUsageInfo {
 
         // Update bucket statistics
         if let Some(bucket_usage) = self.buckets_usage.get_mut(&bucket_name) {
+            bucket_usage.mark_observed();
             bucket_usage.size += total_size;
             bucket_usage.objects_count += 1;
             bucket_usage.versions_count += versions_count;
@@ -2340,6 +2366,9 @@ impl BucketUsageInfo {
     /// Add size summary to this bucket usage
     /// Merge another BucketUsageInfo into this one
     pub fn merge(&mut self, other: &BucketUsageInfo) {
+        // Adding contributions produces a new value, not either input's
+        // whole-bucket certificate. The scanner may certify the final sum.
+        self.mark_observed();
         if self.bucket_incarnation != other.bucket_incarnation {
             self.bucket_incarnation = None;
         }

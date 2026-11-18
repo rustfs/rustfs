@@ -303,6 +303,7 @@ pub(crate) fn table_name_from_marker_path(namespace: &Namespace, object_key: &st
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn metadata_location_from_metadata_file_path(
     namespace: &Namespace,
     table: &IdentifierSegment,

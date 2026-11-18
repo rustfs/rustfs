@@ -16,6 +16,7 @@
 //! This module introduces explicit dependency injection entry points
 //! for storage, IAM, and KMS handles.
 
+mod envelope;
 mod global;
 mod handles;
 mod interfaces;
@@ -23,6 +24,9 @@ mod runtime_sources;
 mod server_slot;
 mod startup;
 
+pub(crate) use envelope::RequestHead;
+pub use envelope::{RequestCredentials, RequestEnvelope};
+pub(crate) use envelope::{authorize_owned_internal_object_request, authorize_owned_request};
 pub use global::*;
 pub use handles::*;
 pub use interfaces::*;
@@ -45,9 +49,9 @@ use rustfs_iam::{
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
 use rustfs_lock::LockClient;
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use s3s::dto::SelectObjectContentInput;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
@@ -263,7 +267,7 @@ pub fn resolve_action_credentials() -> Option<Credentials> {
 }
 
 /// Resolve region using AppContext-first precedence.
-pub fn resolve_region() -> Option<s3s::region::Region> {
+pub fn resolve_region() -> Option<rustfs_s3_types::Region> {
     resolve_region_with(get_global_app_context())
 }
 
@@ -480,7 +484,7 @@ fn resolve_action_credentials_with(context: Arc<AppContext>) -> Option<Credentia
     context.action_credentials().get()
 }
 
-fn resolve_region_with(context: Option<Arc<AppContext>>) -> Option<s3s::region::Region> {
+fn resolve_region_with(context: Option<Arc<AppContext>>) -> Option<rustfs_s3_types::Region> {
     context.and_then(|context| context.region().get())
 }
 
@@ -843,11 +847,11 @@ mod tests {
     }
 
     struct TestRegionInterface {
-        region: Option<s3s::region::Region>,
+        region: Option<rustfs_s3_types::Region>,
     }
 
     impl RegionInterface for TestRegionInterface {
-        fn get(&self) -> Option<s3s::region::Region> {
+        fn get(&self) -> Option<rustfs_s3_types::Region> {
             self.region.clone()
         }
     }
@@ -971,11 +975,11 @@ mod tests {
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: None,
-            request: s3s::dto::SelectObjectContentRequest {
+            request: rustfs_s3select_api::request::SelectObjectContentRequest {
                 expression: "SELECT * FROM S3Object".to_string(),
-                expression_type: s3s::dto::ExpressionType::from_static("SQL"),
-                input_serialization: s3s::dto::InputSerialization::default(),
-                output_serialization: s3s::dto::OutputSerialization::default(),
+                expression_type: rustfs_s3select_api::request::ExpressionType::SQL,
+                input_serialization: rustfs_s3select_api::request::InputSerialization::default(),
+                output_serialization: rustfs_s3select_api::request::OutputSerialization::default(),
                 request_progress: None,
                 scan_range: None,
             },
@@ -1045,7 +1049,7 @@ mod tests {
             access_key: "context-access-key".to_string(),
             ..Default::default()
         };
-        let context_region: s3s::region::Region = "context-region".parse().expect("test region");
+        let context_region: rustfs_s3_types::Region = "context-region".parse().expect("test region");
         let context_oidc_sys = match OidcSys::empty() {
             Ok(sys) => sys,
             Err(err) => unreachable!("test OIDC sys should initialize: {err}"),

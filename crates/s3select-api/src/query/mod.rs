@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::SelectObjectContentInput;
+use crate::request::SelectObjectContentInput;
 use std::sync::Arc;
 
 use crate::{SelectInputMetrics, SelectObjectSnapshot};
@@ -92,7 +92,9 @@ impl Query {
 
 #[cfg(test)]
 fn test_query() -> Query {
-    use s3s::dto::{CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentRequest};
+    use crate::request::{
+        CsvInput, CsvOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentRequest,
+    };
 
     let input = SelectObjectContentInput {
         bucket: "bucket".to_string(),
@@ -103,13 +105,13 @@ fn test_query() -> Query {
         sse_customer_key_md5: None,
         request: SelectObjectContentRequest {
             expression: "SELECT * FROM S3Object".to_string(),
-            expression_type: ExpressionType::from_static(ExpressionType::SQL),
+            expression_type: ExpressionType::SQL,
             input_serialization: InputSerialization {
-                csv: Some(CSVInput::default()),
+                csv: Some(CsvInput::default()),
                 ..Default::default()
             },
             output_serialization: OutputSerialization {
-                csv: Some(CSVOutput::default()),
+                csv: Some(CsvOutput::default()),
                 ..Default::default()
             },
             request_progress: None,

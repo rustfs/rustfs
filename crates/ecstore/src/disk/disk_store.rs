@@ -124,7 +124,7 @@ where
     Box::pin(operation(io_permit))
 }
 
-struct SlowDiskWriter {
+pub(crate) struct SlowDiskWriter {
     inner: crate::disk::FileWriter,
     endpoint: Endpoint,
     pending: Option<(&'static str, time::Instant)>,
@@ -141,6 +141,10 @@ impl SlowDiskWriter {
             timer: None,
             warned: false,
         }
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut dyn crate::disk::DiskFileWriter {
+        &mut *self.inner
     }
 
     fn observe<T>(&mut self, cx: &mut Context<'_>, op: &'static str, result: Poll<T>) -> Poll<T> {
@@ -341,6 +345,7 @@ const DISK_OPERATION_NAMES: &[&str] = &[
     "read_parts",
     "read_multiple",
     "write_all",
+    "write_format_control",
     "compare_and_update_file",
     "read_all",
 ];
@@ -3053,6 +3058,15 @@ impl DiskAPI for LocalDiskWrapper {
         })
     }
 
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<super::os::NativeBucketCreationWitness>> {
+        self.track_disk_health_with_op(
+            "bucket_creation_witness",
+            || async { self.disk.bucket_creation_witness(volume).await },
+            Duration::ZERO,
+        )
+        .await
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()> {
         // Scoped heal must drain directory creation before releasing its lifecycle owner.
         let timeout = if crate::store::bucket_heal_scope(volume).is_some() {
@@ -3645,6 +3659,16 @@ impl DiskAPI for LocalDiskWrapper {
                 TimeoutHealthAction::MarkFailure
             },
             DiskMetricMutation::Write,
+        )
+        .await
+    }
+
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        self.track_disk_health_mutation(
+            "write_format_control",
+            DiskMetricMutation::Write,
+            || async { self.disk.write_format_control(path, data).await },
+            get_max_timeout_duration(),
         )
         .await
     }

@@ -37,10 +37,10 @@ use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics}
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use s3s::dto::SelectObjectContentInput;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock, RwLock as StdRwLock},
@@ -409,8 +409,12 @@ impl ActionCredentialInterface for ActionCredentialHandle {
 }
 
 impl RegionInterface for ECStore {
-    fn get(&self) -> Option<s3s::region::Region> {
+    fn get(&self) -> Option<rustfs_s3_types::Region> {
         self.region()
+    }
+
+    fn additional(&self) -> Vec<rustfs_s3_types::Region> {
+        self.additional_regions()
     }
 }
 
@@ -419,7 +423,7 @@ impl RegionInterface for ECStore {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<s3s::region::Region> {
+    fn get(&self) -> Option<rustfs_s3_types::Region> {
         runtime_sources::region()
     }
 }

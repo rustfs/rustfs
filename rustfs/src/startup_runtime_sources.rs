@@ -43,8 +43,13 @@ pub(crate) fn publish_action_credentials_tolerant(
     }
 }
 
-pub(crate) fn publish_region(instance_ctx: &Arc<InstanceContext>, region: s3s::region::Region) {
+pub(crate) fn publish_region(
+    instance_ctx: &Arc<InstanceContext>,
+    region: rustfs_s3_types::Region,
+    additional_regions: Vec<rustfs_s3_types::Region>,
+) {
     instance_ctx.set_region(region);
+    instance_ctx.set_additional_regions(additional_regions);
 }
 
 pub(crate) fn publish_server_port(port: u16) {

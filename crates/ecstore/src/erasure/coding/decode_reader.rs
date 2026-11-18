@@ -1052,9 +1052,9 @@ mod tests {
             Ok(NoopDecodeWorkspace { shard_len })
         }
 
-        fn reconstruct_into(
+        fn reconstruct_into<S: crate::erasure::codec::shard_buf::ShardBytes>(
             &self,
-            _shards: &mut [Option<Vec<u8>>],
+            _shards: &mut [Option<S>],
             _workspace: &mut Self::Workspace,
         ) -> io::Result<&'static str> {
             Ok("noop_called")

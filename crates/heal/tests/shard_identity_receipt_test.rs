@@ -30,6 +30,78 @@ use storage_api::integration::{
     WriteCommitGuard, WriteCompletion,
 };
 
+async fn complete_fixture_replicas(env: &TestECStoreEnv, bucket: &str, object: &str) {
+    // TailDrained completes fan-out, but a successful quorum write may still
+    // have minority failures. Fault injection needs a fully repaired baseline.
+    let result = ECStoreHealStorage::new(env.ecstore.clone())
+        .heal_object_with_receipt(
+            bucket,
+            object,
+            None,
+            &HealOpts {
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("complete protected fixture replicas before fault injection");
+    assert!(result.error.is_none(), "fixture repair failed: {:?}", result.error);
+    assert_eq!(result.item.after.drives.len(), env.disk_paths.len());
+    assert!(
+        result.item.after.drives.iter().all(|drive| drive.state == "ok"),
+        "fixture requires every replica, not only read/write quorum: {:?}",
+        result.item.after.drives
+    );
+    assert!(result.item.integrity_verified, "fixture must retain protected payload verification");
+}
+
+#[tokio::test]
+#[serial]
+async fn mixed_batch_fixture_repairs_a_missing_minority_replica() {
+    let root = tempfile::tempdir().expect("minority replica fixture");
+    let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+    let bucket = "mixed-fixture-baseline";
+    let object = "object";
+    env.make_bucket(bucket, false).await;
+    let expected = vec![0x5a; 1024 * 1024 + 123];
+    env.ecstore
+        .put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected.clone()),
+            &ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("quorum commit fixture");
+    // Guarantee a minority failure regardless of whether the original write
+    // succeeded on every disk, then repair it before any test fault is applied.
+    let replica = env.disk_paths[0].join(bucket).join(object);
+    if replica.exists() {
+        tokio::fs::remove_dir_all(&replica)
+            .await
+            .expect("remove one complete replica");
+    }
+    complete_fixture_replicas(&env, bucket, object).await;
+    let disks = env.ecstore.pools[0].get_disks(0);
+    for disk in disks.disks.read().await.iter().flatten() {
+        disk.read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("every fixture replica has metadata after completion");
+    }
+    let mut reader = env
+        .ecstore
+        .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+        .await
+        .expect("read the completed fixture");
+    let mut actual = Vec::new();
+    reader.stream.read_to_end(&mut actual).await.expect("completed fixture body");
+    assert_eq!(actual, expected);
+}
+
 #[test]
 fn disabled_lock_reports_only_quorum_selection_and_deep_check_observations() {
     const CHILD_ENV: &str = "RUSTFS_TEST_DISABLED_LOCK_HEAL_CHILD";
@@ -704,6 +776,7 @@ fn admin_mixed_batch_retains_repairs_after_object_retry_exhaustion() {
                             )
                             .await
                             .expect("commit complete fixture");
+                        complete_fixture_replicas(&env, bucket, object).await;
                         for (slot, disk) in disks.iter().enumerate() {
                             let meta = disk
                                 .read_version("", bucket, object, "", &ReadOptions::default())

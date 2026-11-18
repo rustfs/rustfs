@@ -21,7 +21,7 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertIn("missing-referenced-object", by_case)
         self.assertIn("maintenance-stale-plan", by_case)
         self.assertIn("external-bridge-conflict", by_case)
-        self.assertIn("backing-migration-blocked", by_case)
+        self.assertIn("backup-restore-blocked", by_case)
         self.assertIn("permission-negative", by_case)
 
         self.assertEqual(by_case["commit-cas-conflict"]["expected_behavior"], "conflict-without-pointer-advance")
@@ -102,14 +102,14 @@ class FailureCoverageTest(unittest.TestCase):
 
         self.assertEqual(rehearsal["mode"], "manual-or-ci-optional")
         self.assertEqual(rehearsal["ci_gate"], "RUSTFS_TABLE_CATALOG_DR_REHEARSAL=1")
-        self.assertIn("record the RustFS build and catalog backing mode before starting", rehearsal["preconditions"])
+        self.assertIn("record the RustFS build, object catalog mode, node count, and object backend before starting", rehearsal["preconditions"])
         self.assertIn("current metadata pointer remains recoverable or deliberately rolled back", rehearsal["expected_invariants"])
 
         phases = {phase["name"]: phase for phase in rehearsal["phases"]}
         self.assertIn("capture-baseline", phases)
         self.assertIn("diagnose-and-repair", phases)
         self.assertIn("rollback-or-import", phases)
-        self.assertIn("migration-preflight", phases)
+        self.assertIn("backup-restore-preflight", phases)
         self.assertIn("post-recovery-validation", phases)
 
         baseline_steps = {step["name"]: step for step in phases["capture-baseline"]["steps"]}
@@ -134,13 +134,10 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertIn("properties", rollback_steps["import-known-metadata"]["body"])
         self.assertNotIn("external-version-token", rollback_steps["import-known-metadata"]["body"])
 
-        migration_steps = {step["name"]: step for step in phases["migration-preflight"]["steps"]}
-        self.assertEqual(migration_steps["durable-backing-migration-dry-run"]["path"], "/iceberg/v1/lake/catalog/migration")
-        self.assertEqual(migration_steps["durable-backing-migration-materialize"]["method"], "POST")
-        self.assertIn(
-            "READY_TO_SNAPSHOT",
-            migration_steps["durable-backing-migration-dry-run"]["expected_behavior"],
-        )
+        backup_steps = {step["name"]: step for step in phases["backup-restore-preflight"]["steps"]}
+        self.assertEqual(backup_steps["object-catalog-backup"]["path"], "/iceberg/v1/lake/catalog/backup")
+        self.assertEqual(backup_steps["object-catalog-restore"]["method"], "POST")
+        self.assertIn("referenced Iceberg object graph", backup_steps["object-catalog-backup"]["expected_behavior"])
 
         validation_steps = {step["name"]: step for step in phases["post-recovery-validation"]["steps"]}
         self.assertEqual(validation_steps["load-table-after-recovery"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders")
@@ -179,7 +176,7 @@ class FailureCoverageTest(unittest.TestCase):
             writer_count=8,
             maintenance_worker_count=3,
             iteration_count=50,
-            catalog_backing="durable-strong",
+            catalog_backing="object",
         )
 
         self.assertEqual(rehearsal["mode"], "manual-or-ci-optional")
@@ -187,14 +184,14 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertEqual(rehearsal["parameters"]["writer_count"], 8)
         self.assertEqual(rehearsal["parameters"]["maintenance_worker_count"], 3)
         self.assertEqual(rehearsal["parameters"]["iteration_count"], 50)
-        self.assertEqual(rehearsal["parameters"]["catalog_backing"], "durable-strong")
+        self.assertEqual(rehearsal["parameters"]["catalog_backing"], "object")
         self.assertIn("current metadata generation is monotonic", rehearsal["expected_invariants"])
         self.assertIn("maintenance jobs never delete reachable table objects", rehearsal["expected_invariants"])
 
         phases = {phase["name"]: phase for phase in rehearsal["phases"]}
         self.assertIn("concurrent-commit-stress", phases)
         self.assertIn("maintenance-scheduler-failover", phases)
-        self.assertIn("durable-backing-cutover-under-load", phases)
+        self.assertIn("object-backup-restore-under-load", phases)
         self.assertIn("recovery-rollback-import-under-load", phases)
         self.assertIn("post-run-evidence", phases)
 
@@ -208,10 +205,10 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertEqual(scheduler_steps["claim-worker-job"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/maintenance/worker/run")
         self.assertEqual(scheduler_steps["recover-expired-lease"]["expected_status"], "200-or-409")
 
-        cutover_steps = {step["name"]: step for step in phases["durable-backing-cutover-under-load"]["steps"]}
-        self.assertEqual(cutover_steps["migration-dry-run-before-cutover"]["path"], "/iceberg/v1/lake/catalog/migration")
-        self.assertEqual(cutover_steps["materialize-durable-backing-before-cutover"]["method"], "POST")
-        self.assertIn("catalog-backup", cutover_steps["capture-cutover-backup"]["expected_behavior"])
+        backup_restore_steps = {step["name"]: step for step in phases["object-backup-restore-under-load"]["steps"]}
+        self.assertEqual(backup_restore_steps["capture-object-catalog-backup"]["path"], "/iceberg/v1/lake/catalog/backup")
+        self.assertEqual(backup_restore_steps["restore-object-catalog-backup"]["method"], "POST")
+        self.assertIn("complete manifest/data/delete graph", backup_restore_steps["restore-object-catalog-backup"]["expected_behavior"])
 
         recovery_steps = {step["name"]: step for step in phases["recovery-rollback-import-under-load"]["steps"]}
         self.assertEqual(recovery_steps["safe-recovery-repair-under-load"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/recovery")
@@ -241,7 +238,7 @@ class FailureCoverageTest(unittest.TestCase):
                 "--iteration-count",
                 "25",
                 "--catalog-backing",
-                "durable-strong",
+                "object",
                 "--print-scale-fault-rehearsal",
             ]
         )

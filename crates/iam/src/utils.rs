@@ -18,18 +18,16 @@ use std::collections::HashSet;
 
 pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Result<String, jsonwebtoken::errors::Error> {
     let header = Header::new(Algorithm::HS512);
-    jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
+    let key = EncodingKey::from_secret(secret.as_bytes())?;
+    jsonwebtoken::encode(&header, &claims, &key)
 }
 
 pub fn extract_claims<T: DeserializeOwned + Clone>(
     token: &str,
     secret: &str,
 ) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
-    jsonwebtoken::decode::<T>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::new(Algorithm::HS512),
-    )
+    let key = DecodingKey::from_secret(secret.as_bytes())?;
+    jsonwebtoken::decode::<T>(token, &key, &jsonwebtoken::Validation::new(Algorithm::HS512))
 }
 
 pub fn extract_claims_allow_missing_exp<T: DeserializeOwned + Clone>(
@@ -39,7 +37,8 @@ pub fn extract_claims_allow_missing_exp<T: DeserializeOwned + Clone>(
     let mut validation = jsonwebtoken::Validation::new(Algorithm::HS512);
     validation.required_spec_claims = HashSet::new();
 
-    jsonwebtoken::decode::<T>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
+    let key = DecodingKey::from_secret(secret.as_bytes())?;
+    jsonwebtoken::decode::<T>(token, &key, &validation)
 }
 
 #[cfg(test)]

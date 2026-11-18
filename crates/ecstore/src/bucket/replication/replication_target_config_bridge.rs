@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::ReplicationConfiguration;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 
 use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt};
 use super::replication_filemeta_boundary::ReplicationType;
@@ -20,7 +20,7 @@ use super::replication_filemeta_boundary::ReplicationType;
 pub(crate) struct ReplicationTargetConfigBridge;
 
 impl ReplicationTargetConfigBridge {
-    pub(crate) fn target_is_used_by_rules(config: &ReplicationConfiguration, arn: &str) -> bool {
+    pub(crate) fn target_is_used_by_rules(config: &PersistedReplicationConfiguration, arn: &str) -> bool {
         config
             .filter_target_arns(&ObjectOpts {
                 op_type: ReplicationType::All,
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn target_config_bridge_matches_role_target() {
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: " arn:target ".to_string(),
             rules: Vec::new(),
         };

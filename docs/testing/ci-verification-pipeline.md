@@ -8,6 +8,8 @@ The classifier reads the pull request base revision's planner and policy. It com
 
 The committed policy is `enforced`: ordinary Rust changes select their reverse dependency closure plus the fixed core inventory, and unrelated changes can omit the Connect specialization. Package-owned fixtures, non-Rust inputs, build scripts, manifests, unknown paths and non-PR events retain full validation. Existing documentation and isolated E2E scopes remain conservative. Changing a PR's own policy cannot authorize skipping its base revision's requirements. A base planner predating the current workflow contract clears all narrower outputs and selects the full matrix. Set the policy back to `shadow` to retain proposed selections while restoring full ordinary-code execution; do not remove core inventories or negative checks as a rollback.
 
+Stable installation-version alignment has one content-based exception in enforced mode: literal version fields in `flake.nix`, `helm/rustfs/Chart.yaml` and `rustfs.spec`, plus a standard prepended RPM release note, can use the documentation scope. Quick Checks, Typos, CLA and the required aggregate remain. The planner compares both complete Git blobs and requires ordinary non-executable files; changes to build logic, CLI pins, chart settings, RPM macros or older changelog entries retain the full gate. New/deleted files, mode changes, prerelease syntax, unavailable history, shadow rollout and explicit full-path policy overrides also retain full validation. Product-code changes in the same PR retain their normal dependency and core coverage, and main pushes, merge groups, scheduled and manual runs still validate the complete candidate. This exception does not establish artifact availability or authorize a release; post-release checks still verify the published target before updating defaults.
+
 `Test and Lint` remains the required aggregate name. Every verification producer and consumer is a direct dependency. The verifier accepts only the effective plan's exact expected success/skipped outcomes; failure, cancellation, missing results, extra jobs or a plan for a different candidate fail. Quick Checks and CLA retain their separate required names.
 
 ## Build and execute
@@ -20,9 +22,7 @@ The E2E producer builds the hooks server and its existing provenance sidecars, b
 
 Consumer setup does not restore a Cargo target cache. It installs the runtime, then downloads and validates the current artifact. Each consumer extracts once when listing tests; subsequent runs use the extracted Cargo and binary metadata, including the serial ignored ILM run. Missing metadata fails instead of triggering a rebuild. Several tests embed absolute manifest paths and binary paths at compile time. Until those fixtures are made relocatable and tested, consumers require the same absolute checkout path as the producer, use the same runner family, and extract into that checkout's `target` directory. `--workspace-remap` alone does not rewrite strings compiled into a test executable. Source fixtures remain in the exact checkout, while non-test binaries and build outputs travel in the archive. The external s3s tool retains its independent pinned installation.
 
-Ordinary workspace execution uses one shard. To measure bounded sharding, manually dispatch `ci.yml` with `rehearse_workspace_shards=true`. The successful full execution supplies exact candidate durations and the test inventory. `scripts/ci_test_shards.py` asks nextest to resolve inherited group and thread constraints, keeps all constrained binaries together, then balances the remaining whole binaries across at most two ARC workers. Each worker verifies and extracts the same run attempt's archive once and executes from its metadata. The aggregate rejects missing, failed, cancelled, overlapping or mismatched shard results and verifies the exact union, including the migration proofs. The original full execution and serial ignored ILM run remain required during the rehearsal.
-
-Compare execution time and complete occupancy, including the extra transfer, extraction and aggregation, with the full baseline from that same run. This manual rehearsal deliberately pays for both paths; its total is not a production saving. Retain one production shard unless repeated measurements justify promotion. Native nextest hash partitions alone would split process-local resource groups and are not an acceptable replacement. Disabling the manual rehearsal restores the ordinary path without changing test responsibility.
+Workspace execution runs in one job. Splitting it across workers would have to keep every binary in a constrained nextest test group or with `threads-required` on one worker; native nextest hash partitions alone split those groups.
 
 ## Measurements and operational switches
 
@@ -55,7 +55,6 @@ python3 -m pip install PyYAML==6.0.3
 python3 scripts/ci_gate.py --self-test
 python3 scripts/ci_gate.py --check-workflow
 python3 scripts/test_ci_test_artifact.py
-python3 scripts/test_ci_test_shards.py
 python3 scripts/check_connect_release_boundary.py --self-test
 python3 scripts/test_ci_merge_queue.py
 python3 scripts/check_test_wiring.py --self-test

@@ -33,7 +33,6 @@ pub(crate) use crate::storage_api_contracts::object::{
 };
 pub(crate) use crate::storage_api_contracts::range::HTTPRangeSpec;
 pub(crate) use rustfs_replication::{DeletedObject as ReplicationDeletedObject, ObjectToDelete as ReplicationObjectToDelete};
-pub(crate) use rustfs_s3_client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;

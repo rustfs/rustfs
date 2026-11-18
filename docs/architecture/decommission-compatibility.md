@@ -72,6 +72,8 @@ Ordinary publication rechecks the selected pool against the durable pool metadat
 
 Running, queued, failed, canceled, and completed decommission states exclude the source from new ordinary publication, including new multipart uploads. Previously created multipart uploads retain their drain path while the source remains non-terminal; terminal source states reject further multipart publication. Failed and canceled entries become writable for new ordinary publication only after an allowed clear operation removes that state. This check does not change repair admission or the separate fence for operations that only release capacity.
 
+Bucket creation and deletion remove stale bucket usage through namespace maintenance, independently of the scanner publication pause. Failed or canceled decommission state alone does not reject that cleanup. The update checks the logical snapshot revision while holding the fixed and physical object locks, then conditionally publishes to a writable pool; a suspended source remains available for decommission to reconcile against the newer target. Cleanup preserves the scanner epoch and cycle, and retains the bucket namespace and movement guards until its physical writes finish even if the request is canceled. Namespace lease loss still fences the write. Scanner publication continues to require its existing movement admission.
+
 For mixed batch deletes, only the pools selected to receive new delete markers are publication targets. Exact-version deletions on other pools remain protected by the same pool metadata read fence, without treating the retiring source or an unrelated reserved target as a destination for those markers.
 
 ### Shared Capacity On Healthy Targets
@@ -142,6 +144,10 @@ The source is still revalidated under its mutation fence before migration.
 Existing capacity-owner and mutation checks reconcile the pending intent before
 source cleanup; the replica exception does not clear an unknown intent, rewrite
 the native target, or change the scanner's committed-membership selection.
+
+Backlog membership also carries an optional `set_id`, the first disk-slot UUID from the erasure set's persisted format. This identity survives pool removal, reordering, and disk replacement; `pool_index` and `set_index` remain routing locations. Readers resolve bound members by that UUID before checking the existing commit and rollback proofs. A new pool at a removed member's old index cannot impersonate that member. New publications bind every member, while positional records remain readable and gain identities only after their existing authority is verified. Replica schema 1 is retained; 1.0.4 readers ignore the additive identity field and still use positional membership.
+
+Finish upgrading all scanner-capable nodes before changing pool membership. An older writer can replace a bound record with a positional one. If a legacy record was already stranded by pool reindexing, the missing identity cannot be guessed safely: restore the known topology in which its proof was readable, then let the updated writer bind the membership before changing it again. Do not delete or reset the backlog ledger to bypass this check. Partial writes, canceled callers, missing members, and conflicting authority remain subject to the native CAS and recovery rules above.
 
 ## MinIO Divergence Decisions
 

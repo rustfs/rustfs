@@ -19,13 +19,12 @@
 //! on both sides rather than coupling the two test modules.
 
 use super::*;
+use rustfs_s3_types::s3_error;
 
 use super::identity::site_identity_key;
 use crate::storage_api::site_replication::merge_incoming_replication_config;
-use crate::storage_api::site_replication::s3::{
-    ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass,
-};
-use crate::storage_api::site_replication::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use crate::storage_api::site_replication::s3::{PersistedLifecycleExpiration, PersistedTransition};
+use crate::storage_api::site_replication::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, format_lifecycle_date};
 use rustfs_madmin::{BucketBandwidth, SiteReplicationInfo};
 use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1335,12 +1334,16 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
         "a failed destructive delivery must remain visible for operator repair"
     );
 
-    let usecase = include_str!("../app/bucket_usecase.rs");
-    let delete = usecase
-        .split("async fn execute_delete_bucket_inner")
-        .nth(1)
-        .and_then(|rest| rest.split("pub async fn execute_head_bucket").next())
-        .expect("delete bucket usecase");
+    assert_delete_bucket_reserves_before_local_delete(&crate::guard_sources::SourceSet::production(
+        "src/app/bucket_usecase.rs",
+        "src/app/bucket_usecase",
+    ));
+}
+
+/// The reservation and the local delete must both be inside `execute_delete_bucket_inner`, in
+/// that order; the slice ends at that method's own closing line.
+fn assert_delete_bucket_reserves_before_local_delete(usecase: &crate::guard_sources::SourceSet) {
+    let delete = usecase.method_body("execute_delete_bucket_inner");
     assert!(
         delete
             .find("prepare_site_replication_delete_bucket")
@@ -1348,6 +1351,67 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
             < delete.find(".delete_bucket(").expect("local delete"),
         "destructive peer liabilities must be persisted before the local bucket is deleted"
     );
+}
+
+const DELETE_BUCKET_INNER_FIXTURE: &str = "\
+impl DefaultBucketUsecase {
+    async fn execute_delete_bucket_inner(&self) {
+        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;
+        LOCAL_DELETE
+    }
+}
+";
+
+fn delete_bucket_fixture(core: &str) -> crate::guard_sources::SourceSet {
+    let root = crate::guard_sources::fixture_root(&[
+        ("src/app/bucket_usecase.rs", "pub struct DefaultBucketUsecase;\n"),
+        ("src/app/bucket_usecase/core.rs", core),
+    ]);
+    crate::guard_sources::SourceSet::production_under(root.path(), "src/app/bucket_usecase.rs", "src/app/bucket_usecase")
+}
+
+#[test]
+fn delete_bucket_order_guard_passes_after_the_method_moves_into_the_split_directory() {
+    let core = DELETE_BUCKET_INNER_FIXTURE.replace("LOCAL_DELETE", "store.delete_bucket(&bucket).await;");
+    assert_delete_bucket_reserves_before_local_delete(&delete_bucket_fixture(&core));
+}
+
+#[test]
+fn delete_bucket_order_guard_fails_when_the_local_delete_leaves_the_method() {
+    let core = format!(
+        "{}\nimpl DefaultBucketUsecase {{\n    pub(crate) async fn delete_helper(&self) {{\n        store.delete_bucket(&bucket).await;\n    }}\n}}\n",
+        DELETE_BUCKET_INNER_FIXTURE.replace("LOCAL_DELETE", "")
+    );
+    let usecase = delete_bucket_fixture(&core);
+
+    let message = crate::guard_sources::panic_message(move || assert_delete_bucket_reserves_before_local_delete(&usecase));
+
+    assert!(message.contains("local delete"), "{message}");
+}
+
+#[test]
+fn delete_bucket_order_guard_fails_when_the_delete_precedes_the_reservation() {
+    let core = DELETE_BUCKET_INNER_FIXTURE.replace(
+        "        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;\n        LOCAL_DELETE",
+        "        store.delete_bucket(&bucket).await;\n        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;",
+    );
+    let usecase = delete_bucket_fixture(&core);
+
+    let message = crate::guard_sources::panic_message(move || assert_delete_bucket_reserves_before_local_delete(&usecase));
+
+    assert!(message.contains("destructive peer liabilities"), "{message}");
+}
+
+#[test]
+fn delete_bucket_order_guard_fails_when_the_method_has_no_closing_line() {
+    let core = DELETE_BUCKET_INNER_FIXTURE
+        .replace("LOCAL_DELETE", "store.delete_bucket(&bucket).await;")
+        .replace("    }\n}\n", "");
+    let usecase = delete_bucket_fixture(&core);
+
+    let message = crate::guard_sources::panic_message(move || assert_delete_bucket_reserves_before_local_delete(&usecase));
+
+    assert!(message.contains("no closing"), "{message}");
 }
 
 #[test]
@@ -2273,7 +2337,7 @@ fn test_lifecycle_expiry_statement_matrix() {
     // Present with expiry rules and the axis: subset + axis travel.
     let expiry_axis = created + time::Duration::seconds(50);
     let mut config = lc_config(vec![lc_rule("e1", Some(7), None)]);
-    config.expiry_updated_at = Some(Timestamp::from(expiry_axis));
+    config.expiry_updated_at = Some(format_lifecycle_date(expiry_axis).expect("format expiry axis"));
     meta.lifecycle_config_xml = serialize(&config).expect("serialize config");
     let (subset, axis) = lifecycle_expiry_statement(&meta).expect("expiry config is a statement");
     assert!(subset.is_some());
@@ -2287,7 +2351,7 @@ fn test_lifecycle_expiry_statement_matrix() {
     // Transition-only WITH an axis: expiry rules were properly removed —
     // the delete travels at that axis.
     let mut transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
-    transition_only.expiry_updated_at = Some(Timestamp::from(expiry_axis));
+    transition_only.expiry_updated_at = Some(format_lifecycle_date(expiry_axis).expect("format expiry axis"));
     meta.lifecycle_config_xml = serialize(&transition_only).expect("serialize config");
     let (subset, axis) = lifecycle_expiry_statement(&meta).expect("removed expiry state is a statement");
     assert!(subset.is_none());
@@ -3166,8 +3230,8 @@ fn home_office() -> HashSet<String> {
     HashSet::from(["home".to_string(), "office".to_string()])
 }
 
-fn site_repl_config(peer: &str) -> ReplicationConfiguration {
-    ReplicationConfiguration {
+fn site_repl_config(peer: &str) -> PersistedReplicationConfiguration {
+    PersistedReplicationConfiguration {
         role: String::new(),
         rules: vec![build_site_replication_rule(
             &format!("arn:rustfs:replication::{peer}:photos"),
@@ -3177,8 +3241,8 @@ fn site_repl_config(peer: &str) -> ReplicationConfiguration {
     }
 }
 
-fn operator_rule(id: &str) -> ReplicationRule {
-    ReplicationRule {
+fn operator_rule(id: &str) -> PersistedReplicationRule {
+    PersistedReplicationRule {
         id: Some(id.to_string()),
         ..build_site_replication_rule("arn:aws:s3:::backup", 1, id)
     }
@@ -3246,19 +3310,19 @@ fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
     );
 }
 
-fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> LifecycleRule {
-    LifecycleRule {
+fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> PersistedLifecycleRule {
+    PersistedLifecycleRule {
         id: Some(id.to_string()),
-        status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+        status: "Enabled".to_owned(),
         prefix: Some(String::new()),
-        expiration: expiry_days.map(|days| LifecycleExpiration {
+        expiration: expiry_days.map(|days| PersistedLifecycleExpiration {
             days: Some(days),
             ..Default::default()
         }),
         transitions: transition_days.map(|days| {
-            vec![Transition {
+            vec![PersistedTransition {
                 days: Some(days),
-                storage_class: Some(TransitionStorageClass::from_static(TransitionStorageClass::GLACIER)),
+                storage_class: Some("GLACIER".to_owned()),
                 date: None,
             }]
         }),
@@ -3270,14 +3334,14 @@ fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> 
     }
 }
 
-fn lc_config(rules: Vec<LifecycleRule>) -> BucketLifecycleConfiguration {
-    BucketLifecycleConfiguration {
+fn lc_config(rules: Vec<PersistedLifecycleRule>) -> PersistedLifecycleConfiguration {
+    PersistedLifecycleConfiguration {
         rules,
         expiry_updated_at: None,
     }
 }
 
-fn rule_ids(config: &BucketLifecycleConfiguration) -> Vec<&str> {
+fn rule_ids(config: &PersistedLifecycleConfiguration) -> Vec<&str> {
     config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
 }
 
@@ -3290,7 +3354,7 @@ fn test_lifecycle_expiry_subset_xml_strips_transitions() {
         .expect("serialize full config");
 
     let subset = lifecycle_expiry_subset_xml(&full).expect("expiry subset should remain");
-    let parsed: BucketLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
+    let parsed: PersistedLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
     assert_eq!(rule_ids(&parsed), vec!["mixed"]);
     assert!(parsed.rules[0].transitions.is_none(), "transition side must not travel");
 
@@ -3362,7 +3426,7 @@ fn test_build_site_replication_config_reuses_configured_arn() {
             ..peer("remote", "http://remote.example.com:9000")
         },
     );
-    let existing = ReplicationConfiguration {
+    let existing = PersistedReplicationConfiguration {
         role: String::new(),
         rules: vec![build_site_replication_rule(
             "arn:minio:replication::remote:photos",

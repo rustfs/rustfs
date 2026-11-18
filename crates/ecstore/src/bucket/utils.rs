@@ -15,9 +15,23 @@
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
+use rustfs_gateway_types::cors_tagging::{
+    CorsTaggingCodecError, PersistedCorsConfiguration, PersistedTagging, parse_cors, parse_tagging, serialize_cors,
+    serialize_tagging,
+};
+use rustfs_gateway_types::persistence::{
+    PersistedAccelerateConfiguration, PersistedBucketEncryptionConfiguration, PersistedBucketLoggingStatus,
+    PersistedLifecycleConfiguration, PersistedNotificationConfiguration, PersistedObjectLockConfiguration,
+    PersistedPublicAccessBlockConfiguration, PersistedReplicationConfiguration, PersistedRequestPaymentConfiguration,
+    PersistedVersioningConfiguration, PersistedWebsiteConfiguration, PersistenceCodecError, parse_accelerate,
+    parse_bucket_encryption, parse_bucket_logging, parse_lifecycle_legacy_dates, parse_notification, parse_object_lock,
+    parse_public_access_block, parse_replication, parse_request_payment, parse_versioning, parse_website, serialize_accelerate,
+    serialize_bucket_encryption, serialize_bucket_logging, serialize_lifecycle_legacy_dates, serialize_notification,
+    serialize_object_lock, serialize_public_access_block, serialize_replication, serialize_request_payment, serialize_versioning,
+    serialize_website,
+};
 use rustfs_utils::WindowsFileNameError;
 use rustfs_utils::path::SLASH_SEPARATOR;
-use s3s::xml;
 use tracing::instrument;
 
 pub fn is_meta_bucketname(name: &str) -> bool {
@@ -74,37 +88,173 @@ pub fn check_valid_bucket_name_strict(bucket_name: &str) -> Result<()> {
     check_bucket_name_common(bucket_name, true)
 }
 
-// RUSTFS_COMPAT_TODO(s3gate-metadata-xml): the s3s codec reads persisted XML during migration. Remove after every supported writer uses the gateway codec and every retained metadata object and backup archive is verified or rewritten.
-pub fn deserialize<T>(input: &[u8]) -> xml::DeResult<T>
-where
-    T: for<'xml> xml::Deserialize<'xml>,
-{
-    let mut d = xml::Deserializer::new(input);
-    let ans = T::deserialize(&mut d)?;
-    d.expect_eof()?;
-    Ok(ans)
+/// A bucket configuration persisted as XML in the bucket metadata, together
+/// with the codec that reads and writes its stored bytes.
+///
+/// Every family reads and writes its stored bytes through the gateway
+/// persistence codecs (`rustfs_gateway_types::persistence` and
+/// `rustfs_gateway_types::cors_tagging`, rustfs/backlog#2745). The codecs keep
+/// the persisted bytes the `bucket_config_goldens` pin, so a document the old
+/// s3s codec wrote reads back and re-encodes unchanged.
+pub trait BucketConfigXml: Sized {
+    /// Decodes the stored bytes of one configuration document.
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError>;
+
+    /// Encodes the value as RustFS stores it.
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError>;
 }
 
-#[allow(
-    dead_code,
-    reason = "xml serialize helper with no caller in this port; the live sibling is deserialize (backlog#1823)"
-)]
-pub fn serialize_content<T: xml::SerializeContent>(val: &T) -> xml::SerResult<String> {
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = xml::Serializer::new(&mut buf);
-        val.serialize_content(&mut ser)?;
-    }
-    Ok(String::from_utf8(buf).unwrap())
+/// Why a persisted bucket configuration could not be decoded or encoded.
+#[derive(Debug, thiserror::Error)]
+pub enum BucketConfigXmlError {
+    /// A gateway persistence codec refused the bytes or the value.
+    #[error(transparent)]
+    Persisted(#[from] PersistenceCodecError),
+    /// The gateway CORS or Tagging codec refused the bytes or the value.
+    #[error(transparent)]
+    CorsTagging(#[from] CorsTaggingCodecError),
 }
 
-pub fn serialize<T: xml::Serialize>(val: &T) -> xml::SerResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = xml::Serializer::new(&mut buf);
-        val.serialize(&mut ser)?;
+/// Decodes one persisted bucket configuration document.
+pub fn deserialize<T: BucketConfigXml>(input: &[u8]) -> std::result::Result<T, BucketConfigXmlError> {
+    T::decode_config_xml(input)
+}
+
+/// Encodes one bucket configuration as RustFS persists it.
+pub fn serialize<T: BucketConfigXml>(val: &T) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+    val.encode_config_xml()
+}
+
+impl BucketConfigXml for PersistedReplicationConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_replication(input)?)
     }
-    Ok(buf)
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_replication(self)?)
+    }
+}
+
+impl BucketConfigXml for PersistedLifecycleConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_lifecycle_legacy_dates(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_lifecycle_legacy_dates(self)?)
+    }
+}
+
+// The gateway writers of these families are infallible: a value that exists is
+// always encodable, so only the readers can refuse bytes.
+impl BucketConfigXml for PersistedAccelerateConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_accelerate(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_accelerate(self))
+    }
+}
+
+impl BucketConfigXml for PersistedBucketLoggingStatus {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_bucket_logging(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_bucket_logging(self))
+    }
+}
+
+impl BucketConfigXml for PersistedCorsConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_cors(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_cors(self))
+    }
+}
+
+impl BucketConfigXml for PersistedNotificationConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_notification(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_notification(self))
+    }
+}
+
+impl BucketConfigXml for PersistedObjectLockConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_object_lock(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_object_lock(self))
+    }
+}
+
+impl BucketConfigXml for PersistedPublicAccessBlockConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_public_access_block(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_public_access_block(self))
+    }
+}
+
+impl BucketConfigXml for PersistedRequestPaymentConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_request_payment(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_request_payment(self))
+    }
+}
+
+impl BucketConfigXml for PersistedBucketEncryptionConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_bucket_encryption(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_bucket_encryption(self))
+    }
+}
+
+impl BucketConfigXml for PersistedTagging {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_tagging(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_tagging(self))
+    }
+}
+
+impl BucketConfigXml for PersistedVersioningConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_versioning(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_versioning(self))
+    }
+}
+
+impl BucketConfigXml for PersistedWebsiteConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_website(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_website(self))
+    }
 }
 
 pub fn has_bad_path_component(path: &str) -> bool {
@@ -445,6 +595,40 @@ pub fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Every bucket-configuration family reads and writes through its own
+    /// gateway codec (rustfs/backlog#2745): the family's golden document
+    /// decodes and re-encodes to the same bytes, and a document of another
+    /// family is refused instead of decoding into an empty configuration.
+    #[test]
+    fn every_bucket_config_family_uses_its_own_gateway_codec() {
+        fn assert_family<T: BucketConfigXml>(family: &str, own: &[u8], foreign: &[u8]) {
+            let value = deserialize::<T>(own).unwrap_or_else(|err| panic!("{family}: own document must decode: {err}"));
+            let encoded = serialize(&value).unwrap_or_else(|err| panic!("{family}: value must encode: {err}"));
+            assert_eq!(encoded, own, "{family}: re-encoding must keep the persisted bytes");
+            assert!(deserialize::<T>(foreign).is_err(), "{family}: a foreign root element must be refused");
+        }
+
+        macro_rules! golden {
+            ($family:literal) => {
+                include_bytes!(concat!("../../tests/fixtures/bucket-config-goldens/", $family, "/minio.out.xml"))
+            };
+        }
+        let tagging = golden!("tagging");
+        let versioning = golden!("versioning");
+
+        assert_family::<PersistedAccelerateConfiguration>("accelerate", golden!("accelerate"), tagging);
+        assert_family::<PersistedBucketLoggingStatus>("logging", golden!("logging"), tagging);
+        assert_family::<PersistedCorsConfiguration>("cors", golden!("cors"), tagging);
+        assert_family::<PersistedNotificationConfiguration>("notification", golden!("notification"), tagging);
+        assert_family::<PersistedObjectLockConfiguration>("object_lock", golden!("object_lock"), tagging);
+        assert_family::<PersistedPublicAccessBlockConfiguration>("public_access_block", golden!("public_access_block"), tagging);
+        assert_family::<PersistedRequestPaymentConfiguration>("request_payment", golden!("request_payment"), tagging);
+        assert_family::<PersistedBucketEncryptionConfiguration>("encryption", golden!("encryption"), tagging);
+        assert_family::<PersistedTagging>("tagging", tagging, versioning);
+        assert_family::<PersistedVersioningConfiguration>("versioning", versioning, tagging);
+        assert_family::<PersistedWebsiteConfiguration>("website", golden!("website"), tagging);
+    }
 
     /// rustfs#5785: keys whose path segments exceed the on-disk NAME_MAX
     /// budget must be rejected up front as ObjectNameInvalid (4xx), not leak

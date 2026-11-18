@@ -44,7 +44,8 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::policies::{ListPolicyEntitiesBuiltin, handle_builtin_policy_association};
 use crate::admin::handlers::service_account::AddServiceAccount;
 use crate::admin::handlers::user::ImportIam;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_app_context, current_ready_iam_handle, current_server_config_for_context};
 use crate::admin::utils::is_compat_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
@@ -59,8 +60,8 @@ use rustfs_madmin::{
     ServiceAccountInfo,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::MaskedAccessKey;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::{collections::HashMap, sync::LazyLock};
 use time::OffsetDateTime;
@@ -171,7 +172,7 @@ pub struct ImportIamV2 {}
 
 #[async_trait::async_trait]
 impl Operation for ImportIamV2 {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         // Identical semantics to v1 import-iam: same auth action, same body
         // format, same structured result. Delegate to the shared handler.
         ImportIam {}.call(req, params).await
@@ -265,7 +266,7 @@ where
 
 #[async_trait::async_trait]
 impl Operation for RevokeTokens {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let user_provider = params
             .get("user_provider")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing userProvider"))?
@@ -274,7 +275,7 @@ impl Operation for RevokeTokens {
             return Err(s3_error!(InvalidRequest, "unsupported user provider: {}", user_provider));
         }
 
-        let query = RevokeTokensQuery::parse(req.uri.query());
+        let query = RevokeTokensQuery::parse(req.uri().query());
 
         let (cred, owner) = authorize(&req, AdminAction::RemoveServiceAccountAdminAction).await?;
 
@@ -359,7 +360,7 @@ impl Operation for RevokeTokens {
 
         let _ = owner;
         json_response(
-            req.uri.path(),
+            req.uri().path(),
             &cred.secret_key,
             StatusCode::OK,
             &RevokeTokensResp {
@@ -446,7 +447,7 @@ pub struct ListIdpConfig {}
 
 #[async_trait::async_trait]
 impl Operation for ListIdpConfig {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let idp_type = normalized_idp_type(&params)?;
         let (cred, _) = authorize(&req, AdminAction::ServerInfoAdminAction).await?;
 
@@ -456,7 +457,7 @@ impl Operation for ListIdpConfig {
             .map(|(name, enabled)| IdpListEntry { name, enabled })
             .collect();
 
-        json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &IdpListResp { idp_type, idp })
+        json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &IdpListResp { idp_type, idp })
     }
 }
 
@@ -467,7 +468,7 @@ pub struct GetIdpConfig {}
 
 #[async_trait::async_trait]
 impl Operation for GetIdpConfig {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let idp_type = normalized_idp_type(&params)?;
         let name = params.get("name").unwrap_or(DEFAULT_DELIMITER).to_string();
         let (cred, _) = authorize(&req, AdminAction::ServerInfoAdminAction).await?;
@@ -475,7 +476,7 @@ impl Operation for GetIdpConfig {
         let (enabled, info) = idp_config_info(&idp_type, &name)?;
 
         json_response(
-            req.uri.path(),
+            req.uri().path(),
             &cred.secret_key,
             StatusCode::OK,
             &IdpConfigResp {
@@ -501,7 +502,7 @@ pub struct SetIdpConfig {}
 
 #[async_trait::async_trait]
 impl Operation for SetIdpConfig {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let idp_type = normalized_idp_type(&params)?;
         authorize(&req, AdminAction::ConfigUpdateAdminAction).await?;
 
@@ -528,7 +529,7 @@ pub struct DeleteIdpConfig {}
 
 #[async_trait::async_trait]
 impl Operation for DeleteIdpConfig {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let idp_type = normalized_idp_type(&params)?;
         authorize(&req, AdminAction::ConfigUpdateAdminAction).await?;
 
@@ -682,7 +683,7 @@ pub struct AddServiceAccountLdap {}
 
 #[async_trait::async_trait]
 impl Operation for AddServiceAccountLdap {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         AddServiceAccount {}.call(req, params).await
     }
 }
@@ -695,8 +696,8 @@ pub struct ListAccessKeysLdap {}
 
 #[async_trait::async_trait]
 impl Operation for ListAccessKeysLdap {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = SingleUserAccessKeysQuery::parse(req.uri.query());
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query = SingleUserAccessKeysQuery::parse(req.uri().query());
         let list_flags = ListTypeFlags::parse(&query.list_type)?;
 
         let (cred, owner) = authorize(&req, AdminAction::ListServiceAccountsAdminAction).await?;
@@ -715,9 +716,9 @@ impl Operation for ListAccessKeysLdap {
 
         let iam_store = current_ready_iam_handle().map_err(|_| s3_error!(InvalidRequest, "iam not init"))?;
         let resp =
-            collect_access_keys_for_user(&iam_store, &target_user, req.uri.path(), list_flags, Some(IDP_TYPE_LDAP)).await?;
+            collect_access_keys_for_user(&iam_store, &target_user, req.uri().path(), list_flags, Some(IDP_TYPE_LDAP)).await?;
 
-        json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &resp)
+        json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &resp)
     }
 }
 
@@ -744,8 +745,8 @@ impl ListAccessKeysProviderBulk {
 
 #[async_trait::async_trait]
 impl Operation for ListAccessKeysProviderBulk {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = BulkAccessKeysQuery::parse(req.uri.query());
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query = BulkAccessKeysQuery::parse(req.uri().query());
         if query.all && !query.users.is_empty() {
             return Err(s3_error!(InvalidRequest, "either specify users or all, not both"));
         }
@@ -777,14 +778,14 @@ impl Operation for ListAccessKeysProviderBulk {
 
         let mut result: HashMap<String, ListAccessKeysResp> = HashMap::new();
         for user in users {
-            let resp = collect_access_keys_for_user(&iam_store, &user, req.uri.path(), list_flags, Some(self.provider)).await?;
+            let resp = collect_access_keys_for_user(&iam_store, &user, req.uri().path(), list_flags, Some(self.provider)).await?;
             if resp.service_accounts.is_empty() && resp.sts_keys.is_empty() {
                 continue;
             }
             result.insert(user, resp);
         }
 
-        json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &result)
+        json_response(req.uri().path(), &cred.secret_key, StatusCode::OK, &result)
     }
 }
 
@@ -800,7 +801,7 @@ pub struct PolicyOperationLdap {}
 
 #[async_trait::async_trait]
 impl Operation for PolicyOperationLdap {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let operation = params
             .get("operation")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing policy operation"))?;
@@ -964,35 +965,30 @@ fn expiration_for_admin_path(path: &str, expiration: Option<OffsetDateTime>) -> 
     }
 }
 
-async fn authorize(req: &S3Request<Body>, action: AdminAction) -> S3Result<(StoredCredentials, bool)> {
-    let Some(input_cred) = &req.credentials else {
+async fn authorize(req: &AdminRequest, action: AdminAction) -> S3Result<(StoredCredentials, bool)> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
     let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
     authorize_action(req, &cred, owner, action).await?;
     Ok((cred, owner))
 }
 
-async fn authorize_action(req: &S3Request<Body>, cred: &StoredCredentials, owner: bool, action: AdminAction) -> S3Result<()> {
+async fn authorize_action(req: &AdminRequest, cred: &StoredCredentials, owner: bool, action: AdminAction) -> S3Result<()> {
     validate_admin_request(
-        &req.headers,
+        req.headers(),
         cred,
         owner,
         false,
         vec![Action::AdminAction(action)],
-        crate::admin::auth::policy_source_addr(&req.extensions),
+        req.policy_source_addr(),
     )
     .await
 }
 
-fn json_response<T: Serialize>(
-    path: &str,
-    secret_key: &str,
-    status: StatusCode,
-    payload: &T,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
-    super::admin_json_response(path, secret_key, status, payload)
+fn json_response<T: Serialize>(path: &str, secret_key: &str, status: StatusCode, payload: &T) -> S3Result<AdminResponse> {
+    super::owned_admin_json_response(path, secret_key, status, payload)
 }
 
 #[cfg(test)]

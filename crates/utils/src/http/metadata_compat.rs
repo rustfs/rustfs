@@ -46,6 +46,10 @@ pub const SUFFIX_COMPRESSION_SIZE: &str = "compression-size";
 pub const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
 /// Maximum logical object size for a capability-bound multipart upload.
 pub const SUFFIX_MAX_TOTAL_OBJECT_SIZE: &str = "max-total-object-size";
+/// ETag algorithm pinned for a multipart upload at its creation (`xxh3`
+/// when the bucket uses XXH3 ETags), so every part of one upload hashes the
+/// same way even if the bucket setting changes mid-upload.
+pub const SUFFIX_ETAG_ALGORITHM: &str = "etag-algorithm";
 pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";
 /// Used by replication; key stored with capital A
 pub const SUFFIX_ACTUAL_OBJECT_SIZE_CAP: &str = "Actual-Object-Size";
@@ -69,6 +73,9 @@ pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 /// liveness lock for the duration of the asynchronous copy-back.
 pub const SUFFIX_RESTORE_WORKER_LOCK: &str = "restore-worker-lock";
 pub const RESTORE_WORKER_LOCK_PROTOCOL_V1: &str = "v1";
+/// Marks a restore generation after its local copy-back payload has committed.
+pub const SUFFIX_RESTORE_COPYBACK: &str = "restore-copyback";
+pub const RESTORE_COPYBACK_PROTOCOL_V1: &str = "v1";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 /// Upload ID of the multipart completion that published this object version.
 /// A retried CompleteMultipartUpload matches it after the staging directory is gone.

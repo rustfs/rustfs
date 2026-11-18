@@ -37,7 +37,9 @@ use crate::services::tier::{
 use bytes::Bytes;
 use http::StatusCode;
 use rustfs_filemeta::metadata_keys;
+use rustfs_gateway_types::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, ReplicationStatus};
 use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
+use rustfs_s3_client::remote_error_code::RemoteErrorCode;
 use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
@@ -49,10 +51,6 @@ use rustfs_scanner_metrics::metrics::{TierRequestOperation, TierRequestOutcome, 
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
-};
-use s3s::{
-    S3ErrorCode,
-    dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -194,12 +192,15 @@ pub trait WarmBackend {
             .await
         {
             Ok(_) => Ok(TransitionCandidateProbe::VersionedPresent(remote_version_id.to_string())),
-            Err(err) if matches!(to_error_response(&err).code, S3ErrorCode::InvalidRange) => {
+            Err(err) if matches!(to_error_response(&err).code, RemoteErrorCode::INVALID_RANGE) => {
                 Ok(TransitionCandidateProbe::VersionedPresent(remote_version_id.to_string()))
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::NotFound
-                    || matches!(to_error_response(&err).code, S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion) =>
+                    || matches!(
+                        to_error_response(&err).code,
+                        RemoteErrorCode::NO_SUCH_KEY | RemoteErrorCode::NO_SUCH_VERSION
+                    ) =>
             {
                 Ok(TransitionCandidateProbe::Missing)
             }
@@ -219,9 +220,9 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
     let mut opts = PutObjectOptions {
         storage_class,
         send_content_md5: true,
-        legalhold: ObjectLockLegalHoldStatus::from_static(""),
+        legalhold: ObjectLockLegalHoldStatus::custom(""),
         internal: AdvancedPutOptions {
-            replication_status: ReplicationStatus::from_static(""),
+            replication_status: ReplicationStatus::custom(""),
             ..Default::default()
         },
         ..Default::default()
@@ -252,7 +253,7 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
     }
 
     if let Some(mode) = metadata.lookup(metadata_keys::OBJECT_LOCK_MODE) {
-        opts.mode = ObjectLockRetentionMode::from(mode.to_ascii_uppercase());
+        opts.mode = ObjectLockMode::custom(mode.to_ascii_uppercase());
     }
 
     if let Some(retain_until_date) = metadata
@@ -263,7 +264,7 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
     }
 
     if let Some(legalhold) = metadata.lookup(metadata_keys::OBJECT_LOCK_LEGAL_HOLD) {
-        opts.legalhold = ObjectLockLegalHoldStatus::from(legalhold.to_ascii_uppercase());
+        opts.legalhold = ObjectLockLegalHoldStatus::custom(legalhold.to_ascii_uppercase());
     }
 
     // Promoted keys are read above through `lookup`, which accepts more than
@@ -334,6 +335,21 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
 }
 
+/// A bucket can become a host prefix or the first path segment. Keep legacy
+/// uppercase and underscore names, but never permit URL syntax in that field.
+pub(crate) fn validate_tier_bucket(bucket: &str) -> std::io::Result<()> {
+    if bucket.is_empty() {
+        return Err(std::io::Error::other("no bucket name was provided"));
+    }
+    if bucket
+        .split('.')
+        .any(|label| label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+    {
+        return Err(std::io::Error::other("invalid tier bucket name"));
+    }
+    Ok(())
+}
+
 /// Return the authority format accepted by `TransitionClient::new` while
 /// retaining an explicitly configured port. `url::Url::host_str()` omits the
 /// brackets needed when an IPv6 literal is combined with a port.
@@ -341,6 +357,9 @@ pub(crate) fn endpoint_authority(url: &url::Url) -> Result<String, std::io::Erro
     let host = url
         .host_str()
         .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return Err(std::io::Error::other("tier endpoint must use HTTP or HTTPS"));
+    }
     let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
     if host.starts_with('[') && host.ends_with(']') {
         Ok(format!("{host}:{port}"))
@@ -384,9 +403,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         return Err(std::io::Error::other("both access and secret keys are required"));
     }
 
-    if params.bucket.is_empty() {
-        return Err(std::io::Error::other("no bucket name was provided"));
-    }
+    validate_tier_bucket(params.bucket)?;
 
     let u = match url::Url::parse(params.endpoint) {
         Ok(u) => u,
@@ -683,7 +700,7 @@ fn is_remote_tier_auth_rejection(err: &std::io::Error) -> bool {
     matches!(response.status_code, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
         || matches!(
             response.code,
-            S3ErrorCode::AccessDenied | S3ErrorCode::InvalidAccessKeyId | S3ErrorCode::SignatureDoesNotMatch
+            RemoteErrorCode::ACCESS_DENIED | RemoteErrorCode::INVALID_ACCESS_KEY_ID | RemoteErrorCode::SIGNATURE_DOES_NOT_MATCH
         )
 }
 
@@ -1331,7 +1348,7 @@ mod tests {
 
     struct AuthRejectingProbePutBackend {
         status_code: StatusCode,
-        code: S3ErrorCode,
+        code: RemoteErrorCode,
         probes: Arc<AtomicUsize>,
         removes: Arc<AtomicUsize>,
     }
@@ -1794,10 +1811,10 @@ mod tests {
     #[tokio::test]
     async fn check_warm_backend_reports_auth_rejected_probe_put_as_invalid_credentials() {
         for (status_code, code) in [
-            (StatusCode::FORBIDDEN, S3ErrorCode::AccessDenied),
-            (StatusCode::UNAUTHORIZED, S3ErrorCode::Custom("".into())),
-            (StatusCode::OK, S3ErrorCode::InvalidAccessKeyId),
-            (StatusCode::OK, S3ErrorCode::SignatureDoesNotMatch),
+            (StatusCode::FORBIDDEN, RemoteErrorCode::ACCESS_DENIED),
+            (StatusCode::UNAUTHORIZED, RemoteErrorCode::custom("")),
+            (StatusCode::OK, RemoteErrorCode::INVALID_ACCESS_KEY_ID),
+            (StatusCode::OK, RemoteErrorCode::SIGNATURE_DOES_NOT_MATCH),
         ] {
             let probes = Arc::new(AtomicUsize::new(0));
             let removes = Arc::new(AtomicUsize::new(0));
@@ -2091,6 +2108,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tier_bucket_is_a_name_not_a_url_component() {
+        assert!(validate_tier_bucket("archive.EU_1").is_ok());
+        for bucket in ["a:b", "a/b", "a?b", "a#b", "a@b", "a%2Fb", "a\\b", "a..b"] {
+            assert!(validate_tier_bucket(bucket).is_err());
+        }
+    }
+
+    #[test]
+    fn endpoint_authority_requires_http_transport() {
+        let url = url::Url::parse("ftp://archive.example").expect("valid URL");
+        assert!(endpoint_authority(&url).is_err());
+    }
+
     #[tokio::test]
     async fn s3_compatible_backend_strips_only_a_trailing_prefix_separator() {
         let mut params = s3_compatible_params("http://tier.example.com:9000");
@@ -2192,16 +2223,29 @@ mod tests {
             metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
             ObjectLockLegalHoldStatus::ON.to_string(),
         );
-        metadata.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            ObjectLockRetentionMode::GOVERNANCE.to_string(),
-        );
+        metadata.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), ObjectLockMode::GOVERNANCE.to_string());
 
         let opts = build_transition_put_options("COLD".to_string(), metadata);
 
-        assert_eq!(opts.mode.as_str(), ObjectLockRetentionMode::GOVERNANCE);
-        assert_eq!(opts.legalhold.as_str(), ObjectLockLegalHoldStatus::ON);
+        assert_eq!(opts.mode, ObjectLockMode::GOVERNANCE);
+        assert_eq!(opts.legalhold, ObjectLockLegalHoldStatus::ON);
         assert_ne!(opts.retain_until_date, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn build_transition_put_options_sends_no_object_lock_or_replication_headers_by_default() {
+        let opts = build_transition_put_options("COLD".to_string(), HashMap::new());
+        assert_eq!(opts.mode.as_str(), "");
+        assert_eq!(opts.legalhold.as_str(), "");
+        assert_eq!(opts.internal.replication_status.as_str(), "");
+        let header = opts.header();
+        for name in [
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-legal-hold",
+            "x-amz-replication-status",
+        ] {
+            assert!(header.get(name).is_none(), "{name} must not be sent: {header:?}");
+        }
     }
 
     #[test]

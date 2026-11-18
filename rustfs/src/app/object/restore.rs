@@ -15,7 +15,12 @@
 //! RestoreObject path.
 
 use super::*;
+use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::bucket::RestoreRequest;
 use rustfs_filemeta::RestoreStatus;
+use rustfs_gateway_types::dto::{RequestCharged, RestoreObjectOutput};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use rustfs_utils::http::headers::AMZ_RESTORE;
 
 // RUSTFS_COMPAT_TODO(backlog-1337): legacy restores lack a liveness marker. Remove after the minimum supported release writes v1 on every restore.
 const LEGACY_RESTORE_ORPHAN_GRACE: time::Duration = time::Duration::hours(24);
@@ -149,20 +154,24 @@ async fn maybe_pause_after_restore_status_commit(bucket: &str, object: &str) {
 }
 
 impl DefaultObjectUsecase {
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+    #[instrument(
+        name = "execute_restore_object",
+        level = "debug",
+        skip(self, envelope, bucket, object, version_id, restore_request)
+    )]
+    pub(crate) async fn execute_restore_object_owned(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: String,
+        object: String,
+        version_id: Option<String>,
+        restore_request: Option<RestoreRequest>,
+    ) -> S3Result<RestoreObjectOutput> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectRestorePost, S3Operation::RestoreObject);
-        let RestoreObjectInput {
-            bucket,
-            key: object,
-            restore_request: rreq,
-            version_id,
-            ..
-        } = req.input.clone();
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectRestorePost, S3Operation::RestoreObject);
 
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &object).await?;
         validate_table_catalog_object_mutation(&bucket, &object).await?;
@@ -170,7 +179,8 @@ impl DefaultObjectUsecase {
         // Typed S3 errors on every RestoreObject failure (backlog#2205): a
         // `Custom` code serializes as a generic 500, which makes SDK clients
         // retry client errors and conflicts alike.
-        let rreq = rreq.ok_or_else(|| S3Error::with_message(S3ErrorCode::MalformedXML, "restore request is required"))?;
+        let rreq =
+            restore_request.ok_or_else(|| S3Error::with_message(S3ErrorCode::MalformedXML, "restore request is required"))?;
 
         // SELECT-type restore is not supported (backlog#1341). The restore
         // path can only write the retrieved bytes back to the source key, so
@@ -180,11 +190,7 @@ impl DefaultObjectUsecase {
         // on a versioned one) while never writing anything to
         // `OutputLocation.S3`. Reject before any guard, metadata write or
         // fabricated `x-amz-restore-output-path` response header.
-        if rreq
-            .type_
-            .as_ref()
-            .is_some_and(|type_| type_.as_str() == RestoreRequestType::SELECT)
-        {
+        if rreq.type_.as_deref() == Some("SELECT") {
             return Err(S3Error::with_message(
                 S3ErrorCode::NotImplemented,
                 "SELECT restore requests are not supported.",
@@ -206,11 +212,11 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        let version_id_str = version_id.clone().unwrap_or_default();
+        let version_id_str = version_id.unwrap_or_default();
         let mut opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
             .map_err(ApiError::from)?;
-        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+        apply_bucket_generation_guard(&envelope, &bucket, &mut opts)?;
         // `apply_bucket_generation_guard` deliberately tolerates a missing guard
         // (only the S3 access layer installs one), so this must not hard-require
         // it. Resolve the current generation instead, exactly as the copy path
@@ -352,6 +358,10 @@ impl DefaultObjectUsecase {
         // Scopes the accept-guarded metadata write: everything below runs
         // inside the accept critical section, which is released right after.
         {
+            if !already_restored {
+                store.check_restore_copyback_compatibility().await.map_err(ApiError::from)?;
+            }
+
             obj_info.metadata_only = true;
             metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
             let request_date = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
@@ -360,7 +370,7 @@ impl DefaultObjectUsecase {
             metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), request_date);
             if already_restored {
                 metadata.insert(
-                    X_AMZ_RESTORE.as_str().to_string(),
+                    AMZ_RESTORE.to_owned(),
                     RestoreStatus {
                         is_restore_in_progress: Some(false),
                         restore_expiry_date: Some(restore_expiry),
@@ -369,7 +379,7 @@ impl DefaultObjectUsecase {
                 );
             } else {
                 metadata.insert(
-                    X_AMZ_RESTORE.as_str().to_string(),
+                    AMZ_RESTORE.to_owned(),
                     RestoreStatus {
                         is_restore_in_progress: Some(true),
                         restore_expiry_date: Some(OffsetDateTime::now_utc()),
@@ -434,16 +444,12 @@ impl DefaultObjectUsecase {
             drop(superseded_worker_guard.take());
 
             if already_restored {
-                let output = RestoreObjectOutput {
-                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-                    restore_output_path: None,
-                };
-                helper = helper
+                let result = Ok(restore_output());
+                let _ = helper
                     .object(event_object_info.clone())
                     .version_id(version_id_str.clone())
-                    .suppress_event();
-                let result = Ok(S3Response::new(output));
-                let _ = helper.complete(&result);
+                    .suppress_event()
+                    .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                 return result;
             }
         }
@@ -475,7 +481,7 @@ impl DefaultObjectUsecase {
         }
 
         let restore_worker_guard = restore_worker_guard.take();
-        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&envelope);
         spawn_traced(async move {
             let _restore_worker_guard = restore_worker_guard;
             let _table_data_plane_publication_guards = table_data_plane_publication_guards;
@@ -516,14 +522,20 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let output = RestoreObjectOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-            restore_output_path: None,
-        };
-        helper = helper.object(event_object_info).version_id(version_id_str);
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
+        let result = Ok(restore_output());
+        let _ = helper.object(event_object_info).version_id(version_id_str).complete_owned(
+            &result,
+            StatusCode::OK,
+            &HeaderMap::new(),
+        );
         result
+    }
+}
+
+fn restore_output() -> RestoreObjectOutput {
+    RestoreObjectOutput {
+        request_charged: Some(RequestCharged::custom("requester".to_owned())),
+        restore_output_path: None,
     }
 }
 
@@ -531,7 +543,8 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use http::Method;
-    use s3s::dto::RestoreRequest;
+    use s3s::S3ErrorCode;
+    use s3s::dto::{RestoreObjectInput, RestoreRequest};
 
     fn ongoing_metadata(operation_id: Uuid) -> HashMap<String, String> {
         let mut metadata = HashMap::new();

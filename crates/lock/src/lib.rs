@@ -38,7 +38,7 @@ pub mod types;
 // Re-export main types for easy access
 pub use crate::{
     // Client interfaces
-    client::{LockCleanupOutcome, LockClient, local::LocalClient},
+    client::{BatchAcquireOutcome, LockCleanupOutcome, LockClient, local::LocalClient},
     distributed_lock::DistributedLockGuard,
     // Error types
     error::{LockError, Result},
@@ -51,8 +51,8 @@ pub use crate::{
     namespace::{NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper},
     // Core types
     types::{
-        HealthInfo, HealthStatus, LockId, LockInfo, LockLeaseInfo, LockMetadata, LockPriority, LockRequest, LockResponse,
-        LockStats, LockStatus, LockType,
+        CACHE_FENCE_SHARD_COUNT, CacheFenceProof, CacheFenceStamp, CacheFenceStampDecodeError, HealthInfo, HealthStatus, LockId,
+        LockInfo, LockLeaseInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus, LockType,
     },
 };
 

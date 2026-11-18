@@ -4,7 +4,7 @@ Read during Phase 0, before changing RustFS version files or tags. Follow the pa
 
 ### Console release gate
 
-Complete this gate before changing any RustFS version file or creating any RustFS tag. RustFS `build.yml` downloads the asset returned by `repos/rustfs/console/releases/latest`, so a successful Console build alone is insufficient.
+Complete this gate before changing any RustFS version file or creating any RustFS tag. Candidate creation resolves `repos/rustfs/console/releases/latest` once and freezes the exact asset for every build, so a successful Console build alone is insufficient. After freezing, later Console releases do not silently change or invalidate the accepted inputs.
 
 1. Read the latest published Console tag and compare it with Console `main`:
 

@@ -25,9 +25,10 @@
 //! credentials but must *not* be allowed to rewrite the parent's secret. This
 //! module is the single place those distinctions are made.
 
-use crate::admin::auth::authenticate_request;
+use crate::admin::auth::authenticate_envelope_credentials;
 use crate::admin::runtime_sources::current_action_credentials;
-use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Result};
+use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
+use crate::app::RequestEnvelope;
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
@@ -133,12 +134,12 @@ impl CallerIdentity {
     /// Authentication only: callers that need an authorization decision must
     /// still gate on an admin action. Self-service endpoints deliberately do
     /// not, because every authenticated identity may inspect and manage itself.
-    pub(crate) async fn resolve(req: &S3Request<Body>) -> S3Result<Self> {
-        let Some(input_cred) = req.credentials.as_ref() else {
+    pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
+        let Some(input_cred) = envelope.credentials() else {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
         };
 
-        let (credentials, is_owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
+        let (credentials, is_owner) = authenticate_envelope_credentials(input_cred).await?;
         Ok(Self::from_credentials(credentials, is_owner))
     }
 
@@ -263,6 +264,14 @@ impl CallerIdentity {
             Some(denial) => Err(s3::error(S3ErrorCode::InvalidRequest, denial.message())),
         }
     }
+
+    pub(crate) fn ensure_active_mfa_parent(&self, parent: Option<&Credentials>) -> S3Result<()> {
+        if parent.is_some_and(|p| p.access_key == self.access_key && p.is_valid() && !p.is_temp() && !p.is_service_account()) {
+            Ok(())
+        } else {
+            Err(s3::error(S3ErrorCode::AccessDenied, "an active IAM parent is required"))
+        }
+    }
 }
 
 /// Whether the session was minted by an external identity provider.
@@ -284,6 +293,19 @@ mod tests {
     use rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn resolve_envelope_rejects_a_missing_identity() {
+        let req =
+            crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v3/accountinfo").build();
+
+        let owned = CallerIdentity::resolve_envelope(req.envelope())
+            .await
+            .expect_err("no credentials");
+
+        assert_eq!(owned.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(owned.message(), Some("authentication required"));
+    }
 
     fn long_term(access_key: &str) -> Credentials {
         Credentials {
@@ -314,6 +336,16 @@ mod tests {
             claims: Some(claims),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sts_mfa_requires_active_regular_parent() {
+        let caller = CallerIdentity::from_credentials(sts_session("temporary", "parent"), false);
+        let mut parent = long_term("parent");
+        assert!(caller.ensure_active_mfa_parent(Some(&parent)).is_ok());
+        parent.status = "off".to_owned();
+        assert!(caller.ensure_active_mfa_parent(Some(&parent)).is_err());
+        assert!(caller.ensure_active_mfa_parent(None).is_err());
     }
 
     #[test]

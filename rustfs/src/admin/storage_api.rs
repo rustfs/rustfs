@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, quota, remote_s3_client,
+        bandwidth, bucket_target_sys, durability, etag, lifecycle, metadata, metadata_sys, object_lock, quota, remote_s3_client,
         replication, target, utils, versioning, versioning_sys,
     };
 }
@@ -77,7 +77,8 @@ mod ecstore_metrics {
 
 mod ecstore_notification {
     pub(crate) use crate::storage::storage_api::ecstore_notification::{
-        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys,
+        acquire_cross_pool_fence_fleet_proof,
     };
 }
 
@@ -173,19 +174,19 @@ pub(crate) trait AdminReplicationConfigExt {
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool);
 }
 
-impl AdminReplicationConfigExt for s3s::dto::ReplicationConfiguration {
+impl AdminReplicationConfigExt for rustfs_gateway_types::persistence::PersistedReplicationConfiguration {
     fn filter_all_replication_target_arns(&self) -> Vec<String> {
         let obj = ecstore_bucket::replication::ObjectOpts {
             op_type: ecstore_bucket::replication::ReplicationType::All,
             ..Default::default()
         };
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
+        <rustfs_gateway_types::persistence::PersistedReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
             self, &obj,
         )
     }
 
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_existing_object_replication(
+        <rustfs_gateway_types::persistence::PersistedReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_existing_object_replication(
             self, arn,
         )
     }
@@ -195,9 +196,9 @@ pub(crate) trait AdminVersioningConfigExt {
     fn enabled(&self) -> bool;
 }
 
-impl AdminVersioningConfigExt for s3s::dto::VersioningConfiguration {
+impl AdminVersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
     fn enabled(&self) -> bool {
-        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
+        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
     }
 }
 
@@ -205,9 +206,9 @@ pub(crate) trait AdminObjectLockConfigExt {
     fn enabled(&self) -> bool;
 }
 
-impl AdminObjectLockConfigExt for s3s::dto::ObjectLockConfiguration {
+impl AdminObjectLockConfigExt for rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
     fn enabled(&self) -> bool {
-        <s3s::dto::ObjectLockConfiguration as ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
+        <rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
     }
 }
 
@@ -303,6 +304,7 @@ pub(crate) mod metadata {
     pub(crate) const BUCKET_TARGETS_FILE: &str = super::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
     pub(crate) const BUCKET_VERSIONING_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
     pub(crate) const BUCKET_DURABILITY_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_DURABILITY_CONFIG;
+    pub(crate) const BUCKET_ETAG_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_ETAG_CONFIG;
     pub(crate) const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
     pub(crate) const OBJECT_LOCK_CONFIG: &str = super::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
 
@@ -317,6 +319,10 @@ pub(crate) mod durability {
     pub(crate) type BucketDurabilityConfig = super::ecstore_bucket::durability::BucketDurabilityConfig;
 }
 
+pub(crate) mod etag {
+    pub(crate) type BucketEtagConfig = super::ecstore_bucket::etag::BucketEtagConfig;
+}
+
 pub(crate) mod remote_s3_client {
     pub(crate) type PathStyle = super::ecstore_bucket::remote_s3_client::PathStyle;
     pub(crate) type RemoteCredentials = super::ecstore_bucket::remote_s3_client::RemoteCredentials;
@@ -329,8 +335,11 @@ pub(crate) mod metadata_sys {
     pub(crate) use super::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
     use std::sync::Arc;
 
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+    };
     use rustfs_policy::policy::BucketPolicy;
-    use s3s::dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, VersioningConfiguration};
     use time::OffsetDateTime;
 
     use super::Result;
@@ -508,11 +517,17 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::get_durability_config(bucket).await
     }
 
+    pub(crate) async fn get_etag_config(bucket: &str) -> Result<(Option<super::etag::BucketEtagConfig>, OffsetDateTime)> {
+        super::ecstore_bucket::metadata_sys::get_etag_config(bucket).await
+    }
+
     pub(crate) async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_quota_config(bucket).await
     }
 
-    pub(crate) async fn get_replication_config(bucket: &str) -> Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime)> {
+    pub(crate) async fn get_replication_config(
+        bucket: &str,
+    ) -> Result<(rustfs_gateway_types::persistence::PersistedReplicationConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_replication_config(bucket).await
     }
 
@@ -764,19 +779,10 @@ pub(crate) mod target {
 }
 
 pub(crate) mod ecstore_utils {
-    pub(crate) fn deserialize<T>(input: &[u8]) -> s3s::xml::DeResult<T>
-    where
-        T: for<'xml> s3s::xml::Deserialize<'xml>,
-    {
-        super::ecstore_bucket::utils::deserialize(input)
-    }
+    pub(crate) use super::ecstore_bucket::utils::{deserialize, serialize};
 
     pub(crate) fn is_valid_object_prefix(object: &str) -> bool {
         super::ecstore_bucket::utils::is_valid_object_prefix(object)
-    }
-
-    pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-        super::ecstore_bucket::utils::serialize(val)
     }
 }
 
@@ -957,9 +963,8 @@ pub(crate) mod data_usage {
 }
 
 pub(crate) mod access {
-    pub(crate) use crate::storage::storage_api::access_consumer::{
-        ReqInfo, authorize_internal_object_request, authorize_request,
-    };
+    pub(crate) use crate::app::{authorize_owned_internal_object_request, authorize_owned_request};
+    pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_get_object};
     pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
 }
 
@@ -967,6 +972,7 @@ pub(crate) mod bucket {
     pub(crate) use super::bandwidth;
     pub(crate) use super::bucket_target_sys as target_sys;
     pub(crate) use super::durability;
+    pub(crate) use super::etag;
     #[cfg(test)]
     pub(crate) use super::lifecycle;
     pub(crate) use super::metadata;
@@ -986,6 +992,8 @@ pub(crate) mod bucket {
 }
 
 pub(crate) mod cluster {
+    pub(crate) type NotificationPeerErr = super::ecstore_notification::NotificationPeerErr;
+
     pub(crate) use super::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
@@ -1077,9 +1085,10 @@ pub(crate) mod runtime {
 pub(crate) mod s3 {
     // Keep auth types behind the existing s3 facade so test-only callers do
     // not widen the repository's direct s3s import footprint.
+    pub(crate) use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
     #[allow(unused_imports)]
     pub(crate) use s3s::auth;
-    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
+    pub(crate) use s3s::header;
 
     /// Build an `S3Error` without reaching for the `s3s` error macro.
     ///

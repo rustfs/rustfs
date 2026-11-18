@@ -396,10 +396,63 @@ impl Drop for OpaMock {
 }
 
 #[tokio::test]
+async fn test_sts_session_policy_id_limits_object_access() -> TestResult {
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let admin = env.create_s3_client();
+    let bucket = "session-policy-id";
+    admin.create_bucket().bucket(bucket).send().await?;
+    for key in ["allowed", "denied"] {
+        admin
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(Bytes::from_static(b"data").into())
+            .send()
+            .await?;
+    }
+
+    let policy = serde_json::json!({
+        "Id": "read-one-object",
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": format!("arn:aws:s3:::{bucket}/allowed")}]
+    });
+    let response = sts_client(&env.url, &env.access_key, &env.secret_key, None)
+        .assume_role()
+        .role_arn("arn:aws:iam::123456789012:role/test")
+        .role_session_name("session-policy-id")
+        .policy(policy.to_string())
+        .send()
+        .await?;
+    let credentials = response.credentials().ok_or("AssumeRole returned no credentials")?;
+    let session = aws_sdk_s3::Client::from_conf(build_test_s3_config(
+        &env.url,
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+        Some(credentials.session_token()),
+        "e2e-session-policy-id",
+    ));
+    let allowed = session.get_object().bucket(bucket).key("allowed").send().await?;
+    assert_eq!(allowed.body.collect().await?.into_bytes().as_ref(), b"data");
+    let error = session
+        .get_object()
+        .bucket(bucket)
+        .key("denied")
+        .send()
+        .await
+        .expect_err("object outside session policy");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_sts_query_responses_are_aws_sdk_compatible() -> TestResult {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
+    // Exercise the minimum root secret length accepted at startup.
+    env.secret_key.truncate(8);
+    assert_eq!(env.secret_key.len(), 8);
     env.start_rustfs_server(vec![]).await?;
 
     let assumed = sts_client(&env.url, &env.access_key, &env.secret_key, None)

@@ -1,0 +1,10 @@
+# Rulings for the gateway conformance lane (.github/workflows/gateway-acceptance.yml).
+#
+# One row per case that fails on the GATEWAY stack for a reviewed reason: `case`; `ledger`, the
+# rustfs/backlog#2684 entry that accepts the difference (R-0xx or K-n); a one-line `reason`; and
+# `failure`, a prefix of the failure the ruling accepts, as the runner's report.json renders it
+# (`[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 403`).
+# scripts/check_conformance_rulings.py fails the lane on a failed case without a row, on a ruled
+# case whose failures do not start with its `failure`, and on a row whose case no longer fails or
+# no longer exists. The legacy stack is a reference run and takes no rulings: the `rustfs` profile
+# describes the gateway edge, not the legacy one.

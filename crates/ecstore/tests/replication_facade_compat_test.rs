@@ -14,7 +14,7 @@
 
 mod storage_api;
 
-use s3s::dto::ReplicationConfiguration;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use std::future::Future;
 use storage_api::contract_compat::{Error, ObjectInfo, ObjectOptions, ObjectToDelete};
 use storage_api::replication_compat::{
@@ -40,7 +40,7 @@ fn assert_strict_delete_future<F: Future<Output = Result<ReplicateDecision, Erro
 
 #[test]
 fn replication_facade_exports_config_extension_contract() {
-    assert_replication_config_ext::<ReplicationConfiguration>();
+    assert_replication_config_ext::<PersistedReplicationConfiguration>();
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn replication_facade_exports_runtime_and_dto_types() {
 
 #[test]
 fn replication_facade_exports_app_storage_helper_contracts() {
-    let config = ReplicationConfiguration::default();
+    let config = PersistedReplicationConfiguration::default();
     let target_arns = replication_target_arns(&config);
     assert!(target_arns.is_empty());
 

@@ -330,6 +330,7 @@ impl RustFSServer {
             cancel_token: started.cancel_token,
             temp_dir: started.temp_dir,
             runtime_owner: Some(runtime_owner),
+            table_rename_recovery: Some(started.table_rename_recovery),
         }
     }
 }
@@ -350,6 +351,7 @@ pub struct RustFSServer {
     cancel_token: CancellationToken,
     temp_dir: Option<PathBuf>,
     runtime_owner: Option<EmbeddedRuntimeOwner>,
+    table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
 }
 
 impl RustFSServer {
@@ -400,6 +402,7 @@ impl RustFSServer {
             &mut self.shutdown_handle,
             &mut self.temp_dir,
             Some(runtime_owner),
+            self.table_rename_recovery.take(),
         )
         .await;
     }
@@ -417,8 +420,16 @@ impl Drop for RustFSServer {
             &mut self.shutdown_handle,
             &mut self.temp_dir,
             Some(runtime_owner),
+            self.table_rename_recovery.take(),
         );
     }
+}
+
+/// The S3 operations a server on the gateway stack serves. It answers every other operation
+/// `501 NotImplemented`.
+#[cfg(feature = "gateway-stack")]
+pub fn gateway_operations() -> Vec<&'static str> {
+    crate::server::gateway_operations()
 }
 
 /// Find an available TCP port on localhost.

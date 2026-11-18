@@ -46,6 +46,15 @@ impl BootstrapLocalTarget {
         Arc::ptr_eq(&self.ctx, &store.ctx)
     }
 
+    /// Atomically publish a format control file on this bootstrap instance.
+    ///
+    /// # Errors
+    /// Returns a disk error for an unsupported path, unavailable local endpoint,
+    /// publication failure, or failed durability barrier.
+    pub async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
+        write_local_format_control_with_ctx(&self.ctx, disk_ref, path, data).await
+    }
+
     pub async fn rename_local_data(
         &self,
         disk_ref: &str,
@@ -85,10 +94,19 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Atomically publish a format control file on this storage instance.
+    ///
+    /// # Errors
+    /// Returns a disk error for an unsupported path, unavailable local endpoint,
+    /// publication failure, or failed durability barrier.
+    pub async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
+        write_local_format_control_with_ctx(&self.ctx, disk_ref, path, data).await
+    }
+
     /// Resolve a quota lease against this request's captured storage instance.
     pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
-        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false, None).await?;
         Ok(disk)
     }
 
@@ -106,7 +124,7 @@ impl ECStore {
         let path = target.1.to_owned();
         self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
             let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
-            let _owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            let _owner = admit_local_disk(&store.ctx, &disk, id, true, Some(&volume)).await?;
             disk.write_metadata("", &volume, &path, fi).await.map_err(Into::into)
         })
         .await
@@ -127,7 +145,7 @@ impl ECStore {
         let path = target.1.to_owned();
         self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
             let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
-            let owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            let owner = admit_local_disk(&store.ctx, &disk, id, true, Some(&volume)).await?;
             let scope = super::bucket_heal_scope(&volume).ok_or_else(|| StorageError::other("missing bucket heal scope"))?;
             scope.check()?;
             disk.delete_with_namespace_owner(&volume, &path, opts, Some(Arc::new((scope, owner))))
@@ -159,7 +177,7 @@ impl ECStore {
                 .map_err(|error| DiskError::other(error.to_string()))?,
         );
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
-        let owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, true, Some(target.0)).await?;
         if fence.is_lock_lost() {
             return Err(DiskError::other("bucket heal incarnation fence was lost"));
         }
@@ -283,7 +301,7 @@ impl ECStore {
     ) -> DiskResult<crate::disk::multipart_source::MultipartSourceResponse> {
         request.validate()?;
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
-        let owner = admit_local_disk(&self.ctx, &disk, id, request.operation.is_mutation()).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, request.operation.is_mutation(), None).await?;
         let Disk::Local(wrapper) = disk.as_ref() else {
             return Err(DiskError::DiskNotFound);
         };
@@ -307,6 +325,18 @@ impl ECStore {
 }
 
 // The optional ID is a cold lookup to cache only after final admission.
+async fn write_local_format_control_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    path: &str,
+    data: bytes::Bytes,
+) -> DiskResult<()> {
+    crate::disk::validate_format_control_path(path)?;
+    let (disk, id) = local_disk_candidate(ctx, disk_ref).await?;
+    let _owner = admit_local_disk(ctx, &disk, id, false, None).await?;
+    disk.write_format_control(path, data).await
+}
+
 async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<(DiskStore, Option<Uuid>)> {
     let map = ctx.local_disk_map();
     let path_disk = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned();
@@ -356,6 +386,7 @@ async fn admit_local_disk(
     disk: &DiskStore,
     disk_id: Option<Uuid>,
     mutates_namespace: bool,
+    bucket: Option<&str>,
 ) -> DiskResult<Option<Arc<NamespaceCommitGuard>>> {
     if !matches!(disk.as_ref(), Disk::Local(_)) {
         return Err(DiskError::DiskNotFound);
@@ -378,7 +409,10 @@ async fn admit_local_disk(
     }
     // Admission linearizes under the registry read: replacement/quarantine
     // before this point rejects; later changes do not revoke physical I/O.
-    Ok(mutates_namespace.then(|| ctx.begin_namespace_commit()))
+    Ok(mutates_namespace.then(|| match bucket {
+        Some(bucket) => ctx.begin_namespace_commit_for_bucket(bucket),
+        None => ctx.begin_namespace_commit(),
+    }))
 }
 
 async fn rename_local_data_with_ctx(
@@ -398,7 +432,18 @@ async fn rename_local_data_with_ctx(
     }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
     let admit_started = rustfs_io_metrics::put_stage_timer();
-    let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    let owner = admit_local_disk(
+        ctx,
+        &disk,
+        disk_id,
+        mutates_namespace,
+        Some(if !is_meta_bucketname(destination.0) {
+            destination.0
+        } else {
+            source.0
+        }),
+    )
+    .await?;
     if source.0 == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
         let Disk::Local(wrapper) = disk.as_ref() else {
             return Err(DiskError::DiskNotFound);
@@ -444,7 +489,7 @@ async fn undo_local_write_with_ctx(
         return Err(DiskError::other("target undo requires undo_write"));
     }
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
-    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume)).await?;
+    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume), Some(volume)).await?;
     let physical_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
     let result = disk
         .undo_write_with_namespace_owner(volume, path, fi, opts, physical_owner)
@@ -520,6 +565,14 @@ pub async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> DiskResult<Option
     }
     let (disk, _) = local_disk_candidate(&crate::runtime::global::current_ctx(), disk_ref).await?;
     Ok(Some(disk))
+}
+
+/// Resolve the target from the verified listener's instance and acquire any background admission.
+#[cfg(feature = "internode-transport")]
+pub async fn external_rpc_disk(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<DiskStore> {
+    let (disk, id) = local_disk_candidate(ctx, disk_ref).await?;
+    admit_local_disk(ctx, &disk, id, false, None).await?;
+    Ok(disk)
 }
 
 pub async fn all_local_disk_path() -> Vec<String> {
@@ -708,6 +761,26 @@ mod tests {
         }])
     }
 
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_only_resolves_the_listeners_own_storage() {
+        let first = Arc::new(InstanceContext::new());
+        let second = Arc::new(InstanceContext::new());
+        let dir = tempfile::tempdir().expect("local disk");
+        let id = Uuid::new_v4();
+        let disk = target_disk(&first, dir.path(), id).await;
+        for reference in [disk.endpoint().to_string(), id.to_string()] {
+            let found = super::external_rpc_disk(&first, &reference)
+                .await
+                .expect("first instance owns the disk");
+            assert!(Arc::ptr_eq(&found, &disk));
+            assert!(matches!(
+                super::external_rpc_disk(&second, &reference).await,
+                Err(DiskError::DiskNotFound)
+            ));
+        }
+    }
+
     async fn target_disk(ctx: &Arc<InstanceContext>, root: &std::path::Path, id: Uuid) -> DiskStore {
         let mut format = crate::layout::format::FormatV3::new(1, 1);
         format.erasure.this = id;
@@ -874,7 +947,7 @@ mod tests {
             }
             drop(entries);
             assert!(
-                matches!(admit_local_disk(&ctx, &disk, None, true).await, Err(DiskError::DiskNotFound)),
+                matches!(admit_local_disk(&ctx, &disk, None, true, None).await, Err(DiskError::DiskNotFound)),
                 "{state}"
             );
             assert!(!ctx.namespace_commits_pending());

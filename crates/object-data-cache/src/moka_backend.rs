@@ -1478,6 +1478,12 @@ mod tests {
         let ObjectDataCacheLookup::Hit(response_body) = backend.lookup_body(&plan).await else {
             panic!("the reserved body should be cached");
         };
+        let ObjectDataCacheGetPlan::Cacheable { key } = &plan else {
+            panic!("the plan should be cacheable");
+        };
+        let cached_entry = backend.cache.get(key).await.expect("the entry should be cached");
+        let cached_entry_owner = Arc::downgrade(&cached_entry);
+        drop(cached_entry);
         let _ = backend
             .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "object"))
             .await;
@@ -1488,8 +1494,14 @@ mod tests {
             "the response clone still owns the cached allocation"
         );
 
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        // Maintenance removes the entry logically, but epoch reclamation may
+        // still own it. Tear down the cache and observe its actual destruction.
+        drop(backend.cache);
+        assert!(cached_entry_owner.upgrade().is_none(), "the cache entry must have no remaining owners");
+        assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 5, "the response still owns the allocation");
+
         drop(response_body);
-        backend.cache.run_pending_tasks().await;
         assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 0);
     }
 

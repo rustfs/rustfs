@@ -1,0 +1,12 @@
+# Tolerated per-test differences of the s3-tests reference parity lane.
+#
+# One entry per line, four fields separated by " | ":
+#
+#   <target> | <pytest node id> | <tracking issue URL> | <reason>
+#
+# <target> is a candidate name from .config/reference-parity-targets.toml, the
+# node id is exactly as the lane prints it (s3tests/functional/test_s3.py::...),
+# and the issue URL is https://github.com/rustfs/<repo>/issues/<number>.
+#
+# Same semantics as scripts/junit_diff.py --allow: an entry whose difference no
+# longer occurs is stale and fails the lane, so remove it when it is fixed.

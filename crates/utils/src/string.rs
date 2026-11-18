@@ -443,10 +443,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
         }
 
         // Bare `...` without braces (e.g. "1...64") is still an ellipsis attempt.
-        if v.contains(ELLIPSES) {
-            return true;
-        }
-        false
+        v.contains(ELLIPSES)
     })
 }
 

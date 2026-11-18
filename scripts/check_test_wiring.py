@@ -734,11 +734,9 @@ def check_ilm_build_budget(root: Path) -> list[str]:
         if len(builds) != 1:
             return ["ILM integration requires one workspace archive producer"]
         budget = builds[0].get("env", {}).get("CARGO_BUILD_JOBS", "")
-        # This remains the measured build budget; execution has no Cargo build.
-        compact = re.sub(r"\s+", "", budget)
-        expected = "${{(github.event_name=='push'||github.event_name=='workflow_dispatch')&&'3'||'2'}}"
-        if compact != expected:
-            return ["workspace archive must keep the measured 3/2 Cargo build budget"]
+        # Execution reuses this archive and does not invoke Cargo builds.
+        if str(budget) != "2":
+            return ["workspace archive must use the measured two-worker Cargo build budget"]
     except (OSError, KeyError, TypeError, ValueError) as error:
         return [f"invalid ILM workflow contract: {error}"]
     return []
@@ -5643,7 +5641,12 @@ class SelfTests(unittest.TestCase):
             workflow.write_text(valid)
             self.assertEqual(check_ilm_build_budget(root), [])
             for old, new in (
-                ("&& '3' || '2' }}", "&& '3' || '3' }}"),
+                ('CARGO_BUILD_JOBS: "2"', 'CARGO_BUILD_JOBS: "3"'),
+                (
+                    'CARGO_BUILD_JOBS: "2"',
+                    "CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' "
+                    "|| github.event_name == 'workflow_dispatch') && '3' || '2' }}",
+                ),
                 ("outputs.mode == 'full'", "outputs.mode == 'docs'"),
                 ("--profile default -j1", "--profile ci -j1"),
                 ("-j1 --run-ignored", "-j2 --run-ignored"),
@@ -5661,6 +5664,8 @@ class SelfTests(unittest.TestCase):
                 workflow.write_text(valid.replace(old, new))
                 self.assertTrue(check_ilm_build_budget(root), (old, new))
             # Formatting and the consumer job ID are not execution contracts.
+            workflow.write_text(valid.replace('CARGO_BUILD_JOBS: "2"', 'CARGO_BUILD_JOBS: 2'))
+            self.assertEqual(check_ilm_build_budget(root), [])
             workflow.write_text(valid.replace("  workspace-tests:", "  renamed-workspace-tests:"))
             self.assertEqual(check_ilm_build_budget(root), [])
 

@@ -27,7 +27,7 @@ use http::HeaderValue;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use rustfs_common::GlobalReadiness;
 use rustfs_madmin::{BackendInfo, Disk, StorageInfo};
 use std::future::Future;
@@ -37,13 +37,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Mutex as StdMutex, OnceLock},
+    sync::OnceLock,
     time::Instant,
 };
 use tokio::sync::Mutex;
 use tower::{Layer, Service};
 use tracing::{debug, info};
 
+mod cluster_health;
 mod peer_readmission;
 pub(crate) use peer_readmission::observe_peer_drive_admission;
 
@@ -80,7 +81,8 @@ const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_READINESS: &str = "readiness";
 const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
 const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
-const METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL: &str = "rustfs_pool_metadata_check_timeouts_total";
+const METRIC_CLUSTER_HEALTH_READY: &str = "rustfs_cluster_health_ready";
+const METRIC_CLUSTER_HEALTH_DURATION_SECONDS: &str = "rustfs_cluster_health_duration_seconds";
 
 pub use crate::shared_types::{
     DependencyReadiness, DependencyReadinessReport, MissingReadinessDrive, ReadinessDegradedReason, StorageReadinessDetails,
@@ -178,7 +180,7 @@ fn readiness_pending_dependency(stage: rustfs_common::SystemStage) -> &'static s
 fn service_not_ready_response(stage: rustfs_common::SystemStage) -> Response<BoxBody> {
     let pending = readiness_pending_dependency(stage);
     let body: BoxBody = Full::new(Bytes::from(format!("Service not ready: waiting for {pending}")))
-        .map_err(|e| -> BoxError { Box::new(e) })
+        .map_err(|never| match never {})
         .boxed_unsync();
 
     let mut response = Response::new(body);
@@ -293,66 +295,6 @@ struct StorageWriteReadinessStatus {
     pool_metadata_reason: Option<ReadinessDegradedReason>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct NodePoolMetadataReadinessCache {
-    entry: Option<NodePoolMetadataReadinessCacheEntry>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NodePoolMetadataReadinessCacheEntry {
-    cached_at: Instant,
-    observed_at: Instant,
-    status: StorageWriteReadinessStatus,
-}
-
-impl NodePoolMetadataReadinessCache {
-    fn observe(
-        &mut self,
-        observed: StorageWriteReadinessStatus,
-        observed_at: Instant,
-        now: Instant,
-        ttl: Duration,
-    ) -> StorageWriteReadinessStatus {
-        if ttl.is_zero() {
-            self.entry = None;
-            return observed;
-        }
-
-        if observed.pool_metadata_reason == Some(ReadinessDegradedReason::PoolMetadataCheckTimeout) {
-            let Some(previous) = self.entry else {
-                return observed;
-            };
-            if now.saturating_duration_since(previous.cached_at) > ttl {
-                return observed;
-            }
-
-            // A confirmed write block must never be hidden by a later timeout.
-            if previous.status.pool_metadata_reason == Some(ReadinessDegradedReason::PoolMetaWriteBlocked) {
-                return previous.status;
-            }
-
-            // A transient inspection outage is diagnostic, not proof that the
-            // writer became unsafe. Keep the last confirmed writable state.
-            if previous.status.ready {
-                return StorageWriteReadinessStatus {
-                    ready: true,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                };
-            }
-            return observed;
-        }
-
-        if self.entry.is_none_or(|entry| entry.observed_at <= observed_at) {
-            self.entry = Some(NodePoolMetadataReadinessCacheEntry {
-                cached_at: now,
-                observed_at,
-                status: observed,
-            });
-        }
-        observed
-    }
-}
-
 fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWriteReadinessStatus {
     match result {
         Ok(()) => StorageWriteReadinessStatus {
@@ -360,13 +302,9 @@ fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWri
             pool_metadata_reason: None,
         },
         Err(error) => {
-            let pool_metadata_reason = if error.pool_metadata_failure().is_some() {
-                Some(ReadinessDegradedReason::PoolMetaWriteBlocked)
-            } else if matches!(error, StorageError::Timeout) {
-                Some(ReadinessDegradedReason::PoolMetadataCheckTimeout)
-            } else {
-                None
-            };
+            let pool_metadata_reason = error
+                .pool_metadata_failure()
+                .map(|_| ReadinessDegradedReason::PoolMetaWriteBlocked);
             StorageWriteReadinessStatus {
                 ready: false,
                 pool_metadata_reason,
@@ -389,6 +327,7 @@ struct LockQuorumObservation {
 
 #[derive(Debug, Clone)]
 struct ClusterHealthReportCacheEntry {
+    generation: u64,
     captured_at: Instant,
     report: DependencyReadinessReport,
 }
@@ -432,11 +371,6 @@ fn health_cluster_timeout() -> Duration {
         )
         .max(1),
     )
-}
-
-fn node_pool_metadata_readiness_cache() -> &'static StdMutex<NodePoolMetadataReadinessCache> {
-    static CACHE: OnceLock<StdMutex<NodePoolMetadataReadinessCache>> = OnceLock::new();
-    CACHE.get_or_init(|| StdMutex::new(NodePoolMetadataReadinessCache::default()))
 }
 
 fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
@@ -504,31 +438,32 @@ async fn load_cached_storage_readiness() -> Option<StorageWriteReadinessStatus> 
     None
 }
 
-async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+fn cluster_health_report_is_fresh(entry: &ClusterHealthReportCacheEntry) -> bool {
     let ttl = health_readiness_cache_ttl();
-    if ttl.is_zero() {
-        return None;
-    }
-
-    let cache = cluster_health_report_cache(kind).lock().await;
-    let entry = cache.as_ref()?;
-    if entry.captured_at.elapsed() <= ttl {
-        return Some(entry.report.clone());
-    }
-
-    None
+    !ttl.is_zero() && entry.captured_at.elapsed() <= ttl
 }
 
-async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
-    if health_readiness_cache_ttl().is_zero() {
-        return;
-    }
+#[cfg(test)]
+async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+    let cache = cluster_health_report_cache(kind).lock().await;
+    cache
+        .as_ref()
+        .filter(|entry| cluster_health_report_is_fresh(entry))
+        .map(|entry| entry.report.clone())
+}
 
-    let mut cache = cluster_health_report_cache(kind).lock().await;
+fn publish_cluster_health_report(cache: &mut Option<ClusterHealthReportCacheEntry>, report: DependencyReadinessReport) {
+    let generation = cache.as_ref().map_or(1, |entry| entry.generation.wrapping_add(1));
     *cache = Some(ClusterHealthReportCacheEntry {
+        generation,
         captured_at: Instant::now(),
         report,
     });
+}
+
+async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
+    let mut cache = cluster_health_report_cache(kind).lock().await;
+    publish_cluster_health_report(&mut cache, report);
 }
 
 async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
@@ -541,26 +476,6 @@ async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
         captured_at: Instant::now(),
         status,
     });
-}
-
-fn apply_node_pool_metadata_timeout_policy(
-    observed: StorageWriteReadinessStatus,
-    observed_at: Instant,
-) -> StorageWriteReadinessStatus {
-    if observed.pool_metadata_reason == Some(ReadinessDegradedReason::PoolMetadataCheckTimeout) {
-        counter!(METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL).increment(1);
-    }
-    let mut cache = node_pool_metadata_readiness_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.observe(observed, observed_at, Instant::now(), health_readiness_cache_ttl())
-}
-
-#[cfg(test)]
-fn reset_node_pool_metadata_readiness_cache() {
-    *node_pool_metadata_readiness_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = NodePoolMetadataReadinessCache::default();
 }
 
 async fn load_cached_lock_quorum_status() -> Option<LockQuorumObservation> {
@@ -855,9 +770,6 @@ fn record_readiness_report(report: &DependencyReadinessReport) {
         && report.readiness.peer_health_ready;
     gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
     for reason in &report.degraded_reasons {
-        if ready && *reason == ReadinessDegradedReason::PoolMetadataCheckTimeout {
-            continue;
-        }
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
     }
 }
@@ -867,6 +779,7 @@ pub(crate) fn record_readiness_overlay_reason(reason: ReadinessDegradedReason) {
     counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
+#[cfg(test)]
 fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) -> DependencyReadinessReport {
     DependencyReadinessReport {
         degraded_reasons: degraded_reasons(readiness),
@@ -930,11 +843,17 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
 }
 
 pub async fn collect_cluster_write_health_report() -> DependencyReadinessReport {
-    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, collect_dependency_readiness_report).await
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || {
+        cluster_health::collect_cluster_probe_report(ClusterHealthProbeKind::Write)
+    })
+    .await
 }
 
 pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
-    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, collect_cluster_read_dependency_readiness_report).await
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || {
+        cluster_health::collect_cluster_probe_report(ClusterHealthProbeKind::Read)
+    })
+    .await
 }
 
 pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
@@ -944,7 +863,7 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     let mut storage_check_timed_out = false;
     if let Some(store) = runtime_sources::current_object_store_handle() {
         let pool_metadata_status = store.pool_meta_write_status().await;
-        storage = apply_node_pool_metadata_timeout_policy(pool_metadata_write_readiness(pool_metadata_status), Instant::now());
+        storage = pool_metadata_write_readiness(pool_metadata_status);
         match node_storage_snapshot(store.as_ref(), &lock_observation.online_hosts).await {
             Ok((info, unavailable_drives, missing_drives)) => {
                 details.unavailable_drives = unavailable_drives;
@@ -1064,20 +983,79 @@ where
     LoadFn: FnMut() -> Fut,
     Fut: Future<Output = DependencyReadinessReport>,
 {
-    if let Some(cached) = load_cached_cluster_health_report(kind).await {
-        return cached;
-    }
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + health_cluster_timeout();
+    let mut collection_started = None;
+    // Retain flight ownership through timeout publication so an expired leader
+    // cannot overwrite the next collector's newer cache entry.
+    let mut singleflight = None;
+    let outcome = tokio::time::timeout_at(deadline, async {
+        let previous_generation = {
+            let cache = cluster_health_report_cache(kind).lock().await;
+            if let Some(entry) = cache.as_ref()
+                && cluster_health_report_is_fresh(entry)
+            {
+                return (entry.report.clone(), false);
+            }
+            cache.as_ref().map(|entry| entry.generation)
+        };
 
-    let _singleflight = cluster_health_singleflight(kind).lock().await;
-    if let Some(cached) = load_cached_cluster_health_report(kind).await {
-        return cached;
-    }
+        // Completed-cache reuse and sharing an overlapping flight are separate:
+        // TTL=0 still joins a round that finished while this caller was waiting.
+        singleflight = Some(cluster_health_singleflight(kind).lock().await);
+        {
+            let cache = cluster_health_report_cache(kind).lock().await;
+            if let Some(entry) = cache.as_ref()
+                && (Some(entry.generation) != previous_generation || cluster_health_report_is_fresh(entry))
+            {
+                return (entry.report.clone(), false);
+            }
+        }
 
-    let report = match tokio::time::timeout(health_cluster_timeout(), load_report()).await {
-        Ok(report) => report,
-        Err(_) => cluster_health_timeout_report(),
+        if tokio::time::Instant::now() >= deadline {
+            return (cluster_health_timeout_report(), true);
+        }
+        collection_started = Some(tokio::time::Instant::now());
+        let report = load_report().await;
+        update_cluster_health_report_cache(kind, report.clone()).await;
+        (report, true)
+    })
+    .await;
+
+    let (report, record_observation) = match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            let report = cluster_health_timeout_report();
+            // A waiting caller must not overwrite a leader's healthy result.
+            // Publishing a failed collection is best-effort after its deadline.
+            if collection_started.is_some()
+                && singleflight.is_some()
+                && let Ok(mut cache) = cluster_health_report_cache(kind).try_lock()
+            {
+                publish_cluster_health_report(&mut cache, report.clone());
+            }
+            (report, true)
+        }
     };
-    update_cluster_health_report_cache(kind, report.clone()).await;
+    if record_observation {
+        record_readiness_report(&report);
+    }
+    let probe = match kind {
+        ClusterHealthProbeKind::Write => "write",
+        ClusterHealthProbeKind::Read => "read",
+    };
+    let ready = report.degraded_reasons.is_empty()
+        && report.readiness.storage_ready
+        && report.readiness.iam_ready
+        && report.readiness.lock_quorum_ready
+        && report.readiness.peer_health_ready;
+    gauge!(METRIC_CLUSTER_HEALTH_READY, "probe" => probe).set(if ready { 1.0 } else { 0.0 });
+    let wait_duration = collection_started.unwrap_or_else(tokio::time::Instant::now) - started_at;
+    histogram!(METRIC_CLUSTER_HEALTH_DURATION_SECONDS, "probe" => probe, "phase" => "wait").record(wait_duration.as_secs_f64());
+    if let Some(collection_started) = collection_started {
+        histogram!(METRIC_CLUSTER_HEALTH_DURATION_SECONDS, "probe" => probe, "phase" => "collect")
+            .record(collection_started.elapsed().as_secs_f64());
+    }
     report
 }
 
@@ -1092,22 +1070,6 @@ fn cluster_health_timeout_report() -> DependencyReadinessReport {
         degraded_reasons: vec![ReadinessDegradedReason::ClusterHealthTimeout],
         storage_details: None,
     }
-}
-
-pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyReadinessReport {
-    let iam_ready_raw = runtime_sources::current_iam_ready();
-    let storage_ready = collect_storage_read_readiness_uncached().await;
-    let lock_quorum_status = collect_lock_quorum_status().await;
-
-    let readiness = DependencyReadiness {
-        storage_ready,
-        iam_ready: iam_ready_raw,
-        lock_quorum_ready: lock_quorum_status.ready,
-        peer_health_ready: collect_peer_health_readiness(),
-    };
-    let report = dependency_readiness_report_from_readiness(readiness);
-    record_readiness_report(&report);
-    report
 }
 
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
@@ -1149,15 +1111,6 @@ async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStat
         }
     } else {
         StorageWriteReadinessStatus::default()
-    }
-}
-
-async fn collect_storage_read_readiness_uncached() -> bool {
-    if let Some(store) = runtime_sources::current_object_store_handle() {
-        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-        storage_read_ready_from_runtime_state(&storage_info)
-    } else {
-        false
     }
 }
 
@@ -1900,6 +1853,287 @@ mod tests {
         reset_cluster_health_report_caches().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_deadline_includes_uncached_concurrent_waiters() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let calls = AtomicUsize::new(0);
+                let started_at = tokio::time::Instant::now();
+                let request = || {
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        future::pending().await
+                    })
+                };
+                let (first, second, third) = tokio::join!(request(), request(), request());
+                assert_eq!(first, cluster_health_timeout_report());
+                assert_eq!(second, first);
+                assert_eq!(third, first);
+                assert_eq!(tokio::time::Instant::now() - started_at, Duration::from_millis(20));
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "expired waiters must not begin another collection");
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_uncached_burst_shares_one_round_but_later_request_is_fresh() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
+            let calls = AtomicUsize::new(0);
+            let ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                storage_ready: true,
+                iam_ready: true,
+                lock_quorum_ready: true,
+                peer_health_ready: true,
+            });
+            let request = || {
+                collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ready.clone()
+                })
+            };
+            let reports = futures::future::join_all((0..100).map(|_| request())).await;
+            assert!(reports.iter().all(|report| report == &ready));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "overlapping uncached callers must share the same round");
+            assert_eq!(request().await, ready);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "a later uncached caller must start a new observation");
+        })
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_uncached_waiter_shares_failure_before_starting_a_fresh_round() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let calls = AtomicUsize::new(0);
+                let request = || {
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        future::pending().await
+                    })
+                };
+                let started_at = tokio::time::Instant::now();
+                let mut leader = Box::pin(request());
+                assert!(futures::poll!(leader.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(10)).await;
+                let mut waiter = Box::pin(request());
+                assert!(futures::poll!(waiter.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(10)).await;
+                let (first, shared) = tokio::join!(leader, waiter);
+                assert_eq!(first, cluster_health_timeout_report());
+                assert_eq!(shared, first);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(started_at.elapsed(), Duration::from_millis(20));
+
+                let ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                });
+                let recovered =
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async { ready.clone() }).await;
+                assert_eq!(recovered, ready, "a later request must not inherit the completed failed round");
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_waiter_timeout_does_not_poison_the_cache() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let _leader = cluster_health_singleflight(ClusterHealthProbeKind::Write).lock().await;
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    panic!("waiter must expire before entering the collector")
+                })
+                .await;
+                assert_eq!(report, cluster_health_timeout_report());
+                assert!(
+                    load_cached_cluster_health_report(ClusterHealthProbeKind::Write)
+                        .await
+                        .is_none()
+                );
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_cancelled_leader_releases_the_flight() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
+            let started = AtomicUsize::new(0);
+            let mut leader = Box::pin(collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                started.fetch_add(1, Ordering::SeqCst);
+                future::pending().await
+            }));
+            assert!(futures::poll!(leader.as_mut()).is_pending());
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            drop(leader);
+
+            let expected = dependency_readiness_report_from_readiness(DependencyReadiness {
+                storage_ready: true,
+                iam_ready: true,
+                lock_quorum_ready: true,
+                peer_health_ready: true,
+            });
+            let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async { expected.clone() }).await;
+            assert_eq!(report, expected);
+        })
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_timeout_publication_retains_flight_ownership() {
+        use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Default)]
+        struct PublicationRecorder(AtomicBool);
+
+        impl Recorder for PublicationRecorder {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                if key.name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                    && key
+                        .labels()
+                        .any(|label| label.key() == "reason" && label.value() == "cluster_health_timeout")
+                {
+                    assert!(
+                        cluster_health_singleflight(ClusterHealthProbeKind::Write).try_lock().is_err(),
+                        "an expired leader must retain the flight through timeout publication"
+                    );
+                    let cache = cluster_health_report_cache(ClusterHealthProbeKind::Write)
+                        .try_lock()
+                        .expect("timeout cache must have been published without retaining its mutex");
+                    assert_eq!(cache.as_ref().expect("published timeout").report, cluster_health_timeout_report());
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Counter::noop()
+            }
+
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        reset_cluster_health_report_caches().await;
+        let recorder = PublicationRecorder::default();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, future::pending).await;
+                assert_eq!(report, cluster_health_timeout_report());
+                assert!(recorder.0.load(Ordering::SeqCst), "the recorder must observe timeout publication");
+                assert!(
+                    cluster_health_singleflight(ClusterHealthProbeKind::Write).try_lock().is_ok(),
+                    "the completed caller must release the flight"
+                );
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_timeout_records_once_and_cached_failure_is_not_recounted() {
+        reset_cluster_health_report_caches().await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, future::pending).await;
+                assert_eq!(report, cluster_health_timeout_report());
+                let cached = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    panic!("fresh cached timeout must avoid another collection")
+                })
+                .await;
+                assert_eq!(cached, report);
+
+                let read_ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                });
+                assert_eq!(
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || async { read_ready.clone() }).await,
+                    read_ready,
+                    "read and write caches and flights must remain separate"
+                );
+            },
+        )
+        .await;
+        let entries = snapshotter.snapshot().into_vec();
+        let timeout_count = entries.iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == "cluster_health_timeout"))
+            .then_some(value)
+        });
+        assert!(matches!(timeout_count, Some(DebugValue::Counter(1))));
+        for (probe, expected) in [("write", 0.0), ("read", 1.0)] {
+            let ready = entries.iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == METRIC_CLUSTER_HEALTH_READY
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "probe" && label.value() == probe))
+                .then_some(value)
+            });
+            assert!(matches!(ready, Some(DebugValue::Gauge(value)) if value.into_inner() == expected));
+        }
+        reset_cluster_health_report_caches().await;
+    }
+
     #[tokio::test]
     #[serial]
     async fn cluster_health_report_timeout_is_sanitized() {
@@ -2200,6 +2434,7 @@ mod tests {
         for path in [
             "/node_service.HealControlService/HealControl",
             "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            "/node_service.ScannerControlService/ScannerUsageWatch",
             "/node_service.TierMutationControlService/PrepareTierMutation",
         ] {
             let response = service
@@ -2216,7 +2451,7 @@ mod tests {
                 .expect("control routing");
             assert_eq!(response.status(), StatusCode::OK, "gRPC bootstrap must reach the authenticated router");
         }
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
         for (version, content_type, path) in [
             (
                 http::Version::HTTP_11,
@@ -2227,6 +2462,11 @@ mod tests {
                 http::Version::HTTP_2,
                 Some("application/json"),
                 "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            ),
+            (
+                http::Version::HTTP_2,
+                Some("application/json"),
+                "/node_service.ScannerControlService/ScannerUsageWatch",
             ),
             (http::Version::HTTP_2, None, "/bucket/object"),
         ] {
@@ -2244,7 +2484,7 @@ mod tests {
         }
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            3,
+            4,
             "REST requests must remain outside their handlers"
         );
     }
@@ -2927,7 +3167,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_metadata_observation_distinguishes_block_timeout_and_unavailable() {
+    fn pool_metadata_observation_distinguishes_block_and_unavailable() {
         let blocked = blocked_pool_metadata_status();
         assert!(!blocked.ready);
         assert_eq!(blocked.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetaWriteBlocked));
@@ -2935,227 +3175,76 @@ mod tests {
         let writable = pool_metadata_write_readiness(Ok(()));
         assert!(writable.ready);
         assert_eq!(writable.pool_metadata_reason, None);
-        let timed_out = pool_metadata_write_readiness(Err(StorageError::Timeout));
-        assert!(!timed_out.ready);
-        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
         let unavailable = pool_metadata_write_readiness(Err(StorageError::other("pool metadata writes remain blocked")));
         assert!(!unavailable.ready);
         assert_eq!(
             unavailable.pool_metadata_reason, None,
             "error text alone must not be interpreted as a typed write block"
         );
+    }
 
-        let readiness = DependencyReadiness {
-            storage_ready: false,
+    #[test]
+    fn readiness_report_records_ready_gauge_and_degraded_reasons() {
+        let record = |report: DependencyReadinessReport| {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || record_readiness_report(&report));
+            snapshotter.snapshot().into_vec()
+        };
+        let ready = DependencyReadiness {
+            storage_ready: true,
             iam_ready: true,
             lock_quorum_ready: true,
             peer_health_ready: true,
         };
-        let report = dependency_readiness_report_from_write_status(readiness, timed_out);
-        assert!(!report.readiness.storage_ready, "inspection timeout must remain fail-closed");
-        assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::PoolMetadataCheckTimeout]);
-        assert_eq!(report.degraded_reasons[0].as_str(), "pool_metadata_check_timeout");
-    }
 
-    #[test]
-    #[serial]
-    fn sticky_pool_metadata_timeout_uses_dedicated_metric_without_degraded_count() {
-        reset_node_pool_metadata_readiness_cache();
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-
-        metrics::with_local_recorder(&recorder, || {
-            with_var(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"), || {
-                let writable = StorageWriteReadinessStatus {
-                    ready: true,
-                    pool_metadata_reason: None,
-                };
-                assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
-                let sticky = apply_node_pool_metadata_timeout_policy(
-                    StorageWriteReadinessStatus {
-                        ready: false,
-                        pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                    },
-                    Instant::now(),
-                );
-                assert!(sticky.ready);
-                record_readiness_report(&DependencyReadinessReport {
-                    readiness: DependencyReadiness {
-                        storage_ready: true,
-                        iam_ready: true,
-                        lock_quorum_ready: true,
-                        peer_health_ready: true,
-                    },
-                    degraded_reasons: vec![ReadinessDegradedReason::PoolMetadataCheckTimeout],
-                    storage_details: None,
-                });
-            });
+        let entries = record(DependencyReadinessReport {
+            readiness: ready,
+            degraded_reasons: Vec::new(),
+            storage_details: None,
         });
-        reset_node_pool_metadata_readiness_cache();
-
-        let entries = snapshotter.snapshot().into_vec();
-        let ready = entries.iter().find_map(|(composite, _, _, value)| {
+        let gauge = entries.iter().find_map(|(composite, _, _, value)| {
             (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
         });
-        assert!(matches!(ready, Some(DebugValue::Gauge(value)) if value.into_inner() == 1.0));
+        assert!(
+            matches!(gauge, Some(DebugValue::Gauge(value)) if value.into_inner() == 1.0),
+            "a ready report must set the readiness gauge: {gauge:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(composite, _, _, _)| composite.key().name() != METRIC_RUNTIME_READINESS_DEGRADED_TOTAL),
+            "a ready report without reasons must not count degradation"
+        );
 
+        let entries = record(DependencyReadinessReport {
+            readiness: DependencyReadiness {
+                storage_ready: false,
+                ..ready
+            },
+            degraded_reasons: vec![ReadinessDegradedReason::PoolMetaWriteBlocked],
+            storage_details: None,
+        });
+        let gauge = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
+        });
+        assert!(
+            matches!(gauge, Some(DebugValue::Gauge(value)) if value.into_inner() == 0.0),
+            "a degraded report must clear the readiness gauge: {gauge:?}"
+        );
         let degraded = entries.iter().find_map(|(composite, _, _, value)| {
             (composite.kind() == MetricKind::Counter
                 && composite.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
                 && composite
                     .key()
                     .labels()
-                    .any(|label| label.key() == "reason" && label.value() == "pool_metadata_check_timeout"))
+                    .any(|label| label.key() == "reason" && label.value() == "pool_meta_write_blocked"))
             .then_some(value)
         });
-        assert!(degraded.is_none());
-
-        let timeout = entries.iter().find_map(|(composite, _, _, value)| {
-            (composite.kind() == MetricKind::Counter && composite.key().name() == METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL)
-                .then_some(value)
-        });
-        assert!(matches!(timeout, Some(DebugValue::Counter(1))));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_preserves_recent_writable_observation() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let writable = StorageWriteReadinessStatus {
-                ready: true,
-                pool_metadata_reason: None,
-            };
-            assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
-
-            let timed_out = apply_node_pool_metadata_timeout_policy(
-                StorageWriteReadinessStatus {
-                    ready: false,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                },
-                Instant::now(),
-            );
-
-            assert!(timed_out.ready);
-            assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_fails_closed_with_empty_cache() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let timed_out = apply_node_pool_metadata_timeout_policy(
-                StorageWriteReadinessStatus {
-                    ready: false,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                },
-                Instant::now(),
-            );
-
-            assert!(!timed_out.ready);
-            assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
-    }
-
-    #[test]
-    fn node_pool_metadata_timeout_fails_closed_after_cache_ttl() {
-        let mut cache = NodePoolMetadataReadinessCache::default();
-        let observed_at = Instant::now();
-        let ttl = Duration::from_secs(60);
-        let writable = StorageWriteReadinessStatus {
-            ready: true,
-            pool_metadata_reason: None,
-        };
-        assert_eq!(cache.observe(writable, observed_at, observed_at, ttl), writable);
-
-        let timed_out = cache.observe(
-            StorageWriteReadinessStatus {
-                ready: false,
-                pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-            },
-            observed_at + Duration::from_secs(61),
-            observed_at + Duration::from_secs(61),
-            ttl,
+        assert!(
+            matches!(degraded, Some(DebugValue::Counter(1))),
+            "each degraded reason must be counted once: {degraded:?}"
         );
-
-        assert!(!timed_out.ready);
-        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_never_hides_confirmed_block() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let blocked = StorageWriteReadinessStatus {
-                ready: false,
-                pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetaWriteBlocked),
-            };
-            let newer_observation = Instant::now();
-            assert_eq!(apply_node_pool_metadata_timeout_policy(blocked, newer_observation), blocked);
-            assert_eq!(
-                apply_node_pool_metadata_timeout_policy(
-                    StorageWriteReadinessStatus {
-                        ready: true,
-                        pool_metadata_reason: None,
-                    },
-                    newer_observation
-                        .checked_sub(Duration::from_secs(1))
-                        .expect("test instant has elapsed time"),
-                ),
-                StorageWriteReadinessStatus {
-                    ready: true,
-                    pool_metadata_reason: None,
-                }
-            );
-
-            let timed_out = apply_node_pool_metadata_timeout_policy(
-                StorageWriteReadinessStatus {
-                    ready: false,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                },
-                Instant::now(),
-            );
-
-            assert_eq!(timed_out, blocked);
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_fails_closed_without_fresh_observation() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let writable = StorageWriteReadinessStatus {
-                ready: true,
-                pool_metadata_reason: None,
-            };
-            assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
-
-            async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
-                let timed_out = apply_node_pool_metadata_timeout_policy(
-                    StorageWriteReadinessStatus {
-                        ready: false,
-                        pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                    },
-                    Instant::now(),
-                );
-
-                assert!(!timed_out.ready);
-                assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-            })
-            .await;
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
     }
 
     #[test]

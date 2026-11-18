@@ -196,7 +196,7 @@ def main():
         child.add_argument("--configuration", choices=CONFIGURATIONS, required=True)
         child.add_argument("--archive", type=Path, required=True)
     child = sub.add_parser("cargo")
-    child.add_argument("operation", choices=("lint", "doc"))
+    child.add_argument("operation", choices=("lint", "doc", "warm"))
     child.add_argument("--configuration", choices=CONFIGURATIONS, required=True)
     child = sub.add_parser("evidence")
     child.add_argument("listing", type=Path)
@@ -214,8 +214,11 @@ def main():
                 # The original all-targets lint included the harness. Archive
                 # and doctest exclusions must not remove that responsibility.
                 selection = [*selection, "-p", "e2e_test"] if "CI_PACKAGES" in os.environ and os.environ["CI_PACKAGES"] else ["--workspace"]
-            command = ["cargo", "clippy" if args.operation == "lint" else "test", "--locked", *selection]
-            command += ["--all-targets", "--", "-D", "warnings"] if args.operation == "lint" else ["--doc"]
+            command = ["cargo", "clippy" if args.operation == "lint" else "test", "--locked"]
+            # `warm` is the Cargo build `nextest archive` runs, minus the archive:
+            # cache-warm.yml writes ci-dev with it.
+            command += {"lint": [*selection, "--all-targets", "--", "-D", "warnings"],
+                        "doc": [*selection, "--doc"], "warm": ["--no-run", *selection]}[args.operation]
             subprocess.run(command, cwd=ROOT, check=True)
         else:
             print(f"Verified {verify_execution(args.listing, args.junit, args.core)} test executions")

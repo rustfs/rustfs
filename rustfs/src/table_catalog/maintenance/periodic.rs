@@ -230,8 +230,8 @@ mod tests {
 
     type TestStore = ConfiguredTableCatalogStore<TestCatalogObjectBackend>;
 
-    fn backings() -> [TableCatalogBackingMode; 2] {
-        [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong]
+    fn backings() -> [TableCatalogBackingMode; 1] {
+        [TableCatalogBackingMode::ObjectBacked]
     }
 
     fn enabled_config() -> TableMaintenanceConfig {

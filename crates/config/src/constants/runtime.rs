@@ -48,7 +48,7 @@ pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
 pub const DEFAULT_WORKER_THREADS: usize = 16;
 pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 1024;
 pub const DEFAULT_THREAD_PRINT_ENABLED: bool = false;
-pub const DEFAULT_THREAD_STACK_SIZE: usize = MI_B; // 1 MiB
+pub const DEFAULT_THREAD_STACK_SIZE: usize = 2 * MI_B; // 2 MiB
 pub const DEFAULT_THREAD_KEEP_ALIVE: u64 = 60; // seconds
 pub const DEFAULT_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 pub const DEFAULT_THREAD_NAME: &str = "rustfs-worker";
@@ -114,6 +114,14 @@ pub const ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: &str = "RUSTFS_OBJECT_FILE_
 pub const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: bool = false;
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: bool = true;
+
+/// Bytes of page-cache read-ahead a ranged file stream keeps queued in front
+/// of its read position (`posix_fadvise(WILLNEED)`, Linux only; `0` disables).
+/// A shard stream served to a peer reads 4 MiB chunks one after another; the
+/// kernel's own read-ahead window ramps up slowly for large reads, so without
+/// this each chunk waits for its own device round trips.
+pub const ENV_OBJECT_STREAM_READ_AHEAD_BYTES: &str = "RUSTFS_OBJECT_STREAM_READ_AHEAD_BYTES";
+pub const DEFAULT_OBJECT_STREAM_READ_AHEAD_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Threshold for small object seek support in bytes.
@@ -158,3 +166,10 @@ pub const ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT: &str = "RUSTFS_OBJECT_D
 pub const ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU: &str = "RUSTFS_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU";
 pub const ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX: &str = "RUSTFS_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX";
 pub const ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX: &str = "RUSTFS_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX";
+/// Fill the object data cache from the PUT body as it streams in, so the first
+/// GET after a write is a hit (write-once KV-cache chunks). Only objects that
+/// fit the cache entry limit and take the plain streaming PUT path (no
+/// compression, no SSE) are filled; the body is kept in memory once more
+/// during the PUT.
+pub const ENV_OBJECT_DATA_CACHE_FILL_ON_PUT: &str = "RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT";
+pub const DEFAULT_OBJECT_DATA_CACHE_FILL_ON_PUT: bool = false;

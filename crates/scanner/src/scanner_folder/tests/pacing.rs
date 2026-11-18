@@ -29,6 +29,69 @@ impl Drop for IdleGuard {
     }
 }
 
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn object_pacing_does_not_multiply_disk_budget_waits() {
+    let _idle = IdleGuard::enabled();
+    for corrupt in [false, true] {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+        scanner.old_cache.info.name = "bucket".to_owned();
+        scanner.new_cache.info.name = "bucket".to_owned();
+        scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Default).for_disk_with_budget_for_tests(
+            &temp_dir,
+            crate::sleeper::ScannerDiskIoBudgetLimits {
+                iops: Some(0),
+                bytes_per_sec: Some(0),
+            },
+        );
+        let mut metadata = FileMeta::new();
+        let mut info = FileInfo::new("object", 4, 2);
+        info.volume = "bucket".to_owned();
+        info.size = 17;
+        info.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture timestamp"));
+        metadata.add_version(info).expect("add object metadata");
+        let bytes = if corrupt {
+            Vec::new()
+        } else {
+            metadata.marshal_msg().expect("encode object metadata")
+        };
+        write_test_object_metadata_bytes(&temp_dir, "bucket", "object", &bytes).await;
+        let mut entry = DataUsageEntry::default();
+        scanner
+            .scan_folder(
+                CancellationToken::new(),
+                CachedFolder {
+                    name: "bucket".to_owned(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &mut entry,
+            )
+            .await
+            .expect("finish budget-limited folder scan");
+        let total = scanner
+            .new_cache
+            .size_recursive(&hash_path("bucket").0)
+            .expect("root accounting");
+        assert_eq!(total.objects, usize::from(!corrupt));
+        assert_eq!(total.size, if corrupt { 0 } else { 17 });
+        assert_eq!(total.failed_objects, usize::from(corrupt));
+        let budget = crate::sleeper::scanner_disk_io_budget_status()
+            .into_iter()
+            .find(|status| status.disk == temp_dir.to_string_lossy())
+            .expect("disk budget status");
+        assert!(budget.wait_seconds >= 2.0, "the scan must actually exhaust its disk budget");
+        assert_eq!(scanner.pacing_debt.charged_objects, 1);
+        assert!(
+            scanner.pacing_debt.charged_delay < Duration::from_millis(100),
+            "budget waits must not become proportional work debt: {:?}",
+            scanner.pacing_debt.charged_delay
+        );
+        assert_eq!(scanner.pacing_debt.pending(), Duration::ZERO);
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn pacing_preserves_real_folder_versions_bytes_checkpoints_and_maintenance() {

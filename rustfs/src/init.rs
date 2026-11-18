@@ -19,6 +19,7 @@ use crate::server::ShutdownHandle;
 use crate::server::runtime_sources::current_notify_interface;
 use crate::storage_api::error::{StorageError, is_unreadable_config_error};
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage_api::startup::init::notification_config_to_s3s;
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
@@ -32,10 +33,9 @@ use rustfs_config::{
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
 use rustfs_notify::NotificationError;
-use rustfs_s3_types::EventName;
+use rustfs_s3_types::{EventName, s3_error};
 use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
 use rustfs_utils::get_env_usize;
-use s3s::s3_error;
 use std::env;
 use std::io::Error;
 use std::sync::Arc;
@@ -177,7 +177,7 @@ fn notification_config_to_event_rules(
 /// One bucket's persisted notification configuration as startup sees it.
 #[derive(Debug)]
 enum BucketNotificationLookup {
-    Configured(s3s::dto::NotificationConfiguration),
+    Configured(rustfs_gateway_types::persistence::PersistedNotificationConfiguration),
     Missing,
     /// Stored bytes cannot be parsed. Deterministic, so a retry cannot help,
     /// and reading it as missing would clear the bucket's rules.
@@ -186,7 +186,7 @@ enum BucketNotificationLookup {
 
 fn classify_bucket_notification_lookup(
     bucket: &str,
-    lookup: Result<Option<s3s::dto::NotificationConfiguration>, StorageError>,
+    lookup: Result<Option<rustfs_gateway_types::persistence::PersistedNotificationConfiguration>, StorageError>,
 ) -> Result<BucketNotificationLookup, NotificationError> {
     match lookup {
         Ok(Some(cfg)) => Ok(BucketNotificationLookup::Configured(cfg)),
@@ -216,6 +216,7 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
     match classify_bucket_notification_lookup(bucket, get_bucket_notification_config(bucket).await)? {
         BucketNotificationLookup::Unreadable => Ok(false),
         BucketNotificationLookup::Configured(cfg) => {
+            let cfg = notification_config_to_s3s(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
             info!(
                 target: "rustfs::init",
                 event = "notification_config_loaded",
@@ -927,8 +928,7 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
 
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub(crate) fn protocol_storage_client_for_server(server_ctx: Arc<ServerContextSlot>) -> ProtocolStorageClient {
-    let fs = crate::storage_api::startup::init::ecfs::FS::with_server_ctx(server_ctx);
-    ProtocolStorageClient::new(fs)
+    ProtocolStorageClient::new(server_ctx)
 }
 
 /// Initialize the FTP system

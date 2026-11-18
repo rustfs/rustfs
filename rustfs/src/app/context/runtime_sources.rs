@@ -33,12 +33,12 @@ use rustfs_io_metrics::{
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{
     GlobalPublishedOutboundTlsState, TlsGeneration, load_global_outbound_tls_generation, load_global_outbound_tls_state,
 };
-use s3s::dto::SelectObjectContentInput;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
@@ -166,7 +166,7 @@ pub fn action_credentials() -> Option<Credentials> {
     get_global_action_cred()
 }
 
-pub fn region() -> Option<s3s::region::Region> {
+pub fn region() -> Option<rustfs_s3_types::Region> {
     get_global_region()
 }
 

@@ -826,12 +826,17 @@ pub(crate) async fn begin(
 ) -> Result<QuotaContext> {
     let snapshot_admission = opts.quota_admission;
     let data_movement = opts.data_movement;
-    if crate::bucket::utils::is_meta_bucketname(bucket) {
-        let meta_bucket_fast_path_started = rustfs_io_metrics::put_stage_timer();
-        rustfs_io_metrics::record_put_object_stage_duration_from(
-            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
-            meta_bucket_fast_path_started,
-        );
+    // A lockless cache PUT is only taken when the bucket has no quota, so it
+    // reserves nothing and needs no metadata-transaction lock.
+    let lockless_cache = opts.is_lockless_cache_write() && snapshot_admission.is_none();
+    if lockless_cache || crate::bucket::utils::is_meta_bucketname(bucket) {
+        if !lockless_cache {
+            let meta_bucket_fast_path_started = rustfs_io_metrics::put_stage_timer();
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
+                meta_bucket_fast_path_started,
+            );
+        }
         return Ok(QuotaContext {
             store: None,
             bucket: bucket.to_string(),
@@ -1602,6 +1607,7 @@ fn shard_object(ledger_object: &str, shard_index: u16, bucket_incarnation: Uuid,
 }
 
 fn shard_index(object: &str) -> u16 {
+    let object = rustfs_utils::path::encode_dir_object_ref(object);
     let digest = Sha256::digest(object.as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) % SHARDED_LEDGER_COUNT
 }
@@ -2309,6 +2315,12 @@ fn log_deferred_settlement(data: &ReservationLedgerData, state: &'static str, er
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_shard_agrees_with_directory_listing_name() {
+        for listed in ["photos/", "reports/june/"] {
+            assert_eq!(shard_index(listed), shard_index(&rustfs_utils::path::encode_dir_object(listed)));
+        }
+    }
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use serial_test::serial;
 

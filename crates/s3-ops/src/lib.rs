@@ -83,6 +83,14 @@ pub enum S3Operation {
     SelectObjectContent,
     UploadPart,
     UploadPartCopy,
+    GetBucketAccelerateConfiguration,
+    GetBucketRequestPayment,
+    GetBucketWebsite,
+    PutBucketAccelerateConfiguration,
+    PutBucketRequestPayment,
+    PutBucketWebsite,
+    DeleteBucketWebsite,
+    PostObject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,7 +134,7 @@ impl EventMapping {
 }
 
 impl S3Operation {
-    pub const ALL: [Self; 66] = [
+    pub const ALL: [Self; 74] = [
         Self::AbortMultipartUpload,
         Self::CompleteMultipartUpload,
         Self::CopyObject,
@@ -193,6 +201,14 @@ impl S3Operation {
         Self::SelectObjectContent,
         Self::UploadPart,
         Self::UploadPartCopy,
+        Self::GetBucketAccelerateConfiguration,
+        Self::GetBucketRequestPayment,
+        Self::GetBucketWebsite,
+        Self::PutBucketAccelerateConfiguration,
+        Self::PutBucketRequestPayment,
+        Self::PutBucketWebsite,
+        Self::DeleteBucketWebsite,
+        Self::PostObject,
     ];
 
     #[inline]
@@ -214,10 +230,12 @@ impl S3Operation {
             Self::DeleteBucketPolicy => "s3:DeleteBucketPolicy",
             Self::DeleteBucketReplication => "s3:DeleteBucketReplication",
             Self::DeleteBucketTagging => "s3:DeleteBucketTagging",
+            Self::DeleteBucketWebsite => "s3:DeleteBucketWebsite",
             Self::DeleteObject => "s3:DeleteObject",
             Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
             Self::DeleteObjects => "s3:DeleteObjects",
             Self::DeletePublicAccessBlock => "s3:DeletePublicAccessBlock",
+            Self::GetBucketAccelerateConfiguration => "s3:GetBucketAccelerateConfiguration",
             Self::GetBucketAcl => "s3:GetBucketAcl",
             Self::GetBucketCors => "s3:GetBucketCors",
             Self::GetBucketEncryption => "s3:GetBucketEncryption",
@@ -228,8 +246,10 @@ impl S3Operation {
             Self::GetBucketPolicy => "s3:GetBucketPolicy",
             Self::GetBucketPolicyStatus => "s3:GetBucketPolicyStatus",
             Self::GetBucketReplication => "s3:GetBucketReplication",
+            Self::GetBucketRequestPayment => "s3:GetBucketRequestPayment",
             Self::GetBucketTagging => "s3:GetBucketTagging",
             Self::GetBucketVersioning => "s3:GetBucketVersioning",
+            Self::GetBucketWebsite => "s3:GetBucketWebsite",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectAcl => "s3:GetObjectAcl",
             Self::GetObjectAttributes => "s3:GetObjectAttributes",
@@ -247,6 +267,7 @@ impl S3Operation {
             Self::ListObjects => "s3:ListObjects",
             Self::ListObjectsV2 => "s3:ListObjectsV2",
             Self::ListParts => "s3:ListParts",
+            Self::PutBucketAccelerateConfiguration => "s3:PutBucketAccelerateConfiguration",
             Self::PutBucketAcl => "s3:PutBucketAcl",
             Self::PutBucketCors => "s3:PutBucketCors",
             Self::PutBucketEncryption => "s3:PutBucketEncryption",
@@ -255,8 +276,11 @@ impl S3Operation {
             Self::PutBucketNotificationConfiguration => "s3:PutBucketNotificationConfiguration",
             Self::PutBucketPolicy => "s3:PutBucketPolicy",
             Self::PutBucketReplication => "s3:PutBucketReplication",
+            Self::PutBucketRequestPayment => "s3:PutBucketRequestPayment",
             Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::PutBucketVersioning => "s3:PutBucketVersioning",
+            Self::PutBucketWebsite => "s3:PutBucketWebsite",
+            Self::PostObject => "s3:PostObject",
             Self::PutObject => "s3:PutObject",
             Self::PutObjectAcl => "s3:PutObjectAcl",
             Self::PutObjectLegalHold => "s3:PutObjectLegalHold",
@@ -288,6 +312,7 @@ impl S3Operation {
             Self::GetObjectLegalHold => EventMapping::Single(EventName::ObjectAccessedGetLegalHold),
             Self::GetObjectRetention => EventMapping::Single(EventName::ObjectAccessedGetRetention),
             Self::HeadObject => EventMapping::Single(EventName::ObjectAccessedHead),
+            Self::PostObject => EventMapping::Single(EventName::ObjectCreatedPost),
             Self::PutObject => EventMapping::PutObject,
             Self::PutObjectAcl => EventMapping::Single(EventName::ObjectAclPut),
             Self::PutObjectLegalHold => EventMapping::Single(EventName::ObjectCreatedPutLegalHold),
@@ -301,7 +326,9 @@ impl S3Operation {
             | Self::DeleteBucketPolicy
             | Self::DeleteBucketReplication
             | Self::DeleteBucketTagging
+            | Self::DeleteBucketWebsite
             | Self::DeletePublicAccessBlock
+            | Self::GetBucketAccelerateConfiguration
             | Self::GetBucketAcl
             | Self::GetBucketCors
             | Self::GetBucketEncryption
@@ -312,8 +339,10 @@ impl S3Operation {
             | Self::GetBucketPolicy
             | Self::GetBucketPolicyStatus
             | Self::GetBucketReplication
+            | Self::GetBucketRequestPayment
             | Self::GetBucketTagging
             | Self::GetBucketVersioning
+            | Self::GetBucketWebsite
             | Self::GetObjectAcl
             | Self::GetObjectLockConfiguration
             | Self::GetObjectTagging
@@ -326,6 +355,7 @@ impl S3Operation {
             | Self::ListObjects
             | Self::ListObjectsV2
             | Self::ListParts
+            | Self::PutBucketAccelerateConfiguration
             | Self::PutBucketAcl
             | Self::PutBucketCors
             | Self::PutBucketEncryption
@@ -334,8 +364,10 @@ impl S3Operation {
             | Self::PutBucketNotificationConfiguration
             | Self::PutBucketPolicy
             | Self::PutBucketReplication
+            | Self::PutBucketRequestPayment
             | Self::PutBucketTagging
             | Self::PutBucketVersioning
+            | Self::PutBucketWebsite
             | Self::PutObjectLockConfiguration
             | Self::PutPublicAccessBlock
             | Self::UploadPart
@@ -517,11 +549,28 @@ mod tests {
     }
 
     #[test]
+    fn metric_indexes_and_labels_identify_each_operation() {
+        let mut labels = std::collections::HashSet::new();
+        for (index, op) in S3Operation::ALL.into_iter().enumerate() {
+            assert_eq!(op.metric_index(), index, "metric index for {op:?}");
+            assert!(labels.insert(op.as_str()), "repeated metric label for {op:?}");
+        }
+        assert_eq!(S3Operation::UploadPartCopy.metric_index(), 65);
+    }
+
+    #[test]
     fn test_operations_without_event_mapping_remain_unmapped() {
         let unmapped = [
+            S3Operation::DeleteBucketWebsite,
+            S3Operation::GetBucketAccelerateConfiguration,
             S3Operation::GetBucketAcl,
+            S3Operation::GetBucketRequestPayment,
+            S3Operation::GetBucketWebsite,
             S3Operation::ListObjectsV2,
+            S3Operation::PutBucketAccelerateConfiguration,
             S3Operation::PutBucketNotificationConfiguration,
+            S3Operation::PutBucketRequestPayment,
+            S3Operation::PutBucketWebsite,
             S3Operation::UploadPart,
         ];
         for op in unmapped {

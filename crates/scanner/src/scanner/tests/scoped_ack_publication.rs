@@ -12,6 +12,10 @@ const PROOF_BUCKET: &str = "publication-proof-bucket";
 const PROOF_EPOCH: u64 = 7;
 const PROOF_CYCLE: u64 = 11;
 
+mod usage_native_ack;
+mod usage_native_fences;
+mod usage_native_incarnation;
+
 async fn settle_namespace_commits(store: &ECStore) {
     tokio::time::timeout(Duration::from_secs(30), async {
         while ecstore_namespace_commits_pending(store) {
@@ -23,20 +27,39 @@ async fn settle_namespace_commits(store: &ECStore) {
 }
 
 async fn complete_candidate(store: &Arc<ECStore>, cycle: u64) -> (crate::scanner_io::ScannerCycleResult, DataUsageInfo) {
+    let (result, candidate) = candidate_with_budget(store, cycle, Some(8)).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    let candidate = candidate.expect("complete scanner snapshot");
+    assert!(candidate.usage_snapshot_complete);
+    assert_eq!(candidate.usage_snapshot_converged, Some(true));
+    assert_eq!(candidate.scanner_cycle, Some(cycle));
+    assert_eq!(candidate.scanner_epoch, Some(PROOF_EPOCH));
+    (result, candidate)
+}
+
+async fn candidate_with_budget(
+    store: &Arc<ECStore>,
+    cycle: u64,
+    max_objects: Option<u64>,
+) -> (crate::scanner_io::ScannerCycleResult, Option<DataUsageInfo>) {
     settle_namespace_commits(store).await;
     let ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
         &ctx,
         ScannerCycleBudgetConfig {
-            max_objects: Some(8),
+            max_objects,
             ..Default::default()
         },
     );
+    // This fixture commits real checkpoints after count stops; CI disk latency
+    // must not turn the accelerated drain used by timing doubles into lost work.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = crate::scanner_io::nsscanner_with_storage_status_scoped(
         store.as_ref(),
         crate::scanner_io::ScannerCycleRequest {
-            ctx,
+            owner_ctx: ctx.clone(),
+            ctx: budget.token(),
             budget,
             updates,
             want_cycle: cycle,
@@ -48,18 +71,14 @@ async fn complete_candidate(store: &Arc<ECStore>, cycle: u64) -> (crate::scanner
             requires_full_scan: true,
             service_cohort: None,
             resolved_scope_observer: None,
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: None,
         },
     )
     .await
     .expect("real scanner must produce the fixture candidate");
-    assert_eq!(result.status, ScannerCycleStatus::Complete);
-    let candidate = receiver.recv().await.expect("complete scanner snapshot");
-    assert!(candidate.usage_snapshot_complete);
-    assert_eq!(candidate.usage_snapshot_converged, Some(true));
-    assert_eq!(candidate.scanner_cycle, Some(cycle));
-    assert_eq!(candidate.scanner_epoch, Some(PROOF_EPOCH));
+    let candidate = receiver.recv().await;
     (result, candidate)
 }
 
@@ -273,6 +292,7 @@ async fn scoped_ack_publication_observed_candidate_reuse_requires_a_new_root_pro
     let scan = crate::scanner_io::nsscanner_with_storage_status_scoped(
         store.as_ref(),
         crate::scanner_io::ScannerCycleRequest {
+            owner_ctx: ctx.clone(),
             ctx,
             budget,
             updates,
@@ -285,6 +305,7 @@ async fn scoped_ack_publication_observed_candidate_reuse_requires_a_new_root_pro
             requires_full_scan: false,
             service_cohort: None,
             resolved_scope_observer: Some(observer),
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: None,
         },
@@ -316,7 +337,7 @@ async fn scoped_ack_publication_observed_candidate_reuse_requires_a_new_root_pro
 #[tokio::test]
 #[serial]
 async fn scoped_ack_publication_stale_root_cas_keeps_dirty_after_bucket_save() {
-    let (_directory, store) = candidate_store().await;
+    let (directory, store) = candidate_store().await;
     let (scan, candidate) = complete_candidate(&store, PROOF_CYCLE).await;
     let mut bucket_cache = DataUsageCache::default();
     bucket_cache
@@ -363,7 +384,27 @@ async fn scoped_ack_publication_stale_root_cas_keeps_dirty_after_bucket_save() {
         before,
         "bucket durability must not authorize replacing the winning root"
     );
+    let evidence = serde_json::json!({
+        "acknowledgements": acknowledgements.len(),
+        "retained_dirty_buckets": crate::scanner_io::dirty_usage_buckets_for_tests().len(),
+        "winning_root_revision": format!("{:?}", before.1),
+        "persisted_bucket_objects": bucket_cache.checked_flatten(PROOF_BUCKET).expect("saved root still exists").objects,
+    });
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    drop(store);
+    let fixture_path = directory.path().to_path_buf();
+    directory.close().expect("remove stale-CAS disk fixture");
+    assert!(!fixture_path.exists());
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-13", "assertion_id": "USAGE-13-A05", "status": "PASS", "evidence": evidence,
+        })
+    );
+    println!(
+        "usage_cleanup: {}",
+        serde_json::json!({"case_id": "USAGE-13", "status": "PASS", "fixture_removed": !fixture_path.exists()})
+    );
 }
 
 #[tokio::test]
@@ -666,4 +707,280 @@ fn sealed_peer_proof_binds_every_lease_and_keeps_all_post_lease_guardrails() {
             "{field}"
         );
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn usage_budget_post_walk_stop_publishes_exact_root_before_ack() {
+    let (_directory, store) = candidate_store().await;
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let stopped = Arc::clone(&budget);
+    let (updates, mut receiver) = mpsc::channel(1);
+    let scan = crate::scanner_io::nsscanner_with_storage_status_scoped(
+        store.as_ref(),
+        crate::scanner_io::ScannerCycleRequest {
+            owner_ctx: ctx.clone(),
+            ctx: budget.token(),
+            budget: Arc::clone(&budget),
+            updates,
+            want_cycle: PROOF_CYCLE,
+            leader_epoch: PROOF_EPOCH,
+            scan_mode: HealScanMode::Normal,
+            scan_scope: ScannerBucketScanScope::default(),
+            persisted_usage_baseline: None,
+            observed_usage_candidate: None,
+            requires_full_scan: true,
+            service_cohort: None,
+            resolved_scope_observer: None,
+            post_walk_hook: Some(Box::new(move || stopped.cancel_for_runtime())),
+            post_walk_gate: None,
+            peer_observations: None,
+        },
+    )
+    .await
+    .expect("complete all sources before the deterministic budget stop");
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
+    assert!(budget.token().is_cancelled());
+    assert!(!ctx.is_cancelled());
+    assert_eq!(scan.status, ScannerCycleStatus::Complete);
+    let candidate = receiver
+        .recv()
+        .await
+        .expect("coverage, not the walk token, permits publication");
+    assert!(candidate.is_complete_bucket_usage_snapshot());
+    assert_eq!(candidate.buckets_usage[PROOF_BUCKET].objects_count, 1);
+    assert_eq!(candidate.buckets_usage[PROOF_BUCKET].size, 5);
+    assert!(read_root(&store).await.0.is_none());
+    assert!(
+        crate::scanner_io::dirty_usage_buckets_pending(),
+        "a candidate alone must not clear responsibility"
+    );
+    let expected_bytes = serde_json::to_vec(&candidate).expect("sealed candidate bytes");
+    let publication = publish_candidate(&store, &scan, candidate, None).await;
+    assert_eq!(publication.outcome(), DataUsagePersistOutcome::Saved);
+    assert_eq!(read_root(&store).await.0.as_deref(), Some(expected_bytes.as_slice()));
+    let (_, pending, remote) = finalize_scanner_cycle_result(scan, publication);
+    assert!(!pending);
+    assert!(remote.is_empty());
+    assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+}
+
+#[tokio::test]
+#[serial]
+async fn usage_budget_post_walk_owner_loss_prevents_candidate_and_ack() {
+    let (_directory, store) = candidate_store().await;
+    let ctx = CancellationToken::new();
+    let cancelled = ctx.clone();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let stopped = Arc::clone(&budget);
+    let (updates, mut receiver) = mpsc::channel(1);
+    let scan = crate::scanner_io::nsscanner_with_storage_status_scoped(
+        store.as_ref(),
+        crate::scanner_io::ScannerCycleRequest {
+            owner_ctx: ctx.clone(),
+            ctx: budget.token(),
+            budget,
+            updates,
+            want_cycle: PROOF_CYCLE,
+            leader_epoch: PROOF_EPOCH,
+            scan_mode: HealScanMode::Normal,
+            scan_scope: ScannerBucketScanScope::default(),
+            persisted_usage_baseline: None,
+            observed_usage_candidate: None,
+            requires_full_scan: true,
+            service_cohort: None,
+            resolved_scope_observer: None,
+            post_walk_hook: Some(Box::new(move || {
+                stopped.cancel_for_runtime();
+                cancelled.cancel();
+            })),
+            post_walk_gate: None,
+            peer_observations: None,
+        },
+    )
+    .await
+    .expect("owner loss returns an incomplete, non-publishing cycle");
+    assert!(ctx.is_cancelled());
+    assert_ne!(scan.status, ScannerCycleStatus::Complete);
+    assert!(receiver.recv().await.is_none());
+    assert!(read_root(&store).await.0.is_none());
+    assert!(!scan.has_dirty_usage_to_acknowledge());
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn usage_companion_write_failure_retains_dirty_responsibility() {
+    let (directory, store) = candidate_store().await;
+    let (scan, mut candidate) = complete_candidate(&store, PROOF_CYCLE).await;
+    let dirty = crate::scanner_io::dirty_usage_buckets_for_tests();
+    let target = Arc::new(MemoryConfigStore::default());
+    let root_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let companion_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str());
+    let mut baseline = candidate.clone();
+    baseline.scanner_cycle = Some(PROOF_CYCLE - 1);
+    for source in &mut baseline.usage_snapshot_set_states {
+        source.scanner_cycle = Some(PROOF_CYCLE - 1);
+    }
+    let baseline_bytes = serde_json::to_vec(&baseline).expect("prior canonical value");
+    target.objects.lock().await.insert(root_key.clone(), baseline_bytes.clone());
+    target.fail_put_number.lock().await.insert(companion_key.clone(), 1);
+    candidate.usage_snapshot_converged = Some(false);
+    candidate.usage_snapshot_observational = true;
+    let (sender, receiver) = mpsc::channel(1);
+    sender.send(candidate).await.expect("enqueue actual scanner candidate");
+    drop(sender);
+    let publication =
+        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+            CancellationToken::new(),
+            target.clone(),
+            receiver,
+            Some(PROOF_EPOCH),
+            None,
+            ScannerPublicationFence::new(None, None, None).with_ack_expectation(scan.publication_expectation()),
+            || async { None },
+        )
+        .await;
+    assert_eq!(publication.outcome(), DataUsagePersistOutcome::Failed);
+    assert_eq!(
+        target.put_counts.lock().await.get(&companion_key),
+        Some(&1),
+        "the real writer reached the failing companion PUT"
+    );
+    assert!(!target.objects.lock().await.contains_key(&companion_key));
+    assert_eq!(target.objects.lock().await.get(&root_key), Some(&baseline_bytes));
+    let (_, pending, acknowledgements) = finalize_scanner_cycle_result(scan, publication);
+    assert!(pending);
+    assert!(acknowledgements.is_empty());
+    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty);
+    assert!(read_root(&store).await.0.is_none());
+    let evidence = serde_json::json!({
+        "companion_put_attempts": 1,
+        "injected_storage_result": "write failed before commit",
+        "canonical_unchanged": true,
+        "acknowledgements": acknowledgements.len(),
+        "retained_dirty_buckets": dirty.len(),
+    });
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    drop(target);
+    drop(store);
+    let fixture_path = directory.path().to_path_buf();
+    directory.close().expect("remove companion failure fixture");
+    assert!(!fixture_path.exists());
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-13", "assertion_id": "USAGE-13-A06", "status": "PASS", "evidence": evidence,
+        })
+    );
+    println!("usage_cleanup: {}", serde_json::json!({"case_id": "USAGE-13", "status": "PASS"}));
+}
+
+#[tokio::test]
+#[serial]
+async fn usage_durable_root_ack_requires_fresh_contributions_from_every_source() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let (directory, store) = setup_scanner_cycle_store_with_pool_count(false, 2).await;
+    store
+        .make_bucket(PROOF_BUCKET, &crate::storage_api::scan::MakeBucketOptions::default())
+        .await
+        .expect("create the bucket on both physical sources");
+    for (index, pool) in store.pools.iter().enumerate() {
+        pool.disk_set[0]
+            .put_object(
+                PROOF_BUCKET,
+                &format!("source-{index}"),
+                &mut PutObjReader::from_vec(b"proof".to_vec()),
+                &ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist one distinct object on each source");
+    }
+    crate::scanner_io::record_dirty_usage_bucket(PROOF_BUCKET);
+    let (fresh_scan, fresh) = complete_candidate(&store, PROOF_CYCLE).await;
+    assert_eq!(fresh.usage_snapshot_set_states.len(), 2);
+    assert_eq!(fresh.buckets_usage[PROOF_BUCKET].objects_count, 2);
+    assert_eq!(fresh.buckets_usage[PROOF_BUCKET].size, 10);
+    let fresh_bytes = serde_json::to_vec(&fresh).expect("exact all-source root");
+    let publication = publish_candidate(&store, &fresh_scan, fresh, None).await;
+    assert_eq!(publication.outcome(), DataUsagePersistOutcome::Saved);
+    assert_eq!(read_root(&store).await.0.as_deref(), Some(fresh_bytes.as_slice()));
+    let (_, pending, remote) = finalize_scanner_cycle_result(fresh_scan, publication);
+    assert!(!pending);
+    assert!(remote.is_empty());
+    assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+
+    crate::scanner_io::record_dirty_usage_bucket(PROOF_BUCKET);
+    let (_, _) = candidate_with_budget(&store, PROOF_CYCLE + 1, Some(1)).await;
+    let cache_name = path_join_buf(&[PROOF_BUCKET, DATA_USAGE_CACHE_NAME]);
+    let mut mixed_source = None;
+    for (index, pool) in store.pools.iter().enumerate() {
+        let set = pool.disk_set[0].clone();
+        let mut cache = DataUsageCache::default();
+        let revisions = cache
+            .load_with_revisions(set.clone(), &cache_name)
+            .await
+            .expect("bounded source checkpoint");
+        if cache.has_scan_position()
+            && let Some(progress) = cache.info.scan_progress.as_mut()
+        {
+            progress.started_plan.0[0] ^= 1;
+            let epoch = cache.info.scan_identity.expect("checkpoint identity").publication_epoch;
+            cache
+                .save_with_revisions_for_epoch(set, &cache_name, &revisions, epoch)
+                .await
+                .expect("persist a resumed interval mismatch on one source");
+            mixed_source = Some(index);
+            break;
+        }
+    }
+    let mixed_source = mixed_source.expect("the count stop must retain a real source checkpoint");
+    let dirty = crate::scanner_io::dirty_usage_buckets_for_tests();
+    let (scan, candidate) = candidate_with_budget(&store, PROOF_CYCLE + 2, None).await;
+    assert_eq!(
+        scan.status,
+        ScannerCycleStatus::Complete,
+        "the exact old source value remains eligible for display"
+    );
+    let candidate = candidate.expect("a carried source permits a complete, pending primary representation");
+    assert_eq!(candidate.usage_snapshot_set_states.len(), 2);
+    assert_eq!(candidate.usage_snapshot_pending_buckets, vec![PROOF_BUCKET.to_string()]);
+    assert_eq!(candidate.usage_snapshot_converged, Some(false));
+    assert_eq!(candidate.buckets_usage[PROOF_BUCKET].objects_count, 2);
+    assert!(
+        candidate.buckets_usage[PROOF_BUCKET].usage_certification.is_none(),
+        "mixed source values cannot acquire a current certificate"
+    );
+    let publication = publish_candidate(&store, &scan, candidate, None).await;
+    assert_eq!(publication.outcome(), DataUsagePersistOutcome::Saved);
+    let (_, pending, remote) = finalize_scanner_cycle_result(scan, publication);
+    assert!(pending);
+    assert!(remote.is_empty());
+    assert_eq!(
+        crate::scanner_io::dirty_usage_buckets_for_tests(),
+        dirty,
+        "a durable root with one non-fresh source must retain the whole bucket debt"
+    );
+    let evidence = serde_json::json!({
+        "physical_sources": 2, "mixed_source": mixed_source, "exact_objects": 2, "exact_bytes": 10,
+        "fresh_root_saved_and_acknowledged": true, "nonfresh_root_saved": true,
+        "nonfresh_retained_dirty_buckets": dirty.len(),
+    });
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    drop(store);
+    let fixture_path = directory.path().to_path_buf();
+    directory.close().expect("remove all-source acknowledgement fixture");
+    assert!(!fixture_path.exists());
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-13", "assertion_id": "USAGE-13-A08", "status": "PASS", "evidence": evidence,
+        })
+    );
+    println!("usage_cleanup: {}", serde_json::json!({"case_id": "USAGE-13", "status": "PASS"}));
 }

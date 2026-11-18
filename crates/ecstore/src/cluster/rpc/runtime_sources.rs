@@ -481,14 +481,6 @@ pub(crate) fn record_remote_disk_grpc_write_all_request() {
         .record_outgoing_request_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
 }
 
-pub(crate) fn record_remote_disk_grpc_write_all_duration(duration: Duration) {
-    global_internode_metrics().record_duration_for_operation_and_backend(
-        INTERNODE_OPERATION_GRPC_WRITE_ALL,
-        INTERNODE_TRANSPORT_BACKEND_GRPC,
-        duration,
-    );
-}
-
 pub(crate) fn record_remote_disk_grpc_write_all_sent_bytes(bytes: usize) {
     global_internode_metrics().record_sent_bytes_for_operation_and_backend(
         INTERNODE_OPERATION_GRPC_WRITE_ALL,
@@ -527,14 +519,6 @@ pub(crate) fn record_remote_disk_grpc_read_all_error() {
 pub(crate) fn record_remote_disk_grpc_read_all_request() {
     global_internode_metrics()
         .record_outgoing_request_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
-}
-
-pub(crate) fn record_remote_disk_grpc_read_all_duration(duration: Duration) {
-    global_internode_metrics().record_duration_for_operation_and_backend(
-        INTERNODE_OPERATION_GRPC_READ_ALL,
-        INTERNODE_TRANSPORT_BACKEND_GRPC,
-        duration,
-    );
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -614,17 +598,6 @@ pub(crate) fn record_remote_disk_grpc_batch_read_version_stage(stage: &'static s
     );
 }
 
-pub(crate) fn record_remote_disk_grpc_batch_read_version_duration(duration: Duration) {
-    if !rustfs_io_metrics::get_stage_metrics_enabled() {
-        return;
-    }
-    global_internode_metrics().record_duration_for_operation_and_backend(
-        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
-        INTERNODE_TRANSPORT_BACKEND_GRPC,
-        duration,
-    );
-}
-
 pub(crate) fn record_remote_disk_grpc_batch_read_version_error() {
     if !rustfs_io_metrics::get_stage_metrics_enabled() {
         return;
@@ -656,12 +629,34 @@ pub(crate) fn record_remote_disk_grpc_batch_read_version_recv_bytes(bytes: usize
     record_grpc_payload_size(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, bytes);
 }
 
-pub(crate) fn record_remote_disk_grpc_read_version_error() {
+#[derive(Clone, Copy)]
+pub(crate) enum ReadVersionErrorStage {
+    RpcStatus,
+    RemoteResponse,
+    ResponseDecode,
+}
+
+impl ReadVersionErrorStage {
+    fn classification(self) -> &'static str {
+        match self {
+            Self::RpcStatus => "grpc_status",
+            Self::RemoteResponse => "remote_response",
+            Self::ResponseDecode => "response_decode",
+        }
+    }
+}
+
+pub(crate) fn record_remote_disk_grpc_read_version_error(stage: ReadVersionErrorStage) {
     if !rustfs_io_metrics::get_stage_metrics_enabled() {
         return;
     }
-    global_internode_metrics()
-        .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_TRANSPORT_BACKEND_GRPC);
+    let metrics = global_internode_metrics();
+    metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_TRANSPORT_BACKEND_GRPC);
+    metrics.record_classified_error_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        stage.classification(),
+    );
 }
 
 pub(crate) fn record_remote_disk_grpc_read_version_sent_bytes(bytes: usize) {
@@ -715,14 +710,6 @@ pub(crate) fn record_remote_disk_grpc_read_multiple_recv_bytes(bytes: usize) {
         bytes,
     );
     record_grpc_payload_size(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, bytes);
-}
-
-pub(crate) fn record_remote_disk_grpc_read_multiple_duration(duration: Duration) {
-    global_internode_metrics().record_duration_for_operation_and_backend(
-        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-        INTERNODE_TRANSPORT_BACKEND_GRPC,
-        duration,
-    );
 }
 
 /// Payload-size threshold (bytes) above which a unary internode gRPC response is counted as a
@@ -803,6 +790,53 @@ pub(crate) fn internode_msgpack_json_decode_error_total_for_test() -> u64 {
 mod tests {
     #[cfg(feature = "diagnostic-read-version-caller")]
     use super::*;
+
+    #[test]
+    fn read_version_errors_preserve_totals_and_classify_failure_boundaries() {
+        use super::{ReadVersionErrorStage, record_remote_disk_grpc_read_version_error};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            for stage in [
+                ReadVersionErrorStage::RpcStatus,
+                ReadVersionErrorStage::RemoteResponse,
+                ReadVersionErrorStage::ResponseDecode,
+            ] {
+                record_remote_disk_grpc_read_version_error(stage);
+            }
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+        let entries = snapshotter.snapshot().into_vec();
+        let total = entries
+            .iter()
+            .find(|entry| {
+                entry.0.key().name() == "rustfs_system_network_internode_operation_errors_total"
+                    && entry
+                        .0
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "operation" && label.value() == "grpc_read_version")
+            })
+            .expect("existing operation error counter");
+        assert!(matches!(total.3, DebugValue::Counter(3)));
+        for classification in ["grpc_status", "remote_response", "response_decode"] {
+            let count = entries
+                .iter()
+                .find(|entry| {
+                    entry.0.key().name() == "rustfs_system_network_internode_operation_classified_errors_total"
+                        && entry
+                            .0
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "classification" && label.value() == classification)
+                })
+                .expect("bounded failure classification");
+            assert!(matches!(count.3, DebugValue::Counter(1)));
+        }
+    }
 
     #[cfg(feature = "diagnostic-read-version-caller")]
     fn diagnostic_operation(operation: rustfs_s3_ops::S3Operation) -> S3HttpOperationContext {

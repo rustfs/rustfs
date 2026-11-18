@@ -127,28 +127,30 @@ impl AuthoritativeListOperations for ECStore {
         marker: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        if max_keys <= 0 || max_keys > MAX_OBJECT_LIST {
+        self.list_unversioned_authoritative_page(bucket, prefix, marker, max_keys, None)
+            .await
+    }
+
+    async fn list_identifier_tree_leaves_authoritative(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        leaf: &str,
+        marker: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        let valid_prefix = prefix
+            .strip_suffix('/')
+            .is_some_and(|root| !root.is_empty() && root.split('/').all(|part| !part.is_empty() && !matches!(part, "." | "..")));
+        if !valid_prefix || !crate::disk::is_identifier_tree_leaf(leaf) {
             return Err(StorageError::InvalidArgument(
                 bucket.to_string(),
                 prefix.to_string(),
-                "authoritative page size is out of range".to_string(),
+                "identifier-tree listing requires a directory prefix and a dotted leaf name".to_string(),
             ));
         }
-        let opts = ListPathOptions {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-            marker: marker.clone(),
-            limit: max_keys,
-            recursive: true,
-            incl_deleted: true,
-            versioned: true,
-            authoritative: true,
-            caller: ListObjectsGatherCaller::S3ListVersions,
-            ..Default::default()
-        };
-        let mut page = self.list_path(&opts).await?;
-        page.entries.forward_past(marker);
-        unversioned_authoritative_page(bucket, page)
+        self.list_unversioned_authoritative_page(bucket, prefix, marker, max_keys, Some(leaf.to_string()))
+            .await
     }
 
     async fn walk_authoritative(
@@ -368,6 +370,9 @@ fn log_list_path_finished(
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
     pub caller: ListObjectsGatherCaller,
+    /// Internal native-walk admission, shared with every disk producer so
+    /// aborting an HTTP request cannot release its budget ahead of cleanup.
+    pub read_budget: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub id: Option<String>,
 
     // Bucket of the listing.
@@ -432,6 +437,8 @@ pub struct ListPathOptions {
 
     // Internal bounded pages require GET-equivalent per-set resolution.
     pub authoritative: bool,
+
+    pub identifier_tree_leaf: Option<String>,
 
     pub stop_disk_at_limit: bool,
 
@@ -1098,6 +1105,39 @@ impl ListPathOptions {
 }
 
 impl ECStore {
+    async fn list_unversioned_authoritative_page(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        max_keys: i32,
+        identifier_tree_leaf: Option<String>,
+    ) -> Result<ListObjectVersionsInfo> {
+        if max_keys <= 0 || max_keys > MAX_OBJECT_LIST {
+            return Err(StorageError::InvalidArgument(
+                bucket.to_string(),
+                prefix.to_string(),
+                "authoritative page size is out of range".to_string(),
+            ));
+        }
+        let opts = ListPathOptions {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            marker: marker.clone(),
+            limit: max_keys,
+            recursive: true,
+            incl_deleted: true,
+            versioned: true,
+            authoritative: true,
+            identifier_tree_leaf,
+            caller: ListObjectsGatherCaller::S3ListVersions,
+            ..Default::default()
+        };
+        let mut page = self.list_path(&opts).await?;
+        page.entries.forward_past(marker);
+        unversioned_authoritative_page(bucket, page)
+    }
+
     #[allow(clippy::too_many_arguments)]
     // @continuation_token marker
     // @start_after as marker when continuation_token empty
@@ -1478,6 +1518,11 @@ impl ECStore {
         if o.transient {
             o.create = false;
         }
+        let fanout = self.pools.iter().fold(0usize, |total, pool| {
+            total.saturating_add(pool.disk_set.len().saturating_mul(pool.set_drive_count))
+        });
+        o.read_budget = self.ctx.acquire_list_read_budget(fanout).await.map_err(Error::other)?;
+
         let log_context = ListPathLogContext::from_options(&o);
 
         // cancel channel
@@ -2878,6 +2923,12 @@ impl SetDisks {
         if o.transient {
             o.create = false;
         }
+        o.read_budget = self
+            .instance_ctx()
+            .acquire_list_read_budget(self.set_drive_count)
+            .await
+            .map_err(Error::other)?;
+
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
@@ -2922,6 +2973,33 @@ impl SetDisks {
         Ok(page)
     }
 
+    fn resolve_authoritative_listed_entry(
+        bucket: &str,
+        selection: Option<(&str, &str)>,
+        entries: MetaCacheEntries,
+        errors: &[Option<DiskError>],
+        disk_count: usize,
+        parity: usize,
+    ) -> crate::disk::error::Result<Option<MetaCacheEntry>> {
+        if disk_count == 0 || entries.0.len() > disk_count || entries.0.len() != errors.len() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+        // An old peer may ignore the optional disk selector. Its noncandidate
+        // rows must be ignored before metadata parsing. Selected keys retain
+        // the original resolver and all of its quorum/corruption checks.
+        if selection.is_some_and(|(prefix, leaf)| {
+            entries
+                .0
+                .iter()
+                .flatten()
+                .next()
+                .is_some_and(|entry| !crate::disk::identifier_tree_leaf_matches(prefix, leaf, &entry.name))
+        }) {
+            return Ok(None);
+        }
+        Self::resolve_listed_versions(bucket, entries, errors, disk_count, parity)
+    }
+
     /// Version scan for set-scoped callers that act on absence: set walks
     /// (tier reference proofs, tier-delete journals, pool maintenance) and the
     /// recursive prefix-delete scan. Every online drive is read and each
@@ -2945,10 +3023,13 @@ impl SetDisks {
         let first_error = Arc::new(tokio::sync::Mutex::new(None));
         let error_sink = Arc::clone(&first_error);
         let bucket = opts.bucket.clone();
+        let prefix = opts.prefix.clone();
+        let identifier_tree_leaf = opts.identifier_tree_leaf.clone();
         let cancel = rx.clone();
         let result = list_path_raw_with_claim_tracker(
             rx,
             ListPathRawOptions {
+                read_budget: opts.read_budget.clone(),
                 disks: disks.into_iter().map(Some).collect(),
                 bucket: opts.bucket,
                 path: opts.base_dir,
@@ -2961,6 +3042,7 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: read_quorum,
                 preserve_replica_metadata: true,
+                identifier_tree_leaf: opts.identifier_tree_leaf,
                 // A reader's local page may be consumed by stale entries. Only
                 // the resolved, merged page may stop the authoritative walk.
                 per_disk_limit: 0,
@@ -2968,7 +3050,14 @@ impl SetDisks {
                 walkdir_timeout: opts.walkdir_timeout,
                 walkdir_stall_timeout: opts.walkdir_stall_timeout,
                 partial: Some(Box::new(move |entries, errors| {
-                    let resolved = Self::resolve_listed_versions(&bucket, entries, errors, disk_count, parity);
+                    let resolved = Self::resolve_authoritative_listed_entry(
+                        &bucket,
+                        identifier_tree_leaf.as_deref().map(|leaf| (prefix.as_str(), leaf)),
+                        entries,
+                        errors,
+                        disk_count,
+                        parity,
+                    );
                     let sender = sender.clone();
                     let cancel = cancel.clone();
                     let first_error = Arc::clone(&error_sink);
@@ -3107,6 +3196,7 @@ impl SetDisks {
         let result = list_path_raw_with_outcome(
             rx,
             ListPathRawOptions {
+                read_budget: opts.read_budget.clone(),
                 disks: disks.into_iter().map(Some).collect(),
                 fallback_disks: fallback_disks.into_iter().map(Some).collect(),
                 bucket: opts.bucket,
@@ -6788,6 +6878,58 @@ mod test {
         (dirs, store)
     }
 
+    #[tokio::test]
+    async fn list_read_budget_bounds_store_and_set_entrypoints_and_recovers_after_errors() {
+        let (_dirs, store) = single_set_store(4).await;
+        let held = store
+            .ctx
+            .acquire_list_read_budget(usize::MAX)
+            .await
+            .expect("occupy native budget");
+        let semaphore = held.as_ref().expect("bounded instance budget").semaphore();
+        let owners = Arc::strong_count(semaphore);
+        let opts = ListPathOptions {
+            bucket: "list-budget-absent-bucket".into(),
+            limit: 1,
+            authoritative: true,
+            ..Default::default()
+        };
+        let set = store.pools[0].disk_set[0].clone();
+        set.disks.write().await.fill(None);
+        {
+            let mut store_walk = std::pin::pin!(store.clone().list_path(&opts));
+            let mut set_walk = std::pin::pin!(set.clone().list_path_result(&opts));
+            assert!(futures::poll!(&mut store_walk).is_pending(), "store walk must await its budget");
+            assert_eq!(Arc::strong_count(semaphore), owners + 1, "store must queue on the shared budget");
+            assert!(futures::poll!(&mut set_walk).is_pending(), "set walk shares the same instance budget");
+            assert_eq!(Arc::strong_count(semaphore), owners + 2, "set must queue on the same budget");
+            let empty = store
+                .clone()
+                .list_path(&ListPathOptions {
+                    limit: 0,
+                    ..opts.clone()
+                })
+                .await
+                .expect("empty page needs no disk admission");
+            assert!(empty.exhausted);
+        }
+        assert_eq!(Arc::strong_count(semaphore), owners, "cancelled entry points release the queue ownership");
+        drop(held);
+        let result = timeout(Duration::from_secs(5), store.clone().list_path(&opts))
+            .await
+            .expect("failed walk terminates");
+        assert_eq!(
+            result.err(),
+            Some(DiskError::ErasureReadQuorum.into()),
+            "offline drives retain their quorum error"
+        );
+        let next = timeout(Duration::from_secs(5), store.ctx.acquire_list_read_budget(usize::MAX))
+            .await
+            .expect("failed and cancelled walks release their grants")
+            .expect("budget remains open");
+        assert!(next.is_some());
+    }
+
     fn versioned_object_metadata(bucket: &str, name: &str, versions: &[(u128, i64)], slot: usize) -> Bytes {
         let mut meta = FileMeta::new();
         for (id, modified) in versions {
@@ -6926,6 +7068,155 @@ mod test {
                 Err(StorageError::ErasureReadQuorum)
             ),
             "an unavailable set cannot produce successful EOF"
+        );
+    }
+
+    #[test]
+    fn authoritative_identifier_tree_filters_old_peer_rows_before_metadata_resolution() {
+        let prefix = "table-catalog/namespaces/";
+        let leaf = "table-entry.json";
+        let corrupt = |name: &str| {
+            MetaCacheEntries(vec![
+                Some(MetaCacheEntry {
+                    name: format!("{prefix}{name}"),
+                    metadata: b"corrupt metadata".to_vec(),
+                    ..Default::default()
+                });
+                4
+            ])
+        };
+        let report = "sales/tables/orders/maintenance/hash/jobs/job.json";
+        let errors = vec![None; 4];
+        assert!(
+            SetDisks::resolve_authoritative_listed_entry(RUSTFS_META_BUCKET, None, corrupt(report), &errors, 4, 2,).is_err(),
+            "the control must actually parse and reject the corrupt metadata"
+        );
+        assert!(
+            SetDisks::resolve_authoritative_listed_entry(
+                RUSTFS_META_BUCKET,
+                Some((prefix, leaf)),
+                corrupt(report),
+                &errors,
+                4,
+                2,
+            )
+            .expect("an old peer's unrelated report is outside the selected scan")
+            .is_none()
+        );
+        assert!(
+            SetDisks::resolve_authoritative_listed_entry(
+                RUSTFS_META_BUCKET,
+                Some((prefix, leaf)),
+                corrupt("sales/tables/orders/maintenance/tables/owner/table-entry.json"),
+                &errors,
+                4,
+                2,
+            )
+            .is_err(),
+            "a matching nested owner must still fail closed on corruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_identifier_tree_pages_preserve_nested_owners_and_read_quorum() {
+        let (dirs, store) = single_set_store(4).await;
+        let prefix = "table-catalog/identifier-tree/";
+        let leaf = "table-entry.json";
+        for (root, selected) in [
+            ("table-catalog/identifier-tree", leaf),
+            (prefix, "../entry.json"),
+            (prefix, "table-entry"),
+        ] {
+            assert!(matches!(
+                store
+                    .clone()
+                    .list_identifier_tree_leaves_authoritative(RUSTFS_META_BUCKET, root, selected, None, 2)
+                    .await,
+                Err(StorageError::InvalidArgument(..))
+            ));
+        }
+        let names = [
+            format!("{prefix}a/tables/first/{leaf}"),
+            format!("{prefix}sales/tables/orders/maintenance/tables/owner/{leaf}"),
+            format!("{prefix}z/tables/last/{leaf}"),
+        ];
+        for name in &names {
+            write_version_replicas(&dirs, RUSTFS_META_BUCKET, name, |slot| Some(unversioned_catalog_metadata(name, slot))).await;
+        }
+        for name in [
+            format!("{prefix}sales"),
+            format!("{prefix}sales/tables/orders/maintenance/hash/jobs/job.json"),
+        ] {
+            write_version_replicas(&dirs, RUSTFS_META_BUCKET, &name, |_| Some(b"corrupt noncandidate metadata".to_vec())).await;
+        }
+        assert!(
+            store
+                .clone()
+                .list_unversioned_objects_authoritative(RUSTFS_META_BUCKET, prefix, None, 100)
+                .await
+                .is_err(),
+            "the ordinary authoritative scan must expose the corrupt control objects"
+        );
+        let first = store
+            .clone()
+            .list_identifier_tree_leaves_authoritative(RUSTFS_META_BUCKET, prefix, leaf, None, 2)
+            .await
+            .expect("noncandidate metadata must not be read");
+        assert!(first.is_truncated);
+        assert_eq!(
+            first.objects.iter().map(|object| &object.name).collect::<Vec<_>>(),
+            names[..2].iter().collect::<Vec<_>>()
+        );
+        let second = store
+            .clone()
+            .list_identifier_tree_leaves_authoritative(RUSTFS_META_BUCKET, prefix, leaf, first.next_marker, 2)
+            .await
+            .expect("the next page must retain the final owner");
+        assert!(!second.is_truncated);
+        assert_eq!(second.objects.iter().map(|object| &object.name).collect::<Vec<_>>(), vec![&names[2]]);
+
+        write_version_replicas(&dirs, RUSTFS_META_BUCKET, &names[0], |_| Some(b"corrupt selected metadata".to_vec())).await;
+        assert!(
+            store
+                .clone()
+                .list_identifier_tree_leaves_authoritative(RUSTFS_META_BUCKET, prefix, leaf, None, 2)
+                .await
+                .is_err(),
+            "corruption at a selected key cannot be skipped to fill the page"
+        );
+        write_version_replicas(&dirs, RUSTFS_META_BUCKET, &names[0], |slot| {
+            Some(unversioned_catalog_metadata(&names[0], slot))
+        })
+        .await;
+        write_version_replicas(&dirs, RUSTFS_META_BUCKET, &names[0], |slot| {
+            Some(versioned_object_metadata(RUSTFS_META_BUCKET, &names[0], &[(2, 1_700_000_002)], slot).to_vec())
+        })
+        .await;
+        assert!(
+            store
+                .clone()
+                .list_identifier_tree_leaves_authoritative(RUSTFS_META_BUCKET, prefix, leaf, None, 2)
+                .await
+                .is_err(),
+            "a versioned ownership entry cannot be accepted as an unversioned proof"
+        );
+        write_version_replicas(&dirs, RUSTFS_META_BUCKET, &names[0], |slot| {
+            Some(unversioned_catalog_metadata(&names[0], slot))
+        })
+        .await;
+        let set = &store.pools[0].disk_set[0];
+        for disk in set.disks.write().await.iter_mut().skip(1) {
+            *disk = None;
+        }
+        assert!(
+            matches!(
+                store
+                    .clone()
+                    .list_identifier_tree_leaves_authoritative(RUSTFS_META_BUCKET, prefix, leaf, None, 2)
+                    .await,
+                Err(StorageError::ErasureReadQuorum)
+            ),
+            "unavailable replicas cannot prove owner absence"
         );
     }
 
@@ -8213,7 +8504,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
 
         handle.await.unwrap().unwrap();
@@ -8242,7 +8533,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
 
         handle.await.unwrap().unwrap();
@@ -8886,7 +9177,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
 
         handle.await.unwrap().unwrap();
@@ -8974,7 +9265,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9004,7 +9295,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9076,7 +9367,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9110,7 +9401,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9200,7 +9491,7 @@ mod test {
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
             assert!(entry.is_object(), "the directory-marker object must shadow the same-named prefix dir");
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9223,7 +9514,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 
@@ -9247,7 +9538,7 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            results.push(entry.name.clone());
+            results.push(entry.name);
         }
         handle.await.unwrap().unwrap();
 

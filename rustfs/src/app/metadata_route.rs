@@ -15,20 +15,23 @@
 //! MinIO-compatible metadata listing extension routes.
 
 use super::bucket_usecase::DefaultBucketUsecase;
-use super::object_usecase::DefaultObjectUsecase;
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::storage::access::{ReqInfo, authorize_bucket_listing, req_info_mut};
+use crate::storage::access::access_owned::listing_multipart::authorize_bucket_listing;
+use crate::storage::access::req_info_mut;
+use crate::storage::req_info::ReqInfo;
+use crate::storage::request_markers::WebsiteRead;
 use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
 use http::header::HOST;
 use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use rustfs_gateway_types::persistence::{PersistedErrorDocument, PersistedRoutingRule as RoutingRule};
 use rustfs_policy::policy::action::S3Action;
 use s3s::access::S3Access;
 use s3s::dto::{
     ETagCondition, EncodingType, GetObjectInput, GetObjectOutput, HeadObjectInput, ListObjectVersionsInput, ListObjectsV2Input,
-    Range, RoutingRule, Timestamp, TimestampFormat,
+    Range, Timestamp, TimestampFormat,
 };
 use s3s::host::{MultiDomain, S3Host};
 use s3s::route::S3Route;
@@ -189,7 +192,7 @@ async fn call_website(
         return website_redirect(
             &req,
             redirect.host_name.as_str(),
-            redirect.protocol.as_ref().map(|protocol| protocol.as_str()),
+            redirect.protocol.as_deref(),
             &target.key,
             StatusCode::MOVED_PERMANENTLY,
             website_scheme,
@@ -374,9 +377,7 @@ async fn website_get_object(
     req_info.is_owner = false;
     request.extensions.insert(WebsiteRead);
     S3Access::get_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), &mut request).await?;
-    DefaultObjectUsecase::with_context(server_ctx.installed_app_context())
-        .execute_get_object(request)
-        .await
+    s3s::S3::get_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), request).await
 }
 
 async fn website_head_redirect(
@@ -420,14 +421,9 @@ async fn website_head_redirect(
     req_info.cred = None;
     req_info.is_owner = false;
     S3Access::head_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), &mut request).await?;
-    let response = DefaultObjectUsecase::with_context(server_ctx.installed_app_context())
-        .execute_head_object(request)
-        .await?;
+    let response = s3s::S3::head_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), request).await?;
     Ok(response.output.website_redirect_location)
 }
-
-#[derive(Clone)]
-pub(crate) struct WebsiteRead;
 
 fn response_to_website(response: S3Response<GetObjectOutput>, head: bool) -> S3Result<S3Response<Body>> {
     let output = response.output;
@@ -483,7 +479,7 @@ async fn website_error_with_document(
     req: &S3Request<Body>,
     server_ctx: &Arc<ServerContextSlot>,
     bucket: &str,
-    error_document: Option<&s3s::dto::ErrorDocument>,
+    error_document: Option<&PersistedErrorDocument>,
     status: http::StatusCode,
 ) -> S3Result<S3Response<Body>> {
     let Some(error_document) = error_document else {
@@ -614,7 +610,7 @@ fn website_rule_redirect(
     website_redirect(
         req,
         redirect.host_name.as_deref().unwrap_or_default(),
-        redirect.protocol.as_ref().map(|protocol| protocol.as_str()),
+        redirect.protocol.as_deref(),
         &key,
         status,
         website_scheme,
@@ -681,7 +677,7 @@ async fn check_metadata_access(req: &mut S3Request<Body>, target: BucketTarget) 
         MetadataOperation::ListObjectVersions => S3Action::ListBucketVersionsAction,
         MetadataOperation::ListObjectsV2 => S3Action::ListBucketAction,
     };
-    authorize_bucket_listing(req, &target.bucket, action).await
+    Ok(authorize_bucket_listing(req, &target.bucket, action).await?)
 }
 
 async fn call_list_object_versions(req: S3Request<Body>, bucket: String) -> S3Result<S3Response<Body>> {
@@ -902,8 +898,7 @@ mod tests {
             status: "on".to_owned(),
             ..Default::default()
         }));
-        let backend =
-            EcStoreTableCatalogObjectBackend::new_with_strong_runtime(Arc::clone(&store), context.table_catalog_strong_runtime());
+        let backend = EcStoreTableCatalogObjectBackend::new(Arc::clone(&store));
         let catalog =
             ConfiguredTableCatalogStore::new_for_test(backend, TableCatalogBackingMode::from_env().expect("catalog mode"));
         catalog
@@ -1068,7 +1063,10 @@ mod tests {
     };
     use http::header::HOST;
     use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
-    use s3s::dto::{Condition, EncodingType, Redirect, RoutingRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule, PersistedRoutingRuleCondition as Condition,
+    };
+    use s3s::dto::EncodingType;
     use s3s::host::MultiDomain;
     use s3s::{Body, S3Request};
 

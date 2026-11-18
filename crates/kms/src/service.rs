@@ -304,6 +304,15 @@ impl ObjectEncryptionService {
         self.kms_manager.backend_capabilities()
     }
 
+    /// Whether a stored data key that is not a RustFS envelope may still belong
+    /// to the active backend, and so must be offered to
+    /// [`Self::decrypt_data_key`] instead of being treated as foreign.
+    ///
+    /// See [`crate::backends::KmsBackend::reads_bare_data_key_ciphertext`].
+    pub fn reads_bare_data_key_ciphertext(&self) -> bool {
+        self.kms_manager.reads_bare_data_key_ciphertext()
+    }
+
     /// Re-wrap an object's encrypted data key onto its master key's current
     /// version, without the plaintext data key ever reaching the caller.
     ///

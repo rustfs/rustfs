@@ -16,10 +16,15 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+#[cfg(feature = "gateway-stack")]
+mod gateway_handlers;
+#[cfg(feature = "gateway-stack")]
+mod gateway_stack;
 mod health;
 mod http;
 mod hybrid;
 mod layer;
+mod legacy_compat;
 mod module_switch;
 mod prefix;
 pub mod rate_limit;
@@ -28,6 +33,8 @@ mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
 mod ssec_transport;
+#[cfg(feature = "gateway-stack")]
+mod stack;
 pub mod tls_material;
 pub(crate) mod tls_publish;
 
@@ -56,6 +63,7 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub use crate::shared_types::RemoteAddr;
 pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
     reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
@@ -72,7 +80,15 @@ pub(crate) use health::{
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
 pub use layer::s3_http_request_guard;
-pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
+pub(crate) use layer::{RequestContextLayer, is_control_plane_route, is_sts_query_request};
+
+/// The S3 operations the gateway stack serves.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn gateway_operations() -> Vec<&'static str> {
+    gateway_handlers::rows(gateway_handlers::OPERATIONS)
+        .map(|row| row.name)
+        .collect()
+}
 pub(crate) use module_switch::{
     MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
     current_module_switch_snapshot, refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store,
@@ -95,9 +111,6 @@ pub(crate) use readiness::snapshot_dependency_readiness_report;
 #[cfg(test)]
 pub(crate) use readiness::wait_for_runtime_readiness_with;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
-pub(crate) use ssec_transport::NativeTlsTransport;
-
-pub use crate::shared_types::RemoteAddr;
 
 pub(crate) fn strip_valid_port_suffix(host: &str) -> &str {
     if host.ends_with(']') {
