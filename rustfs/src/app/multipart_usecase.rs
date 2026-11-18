@@ -101,7 +101,7 @@ use crate::table_catalog;
 #[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, Uri};
 use metrics::counter;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
