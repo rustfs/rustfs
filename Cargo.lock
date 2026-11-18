@@ -10828,7 +10828,6 @@ dependencies = [
 name = "rustfs-madmin"
 version = "1.0.5"
 dependencies = [
- "hotpath",
  "http 1.5.0",
  "humantime",
  "hyper",
