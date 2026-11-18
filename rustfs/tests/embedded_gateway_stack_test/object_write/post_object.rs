@@ -100,7 +100,8 @@ async fn post_wire_observes_success_controls_and_storage(server: rustfs::embedde
         match status {
             200 | 204 => assert!(answer.body.is_empty(), "{key}: {}", answer.body),
             201 => {
-                assert!(answer.body.contains(&format!("<Location>/{BUCKET}/{key}</Location>")), "{}", answer.body);
+                let location = format!("{endpoint}/{BUCKET}/{key}");
+                assert!(answer.body.contains(&format!("<Location>{location}</Location>")), "{}", answer.body);
                 assert!(answer.body.contains(&format!("<Bucket>{BUCKET}</Bucket>")), "{}", answer.body);
                 assert!(answer.body.contains(&format!("<Key>{key}</Key>")), "{}", answer.body);
                 assert!(answer.body.contains(&format!("<ETag>{ETAG}</ETag>")), "{}", answer.body);
@@ -227,6 +228,54 @@ async fn assert_versioned_post(server: &rustfs::embedded::RustFSServer, bucket: 
 #[serial_test::serial]
 fn gateway_post_wire_preserves_success_controls_and_storage() {
     stack::with_stack(stack::GATEWAY, |server| post_wire_observes_success_controls_and_storage(server, true));
+}
+
+async fn post_response_location_is_absolute_and_percent_encoded(server: rustfs::embedded::RustFSServer) {
+    const BUCKET: &str = "post-location-encoding";
+    stack::create_bucket_in_the_store(BUCKET).await;
+    let endpoint = server.endpoint();
+    let client = WireClient {
+        endpoint: &endpoint,
+        access_key: server.access_key(),
+        secret_key: server.secret_key(),
+    };
+    for (key, encoded_key) in [
+        ("test/a+b c%d.txt", "test/a%2Bb%20c%25d.txt"),
+        ("café/résumé.txt", "caf%C3%A9/r%C3%A9sum%C3%A9.txt"),
+        ("a&b?c#d.txt", "a%26b%3Fc%23d.txt"),
+        ("a-b_c.d~e/photo.jpg", "a-b_c.d~e/photo.jpg"),
+    ] {
+        let answer = client
+            .post_form(BUCKET, &[("key", key), ("success_action_status", "201")], &[], true, true)
+            .await;
+        assert_eq!(answer.status, 201, "{key}: {}", answer.body);
+        let location = format!("{endpoint}/{BUCKET}/{encoded_key}");
+        let xml_key = key.replace("&", "&amp;");
+        assert!(
+            answer.body.contains(&format!("<Location>{location}</Location>")),
+            "{key}: {}",
+            answer.body
+        );
+        assert!(answer.body.contains(&format!("<Key>{xml_key}</Key>")), "{key}: {}", answer.body);
+        assert!(
+            !answer.body.contains(&format!("<Location>/{BUCKET}/{key}</Location>")),
+            "{key}: {}",
+            answer.body
+        );
+    }
+    server.shutdown().await;
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_post_response_location_is_absolute_and_percent_encoded() {
+    stack::with_stack(stack::GATEWAY, post_response_location_is_absolute_and_percent_encoded);
+}
+
+#[test]
+#[serial_test::serial]
+fn legacy_post_response_location_is_absolute_and_percent_encoded() {
+    stack::with_stack(stack::LEGACY, post_response_location_is_absolute_and_percent_encoded);
 }
 
 #[test]

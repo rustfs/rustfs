@@ -35,6 +35,7 @@ use crate::server::{
         IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer,
         StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
     },
+    post_object_location::PostObjectLocationFixLayer,
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
@@ -2039,7 +2040,7 @@ macro_rules! external_service_stack {
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
         let server_domains_configured = $server_domains_configured;
-        let vh_domain_hosts = $vh_domain_hosts;
+        let vh_domain_hosts: std::sync::Arc<[String]> = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -2159,6 +2160,7 @@ macro_rules! external_service_stack {
             .layer(S3ErrorMessageCompatLayer)
             .layer(IcebergRestErrorCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
+            .layer(PostObjectLocationFixLayer::new(vh_domain_hosts.clone(), connection_is_tls))
             .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
@@ -3363,6 +3365,7 @@ fn process_connection(
         // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
         // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
         // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        //     PostObjectLocationFixLayer             — absolute, encoded POST Object Location
         // 18. ConditionalCorsLayer                   — S3 API CORS
         // 19. RedirectLayer                          — console redirect (conditional)
         // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
@@ -10126,7 +10129,7 @@ mod tests {
     /// the s3s patch layers that `server::legacy_compat` groups; T2.12
     /// (rustfs/backlog#2771) reuses this test to prove which layers the gateway
     /// stack keeps.
-    const EXTERNAL_STACK_CENSUS: [&str; 28] = [
+    const EXTERNAL_STACK_CENSUS: [&str; 29] = [
         "AddExtension",                        // Option<RemoteAddr>
         "AddExtension",                        // SocketAddr (optional)
         "TrustedProxyMiddleware",              // TrustedProxyLayer (optional)
@@ -10147,6 +10150,7 @@ mod tests {
         "S3ErrorMessageCompatService",         // legacy_compat
         "IcebergRestErrorCompatService",       // legacy_compat
         "ObjectAttributesEtagFixService",      // legacy_compat
+        "PostObjectLocationFixService",        // POST Object Location encoding
         "ConditionalCorsService",              //
         "RedirectService",                     // optional
         "BodylessStatusFixService",            // legacy_compat
