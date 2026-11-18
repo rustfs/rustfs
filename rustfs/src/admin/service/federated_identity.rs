@@ -866,16 +866,7 @@ mod tests {
             .authorization
             .oidc_virtual_parent()
             .expect("test authorization should have a virtual parent");
-        iam.create_user(
-            &parent,
-            &AddOrUpdateUserReq {
-                secret_key: "regular-user-secret".to_string(),
-                policy: None,
-                status: AccountStatus::Enabled,
-            },
-        )
-        .await
-        .expect("create colliding regular user");
+        // Virtual parent IDs cannot be registered as users, but a legacy mapping can still exist.
         iam.policy_db_set(&parent, UserType::Reg, false, "readonly")
             .await
             .expect("store colliding regular policy mapping");
