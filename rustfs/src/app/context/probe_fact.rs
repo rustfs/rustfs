@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! A request fact a permission probe is told the caller already supplied.
 //!
 //! Not responsible for evaluating the probe. Upstream: the admin permission probe and

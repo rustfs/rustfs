@@ -19,6 +19,7 @@ pub(crate) mod denial_audit;
 pub mod ecfs;
 pub(crate) mod helper;
 pub mod options;
+pub(crate) mod req_info;
 pub mod request_context;
 pub mod rpc;
 pub(crate) mod s3_api;

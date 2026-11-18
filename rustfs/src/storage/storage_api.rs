@@ -164,7 +164,7 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
         MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
-        PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold,
+        PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
         RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
@@ -176,21 +176,23 @@ pub(crate) mod access_consumer {
     };
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
+    pub(crate) use super::super::req_info::ReqInfo;
 }
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::{
-        AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo,
-        RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
-        RequestedObjectTags, TableDataPlanePublicationGuards, authorize_bucket_config_mutation, authorize_object_request,
+        AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
+        RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
+        TableDataPlanePublicationGuards, authorize_bucket_config_mutation, authorize_object_request,
         authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
         authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
     pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
+    pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_context::RequestContext;
 }
 

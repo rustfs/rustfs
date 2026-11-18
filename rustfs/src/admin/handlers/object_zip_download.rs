@@ -217,7 +217,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             object: snapshot.object,
             version_id: snapshot.version_id,
             replication_request_authorized: false,
-            region: current_region().map(Into::into),
+            region: current_region(),
             request_context: None,
             suppress_denial_log: false,
             suppress_denial_audit: false,
@@ -429,7 +429,7 @@ async fn authenticate_object_zip_download_request(req: &mut AdminRequest) -> S3R
     req.install_req_info(ReqInfo {
         cred: Some(cred),
         is_owner: owner,
-        region: current_region().map(Into::into),
+        region: current_region(),
         request_context,
         ..Default::default()
     });
@@ -1703,7 +1703,7 @@ mod tests {
             object: None,
             version_id: None,
             replication_request_authorized: false,
-            region: current_region().map(Into::into),
+            region: current_region(),
             request_context: None,
             suppress_denial_log: false,
             suppress_denial_audit: false,

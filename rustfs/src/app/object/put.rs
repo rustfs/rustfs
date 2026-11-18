@@ -4739,7 +4739,7 @@ mod tests {
         request
             .headers
             .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::access::ReqInfo {
+        request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });

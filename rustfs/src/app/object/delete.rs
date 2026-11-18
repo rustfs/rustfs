@@ -1714,7 +1714,7 @@ mod tests {
                 ));
                 let mut req = build_request((), Method::DELETE);
                 req.extensions.insert(slot.clone());
-                req.extensions.insert(crate::storage::access::ReqInfo {
+                req.extensions.insert(crate::storage::req_info::ReqInfo {
                     bucket: Some(bucket.clone()),
                     object: Some("team/".to_owned()),
                     ..Default::default()
@@ -1826,7 +1826,7 @@ mod tests {
                                 .insert("x-amz-bypass-governance-retention", HeaderValue::from_static("true"));
                         }
                         req.extensions.insert(slot.clone());
-                        req.extensions.insert(crate::storage::access::ReqInfo {
+                        req.extensions.insert(crate::storage::req_info::ReqInfo {
                             bucket: Some(bucket.clone()),
                             object: Some("team/".to_owned()),
                             ..Default::default()
@@ -1970,7 +1970,7 @@ mod tests {
                                 .build()
                                 .expect("batch delete input");
                             let mut req = build_request(input, Method::POST);
-                            req.extensions.insert(crate::storage::access::ReqInfo {
+                            req.extensions.insert(crate::storage::req_info::ReqInfo {
                                 bucket: Some(bucket.clone()),
                                 cred: Some(rustfs_credentials::Credentials::default()),
                                 is_owner: true,
@@ -2004,7 +2004,7 @@ mod tests {
                                 .build()
                                 .expect("single delete input");
                             let mut req = build_request(input, Method::DELETE);
-                            req.extensions.insert(crate::storage::access::ReqInfo {
+                            req.extensions.insert(crate::storage::req_info::ReqInfo {
                                 bucket: Some(bucket.clone()),
                                 object: Some(keys[0].to_string()),
                                 cred: Some(rustfs_credentials::Credentials::default()),
@@ -2125,7 +2125,7 @@ mod tests {
                     .method(method)
                     .uri(uri)
                     .header("host", "localhost")
-                    .extension(crate::storage::access::ReqInfo {
+                    .extension(crate::storage::req_info::ReqInfo {
                         cred: Some(rustfs_credentials::Credentials::default()),
                         is_owner: true,
                         ..Default::default()
@@ -2499,7 +2499,7 @@ mod tests {
                                 .unwrap(),
                             Method::POST,
                         );
-                        req.extensions.insert(crate::storage::access::ReqInfo {
+                        req.extensions.insert(crate::storage::req_info::ReqInfo {
                             cred: Some(rustfs_credentials::Credentials::default()),
                             is_owner: true,
                             ..Default::default()
@@ -2522,7 +2522,7 @@ mod tests {
                                 .unwrap(),
                             Method::DELETE,
                         );
-                        req.extensions.insert(crate::storage::access::ReqInfo {
+                        req.extensions.insert(crate::storage::req_info::ReqInfo {
                             cred: Some(rustfs_credentials::Credentials::default()),
                             is_owner: true,
                             ..Default::default()
@@ -2680,7 +2680,7 @@ mod tests {
                     .unwrap(),
                 Method::POST,
             );
-            req.extensions.insert(crate::storage::access::ReqInfo {
+            req.extensions.insert(crate::storage::req_info::ReqInfo {
                 cred: Some(rustfs_credentials::Credentials::default()),
                 is_owner: true,
                 ..Default::default()
@@ -2714,7 +2714,7 @@ mod tests {
                         .unwrap(),
                     Method::POST,
                 );
-                req.extensions.insert(crate::storage::access::ReqInfo {
+                req.extensions.insert(crate::storage::req_info::ReqInfo {
                     cred: Some(rustfs_credentials::Credentials::default()),
                     is_owner: true,
                     ..Default::default()
@@ -2741,7 +2741,7 @@ mod tests {
                     .unwrap(),
                 Method::DELETE,
             );
-            req.extensions.insert(crate::storage::access::ReqInfo {
+            req.extensions.insert(crate::storage::req_info::ReqInfo {
                 cred: Some(rustfs_credentials::Credentials::default()),
                 is_owner: true,
                 ..Default::default()
@@ -2896,7 +2896,7 @@ mod tests {
                     .build()
                     .expect("delete input should build");
                 let mut req = build_request(input, Method::DELETE);
-                req.extensions.insert(crate::storage::access::ReqInfo {
+                req.extensions.insert(crate::storage::req_info::ReqInfo {
                     bucket: Some("test-bucket".to_string()),
                     object: Some("missing-key".to_string()),
                     version_id: version_id.clone(),
@@ -3047,7 +3047,7 @@ mod tests {
             .build()
             .expect("delete objects input should build");
         let mut req = build_request(input, Method::POST);
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
+        req.extensions.insert(crate::storage::req_info::ReqInfo::default());
         let loaded = Arc::new(tokio::sync::Barrier::new(2));
         let resume = Arc::new(tokio::sync::Barrier::new(2));
         install_delete_objects_generation_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
@@ -3524,7 +3524,7 @@ mod tests {
                 .build()
                 .expect("build mixed conditional batch");
             let mut req = build_request(input, Method::POST);
-            req.extensions.insert(crate::storage::access::ReqInfo::default());
+            req.extensions.insert(crate::storage::req_info::ReqInfo::default());
             let usecase = DefaultObjectUsecase::from_global();
             let response = usecase
                 .execute_delete_objects_from_s3s(req)
@@ -3598,7 +3598,7 @@ mod tests {
                 .build()
                 .expect("build quiet mixed batch");
             let mut quiet_req = build_request(quiet_input, Method::POST);
-            quiet_req.extensions.insert(crate::storage::access::ReqInfo::default());
+            quiet_req.extensions.insert(crate::storage::req_info::ReqInfo::default());
             let quiet_response = usecase
                 .execute_delete_objects_from_s3s(quiet_req)
                 .await
@@ -3693,7 +3693,7 @@ mod tests {
                             .expect("batch input");
                         let mut request = build_request(input, Method::POST);
                         request.uri = format!("/{request_bucket}").parse().expect("URI");
-                        request.extensions.insert(crate::storage::access::ReqInfo::default());
+                        request.extensions.insert(crate::storage::req_info::ReqInfo::default());
                         usecase.execute_delete_objects_from_s3s(request).await.map(|_| ())
                     } else {
                         let input = DeleteObjectInput::builder()
@@ -3774,7 +3774,7 @@ mod tests {
                 .expect("build force delete");
             let mut req = build_request(input, Method::DELETE);
             req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
-            req.extensions.insert(crate::storage::access::ReqInfo {
+            req.extensions.insert(crate::storage::req_info::ReqInfo {
                 is_owner: true,
                 bucket: Some(bucket.clone()),
                 object: Some("folder/".to_owned()),
@@ -3857,7 +3857,7 @@ mod tests {
             .unwrap();
         let mut req = build_request(input, Method::DELETE);
         req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
+        req.extensions.insert(crate::storage::req_info::ReqInfo::default());
 
         let err = DefaultObjectUsecase::without_context()
             .execute_delete_object_from_s3s(req)
@@ -4034,7 +4034,7 @@ mod tests {
                 .expect("single delete input should build"),
             Method::DELETE,
         );
-        single_req.extensions.insert(crate::storage::access::ReqInfo {
+        single_req.extensions.insert(crate::storage::req_info::ReqInfo {
             cred: Some(rustfs_credentials::Credentials::default()),
             is_owner: true,
             ..Default::default()
@@ -4068,7 +4068,7 @@ mod tests {
                 .expect("batch delete input should build"),
             Method::POST,
         );
-        batch_req.extensions.insert(crate::storage::access::ReqInfo {
+        batch_req.extensions.insert(crate::storage::req_info::ReqInfo {
             cred: Some(rustfs_credentials::Credentials::default()),
             is_owner: true,
             ..Default::default()

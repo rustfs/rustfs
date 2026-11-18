@@ -15,11 +15,11 @@
 use self::access_owned::listing_multipart::{
     authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
-use crate::app::context::PermissionProbeRequestFact;
 use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
+use crate::app::context::PermissionProbeRequestFact;
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
@@ -34,7 +34,8 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::denial_audit::DenialAuditor;
-use crate::storage::helper::{AuditRequestView, DenialScope};
+use crate::storage::helper::DenialScope;
+pub(crate) use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
@@ -99,29 +100,6 @@ fn iam_authorization_error(err: IamError) -> ApiError {
 const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
 const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
-
-#[derive(Default, Clone, Debug)]
-pub(crate) struct ReqInfo {
-    pub cred: Option<rustfs_credentials::Credentials>,
-    pub is_owner: bool,
-    /// Original session presence of a host-verified Keystone identity; its token bytes were erased.
-    pub keystone_session_present: Option<bool>,
-    pub bucket: Option<String>,
-    pub object: Option<String>,
-    pub version_id: Option<String>,
-    pub replication_request_authorized: bool,
-    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
-    pub region: Option<s3s::region::Region>,
-    pub request_context: Option<RequestContext>,
-    /// Set by probe-style callers that treat AccessDenied as an expected filter
-    /// outcome (ListBuckets per-bucket fallback, ListObjects metadata permission
-    /// collection) so `authorize_request` logs those routine denials at `debug`
-    /// instead of `warn` (issue #5740).
-    pub suppress_denial_log: bool,
-    /// Set by callers that audit their denials in aggregate (DeleteObjects), so each per-key
-    /// denial is not audited on its own. The denial is still logged.
-    pub suppress_denial_audit: bool,
-}
 
 pub(crate) fn replication_request_authorized<R: AuthorizationRequest + ?Sized>(req: &R) -> bool {
     req.req_info().is_some_and(|req_info| req_info.replication_request_authorized)
@@ -1735,7 +1713,7 @@ pub(crate) async fn resolve_req_info(
     Ok(ReqInfo {
         cred,
         is_owner,
-        region: region.map(Into::into),
+        region,
         request_context,
         ..Default::default()
     })
@@ -4370,6 +4348,7 @@ pub(crate) mod parity_test_support {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
+    use super::audit_request_denial;
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
         BucketPolicyRawLoadErrorKind, DenialContext, FS, InternalObjectAuthorization, ObjectTagConditions,
@@ -4386,8 +4365,6 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
-    use super::audit_request_denial;
-    use crate::storage::denial_audit::BulkDenialAudit;
     use super::{
         PostObjectPolicyHeaders, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectTags, remaining_retention_days,
         requested_bucket_location_constraint, set_post_object_policy_headers, set_requested_object_lock_retain_until,
@@ -4396,6 +4373,7 @@ mod tests {
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::auth::facts::{AuthzPrincipal, AuthzTarget, list_query_pairs, merge_list_query_conditions};
     use crate::error::ApiError;
+    use crate::storage::denial_audit::BulkDenialAudit;
     use crate::storage::denial_audit::{DenialAuditor, DenialRateLimiter};
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
