@@ -283,7 +283,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(req, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(Err(err.into())),
+            Err(err) => return Some(Err(err)),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
