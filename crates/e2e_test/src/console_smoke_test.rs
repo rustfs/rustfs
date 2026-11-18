@@ -169,8 +169,8 @@ async fn test_console_over_the_wire_smoke() -> TestResult {
     let s3_root_response = client.get(format!("{console_base}/")).send().await?;
     assert_eq!(
         s3_root_response.status(),
-        reqwest::StatusCode::FORBIDDEN,
-        "unauthenticated S3 root on the console listener must be denied"
+        reqwest::StatusCode::NOT_FOUND,
+        "the console listener must not expose the S3 root"
     );
 
     // --- console disabled on a listener means no console surface at all ------
