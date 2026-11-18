@@ -27,8 +27,9 @@ use super::{
     BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
     PendingDeleteBucketGenerationGuard,
 };
+use super::{TableDataPlaneListAccess, TableDataPlanePublicationGuards};
 use crate::storage::ECStore;
-use crate::storage::access::{ObjectTagConditions, TableDataPlaneListAccess, TableDataPlanePublicationGuards};
+use crate::storage::access::ObjectTagConditions;
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;

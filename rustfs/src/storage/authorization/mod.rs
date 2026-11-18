@@ -26,6 +26,7 @@
 mod admission;
 mod guards;
 mod request;
+mod table_data_plane;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
 pub(crate) use guards::{
@@ -46,4 +47,16 @@ pub(crate) use request::{
     missing_req_info_error, object_store_not_initialized_error, recursive_force_delete_has_authenticated_caller,
     replication_request_authorized, req_info_mut, req_info_ref, request_context_from_req, request_iam_store,
     request_object_store, set_requested_object_lock_retain_until,
+};
+#[cfg(test)]
+pub(crate) use table_data_plane::{
+    TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN, require_owned_reserved_table_object, table_catalog_backend_for_data_plane,
+    table_data_plane_admin_action, table_data_plane_content_mutation, table_data_plane_resource_for_request,
+    table_publication_guard_error,
+};
+pub(crate) use table_data_plane::{
+    TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlaneListResource,
+    TableDataPlanePublicationGuards, TablePermissionConditions, authorize_table_data_plane_if_needed,
+    deny_anonymous_table_data_plane_if_needed, retain_table_bucket_publication_guard, table_bucket_enabled_for_data_plane,
+    table_catalog_store_for_data_plane, table_data_plane_list_internal_error, table_list_catalog_error,
 };

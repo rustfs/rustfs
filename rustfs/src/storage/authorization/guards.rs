@@ -24,8 +24,8 @@
 //! store's bucket metadata and the use cases' `ObjectOptions`.
 
 use super::AuthorizationRequest;
+use super::TableDataPlanePublicationGuards;
 use crate::error::ApiError;
-use crate::storage::access::TableDataPlanePublicationGuards;
 use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
