@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod double_slash_list_buckets_compat;
 mod s3_error_message_compat;
 mod sigv4_header_guard;
+mod virtual_host_style_hint;
 
 /// A handler for every operation these tests reach. It records that it ran and answers an empty
 /// output, so a request that arrives is `200` and one that is refused first never runs it.
@@ -104,8 +105,13 @@ impl Handler<dto::GetObjectAttributes> for Probe {
 /// registered for the operations above. Everything else, the RustFS profile included, is what
 /// `GatewayStack::assemble` configures.
 pub(super) fn probe_stack(probe: &Arc<Probe>) -> GatewayStack {
+    probe_stack_for(probe, assembly())
+}
+
+/// [`probe_stack`] over a different server configuration.
+pub(super) fn probe_stack_for(probe: &Arc<Probe>, assembly: GatewayAssembly) -> GatewayStack {
     let builder = GatewayStack::configured_builder(
-        &assembly(),
+        &assembly,
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
         allow_when(|request| request.identity.is_some()),
