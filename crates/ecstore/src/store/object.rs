@@ -6878,7 +6878,8 @@ impl ECStore {
         let object = encode_dir_object(object);
         let opts = transition_restore_pool_opts(opts);
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, &opts).await?;
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+        // Even an unqualified restore copies back to an existing version.
+        if !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("restore is missing its bucket incarnation snapshot"))?;

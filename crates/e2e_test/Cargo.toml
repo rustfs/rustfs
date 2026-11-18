@@ -128,6 +128,7 @@ hex-simd = { workspace = true }
 md-5 = { workspace = true }
 prost.workspace = true
 sha2 = { workspace = true }
+rustfs-s3-types = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 zstd.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }

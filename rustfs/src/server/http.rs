@@ -7234,6 +7234,41 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct ReadOneFrameThenRejectService;
+
+    impl<B> Service<HttpRequest<B>> for ReadOneFrameThenRejectService
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Send + 'static,
+    {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+            Box::pin(async move {
+                let mut body = Box::pin(req.into_body());
+                let Some(Ok(frame)) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await else {
+                    panic!("the request must deliver a body frame before the early response");
+                };
+                assert!(
+                    frame.into_data().is_ok_and(|bytes| !bytes.is_empty()),
+                    "the early response must follow a non-empty body frame"
+                );
+                drop(body);
+                Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Empty::new())
+                    .expect("response"))
+            })
+        }
+    }
+
     struct TransformCountingBody<B> {
         inner: B,
         polls: Arc<AtomicUsize>,
@@ -7820,6 +7855,78 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn early_response_http1_closes_a_stalled_chunked_body_after_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("server accept");
+            let service = EarlyResponseBodyService::new(RejectWithoutReadingBodyService, Duration::from_millis(100));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+        });
+        let mut stream = TcpStream::connect(addr).await.expect("client connect");
+        stream
+            .write_all(
+                format!(
+                    "PUT /bucket/object HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send an incomplete chunked body");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the stalled connection must close")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("HTTP response is text");
+        assert!(response.contains("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"), "{response}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server connection must finish")
+            .expect("server task")
+            .expect("HTTP connection");
+    }
+
+    #[tokio::test]
+    async fn early_response_http1_closes_a_partially_read_stalled_chunked_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("server accept");
+            let service = EarlyResponseBodyService::new(ReadOneFrameThenRejectService, Duration::from_millis(100));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+        });
+        let mut stream = TcpStream::connect(addr).await.expect("client connect");
+        stream
+            .write_all(
+                format!(
+                    "PUT /bucket/object HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send an incomplete chunked body");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the stalled connection must close")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("HTTP response is text");
+        assert!(response.contains("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"), "{response}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server connection must finish")
+            .expect("server task")
+            .expect("HTTP connection");
     }
 
     async fn assert_http1_early_response_accepts_streaming_body(expect_continue: bool) {

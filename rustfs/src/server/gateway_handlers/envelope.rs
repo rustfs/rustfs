@@ -33,7 +33,8 @@ use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::access::{AccessMarkers, VerifiedSignature};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, HeaderMap, HeaderValue, Uri};
-use rustfs_gateway::{IdentityOrigin, RequestContextView, TransportExtensions};
+use rustfs_gateway::sig::{SigFamily, SigLocation};
+use rustfs_gateway::{IdentityOrigin, RequestContextView, RequestPrincipal, TransportExtensions};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_trusted_proxies::ClientInfo;
 use std::sync::Arc;
@@ -75,7 +76,7 @@ impl RequestEnvelope {
                 Some(request_credentials(
                     principal.access_key_id(),
                     secret_key,
-                    get_session_token(&uri, &headers),
+                    credential_token(context, principal, &uri, &headers)?,
                 )?)
             }
             None => match context.header_token_principal() {
@@ -106,7 +107,11 @@ impl RequestEnvelope {
             region: scope.map(|scope| scope.region().to_owned()),
             service: scope.map(|scope| scope.service().to_owned()),
         };
-        Ok(Self::from_parts(head, extensions))
+        let mut envelope = Self::from_parts(head, extensions);
+        if context.operation() == "PostObject" {
+            envelope.mark_gateway_post();
+        }
+        Ok(envelope)
     }
 }
 
@@ -139,6 +144,30 @@ fn request_uri(context: &RequestContextView) -> S3Result<Uri> {
         .path_and_query(path_and_query)
         .build()
         .map_err(|_| unreadable("the accepted request target is not a URI"))
+}
+
+fn credential_token<'a>(
+    context: &RequestContextView,
+    principal: &'a RequestPrincipal,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+) -> S3Result<Option<&'a str>> {
+    if context.operation() != "PostObject" {
+        return Ok(get_session_token(uri, headers));
+    }
+    let scheme = principal.scheme();
+    if !matches!(scheme.family(), SigFamily::V4 | SigFamily::V2) || scheme.location() != SigLocation::FormField {
+        return Err(unreadable("the PostObject principal was not authenticated by a form signature"));
+    }
+    if !scheme.is_temporary() {
+        return Ok(None);
+    }
+    let token = principal
+        .verified_form_session_token()
+        .ok_or_else(|| unreadable("the verified PostObject session token is missing"))?;
+    let token =
+        std::str::from_utf8(token.expose()).map_err(|_| unreadable("the verified PostObject session token is not text"))?;
+    Ok(Some(token))
 }
 
 /// The caller's credentials as the app layer holds them. `secret_key` is what the gateway handed
@@ -255,6 +284,22 @@ mod tests {
 
     fn signed_list_buckets(form: Signed) -> Request<Empty<Bytes>> {
         signed_request(form, Method::GET, "/", "", SIGNER_ACCESS_KEY, SIGNER_SECRET_KEY)
+    }
+
+    #[test]
+    fn from_gateway_marks_only_post_object_provenance() {
+        let server_ctx = ServerContextSlot::new();
+        for (operation, expected) in [("PostObject", true), ("PutObject", false)] {
+            let context = RequestContextView::detached(operation);
+            let envelope = RequestEnvelope::from_gateway(&context, &server_ctx, VerifiedSignature::default())
+                .expect("detached gateway context");
+            assert_eq!(envelope.is_gateway_post(), expected, "{operation}");
+            assert_eq!(
+                envelope.fork_for_authorization().is_gateway_post(),
+                expected,
+                "{operation} authorization fork"
+            );
+        }
     }
 
     #[tokio::test]

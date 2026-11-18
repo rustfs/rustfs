@@ -129,7 +129,21 @@ def load_collected_nodeids(path: pathlib.Path) -> set[str]:
     for line in path.read_text(encoding="utf-8").splitlines():
         nodeid = line.strip()
         if nodeid:
-            names.add(nodeid.rsplit("::", 1)[-1])
+            # Parameter IDs may contain "::"; only separators outside
+            # parametrization identify the final test case.
+            depth = 0
+            start = 0
+            index = 0
+            while index < len(nodeid):
+                if nodeid[index] == "[":
+                    depth += 1
+                elif nodeid[index] == "]" and depth:
+                    depth -= 1
+                elif depth == 0 and nodeid[index:index + 2] == "::":
+                    start = index + 2
+                    index += 1
+                index += 1
+            names.add(nodeid[start:])
     return names
 
 

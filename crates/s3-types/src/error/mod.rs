@@ -51,7 +51,8 @@ pub struct S3Error(Box<S3ErrorParts>);
 pub struct S3ErrorParts {
     /// The wire error code.
     pub code: S3ErrorCode,
-    /// The message, when one was given; there is no per-code default here.
+    /// The message, when one was given; the per-code default is not filled in
+    /// here (see [`S3ErrorCode::default_message`]).
     pub message: Option<Cow<'static, str>>,
     /// The request id, when one was attached.
     pub request_id: Option<String>,
