@@ -94,6 +94,8 @@ overflow remains covered by durable discovery, including after a restart.
 These limits bound background work, not the canonical rollback deadline or
 its durability checks.
 
+When diagnosing high disk reads after a restart, separate raw discovery from settlement of already discovered keys. Sample the `delete_recovery` subsystem's discovery and settlement retry events alongside per-drive operations and foreground latency over the same time interval. These events report changes in retry state; their count is not a count of disk reads. The ECStore recovery worker runs independently of the scanner and HealManager switches. Stopping an admin heal or accepting a legacy MRF responsibility does not settle a delete transaction. Leave the on-disk records in place: they are the evidence recovery needs to finish or roll back that deletion.
+
 Corrupt record contents remain discoverable by their physical key; exact-key
 inspection rejects them without hiding later records. Unsafe paths, symlinks,
 and structural filesystem errors still stop that discovery scope.
