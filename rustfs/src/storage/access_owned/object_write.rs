@@ -178,7 +178,7 @@ impl PostObjectFormPolicy {
         Ok(Self(values))
     }
 
-    #[cfg(feature = "gateway-stack")]
+    #[cfg(all(test, feature = "gateway-stack"))]
     pub(crate) fn with_metadata(mut self, metadata: &[(String, String)]) -> S3Result<Self> {
         for (name, value) in metadata {
             let name = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()).map_err(|_| invalid_post_form_field())?;
