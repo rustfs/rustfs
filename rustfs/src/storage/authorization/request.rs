@@ -23,11 +23,12 @@
 //! Upstream: both edges' access phases. Downstream: every module of `storage::authorization`,
 //! `storage::access_owned`, and the use cases that read authorization state.
 
-use crate::storage::ECStore;
-use crate::storage::access::{
-    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
-    OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, TableDataPlaneListAccess, TableDataPlanePublicationGuards,
+use super::{
+    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
+    PendingDeleteBucketGenerationGuard,
 };
+use crate::storage::ECStore;
+use crate::storage::access::{ObjectTagConditions, TableDataPlaneListAccess, TableDataPlanePublicationGuards};
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;

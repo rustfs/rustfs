@@ -18,7 +18,7 @@ use self::access_owned::listing_multipart::{
 use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
 use super::ObjectOptions;
 use super::ecfs::FS;
-use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
+use super::{ECStore, PolicySys, StorageError, is_err_bucket_not_found};
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
@@ -41,6 +41,20 @@ use crate::storage::authorization::{
     recursive_force_delete_has_authenticated_caller, req_info_ref, request_iam_store, request_object_store, resolve_req_info,
     set_requested_object_lock_retain_until,
 };
+use crate::storage::authorization::{
+    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
+    PendingDeleteBucketGenerationGuard, capture_odm_read_generation, load_bucket_config_mutation_snapshot,
+    load_bucket_generation,
+};
+#[cfg(test)]
+use crate::storage::authorization::{
+    PUT_GENERATION_READ_QUORUM_FAILURE, install_object_generation_test_hook, wait_for_object_generation_test_hook,
+};
+#[cfg(test)]
+use crate::storage::authorization::{
+    apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, bucket_config_mutation_incarnation,
+    odm_read_generation, retained_table_data_plane_publication_guards,
+};
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
 pub(crate) use crate::storage::req_info::ReqInfo;
@@ -50,8 +64,7 @@ pub(crate) use crate::storage::request_markers::{
     MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
     RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
 };
-use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
-use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+use crate::storage::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -84,8 +97,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::OnceLock;
 use time::OffsetDateTime;
 use url::Url;
 
@@ -388,67 +399,6 @@ fn invalid_table_data_plane_list_cursor() -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid table listing continuation token".to_string())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BucketGenerationGuard {
-    bucket: String,
-    incarnation_id: uuid::Uuid,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BucketConfigMutationSnapshot {
-    bucket: String,
-    incarnation_id: uuid::Uuid,
-}
-
-pub(crate) fn bucket_config_mutation_incarnation<R: AuthorizationRequest + ?Sized>(
-    req: &R,
-    bucket: &str,
-) -> S3Result<Option<uuid::Uuid>> {
-    let Some(snapshot) = req.bucket_config_mutation() else {
-        if req.server_context().is_some() {
-            return Err(s3_error!(InternalError, "bucket config mutation snapshot is missing"));
-        }
-        return Ok(None);
-    };
-    if snapshot.bucket != bucket {
-        return Err(s3_error!(InternalError, "bucket config mutation snapshot does not match request bucket"));
-    }
-    Ok(Some(snapshot.incarnation_id))
-}
-
-async fn load_bucket_config_mutation_snapshot<R: AuthorizationRequest + ?Sized>(
-    server_ctx: &ServerContextSlot,
-    req: &R,
-    bucket: &str,
-) -> S3Result<BucketConfigMutationSnapshot> {
-    let store = server_ctx
-        .object_store()
-        .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
-    let lock = store
-        .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
-        .await
-        .map_err(ApiError::from)?;
-    let _lifecycle_guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(|err| {
-        ApiError::from(match err {
-            rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
-                mode: "bucket_config_mutation",
-                bucket: bucket.to_string(),
-                object: BUCKET_LIFECYCLE_LOCK_OBJECT.to_string(),
-                required,
-                achieved,
-            },
-            other => StorageError::Lock(other),
-        })
-    })?;
-    let incarnation_id = load_bucket_generation_from_store(store.as_ref(), req, bucket)
-        .await?
-        .incarnation_id;
-    Ok(BucketConfigMutationSnapshot {
-        bucket: bucket.to_string(),
-        incarnation_id,
-    })
-}
-
 /// Authorizes a bucket-configuration mutation for either edge: `action` on `bucket`, with the
 /// bucket incarnation snapshotted under the lifecycle namespace read lock BEFORE the decision, so
 /// a bucket recreated during authorization is refused by the use case's conditional write. A
@@ -489,174 +439,6 @@ pub(crate) async fn authorize_bucket_tag_deletion<R: AuthorizationRequest + ?Siz
     .await
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct CopySourceBucketGenerationGuard {
-    bucket: String,
-    incarnation_id: uuid::Uuid,
-}
-
-#[cfg(test)]
-type ObjectGenerationTestHook = (String, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
-
-#[cfg(test)]
-static OBJECT_GENERATION_TEST_HOOK: OnceLock<std::sync::Mutex<Option<ObjectGenerationTestHook>>> = OnceLock::new();
-
-#[cfg(test)]
-tokio::task_local! {
-    static PUT_GENERATION_READ_QUORUM_FAILURE: ();
-}
-
-#[cfg(test)]
-fn install_object_generation_test_hook(
-    bucket: String,
-    loaded: tokio::sync::oneshot::Sender<()>,
-    resume: tokio::sync::oneshot::Receiver<()>,
-) {
-    *OBJECT_GENERATION_TEST_HOOK
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("object generation test hook lock should not be poisoned") = Some((bucket, loaded, resume));
-}
-
-#[cfg(test)]
-async fn wait_for_object_generation_test_hook(bucket: &str) {
-    let hook = {
-        let mut slot = OBJECT_GENERATION_TEST_HOOK
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("object generation test hook lock should not be poisoned");
-        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
-            slot.take()
-        } else {
-            None
-        }
-    };
-    if let Some((_bucket, loaded, resume)) = hook {
-        let _ = loaded.send(());
-        let _ = resume.await;
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum PendingDeleteBucketGenerationGuard {
-    Ready(BucketGenerationGuard),
-    Failed { code: S3ErrorCode, message: String },
-}
-
-impl PendingDeleteBucketGenerationGuard {
-    fn from_result(result: S3Result<BucketGenerationGuard>) -> Self {
-        match result {
-            Ok(guard) => Self::Ready(guard),
-            Err(err) => Self::Failed {
-                code: err.code().clone(),
-                message: err.message().unwrap_or_else(|| err.code().as_str()).to_string(),
-            },
-        }
-    }
-}
-
-pub(crate) async fn load_bucket_generation_from_store<R: AuthorizationRequest + ?Sized>(
-    store: &crate::storage::storage_api::ECStore,
-    req: &R,
-    bucket: &str,
-) -> S3Result<BucketGenerationGuard> {
-    if let Some(existing) = req.bucket_generation() {
-        return if existing.bucket == bucket {
-            Ok(existing.clone())
-        } else {
-            Err(s3_error!(InternalError, "bucket generation guard does not match request bucket"))
-        };
-    }
-
-    let incarnation_id = store.bucket_incarnation_id(bucket).await.map_err(ApiError::from)?;
-    Ok(BucketGenerationGuard {
-        bucket: bucket.to_string(),
-        incarnation_id,
-    })
-}
-
-/// Loads the bucket incarnation through `server_ctx`'s object store, or returns the guard the
-/// request already carries. The legacy hooks pass `FS::server_ctx`; the gateway edge passes the
-/// envelope's server context.
-pub(crate) async fn load_bucket_generation<R: AuthorizationRequest + ?Sized>(
-    server_ctx: &ServerContextSlot,
-    req: &R,
-    bucket: &str,
-) -> S3Result<BucketGenerationGuard> {
-    let store = server_ctx
-        .object_store()
-        .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
-    load_bucket_generation_from_store(store.as_ref(), req, bucket).await
-}
-
-/// A read may consult only the source admitted before its authorization.
-/// Capture failures are deferred until a local miss actually needs that source.
-#[derive(Clone, Debug)]
-pub(crate) enum OdmReadGenerationGuard {
-    Unavailable,
-    Ready(BucketGenerationGuard),
-    Failed { code: S3ErrorCode, message: String },
-}
-
-impl OdmReadGenerationGuard {
-    fn from_result(result: S3Result<BucketGenerationGuard>) -> Self {
-        match result {
-            Ok(guard) => Self::Ready(guard),
-            Err(err) => Self::Failed {
-                code: err.code().clone(),
-                message: err.message().unwrap_or_else(|| err.code().as_str()).to_string(),
-            },
-        }
-    }
-}
-
-fn odm_read_source_configured(bucket: &str) -> bool {
-    let sys = crate::on_demand_migration::OnDemandMigrationSys::get();
-    sys.is_module_enabled() && sys.state(bucket).is_some()
-}
-
-/// The on-demand-migration source generation a read may consult, captured before its
-/// authorization. A capture failure is kept in the guard and surfaces only on a source miss.
-pub(crate) async fn capture_odm_read_generation<R: AuthorizationRequest + ?Sized>(
-    server_ctx: &ServerContextSlot,
-    req: &R,
-    bucket: &str,
-) -> OdmReadGenerationGuard {
-    if !odm_read_source_configured(bucket) {
-        return OdmReadGenerationGuard::Unavailable;
-    }
-    OdmReadGenerationGuard::from_result(load_bucket_generation(server_ctx, req, bucket).await)
-}
-
-/// Direct usecase callers have no access middleware; capture at their entry.
-/// A server request without the access marker must never bind to a later source.
-pub(crate) async fn prepare_odm_read_generation<R: AuthorizationRequest + ?Sized>(
-    store: &crate::storage::storage_api::ECStore,
-    req: &mut R,
-    bucket: &str,
-) {
-    if req.odm_read_generation().is_some() {
-        return;
-    }
-    let guard = if req.server_context().is_some() || !odm_read_source_configured(bucket) {
-        OdmReadGenerationGuard::Unavailable
-    } else {
-        OdmReadGenerationGuard::from_result(load_bucket_generation_from_store(store, req, bucket).await)
-    };
-    req.install_odm_read_generation(guard);
-}
-
-pub(crate) fn odm_read_generation<R: AuthorizationRequest + ?Sized>(req: &R, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
-    match req.odm_read_generation() {
-        Some(OdmReadGenerationGuard::Ready(guard)) if guard.bucket == bucket => Ok(Some(guard.incarnation_id)),
-        Some(OdmReadGenerationGuard::Ready(_)) => {
-            Err(s3_error!(InternalError, "source generation guard does not match request bucket"))
-        }
-        Some(OdmReadGenerationGuard::Failed { code, message }) => Err(S3Error::with_message(code.clone(), message.clone())),
-        Some(OdmReadGenerationGuard::Unavailable) | None => Ok(None),
-    }
-}
-
 /// The legacy decoder's copy source as owned parts; `None` for an access-point or Outposts ARN.
 pub(crate) fn legacy_copy_source(source: &CopySource) -> Option<(String, String, Option<String>)> {
     match source {
@@ -673,77 +455,6 @@ fn copy_source_object<'a>(
     version_id: Option<&'a str>,
 ) -> access_owned::object_commit::CopySourceObject<'a> {
     access_owned::object_commit::CopySourceObject { bucket, key, version_id }
-}
-
-pub(crate) fn apply_bucket_generation_guard<R: AuthorizationRequest + ?Sized>(
-    req: &R,
-    bucket: &str,
-    opts: &mut ObjectOptions,
-) -> S3Result<()> {
-    let guard = match req.pending_delete_bucket_generation() {
-        Some(PendingDeleteBucketGenerationGuard::Ready(guard)) => Some(guard),
-        Some(PendingDeleteBucketGenerationGuard::Failed { code, message }) => {
-            return Err(S3Error::with_message(code.clone(), message.clone()));
-        }
-        None => req.bucket_generation(),
-    };
-    apply_generation_fence(
-        req,
-        guard.map(|guard| (guard.bucket.as_str(), guard.incarnation_id)),
-        bucket,
-        opts,
-        "bucket generation guard",
-    )
-}
-
-pub(crate) fn retained_table_data_plane_publication_guards<R: AuthorizationRequest + ?Sized>(
-    req: &R,
-) -> Option<TableDataPlanePublicationGuards> {
-    req.publication_guards().cloned()
-}
-
-pub(crate) fn apply_copy_source_bucket_generation_guard<R: AuthorizationRequest + ?Sized>(
-    req: &R,
-    bucket: &str,
-    opts: &mut ObjectOptions,
-) -> S3Result<()> {
-    let guard = req.copy_source_bucket_generation();
-    apply_generation_fence(
-        req,
-        guard.map(|guard| (guard.bucket.as_str(), guard.incarnation_id)),
-        bucket,
-        opts,
-        "copy source bucket generation guard",
-    )
-}
-
-/// Binds `opts` to the captured incarnation of `bucket` and to the retained table publication
-/// locks. A server request without a captured guard is refused: only direct use-case callers,
-/// which carry no server context, run unfenced.
-fn apply_generation_fence<R: AuthorizationRequest + ?Sized>(
-    req: &R,
-    guard: Option<(&str, uuid::Uuid)>,
-    bucket: &str,
-    opts: &mut ObjectOptions,
-    guard_name: &str,
-) -> S3Result<()> {
-    match guard {
-        Some((guarded, _)) if guarded != bucket => {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("{guard_name} does not match request bucket"),
-            ));
-        }
-        Some((_, incarnation_id)) => opts.expected_bucket_incarnation_id = Some(incarnation_id),
-        None if req.server_context().is_some() => {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{guard_name} is missing")));
-        }
-        None => {}
-    }
-    if let Some(publication_guards) = req.publication_guards() {
-        publication_guards.add_lock_loss_fences(opts);
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -8050,6 +7761,7 @@ mod tests {
 
         let mut opts = crate::storage::ObjectOptions::default();
         let err = apply_bucket_generation_guard(&req, "generation-guard-bucket", &mut opts)
+            .map_err(s3s::S3Error::from)
             .expect_err("a dispatched PutObject must not commit without its authorization fence");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }

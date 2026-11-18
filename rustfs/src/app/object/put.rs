@@ -984,7 +984,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..

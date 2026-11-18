@@ -24,9 +24,21 @@
 //! policy, IAM and table-catalog systems.
 
 mod admission;
+mod guards;
 mod request;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
+pub(crate) use guards::{
+    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
+    PendingDeleteBucketGenerationGuard, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+    bucket_config_mutation_incarnation, capture_odm_read_generation, load_bucket_config_mutation_snapshot,
+    load_bucket_generation, load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
+    retained_table_data_plane_publication_guards,
+};
+#[cfg(test)]
+pub(crate) use guards::{
+    PUT_GENERATION_READ_QUORUM_FAILURE, install_object_generation_test_hook, wait_for_object_generation_test_hook,
+};
 #[cfg(test)]
 pub(crate) use request::AMZ_WRITE_OFFSET_BYTES_HEADER;
 pub(crate) use request::{
