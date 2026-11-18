@@ -61,6 +61,11 @@ struct FillRequest {
     response: oneshot::Sender<FillResult>,
 }
 
+struct FilledStripes {
+    primary: Vec<u8>,
+    queued: VecDeque<Vec<u8>>,
+}
+
 struct FillResult {
     result: io::Result<Option<Vec<u8>>>,
     queued_buffers: VecDeque<Vec<u8>>,
@@ -293,7 +298,7 @@ where
         Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, fill_policy)
     }
 
-    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<(Vec<u8>, VecDeque<Vec<u8>>)>>> {
+    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<FilledStripes>>> {
         if self.fill.is_none() {
             let fill_worker_tx = match self.fill_worker_tx() {
                 Ok(tx) => tx,
@@ -360,7 +365,10 @@ where
                 // bounded by `remaining - buf.len()`, ruling out underflow.
                 self.remaining -= buf.len();
                 self.remaining -= queued_buffers.iter().map(Vec::len).sum::<usize>();
-                Poll::Ready(Ok(Some((buf, queued_buffers))))
+                Poll::Ready(Ok(Some(FilledStripes {
+                    primary: buf,
+                    queued: queued_buffers,
+                })))
             }
             Ok(None) => {
                 if self.remaining == 0 {
@@ -398,7 +406,7 @@ where
         };
 
         match fill {
-            Ok(Some((buf, queued_buffers))) => {
+            Ok(Some(FilledStripes { primary: buf, queued })) => {
                 let output_has_remaining = self.output_pos < self.output_buf.len() || !self.prefetched_bufs.is_empty();
                 let mut queued_count = 0usize;
                 let mut queued_bytes = 0usize;
@@ -417,7 +425,7 @@ where
                     self.output_buf = buf;
                     self.output_pos = 0;
                 }
-                self.prefetched_bufs.extend(queued_buffers);
+                self.prefetched_bufs.extend(queued);
 
                 if !self.prefetched_bufs.is_empty() {
                     let total_prefetched_bytes = self.prefetched_bufs.iter().map(Vec::len).sum::<usize>();
