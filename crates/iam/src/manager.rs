@@ -3095,9 +3095,15 @@ mod tests {
             .with_subscriber(subscriber)
             .await;
         assert!(
-            matches!(result, Err(Error::InvalidArgument)),
-            "the test store rejects persistence after the existing-user path"
+            matches!(result, Err(Error::IAMActionNotAllowed)),
+            "a store without conditional regular-user writes must reject the update"
         );
+        let retained = cache.cache.snapshot();
+        let retained = retained
+            .users
+            .get(&identity.credentials.access_key)
+            .expect("existing user retained");
+        assert_eq!(retained.credentials.secret_key, identity.credentials.secret_key);
         let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
         assert!(
             captured.contains(EVENT_USER_UPDATE_EXISTING) || captured.contains("IAM user already exists"),
