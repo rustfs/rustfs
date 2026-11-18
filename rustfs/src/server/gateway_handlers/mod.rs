@@ -36,6 +36,7 @@ mod bucket_core;
 mod bucket_replication_lifecycle;
 mod lifecycle_input;
 mod listing_multipart;
+pub(crate) mod metadata_listing;
 mod object_commit;
 mod object_meta;
 mod object_misc;
