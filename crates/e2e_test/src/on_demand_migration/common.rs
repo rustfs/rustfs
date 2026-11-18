@@ -693,7 +693,7 @@ impl OdmTestEnv {
             .uri(uri)
             .header(http::header::HOST, authority)
             .header("x-amz-content-sha256", rustfs_signer::constants::UNSIGNED_PAYLOAD)
-            .body(s3s::Body::empty())?;
+            .body(rustfs_s3_types::Body::empty())?;
         let signed = rustfs_signer::sign_v4(request, 0, &self.rustfs.access_key, &self.rustfs.secret_key, "", "us-east-1");
 
         let mut builder =

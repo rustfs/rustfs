@@ -358,7 +358,7 @@ fn telemetry_operation(operation: rustfs_s3_ops::S3Operation) -> Option<Telemetr
     use rustfs_s3_ops::S3Operation;
     match operation {
         S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
-        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::PutObject | S3Operation::PostObject => Some(TelemetryTraceOperation::PutObject),
         S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
         S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
         _ => None,
@@ -447,6 +447,7 @@ fn foreground_class(operation: Option<rustfs_s3_ops::S3Operation>) -> Foreground
         Some(S3Operation::GetObject | S3Operation::SelectObjectContent) => ForegroundClass::Read,
         Some(
             S3Operation::PutObject
+            | S3Operation::PostObject
             | S3Operation::CopyObject
             | S3Operation::UploadPart
             | S3Operation::UploadPartCopy

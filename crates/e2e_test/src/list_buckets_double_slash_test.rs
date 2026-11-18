@@ -24,9 +24,9 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
     use http::header::HOST;
+    use rustfs_s3_types::Body;
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
-    use s3s::Body;
     use std::error::Error;
 
     /// Sends a SigV4-signed `GET` where the signature is computed over `sign_path`

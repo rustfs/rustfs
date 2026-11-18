@@ -95,7 +95,12 @@ async fn original(
             credentials,
         },
     )?;
-    let output = backend.fs.upload_part_copy(request).await.map_err(S3Error::from)?.output;
+    let output = backend
+        .legacy_fs()
+        .upload_part_copy(request)
+        .await
+        .map_err(S3Error::from)?
+        .output;
     gateway_s3s_compat::generated::ops::upload_part_copy::output_from_s3s(output)
         .map_err(|error| conversion_error("UploadPartCopy output", error))
 }
@@ -124,7 +129,7 @@ fn protocol_upload_copy_original_refusal_order() {
         use crate::storage_api::protocols::client::StorageObjectOptions;
         let bucket = "protocol-upload-copy-order";
         let (_temp, root, backend, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let context = backend.fs.server_ctx().app_context().expect("bound context");
+        let context = backend.legacy_fs().server_ctx().app_context().expect("bound context");
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         let probe = crate::app::storage_api::helper::MutationCompletionProbe::install(bucket);
@@ -291,7 +296,7 @@ fn protocol_upload_copy_original_range_and_metadata() {
         use tokio::io::AsyncReadExt;
         let bucket = "protocol-upload-copy-range";
         let (_foreign_temp, _, foreign, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let ambient = foreign.fs.server_ctx().app_context().expect("foreign context");
+        let ambient = foreign.legacy_fs().server_ctx().app_context().expect("foreign context");
         let options = StorageObjectOptions::default();
         let foreign_etag = ambient
             .object_store()
@@ -306,7 +311,7 @@ fn protocol_upload_copy_original_range_and_metadata() {
             .etag
             .expect("foreign tag");
         let (_temp, root, backend, source_etag) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let context = backend.fs.server_ctx().app_context().expect("bound context");
+        let context = backend.legacy_fs().server_ctx().app_context().expect("bound context");
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         assert!(!std::sync::Arc::ptr_eq(&context, &ambient));
@@ -315,7 +320,7 @@ fn protocol_upload_copy_original_range_and_metadata() {
             &ambient
         ));
         let fallback = crate::init::protocol_storage_client_for_server(crate::runtime_sources::ServerContextSlot::new());
-        assert!(fallback.fs.server_ctx().installed_app_context().is_none());
+        assert!(fallback.legacy_fs().server_ctx().installed_app_context().is_none());
         for (backend, store, source_etag, expected_bytes) in [
             (&backend, store, source_etag, b"otoco".as_slice()),
             (&fallback, ambient.object_store(), foreign_etag, b"reign".as_slice()),
@@ -420,7 +425,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
         let source = "protocol-upload-copy-generation";
         let destination = "protocol-upload-copy-recreated";
         let (_temp, root, backend, _) = crate::protocols::mainflow_test::object_client(source).await;
-        let context = backend.fs.server_ctx().app_context().expect("context");
+        let context = backend.legacy_fs().server_ctx().app_context().expect("context");
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         store

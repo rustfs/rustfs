@@ -1634,6 +1634,7 @@ fn select_s3_stack(
 #[derive(Clone)]
 struct ControlBodyDigestService<S> {
     inner: S,
+    console_listener: bool,
     idle_timeout: Duration,
     total_timeout: Duration,
     max_body_size: usize,
@@ -1644,11 +1645,17 @@ impl<S> ControlBodyDigestService<S> {
     fn new(inner: S, idle_timeout: Duration) -> Self {
         Self {
             inner,
+            console_listener: false,
             idle_timeout,
             total_timeout: Duration::from_secs(30),
             max_body_size: rustfs_s3_config().xml_max_body_size,
             virtual_host: None,
         }
+    }
+
+    fn with_console_listener(mut self, enabled: bool) -> Self {
+        self.console_listener = enabled;
+        self
     }
 
     fn with_virtual_host_domains(mut self, domains: Arc<[String]>) -> Self {
@@ -1860,6 +1867,11 @@ where
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         use http_body_util::BodyExt;
+        if self.console_listener && !admin::router::console_listener_route(request.method(), request.uri(), request.headers()) {
+            let mut response = Response::new(s3s::Body::empty());
+            *response.status_mut() = http::StatusCode::NOT_FOUND;
+            return Box::pin(async move { Ok(response) });
+        }
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let required = control_body_digest_required(&request, self.virtual_host.as_deref());
@@ -2502,13 +2514,18 @@ async fn start_http_server_inner(
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
-        b.set_route(storage::metadata_route::with_metadata_route(
-            admin::make_admin_route(config.console_enable, admin_server_ctx)?,
-            metadata_route_host,
-            website_route_domains,
-            protocol,
-            Arc::clone(&server_ctx),
-        ));
+        let admin_route = admin::make_admin_route(config.console_enable, admin_server_ctx)?;
+        if config.console_enable {
+            b.set_route(admin_route);
+        } else {
+            b.set_route(storage::metadata_route::with_metadata_route(
+                admin_route,
+                metadata_route_host,
+                website_route_domains,
+                protocol,
+                Arc::clone(&server_ctx),
+            ));
+        }
 
         // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
         // AWS S3 accepts keys such as "/foo/bar"; without this, requests like
@@ -3291,9 +3308,10 @@ fn process_connection(
         );
 
         let http_service = ControlBodyDigestService::new(s3_service, request_body_idle_timeout)
+            .with_console_listener(is_console)
             .with_virtual_host_domains(vh_domain_hosts.clone());
         #[cfg(feature = "swift")]
-        let http_service = SwiftService::new(true, None, http_service);
+        let http_service = SwiftService::new(!is_console, None, http_service);
         let http_service =
             EarlyResponseBodyService::new(http_service, request_body_idle_timeout).with_task_owner(task_owner.clone());
         #[cfg(not(feature = "internode-transport"))]
@@ -4350,6 +4368,37 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn console_listener_isolates_object_routes() {
+        use tower::ServiceExt;
+        let inner = tower::service_fn(|_: HttpRequest<ControlRequestBody>| async {
+            Ok::<_, Infallible>(Response::new(s3s::Body::empty()))
+        });
+        let data = ControlBodyDigestService::new(inner, Duration::from_secs(1));
+        let console = data.clone().with_console_listener(true);
+        for (uri, expected) in [
+            ("/", StatusCode::NOT_FOUND),
+            ("/bucket/notes.txt", StatusCode::NOT_FOUND),
+            ("/bucket/notes.txt?response-content-type=text%2Fplain", StatusCode::NOT_FOUND),
+            ("/favicon.ico?events", StatusCode::NOT_FOUND),
+            ("/rustfs/admin/v3/info?lambdaArn=example", StatusCode::NOT_FOUND),
+            ("/favicon.ico", StatusCode::OK),
+            ("/rustfs/admin/v3/info", StatusCode::OK),
+        ] {
+            for signed in [false, true] {
+                let request = || {
+                    let mut req = HttpRequest::builder().uri(uri);
+                    if signed {
+                        req = req.header("authorization", "routing-test");
+                    }
+                    req.body(s3s::Body::empty()).unwrap()
+                };
+                assert_eq!(console.clone().oneshot(request()).await.unwrap().status(), expected, "{uri}");
+                assert_eq!(data.clone().oneshot(request()).await.unwrap().status(), StatusCode::OK, "{uri}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -7234,6 +7283,41 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct ReadOneFrameThenRejectService;
+
+    impl<B> Service<HttpRequest<B>> for ReadOneFrameThenRejectService
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Send + 'static,
+    {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+            Box::pin(async move {
+                let mut body = Box::pin(req.into_body());
+                let Some(Ok(frame)) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await else {
+                    panic!("the request must deliver a body frame before the early response");
+                };
+                assert!(
+                    frame.into_data().is_ok_and(|bytes| !bytes.is_empty()),
+                    "the early response must follow a non-empty body frame"
+                );
+                drop(body);
+                Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Empty::new())
+                    .expect("response"))
+            })
+        }
+    }
+
     struct TransformCountingBody<B> {
         inner: B,
         polls: Arc<AtomicUsize>,
@@ -7820,6 +7904,78 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn early_response_http1_closes_a_stalled_chunked_body_after_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("server accept");
+            let service = EarlyResponseBodyService::new(RejectWithoutReadingBodyService, Duration::from_millis(100));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+        });
+        let mut stream = TcpStream::connect(addr).await.expect("client connect");
+        stream
+            .write_all(
+                format!(
+                    "PUT /bucket/object HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send an incomplete chunked body");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the stalled connection must close")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("HTTP response is text");
+        assert!(response.contains("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"), "{response}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server connection must finish")
+            .expect("server task")
+            .expect("HTTP connection");
+    }
+
+    #[tokio::test]
+    async fn early_response_http1_closes_a_partially_read_stalled_chunked_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("server accept");
+            let service = EarlyResponseBodyService::new(ReadOneFrameThenRejectService, Duration::from_millis(100));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+        });
+        let mut stream = TcpStream::connect(addr).await.expect("client connect");
+        stream
+            .write_all(
+                format!(
+                    "PUT /bucket/object HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send an incomplete chunked body");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the stalled connection must close")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("HTTP response is text");
+        assert!(response.contains("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"), "{response}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server connection must finish")
+            .expect("server task")
+            .expect("HTTP connection");
     }
 
     async fn assert_http1_early_response_accepts_streaming_body(expect_continue: bool) {

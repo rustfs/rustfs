@@ -21,7 +21,7 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
 impl ProtocolStorageClient {
     pub(super) fn owned_multipart_usecase(&self) -> crate::app::multipart_usecase::DefaultMultipartUsecase {
-        crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.fs.server_ctx().app_context())
+        crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.server_ctx.app_context())
     }
 }
 

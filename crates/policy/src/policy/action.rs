@@ -465,6 +465,8 @@ pub enum AdminAction {
     ServiceFreezeAdminAction,
     #[strum(serialize = "admin:ConfigUpdate")]
     ConfigUpdateAdminAction,
+    #[strum(serialize = "admin:ManageOpenIDConfig")]
+    ManageOpenIDConfigAdminAction,
     #[strum(serialize = "admin:TLSCertificatePublish")]
     TLSCertificatePublishAdminAction,
     #[strum(serialize = "admin:TLSCertificateStatus")]
@@ -692,6 +694,7 @@ impl AdminAction {
                 | AdminAction::ServiceStopAdminAction
                 | AdminAction::ServiceFreezeAdminAction
                 | AdminAction::ConfigUpdateAdminAction
+                | AdminAction::ManageOpenIDConfigAdminAction
                 | AdminAction::TLSCertificatePublishAdminAction
                 | AdminAction::TLSCertificateStatusAdminAction
                 | AdminAction::CreateUserAdminAction
@@ -1026,6 +1029,14 @@ mod tests {
         assert!(all_admin.is_match(&Action::AdminAction(set_action)));
         assert!(all_admin.is_match(&Action::AdminAction(get_action)));
         assert!(!Action::AdminAction(get_action).is_match(&Action::AdminAction(set_action)));
+    }
+
+    #[test]
+    fn oidc_config_action_is_separate_from_general_config_writes() {
+        let oidc = Action::try_from("admin:ManageOpenIDConfig").expect("parse OIDC management permission");
+        assert!(!Action::AdminAction(AdminAction::ConfigUpdateAdminAction).is_match(&oidc));
+        assert!(Action::AdminAction(AdminAction::AllAdminActions).is_match(&oidc));
+        assert!(AdminAction::ManageOpenIDConfigAdminAction.is_valid());
     }
 
     #[test]

@@ -4454,7 +4454,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(envelope, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err.into()))),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
@@ -4569,7 +4569,6 @@ impl DefaultObjectUsecase {
             },
         };
         let mut response = read_answer(&input.bucket, envelope.method(), envelope.headers(), output).await;
-        inject_accept_ranges_header(&mut response.headers);
         if ranged {
             response.status = Some(StatusCode::PARTIAL_CONTENT);
         }
@@ -4773,7 +4772,6 @@ impl DefaultObjectUsecase {
                     }
                     lifecycle.finish_ok();
                     let mut response = read_answer(&bucket, envelope.method(), envelope.headers(), *output).await;
-                    inject_accept_ranges_header(&mut response.headers);
                     mark_on_demand_migration_response(&mut response.headers);
                     let result = Ok(response);
                     complete_read(helper.version_id(version_id_for_event), &result);

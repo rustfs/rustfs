@@ -32,9 +32,9 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use http::StatusCode;
     use http::header::HOST;
+    use rustfs_s3_types::Body;
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
-    use s3s::Body;
     use std::error::Error;
     use tracing::{debug, info};
 

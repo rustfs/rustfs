@@ -1054,7 +1054,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         return Ok(upload_dirs
             .into_iter()
             .filter_map(|upload_dir| {
-                let upload_dir = upload_dir.trim_end_matches('/');
+                let upload_dir = upload_dir.strip_suffix('/')?;
                 multipart_upload_leaf_is_safe(upload_dir).then(|| format!("{root_prefix}/{upload_dir}"))
             })
             .collect());
@@ -1102,7 +1102,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         let (sha_dir, upload_dirs) = listed_upload_dirs?;
         upload_paths.reserve(upload_dirs.len());
         upload_paths.extend(upload_dirs.into_iter().filter_map(|upload_dir| {
-            let upload_dir = upload_dir.trim_end_matches('/');
+            let upload_dir = upload_dir.strip_suffix('/')?;
             multipart_upload_leaf_is_safe(upload_dir).then(|| format!("{sha_dir}/{upload_dir}"))
         }));
     }
@@ -2562,6 +2562,9 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         Self::validate_completed_multipart_publication(bucket, object, upload_id, &completed)?;
+        if opts.restore_copyback {
+            require_multipart_restore_target(opts, completed.version_id)?;
+        }
         if let Some(publication) = publication_identity(&completed)? {
             confirm_target(disks, &publication, &self.multipart_proof_verification_context()).await?;
         }
@@ -2783,14 +2786,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // it is reacquired for the short final rename, so Complete/Abort are
         // not blocked behind a slow body upload.
         let _capped_staging_guard = if multipart_size_limit.is_some() {
+            let semaphore = capped_multipart_staging_semaphore(&upload_id_path);
+            let permit = if opts.multipart_copy_source_locked {
+                semaphore.try_acquire_owned().map_err(|_| Error::SlowDown)?
+            } else {
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::other("capped multipart staging semaphore closed"))?
+            };
             Some(CappedMultipartStagingGuard {
                 upload_id_path: upload_id_path.clone(),
-                permit: Some(
-                    capped_multipart_staging_semaphore(&upload_id_path)
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::other("capped multipart staging semaphore closed"))?,
-                ),
+                permit: Some(permit),
             })
         } else {
             None
@@ -3573,7 +3580,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
-        let upload_path = Self::get_multipart_upload_dir(bucket, object, upload_uuid.as_str(), opts.data_movement);
+        let upload_path = Self::get_multipart_upload_dir(bucket, object, &upload_id, opts.data_movement);
 
         #[cfg(any(test, feature = "test-util"))]
         pause_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost).await;
@@ -3754,6 +3761,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await?;
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
+        if opts.restore_copyback
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && opts
+                .object_lock_config_snapshot
+                .as_deref()
+                .is_none_or(|snapshot| matches!(snapshot.state(), ObjectLockConfigState::Fabricated))
+        {
+            return Err(Error::other("multipart restore requires an authoritative Object Lock snapshot"));
+        }
         let (mut fi, mut files_metas) = match self
             .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
             .await
@@ -3973,7 +3989,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // completion in a versioned bucket gets a concrete version.
         let replicated_null_version = fi.version_id.is_none_or(|version_id| version_id.is_nil())
             && (opts.replication_request || opts.delete_marker_replication_status() == ReplicationStatusType::Replica);
-        if opts.versioned && replicated_null_version {
+        if opts.restore_copyback {
+            require_multipart_restore_target(opts, fi.version_id)?;
+        } else if opts.versioned && replicated_null_version {
             fi.version_id = Some(Uuid::nil());
         } else if opts.versioned {
             fi.version_id = Some(match fi.version_id.filter(|version_id| !version_id.is_nil()) {
@@ -4588,19 +4606,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         )
         .await?;
 
-        if !opts.versioned
+        if (opts.restore_copyback || !opts.versioned)
             && !crate::bucket::utils::is_meta_bucketname(bucket)
             && let Some(snapshot) = opts.object_lock_config_snapshot.as_deref()
             && !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)
         {
-            // Completion replaces the null version, not necessarily the latest
-            // version inspected by the request-level Object Lock check.
+            // Check the physical replacement, not necessarily the latest version.
             let current = self
                 .get_object_info(
                     bucket,
                     object,
                     &ObjectOptions {
-                        version_id: Some(Uuid::nil().to_string()),
+                        version_id: Some(fi.version_id.unwrap_or_default().to_string()),
                         no_lock: true,
                         metadata_cache_safe: false,
                         versioned: opts.versioned,
@@ -4616,8 +4633,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     }
                 }
                 // A null delete marker has no protected payload to replace.
-                Err(StorageError::MethodNotAllowed) => {}
-                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(StorageError::MethodNotAllowed) if !opts.restore_copyback => {}
+                Err(err) if !opts.restore_copyback && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -5230,6 +5247,16 @@ fn preserves_staged_encrypted_etag_proof(fi: &FileInfo, opts: &ObjectOptions, re
     version.filter(|version| !version.is_nil()) == fi.version_id.filter(|version| !version.is_nil())
         && fi.metadata.get("etag").map(String::as_str) == Some(etag)
         && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
+}
+
+// A missing ID on disk denotes the null version, but a missing request ID
+// means "latest" and cannot authorize publication to a particular version.
+fn require_multipart_restore_target(opts: &ObjectOptions, physical: Option<Uuid>) -> Result<()> {
+    let selected = opts.version_id.as_deref().ok_or(StorageError::PreconditionFailed)?;
+    if Uuid::parse_str(selected)? != physical.unwrap_or_default() {
+        return Err(StorageError::PreconditionFailed);
+    }
+    Ok(())
 }
 
 /// Final ETag for a completed multipart object. An authorized replication
@@ -8903,6 +8930,18 @@ mod tests {
         });
         let input = tokio_util::io::StreamReader::new(stream);
         let mut reader = PutObjReader::new(HashReader::from_stream(input, 512, 512, None, None, false).expect("part reader"));
+        let copy_options = ObjectOptions {
+            multipart_copy_source_locked: true,
+            ..Default::default()
+        };
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            set_disks.put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &copy_options),
+        )
+        .await
+        .expect("source-locked copy must not queue");
+        assert!(matches!(refused, Err(Error::SlowDown)));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
         let task = tokio::spawn(async move {
             set_disks
                 .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
@@ -12819,7 +12858,15 @@ mod tests {
         }
 
         let healthy = set_disks
-            .new_multipart_upload(bucket, "healthy/object.bin", &ObjectOptions::default())
+            .new_multipart_upload(
+                bucket,
+                "healthy/object.bin",
+                &ObjectOptions {
+                    // Keep the source time historical but distinct from the absent-time sentinel.
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("healthy multipart upload should be created");
         set_disks
@@ -14860,6 +14907,66 @@ mod tests {
                 completed.version_id.is_some_and(|version_id| version_id.is_nil()),
                 "suspended completion must publish a null-version object internally"
             );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn multipart_restore_preserves_explicit_target_across_versioning_modes() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "restore-target-bucket";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            for (index, (versioned, selected)) in [
+                (true, Uuid::nil()),
+                (true, Uuid::new_v4()),
+                (false, Uuid::nil()),
+                (false, Uuid::new_v4()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let object = format!("object-{index}");
+                let create_opts = ObjectOptions {
+                    versioned,
+                    version_suspended: !versioned,
+                    version_id: Some(selected.to_string()),
+                    ..Default::default()
+                };
+                let (upload, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, &object, b"copy-back", &create_opts).await;
+                let mut complete_opts = ObjectOptions {
+                    restore_copyback: true,
+                    ..create_opts
+                };
+                assert!(
+                    set_disks
+                        .clone()
+                        .complete_multipart_upload(bucket, &object, &upload, parts.clone(), &complete_opts)
+                        .await
+                        .is_err()
+                );
+                complete_opts.object_lock_config_snapshot =
+                    Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent)));
+                complete_opts.version_id = Some(Uuid::new_v4().to_string());
+                assert!(matches!(
+                    set_disks
+                        .clone()
+                        .complete_multipart_upload(bucket, &object, &upload, parts.clone(), &complete_opts)
+                        .await,
+                    Err(StorageError::PreconditionFailed)
+                ));
+                complete_opts.version_id = Some(selected.to_string());
+                let result = set_disks
+                    .clone()
+                    .complete_multipart_upload(bucket, &object, &upload, parts, &complete_opts)
+                    .await
+                    .expect("publish to staged version");
+                assert_eq!(result.version_id, Some(selected));
+                let stored = set_disks
+                    .get_object_info(bucket, &object, &complete_opts)
+                    .await
+                    .expect("read exact version");
+                assert_eq!(stored.version_id, Some(selected));
+            }
         }
 
         /// Read the whole committed object back; returns `(body, etag)`. The full

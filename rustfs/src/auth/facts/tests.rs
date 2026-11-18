@@ -328,7 +328,13 @@ fn run_cases() -> Vec<(Case, Conditions, Conditions)> {
         .map(|case| {
             let credentials = credentials(case.who);
             let before = OffsetDateTime::now_utc();
-            let legacy = case.legacy(&credentials);
+            let mut legacy = case.legacy(&credentials);
+            // The historical oracle supplied empty identity strings for anonymous requests.
+            // The corrected policy contract omits these keys entirely.
+            if matches!(case.who, Who::Anonymous) {
+                legacy.remove("userid");
+                legacy.remove("username");
+            }
             let after = OffsetDateTime::now_utc();
             // A rejected listing read no clock.
             let now = if legacy == rejected_listing() {
@@ -680,12 +686,12 @@ fn referer_matches_legacy() {
 
 #[test]
 fn userid_matches_legacy() {
-    assert_key_matches_legacy("userid", condition_cases(), 0);
+    assert_key_matches_legacy("userid", 1, 1);
 }
 
 #[test]
 fn username_matches_legacy() {
-    assert_key_matches_legacy("username", condition_cases(), 0);
+    assert_key_matches_legacy("username", 1, 1);
 }
 
 #[test]
