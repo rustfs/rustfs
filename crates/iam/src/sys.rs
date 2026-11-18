@@ -430,9 +430,27 @@ impl<T: Store> IamSys<T> {
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
         crate::delegation::read_active_for_broker(&self.store.api, id, now).await
     }
+    /// Bind a registration request to the actual signing secret and durable owner revision.
+    /// Call before reading the request body; do not obtain a new snapshot on publication failure.
+    ///
+    /// # Errors
+    /// Rejects missing, stale or non-regular signing authority and unavailable/corrupt storage.
+    pub async fn prepare_plugin_delegation_owner(
+        &self,
+        access_key: &str,
+        signing_secret: &str,
+    ) -> std::result::Result<crate::delegation::RegistrationOwner, crate::delegation::DelegationError> {
+        crate::delegation::prepare_owner(&self.store.api, access_key, signing_secret).await
+    }
+    /// Publish restrictions only while the request-bound owner snapshot remains current.
+    /// Consumes the snapshot; failure requires a new authenticated request, never rebinding by name.
+    /// Cancellation or storage failure can leave unreturned immutable records.
+    ///
+    /// # Errors
+    /// Rejects invalid restrictions, changed owner snapshots, and unavailable/corrupt persistence.
     pub async fn create_plugin_delegation(
         &self,
-        owner: &str,
+        owner: crate::delegation::RegistrationOwner,
         restrictions: crate::delegation::Restrictions,
         now: u64,
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {

@@ -721,6 +721,25 @@ impl ObjectStore {
         }
     }
 
+    async fn read_plugin_delegation_owner(&self, name: &str) -> Result<(DelegationOwnerIdentity, String)> {
+        let (mut owner, revision) = self
+            .read_regular_user_record::<DelegationOwnerIdentity>(name)
+            .await?
+            .ok_or(Error::ConfigNotFound)?;
+        validate_regular_user_identity(name, &mut owner.identity)?;
+        if !owner.identity.credentials.is_valid() || owner.identity.credentials.is_service_account() {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        if owner
+            .plugin_delegation_epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.len() != 32 || !epoch.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((owner, revision))
+    }
+
     async fn save_regular_user_record(&self, name: &str, record: &DelegationOwnerIdentity, revision: Option<&str>) -> Result<()> {
         if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
             return Err(Error::InvalidArgument);
@@ -1057,23 +1076,21 @@ impl Store for ObjectStore {
             .await
     }
 
-    async fn load_plugin_delegation_owner_epoch(&self, name: &str, initialize: bool) -> Result<String> {
-        let (mut owner, revision) = self
-            .read_regular_user_record::<DelegationOwnerIdentity>(name)
-            .await?
-            .ok_or(Error::ConfigNotFound)?;
-        validate_regular_user_identity(name, &mut owner.identity)?;
-        if !owner.identity.credentials.is_valid() || owner.identity.credentials.is_service_account() {
+    async fn plugin_delegation_owner_revision(&self, name: &str) -> Result<(String, String)> {
+        let (owner, revision) = self.read_plugin_delegation_owner(name).await?;
+        Ok((owner.plugin_delegation_epoch.ok_or(Error::IAMActionNotAllowed)?, revision))
+    }
+
+    async fn authenticate_plugin_delegation_owner(&self, name: &str, signing_secret: &str) -> Result<(String, String)> {
+        use subtle::ConstantTimeEq as _;
+
+        let (owner, revision) = self.read_plugin_delegation_owner(name).await?;
+        let secret = &owner.identity.credentials.secret_key;
+        if !bool::from(secret.as_bytes().ct_eq(signing_secret.as_bytes())) {
             return Err(Error::IAMActionNotAllowed);
         }
         if let Some(epoch) = owner.plugin_delegation_epoch {
-            if epoch.len() != 32 || !epoch.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(Error::InvalidArgument);
-            }
-            return Ok(epoch);
-        }
-        if !initialize {
-            return Err(Error::IAMActionNotAllowed);
+            return Ok((epoch, revision));
         }
         let owner = DelegationOwnerIdentity::new(owner.identity);
         let epoch = owner.plugin_delegation_epoch.clone().ok_or(Error::InvalidArgument)?;
@@ -1085,7 +1102,18 @@ impl Store for ObjectStore {
             barrier.1.notified().await;
         }
         self.save_regular_user_record(name, &owner, Some(&revision)).await?;
-        Ok(epoch)
+        #[cfg(test)]
+        if let Ok(barrier) = OWNER_EPOCH_INIT_READBACK_BARRIER.try_with(Arc::clone) {
+            barrier.0.notify_one();
+            barrier.1.notified().await;
+        }
+        // Read back the revision of our own initialized epoch, never a newer
+        // owner's epoch. The request retains this exact snapshot through publication.
+        let (current_epoch, revision) = self.plugin_delegation_owner_revision(name).await?;
+        if current_epoch != epoch {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        Ok((epoch, revision))
     }
 
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
@@ -1584,6 +1612,7 @@ fn map_delete_user_identity_error(name: &str, err: Error) -> Error {
 tokio::task_local! {
     static LOAD_ALL_COMMIT_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
     static OWNER_EPOCH_INIT_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+    static OWNER_EPOCH_INIT_READBACK_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
 }
 
 #[cfg(test)]
@@ -1819,6 +1848,14 @@ mod tests {
         }
     }
 
+    async fn register_plugin_delegation(
+        store: &ObjectStore,
+        credentials: &Credentials,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        let owner = crate::delegation::prepare_owner(store, &credentials.access_key, &credentials.secret_key).await?;
+        crate::delegation::create(store, owner, plugin_delegation_restrictions(), 100).await
+    }
+
     #[tokio::test]
     #[serial]
     async fn plugin_delegation_owner_changes_reject_stale_peer_cache() {
@@ -1834,8 +1871,12 @@ mod tests {
             let local = IamCache::new(store.clone()).await.expect("local IAM cache");
             let peer_cache = IamCache::new(store.clone()).await.expect("peer IAM cache");
             let peer = IamSys::new(peer_cache.clone());
+            let owner = peer
+                .prepare_plugin_delegation_owner(name, &identity.credentials.secret_key)
+                .await
+                .expect("authenticate registration request");
             let record = peer
-                .create_plugin_delegation(name, plugin_delegation_restrictions(), 100)
+                .create_plugin_delegation(owner, plugin_delegation_restrictions(), 100)
                 .await
                 .expect("register an ordinary owner's delegation");
             assert!(peer.read_active_plugin_delegation_for_broker(&record.id, 101).await.is_ok());
@@ -1862,7 +1903,7 @@ mod tests {
                 .expect("restore old secret");
             assert!(peer.read_active_plugin_delegation_for_broker(&record.id, 101).await.is_err());
 
-            let before_delete = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+            let before_delete = register_plugin_delegation(&store, &identity.credentials)
                 .await
                 .expect("new delegation after rotation");
             local.delete_user(name, UserType::Reg).await.expect("remove owner");
@@ -1882,7 +1923,7 @@ mod tests {
                     .is_err()
             );
             assert!(peer.read_owned_plugin_delegation(name, &before_delete.id).await.is_err());
-            let replacement = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+            let replacement = register_plugin_delegation(&store, &identity.credentials)
                 .await
                 .expect("replacement owner can explicitly register a new delegation");
             assert!(
@@ -1932,7 +1973,7 @@ mod tests {
                     .await
                     .expect("read owner revision")
                     .expect("persisted owner");
-                let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+                let record = register_plugin_delegation(&store, &identity.credentials)
                     .await
                     .expect("initialize only plugin epoch");
                 let (initialized, _) = store
@@ -1958,7 +1999,7 @@ mod tests {
 
                 let cache = IamCache::new(store.clone()).await.expect("IAM cache");
                 for edit in ["upsert", "preserving-status", "save-identity", "ssh", "status"] {
-                    let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+                    let record = register_plugin_delegation(&store, &identity.credentials)
                         .await
                         .expect("register before identity edit");
                     let (before, revision) = store
@@ -1966,10 +2007,7 @@ mod tests {
                         .await
                         .expect("pre-edit revision")
                         .expect("owner");
-                    let epoch = store
-                        .load_plugin_delegation_owner_epoch(name, false)
-                        .await
-                        .expect("pre-edit epoch");
+                    let epoch = store.plugin_delegation_owner_revision(name).await.expect("pre-edit epoch").0;
                     match edit {
                         "upsert" => {
                             cache
@@ -2024,10 +2062,7 @@ mod tests {
                         .expect("owner");
                     assert_eq!(after.sts_generation, generation, "{edit} must not rotate STS for an unchanged secret");
                     assert_ne!(
-                        store
-                            .load_plugin_delegation_owner_epoch(name, false)
-                            .await
-                            .expect("post-edit epoch"),
+                        store.plugin_delegation_owner_revision(name).await.expect("post-edit epoch").0,
                         epoch,
                         "{edit}"
                     );
@@ -2063,6 +2098,73 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn plugin_delegation_registration_rechecks_snapshot_after_publication() {
+        use crate::{delegation, store::Store, store::UserType};
+
+        let (_temp, store) = plugin_delegation_store().await;
+        let identity = plugin_delegation_identity();
+        let name = &identity.credentials.access_key;
+        for edit in ["rotate", "recreate-same-secret", "rotate-restore", "same-epoch-revision"] {
+            store
+                .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                .await
+                .expect("current owner");
+            let owner = delegation::prepare_owner(&store, name, &identity.credentials.secret_key)
+                .await
+                .expect("request snapshot");
+            let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+            let registering = delegation::REGISTRATION_PUBLICATION_BARRIER
+                .scope(barrier.clone(), delegation::create(&store, owner, plugin_delegation_restrictions(), 100));
+            let editing = async {
+                barrier.0.notified().await;
+                if edit == "same-epoch-revision" {
+                    let path = super::get_user_identity_path(name, UserType::Reg);
+                    let mut record: serde_json::Value = store.load_iam_config_strict(&path).await.expect("atomic owner record");
+                    record["fixture_revision"] = serde_json::json!(1);
+                    store
+                        .save_iam_config(record, &path)
+                        .await
+                        .expect("same-epoch storage revision change");
+                } else {
+                    let mut next = identity.clone();
+                    if edit == "recreate-same-secret" {
+                        store
+                            .delete_user_identity(name, UserType::Reg)
+                            .await
+                            .expect("delete original owner");
+                    } else {
+                        next.credentials.secret_key = "new-publication-fixture-secret".into();
+                    }
+                    store
+                        .save_user_identity(name, UserType::Reg, next, None)
+                        .await
+                        .expect("edit during record publication");
+                    if edit == "rotate-restore" {
+                        store
+                            .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                            .await
+                            .expect("restore old secret, not its epoch");
+                    }
+                }
+                barrier.1.notify_one();
+            };
+            let (result, ()) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(registering, editing) })
+                    .await
+                    .expect("bounded publication interleaving");
+            assert!(
+                matches!(result, Err(delegation::DelegationError::Revoked)),
+                "{edit} cannot rebind an in-flight request"
+            );
+        }
+        assert!(
+            register_plugin_delegation(&store, &identity.credentials).await.is_ok(),
+            "a fresh request using the current reused secret may register"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn plugin_delegation_owner_binding_is_required_and_strict() {
         use crate::{delegation, store::Store, store::UserType};
         let (_temp, store) = plugin_delegation_store().await;
@@ -2073,17 +2175,22 @@ mod tests {
             .save_iam_config(&identity, &path)
             .await
             .expect("legacy owner without epoch");
-        assert!(store.load_plugin_delegation_owner_epoch(name, false).await.is_err());
-        let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+        assert!(store.plugin_delegation_owner_revision(name).await.is_err());
+        assert!(matches!(
+            delegation::prepare_owner(&store, name, "stale-legacy-fixture-secret").await,
+            Err(delegation::DelegationError::OwnerRejected)
+        ));
+        assert!(
+            store.plugin_delegation_owner_revision(name).await.is_err(),
+            "stale authentication cannot initialize legacy consent"
+        );
+        let record = register_plugin_delegation(&store, &identity.credentials)
             .await
             .expect("registration conditionally upgrades a legacy identity");
-        let epoch = store
-            .load_plugin_delegation_owner_epoch(name, false)
-            .await
-            .expect("persisted epoch");
+        let epoch = store.plugin_delegation_owner_revision(name).await.expect("persisted epoch");
         assert_eq!(
             store
-                .load_plugin_delegation_owner_epoch(name, true)
+                .authenticate_plugin_delegation_owner(name, &identity.credentials.secret_key)
                 .await
                 .expect("stable epoch"),
             epoch
@@ -2100,7 +2207,7 @@ mod tests {
             "tombstones retain history"
         );
 
-        let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+        let record = register_plugin_delegation(&store, &identity.credentials)
             .await
             .expect("new delegation");
         let binding_path = format!("config/iam/plugin-delegations/v1/{}/owner.json", record.id);
@@ -2122,7 +2229,7 @@ mod tests {
         ));
         assert!(delegation::read_owned(&store, name, &record.id).await.is_err());
 
-        let record = delegation::create(&store, name, plugin_delegation_restrictions(), 100)
+        let record = register_plugin_delegation(&store, &identity.credentials)
             .await
             .expect("bound delegation before corrupt owner fixture");
         let mut corrupt = serde_json::to_value(&identity).expect("identity JSON");
@@ -2132,11 +2239,7 @@ mod tests {
             delegation::read_active_for_broker(&store, &record.id, 101).await,
             Err(delegation::DelegationError::Unavailable)
         ));
-        assert!(
-            delegation::create(&store, name, plugin_delegation_restrictions(), 100)
-                .await
-                .is_err()
-        );
+        assert!(register_plugin_delegation(&store, &identity.credentials).await.is_err());
         assert!(
             store
                 .regular_user_revision(name)
@@ -2153,11 +2256,7 @@ mod tests {
             .save_user_identity(name, UserType::Reg, disabled, None)
             .await
             .expect("disabled owner");
-        assert!(
-            delegation::create(&store, name, plugin_delegation_restrictions(), 100)
-                .await
-                .is_err()
-        );
+        assert!(register_plugin_delegation(&store, &identity.credentials).await.is_err());
     }
 
     #[tokio::test]
@@ -2172,8 +2271,9 @@ mod tests {
             .await
             .expect("legacy owner");
         let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
-        let registering = super::OWNER_EPOCH_INIT_BARRIER
-            .scope(barrier.clone(), delegation::create(&store, &name, plugin_delegation_restrictions(), 100));
+        let authenticated = identity.credentials.clone();
+        let registering =
+            super::OWNER_EPOCH_INIT_BARRIER.scope(barrier.clone(), register_plugin_delegation(&store, &authenticated));
         let editing = async {
             barrier.0.notified().await;
             identity.credentials.secret_key = "concurrent-fixture-secret".into();
@@ -2198,6 +2298,56 @@ mod tests {
             identity.credentials.secret_key,
             "failed legacy CAS must not restore old credentials"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_legacy_epoch_readback_does_not_adopt_replacement_owner() {
+        use crate::{delegation, store::Store, store::UserType};
+
+        let (_temp, store) = plugin_delegation_store().await;
+        let identity = plugin_delegation_identity();
+        let name = &identity.credentials.access_key;
+        for edit in ["rotate", "recreate-same-secret", "rotate-restore"] {
+            store
+                .save_iam_config(&identity, super::get_user_identity_path(name, UserType::Reg))
+                .await
+                .expect("legacy owner without epoch");
+            let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+            let registering = super::OWNER_EPOCH_INIT_READBACK_BARRIER
+                .scope(barrier.clone(), register_plugin_delegation(&store, &identity.credentials));
+            let editing = async {
+                barrier.0.notified().await;
+                let mut next = identity.clone();
+                if edit == "recreate-same-secret" {
+                    store
+                        .delete_user_identity(name, UserType::Reg)
+                        .await
+                        .expect("delete initialized owner");
+                } else {
+                    next.credentials.secret_key = "replacement-initialization-fixture-secret".into();
+                }
+                store
+                    .save_user_identity(name, UserType::Reg, next, None)
+                    .await
+                    .expect("replace initialized epoch before readback");
+                if edit == "rotate-restore" {
+                    store
+                        .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                        .await
+                        .expect("restore secret with a different epoch");
+                }
+                barrier.1.notify_one();
+            };
+            let (registered, ()) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(registering, editing) })
+                    .await
+                    .expect("bounded legacy readback interleaving");
+            assert!(
+                matches!(registered, Err(delegation::DelegationError::OwnerRejected)),
+                "{edit} must not adopt the replacement epoch"
+            );
+        }
     }
 
     fn test_cred() -> Credentials {

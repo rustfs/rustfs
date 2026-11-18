@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Real handler, persisted IAM and four-disk storage; this is not a signed HTTP/S3 end-to-end test.
 use super::*;
+use crate::admin::handlers::plugin_delegation::Create as CreateDelegation;
 use crate::admin::{
     runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot},
     storage_api::{
@@ -150,16 +151,22 @@ impl Fixture {
             .await
             .expect("attach actual IAM policy");
     }
-    fn request(&self, body: &Value) -> AdminRequest {
+    fn request_as(&self, access_key: &str, secret: Option<&str>, body: rustfs_s3_types::Body) -> AdminRequest {
         let slot = ServerContextSlot::new();
         assert!(slot.install(self.context.clone()));
         let mut extensions = http::Extensions::new();
         extensions.insert(slot);
-        crate::admin::operation::test_support::TestRequest::new(Method::POST, "/")
+        let request = crate::admin::operation::test_support::TestRequest::new(Method::POST, "/")
             .extensions(extensions)
-            .credentials(BROKER, SECRET, None)
-            .body(serde_json::to_vec(body).expect("attempt JSON"))
-            .build()
+            .body(body);
+        match secret {
+            Some(secret) => request.credentials(access_key, secret, None),
+            None => request.credentials_without_secret(access_key, None),
+        }
+        .build()
+    }
+    fn request(&self, body: &Value) -> AdminRequest {
+        self.request_as(BROKER, Some(SECRET), serde_json::to_vec(body).expect("attempt JSON").into())
     }
     async fn issue(&self, record: &Delegation, body: &Value) -> S3Result<AdminResponse> {
         let mut router = matchit::Router::new();
@@ -196,6 +203,142 @@ impl Fixture {
     }
 }
 
+fn registration_body() -> Vec<u8> {
+    serde_json::to_vec(&json!({"deployment":"runner","bucket":"photos","input_prefix":"input/",
+        "output_prefix":"output/","expires_at_unix_seconds":now().expect("clock")+3600}))
+    .expect("registration JSON")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn delegation_registration_authenticates_actual_signing_secret_before_snapshot() {
+    temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+        let fixture = Fixture::new().await;
+        fixture
+            .policy(
+                PARENT,
+                json!({"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Action":"admin:CreatePluginDelegation"}]}),
+            )
+            .await;
+        let response = CreateDelegation
+            .call(fixture.request_as(PARENT, Some(SECRET), registration_body().into()), Params::new())
+            .await
+            .expect("current signing owner can register");
+        let (status, _, mut body) = response.into_parts();
+        assert_eq!(status, StatusCode::OK);
+        let record: Delegation =
+            serde_json::from_slice(&body.store_all_limited(16384).await.expect("response body")).expect("delegation");
+        assert!(
+            fixture
+                .iam
+                .read_active_plugin_delegation_for_broker(&record.id, now().expect("clock"))
+                .await
+                .is_ok()
+        );
+
+        for secret in [None, Some("unrelated-fixture-signing-secret")] {
+            assert!(
+                CreateDelegation
+                    .call(fixture.request_as(PARENT, secret, registration_body().into()), Params::new())
+                    .await
+                    .is_err(),
+                "name authorization must not substitute for the request's signing secret"
+            );
+        }
+
+        let mut replacement = fixture.iam.get_user(PARENT).await.expect("cached owner");
+        replacement.credentials.secret_key = "replacement-fixture-signing-secret".into();
+        ObjectStore::new(fixture.store.clone())
+            .save_user_identity(PARENT, UserType::Reg, replacement, None)
+            .await
+            .expect("persist reset on another node without refreshing this cache");
+        assert_eq!(
+            fixture
+                .iam
+                .get_user(PARENT)
+                .await
+                .expect("stale peer owner")
+                .credentials
+                .secret_key,
+            SECRET
+        );
+        let rejected = CreateDelegation
+            .call(fixture.request_as(PARENT, Some(SECRET), registration_body().into()), Params::new())
+            .await
+            .expect_err("stale signing secret must not adopt the reset owner's epoch");
+        assert_eq!(rejected.code(), &S3ErrorCode::NoSuchKey);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn delegation_registration_keeps_request_snapshot_across_body_processing() {
+    temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+        let fixture = Fixture::new().await;
+        fixture
+            .policy(
+                PARENT,
+                json!({"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Action":"admin:CreatePluginDelegation"}]}),
+            )
+            .await;
+        let original = fixture.iam.get_user(PARENT).await.expect("owner");
+        let store = ObjectStore::new(fixture.store.clone());
+        for edit in ["rotate", "recreate-same-secret", "rotate-restore"] {
+            store
+                .save_user_identity(PARENT, UserType::Reg, original.clone(), None)
+                .await
+                .expect("reset fixture owner");
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let stream = futures_util::stream::once({
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(registration_body()))
+                }
+            });
+            let registering = CreateDelegation.call(
+                fixture.request_as(PARENT, Some(SECRET), rustfs_s3_types::Body::from_stream(stream)),
+                Params::new(),
+            );
+            let editing = async {
+                started.notified().await;
+                let mut next = original.clone();
+                if edit == "recreate-same-secret" {
+                    store
+                        .delete_user_identity(PARENT, UserType::Reg)
+                        .await
+                        .expect("delete original owner");
+                } else {
+                    next.credentials.secret_key = "replacement-body-fixture-secret".into();
+                }
+                store
+                    .save_user_identity(PARENT, UserType::Reg, next, None)
+                    .await
+                    .expect("edit after request authentication");
+                if edit == "rotate-restore" {
+                    store
+                        .save_user_identity(PARENT, UserType::Reg, original.clone(), None)
+                        .await
+                        .expect("restore the same secret with a new epoch");
+                }
+                release.notify_one();
+            };
+            let (registered, ()) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(registering, editing) })
+                .await
+                .expect("bounded handler interleaving");
+            let error = registered.expect_err("registration cannot adopt authority changed after the request snapshot");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{edit}");
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
@@ -209,9 +352,14 @@ async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
             let now = now().expect("clock");
             let legacy = json!({"deployment":"runner","bucket":"photos","input_prefix":"input/",
             "output_prefix":"output/","expires_at_unix_seconds":now+3600});
+            let owner = fixture
+                .iam
+                .prepare_plugin_delegation_owner(PARENT, SECRET)
+                .await
+                .expect("current v1 owner");
             let v1 = fixture
                 .iam
-                .create_plugin_delegation(PARENT, serde_json::from_value(legacy.clone()).expect("v1"), now)
+                .create_plugin_delegation(owner, serde_json::from_value(legacy.clone()).expect("v1"), now)
                 .await
                 .expect("persist legacy delegation");
             assert_eq!(v1.version, 1);
@@ -219,9 +367,14 @@ async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
             let mut v2 = legacy;
             v2["version"] = json!(2);
             v2["output_bucket"] = json!("artifacts");
+            let owner = fixture
+                .iam
+                .prepare_plugin_delegation_owner(PARENT, SECRET)
+                .await
+                .expect("current v2 owner");
             let record = fixture
                 .iam
-                .create_plugin_delegation(PARENT, serde_json::from_value(v2.clone()).expect("v2"), now)
+                .create_plugin_delegation(owner, serde_json::from_value(v2.clone()).expect("v2"), now)
                 .await
                 .expect("persist v2 delegation");
             assert_eq!(record.version, 2);

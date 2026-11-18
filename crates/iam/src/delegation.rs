@@ -98,7 +98,55 @@ struct OwnerBinding {
     epoch: String,
 }
 
-async fn check_owner<T: Store>(store: &T, record: &Delegation) -> Result<(), DelegationError> {
+/// Request-bound registration authority, obtainable only by checking the actual signing secret.
+/// Not serializable: clients must not supply, persist or reuse it for another request.
+pub struct RegistrationOwner {
+    access_key: String,
+    epoch: String,
+    revision: String,
+}
+
+pub(crate) async fn prepare_owner<T: Store>(
+    store: &T,
+    access_key: &str,
+    signing_secret: &str,
+) -> Result<RegistrationOwner, DelegationError> {
+    let (epoch, revision) = store
+        .authenticate_plugin_delegation_owner(access_key, signing_secret)
+        .await
+        .map_err(|error| match error {
+            crate::error::Error::ConfigNotFound
+            | crate::error::Error::NoSuchUser(_)
+            | crate::error::Error::IAMActionNotAllowed => DelegationError::OwnerRejected,
+            _ => DelegationError::Unavailable,
+        })?;
+    Ok(RegistrationOwner {
+        access_key: access_key.to_owned(),
+        epoch,
+        revision,
+    })
+}
+
+fn check_registration_owner(owner: &RegistrationOwner, current: (String, String)) -> Result<(), DelegationError> {
+    if current.0 != owner.epoch || current.1 != owner.revision {
+        return Err(DelegationError::Revoked);
+    }
+    Ok(())
+}
+
+async fn current_owner<T: Store>(store: &T, name: &str) -> Result<(String, String), DelegationError> {
+    store
+        .plugin_delegation_owner_revision(name)
+        .await
+        .map_err(|error| match error {
+            crate::error::Error::ConfigNotFound
+            | crate::error::Error::NoSuchUser(_)
+            | crate::error::Error::IAMActionNotAllowed => DelegationError::Revoked,
+            _ => DelegationError::Unavailable,
+        })
+}
+
+async fn check_owner<T: Store>(store: &T, record: &Delegation) -> Result<(String, String), DelegationError> {
     let binding: OwnerBinding = store
         .load_iam_config_strict(format!("{PREFIX}/{}/owner.json", record.id))
         .await
@@ -117,19 +165,11 @@ async fn check_owner<T: Store>(store: &T, record: &Delegation) -> Result<(), Del
     {
         return Err(DelegationError::Unavailable);
     }
-    let epoch = store
-        .load_plugin_delegation_owner_epoch(&record.owner_access_key, false)
-        .await
-        .map_err(|error| match error {
-            crate::error::Error::ConfigNotFound
-            | crate::error::Error::NoSuchUser(_)
-            | crate::error::Error::IAMActionNotAllowed => DelegationError::Revoked,
-            _ => DelegationError::Unavailable,
-        })?;
-    if epoch != binding.epoch {
+    let current = current_owner(store, &record.owner_access_key).await?;
+    if current.0 != binding.epoch {
         return Err(DelegationError::Revoked);
     }
-    Ok(())
+    Ok(current)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,23 +220,12 @@ async fn load<T: Store>(store: &T, id: &str) -> Result<Delegation, DelegationErr
 
 pub(crate) async fn create<T: Store>(
     store: &T,
-    owner: &str,
+    owner: RegistrationOwner,
     restrictions: Restrictions,
     now: u64,
 ) -> Result<Delegation, DelegationError> {
     restrictions.validate(now)?;
-    if owner.is_empty() {
-        return Err(DelegationError::OwnerRejected);
-    }
-    let epoch = store
-        .load_plugin_delegation_owner_epoch(owner, true)
-        .await
-        .map_err(|error| match error {
-            crate::error::Error::ConfigNotFound
-            | crate::error::Error::NoSuchUser(_)
-            | crate::error::Error::IAMActionNotAllowed => DelegationError::OwnerRejected,
-            _ => DelegationError::Unavailable,
-        })?;
+    check_registration_owner(&owner, current_owner(store, &owner.access_key).await?)?;
     // IDs are generated exclusively here; no update operation accepts an ID.
     let id = format!("{:032x}", rand::random::<u128>());
     let path = record_path(&id)?;
@@ -208,15 +237,15 @@ pub(crate) async fn create<T: Store>(
         version: restrictions.version.unwrap_or(1),
         revision: id.clone(),
         id,
-        owner_access_key: owner.to_owned(),
+        owner_access_key: owner.access_key.clone(),
         created_at_unix_seconds: now,
         restrictions,
     };
     let binding = OwnerBinding {
         version: 1,
         id: record.id.clone(),
-        owner_access_key: owner.to_owned(),
-        epoch,
+        owner_access_key: owner.access_key.clone(),
+        epoch: owner.epoch.clone(),
     };
     let owner_path = format!("{PREFIX}/{}/owner.json", record.id);
     store
@@ -230,6 +259,11 @@ pub(crate) async fn create<T: Store>(
     if saved != binding {
         return Err(DelegationError::Unavailable);
     }
+    #[cfg(test)]
+    if let Ok(barrier) = REGISTRATION_PUBLICATION_BARRIER.try_with(std::sync::Arc::clone) {
+        barrier.0.notify_one();
+        barrier.1.notified().await;
+    }
     store
         .save_iam_config(&record, path)
         .await
@@ -237,8 +271,13 @@ pub(crate) async fn create<T: Store>(
     if load(store, &record.id).await? != record {
         return Err(DelegationError::Unavailable);
     }
-    check_owner(store, &record).await?;
+    check_registration_owner(&owner, check_owner(store, &record).await?)?;
     Ok(record)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static REGISTRATION_PUBLICATION_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
 }
 
 pub(crate) async fn revoke<T: Store>(store: &T, owner: &str, id: &str) -> Result<(), DelegationError> {

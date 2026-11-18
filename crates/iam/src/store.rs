@@ -77,11 +77,18 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
 
-    /// Read an enabled regular owner's delegation epoch from authoritative storage, never an IAM cache.
-    /// Registration may initialize a legacy identity with a conditional write; concurrent edits or
-    /// unavailable/corrupt state must fail closed. Every regular identity write replaces the epoch,
-    /// including same-secret writes and recreation. Backends without this contract reject delegation.
-    async fn load_plugin_delegation_owner_epoch(&self, _name: &str, _initialize: bool) -> Result<String> {
+    /// Read an enabled regular owner's (plugin epoch, identity revision) from authoritative storage.
+    /// Never initialize or rebind missing state here. Every regular identity write replaces the epoch,
+    /// independently of STS generation. Backends without this contract reject delegation.
+    async fn plugin_delegation_owner_revision(&self, _name: &str) -> Result<(String, String)> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
+
+    /// Authenticate the actual request signing secret against the authoritative regular owner,
+    /// then return its (plugin epoch, identity revision) from the same atomic record.
+    /// May initialize a missing legacy epoch using exact-revision CAS, preserving STS generation.
+    /// Never adopt a different epoch after that CAS or retry against a concurrent identity edit.
+    async fn authenticate_plugin_delegation_owner(&self, _name: &str, _signing_secret: &str) -> Result<(String, String)> {
         Err(crate::error::Error::IamSysNotInitialized)
     }
 
