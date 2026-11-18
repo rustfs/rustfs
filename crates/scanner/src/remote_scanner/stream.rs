@@ -334,6 +334,18 @@ struct RemoteScannerServerError {
 }
 
 impl RemoteScannerServerError {
+    fn check_scan_source(disk: &Disk) -> Result<(), Self> {
+        crate::scanner_io::check_local_scanner_handle(disk).map_err(Self::source_unavailable)
+    }
+
+    fn source_unavailable(error: StorageError) -> Self {
+        Self {
+            scope: RemoteScannerErrorScope::Bucket,
+            error: ScannerError::source_unavailable(error),
+            retry_bucket: true,
+        }
+    }
+
     fn worker(message: impl Into<String>) -> Self {
         Self {
             scope: RemoteScannerErrorScope::Worker,
@@ -932,6 +944,15 @@ async fn scan_and_persist_local_bucket_with_store(
             "remote namespace scanner disk does not belong to its storage instance",
         ));
     }
+    // A queued RPC can arrive after a verified blank replacement occupied the same path.
+    // Mirror coordinator admission before consulting any cache from the previous attachment.
+    let disk_info = disk
+        .disk_info(&crate::DiskInfoOptions::default())
+        .await
+        .map_err(|err| RemoteScannerServerError::retry_bucket(format!("scanner source identity unavailable: {err}")))?;
+    if disk_info.id.is_none_or(|id| id.is_nil()) || disk_info.healing {
+        return Err(RemoteScannerServerError::retry_bucket("scanner source is unformatted or rebuilding"));
+    }
     if let Some(proof) = usage_watch.as_deref()
         && !proof.verify_with_store(&store).await
     {
@@ -1036,6 +1057,7 @@ async fn scan_and_persist_local_bucket_with_store(
                     "remote namespace scanner usage watch changed before cache reuse",
                 ));
             }
+            RemoteScannerServerError::check_scan_source(&disk)?;
             return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
                 source,
                 scan_plan_digest,
@@ -1128,6 +1150,11 @@ async fn scan_and_persist_local_bucket_with_store(
             result = &mut scan => {
                 match result {
                     Ok(outcome) => break outcome,
+                    Err(err) if crate::scanner_io::is_scanner_source_unavailable(&err) => {
+                        // The coordinator's existing retry disposition also retires this worker. A
+                        // later health probe cannot validate a walk performed by an older handle.
+                        return Err(RemoteScannerServerError::source_unavailable(err));
+                    }
                     Err(err) => {
                         let disk_online =
                             tokio::time::timeout(NS_SCANNER_DISK_HEALTH_TIMEOUT, crate::scanner_disk_is_online(disk.as_ref()))
@@ -1154,6 +1181,11 @@ async fn scan_and_persist_local_bucket_with_store(
                     checkpoint_channel_closed = true;
                     continue;
                 };
+                if let Err(error) = RemoteScannerServerError::check_scan_source(&disk) {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(error);
+                }
                 if guard.is_lock_lost() {
                     scan_ctx.cancel();
                     let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -1259,6 +1291,7 @@ async fn scan_and_persist_local_bucket_with_store(
         .map_err(|err| {
             RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
         })?;
+    RemoteScannerServerError::check_scan_source(&disk)?;
     let done_save = Metrics::time(Metric::SaveUsage);
     // Each physical main/backup PUT must still prove the epoch captured before
     // the scan. A movement transition that starts and ends during the scan
@@ -1304,6 +1337,7 @@ async fn scan_and_persist_local_bucket_with_store(
         ));
     }
 
+    RemoteScannerServerError::check_scan_source(&disk)?;
     if let Some(partial_result) = partial_result {
         if matches!(partial_result, RemoteScannerFrameResult::Partial) {
             log_saved_partial_bucket_cache(&cache, &cache_name);

@@ -2020,10 +2020,9 @@ async fn retry_bucket_error_terminal_frame_requeues_bucket_work() {
             &mut sequence,
             &RemoteScannerFrame::terminal(
                 RemoteScannerProgress::default(),
-                RemoteScannerFrameResult::Error(RemoteScannerErrorFrame {
-                    scope: RemoteScannerErrorScope::Bucket,
-                    message: format!("{NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX} cache lock contention"),
-                }),
+                RemoteScannerFrameResult::Error(
+                    RemoteScannerServerError::source_unavailable(StorageError::FaultyDisk).into_frame(),
+                ),
             ),
         )
         .await
@@ -2038,7 +2037,7 @@ async fn retry_bucket_error_terminal_frame_requeues_bucket_work() {
 
     assert!(error.retry_bucket_work());
     assert!(!error.retire_worker());
-    assert!(error.to_string().contains("cache lock contention"));
+    assert!(error.to_string().contains("Faulty disk"));
 }
 
 #[tokio::test]

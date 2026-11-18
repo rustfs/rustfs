@@ -783,7 +783,7 @@ fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
         heal_bitrot: false,
         debug: false,
     };
-    let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_CORRUPT_ERROR));
+    let err = StorageError::FileCorrupt;
 
     let action = classify_get_size_failure(&item, &err);
 
@@ -815,7 +815,8 @@ fn test_classify_get_size_failure_records_transient_metadata_error_without_heal(
         heal_bitrot: false,
         debug: false,
     };
-    let err = StorageError::other(format!("{}: temporary read failure", crate::scanner_io::SCANNER_METADATA_TRANSIENT_ERROR));
+    // An ambiguous I/O message is not storage evidence, even with the old diagnostic prefix.
+    let err = StorageError::other("scanner metadata corrupt: drive is faulty");
 
     let action = classify_get_size_failure(&item, &err);
 
@@ -2284,6 +2285,47 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
 
     let size = item.heal_actions(&object_info, 123, &mut size_summary, None).await;
     assert_eq!(size, 123);
+}
+
+#[tokio::test]
+async fn stale_disk_abandons_nested_walk_without_failed_objects_or_heals() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir.clone()),
+    };
+    for object in ["prefix/a", "prefix/b", "other/c"] {
+        write_test_object_metadata(&temp_dir, "bucket", object).await;
+    }
+    // The wrapper expects a formatted disk, but the mounted directory has no format.
+    // Native directory listings still succeed; only the metadata read sees the fault.
+    crate::storage_api::owner::EcstoreDiskAPI::set_disk_id(scanner.local_disk.as_ref(), Some(Uuid::new_v4()))
+        .await
+        .expect("bind the wrapper to its former disk identity");
+    scanner.old_cache.info.name = "bucket".into();
+    scanner.new_cache.info.name = "bucket".into();
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
+    let visits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    scanner.object_metadata_visits = metrics::Counter::from_arc(visits.clone());
+    let mut root = DataUsageEntry::default();
+    let result = scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".into(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut root,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ScannerError::SourceUnavailable(ref err)) if matches!(err.as_ref(), StorageError::UnformattedDisk)),
+        "{result:?}"
+    );
+    assert_eq!(visits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(root.failed_objects, 0);
+    assert!(scanner.new_cache.info.failed_objects.is_empty());
+    assert!(scanner.new_cache.info.pending_heals.is_empty());
 }
 
 #[tokio::test]
