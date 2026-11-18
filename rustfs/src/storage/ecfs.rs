@@ -21,11 +21,10 @@ use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders, dto::*, s3_error};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders, dto::*};
 use std::fmt::Debug;
 use std::future::Future;
 use tracing::{error, instrument};
-use uuid::Uuid;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
@@ -67,12 +66,6 @@ pub struct FS {
     server_ctx: std::sync::Arc<runtime_sources::ServerContextSlot>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
-pub(crate) struct ListObjectUnorderedQuery {
-    #[serde(rename = "allow-unordered")]
-    pub(crate) allow_unordered: Option<String>,
-}
-
 impl Default for FS {
     fn default() -> Self {
         Self::new()
@@ -110,22 +103,6 @@ impl FS {
         crate::storage::authorization::existing_object_tag_conditions(store.as_ref(), bucket, object, version_id)
             .await
             .map_err(Into::into)
-    }
-}
-
-pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
-    if let Some(vid) = version_id {
-        if vid == "null" {
-            // A nil UUID selects the stored null version; None selects latest.
-            return Ok(Some(Uuid::nil()));
-        }
-        let uuid = Uuid::parse_str(&vid).map_err(|e| {
-            error!("Invalid version ID: {}", e);
-            s3_error!(InvalidArgument, "Invalid version ID")
-        })?;
-        Ok(Some(uuid))
-    } else {
-        Ok(None)
     }
 }
 

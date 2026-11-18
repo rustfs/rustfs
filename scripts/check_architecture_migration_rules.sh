@@ -2197,7 +2197,7 @@ fi
   rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b|(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b)' \
     rustfs/src/storage/access.rs \
     "${ECFS_GUARD_SOURCES[@]}" \
-    rustfs/src/storage/ecfs_extend.rs \
+    rustfs/src/storage/s3_support.rs \
     rustfs/src/storage/helper.rs \
     rustfs/src/storage/concurrency/manager.rs \
     rustfs/src/storage/sse.rs \
@@ -4623,7 +4623,7 @@ fi
   rg -n --with-filename 'crate::storage::core_storage_compat' \
     rustfs/src/storage/mod.rs \
     "${ECFS_GUARD_SOURCES[@]}" \
-    rustfs/src/storage/ecfs_extend.rs \
+    rustfs/src/storage/s3_support.rs \
     rustfs/src/storage/access.rs \
     rustfs/src/storage/head_prefix.rs \
     rustfs/src/storage/options.rs \
