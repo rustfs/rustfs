@@ -1597,6 +1597,10 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
     Ok(lines.join("\n").into_bytes())
 }
 
+fn render_config_export(config: &ServerConfig) -> Vec<u8> {
+    render_full_config(config, true)
+}
+
 fn render_full_config(config: &ServerConfig, redact_secrets: bool) -> Vec<u8> {
     let mut subsystems = config.0.iter().collect::<Vec<_>>();
     subsystems.sort_by_key(|(lhs, _)| *lhs);
@@ -2268,7 +2272,7 @@ impl Operation for GetConfigHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
         let config = load_active_server_config().await?;
-        let payload = render_full_config(&config, false);
+        let payload = render_config_export(&config);
         let (body, content_type) = encode_config_payload(req.uri().path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
     }
@@ -2455,6 +2459,10 @@ mod tests {
         .expect("utf8");
         assert!(rendered.contains(r#"client_id="console""#));
         assert!(rendered.contains(r#"client_secret="*redacted*""#));
+
+        let export = String::from_utf8(render_config_export(&config)).expect("utf8 config export");
+        assert!(!export.contains("secret-value"));
+        assert!(export.contains(r#"client_secret="*redacted*""#));
 
         let delete_directives = parse_config_directives("identity_openid client_secret", true).expect("parse delete directives");
         apply_delete_directives(&mut config, &delete_directives);

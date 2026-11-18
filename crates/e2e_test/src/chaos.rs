@@ -37,9 +37,9 @@
 
 use crate::common::{RustFSTestEnvironment, local_http_client};
 use http::header::{CONTENT_TYPE, HOST};
+use rustfs_s3_types::Body;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
-use s3s::Body;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;

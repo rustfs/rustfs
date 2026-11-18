@@ -4204,6 +4204,11 @@ mod tests {
             policy: None,
             status: rustfs_madmin::AccountStatus::Enabled,
         };
+        let virtual_parent = base64_simd::URL_SAFE_NO_PAD.encode_to_string([42; 32]);
+        assert!(matches!(
+            iam.create_user(&virtual_parent, &args).await,
+            Err(IamError::AccessKeyAlreadyExists)
+        ));
         for service in [false, true] {
             for expired in [false, true] {
                 let key = format!("collision-{service}-{expired}");

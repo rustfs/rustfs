@@ -23,8 +23,8 @@
 //! routing a request (the gateway), or any S3 behaviour (the use cases in `crate::app`).
 //! Upstream: the gateway's dispatch. Downstream: `crate::app` use cases.
 //!
-//! An operation is one `impl Served` and one row of `ROWS` in the family file named after its
-//! migration batch, the stem `storage/legacy_edge/` uses for the same operations.
+//! Every operation has one `ROWS` entry. Standard operations implement `Served`; browser POST
+//! uses the gateway’s two-stage PostObject registration.
 
 mod access;
 mod envelope;
@@ -41,6 +41,9 @@ mod object_meta;
 mod object_misc;
 mod object_read;
 mod object_write;
+#[cfg(test)]
+mod post_archive_diagnostic_tests;
+mod post_object;
 
 #[cfg(test)]
 pub(crate) mod test_support;

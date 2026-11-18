@@ -90,6 +90,7 @@ pub enum S3Operation {
     PutBucketRequestPayment,
     PutBucketWebsite,
     DeleteBucketWebsite,
+    PostObject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +134,7 @@ impl EventMapping {
 }
 
 impl S3Operation {
-    pub const ALL: [Self; 73] = [
+    pub const ALL: [Self; 74] = [
         Self::AbortMultipartUpload,
         Self::CompleteMultipartUpload,
         Self::CopyObject,
@@ -207,6 +208,7 @@ impl S3Operation {
         Self::PutBucketRequestPayment,
         Self::PutBucketWebsite,
         Self::DeleteBucketWebsite,
+        Self::PostObject,
     ];
 
     #[inline]
@@ -278,6 +280,7 @@ impl S3Operation {
             Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::PutBucketVersioning => "s3:PutBucketVersioning",
             Self::PutBucketWebsite => "s3:PutBucketWebsite",
+            Self::PostObject => "s3:PostObject",
             Self::PutObject => "s3:PutObject",
             Self::PutObjectAcl => "s3:PutObjectAcl",
             Self::PutObjectLegalHold => "s3:PutObjectLegalHold",
@@ -309,6 +312,7 @@ impl S3Operation {
             Self::GetObjectLegalHold => EventMapping::Single(EventName::ObjectAccessedGetLegalHold),
             Self::GetObjectRetention => EventMapping::Single(EventName::ObjectAccessedGetRetention),
             Self::HeadObject => EventMapping::Single(EventName::ObjectAccessedHead),
+            Self::PostObject => EventMapping::Single(EventName::ObjectCreatedPost),
             Self::PutObject => EventMapping::PutObject,
             Self::PutObjectAcl => EventMapping::Single(EventName::ObjectAclPut),
             Self::PutObjectLegalHold => EventMapping::Single(EventName::ObjectCreatedPutLegalHold),

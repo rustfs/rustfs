@@ -969,9 +969,13 @@ async fn flush_extract_batch(
     let members = batch.split_off(0);
     batch_state.clear();
     let commit_context = context.clone();
-    run_extract_outcomes_owner(context.clone(), ignore_errors, async move {
-        run_extract_commits(members, |member| commit_extract_member(commit_context.clone(), member)).await
-    })
+    run_extract_outcomes_owner(
+        context.clone(),
+        ignore_errors,
+        Box::pin(
+            async move { run_extract_commits(members, |member| commit_extract_member(commit_context.clone(), member)).await },
+        ),
+    )
     .await
 }
 
@@ -998,7 +1002,7 @@ async fn acquire_extract_member_lifecycle_permit(
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PutObjectExtractOptions {
+pub(super) struct PutObjectExtractOptions {
     prefix: Option<String>,
     ignore_dirs: bool,
     ignore_errors: bool,
@@ -1148,7 +1152,7 @@ fn extract_notification_version_id(version_id: Option<Uuid>, versioned: bool, ve
     }
 }
 
-pub(super) fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
+pub(crate) fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
     header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
 }
 
@@ -1889,7 +1893,7 @@ where
     apply_extract_entry_pax_extensions(entry, bucket, object_name, object_lock_config_state, metadata, opts).await
 }
 
-fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
+pub(super) fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .map(|value| normalize_snowball_prefix(&value))
         .transpose()?
@@ -2010,6 +2014,41 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        // The legacy edge has no verified replay binding for individual members.
+        if envelope.post_object().is_some() && !envelope.is_gateway_post() {
+            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
+        }
+        #[cfg(feature = "gateway-stack")]
+        let input = if envelope.is_gateway_post() {
+            let mut input = input;
+            let archive = input
+                .post_archive
+                .take()
+                .ok_or_else(|| rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"))?;
+            if input.body.is_some()
+                || input.content_length.is_some()
+                || input.frame_trailers.is_some()
+                || input.trailing_headers.is_some()
+            {
+                return Err(rustfs_s3_types::s3_error!(InvalidRequest, "POST archive replay is ambiguous"));
+            }
+            let (body, length) = archive.into_replay(&envelope, &input.bucket, &input.key)?;
+            input.body = Some(body);
+            input.content_length = Some(length);
+            input
+        } else {
+            if input.post_archive.is_some() {
+                return Err(rustfs_s3_types::s3_error!(
+                    InvalidRequest,
+                    "POST archive replay requires its original request"
+                ));
+            }
+            input
+        };
+        #[cfg(not(feature = "gateway-stack"))]
+        if envelope.is_gateway_post() {
+            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
+        }
         Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 
@@ -2352,6 +2391,9 @@ impl DefaultObjectUsecase {
             extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);
 
             let mut auth_req = envelope.fork_for_authorization();
+            // The outer archive's cached tags may predate an overwrite of this
+            // same key; each member needs a fresh authorization snapshot.
+            let _ = auth_req.take_object_tag_conditions();
             {
                 let req_info = extract_try!(req_info_mut(&mut auth_req));
                 req_info.bucket = Some(bucket.clone());
@@ -2450,10 +2492,17 @@ impl DefaultObjectUsecase {
                 extract_try!(ensure_legacy_archive_size_within_quota(quota_check, next_legacy_quota_growth,));
                 legacy_quota_growth = next_legacy_quota_growth;
             }
+            // POST authorization reads the form projection, so PAX overrides
+            // must describe the same stored member in both authorization views.
             for (name, value) in &pax_authorization.headers {
                 extract_try!(auth_req.headers_mut().try_insert(name.clone(), value.clone()).map_err(|_| {
                     object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
                 }));
+                if let Some(headers) = auth_req.post_object_policy_headers_mut() {
+                    extract_try!(headers.try_insert(name.clone(), value.clone()).map_err(|_| {
+                        object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
+                    }));
+                }
             }
             let explicit_version_id = pax_authorization.version_id.as_deref().or(outer_version_id.as_deref());
             let authorization_version_id = extract_try!(
@@ -2632,54 +2681,63 @@ impl DefaultObjectUsecase {
                 if is_dir {
                     drop(f);
                     extract_try!(
-                        run_extract_outcomes_owner(owner_context, extract_options.ignore_errors, async move {
-                            vec![
-                                commit_extract_member(
-                                    member_context,
-                                    ExtractPreparedMember {
-                                        archive_seq: extracted_entry_count,
-                                        key: fpath,
-                                        size,
-                                        actual_size,
-                                        body: std::io::Cursor::new(Vec::new()),
-                                        write_plan,
-                                        opts,
-                                        table_data_plane_publication_guards,
-                                        replication,
-                                        producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject,
-                                        staging_permit,
-                                        member_permit,
-                                    },
-                                )
-                                .await,
-                            ]
-                        })
+                        run_extract_outcomes_owner(
+                            owner_context,
+                            extract_options.ignore_errors,
+                            Box::pin(async move {
+                                vec![
+                                    commit_extract_member(
+                                        member_context,
+                                        ExtractPreparedMember {
+                                            archive_seq: extracted_entry_count,
+                                            key: fpath,
+                                            size,
+                                            actual_size,
+                                            body: std::io::Cursor::new(Vec::new()),
+                                            write_plan,
+                                            opts,
+                                            table_data_plane_publication_guards,
+                                            replication,
+                                            producer_identity:
+                                                rustfs_scanner::SegmentInvalidationProducerIdentity::DirectoryObject,
+                                            staging_permit,
+                                            member_permit,
+                                        },
+                                    )
+                                    .await,
+                                ]
+                            })
+                        )
                         .await
                     );
                 } else {
                     extract_try!(
-                        run_extract_outcomes_owner(owner_context, extract_options.ignore_errors, async move {
-                            vec![
-                                commit_extract_member(
-                                    member_context,
-                                    ExtractPreparedMember {
-                                        archive_seq: extracted_entry_count,
-                                        key: fpath,
-                                        size,
-                                        actual_size,
-                                        body: f,
-                                        write_plan,
-                                        opts,
-                                        table_data_plane_publication_guards,
-                                        replication,
-                                        producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
-                                        staging_permit,
-                                        member_permit,
-                                    },
-                                )
-                                .await,
-                            ]
-                        })
+                        run_extract_outcomes_owner(
+                            owner_context,
+                            extract_options.ignore_errors,
+                            Box::pin(async move {
+                                vec![
+                                    commit_extract_member(
+                                        member_context,
+                                        ExtractPreparedMember {
+                                            archive_seq: extracted_entry_count,
+                                            key: fpath,
+                                            size,
+                                            actual_size,
+                                            body: f,
+                                            write_plan,
+                                            opts,
+                                            table_data_plane_publication_guards,
+                                            replication,
+                                            producer_identity: rustfs_scanner::SegmentInvalidationProducerIdentity::PutObject,
+                                            staging_permit,
+                                            member_permit,
+                                        },
+                                    )
+                                    .await,
+                                ]
+                            })
+                        )
                         .await
                     );
                 }
@@ -2768,6 +2826,10 @@ impl DefaultObjectUsecase {
         result
     }
 }
+
+#[cfg(feature = "gateway-stack")]
+#[path = "extract/post_archive_preflight.rs"]
+pub(super) mod post_archive_preflight;
 
 #[cfg(test)]
 mod tests {
@@ -3764,6 +3826,273 @@ mod tests {
                     actual >= before && actual <= OffsetDateTime::now_utc(),
                     "ordinary upload used archive time: {actual}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_owned_member_put_iam_gates_creation_and_overwrite() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::contract::object::ObjectIO as _;
+        use crate::app::storage_api::test::{StorageObjectOptions, StoragePutObjReader};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-member-iam-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        store
+            .put_object(
+                &bucket,
+                "denied-existing",
+                &mut StoragePutObjReader::from_vec(b"original".to_vec()),
+                &StorageObjectOptions::default(),
+            )
+            .await
+            .expect("create original object");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":"s3:PutObject", "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":"s3:PutObject", "Resource":format!("arn:aws:s3:::{bucket}/denied*")}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install member policy");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let options = ObjectOptions::default();
+        let original = store
+            .get_object_info(&bucket, "denied-existing", &options)
+            .await
+            .expect("original object");
+        for (member, allowed) in [("denied-existing", false), ("denied-new", false), ("allowed-new", true)] {
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, member, &b"x"[..])
+                .await
+                .expect("archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: "archive.tar".to_owned(),
+                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                ..Default::default()
+            };
+            let mut request = build_request(input, Method::PUT);
+            request.extensions.insert(ReqInfo::default());
+            let envelope = RequestEnvelope::from_s3s(&request);
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+            if allowed {
+                result.expect("caller is allowed to write member");
+                let info = store
+                    .get_object_info(&bucket, member, &options)
+                    .await
+                    .expect("allowed member exists");
+                assert_eq!(info.size, 1);
+            } else {
+                assert_eq!(result.err().expect("IAM must deny the member").code().as_str(), "AccessDenied");
+                if member == "denied-existing" {
+                    let after = store
+                        .get_object_info(&bucket, member, &options)
+                        .await
+                        .expect("original remains");
+                    assert_eq!(after.size, original.size);
+                    assert_eq!(after.etag, original.etag);
+                } else {
+                    let missing = store
+                        .get_object_info(&bucket, member, &options)
+                        .await
+                        .expect_err("denied member absent");
+                    assert!(is_err_object_not_found(&missing), "{missing}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_member_iam_reloads_outer_cached_tags_after_change() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::{StorageObjectOptions, StoragePutObjReader};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-stale-member-tags-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":"s3:PutObject",
+                 "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":"s3:PutObject",
+                 "Resource":format!("arn:aws:s3:::{bucket}/*"),
+                 "Condition":{"StringEquals":{"s3:ExistingObjectTag/classification":"private"}}}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install bucket policy");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (key, current_tag, allowed) in [("changed.tar", "private", false), ("unchanged.tar", "public", true)] {
+            let opts = |tag: &str| StorageObjectOptions {
+                user_defined: HashMap::from([(AMZ_OBJECT_TAGGING.to_owned(), format!("classification={tag}"))]),
+                ..Default::default()
+            };
+            store
+                .put_object(&bucket, key, &mut StoragePutObjReader::from_vec(b"before".to_vec()), &opts("public"))
+                .await
+                .expect("create public original");
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_ustar();
+            header.set_size(1);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, key, &b"x"[..])
+                .await
+                .expect("archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: key.to_owned(),
+                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                ..Default::default()
+            };
+            let mut request = build_request(input, Method::PUT);
+            let req_info = ReqInfo {
+                bucket: Some(bucket.clone()),
+                object: Some(key.to_owned()),
+                ..Default::default()
+            };
+            request.extensions.insert(req_info);
+            let mut envelope = RequestEnvelope::from_s3s(&request);
+            authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectAction))
+                .await
+                .expect("outer authorization caches public tags");
+            assert!(envelope.object_tag_conditions().is_some(), "outer tag lookup must be exercised");
+            if !allowed {
+                store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut StoragePutObjReader::from_vec(b"private original".to_vec()),
+                        &opts(current_tag),
+                    )
+                    .await
+                    .expect("change the object after outer authorization");
+            }
+            let before = store
+                .get_object_info(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("object before");
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+            let after = store
+                .get_object_info(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("object after");
+            if allowed {
+                result.expect("unchanged public member is allowed");
+                assert_eq!(after.size, 1);
+            } else {
+                assert_eq!(result.err().expect("private member must be denied").code().as_str(), "AccessDenied");
+                assert_eq!(after.etag, before.etag, "denied member must not overwrite");
+                assert_eq!(after.user_tags.as_str(), "classification=private");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_pax_tags_override_post_policy_projection_for_member_iam() {
+        use crate::app::storage_api::context::{PostObjectPolicyHeaders, PostObjectRequestMarker};
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-pax-post-policy-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":["s3:PutObject", "s3:PutObjectTagging"],
+                 "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":"s3:PutObject",
+                 "Resource":format!("arn:aws:s3:::{bucket}/*"),
+                 "Condition":{"StringEquals":{"s3:RequestObjectTag/classification":"public"}}}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install bucket policy");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (projected, tag, allowed) in [(true, "public", false), (false, "public", false), (true, "private", true)] {
+            let member = format!("member-{projected}-{tag}");
+            let record = pax_record("minio.metadata.x-amz-tagging", format!("classification={tag}").as_bytes());
+            let mut builder = Builder::new(Vec::new());
+            let mut extension = Header::new_ustar();
+            extension.set_size(u64::try_from(record.len()).expect("PAX size"));
+            extension.set_entry_type(EntryType::XHeader);
+            builder
+                .append_data(&mut extension, "pax", &record[..])
+                .await
+                .expect("PAX record");
+            let mut header = Header::new_ustar();
+            header.set_size(1);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, &member, &b"x"[..])
+                .await
+                .expect("archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: "archive.tar".to_owned(),
+                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                ..Default::default()
+            };
+            let mut request = build_request(input, Method::POST);
+            request.extensions.insert(ReqInfo::default());
+            request.extensions.insert(PostObjectRequestMarker);
+            if projected {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-amz-tagging", HeaderValue::from_static("classification=private"));
+                request.extensions.insert(PostObjectPolicyHeaders(headers));
+            }
+            let envelope = RequestEnvelope::from_s3s(&request);
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            // Exercise member IAM independently of the outer POST admission check.
+            let result = Box::pin(usecase.execute_put_object_extract_inner(envelope, input)).await;
+            let stored = store.get_object_info(&bucket, &member, &ObjectOptions::default()).await;
+            if allowed {
+                result.expect("private member is authorized");
+                assert_eq!(stored.expect("private member stored").user_tags.as_str(), "classification=private");
+            } else {
+                assert_eq!(result.err().expect("public member must be denied").code().as_str(), "AccessDenied");
+                assert!(is_err_object_not_found(&stored.expect_err("denied member must not be stored")));
             }
         }
     }

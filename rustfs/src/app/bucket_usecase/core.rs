@@ -17,7 +17,7 @@
 use super::*;
 use crate::app::storage_api::bucket_usecase::access::requested_bucket_force_delete;
 use crate::app::storage_api::s3::S3Error;
-use crate::app::storage_api::s3::region::Region;
+use rustfs_s3_types::Region;
 
 /// Whether `CreateBucket` may record `location`: the server's own region, or
 /// one of the further regions listed after it in `RUSTFS_REGION`. `location`

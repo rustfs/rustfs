@@ -21,8 +21,8 @@ use crate::common::{
 };
 use http::header::{AUTHORIZATION, HOST};
 use reqwest::StatusCode;
+use rustfs_s3_types::Body;
 use rustfs_signer::{constants::UNSIGNED_PAYLOAD, sign_v4};
-use s3s::Body;
 use serde_json::Value;
 use std::{error::Error, time::Duration};
 

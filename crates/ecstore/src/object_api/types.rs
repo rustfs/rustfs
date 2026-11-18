@@ -1232,6 +1232,9 @@ pub struct ObjectOptions {
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: Option<usize>,
 
+    /// Exact logical versions authorized under the recursive delete bucket write lock.
+    /// An empty request plan must not dispatch any disk mutation. Never serialized.
+    pub recursive_delete_targets: Option<Arc<[(String, Uuid)]>>,
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
