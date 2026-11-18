@@ -122,10 +122,12 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
         decide_with(|_| Decision::Allow),
+        std::convert::identity,
     )
     .unwrap();
     let stack = GatewayStack {
         keystone_auth: None,
+        control_plane: false,
         service: builder
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())

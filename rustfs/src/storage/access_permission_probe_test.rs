@@ -3,9 +3,7 @@
 
 //! Table permission probes use the real catalog resource and IAM, without publishing objects.
 
-use super::{
-    Action, AuthorizationRequest, ECStore, ReqInfo, RequestedObjectLockRetention, S3Action, S3ErrorCode, authorize_request_core,
-};
+use super::{Action, AuthorizationRequest, ECStore, ReqInfo, RequestedObjectLockRetention, S3Action, authorize_request_core};
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage::storage_api::contract::object::ObjectOperations as _;
@@ -23,6 +21,7 @@ use rustfs_iam::{
 };
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
 use rustfs_policy::policy::Policy;
+use rustfs_s3_types::S3ErrorCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 

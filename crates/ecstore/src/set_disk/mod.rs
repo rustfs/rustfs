@@ -81,7 +81,7 @@ use crate::erasure::codec::bridge::{
 use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, create_bitrot_writer, create_bitrot_writer_with_orig_volume};
+use crate::io_support::bitrot::{create_bitrot_writer, create_bitrot_writer_with_orig_volume};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
 use crate::object_api::object_api_utils::get_raw_etag;
@@ -6222,6 +6222,7 @@ fn known_put_object_storage_size(data_size: i64) -> i64 {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers<'a>(
     files: impl Iterator<Item = &'a FileInfo> + Send,
@@ -6233,10 +6234,36 @@ async fn build_inline_bitrot_readers<'a>(
     checksum_algo: &HashAlgorithm,
     skip_verify_bitrot: bool,
 ) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    build_inline_bitrot_readers_with_frame_size(
+        files,
+        total_shards,
+        bucket,
+        object,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers_with_frame_size<'a>(
+    files: impl Iterator<Item = &'a FileInfo> + Send,
+    total_shards: usize,
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
     let mut readers = Vec::with_capacity(total_shards);
     for file in files.take(total_shards) {
         let reader = if let Some(data) = &file.data {
-            create_bitrot_reader_from_bytes(
+            crate::io_support::bitrot::create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
                 Some(data.clone()),
                 None,
                 bucket,
@@ -6244,9 +6271,72 @@ async fn build_inline_bitrot_readers<'a>(
                 0,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 false,
+                None,
+            )
+            .await?
+        } else {
+            None
+        };
+        readers.push(reader);
+    }
+    Ok(readers)
+}
+
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers_from_refs(
+    files: &[&FileInfo],
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    build_inline_bitrot_readers_from_refs_with_frame_size(
+        files,
+        bucket,
+        object,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers_from_refs_with_frame_size(
+    files: &[&FileInfo],
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    let mut readers = Vec::with_capacity(files.len());
+    for file in files {
+        let reader = if let Some(data) = &file.data {
+            crate::io_support::bitrot::create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+                Some(data.clone()),
+                None,
+                bucket,
+                object,
+                0,
+                read_length,
+                shard_size,
+                frame_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                false,
+                None,
             )
             .await?
         } else {
@@ -6289,14 +6379,31 @@ fn try_decode_inline_data_shards(
     if shard_size == 0 {
         return None;
     }
+    let frame_size = crate::object_api::persisted_ec_read_quantum(&fi.metadata, fi.erasure.block_size, data_shards, shard_size)
+        .ok()?
+        .unwrap_or(shard_size);
+    if frame_size == 0 {
+        return None;
+    }
     let checksum_algo = part_checksum_algorithm(fi, part.number);
     let hash_size = checksum_algo.size();
-    let stride = shard_size.checked_add(hash_size)?;
     let part_size = inline_erasure_shard_file_size(part.size, fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
-    let encoded_size = part_size
-        .div_ceil(shard_size)
-        .checked_mul(hash_size)?
-        .checked_add(part_size)?;
+    let encoded_size = if frame_size == shard_size {
+        part_size
+            .div_ceil(shard_size)
+            .checked_mul(hash_size)?
+            .checked_add(part_size)?
+    } else {
+        let mut remaining = part_size;
+        let mut total = 0usize;
+        while remaining > 0 {
+            let payload = remaining.min(frame_size);
+            total = total.checked_add(hash_size)?.checked_add(payload)?;
+            remaining -= payload;
+        }
+        total
+    };
+    let stride = frame_size.checked_add(hash_size)?;
     // Metadata early-stop can cache this body, so require exact framing even
     // when the caller explicitly skips bitrot digest verification.
     for file in data_files.iter().take(data_shards) {
@@ -6312,26 +6419,54 @@ fn try_decode_inline_data_shards(
         disk_call_counters::record(_object, disk_call_counters::KIND_BODY_DECODE, 0);
     }
     let mut body = Vec::with_capacity(object_size);
-    for (frame, offset) in (0..object_size).step_by(fi.erasure.block_size).enumerate() {
-        let block_length = fi.erasure.block_size.min(object_size - offset);
-        let read_length =
-            inline_erasure_shard_file_size(block_length, fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
-        if read_length == 0 || read_length > shard_size {
+    if frame_size == shard_size {
+        for (frame, offset) in (0..object_size).step_by(fi.erasure.block_size).enumerate() {
+            let block_length = fi.erasure.block_size.min(object_size - offset);
+            let read_length =
+                inline_erasure_shard_file_size(block_length, fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
+            if read_length == 0 || read_length > shard_size {
+                return None;
+            }
+            let start = frame.checked_mul(stride)?;
+            let end = start.checked_add(hash_size)?.checked_add(read_length)?;
+            let mut remaining = block_length;
+            for file in data_files.iter().take(block_length.div_ceil(read_length)) {
+                let block = file.data.as_deref()?.get(start..end)?;
+                let data = coding::verified_bitrot_frame(&checksum_algo, skip_verify_bitrot, block).ok()?;
+                let take = remaining.min(data.len());
+                body.extend_from_slice(&data[..take]);
+                remaining -= take;
+            }
+            if remaining != 0 {
+                return None;
+            }
+        }
+    } else {
+        let read_length = part_size;
+        let shards_needed = object_size.div_ceil(read_length.max(1)).max(1);
+        if shards_needed > data_shards {
             return None;
         }
-        let start = frame.checked_mul(stride)?;
-        let end = start.checked_add(hash_size)?.checked_add(read_length)?;
-        let mut remaining = block_length;
-        for file in data_files.iter().take(block_length.div_ceil(read_length)) {
-            let block = file.data.as_deref()?.get(start..end)?;
-            let data = coding::verified_bitrot_frame(&checksum_algo, skip_verify_bitrot, block).ok()?;
-            let take = remaining.min(data.len());
-            body.extend_from_slice(&data[..take]);
-            remaining -= take;
+        for file in data_files.iter().take(shards_needed) {
+            let raw = file.data.as_deref()?;
+            let mut remaining = read_length;
+            let mut cursor = 0usize;
+            while remaining > 0 {
+                let payload_len = remaining.min(frame_size);
+                let frame_need = hash_size.checked_add(payload_len)?;
+                let end = cursor.checked_add(frame_need)?;
+                let block = raw.get(cursor..end)?;
+                let data = coding::verified_bitrot_frame(&checksum_algo, skip_verify_bitrot, block).ok()?;
+                body.extend_from_slice(data);
+                cursor = end;
+                remaining -= payload_len;
+            }
+            if body.len() >= object_size {
+                body.truncate(object_size);
+                return Some(Bytes::from(body));
+            }
         }
-        if remaining != 0 {
-            return None;
-        }
+        return None;
     }
     Some(Bytes::from(body))
 }

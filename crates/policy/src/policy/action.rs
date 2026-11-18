@@ -473,6 +473,10 @@ pub enum AdminAction {
     TLSCertificateStatusAdminAction,
     #[strum(serialize = "admin:CreateUser")]
     CreateUserAdminAction,
+    #[strum(serialize = "admin:ChangeOwnPassword")]
+    ChangeOwnPasswordAdminAction,
+    #[strum(serialize = "admin:ManageOwnMFA")]
+    ManageOwnMFAAdminAction,
     #[strum(serialize = "admin:DeleteUser")]
     DeleteUserAdminAction,
     #[strum(serialize = "admin:ListUsers")]
@@ -698,6 +702,8 @@ impl AdminAction {
                 | AdminAction::TLSCertificatePublishAdminAction
                 | AdminAction::TLSCertificateStatusAdminAction
                 | AdminAction::CreateUserAdminAction
+                | AdminAction::ChangeOwnPasswordAdminAction
+                | AdminAction::ManageOwnMFAAdminAction
                 | AdminAction::DeleteUserAdminAction
                 | AdminAction::ListUsersAdminAction
                 | AdminAction::EnableUserAdminAction

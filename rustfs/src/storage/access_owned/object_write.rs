@@ -112,7 +112,9 @@ pub(crate) async fn authorize_post_object<R: AuthorizationRequest + ?Sized>(
     info.object = Some(key.to_owned());
     info.version_id = version_id.map(str::to_owned);
     req.install_post_object_marker();
-    authorize_request(req, post_object_authorize_action()).await
+    authorize_request(req, post_object_authorize_action())
+        .await
+        .map_err(Into::into)
 }
 
 /// Form fields that shadow wire headers in the PutObject policy decision.
@@ -174,6 +176,16 @@ impl PostObjectFormPolicy {
             (HeaderName::from_static("if-none-match"), fields.if_none_match),
         ]);
         Ok(Self(values))
+    }
+
+    #[cfg(all(test, feature = "gateway-stack"))]
+    pub(crate) fn with_metadata(mut self, metadata: &[(String, String)]) -> S3Result<Self> {
+        for (name, value) in metadata {
+            let name = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()).map_err(|_| invalid_post_form_field())?;
+            let value = HeaderValue::from_str(value).map_err(|_| invalid_post_form_field())?;
+            self.0.push((name, Some(value)));
+        }
+        Ok(self)
     }
 
     pub(crate) fn install<R: AuthorizationRequest + ?Sized>(self, req: &mut R) {
