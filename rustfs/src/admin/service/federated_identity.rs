@@ -866,22 +866,50 @@ mod tests {
             .authorization
             .oidc_virtual_parent()
             .expect("test authorization should have a virtual parent");
-        iam.create_user(
-            &parent,
-            &AddOrUpdateUserReq {
-                secret_key: "regular-user-secret".to_string(),
-                policy: None,
-                status: AccountStatus::Enabled,
-            },
-        )
-        .await
-        .expect("create colliding regular user");
+        let creation_error = iam
+            .create_user(
+                &parent,
+                &AddOrUpdateUserReq {
+                    secret_key: "regular-user-secret".to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect_err("virtual OIDC parents must remain reserved");
+        assert!(matches!(creation_error, rustfs_iam::error::Error::AccessKeyAlreadyExists));
+
+        // Seed a legacy collision directly; the public creation API now reserves virtual OIDC parents.
+        ObjectStore::new(current_object_store_handle().expect("test object store should be published"))
+            .save_user_identity(
+                &parent,
+                UserType::Reg,
+                rustfs_policy::auth::UserIdentity::new(rustfs_credentials::Credentials {
+                    access_key: parent.clone(),
+                    secret_key: "regular-user-secret".to_string(),
+                    status: "on".to_string(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .expect("seed legacy colliding regular user");
+        iam.load_user(&parent, UserType::Reg)
+            .await
+            .expect("load legacy colliding regular user");
         iam.policy_db_set(&parent, UserType::Reg, false, "readonly")
             .await
             .expect("store colliding regular policy mapping");
         iam.policy_db_set(&parent, UserType::Sts, false, "writeonly")
             .await
             .expect("store STS policy mapping");
+        assert_eq!(
+            iam.policy_db_get(&parent, &None)
+                .await
+                .expect("read colliding regular policy"),
+            vec!["readonly".to_string()],
+            "the fixture must retain a valid regular-namespace collision"
+        );
 
         let credentials = DefaultFederatedSessionBinding
             .bind(&transaction)
