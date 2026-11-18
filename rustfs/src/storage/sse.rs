@@ -4704,7 +4704,7 @@ pub(crate) mod tests {
             service: None,
             trailing_headers: None,
         };
-        request.extensions.insert(crate::storage::access::ReqInfo::default());
+        request.extensions.insert(crate::storage::req_info::ReqInfo::default());
 
         let principal = SseKmsPrincipal::from_request(&request).expect("S3-boundary request should build a principal");
 

@@ -32,9 +32,18 @@ use crate::auth::{
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
+pub(crate) use crate::storage::authorization_actions::{
+    delete_object_authorize_action, versioned_read_action, versioned_tagging_action,
+};
 use crate::storage::denial_audit::DenialAuditor;
-use crate::storage::helper::{AuditRequestView, DenialScope};
+use crate::storage::helper::DenialScope;
+pub(crate) use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
+use crate::storage::request_markers::PermissionProbeRequestFact;
+pub(crate) use crate::storage::request_markers::{
+    MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource, RequestedObjectLegalHold,
+    RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
+};
 use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
@@ -99,29 +108,6 @@ const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
 const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
 
-#[derive(Default, Clone, Debug)]
-pub(crate) struct ReqInfo {
-    pub cred: Option<rustfs_credentials::Credentials>,
-    pub is_owner: bool,
-    /// Original session presence of a host-verified Keystone identity; its token bytes were erased.
-    pub keystone_session_present: Option<bool>,
-    pub bucket: Option<String>,
-    pub object: Option<String>,
-    pub version_id: Option<String>,
-    pub replication_request_authorized: bool,
-    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
-    pub region: Option<s3s::region::Region>,
-    pub request_context: Option<RequestContext>,
-    /// Set by probe-style callers that treat AccessDenied as an expected filter
-    /// outcome (ListBuckets per-bucket fallback, ListObjects metadata permission
-    /// collection) so `authorize_request` logs those routine denials at `debug`
-    /// instead of `warn` (issue #5740).
-    pub suppress_denial_log: bool,
-    /// Set by callers that audit their denials in aggregate (DeleteObjects), so each per-key
-    /// denial is not audited on its own. The denial is still logged.
-    pub suppress_denial_audit: bool,
-}
-
 pub(crate) fn replication_request_authorized<R: AuthorizationRequest + ?Sized>(req: &R) -> bool {
     req.req_info().is_some_and(|req_info| req_info.replication_request_authorized)
 }
@@ -167,23 +153,7 @@ fn invalid_force_delete_header() -> S3Error {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PostObjectRequestMarker;
-
-#[derive(Clone, Debug)]
 struct InternalObjectAuthorization;
-
-/// Retain-until date the request asks to set. `authorization_conditions` turns it
-/// into `object-lock-remaining-retention-days`.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestedObjectLockRetainUntil(pub(crate) OffsetDateTime);
-
-/// Retention a standalone PutObjectRetention applies from its XML body. Owned, so both request
-/// forms carry it; each edge converts its decoded body once.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestedObjectLockRetention {
-    pub(crate) mode: Option<String>,
-    pub(crate) retain_until: Option<OffsetDateTime>,
-}
 
 impl From<&ObjectLockRetention> for RequestedObjectLockRetention {
     fn from(retention: &ObjectLockRetention) -> Self {
@@ -194,20 +164,11 @@ impl From<&ObjectLockRetention> for RequestedObjectLockRetention {
     }
 }
 
-/// Legal hold status a standalone PutObjectLegalHold applies from its XML body.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestedObjectLegalHold(pub(crate) Option<String>);
-
 impl From<&ObjectLockLegalHold> for RequestedObjectLegalHold {
     fn from(legal_hold: &ObjectLockLegalHold) -> Self {
         Self(legal_hold.status.as_ref().map(|status| status.as_str().to_owned()))
     }
 }
-
-/// Tag set a standalone PutObjectTagging applies from its XML body, as the key/value pairs a
-/// policy condition can name: a tag without a key or a value names none.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RequestedObjectTags(pub(crate) Vec<(String, String)>);
 
 impl From<&Tagging> for RequestedObjectTags {
     fn from(tagging: &Tagging) -> Self {
@@ -220,55 +181,6 @@ impl From<&Tagging> for RequestedObjectTags {
         )
     }
 }
-
-/// Request headers with the object policy inputs a POST upload applies from its
-/// form fields, so header-derived condition keys describe what is stored.
-#[derive(Clone)]
-pub(crate) struct PostObjectPolicyHeaders(pub(crate) http::HeaderMap);
-
-// The map is a clone of the request headers, so it can carry `Authorization`
-// and session tokens; its debug form names the headers without their values.
-impl std::fmt::Debug for PostObjectPolicyHeaders {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PostObjectPolicyHeaders")
-            .field(&self.0.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-/// Copy source as the handler resolves it (percent-decoded, versionId canonical).
-#[derive(Clone)]
-pub(crate) struct RequestedCopySource(pub(crate) String);
-
-#[derive(Clone, Copy)]
-pub(crate) enum PermissionProbeRequestFact {
-    CopySource = 1,
-    IfMatch = 2,
-    IfNoneMatch = 4,
-}
-
-impl RequestedCopySource {
-    pub(crate) fn from_object(bucket: &str, key: &str, version_id: Option<&str>) -> Self {
-        Self(match version_id {
-            Some(version) => format!("{bucket}/{key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
-            None => format!("{bucket}/{key}"),
-        })
-    }
-}
-
-/// These operations stage upload state without publishing an object. Keep this
-/// separate from the marker controlling multipart publication fences.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MultipartStagingOperation;
-
-impl MultipartStagingOperation {
-    pub(crate) fn for_operation(operation: &str) -> Option<Self> {
-        matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy").then_some(Self)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct StagedMultipartPartAuthorization;
 
 #[derive(Clone, Default)]
 pub(crate) struct TableDataPlanePublicationGuards {
@@ -1741,7 +1653,7 @@ pub(crate) async fn resolve_req_info(
     Ok(ReqInfo {
         cred,
         is_owner,
-        region: region.map(Into::into),
+        region,
         request_context,
         ..Default::default()
     })
@@ -2039,46 +1951,6 @@ pub(crate) fn log_list_buckets_iam_implicit_deny<R: AuthorizationRequest + ?Size
     Ok(())
 }
 
-pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action {
-    Action::S3Action(if version_id.is_some() {
-        S3Action::DeleteObjectVersionAction
-    } else {
-        S3Action::DeleteObjectAction
-    })
-}
-
-/// GHSA-3ppv: select the IAM action for an object read by whether the request
-/// names an explicit object version. A read that targets a specific version must
-/// authorize against `s3:GetObjectVersion`; a current-object read authorizes
-/// against `s3:GetObject`. Reading a historical version while only holding
-/// `s3:GetObject` is an information-disclosure bypass, so the two must not be
-/// conflated at the authorization boundary.
-///
-/// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
-/// `s3:GetObject` request. It only broadens a Version grant toward current
-/// reads, never the reverse.
-pub(crate) fn versioned_read_action(version_id: Option<&str>) -> Action {
-    if version_id.is_some() {
-        Action::S3Action(S3Action::GetObjectVersionAction)
-    } else {
-        Action::S3Action(S3Action::GetObjectAction)
-    }
-}
-
-pub(crate) fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
-    let action = if version_id.is_some() {
-        match action {
-            S3Action::GetObjectTaggingAction => S3Action::GetObjectVersionTaggingAction,
-            S3Action::PutObjectTaggingAction => S3Action::PutObjectVersionTaggingAction,
-            S3Action::DeleteObjectTaggingAction => S3Action::DeleteObjectVersionTaggingAction,
-            action => action,
-        }
-    } else {
-        action
-    };
-    Action::S3Action(action)
-}
-
 async fn get_or_fetch_object_tag_conditions<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     store: &ECStore,
@@ -2211,51 +2083,6 @@ fn audit_request_denial<R: AuthorizationRequest + ?Sized>(
         return;
     }
     req.audit_denial(auditor, &action, reason);
-}
-
-/// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
-///
-/// `start_owned` marks the request so per-key denials are logged but not audited; `finish_owned` clears the
-/// mark and emits one entry per denied action with the number of keys refused for it.
-pub(crate) struct BulkDenialAudit {
-    denied: Vec<(Action, u64)>,
-}
-
-impl BulkDenialAudit {
-    pub(crate) fn start_owned<R: AuthorizationRequest + ?Sized>(request: &mut R) -> S3Result<Self> {
-        req_info_mut(request)?.suppress_denial_audit = true;
-        Ok(Self { denied: Vec::new() })
-    }
-
-    /// Counts one refused key for `action`.
-    pub(crate) fn denied(&mut self, action: Action) {
-        match self.denied.iter_mut().find(|(denied_action, _)| *denied_action == action) {
-            Some((_, count)) => *count += 1,
-            None => self.denied.push((action, 1)),
-        }
-    }
-
-    pub(crate) fn finish_owned<R: AuthorizationRequest + ?Sized>(
-        self,
-        request: &mut R,
-        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
-    ) -> S3Result<()> {
-        self.finish_owned_with(request, audit_view, DenialAuditor::global())
-    }
-
-    fn finish_owned_with<R: AuthorizationRequest + ?Sized>(
-        self,
-        request: &mut R,
-        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
-        auditor: &DenialAuditor,
-    ) -> S3Result<()> {
-        req_info_mut(request)?.suppress_denial_audit = false;
-        let view = audit_view(request);
-        for (action, keys) in self.denied {
-            auditor.audit_owned(&view, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
-        }
-        Ok(())
-    }
 }
 
 /// Authorizes the request based on the action and credentials.
@@ -4421,6 +4248,7 @@ pub(crate) mod parity_test_support {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
+    use super::audit_request_denial;
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
         BucketPolicyRawLoadErrorKind, DenialContext, FS, InternalObjectAuthorization, ObjectTagConditions,
@@ -4437,7 +4265,6 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
-    use super::{BulkDenialAudit, audit_request_denial};
     use super::{
         PostObjectPolicyHeaders, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectTags, remaining_retention_days,
         requested_bucket_location_constraint, set_post_object_policy_headers, set_requested_object_lock_retain_until,
@@ -4446,6 +4273,7 @@ mod tests {
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::auth::facts::{AuthzPrincipal, AuthzTarget, list_query_pairs, merge_list_query_conditions};
     use crate::error::ApiError;
+    use crate::storage::denial_audit::BulkDenialAudit;
     use crate::storage::denial_audit::{DenialAuditor, DenialRateLimiter};
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
