@@ -21706,13 +21706,24 @@ mod test {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let probe_src = dir.path().join("hardlink-probe.src");
+            let probe_dst = dir.path().join("hardlink-probe.dst");
+            std::fs::write(&probe_src, b"probe").expect("write hardlink probe");
+            let hardlink_supported = std::fs::hard_link(&probe_src, &probe_dst).is_ok();
+            let _ = std::fs::remove_file(&probe_dst);
+            let _ = std::fs::remove_file(&probe_src);
             let new_stat = std::fs::symlink_metadata(&new_meta_file).expect("new.meta stat");
             let data_absent_stat = std::fs::symlink_metadata(&old_data_absent_file).expect("old.data.absent stat");
             let meta_absent_stat = std::fs::symlink_metadata(&old_meta_absent_file).expect("old.meta.absent stat");
-            assert_eq!((data_absent_stat.dev(), data_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
-            assert_eq!((meta_absent_stat.dev(), meta_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
-            assert_eq!(data_absent_stat.len(), meta.len() as u64);
-            assert_eq!(meta_absent_stat.len(), meta.len() as u64);
+            if hardlink_supported {
+                assert_eq!((data_absent_stat.dev(), data_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
+                assert_eq!((meta_absent_stat.dev(), meta_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
+                assert_eq!(data_absent_stat.len(), meta.len() as u64);
+                assert_eq!(meta_absent_stat.len(), meta.len() as u64);
+            } else {
+                assert_eq!(data_absent_stat.len(), 0);
+                assert_eq!(meta_absent_stat.len(), 0);
+            }
         }
         assert!(
             disk.read_all("bucket", &format!("{txn_rel}/{PART_TRANSACTION_OLD_META_ABSENT}"))
