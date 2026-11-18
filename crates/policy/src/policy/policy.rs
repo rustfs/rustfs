@@ -645,6 +645,58 @@ mod test {
     use crate::policy::action::{AdminAction, KmsAction, S3Action};
 
     #[tokio::test]
+    async fn delegated_service_account_obeys_admin_wildcards_and_target_conditions() -> Result<()> {
+        let conditions = HashMap::from([("TargetUser".into(), vec!["backup".into()])]);
+        let args = Args {
+            account: "operator",
+            groups: &None,
+            action: Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction),
+            bucket: "",
+            object: "",
+            conditions: &conditions,
+            claims: &HashMap::new(),
+            is_owner: false,
+            deny_only: false,
+        };
+        for (statement, allowed) in [
+            (serde_json::json!({"Effect":"Allow","Action":"admin:*"}), true),
+            (serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccount"}), false),
+            (serde_json::json!({"Effect":"Allow","NotAction":"admin:DeleteUser","Resource":"*"}), true),
+            (
+                serde_json::json!({"Effect":"Allow","NotAction":"admin:CreateServiceAccountForUser","Resource":"*"}),
+                false,
+            ),
+            (
+                serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"backup"}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"archive"}}}),
+                false,
+            ),
+        ] {
+            let policy = Policy::parse_config(
+                &serde_json::to_vec(&serde_json::json!({"Version":DEFAULT_VERSION,"Statement":[statement]}))
+                    .expect("encode policy"),
+            )?;
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{statement}");
+        }
+        let admin = default::DEFAULT_POLICIES
+            .iter()
+            .find(|(name, _)| *name == "consoleAdmin")
+            .expect("built-in admin policy");
+        assert!(admin.1.is_allowed(&args).await);
+        for denied_action in ["admin:*", "admin:CreateServiceAccountForUser"] {
+            let deny = Policy::parse_config(&serde_json::to_vec(&serde_json::json!({
+                "Version": DEFAULT_VERSION,
+                "Statement": [{"Effect": "Deny", "Action": denied_action}]
+            }))?)?;
+            assert!(!Policy::merge_policies(vec![admin.1.clone(), deny]).is_allowed(&args).await);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_parse_policy() -> Result<()> {
         let data = r#"
 {
@@ -3533,6 +3585,123 @@ mod test {
             policy_needs_existing_object_tag_for_args(&policy, &args_private).await,
             "resource match should keep ExistingObjectTag fetch hint"
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_policy_many_variable_values_do_not_suppress_explicit_deny() {
+        use crate::policy::action::{Action, S3Action};
+        use crate::policy::function::key_name::KeyName;
+
+        let policy: BucketPolicy = serde_json::from_str(r#"{
+          "Version":"2012-10-17",
+          "Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+            {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/${aws:username}/${aws:username}/*"}
+          ]
+        }"#).expect("parse bucket policy");
+        let key = KeyName::COMMON_KEYS
+            .iter()
+            .find(|key| key.var_name() == "${aws:username}")
+            .expect("username key")
+            .name()
+            .to_owned();
+        let conditions = HashMap::from([(key, (0..33).map(|index| format!("user-{index}")).collect())]);
+        let groups = None;
+        let mut args = BucketPolicyArgs {
+            account: "requester",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "user-32/user-31/object",
+        };
+        assert!(!policy.is_allowed(&args).await, "matching explicit Deny must survive a large expansion");
+        args.object = "user-32/not-listed/object";
+        assert!(policy.is_allowed(&args).await, "unmatched resources still follow the Allow statement");
+    }
+
+    #[tokio::test]
+    async fn unresolved_bucket_resource_never_broadens_allow_or_suppresses_deny() {
+        use crate::policy::action::{Action, S3Action};
+        let not_resource_allow: BucketPolicy = serde_json::from_str(r#"{
+          "Version":"2012-10-17", "Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","NotResource":"arn:aws:s3:::bucket/${aws:username}/*"}
+          ]
+        }"#).expect("parse NotResource policy");
+        let resource_deny: BucketPolicy = serde_json::from_str(
+            r#"{
+          "Version":"2012-10-17", "Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+            {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/${aws:username}/*"}
+          ]
+        }"#,
+        )
+        .expect("parse Deny policy");
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = BucketPolicyArgs {
+            account: "anonymous",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "private/file",
+        };
+        assert!(
+            !not_resource_allow.is_allowed(&args).await,
+            "unresolved NotResource must not grant access"
+        );
+        assert!(!resource_deny.is_allowed(&args).await, "unresolved Resource must not suppress a Deny");
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_and_kms_resources_fail_closed() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction, S3Action};
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        for (action, not_resource, broad, resource) in [
+            (
+                "s3:GetObject",
+                "arn:aws:s3:::bucket/${aws:userid}/*",
+                "arn:aws:s3:::bucket/*",
+                "arn:aws:s3:::bucket/${aws:userid}/*",
+            ),
+            (
+                "kms:DescribeKey",
+                "arn:aws:kms:::key/${aws:userid}",
+                "arn:aws:kms:::key/*",
+                "arn:aws:kms:::key/${aws:userid}",
+            ),
+        ] {
+            let allow = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","NotResource":"{not_resource}"}}]}}"#
+            );
+            let deny = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{broad}"}},{{"Effect":"Deny","Action":"{action}","Resource":"{resource}"}}]}}"#
+            );
+            let allow = Policy::parse_config(allow.as_bytes())?;
+            let deny = Policy::parse_config(deny.as_bytes())?;
+            let args = if action.starts_with("kms:") {
+                kms_args(Action::KmsAction(KmsAction::DescribeKeyAction), "private", &conditions, &claims)
+            } else {
+                Args {
+                    account: "alice",
+                    groups: &None,
+                    action: Action::S3Action(S3Action::GetObjectAction),
+                    bucket: "bucket",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "private/file",
+                    claims: &claims,
+                    deny_only: false,
+                }
+            };
+            assert!(!allow.is_allowed(&args).await, "unresolved {action} NotResource must not grant access");
+            assert!(!deny.is_allowed(&args).await, "unresolved {action} Resource must not suppress a Deny");
+        }
+        Ok(())
     }
 
     #[tokio::test]

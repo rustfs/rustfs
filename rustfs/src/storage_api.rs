@@ -143,6 +143,7 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
+        #[cfg(test)]
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
@@ -193,8 +194,8 @@ pub(crate) mod server {
         pub(crate) use crate::storage::storage_api::{
             RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
             rpc_auth_is_resource_exhausted, rpc_background_admission, tonic_boot_epoch_challenge,
-            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
-            with_remote_background_io,
+            tonic_boot_epoch_response_headers_with_msgpack_capability, tonic_msgpack_manifest_capability_requested,
+            tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap, with_remote_background_io,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -206,7 +207,7 @@ pub(crate) mod server {
             Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
             find_local_disk_by_ref, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
             get_global_lock_client, get_global_lock_clients, init_local_disks, init_lock_clients,
-            verify_tonic_boot_epoch_response,
+            tonic_boot_epoch_response_headers, verify_tonic_boot_epoch_response,
         };
 
         pub(crate) mod ecfs {
@@ -238,9 +239,28 @@ pub(crate) mod server {
             /// The per-batch authorization shapes, one module per migration batch.
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
             pub(crate) use crate::storage::storage_api::access_consumer::{
-                AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
-                authorize_object_request, resolve_req_info,
+                AccessMarkers, ReqInfo, VerifiedSignature, admit_operation, authorize_bucket_config_mutation,
+                authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request, resolve_req_info,
             };
+
+            #[cfg(test)]
+            pub(crate) mod test_support {
+                pub(crate) use crate::storage::storage_api::access_consumer::{AuthorizationRequest, ReqInfo};
+                pub(crate) use crate::storage::storage_api::contract::bucket::{
+                    BucketOperations, DeleteBucketOptions, MakeBucketOptions,
+                };
+                pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
+                pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
+                pub(crate) use crate::storage::storage_api::{
+                    FS, StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
+                    set_bucket_metadata,
+                };
+                pub(crate) use s3s::{
+                    S3Request,
+                    access::S3Access,
+                    dto::{ETag, ETagCondition, PutObjectInput},
+                };
+            }
         }
 
         pub(crate) mod rpc {
@@ -453,10 +473,6 @@ pub(crate) mod startup {
 
         pub(crate) mod concurrency {
             pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
-        }
-
-        pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::storage_api::FS;
         }
     }
 

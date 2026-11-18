@@ -15,58 +15,63 @@
 //! Bucket tagging use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketTaggingInput, DeleteBucketTaggingOutput, GetBucketTaggingInput, PutBucketTaggingInput, PutBucketTaggingOutput,
-};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use crate::app::storage_api::bucket_usecase::bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
+use rustfs_s3_types::s3_error;
 
 impl DefaultBucketUsecase {
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_bucket_tagging(
+    #[instrument(level = "debug", skip(self, envelope))]
+    pub(crate) async fn execute_delete_bucket_tagging(
         &self,
-        req: S3Request<DeleteBucketTaggingInput>,
-    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketTaggingInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::DeleteBucketTagging, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        metadata_sys::update_s3_tagging_config(&bucket, None, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            metadata_sys::update_s3_tagging_config(bucket, None, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false).await;
+            notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket tagging", request_context, false).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "tags");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
-        }
+            let item = sr_bucket_meta_item(bucket.to_owned(), "tags");
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
+            }
 
-        rustfs_scanner::record_dirty_usage_bucket_from_producer(
-            &bucket,
-            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
-        );
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+            rustfs_scanner::record_dirty_usage_bucket_from_producer(
+                bucket,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+            );
+
+            Ok(())
+        })
+        .await
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<PersistedTagging> {
-        let GetBucketTaggingInput { bucket, .. } = req.input;
-
+    /// Returns the stored bucket tagging configuration after checking the bucket exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InternalError` if the store is uninitialized, `NoSuchTagSet`
+    /// if the configuration is absent, or the storage error from either lookup.
+    #[instrument(level = "debug", skip(self, bucket))]
+    pub async fn execute_get_bucket_tagging(&self, bucket: &str) -> rustfs_s3_types::S3Result<PersistedTagging> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let tagging = match metadata_sys::get_tagging_config(&bucket).await {
+        let tagging = match metadata_sys::get_tagging_config(bucket).await {
             Ok((tags, _)) => tags,
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
+                    return Err(rustfs_s3_types::s3_error!(NoSuchTagSet, "The TagSet does not exist"));
                 }
                 warn!(
                     component = LOG_COMPONENT_APP,
@@ -83,51 +88,50 @@ impl DefaultBucketUsecase {
         Ok(tagging)
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_bucket_tagging(
+    #[instrument(level = "debug", skip(self, envelope, tagging))]
+    pub(crate) async fn execute_put_bucket_tagging(
         &self,
-        req: S3Request<PutBucketTaggingInput>,
+        envelope: RequestEnvelope,
+        bucket: &str,
         tagging: PersistedTagging,
-    ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketTaggingInput { bucket, .. } = req.input;
-        let s3_tag_set: Vec<dto::Tag> = tagging
-            .tag_set
-            .iter()
-            .map(|tag| dto::Tag {
-                key: tag.key.clone(),
-                value: tag.value.clone(),
-            })
-            .collect();
-        crate::app::storage_api::bucket_usecase::s3_api::tagging::validate_bucket_tag_set(&s3_tag_set)?;
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketTagging, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+            if tagging.tag_set.len() > MAX_BUCKET_TAGS {
+                return Err(s3_error!(InvalidTag, "Cannot have more than 50 tags per bucket"));
+            }
+            validate_tag_set_entries(&tagging.tag_set).map_err(|err| s3_error!(InvalidTag, "{err}"))?;
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+            let Some(store) = self.object_store() else {
+                return Err(s3_error!(InternalError, "Not init"));
+            };
 
-        metadata_sys::update_s3_tagging_config(&bucket, Some(tagging.clone()), expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context, false).await;
+            metadata_sys::update_s3_tagging_config(bucket, Some(tagging.clone()), expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
-        item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
-        }
+            notify_bucket_metadata_reload(bucket.to_owned(), "put bucket tagging", request_context, false).await;
 
-        rustfs_scanner::record_dirty_usage_bucket_from_producer(
-            &bucket,
-            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
-        );
-        Ok(S3Response::new(PutBucketTaggingOutput::default()))
+            let mut item = sr_bucket_meta_item(bucket.to_owned(), "tags");
+            item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
+            }
+
+            rustfs_scanner::record_dirty_usage_bucket_from_producer(
+                bucket,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+            );
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -135,21 +139,16 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
-    use crate::app::storage_api::s3::dto::{Tag, Tagging};
+    use crate::app::storage_api::s3::dto::{self, PutBucketTaggingInput, Tag, Tagging};
     use http::Method;
+    use rustfs_s3_types::S3ErrorCode;
 
     #[tokio::test]
     async fn execute_get_bucket_tagging_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_tagging(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_tagging("test-bucket").await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[test]
@@ -157,15 +156,14 @@ mod tests {
     fn put_bucket_tagging_rejects_invalid_shapes_before_storage_mutation() {
         crate::app::gating_test_env::run_large_stack_test("bucket-tag-validation", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
-            use crate::app::storage_api::s3::S3Access as _;
+            use crate::app::storage_api::owned_parity::authorize_bucket_config_mutation;
             use crate::app::storage_api::test::ReqInfo;
-            use crate::app::storage_api::test::ecfs::FS;
+            use rustfs_policy::policy::action::{Action, S3Action};
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let fs = FS::with_server_ctx(slot.clone());
             let usecase = DefaultBucketUsecase::with_context(Some(context));
             let bucket = format!("tag-validation-{}", uuid::Uuid::new_v4().simple());
             store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
@@ -213,8 +211,12 @@ mod tests {
                 let mut req = build_request(input, Method::PUT);
                 req.extensions.insert(ReqInfo::default());
                 req.extensions.insert(slot.clone());
-                fs.put_bucket_tagging(&mut req).await.expect("permission allows tag updates");
-                let result = usecase.execute_put_bucket_tagging(req, persisted).await;
+                authorize_bucket_config_mutation(&slot, &mut req, &bucket, Action::S3Action(S3Action::PutBucketTaggingAction))
+                    .await
+                    .expect("permission allows tag updates");
+                let result = usecase
+                    .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, persisted)
+                    .await;
                 if valid {
                     result.expect("valid tags are persisted");
                 } else {
@@ -245,9 +247,25 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_tagging(req, PersistedTagging::default())
+            .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+
+        let tag = rustfs_gateway_types::cors_tagging::PersistedTag {
+            key: Some("team".to_owned()),
+            value: Some("storage".to_owned()),
+        };
+        for (tag_set, message) in [
+            (vec![tag.clone(), tag.clone()], "Cannot provide multiple Tags with the same key"),
+            (vec![tag; MAX_BUCKET_TAGS + 1], "Cannot have more than 50 tags per bucket"),
+        ] {
+            let err = usecase
+                .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging { tag_set })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+            assert_eq!(err.message(), Some(message));
+        }
     }
 }

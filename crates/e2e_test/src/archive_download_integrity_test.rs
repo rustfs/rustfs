@@ -21,9 +21,9 @@ mod tests {
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
     use http::header::{CONTENT_TYPE, HOST};
     use reqwest::StatusCode;
+    use rustfs_s3_types::Body;
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::{pre_sign_v4, sign_v4};
-    use s3s::Body;
     use sha2::{Digest, Sha256};
     use std::error::Error;
     use std::io::{Cursor, Write};

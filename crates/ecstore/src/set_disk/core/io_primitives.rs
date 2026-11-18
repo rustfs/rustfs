@@ -242,6 +242,7 @@ pub(in crate::set_disk) enum MetadataCacheLookup {
     Hit(Arc<GetObjectMetadataCacheEntry>),
     Miss,
     RejectedInsufficientQuorum,
+    RejectedFenceProof,
 }
 
 pub(in crate::set_disk) fn is_confirmed_missing_part_error(err: Option<&str>) -> bool {
@@ -4009,6 +4010,7 @@ impl SetDisks {
                 file_info.validate_for_erasure_write()?;
             }
         }
+        let file_infos = Arc::new(file_infos);
 
         let disk_count = disks.len();
         let fanout_disks = disks.to_vec();
@@ -4031,19 +4033,16 @@ impl SetDisks {
                 let successful_rename_completion_rank =
                     rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
                 let mut tasks = JoinSet::new();
-                for (i, ((disk, file_info), scanner_publication_lease_token)) in fanout_disks
-                    .into_iter()
-                    .zip(file_infos.iter())
-                    .zip(fanout_fence_tokens.into_iter())
-                    .enumerate()
+                for (i, (disk, scanner_publication_lease_token)) in
+                    fanout_disks.into_iter().zip(fanout_fence_tokens.into_iter()).enumerate()
                 {
                     let src_bucket = fanout_src_bucket.clone();
                     let src_object = fanout_src_object.clone();
                     let dst_bucket = fanout_dst_bucket.clone();
                     let dst_object = fanout_dst_object.clone();
-                    let file_info = file_info.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     let namespace_commit_guard = namespace_commit_guard.clone();
+                    let file_infos = file_infos.clone();
                     tasks.spawn(crate::disk::with_detached_disk_io_context(async move {
                         let _namespace_commit_guard = namespace_commit_guard.clone();
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
@@ -4060,12 +4059,16 @@ impl SetDisks {
                                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
                             };
 
+                            let file_info = &file_infos[i];
                             let is_delete_marker = file_info.is_canonical_delete_marker();
-                            // Clone FileInfo and set erasure.index for this disk
-                            let mut file_info = file_info.clone();
-                            if file_info.erasure.index == 0 {
-                                file_info.erasure.index = i + 1;
-                            }
+                            let mut indexed_file_info;
+                            let file_info = if file_info.erasure.index == 0 {
+                                indexed_file_info = file_info.clone();
+                                indexed_file_info.erasure.index = i + 1;
+                                &indexed_file_info
+                            } else {
+                                file_info
+                            };
                             if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
                                 return Err(DiskError::FileCorrupt);
                             }
@@ -4083,7 +4086,7 @@ impl SetDisks {
                                 .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
                                     &src_object,
-                                    &file_info,
+                                    file_info,
                                     &dst_bucket,
                                     &dst_object,
                                     disk::RenameDataGuards {
@@ -4191,7 +4194,7 @@ impl SetDisks {
                         let snapshot_commit = Self::rename_data_commit_from_observations(
                             RenameDataObservations {
                                 disks: &coordinator_disks,
-                                file_infos: &file_infos,
+                                file_infos: file_infos.as_slice(),
                                 disk_versions: &disk_versions,
                                 errs: &errs,
                                 cleanup_data_dirs: &cleanup_data_dirs,
@@ -4236,6 +4239,7 @@ impl SetDisks {
                 if !sent_commit {
                     let ret_err =
                         reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum).unwrap_or(DiskError::Unexpected);
+                    let file_infos = Arc::try_unwrap(file_infos).unwrap_or_else(|file_infos| file_infos.as_ref().clone());
                     rollback_failed_rename(
                         &coordinator_disks,
                         file_infos,
@@ -9901,6 +9905,19 @@ mod tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                let fanout_order = bounded_metadata_fanout_order(bucket, &object, DISKS, 2);
+                let distribution = FileInfo::new(&metadata_distribution_key(bucket, &object), 2, 2)
+                    .erasure
+                    .distribution;
+                let initial_parity_disk = *fanout_order
+                    .iter()
+                    .take(3)
+                    .find(|disk_index| distribution[**disk_index] > 2)
+                    .expect("initial fanout should include one parity shard");
+                // Hold the initial parity response so the single-pending-read
+                // hedge is exercised independently of task completion order.
+                let initial_barrier =
+                    rename_fanout_barrier::arm(&object, initial_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
                 let spare_disk = bounded_spare_disk_index(bucket, &object, 2, 2);
                 let barrier = rename_fanout_barrier::arm(&object, spare_disk, rename_fanout_barrier::PHASE_READ_VERSION);
                 let tracker = rename_fanout_barrier::observe_tasks(&object);
@@ -9923,9 +9940,13 @@ mod tests {
                     .await
                 });
 
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, initial_barrier.wait_until_paused())
+                    .await
+                    .expect("initial parity response should pause before quorum");
                 tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
                     .await
                     .expect("bounded fanout should hedge and pause the spare disk");
+                initial_barrier.release();
                 let (parts_metadata, errs, diagnostics) = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read)
                     .await
                     .expect("verified inline quorum should return without the paused spare")
@@ -10217,6 +10238,15 @@ mod tests {
         }
         assert_eq!(
             data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &corrupt, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
+        );
+
+        let mut trailing = parts_metadata.clone();
+        let mut inline_data = trailing[data_disk].data.as_ref().expect("fixture inline bytes").to_vec();
+        inline_data.push(0x7b);
+        trailing[data_disk].data = Some(Bytes::from(inline_data));
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &trailing, &disks).await,
             Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
         );
     }

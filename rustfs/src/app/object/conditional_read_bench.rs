@@ -48,7 +48,7 @@ async fn read_once(usecase: &DefaultObjectUsecase, object: &str, etag: &str, kin
             HeaderValue::from_str(&format!("\"{tag}\"")).expect("benchmark condition"),
         );
     }
-    match usecase.execute_get_object(req).await {
+    match usecase.execute_get_object_from_s3s(req).await {
         Err(error) => {
             assert_eq!(kind, "hit");
             assert_eq!(error.code(), &S3ErrorCode::NotModified);

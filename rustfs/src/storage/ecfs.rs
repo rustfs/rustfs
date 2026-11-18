@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{StorageError, decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
+use super::{decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use crate::app::{Answered, RequestEnvelope};
 use crate::error::ApiErrorDiagnostic;
 use crate::storage::s3_api;
@@ -23,7 +23,7 @@ use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders, dto::*, s3_error};
 use std::fmt::Debug;
 use std::future::Future;
 use tracing::{debug, error, instrument, warn};
@@ -172,89 +172,6 @@ pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Op
     } else {
         Ok(None)
     }
-}
-
-const MAXIMUM_RETENTION_DAYS: i32 = 36_500;
-const MAXIMUM_RETENTION_YEARS: i32 = 100;
-
-fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
-    S3Error::with_message(S3ErrorCode::MalformedXML, message.into())
-}
-
-pub(crate) fn propagate_object_lock_peer_reload(result: std::result::Result<(), StorageError>) -> S3Result<()> {
-    result.map_err(|err| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to publish Object Lock metadata: {err}"))
-    })
-}
-
-fn invalid_retention_period(message: impl Into<String>) -> S3Error {
-    let mut err = S3Error::with_message(S3ErrorCode::Custom("InvalidRetentionPeriod".into()), message.into());
-    err.set_status_code(StatusCode::BAD_REQUEST);
-    err
-}
-
-fn validate_default_retention_configuration(default_retention: &DefaultRetention) -> S3Result<()> {
-    let Some(mode) = default_retention.mode.as_ref() else {
-        return Err(invalid_object_lock_configuration("retention mode must be specified"));
-    };
-
-    match mode.as_str() {
-        ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => {}
-        _ => {
-            return Err(invalid_object_lock_configuration(format!("unknown retention mode {}", mode.as_str())));
-        }
-    }
-
-    match (default_retention.days, default_retention.years) {
-        (Some(days), None) => {
-            if days <= 0 {
-                return Err(invalid_retention_period(
-                    "Default retention period must be a positive integer value for 'Days'",
-                ));
-            }
-            if days > MAXIMUM_RETENTION_DAYS {
-                return Err(invalid_retention_period(format!("Default retention period too large for 'Days' {days}",)));
-            }
-        }
-        (None, Some(years)) => {
-            if years <= 0 {
-                return Err(invalid_retention_period(
-                    "Default retention period must be a positive integer value for 'Years'",
-                ));
-            }
-            if years > MAXIMUM_RETENTION_YEARS {
-                return Err(invalid_retention_period(format!(
-                    "Default retention period too large for 'Years' {years}",
-                )));
-            }
-        }
-        (Some(_), Some(_)) => {
-            return Err(invalid_object_lock_configuration("either Days or Years must be specified, not both"));
-        }
-        (None, None) => {
-            return Err(invalid_object_lock_configuration("either Days or Years must be specified"));
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) fn validate_object_lock_configuration_input(input_cfg: &ObjectLockConfiguration) -> S3Result<()> {
-    let enabled = input_cfg.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str);
-    if enabled != Some(ObjectLockEnabled::ENABLED) {
-        return Err(invalid_object_lock_configuration(
-            "only 'Enabled' value is allowed to ObjectLockEnabled element",
-        ));
-    }
-
-    if let Some(rule) = input_cfg.rule.as_ref() {
-        let Some(default_retention) = rule.default_retention.as_ref() else {
-            return Err(invalid_object_lock_configuration("Rule must include DefaultRetention"));
-        };
-        validate_default_retention_configuration(default_retention)?;
-    }
-
-    Ok(())
 }
 
 /// Runs a use case that speaks the request envelope and the gateway's types behind this edge: the
@@ -767,7 +684,7 @@ mod audit_coverage_tests {
             .collect();
         // AbortMultipartUpload has an internal event but no handler-built helper.
         expected.push(S3Operation::AbortMultipartUpload);
-        assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
+        assert_eq!(expected.len(), 26, "an operation was added or removed: {expected:?}");
 
         let legacy_edge = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
         let use_cases = SourceSet::production("src/app/mod.rs", "src/app");

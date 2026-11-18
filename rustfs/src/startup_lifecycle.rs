@@ -210,6 +210,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
     } = lifecycle;
     let StartupServiceRuntime {
         table_maintenance,
+        table_rename_recovery,
         oidc_recovery,
         optional_runtimes,
         heartbeat,
@@ -248,6 +249,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
             table_maintenance,
             scanner_cleanup,
             store,
+            table_rename_recovery,
             #[cfg(feature = "internode-transport")]
             peer_control: peer_control.take(),
         },

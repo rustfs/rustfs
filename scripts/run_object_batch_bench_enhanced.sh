@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Enhanced batch object benchmark runner for warp/s3bench:
 # - Multi-round execution (default 3 rounds)
 # - Retry failed round attempts automatically
@@ -68,6 +70,11 @@ REQUIRE_NODE_TELEMETRY=false
 NODE_TELEMETRY_FAILED=false
 AFTER_PROBE=false
 AFTER_PROBE_DIR=""
+STORAGE_QUIESCENCE_CONTAINER=""
+STORAGE_QUIESCENCE_DOCKER_CONTEXT=""
+STORAGE_QUIESCENCE_CONSECUTIVE=10
+STORAGE_QUIESCENCE_TIMEOUT_SECS=120
+STORAGE_QUIESCENCE_INTERVAL_SECS=1
 
 usage() {
   cat <<'USAGE'
@@ -148,6 +155,16 @@ Enhanced options:
                                Optional SSH private key used for node telemetry
   --node-ssh-timeout-secs <n> Bound each remote telemetry command (default 30)
   --require-node-telemetry    Mark a round failed when any node snapshot fails
+  --storage-quiescence-container <container>
+                               Require a quiet storage/writeback window from this container
+  --storage-quiescence-docker-context <context>
+                               Pin the Docker context used by the quiescence gate
+  --storage-quiescence-consecutive <n>
+                               Consecutive quiet samples required (default: 10)
+  --storage-quiescence-timeout-secs <n>
+                               Fail if no quiet window appears (default: 120)
+  --storage-quiescence-interval-secs <n>
+                               Seconds between samples (default: 1)
   --after-probe                After successful PUT, HEAD and GET one sampled object,
                                verify length, ETag presence, and repeatable SHA-256
 
@@ -266,6 +283,11 @@ parse_args() {
       --node-ssh-identity-file) NODE_SSH_IDENTITY_FILE="$2"; shift 2 ;;
       --node-ssh-timeout-secs) NODE_SSH_TIMEOUT_SECS="$2"; shift 2 ;;
       --require-node-telemetry) REQUIRE_NODE_TELEMETRY=true; shift ;;
+      --storage-quiescence-container) STORAGE_QUIESCENCE_CONTAINER="$2"; shift 2 ;;
+      --storage-quiescence-docker-context) STORAGE_QUIESCENCE_DOCKER_CONTEXT="$2"; shift 2 ;;
+      --storage-quiescence-consecutive) STORAGE_QUIESCENCE_CONSECUTIVE="$2"; shift 2 ;;
+      --storage-quiescence-timeout-secs) STORAGE_QUIESCENCE_TIMEOUT_SECS="$2"; shift 2 ;;
+      --storage-quiescence-interval-secs) STORAGE_QUIESCENCE_INTERVAL_SECS="$2"; shift 2 ;;
       --after-probe) AFTER_PROBE=true; shift ;;
       --extra-args)
         # shellcheck disable=SC2206
@@ -421,6 +443,16 @@ validate_args() {
   validate_positive_int "$SERVICE_METRICS_MAX_TIME_SECS" "--service-metrics-max-time-secs"
   validate_nonnegative_int "$SERVICE_METRICS_SETTLE_SECS" "--service-metrics-settle-secs"
   validate_positive_int "$NODE_SSH_TIMEOUT_SECS" "--node-ssh-timeout-secs"
+  validate_positive_int "$STORAGE_QUIESCENCE_CONSECUTIVE" "--storage-quiescence-consecutive"
+  validate_positive_int "$STORAGE_QUIESCENCE_TIMEOUT_SECS" "--storage-quiescence-timeout-secs"
+  validate_positive_int "$STORAGE_QUIESCENCE_INTERVAL_SECS" "--storage-quiescence-interval-secs"
+  if [[ -n "$STORAGE_QUIESCENCE_CONTAINER" || -n "$STORAGE_QUIESCENCE_DOCKER_CONTEXT" ]]; then
+    if [[ -z "$STORAGE_QUIESCENCE_CONTAINER" || -z "$STORAGE_QUIESCENCE_DOCKER_CONTEXT" ]]; then
+      echo "ERROR: storage quiescence requires both container and Docker context" >&2
+      exit 1
+    fi
+    [[ "$DRY_RUN" == "true" ]] || require_cmd docker
+  fi
   if [[ -n "$SERVICE_METRICS_URL" && -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
     exit 1
@@ -603,7 +635,38 @@ EOF
     echo "node_ssh_timeout_secs=${NODE_SSH_TIMEOUT_SECS}"
     echo "require_node_telemetry=${REQUIRE_NODE_TELEMETRY}"
     echo "after_probe=${AFTER_PROBE}"
+    echo "storage_quiescence_container=${STORAGE_QUIESCENCE_CONTAINER:-N/A}"
+    echo "storage_quiescence_docker_context=${STORAGE_QUIESCENCE_DOCKER_CONTEXT:-N/A}"
+    echo "storage_quiescence_consecutive=${STORAGE_QUIESCENCE_CONSECUTIVE}"
+    echo "storage_quiescence_timeout_secs=${STORAGE_QUIESCENCE_TIMEOUT_SECS}"
+    echo "storage_quiescence_interval_secs=${STORAGE_QUIESCENCE_INTERVAL_SECS}"
   } >>"$manifest_file"
+}
+
+wait_for_storage_quiescence() {
+  local size="$1" round="$2" attempt="$3" output_file
+  if [[ -z "$STORAGE_QUIESCENCE_CONTAINER" ]]; then
+    return 0
+  fi
+  output_file="$OUT_DIR/node_telemetry/quiescence_${size}_r${round}_a${attempt}.json"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf '[DRY-RUN] %q ' "$PYTHON_BIN" "$SCRIPT_DIR/wait_storage_quiescence.py" \
+      --docker-context "$STORAGE_QUIESCENCE_DOCKER_CONTEXT" \
+      --container "$STORAGE_QUIESCENCE_CONTAINER" \
+      --consecutive "$STORAGE_QUIESCENCE_CONSECUTIVE" \
+      --timeout-secs "$STORAGE_QUIESCENCE_TIMEOUT_SECS" \
+      --interval-secs "$STORAGE_QUIESCENCE_INTERVAL_SECS" \
+      --output-json "$output_file"
+    printf '\n'
+    return 0
+  fi
+  "$PYTHON_BIN" "$SCRIPT_DIR/wait_storage_quiescence.py" \
+    --docker-context "$STORAGE_QUIESCENCE_DOCKER_CONTEXT" \
+    --container "$STORAGE_QUIESCENCE_CONTAINER" \
+    --consecutive "$STORAGE_QUIESCENCE_CONSECUTIVE" \
+    --timeout-secs "$STORAGE_QUIESCENCE_TIMEOUT_SECS" \
+    --interval-secs "$STORAGE_QUIESCENCE_INTERVAL_SECS" \
+    --output-json "$output_file"
 }
 
 write_node_inventory() {
@@ -643,7 +706,7 @@ setup_output() {
   if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
     mkdir -p "$OUT_DIR/node_resources"
   fi
-  if ((${#NODE_SSH_TARGETS[@]} > 0)); then
+  if ((${#NODE_SSH_TARGETS[@]} > 0)) || [[ -n "$STORAGE_QUIESCENCE_CONTAINER" ]]; then
     mkdir -p "$OUT_DIR/node_telemetry"
   fi
 
@@ -1335,11 +1398,18 @@ run_one_attempt() {
   local exit_code=0
   local started_at_utc finished_at_utc
   NODE_TELEMETRY_FAILED=false
+  started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! wait_for_storage_quiescence "$size" "$round" "$attempt"; then
+    finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    : >"$log_file"
+    echo "$size,$TOOL,$round,$attempt,$CONCURRENCY,failed,1,$started_at_utc,$finished_at_utc,N/A,N/A,N/A,N/A,N/A,$log_file,N/A,N/A,N/A,N/A" >> "$ROUND_CSV"
+    echo "failed"
+    return
+  fi
   capture_round_service_metrics "$size" "$round" "$attempt" before
   capture_round_node_metrics "$size" "$round" "$attempt" before
   capture_round_node_resources "$size" "$round" "$attempt" before
   capture_round_node_telemetry "$size" "$round" "$attempt" before
-  started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
     local warp_host bucket

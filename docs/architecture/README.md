@@ -58,6 +58,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) | changing the bulk envelope re-wrap sweep, its admin endpoints, the re-wrap primitive, or which objects a rekey may touch |
 | [remote-credential-sealing-adr.md](remote-credential-sealing-adr.md) | adding, reading, or persisting a stored remote credential (replication target, remote tier, on-demand migration source), or needing the sealed-envelope format, the mixed-version rules, or the reason this is worth doing in one deployment and not in another |
 | [tier-stats-contract.md](tier-stats-contract.md) | changing what `GET /rustfs/admin/v3/tier-stats` returns, adding a tier accounting source, or wiring a metric to a remote tier request |
+| [s3-over-rdma-llm-serving.md](s3-over-rdma-llm-serving.md) | you change the RDMA or NIXL data path, the large-PUT path, or a per-bucket ETag setting, or you build or run a client that loads model weights or offloads KV cache to RustFS over RDMA, such as the SGLang weight loader and HiCache backend |
 
 ## Support and compatibility matrices (release-facing, keep current)
 

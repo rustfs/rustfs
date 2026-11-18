@@ -6825,6 +6825,28 @@ mod tests {
         tokio::fs::remove_file(conflicting_metadata)
             .await
             .expect("remove conflicting fixture");
+        struct RequiresOwner;
+        impl crate::storage_api_contracts::multipart::MultipartAbortAuthorization for RequiresOwner {
+            type Error = StorageError;
+
+            fn authorize(&self, _: Option<&crate::storage_api_contracts::multipart::MultipartOwner>) -> Result<()> {
+                panic!("metadata-absent recovery cannot observe an upload owner");
+            }
+        }
+        let native_opts = ObjectOptions {
+            multipart_abort_authorization: Some(Arc::new(RequiresOwner)),
+            ..Default::default()
+        };
+        let rejected = store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &native_opts)
+            .await;
+        for disk_index in 0..3 {
+            assert!(
+                staging_dir(0, disk_index).join("part.1").exists(),
+                "owner-required Abort must preserve late data"
+            );
+        }
+        assert!(matches!(rejected, Err(StorageError::InvalidUploadID(..))));
         let (paused, release) = crate::store::multipart::pause_orphan_multipart_cleanup_for_test(&bucket);
         let recovery_store = store.clone();
         let recovery_bucket = bucket.clone();
@@ -7102,7 +7124,6 @@ mod tests {
             .expect("create upload in active target pool");
         drop(lifecycle_guard);
 
-        mark_test_pool_decommissioning(&store, 0).await;
         // Corrupt only the source pool's entry for this UploadID. Taking the
         // whole source set offline would also make the bucket-incarnation
         // sidecar unreadable before multipart routing is reached.
@@ -7125,6 +7146,17 @@ mod tests {
                 .expect("inject source upload metadata read failure");
         }
 
+        let failed_binding = store
+            .lookup_multipart_part_binding(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await;
+        assert!(
+            failed_binding
+                .as_ref()
+                .is_err_and(|err| !crate::error::is_err_invalid_upload_id(err)),
+            "a hard error in the first active pool must not be hidden by the later upload: {failed_binding:?}"
+        );
+
+        mark_test_pool_decommissioning(&store, 0).await;
         let source_result = store.pools[0]
             .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
             .await;
@@ -7140,6 +7172,13 @@ mod tests {
         );
         let routed = routed_result.expect("the active target UploadID must be resolved before the faulted suspended source");
         assert_eq!(routed.upload_id, upload.upload_id);
+        let (binding, owner) = store
+            .lookup_multipart_part_binding(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("binding must prefer the active target before the faulted suspended source");
+        assert_eq!(binding.upload_id, upload.upload_id);
+        let owner = owner.expect("active target must have an owner");
+        assert_eq!((owner.bucket.as_str(), owner.object.as_str()), (bucket.as_str(), object));
 
         shutdown.cancel();
     }

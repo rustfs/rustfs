@@ -255,7 +255,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -266,7 +266,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1004,7 +1004,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b744eed18cd75d814effdf2aba2880f912abe0fe1c327b361341d31aba9a7005"
 dependencies = [
- "bindgen",
+ "bindgen 0.73.2",
  "cc",
  "cmake",
  "dunce",
@@ -1620,6 +1620,26 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
+version = "0.71.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+dependencies = [
+ "bitflags 2.13.2",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease 0.2.37",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 1.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.73.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
@@ -1633,7 +1653,7 @@ dependencies = [
  "quote",
  "regex",
  "rustc-hash",
- "shlex",
+ "shlex 2.0.1",
  "syn 3.0.10",
 ]
 
@@ -1764,6 +1784,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2",
 ]
 
 [[package]]
@@ -1986,7 +2015,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -2087,7 +2116,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 2.0.1",
 ]
 
 [[package]]
@@ -2769,6 +2798,27 @@ checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
 dependencies = [
  "cmov",
  "subtle",
+]
+
+[[package]]
+name = "cuobject"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486fec9045f8057131bf4bba71fbb87bf9dd3e44f853622cf7fa42713f3a108c"
+dependencies = [
+ "cuobject-sys",
+ "memmap2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cuobject-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc615b2a037eb0d80180d202f809629155742db9c9e94b9f7696b1100a7d52f"
+dependencies = [
+ "bindgen 0.73.2",
+ "cc",
 ]
 
 [[package]]
@@ -4083,7 +4133,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4179,6 +4229,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-types",
  "rustfs-signer",
  "rustfs-tokio-tar",
  "rustfs-utils",
@@ -4397,7 +4448,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4591,7 +4642,7 @@ checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5537,6 +5588,7 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "tokio",
+ "tracing",
  "want",
 ]
 
@@ -5793,7 +5845,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6957,6 +7009,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixl-sys"
+version = "1.6.0"
+source = "git+https://github.com/houseme/nixl?rev=cc636c83f13d692e85b67e55aed092413d16fb41#cc636c83f13d692e85b67e55aed092413d16fb41"
+dependencies = [
+ "anyhow",
+ "bindgen 0.71.1",
+ "cc",
+ "libc",
+ "os_info",
+ "pkg-config",
+ "serde",
+ "thiserror 2.0.21",
+ "tracing",
+ "wincode",
+]
+
+[[package]]
 name = "nkeys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7005,7 +7074,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7188,6 +7257,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-cloud-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ad74d880bb43877038da939b7427bba67e9dd42004a18b809ba7d87cee241c"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-core-data"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b402a653efbb5e82ce4df10683b6b28027616a2715e90009947d50b8dd298fa"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7196,6 +7286,51 @@ dependencies = [
  "bitflags 2.13.2",
  "dispatch2",
  "objc2",
+]
+
+[[package]]
+name = "objc2-core-graphics"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
+dependencies = [
+ "bitflags 2.13.2",
+ "dispatch2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-io-surface",
+]
+
+[[package]]
+name = "objc2-core-image"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5d563b38d2b97209f8e861173de434bd0214cf020e3423a52624cd1d989f006"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-core-location"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca347214e24bc973fc025fd0d36ebb179ff30536ed1f80252706db19ee452009"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-core-text"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
 ]
 
 [[package]]
@@ -7211,7 +7346,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
+ "libc",
  "objc2",
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -7221,6 +7359,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
  "libc",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-surface"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
  "objc2-core-foundation",
 ]
 
@@ -7236,12 +7385,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-quartz-core"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-system-configuration"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
 dependencies = [
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-ui-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
+dependencies = [
+ "bitflags 2.13.2",
+ "block2",
+ "objc2",
+ "objc2-cloud-kit",
+ "objc2-core-data",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-image",
+ "objc2-core-location",
+ "objc2-core-text",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "objc2-user-notifications",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -7509,6 +7701,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "os_info"
+version = "3.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cf20a545b305cf1da722b236b5155c9bb35f1d5ceb28c048bd96ca842f41b5b"
+dependencies = [
+ "android_system_properties",
+ "log",
+ "nix 0.31.3",
+ "objc2",
+ "objc2-foundation",
+ "objc2-ui-kit",
+ "serde",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ouroboros"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7758,6 +7966,12 @@ dependencies = [
  "getrandom 0.4.3",
  "phc",
 ]
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "path-absolutize"
@@ -8813,7 +9027,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9645,12 +9859,15 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-crypto",
+ "rustfs-cuobject",
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-extension-schema",
  "rustfs-filemeta",
  "rustfs-gateway",
  "rustfs-gateway-adapter",
+ "rustfs-gateway-core",
+ "rustfs-gateway-dialect-rustfs-admin",
  "rustfs-gateway-stream",
  "rustfs-gateway-types",
  "rustfs-heal",
@@ -9666,6 +9883,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-mimalloc",
  "rustfs-mimalloc-sys",
+ "rustfs-nixl",
  "rustfs-notify",
  "rustfs-object-capacity",
  "rustfs-object-data-cache",
@@ -9850,6 +10068,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-cuobject"
+version = "1.0.5"
+dependencies = [
+ "bytes",
+ "cuobject",
+ "parking_lot 0.13.0",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "rustfs-data-usage"
 version = "1.0.5"
 dependencies = [
@@ -9961,6 +10190,7 @@ dependencies = [
  "serial_test",
  "sha2 0.11.1",
  "shadow-rs",
+ "slab",
  "smallvec",
  "temp-env",
  "tempfile",
@@ -10039,8 +10269,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway"
-version = "0.63.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+version = "0.66.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -10086,8 +10316,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-core"
-version = "0.60.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+version = "0.63.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "bytes",
  "futures-core",
@@ -10106,9 +10336,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-gateway-dialect-rustfs-admin"
+version = "0.13.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
+dependencies = [
+ "bytes",
+ "form_urlencoded",
+ "http 1.5.0",
+ "rustfs-gateway-core",
+ "rustfs-gateway-sig",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-types",
+]
+
+[[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10126,7 +10370,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10136,7 +10380,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-sig"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10151,7 +10395,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10161,8 +10405,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-types"
-version = "0.40.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+version = "0.42.0+aws.2026-10-02"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10185,7 +10429,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
+source = "git+https://github.com/rustfs/gateway.git?rev=fb4d21fca840036faef784aa1b0e965b03451db3#fb4d21fca840036faef784aa1b0e965b03451db3"
 dependencies = [
  "quick-xml 0.41.0",
 ]
@@ -10553,6 +10797,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-nixl"
+version = "1.0.5"
+dependencies = [
+ "base64-simd",
+ "bytes",
+ "memmap2",
+ "nixl-sys",
+ "parking_lot 0.13.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustfs-notify"
 version = "1.0.5"
 dependencies = [
@@ -10788,6 +11046,8 @@ version = "1.0.5"
 dependencies = [
  "flatbuffers",
  "hotpath",
+ "hyper",
+ "hyper-util",
  "prost 0.14.6",
  "rcgen",
  "rmp-serde",
@@ -10806,6 +11066,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -11398,7 +11659,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11480,7 +11741,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12110,6 +12371,12 @@ dependencies = [
 
 [[package]]
 name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
@@ -12291,7 +12558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12442,7 +12709,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12750,10 +13017,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13868,7 +14135,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13876,6 +14143,31 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "wincode"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063b5affe63fb4e584a33101d8808f01f2348b4f533db6223bf27263a0fdb9e9"
+dependencies = [
+ "pastey",
+ "proc-macro2",
+ "quote",
+ "thiserror 2.0.21",
+ "wincode-derive",
+]
+
+[[package]]
+name = "wincode-derive"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11d582d9fc9d813264407a9e16bfa16846ccf15ef032f9bbcd700741bdc00255"
+dependencies = [
+ "darling 0.23.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "windows"
@@ -13994,15 +14286,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
@@ -14179,7 +14462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags 2.13.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -14522,7 +14805,7 @@ version = "2.1.3+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
 dependencies = [
- "bindgen",
+ "bindgen 0.73.2",
  "cc",
  "pkg-config",
 ]

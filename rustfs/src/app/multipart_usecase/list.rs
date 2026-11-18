@@ -18,9 +18,82 @@ use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values;
 use crate::app::storage_api::multipart_usecase::contract::multipart::ListMultipartsInfo;
-use crate::app::storage_api::s3::dto::{ListPartsInput, ListPartsOutput};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+pub(crate) use crate::app::storage_api::multipart_usecase::contract::multipart::ListPartsInfo;
+#[cfg(any(feature = "gateway-stack", test))]
+use crate::app::storage_api::multipart_usecase::contract::multipart::ListPartsOwner;
 use rustfs_gateway_types::dto as gateway_dto;
+#[cfg(any(feature = "gateway-stack", test))]
+use rustfs_gateway_types::{BucketName, ObjectKey, RecordedUpload, UploadIdClaim, resolve_upload_async};
+use rustfs_s3_types::S3Result;
+#[cfg(any(feature = "gateway-stack", test))]
+use rustfs_s3_types::{S3Error, S3ErrorCode};
+
+pub(crate) enum ListPartsTarget {
+    Legacy {
+        bucket: String,
+        key: String,
+        upload_id: String,
+    },
+    #[cfg(any(feature = "gateway-stack", test))]
+    Gateway {
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: UploadIdClaim,
+    },
+}
+
+impl ListPartsTarget {
+    fn resource(&self) -> (&str, &str) {
+        match self {
+            Self::Legacy { bucket, key, .. } => (bucket, key),
+            #[cfg(any(feature = "gateway-stack", test))]
+            Self::Gateway { bucket, key, .. } => (bucket.as_str(), key.as_str()),
+        }
+    }
+}
+
+pub(crate) struct ListPartsFields {
+    pub(crate) target: ListPartsTarget,
+    pub(crate) part_number_marker: Option<String>,
+    pub(crate) max_parts: Option<i32>,
+}
+
+#[cfg(any(feature = "gateway-stack", test))]
+struct RecordedListParts {
+    owner: ListPartsOwner,
+    page: ListPartsInfo,
+}
+
+#[cfg(any(feature = "gateway-stack", test))]
+impl RecordedUpload for RecordedListParts {
+    fn bucket(&self) -> &str {
+        &self.owner.bucket
+    }
+
+    fn key(&self) -> &str {
+        &self.owner.object
+    }
+}
+
+#[cfg(any(feature = "gateway-stack", test))]
+async fn resolve_list_parts<'a, F>(
+    upload_id: &'a UploadIdClaim,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    lookup: impl FnOnce(&'a str) -> F,
+) -> S3Result<ListPartsInfo>
+where
+    F: Future<Output = Result<ListPartsInfo, StorageError>>,
+{
+    let (_, record) = resolve_upload_async(upload_id, bucket, key, |id| async move {
+        let mut page = lookup(id).await?;
+        Ok::<_, StorageError>(page.recorded_owner.take().map(|owner| RecordedListParts { owner, page }))
+    })
+    .await
+    .map_err(|error| S3Error::from(multipart_upload_api_error(error)))?
+    .map_err(|refusal| S3Error::with_message(S3ErrorCode::NoSuchUpload, refusal.reason()))?;
+    Ok(record.page)
+}
 
 impl DefaultMultipartUsecase {
     /// One page of ListMultipartUploads: the uploads of the bucket's current incarnation.
@@ -101,41 +174,58 @@ impl DefaultMultipartUsecase {
         list_multipart_uploads_output(bucket, prefix, result, input.encoding_type)
     }
 
-    pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+    pub(crate) async fn execute_list_parts(&self, envelope: RequestEnvelope, fields: ListPartsFields) -> S3Result<ListPartsInfo> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+            envelope.headers(),
+            envelope.uri().query(),
+            envelope.verified_sigv4().is_some(),
         )?;
         reject_presigned_put_max_content_length_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+            envelope.headers(),
+            envelope.uri().query(),
+            envelope.verified_presigned().is_some(),
         )?;
+        let (bucket, key) = fields.target.resource();
         let mut opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
-        let ListPartsInput {
-            bucket,
-            key,
-            upload_id,
-            part_number_marker,
-            max_parts,
-            ..
-        } = req.input;
+        apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), bucket, key).await?;
 
-        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
-        let params = parse_list_parts_params(part_number_marker, max_parts)?;
+        let marker = fields
+            .part_number_marker
+            .as_deref()
+            .map(|marker| {
+                marker
+                    .parse::<i32>()
+                    .map_err(|_| rustfs_s3_types::s3_error!(InvalidArgument, "invalid query: part-number-marker: {marker}"))
+            })
+            .transpose()?;
+        let params = parse_list_parts_params(marker, fields.max_parts)?;
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
-        let res = store
-            .list_object_parts(&bucket, &key, &upload_id, params.part_number_marker, params.max_parts, &opts)
-            .await
-            .map_err(multipart_upload_api_error)?;
-
-        Ok(S3Response::new(build_list_parts_output(res)))
+        match &fields.target {
+            ListPartsTarget::Legacy { upload_id, .. } => store
+                .list_object_parts(bucket, key, upload_id, params.part_number_marker, params.max_parts, &opts)
+                .await
+                .map_err(|error| multipart_upload_api_error(error).into()),
+            #[cfg(any(feature = "gateway-stack", test))]
+            ListPartsTarget::Gateway {
+                bucket: bucket_name,
+                key: object_key,
+                upload_id,
+            } => {
+                let store = &store;
+                let opts = &opts;
+                resolve_list_parts(upload_id, bucket_name, object_key, |id| async move {
+                    store
+                        .list_object_parts(bucket, key, id, params.part_number_marker, params.max_parts, opts)
+                        .await
+                })
+                .await
+            }
+        }
     }
 }
 
@@ -191,6 +281,9 @@ fn list_multipart_uploads_output(
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod parts_tests;
 
 #[cfg(test)]
 mod tests {
@@ -301,48 +394,38 @@ mod tests {
         assert!(output.common_prefixes.is_empty());
     }
 
+    async fn list_parts_refusal(marker: Option<&str>, max_parts: Option<i32>) -> S3Error {
+        let fields = ListPartsFields {
+            target: ListPartsTarget::Legacy {
+                bucket: "bucket".to_owned(),
+                key: "object".to_owned(),
+                upload_id: "upload-id".to_owned(),
+            },
+            part_number_marker: marker.map(str::to_owned),
+            max_parts,
+        };
+        make_usecase()
+            .execute_list_parts(RequestEnvelope::from_s3s(&build_request((), Method::GET)), fields)
+            .await
+            .expect_err("refused")
+    }
+
     #[tokio::test]
     async fn execute_list_parts_returns_internal_error_when_store_uninitialized() {
-        let input = ListPartsInput::builder()
-            .bucket("bucket".to_string())
-            .key("object".to_string())
-            .upload_id("upload-id".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::GET);
-
-        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        let err = list_parts_refusal(None, None).await;
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
     async fn execute_list_parts_rejects_negative_part_number_marker_before_store_lookup() {
-        let input = ListPartsInput::builder()
-            .bucket("bucket".to_string())
-            .key("object".to_string())
-            .upload_id("upload-id".to_string())
-            .part_number_marker(Some(-1))
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::GET);
-
-        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        let err = list_parts_refusal(Some("-1"), Some(0)).await;
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("part-number-marker must be non-negative"));
     }
 
     #[tokio::test]
     async fn execute_list_parts_rejects_invalid_max_parts_before_store_lookup() {
-        let input = ListPartsInput::builder()
-            .bucket("bucket".to_string())
-            .key("object".to_string())
-            .upload_id("upload-id".to_string())
-            .max_parts(Some(1001))
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::GET);
-
-        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        let err = list_parts_refusal(None, Some(1001)).await;
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("max-parts must be between 1 and 1000"));
     }

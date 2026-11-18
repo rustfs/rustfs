@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! GetObjectTagging and DeleteObjectTagging: the tag set an object version stores.
+//! GetObjectTagging, PutObjectTagging and DeleteObjectTagging for an object version.
 //!
-//! Responsible for: reading the stored tags (as stored), deleting them with metadata replication,
-//! and, for an object missing locally, serving the request from a replication target that has it.
-//! NOT responsible for: authorization (and so not the version swap of its action), or
-//! PutObjectTagging, which still runs on the legacy edge.
+//! Reads stored tags and applies validated mutations with metadata replication. For an object
+//! missing locally, it can serve the request from a replication target that has it. The edges
+//! authorize requests before invoking these operations.
 //! Upstream: both edges. Downstream: the object store, metadata replication and the tagging proxy.
 
 use super::ObjectMetaUsecase;
-use super::tagging_proxy::{proxy_delete_object_tagging, proxy_get_object_tagging};
+use super::tagging_proxy::{proxy_delete_object_tagging, proxy_get_object_tagging, proxy_put_object_tagging};
 use crate::app::RequestEnvelope;
 use crate::app::object::shared::{reject_veeam_sosapi_mutation, s3_response_version_id, validate_table_catalog_object_mutation};
 use crate::app::storage_api::object_meta_usecase::contract::ObjectOperations as _;
-use crate::app::storage_api::object_meta_usecase::{VersioningApi as _, decode_stored_tags, parse_object_version_id};
+use crate::app::storage_api::object_meta_usecase::{
+    VersioningApi as _, decode_stored_tags, encode_stored_tags, parse_object_version_id, validate_tag_set_entries,
+};
 use crate::app::storage_api::object_usecase::ECStore;
 use crate::app::storage_api::object_usecase::StorageObjectOptions as ObjectOptions;
 use crate::app::storage_api::object_usecase::bucket::replication::{must_replicate_metadata, schedule_metadata_replication};
@@ -36,9 +37,12 @@ use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::error::ApiError;
 use http::{HeaderMap, StatusCode};
 use metrics::{counter, histogram};
+use rustfs_gateway_types::cors_tagging::PersistedTag;
+#[cfg(feature = "gateway-stack")]
+use rustfs_gateway_types::dto::PutObjectTaggingInput;
 #[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::{DeleteObjectTaggingInput, GetObjectTaggingInput};
-use rustfs_gateway_types::dto::{DeleteObjectTaggingOutput, GetObjectTaggingOutput, Tag};
+use rustfs_gateway_types::dto::{DeleteObjectTaggingOutput, GetObjectTaggingOutput, PutObjectTaggingOutput, Tag};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{EventName, S3Error, S3ErrorCode, S3Result};
 use rustfs_utils::http::{
@@ -158,6 +162,130 @@ impl ObjectMetaUsecase {
             tag_set,
             version_id: s3_response_version_id(info.version_id),
         })
+    }
+
+    /// Replaces the tag set of the named object version and replicates the change when configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidTag` for an invalid tag set, a refusal for reserved objects, or the
+    /// storage error when the tags cannot be written.
+    #[cfg(feature = "gateway-stack")]
+    pub async fn execute_put_object_tagging(
+        &self,
+        envelope: RequestEnvelope,
+        input: PutObjectTaggingInput,
+    ) -> S3Result<PutObjectTaggingOutput> {
+        self.put_object_tagging_fields(
+            envelope,
+            input.bucket.as_str(),
+            input.key.as_str(),
+            input.version_id,
+            input.tagging.tag_set,
+        )
+        .await
+    }
+
+    pub(crate) async fn put_object_tagging_fields(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        tag_set: Vec<Tag>,
+    ) -> S3Result<PutObjectTaggingOutput> {
+        let start_time = Instant::now();
+        let helper =
+            OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
+        let (bucket, object) = (bucket.to_owned(), object.to_owned());
+
+        reject_veeam_sosapi_mutation(|| self.object_store().ok(), &bucket, &object).await?;
+        validate_table_catalog_object_mutation(&bucket, &object).await?;
+        let (bucket, object) = (bucket.as_str(), object.as_str());
+        let persisted_tags = validate_put_tags(&tag_set)?;
+        let store = self.object_store()?;
+        let tags = encode_stored_tags(persisted_tags);
+        let mut opts = get_opts(bucket, object, version_id.clone(), None, envelope.headers())
+            .await
+            .map_err(ApiError::from)?;
+        let existing = match store.get_object_info(bucket, object, &opts).await {
+            Ok(info) => info,
+            Err(error) => {
+                // A write on a remote target emits no local object event.
+                if (is_err_object_not_found(&error) || is_err_version_not_found(&error))
+                    && proxy_allowed(&envelope)
+                    && proxy_put_object_tagging(bucket, object, version_id.clone(), envelope.headers(), &tag_set)
+                        .await
+                        .is_some()
+                {
+                    counter!("rustfs_put_object_tagging_success").increment(1);
+                    record_tagging_duration("put", start_time);
+                    return Ok(PutObjectTaggingOutput { version_id });
+                }
+                return Err(ApiError::from(error).into());
+            }
+        };
+        let decision = must_replicate_metadata(
+            bucket,
+            object,
+            &existing.user_defined,
+            tags.clone(),
+            existing.replication_status,
+            opts.clone(),
+        )
+        .await;
+        if decision.replicate_any() {
+            let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut eval_metadata,
+                SUFFIX_REPLICATION_STATUS,
+                decision.pending_status().unwrap_or_default(),
+            );
+            insert_str(
+                &mut eval_metadata,
+                SUFFIX_TAGGING_TIMESTAMP,
+                OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+            );
+            opts.eval_metadata = Some(eval_metadata);
+        }
+        let info = store.put_object_tags(bucket, object, &tags, &opts).await.map_err(|error| {
+            error!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_TAGGING,
+                event = "object_tagging_put_failed",
+                bucket = %bucket,
+                object = %object,
+                error = %error,
+                "Failed to put object tags"
+            );
+            counter!("rustfs_put_object_tagging_failure").increment(1);
+            ApiError::from(error)
+        })?;
+        if decision.replicate_any() {
+            schedule_metadata_replication(info.clone(), Arc::clone(&store), decision).await;
+        }
+        counter!("rustfs_put_object_tagging_success").increment(1);
+
+        let event_version_id = version_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| info.version_id.map(|version| version.to_string()))
+            .unwrap_or_default();
+        let result = Ok(PutObjectTaggingOutput { version_id });
+        let _ = helper
+            .object(info)
+            .version_id(event_version_id)
+            .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            bucket,
+            object,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::ObjectMetadata,
+        );
+        record_tagging_duration("put", start_time);
+        result
     }
 
     /// Deletes the tag set of the object version `input` names, replicating the change where the
@@ -294,7 +422,7 @@ impl ObjectMetaUsecase {
 
 /// A proxy may answer only when no tag-conditioned authorization ran: the remote's tags were never
 /// shown to the policy that admitted the request.
-fn proxy_allowed(envelope: &RequestEnvelope) -> bool {
+pub(crate) fn proxy_allowed(envelope: &RequestEnvelope) -> bool {
     envelope.object_tag_conditions().is_none()
 }
 
@@ -312,4 +440,19 @@ fn stored_tags(encoded: &str) -> Vec<Tag> {
             value: tag.value,
         })
         .collect()
+}
+
+fn validate_put_tags(tags: &[Tag]) -> S3Result<Vec<PersistedTag>> {
+    if tags.len() > 10 {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidTag, "Cannot have more than 10 tags per object"));
+    }
+    let tags: Vec<_> = tags
+        .iter()
+        .map(|tag| PersistedTag {
+            key: tag.key.clone(),
+            value: tag.value.clone(),
+        })
+        .collect();
+    validate_tag_set_entries(&tags).map_err(|error| S3Error::with_message(S3ErrorCode::InvalidTag, error))?;
+    Ok(tags)
 }

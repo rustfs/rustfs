@@ -18,3 +18,6 @@ pub use client::ProtocolStorageClient;
 
 #[cfg(test)]
 mod policy_test;
+
+#[cfg(test)]
+mod mainflow_test;

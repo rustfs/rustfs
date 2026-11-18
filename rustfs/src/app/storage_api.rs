@@ -28,7 +28,9 @@ pub(crate) fn EndpointServerPools(
 pub(crate) mod request_body {
     pub(crate) use s3s::StdError;
     pub(crate) use s3s::dto::StreamingBlob;
-    pub(crate) use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+    pub(crate) use s3s::stream::ByteStream;
+    #[cfg(test)]
+    pub(crate) use s3s::stream::{DynByteStream, RemainingLength};
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -52,6 +54,8 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+    pub(crate) use s3s::Body;
     pub(crate) use s3s::S3Response;
     pub(crate) use s3s::StdError;
     #[cfg(test)]
@@ -73,7 +77,6 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     pub(crate) use s3s::header;
-    pub(crate) use s3s::region;
     pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
@@ -84,7 +87,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3};
+    pub(crate) use s3s::{BodySizeLimitExceeded, S3};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 
@@ -249,7 +252,7 @@ pub(crate) mod runtime {
         crate::storage::storage_api::get_global_lock_clients()
     }
 
-    pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
+    pub(crate) fn get_global_region() -> Option<rustfs_s3_types::Region> {
         crate::storage::storage_api::get_global_region()
     }
 
@@ -325,22 +328,24 @@ pub(crate) mod runtime_sources {
 
 pub(crate) mod access {
     #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::access_consumer::PostObjectRequestMarker;
+    #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::requested_bucket_force_delete;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        AuthorizationRequest, PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess,
-        TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
-        apply_copy_source_bucket_generation_guard, authorize_copy_object_tags, authorize_request,
-        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        AuthorizationRequest, CopySourceObject, RequestedObjectLegalHold, RequestedObjectLockRetention,
+        TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
+        TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_copy_object_tags, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
+        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_proxy_allowed, replication_request_authorized, req_info_mut, req_info_ref,
-        retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
 pub(crate) mod bucket {
-    use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
         RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging,
     };
     use std::sync::Arc;
@@ -387,7 +392,7 @@ pub(crate) mod bucket {
         crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle::predict_expiration(lifecycle, obj).await
     }
 
-    // Remove this conversion when RestoreObject receives Gateway inputs.
+    // The legacy edge keeps values that its decoder permits before domain validation.
     pub(crate) fn restore_request_from_wire(request: s3s::dto::RestoreRequest) -> RestoreRequest {
         use rustfs_gateway_types::dto;
 
@@ -938,6 +943,10 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod metadata {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
+        pub(crate) use crate::storage::storage_api::{
+            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
+        };
         pub(crate) const BUCKET_CORS_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_CORS_CONFIG;
         pub(crate) const BUCKET_LIFECYCLE_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -952,11 +961,13 @@ pub(crate) mod bucket {
         pub(crate) const BUCKET_TARGETS_FILE: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
         pub(crate) const BUCKET_VERSIONING_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
-        #[cfg(test)]
         pub(crate) const OBJECT_LOCK_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
     }
 
     pub(crate) mod metadata_sys {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            get_accelerate_config, get_logging_config, get_request_payment_config, get_website_config,
+        };
         use std::sync::Arc;
 
         use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};
@@ -1590,6 +1601,8 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use crate::storage::storage_api::ecstore_compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use crate::storage::storage_api::ecstore_compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
     };
@@ -1601,6 +1614,7 @@ pub(crate) mod deadlock_detector {
     pub(crate) use crate::storage::storage_api::deadlock_detector_consumer::{DeadlockDetector, get_deadlock_detector};
 }
 
+#[cfg(test)]
 pub(crate) mod ecfs {
     pub(crate) use crate::storage::storage_api::FS;
 }
@@ -1625,12 +1639,14 @@ pub(crate) mod helper {
         MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
     };
     pub(crate) use crate::storage::storage_api::helper_consumer::{
-        OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+        OperationHelper, build_owned_event_resp_elements, run_owned_mutation, spawn_background_with_context,
     };
 }
 
 pub(crate) mod object_utils {
-    pub(crate) use crate::storage::storage_api::{to_s3s_etag, to_s3s_xml_etag};
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::to_s3s_etag;
+    pub(crate) use crate::storage::storage_api::to_s3s_xml_etag;
 }
 
 pub(crate) mod io {
@@ -1701,14 +1717,13 @@ pub(crate) mod s3_api {
 
     pub(crate) mod multipart {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::{
-            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-            parse_upload_part_number,
+            ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
         };
     }
 
     pub(crate) mod tagging {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::tagging::{
-            parse_copy_object_tags, resolve_copy_object_tags, validate_bucket_tag_set,
+            parse_copy_object_tags, resolve_copy_object_tags,
         };
     }
 }
@@ -1745,8 +1760,8 @@ pub(crate) mod bucket_usecase {
 
     pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
-        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, process_lambda_configurations,
-        process_queue_configurations, process_topic_configurations, validate_list_object_unordered_with_delimiter,
+        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
+        validate_website_configuration,
     };
 }
 
@@ -1778,6 +1793,18 @@ pub(crate) mod object_usecase {
         pub(crate) use crate::storage::storage_api::{evaluate_read_preconditions, has_read_preconditions};
     }
 
+    /// Process-wide runtime facts the object use case reads (cuObject S3-over-RDMA addressing).
+    /// ECStore surface of the S3-over-RDMA object transport.
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use crate::storage::storage_api::ecstore_rdma as rdma;
+
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) mod runtime {
+        pub(crate) use super::super::runtime::get_global_endpoints_opt;
+        #[cfg(not(feature = "nixl"))]
+        pub(crate) use super::super::runtime::global_rustfs_port;
+    }
+
     pub(crate) mod contract {
         #[cfg(test)]
         pub(crate) mod http {
@@ -1798,26 +1825,37 @@ pub(crate) mod object_usecase {
     }
 
     pub(crate) use super::{
-        access, bucket, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
-        object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
+        access, bucket, compression, concurrency, data_usage, deadlock_detector, error, head_prefix, helper, io, options,
+        request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
+    #[cfg(test)]
+    pub(crate) use super::{ecfs, object_utils};
     pub(crate) use crate::storage::storage_api::{
         ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
-        parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
+        parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_part_number_i32_to_usize,
         remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
         validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        wrap_response_with_cors,
+    };
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use crate::storage::storage_api::{
+        StorageGetObjectSink, StorageGetObjectSinkSegments, StorageGetObjectSinkWriter,
     };
 }
 
 pub(crate) mod object_meta_usecase {
     pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::object::ObjectLockRetentionOptions;
         pub(crate) use super::super::storage_contracts::{BucketOperations, BucketOptions, ObjectOperations};
     }
 
+    pub(crate) use crate::storage::storage_api::check_retention_for_modification;
+
     pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::validate_bucket_object_lock_enabled;
-    pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::decode_tags as decode_stored_tags;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::{
+        decode_tags as decode_stored_tags, encode_tags as encode_stored_tags,
+    };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi;
     pub(crate) use crate::storage::storage_api::parse_object_version_id;
 }
@@ -1830,9 +1868,13 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod multipart {
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::multipart::ListPartsOwner;
             pub(crate) use super::super::super::storage_contracts::{
-                CompletePart, ListMultipartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
+                CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::{MultipartAbortAuthorization, MultipartOwner};
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 
@@ -1860,8 +1902,8 @@ pub(crate) mod select_object {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::StorageError;
     pub(crate) use crate::storage::storage_api::{
-        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
-        validate_ssec_for_read,
+        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store_owned,
+        validate_sse_headers_for_read, validate_ssec_for_read,
     };
 }
 

@@ -15,6 +15,8 @@
 #[cfg(feature = "internode-transport")]
 pub mod external_transport;
 pub mod http_service;
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+pub mod nixl_read;
 pub mod node_service;
 
 pub use http_service::InternodeRpcService;
@@ -31,6 +33,33 @@ use serde::Serialize;
 /// Uses `.with_struct_map()` so structs are serialized with named fields
 /// (msgpack map) instead of positional arrays. This matches what the
 /// client-side `Deserializer::new()` expects.
+/// Opens a shard file for positional reads (the NIXL serve path) and
+/// refuses it unless the opened file lies inside its volume directory: `path`
+/// passed the string-level containment check, but a symlink inside the volume
+/// could still point elsewhere. The check reads the opened descriptor's real
+/// path, so nothing can change between the check and the use.
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+pub(crate) fn open_shard_contained(path: &std::path::Path, key: &str) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut volume = path.to_path_buf();
+        for _ in std::path::Path::new(key).components() {
+            volume.pop();
+        }
+        let volume = std::fs::canonicalize(&volume)?;
+        let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        if !opened.starts_with(&volume) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "shard path resolves outside its volume",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 pub(crate) fn encode_msgpack_map<T: Serialize>(value: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
     let mut buf = Vec::new();
     value.serialize(&mut Serializer::new(&mut buf).with_struct_map())?;
@@ -39,6 +68,23 @@ pub(crate) fn encode_msgpack_map<T: Serialize>(value: &T) -> Result<Vec<u8>, rmp
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", feature = "nixl"))]
+    #[test]
+    fn shard_opens_stay_inside_their_volume() {
+        let base = std::env::temp_dir().join(format!("rustfs-shard-open-{}", std::process::id()));
+        let volume = base.join("disk").join("bucket");
+        std::fs::create_dir_all(volume.join("obj")).expect("volume");
+        std::fs::write(volume.join("obj").join("part.1"), b"shard").expect("shard");
+        std::fs::create_dir_all(base.join("outside")).expect("outside");
+        std::fs::write(base.join("outside").join("secret"), b"secret").expect("secret");
+        std::os::unix::fs::symlink(base.join("outside"), volume.join("link")).expect("symlink");
+
+        assert!(super::open_shard_contained(&volume.join("obj").join("part.1"), "obj/part.1").is_ok());
+        let escaped = super::open_shard_contained(&volume.join("link").join("secret"), "link/secret");
+        assert_eq!(escaped.expect_err("symlink escape").kind(), std::io::ErrorKind::PermissionDenied);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::encode_msgpack_map;
     use rmp_serde::{Deserializer, Serializer};
     use rustfs_madmin::{BackendDisks, BackendInfo, Disk, ITEM_ONLINE, StorageInfo};

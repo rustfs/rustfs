@@ -79,6 +79,18 @@ pub(crate) struct StartupHttpServers {
     pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
 }
 
+/// cuObject S3-over-RDMA servers live for the process lifetime; they stop with it.
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+async fn init_cuobject_servers() -> Result<()> {
+    crate::app::object::cuobject::init_cuobject_service().await?;
+    Ok(())
+}
+
+#[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+async fn init_cuobject_servers() -> Result<()> {
+    Ok(())
+}
+
 pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
@@ -244,8 +256,8 @@ pub(crate) async fn init_embedded_startup_listen_context(
         // The instance context is per-server, so region publication cannot
         // panic on a second embedded server; the process still has one region
         // for legacy ambient readers.
-        instance_ctx.set_region(region.into());
-        instance_ctx.set_additional_regions(additional_regions.into_iter().map(Into::into).collect());
+        instance_ctx.set_region(region);
+        instance_ctx.set_additional_regions(additional_regions);
     }
 
     startup_runtime_sources::publish_server_port(server_addr.port());
@@ -289,6 +301,8 @@ pub(crate) async fn init_startup_http_servers(
         Some(console_config) => Some(start_http_server(&console_config, readiness, server_ctx).await?.0),
         None => None,
     };
+
+    init_cuobject_servers().await?;
 
     Ok(StartupHttpServers {
         state_manager,
@@ -394,11 +408,11 @@ fn validate_console_listener_address(config: &Config, s3_addr: SocketAddr) -> Re
 /// regions `CreateBucket` accepts as a `LocationConstraint`. Whitespace around
 /// entries is ignored; an empty or invalid entry is an error, as an invalid
 /// single region always was.
-fn parse_region_list(region_str: &str) -> Result<(s3s::region::Region, Vec<s3s::region::Region>)> {
+fn parse_region_list(region_str: &str) -> Result<(rustfs_s3_types::Region, Vec<rustfs_s3_types::Region>)> {
     let mut regions = region_str.split(',').map(|entry| {
         entry
             .trim()
-            .parse::<s3s::region::Region>()
+            .parse::<rustfs_s3_types::Region>()
             .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))
     });
     let region = regions
