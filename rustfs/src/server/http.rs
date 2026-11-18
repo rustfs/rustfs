@@ -4379,6 +4379,7 @@ mod tests {
         let data = ControlBodyDigestService::new(inner, Duration::from_secs(1));
         let console = data.clone().with_console_listener(true);
         for (uri, expected) in [
+            ("/", StatusCode::NOT_FOUND),
             ("/bucket/notes.txt", StatusCode::NOT_FOUND),
             ("/bucket/notes.txt?response-content-type=text%2Fplain", StatusCode::NOT_FOUND),
             ("/favicon.ico?events", StatusCode::NOT_FOUND),

@@ -1903,19 +1903,21 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
         };
         let legacy_outcome = outcome(
             legacy_result.map_err(|err| err.code().clone()),
-            bucket_config_mutation_incarnation(&legacy, bucket).map_err(|err| err.code().clone()),
+            bucket_config_mutation_incarnation(&legacy, bucket).map_err(|err| err.code().clone().into()),
         );
         let owned_outcome = outcome(
             owned_result.map_err(|err| err.code().clone()),
-            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()),
+            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone().into()),
         );
         // A refused request hands no snapshot on: the use case's reader refuses to run without one.
         let refused_without_snapshot = |snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| {
             matches!(expected, MutationOutcome::Allowed(_)) || snapshot == Err(S3ErrorCode::InternalError)
         };
-        let both_refused_without_snapshot =
-            refused_without_snapshot(bucket_config_mutation_incarnation(&legacy, bucket).map_err(|err| err.code().clone()))
-                && refused_without_snapshot(bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()));
+        let both_refused_without_snapshot = refused_without_snapshot(
+            bucket_config_mutation_incarnation(&legacy, bucket).map_err(|err| err.code().clone().into()),
+        ) && refused_without_snapshot(
+            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone().into()),
+        );
         let bucket_recorded = [legacy.extensions.get::<ReqInfo>(), owned.req_info()]
             .iter()
             .all(|info| info.and_then(|info| info.bucket.as_deref()) == Some(bucket));

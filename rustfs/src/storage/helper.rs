@@ -14,7 +14,7 @@
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
 use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
-use crate::storage::access::ReqInfo;
+use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -854,7 +854,7 @@ impl Drop for OperationHelper {
 mod tests {
     use super::OperationHelper;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
-    use crate::storage::access::ReqInfo;
+    use crate::storage::req_info::ReqInfo;
     use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
