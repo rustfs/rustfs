@@ -849,7 +849,12 @@ impl RequestEnvelope {
             self.client_info(),
             self.remote_addr(),
             self.request_context(),
-            self.bucket_generation(),
+            PendingDeleteBucketGenerationGuard::resolve_generation(
+                self.bucket_generation(),
+                self.pending_delete_bucket_generation(),
+            )
+            .ok()
+            .flatten(),
         )
     }
 }

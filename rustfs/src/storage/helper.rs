@@ -60,7 +60,12 @@ pub(crate) struct AuditRequestView<'a> {
 impl<'a> AuditRequestView<'a> {
     pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
         Self {
-            bucket_generation: req.extensions.get(),
+            bucket_generation: super::authorization::PendingDeleteBucketGenerationGuard::resolve_generation(
+                req.extensions.get(),
+                req.extensions.get(),
+            )
+            .ok()
+            .flatten(),
             headers: &req.headers,
             uri: &req.uri,
             req_info: req.extensions.get::<ReqInfo>(),
@@ -1079,6 +1084,48 @@ mod tests {
             Some("s3:DeleteObject")
         );
         assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[test]
+    fn notification_view_uses_the_generation_validated_for_deferred_deletes() {
+        use crate::storage::authorization::{BucketGenerationGuard, PendingDeleteBucketGenerationGuard};
+
+        let ordinary = uuid::Uuid::new_v4();
+        let deleted = uuid::Uuid::new_v4();
+        let mut request = build_request((), Method::DELETE, "/bucket/object".parse().expect("delete URI"));
+        request.extensions.insert(BucketGenerationGuard {
+            bucket: "bucket".to_string(),
+            incarnation_id: ordinary,
+        });
+        request
+            .extensions
+            .insert(PendingDeleteBucketGenerationGuard::Ready(BucketGenerationGuard {
+                bucket: "bucket".to_string(),
+                incarnation_id: deleted,
+            }));
+        assert_eq!(
+            super::AuditRequestView::legacy(&request)
+                .bucket_generation
+                .map(|guard| guard.incarnation_id),
+            Some(deleted),
+            "delete notifications must use the deferred guard that storage validates"
+        );
+        request.extensions.insert(PendingDeleteBucketGenerationGuard::Failed {
+            code: rustfs_s3_types::S3ErrorCode::NoSuchBucket,
+            message: "bucket generation unavailable".to_string(),
+        });
+        assert!(
+            super::AuditRequestView::legacy(&request).bucket_generation.is_none(),
+            "a failed deferred capture must not fall back to another generation"
+        );
+        request.extensions.remove::<PendingDeleteBucketGenerationGuard>();
+        assert_eq!(
+            super::AuditRequestView::legacy(&request)
+                .bucket_generation
+                .map(|guard| guard.incarnation_id),
+            Some(ordinary),
+            "ordinary operations retain their original generation"
+        );
     }
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
