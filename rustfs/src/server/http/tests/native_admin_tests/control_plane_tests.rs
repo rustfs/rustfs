@@ -31,15 +31,15 @@ const HOST: &str = "localhost:9000";
 
 /// The legacy service, counting every request it is handed.
 #[derive(Clone)]
-struct Recorded(s3s::service::S3Service, Arc<AtomicUsize>);
+struct Recorded(crate::server::http::S3Service, Arc<AtomicUsize>);
 
 impl<B> Service<HttpRequest<B>> for Recorded
 where
-    s3s::service::S3Service: Service<HttpRequest<B>>,
+    crate::server::http::S3Service: Service<HttpRequest<B>>,
 {
-    type Response = <s3s::service::S3Service as Service<HttpRequest<B>>>::Response;
-    type Error = <s3s::service::S3Service as Service<HttpRequest<B>>>::Error;
-    type Future = <s3s::service::S3Service as Service<HttpRequest<B>>>::Future;
+    type Response = <crate::server::http::S3Service as Service<HttpRequest<B>>>::Response;
+    type Error = <crate::server::http::S3Service as Service<HttpRequest<B>>>::Error;
+    type Future = <crate::server::http::S3Service as Service<HttpRequest<B>>>::Future;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Service::<HttpRequest<B>>::poll_ready(&mut self.0, cx)
@@ -56,7 +56,7 @@ type Edge = crate::server::stack::S3StackService<Recorded, GatewayEdgeService>;
 /// The gateway selection over `router`, with a legacy service that records every call.
 fn edge(
     slot: &Arc<ServerContextSlot>,
-    legacy: s3s::service::S3Service,
+    legacy: crate::server::http::S3Service,
     router: S3Router<AdminOperation>,
 ) -> (Edge, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -618,7 +618,7 @@ fn probe_router(slot: &Arc<ServerContextSlot>) -> S3Router<AdminOperation> {
 #[serial_test::serial]
 async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
     let (_env, slot, _) = admin_fixture().await;
-    let mut legacy = s3s::service::S3ServiceBuilder::new(UnusedS3);
+    let mut legacy = crate::server::http::S3ServiceBuilder::new(UnusedS3);
     legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
     legacy.set_route(probe_router(&slot));
     let legacy = legacy.build();
