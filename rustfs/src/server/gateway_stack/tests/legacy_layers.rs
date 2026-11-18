@@ -26,6 +26,7 @@ use super::*;
 use rustfs_gateway::{Handler, HandlerResult, Req, Resp, allow_when, dto};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod double_slash_list_buckets_compat;
 mod s3_error_message_compat;
 mod sigv4_header_guard;
 
