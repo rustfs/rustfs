@@ -94,7 +94,7 @@ fn signed_as(method: Method, path: &str, query: &str, key: &str, secret: &str, f
 enum Compare {
     /// Status, content type and the whole body.
     Bytes,
-    /// Status, and the JSON documents the two bodies hold.
+    /// Status, content type, and the JSON documents the two bodies hold.
     Json,
     /// Status, and the error code and message.
     Refusal,
@@ -343,8 +343,9 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
                     && snapshot_error_xml_or_bytes(&old.2) == snapshot_error_xml_or_bytes(&new.2)
             }
             Compare::Json => {
-                serde_json::from_slice::<serde_json::Value>(&old.2).ok()
-                    == serde_json::from_slice::<serde_json::Value>(&new.2).ok()
+                old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE)
+                    && serde_json::from_slice::<serde_json::Value>(&old.2).ok()
+                        == serde_json::from_slice::<serde_json::Value>(&new.2).ok()
             }
             // The gateway's authenticator words the disabled-key refusal itself, as on the native routes.
             Compare::Refusal if *label == "disabled user" => {
