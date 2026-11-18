@@ -111,18 +111,12 @@ fn is_pool_meta_object(bucket: &str, object: &str) -> bool {
     bucket == RUSTFS_META_BUCKET && object == POOL_META_NAME
 }
 
-/// Whether a drive, as a pool.bin heal inspection reports it, needs a repair
-/// that a write can deliver: the drive answers but lacks the current copy.
-///
-/// An offline or faulty drive cannot take the write. Republishing pool.bin
-/// for it anyway gives the reachable replicas a new version and leaves the
-/// unreachable one a version behind once it is back. In a set of three drives
-/// at EC:1, losing another drive then leaves one current and one stale
-/// replica: pool.bin has no read quorum and no node can start.
+/// Republish only for a confirmed missing, stale, or corrupt replica. A failed
+/// probe (including a timeout) can leave the replica intact. Republishing to
+/// the other drives in that case can leave no quorum after the next drive loss.
 fn pool_meta_drive_needs_repair(state: &str) -> bool {
     use rustfs_heal_contracts::heal_channel::DriveState;
-    let current_or_unreachable = [DriveState::Ok, DriveState::Offline, DriveState::Faulty];
-    !current_or_unreachable.iter().any(|skip| state == skip.to_str())
+    state == DriveState::Missing.to_str() || state == DriveState::Corrupt.to_str()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3848,7 +3842,7 @@ mod tests {
             replicas_before.push(raw.buf);
         }
 
-        let (result, _) = tokio::time::timeout(
+        let (result, error) = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             store.handle_heal_object(
                 RUSTFS_META_BUCKET,
@@ -3865,6 +3859,8 @@ mod tests {
         .expect("pool metadata read repair should not hang on an unreachable drive")
         .expect("pool metadata read repair should report its outcome");
 
+        assert!(error.is_none(), "pool metadata inspection should have read quorum: {error:?}");
+        assert!(!result.metadata_repair_verified, "skipping a write must not report a verified repair");
         assert!(
             result
                 .after
@@ -3884,15 +3880,18 @@ mod tests {
     }
 
     #[test]
-    fn pool_meta_drive_needs_repair_only_for_a_reachable_drive_without_the_current_copy() {
-        for state in [DriveState::Ok, DriveState::Offline, DriveState::Faulty] {
+    fn pool_meta_drive_needs_repair_only_for_confirmed_replica_damage() {
+        for state in [
+            DriveState::Ok,
+            DriveState::Offline,
+            DriveState::Faulty,
+            DriveState::Unknown(DiskError::Timeout.to_string()),
+            DriveState::Unknown(DiskError::from(tonic::Status::deadline_exceeded("metadata read deadline")).to_string()),
+            DriveState::Unknown(DiskError::from(tonic::Status::permission_denied("metadata read denied")).to_string()),
+        ] {
             assert!(!pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
         }
-        for state in [
-            DriveState::Missing,
-            DriveState::Corrupt,
-            DriveState::Unknown("outdated".to_string()),
-        ] {
+        for state in [DriveState::Missing, DriveState::Corrupt] {
             assert!(pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
         }
     }
