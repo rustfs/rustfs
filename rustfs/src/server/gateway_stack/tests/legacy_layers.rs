@@ -26,6 +26,7 @@ use super::*;
 use rustfs_gateway::{Handler, HandlerResult, Req, Resp, allow_when, dto};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod s3_error_message_compat;
 mod sigv4_header_guard;
 
 /// A handler for every operation these tests reach. It records that it ran and answers an empty
