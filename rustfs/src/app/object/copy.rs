@@ -1186,7 +1186,7 @@ mod tests {
             .build()
             .expect("self-copy input should build");
         let mut req = build_request(input, Method::PUT);
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
+        req.extensions.insert(crate::storage::req_info::ReqInfo::default());
         fs.copy_object(&mut req)
             .await
             .expect("authorize self-copy whose object key equals its bucket");

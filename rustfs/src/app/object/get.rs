@@ -4454,7 +4454,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(envelope, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err.into()))),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}

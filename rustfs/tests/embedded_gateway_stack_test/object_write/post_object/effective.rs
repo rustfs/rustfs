@@ -223,20 +223,42 @@ fn gateway_post_stores_the_authorized_form_metadata_and_bucket_retention() {
             access_key: USER,
             secret_key: stack::USER_SECRET_KEY,
         };
-        let rejected_wire_property = caller
-            .post_form(
-                BUCKET,
-                &[("key", "wire-property"), ("x-amz-storage-class", "STANDARD")],
-                &[("x-amz-meta-purpose", "wire")],
-                true,
-                true,
-            )
-            .await;
-        assert_eq!(rejected_wire_property.status, 403, "{}", rejected_wire_property.body);
-        assert!(
-            sdk.head_object().bucket(BUCKET).key("wire-property").send().await.is_err(),
-            "a POST object property supplied outside the form must not publish an object"
-        );
+        for (index, (name, value)) in [
+            ("x-amz-meta-purpose", "wire"),
+            ("x-minio-meta-purpose", "wire"),
+            ("x-rustfs-meta-purpose", "wire"),
+            ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+            ("x-amz-meta-snowball-auto-extract", "true"),
+            ("x-amz-snowball-auto-extract", "true"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("wire-property-{index}");
+            let denied = caller
+                .post_form(
+                    BUCKET,
+                    &[
+                        ("key", &key),
+                        ("x-amz-storage-class", "STANDARD"),
+                        ("x-amz-meta-purpose", "form"),
+                    ],
+                    &[(name, value)],
+                    true,
+                    true,
+                )
+                .await;
+            assert_eq!(denied.status, 403, "{name}: {}", denied.body);
+            assert!(denied.body.contains("<Code>AccessDenied</Code>"), "{name}: {}", denied.body);
+            let error = sdk
+                .head_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .send()
+                .await
+                .expect_err("rejected form must not publish");
+            assert!(error.as_service_error().is_some_and(|error| error.is_not_found()), "{name}: {error}");
+        }
         let answer = caller
             .post_form(
                 BUCKET,
