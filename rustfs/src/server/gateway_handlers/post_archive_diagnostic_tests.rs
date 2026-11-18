@@ -13,13 +13,15 @@
 // limitations under the License.
 
 //! Test-only assembly of verified POST preflight and shared member authorization.
-//! The production gateway handler remains closed for archive extraction.
+//! Production archive admission is opened only under test-owned staging resources.
 
 use super::*;
 use crate::app::object::post_body::{
     PostBodyIntegrity, VerifiedPostArchivePolicy, stage_post_archive_for_test, with_archive_resources_for_test,
 };
-use crate::app::object::post_headers::{post_archive_checksum_headers, post_archive_content_md5};
+use crate::app::object::post_headers::{
+    install_post_archive_form_metadata, post_archive_checksum_headers, post_archive_content_md5,
+};
 use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput};
 use crate::storage_api::server::http::access::access_owned::object_write::{
     PostObjectFormPolicy, PostObjectPolicyFields, PutObjectAuthorization, authorize_post_object, authorize_put_object,
@@ -91,6 +93,7 @@ impl Handler<dto::PostObject> for Probe {
         let key = input.key.as_str().to_owned();
         authorize_form(&mut envelope, &self.server, &bucket, &key).await?;
         self.authorized.fetch_add(1, Ordering::SeqCst);
+        install_post_archive_form_metadata(&mut envelope, &input.metadata).map_err(handler_error)?;
         let generation = envelope
             .take_bucket_generation()
             .ok_or_else(|| HandlerError::internal_error("archive generation is missing"))?;
@@ -153,7 +156,7 @@ fn signed_form(archive: &[u8], bad_checksum: bool, tampered: bool) -> Vec<u8> {
         "conditions":[
             {"bucket":BUCKET}, ["starts-with","$key","allowed/"], {"x-amz-algorithm":"AWS4-HMAC-SHA256"},
             {"x-amz-credential":credential}, {"x-amz-date":stamp},
-            {"x-amz-checksum-sha256":sha}, {"content-md5":md5}
+            {"x-amz-checksum-sha256":sha}, {"content-md5":md5}, {"x-amz-meta-snowball-auto-extract":"true"}
         ]
     });
     let encoded = base64_simd::STANDARD.encode_to_string(policy.to_string().as_bytes());
@@ -175,6 +178,7 @@ fn signed_form(archive: &[u8], bad_checksum: bool, tampered: bool) -> Vec<u8> {
         ("x-amz-date", stamp.as_str()),
         ("x-amz-checksum-sha256", sha.as_str()),
         ("content-md5", md5.as_str()),
+        ("x-amz-meta-snowball-auto-extract", "true"),
         ("policy", encoded.as_str()),
         ("x-amz-signature", signature.as_str()),
     ] {
@@ -305,7 +309,6 @@ async fn signed_snapshot_preflight_and_member_iam_gate_real_storage() {
                 .uri(format!("/{BUCKET}"))
                 .header("host", "localhost")
                 .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
-                .header("x-amz-meta-snowball-auto-extract", "true")
                 .header("content-length", form.len())
                 .body(Full::new(Bytes::from(form)))
                 .expect("signed diagnostic request");
@@ -409,7 +412,6 @@ async fn signed_snapshot_preflight_and_member_iam_gate_real_storage() {
                 .uri(format!("/{BUCKET}"))
                 .header("host", "localhost")
                 .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
-                .header("x-amz-meta-snowball-auto-extract", "true")
                 .header("content-length", form.len())
                 .body(Full::new(Bytes::from(form)))
                 .expect("signed production request");

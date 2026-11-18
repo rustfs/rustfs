@@ -1822,7 +1822,14 @@ mod access_phase_tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(http::header::CONTENT_TYPE, "multipart/form-data; boundary=test".parse().unwrap());
         super::validate_post_object_metadata(&headers, Some("client=browser")).unwrap();
-        for query in ["X-Amz-Meta-Label=test", "X%2DAmz-Storage-Class=STANDARD"] {
+        for query in [
+            "X-Amz-Meta-Label=test",
+            "X%2DAmz-Storage-Class=STANDARD",
+            "x-minio-meta-label=test",
+            "x-rustfs-meta-label=test",
+            "X-Amz-Snowball-Auto-Extract=true",
+            "x-amz-meta-snowball-auto-extract=true",
+        ] {
             assert!(super::validate_post_object_metadata(&headers, Some(query)).is_err());
         }
         for name in [
@@ -1830,6 +1837,8 @@ mod access_phase_tests {
             "x-minio-meta-label",
             "x-rustfs-meta-label",
             "x-amz-storage-class",
+            "x-amz-snowball-auto-extract",
+            "x-amz-meta-snowball-auto-extract",
         ] {
             headers.insert(name, "test".parse().unwrap());
             assert!(super::validate_post_object_metadata(&headers, None).is_err());
