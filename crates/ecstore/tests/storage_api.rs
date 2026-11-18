@@ -98,3 +98,8 @@ pub(crate) mod pinned_erasure_fixtures {
 pub(crate) mod bucket_config_codec {
     pub(crate) use rustfs_ecstore::api::bucket::utils::{BucketConfigXml, deserialize, serialize};
 }
+
+pub(crate) mod local_drive_retirement {
+    pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::Disk;
+}
