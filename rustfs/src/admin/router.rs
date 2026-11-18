@@ -852,7 +852,7 @@ async fn authorize_object_lambda_request(req: &mut S3Request<Body>, bucket: &str
         bucket: Some(bucket.to_owned()),
         object: Some(object.to_owned()),
         version_id: None,
-        region: current_region().map(Into::into),
+        region: current_region(),
         ..Default::default()
     });
 
