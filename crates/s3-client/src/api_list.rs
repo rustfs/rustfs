@@ -411,13 +411,10 @@ impl ListObjectsOptions {
 
 fn decode_s3_name(name: &str, encoding_type: &str) -> Result<String, std::io::Error> {
     match encoding_type {
-        "url" => {
-            //return url::QueryUnescape(name);
-            return Ok(name.to_string());
-        }
-        _ => {
-            return Ok(name.to_string());
-        }
+        "url" => urlencoding::decode(name)
+            .map(|decoded| decoded.into_owned())
+            .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err)),
+        _ => Ok(name.to_string()),
     }
 }
 
@@ -447,6 +444,170 @@ mod tests {
             max_retries: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn url_encoded_s3_names_are_decoded() {
+        for (encoded, expected) in [
+            ("test_file%283%29.png", "test_file(3).png"),
+            ("dir%20a/file.txt", "dir a/file.txt"),
+            ("%E4%B8%AD%E6%96%87.txt", "中文.txt"),
+            ("%F0%9F%98%80.txt", "😀.txt"),
+            ("file%2bname+%25.txt", "file+name+%.txt"),
+            ("literal%252F.txt", "literal%2F.txt"),
+            ("dir%2Ffile%00%01.txt", "dir/file\0\u{1}.txt"),
+            ("", ""),
+        ] {
+            assert_eq!(decode_s3_name(encoded, "url").expect("valid URL-encoded S3 key"), expected);
+        }
+    }
+
+    #[test]
+    fn s3_names_without_url_encoding_are_preserved() {
+        for encoding in ["", "unknown"] {
+            let name = "中文+%20%FF.txt";
+            assert_eq!(decode_s3_name(name, encoding).expect("unencoded key should pass through"), name);
+        }
+    }
+
+    #[test]
+    fn url_encoded_s3_names_reject_invalid_utf8() {
+        for name in ["%FF", "%C3%28", "%E4%B8", "%ED%A0%80", "%C0%AF"] {
+            let err = decode_s3_name(name, "url").expect_err("invalid UTF-8 must not become a different object key");
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn url_encoded_s3_names_preserve_malformed_percent_escapes() {
+        // Match urlencoding's permissive handling without treating '+' as a space.
+        for name in ["file%", "file%2", "file%GG+name"] {
+            assert_eq!(decode_s3_name(name, "url").expect("literal malformed escape"), name);
+        }
+    }
+
+    async fn list_response_fixture(responses: Vec<&'static str>) -> (TransitionClient, tokio::task::JoinHandle<Vec<url::Url>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("list fixture should bind");
+        let endpoint = listener.local_addr().expect("list fixture address").to_string();
+        let fixture = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let mut requests = Vec::new();
+                for body in responses {
+                    let (mut stream, _) = listener.accept().await.expect("list fixture should accept request");
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut buffer).await.expect("list fixture should read request");
+                        assert_ne!(read, 0, "request headers must be complete");
+                        request.extend_from_slice(&buffer[..read]);
+                        assert!(request.len() <= 16 * 1024, "fixture request headers should be bounded");
+                    }
+                    let request = std::str::from_utf8(&request).expect("request headers should be UTF-8");
+                    let target = request.split_whitespace().nth(1).expect("request should have a target");
+                    requests.push(url::Url::parse(&format!("http://localhost{target}")).expect("request URL should parse"));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.expect("list fixture should send response");
+                }
+                requests
+            })
+            .await
+            .expect("list fixture should finish within its deadline")
+        });
+        let client = TransitionClient::new_with_timeouts(
+            &endpoint,
+            timeout_test_options(),
+            "",
+            TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_secs(1), Duration::from_secs(1)),
+        )
+        .await
+        .expect("list fixture client should build");
+        client
+            .bucket_loc_cache
+            .lock()
+            .expect("location cache should lock")
+            .set("bucket", "us-east-1");
+        (client, fixture)
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_decodes_prefixes_and_preserves_continuation_tokens() {
+        let (client, fixture) = list_response_fixture(vec![
+            r#"<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>
+                <CommonPrefixes><Prefix>dir%20a/</Prefix></CommonPrefixes>
+                <NextContinuationToken>opaque%2F+token</NextContinuationToken></ListBucketResult>"#,
+            "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>",
+        ])
+        .await;
+        let first = client
+            .list_objects_v2_query("bucket", "", "", false, false, "/", "", 1, HeaderMap::new())
+            .await
+            .expect("first object page should decode");
+        assert_eq!(first.common_prefixes[0].prefix, "dir a/");
+        assert_eq!(first.next_continuation_token, "opaque%2F+token");
+        let second = client
+            .list_objects_v2_query("bucket", "", &first.next_continuation_token, false, false, "/", "", 1, HeaderMap::new())
+            .await
+            .expect("second object page should succeed");
+        assert!(!second.is_truncated);
+        let requests = fixture.await.expect("object list fixture should join");
+        let query: HashMap<_, _> = requests[1].query_pairs().into_owned().collect();
+        assert_eq!(query.get("continuation-token").map(String::as_str), Some("opaque%2F+token"));
+        assert_eq!(query.get("encoding-type").map(String::as_str), Some("url"));
+    }
+
+    #[tokio::test]
+    async fn list_versions_decodes_names_and_round_trips_pagination_markers() {
+        let (client, fixture) = list_response_fixture(vec![
+            r#"<ListVersionsResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>
+                <Version><Key>dir%20a/%E4%B8%AD%E6%96%87%2B%252F.txt</Key><VersionId>version%2F+id</VersionId></Version>
+                <DeleteMarker><Key>deleted%20file%2B.txt</Key><VersionId>delete%2F+id</VersionId></DeleteMarker>
+                <CommonPrefixes><Prefix>dir%20a/</Prefix></CommonPrefixes>
+                <NextKeyMarker>dir%20a/%E4%B8%AD%E6%96%87%2B%252F.txt</NextKeyMarker>
+                <NextVersionIdMarker>version%2F+id</NextVersionIdMarker></ListVersionsResult>"#,
+            "<ListVersionsResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListVersionsResult>",
+        ])
+        .await;
+        let mut opts = ListObjectsOptions::default();
+        opts.set("prefix", "dir a/");
+        let first = client
+            .list_object_versions_query("bucket", &opts, "", "", "/")
+            .await
+            .expect("first version page");
+        assert_eq!(first.versions[0].key, "dir a/中文+%2F.txt");
+        assert_eq!(first.versions[0].version_id, "version%2F+id");
+        assert_eq!(first.delete_markers[0].key, "deleted file+.txt");
+        assert_eq!(first.delete_markers[0].version_id, "delete%2F+id");
+        assert_eq!(first.common_prefixes[0].prefix, "dir a/");
+        assert_eq!(first.next_key_marker, "dir a/中文+%2F.txt");
+        assert_eq!(first.next_version_id_marker, "version%2F+id");
+        let second = client
+            .list_object_versions_query("bucket", &opts, &first.next_key_marker, &first.next_version_id_marker, "/")
+            .await
+            .expect("second version page");
+        assert!(!second.is_truncated);
+        let requests = fixture.await.expect("version list fixture should join");
+        let query: HashMap<_, _> = requests[1].query_pairs().into_owned().collect();
+        assert_eq!(query.get("key-marker").map(String::as_str), Some("dir a/中文+%2F.txt"));
+        assert_eq!(query.get("version-id-marker").map(String::as_str), Some("version%2F+id"));
+        assert_eq!(query.get("prefix").map(String::as_str), Some("dir a/"));
+        assert_eq!(query.get("encoding-type").map(String::as_str), Some("url"));
+    }
+
+    #[tokio::test]
+    async fn list_versions_rejects_invalid_utf8_keys() {
+        let (client, fixture) = list_response_fixture(vec![
+            "<ListVersionsResult><EncodingType>url</EncodingType><Version><Key>%FF</Key></Version></ListVersionsResult>",
+        ])
+        .await;
+        let err = client
+            .list_object_versions_query("bucket", &ListObjectsOptions::default(), "", "", "")
+            .await
+            .expect_err("invalid UTF-8 in a remote key should fail the listing");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(fixture.await.expect("invalid key fixture should join").len(), 1);
     }
 
     #[test]

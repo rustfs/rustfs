@@ -210,6 +210,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
     } = lifecycle;
     let StartupServiceRuntime {
         table_maintenance,
+        table_rename_recovery,
         oidc_recovery,
         optional_runtimes,
         heartbeat,
@@ -226,7 +227,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
         subsystem = LOG_SUBSYSTEM_STARTUP,
         version = %crate::version::get_version(),
         server_address = %server_address,
-        started_at = %jiff::Zoned::now(),
+        started_at = %jiff::ZonedDateTime::now(),
         iam_bootstrap = ?iam_bootstrap,
         "RustFS server ready"
     );
@@ -246,6 +247,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
         StartupShutdownServices {
             capacity: capacity_tasks,
             table_maintenance,
+            table_rename_recovery,
             #[cfg(feature = "internode-transport")]
             peer_control: peer_control.take(),
         },

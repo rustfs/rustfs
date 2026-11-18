@@ -1405,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_storage_snapshot_tracks_read_write_quorum_and_recovery() {
-        for (drive_count, parity) in [(4, 2), (4, 1), (8, 2)] {
+        for (drive_count, parity) in [(2, 1), (3, 1), (4, 2), (4, 1), (8, 2)] {
             let store = runtime_inventory(&[(1, drive_count, parity)]).await;
             let data = drive_count - parity;
             let write_quorum = data + usize::from(data == parity);
@@ -1688,6 +1688,54 @@ mod tests {
         assert!(waited >= Duration::from_secs(10), "published after {waited:?}");
         assert!(readiness.is_ready());
         assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
+    }
+
+    #[tokio::test]
+    async fn two_drive_startup_admits_reads_without_write_quorum_but_requires_iam() {
+        let mut store = runtime_inventory(&[(1, 2, 1)]).await;
+        store.disks.get_mut(&DiskSetSelector::new(0, 0)).expect("configured set")[1] = None;
+
+        for (online, iam_ready, expected_ready) in [(true, true, true), (true, false, false), (false, true, false)] {
+            let hosts = if online {
+                HashSet::from(["node-0:9000".to_string()])
+            } else {
+                HashSet::new()
+            };
+            let (info, unavailable_drives, missing_drives) = node_storage_snapshot(&store, &hosts)
+                .await
+                .expect("snapshot surviving drive and missing slot");
+            assert_eq!(missing_drives.len(), 1);
+            let (dependencies, _, details) = apply_node_service_readiness(
+                StorageWriteReadinessStatus {
+                    ready: false,
+                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetaWriteBlocked),
+                },
+                StorageReadinessDetails {
+                    read_quorum_ready: storage_read_ready_from_runtime_state(&info),
+                    write_quorum_ready: storage_ready_from_runtime_state(&info),
+                    unavailable_drives,
+                    missing_drives,
+                    ..Default::default()
+                },
+                true,
+                iam_ready,
+                true,
+            );
+            assert!(!details.write_quorum_ready, "one surviving drive cannot authorize writes");
+            assert!(!details.pool_metadata_write_ready);
+            let readiness = GlobalReadiness::new();
+            assert!(readiness_gate_blocks_path("/bucket/object", &readiness));
+            let result = wait_for_runtime_readiness_with(
+                Duration::ZERO,
+                Duration::from_millis(1),
+                || future::ready(dependencies),
+                |_| readiness.mark_stage(rustfs_common::SystemStage::FullReady),
+            )
+            .await;
+            assert_eq!(result.is_ok(), expected_ready, "online={online}, iam_ready={iam_ready}");
+            assert_eq!(readiness.is_ready(), expected_ready);
+            assert_eq!(readiness_gate_blocks_path("/bucket/object", &readiness), !expected_ready);
+        }
     }
 
     #[tokio::test]

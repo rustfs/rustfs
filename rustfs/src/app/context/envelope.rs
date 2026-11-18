@@ -26,7 +26,6 @@
 //! envelope lives in `storage/s3_compat/envelope.rs`.
 
 use super::ServerContextSlot;
-use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
@@ -41,6 +40,7 @@ use crate::app::storage_api::context::{
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
+use crate::storage::request_markers::WebsiteRead;
 use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
@@ -197,6 +197,9 @@ pub struct RequestEnvelope {
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
+    gateway_post: bool,
+    #[cfg(feature = "gateway-stack")]
+    gateway_post_archive_identity: Option<Arc<()>>,
     post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
@@ -248,6 +251,9 @@ impl RequestEnvelope {
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
             post_object: extensions.remove(),
+            gateway_post: false,
+            #[cfg(feature = "gateway-stack")]
+            gateway_post_archive_identity: None,
             post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
@@ -297,6 +303,9 @@ impl RequestEnvelope {
             verified_presigned: self.verified_presigned,
             website_read: self.website_read.clone(),
             post_object: self.post_object.clone(),
+            gateway_post: self.gateway_post,
+            #[cfg(feature = "gateway-stack")]
+            gateway_post_archive_identity: self.gateway_post_archive_identity.clone(),
             post_object_policy_headers: self.post_object_policy_headers.clone(),
             req_info: self.req_info.clone(),
             bucket_generation: self.bucket_generation.clone(),
@@ -374,7 +383,10 @@ impl RequestEnvelope {
         }
     }
 
-    pub(crate) fn mark_permission_probe_request_fact_known(&mut self, fact: crate::storage::access::PermissionProbeRequestFact) {
+    pub(crate) fn mark_permission_probe_request_fact_known(
+        &mut self,
+        fact: crate::storage::request_markers::PermissionProbeRequestFact,
+    ) {
         if self.permission_probe {
             self.permission_probe_known_request_facts |= fact as u8;
         }
@@ -482,6 +494,29 @@ impl RequestEnvelope {
         self.post_object.as_ref()
     }
 
+    pub(crate) fn is_gateway_post(&self) -> bool {
+        self.gateway_post
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn mark_gateway_post(&mut self) {
+        self.gateway_post = true;
+        self.gateway_post_archive_identity = None;
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn bind_gateway_post_archive_identity(&mut self) -> Option<&Arc<()>> {
+        if !self.gateway_post {
+            return None;
+        }
+        Some(self.gateway_post_archive_identity.get_or_insert_with(|| Arc::new(())))
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn gateway_post_identity(&self) -> Option<&Arc<()>> {
+        self.gateway_post_archive_identity.as_ref()
+    }
+
     pub(crate) fn req_info(&self) -> Option<&ReqInfo> {
         self.req_info.as_ref()
     }
@@ -496,6 +531,11 @@ impl RequestEnvelope {
 
     pub(crate) fn bucket_generation(&self) -> Option<&BucketGenerationGuard> {
         self.bucket_generation.as_ref()
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn take_bucket_generation(&mut self) -> Option<BucketGenerationGuard> {
+        self.bucket_generation.take()
     }
 
     pub(crate) fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard> {
@@ -520,6 +560,12 @@ impl RequestEnvelope {
 
     pub(crate) fn install_table_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
         self.table_publication_guards = Some(guards);
+    }
+
+    /// Releases preflight guards before uncommitted POST staging; publication must reauthorize.
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn release_table_publication_guards(&mut self) {
+        self.table_publication_guards = None;
     }
 
     pub(crate) fn table_list_access(&self) -> Option<&TableDataPlaneListAccess> {
@@ -554,6 +600,10 @@ impl RequestEnvelope {
         self.post_object_policy_headers.as_ref()
     }
 
+    pub(crate) fn post_object_policy_headers_mut(&mut self) -> Option<&mut HeaderMap> {
+        self.post_object_policy_headers.as_mut().map(|headers| &mut headers.0)
+    }
+
     pub(crate) fn requested_object_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
         self.requested_object_legal_hold.as_ref()
     }
@@ -573,7 +623,7 @@ impl AuthorizationRequest for RequestEnvelope {
     fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
         self.permission_probe_caller_authentication
     }
-    fn permission_probe_request_fact_known(&self, fact: crate::storage::access::PermissionProbeRequestFact) -> bool {
+    fn permission_probe_request_fact_known(&self, fact: crate::storage::request_markers::PermissionProbeRequestFact) -> bool {
         self.permission_probe_known_request_facts & (fact as u8) != 0
     }
     fn permission_probe(&self) -> bool {
@@ -690,6 +740,12 @@ impl AuthorizationRequest for RequestEnvelope {
     }
     fn policy_headers(&self) -> &HeaderMap {
         self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
+    }
+    fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders) {
+        self.post_object_policy_headers = Some(headers);
+    }
+    fn install_post_object_marker(&mut self) {
+        self.post_object = Some(PostObjectRequestMarker);
     }
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions()

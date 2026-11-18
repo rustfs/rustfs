@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! Over-the-wire smoke net for the embedded console listener (backlog#1154
-//! peri-4). The console is a second HTTP listener that serves the full S3/admin
-//! surface plus the unauthenticated console routes under `/rustfs/console`;
+//! peri-4). The console is a second HTTP listener for the control-plane and
+//! unauthenticated console routes under `/rustfs/console`;
 //! before this test its behaviour was only covered by in-process router tests
 //! (`rustfs/src/admin/console.rs`), so a misconfiguration that exposed
 //! credentials through the public console endpoints or fail-opened the
@@ -26,13 +26,13 @@
 //!   * `/rustfs/console/license` exposes only the coarse `licensed` flag.
 //!   * the console SPA prefix dispatches to the static handler, never to the
 //!     S3 API (no S3 error XML), whether or not console assets are embedded.
-//!   * unauthenticated requests to the admin API and the S3 root on the console
-//!     listener are denied (403 AccessDenied) — the extra listener does not
-//!     fail-open the protected surface.
+//!   * unauthenticated admin API requests are denied with 403 AccessDenied.
+//!   * S3 root/object requests on the console listener return an empty 404,
+//!     including authenticated requests, before S3 dispatch.
 //!   * a listener with the console disabled (the main S3 port here) does not
 //!     serve the unauthenticated console endpoints at all.
 
-use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestEnvironment, init_logging, local_http_client, signed_request_with_client};
 use std::error::Error;
 use tokio::time::{Duration, sleep};
 
@@ -166,12 +166,38 @@ async fn test_console_over_the_wire_smoke() -> TestResult {
     let admin_body = admin_response.text().await?;
     assert!(admin_body.contains("AccessDenied"), "admin denial must be AccessDenied: {admin_body}");
 
-    let s3_root_response = client.get(format!("{console_base}/")).send().await?;
+    let signed_data_root = signed_request_with_client(
+        &client,
+        http::Method::GET,
+        &format!("{}/", env.url),
+        &env.access_key,
+        &env.secret_key,
+        None,
+        None,
+    )
+    .await?;
     assert_eq!(
-        s3_root_response.status(),
-        reqwest::StatusCode::FORBIDDEN,
-        "unauthenticated S3 root on the console listener must be denied"
+        signed_data_root.status(),
+        reqwest::StatusCode::OK,
+        "the same credentials must reach S3 on the data listener"
     );
+
+    for path in ["/", "/console-object-bucket/key"] {
+        let url = format!("{console_base}{path}");
+        for signed in [false, true] {
+            let response = if signed {
+                signed_request_with_client(&client, http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await?
+            } else {
+                client.get(&url).send().await?
+            };
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "S3 route {path}, signed={signed} must be isolated from the console listener"
+            );
+            assert!(response.bytes().await?.is_empty(), "isolated S3 routes must not reach a handler");
+        }
+    }
 
     // --- console disabled on a listener means no console surface at all ------
     // The main S3 listener of this same process runs with the console disabled,

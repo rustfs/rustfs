@@ -822,6 +822,11 @@ fn resume_admission_cancel_returns_node_but_native_keeps_physical_and_memory() {
             .unwrap()
             .set_test_capacity(vec![physical.clone()])
             .expect("explicit native physical capacity");
+        // Building the real ECStore fixture can outlive the node admission
+        // sample's three-second lease. Refresh the same owner immediately
+        // before starting the producer so this test reaches the native-open
+        // cancellation boundary instead of testing stale-sample deferral.
+        publish_resume_node(&node, true);
         let mut pause = LocalPublicationPause::install(
             fixture.disk.as_ref(),
             crate::heal::RUSTFS_META_BUCKET,

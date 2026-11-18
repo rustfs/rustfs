@@ -18,7 +18,7 @@ use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_s
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
-    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
+    store::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
         MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, SITE_REPLICATOR_CLAIM,
         SITE_REPLICATOR_SERVICE_ACCOUNT, STATUS_DISABLED, STATUS_ENABLED, UpdateServiceAccountOpts,
@@ -1590,6 +1590,20 @@ where
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
+        // A virtual OIDC parent is a canonical base64url-encoded SHA-256 digest.
+        // It has no stored user record to collide with in the checks below.
+        if access_key.len() == 43
+            && base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(access_key.as_bytes())
+                .is_ok_and(|bytes| bytes.len() == 32)
+        {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
+        // The access key is a single durable IAM path component. Reject
+        // unrepresentable keys before allocating or waiting on mutation locks.
+        if access_key.contains(['\0', '/', '\\']) || matches!(access_key, "" | "." | "..") {
+            return Err(Error::InvalidArgument);
+        }
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let parent_guard = parent_lock.lock_owned().await;
         let _service_guard = self.cache.service_account_mutation_lock().lock().await;
@@ -1979,38 +1993,25 @@ where
         // whose time predates the entity's load time — a replicated edit
         // whose source time is older than this node's startup would
         // otherwise never reach the cache.
-        let gi = match cache.groups.get(group) {
-            Some(res) => {
-                let mut gi = res.clone();
+        drop(cache);
+        let (edit, current) = self.api.begin_group_edit(group).await?;
+        let gi = match current {
+            Some(mut gi) => {
                 let mut uniq_set: HashSet<String, std::collections::hash_map::RandomState> =
                     HashSet::from_iter(gi.members.iter().cloned());
-                uniq_set.extend(members.iter().cloned());
+                uniq_set.extend(members);
 
                 gi.members = uniq_set.into_iter().collect();
                 gi.update_at = Some(updated_at);
                 gi
             }
             None => {
-                let mut gi = GroupInfo::new(members.clone());
+                let mut gi = GroupInfo::new(members);
                 gi.update_at = Some(updated_at);
                 gi
             }
         };
-        drop(cache);
-
-        self.api.save_group_info(group, gi.clone()).await?;
-
-        self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
-            cache.add_or_update_group(group, &gi, now);
-
-            let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-            members.iter().for_each(|member| {
-                let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
-                m.insert(group.to_string());
-                cache.add_or_update_user_group_membership(member, &m, now);
-            });
-        });
+        self.save_group_and_publish(group, &*edit, gi).await?;
 
         Ok(updated_at)
     }
@@ -2026,13 +2027,8 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        let cache = self.cache.snapshot();
-        let groups = Arc::clone(&cache.groups);
-        let mut gi = match groups.get(name) {
-            Some(gi) => gi.clone(),
-            None => return Err(Error::NoSuchGroup(name.to_string())),
-        };
-        drop(cache);
+        let (edit, current) = self.api.begin_group_edit(name).await?;
+        let mut gi = current.ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
 
         if enable {
             gi.status = STATUS_ENABLED.to_owned();
@@ -2041,11 +2037,7 @@ where
         }
         gi.update_at = Some(updated_at);
 
-        self.api.save_group_info(name, gi.clone()).await?;
-
-        // Cache publication time is the local clock, not the record stamp
-        // (see `add_users_to_group_at`).
-        self.cache.add_or_update_group(name, &gi, OffsetDateTime::now_utc());
+        self.save_group_and_publish(name, &*edit, gi).await?;
 
         Ok(updated_at)
     }
@@ -2132,37 +2124,27 @@ where
         update_cache_only: bool,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        let cache = self.cache.snapshot();
-        let mut gi = cache
-            .groups
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
-        drop(cache);
-
-        let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
-        let d: HashSet<&String> = HashSet::from_iter(members.iter());
-        gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
-        gi.update_at = Some(updated_at);
-        if !update_cache_only {
-            self.api.save_group_info(name, gi.clone()).await?;
-        }
-
-        self.cache.with_write_lock(|cache| {
-            // Sample after storage completes so a concurrent reload cannot
-            // make this publication older than the cache it must update.
-            let now = OffsetDateTime::now_utc();
-            cache.add_or_update_group(name, &gi, now);
-
-            let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-            members.iter().for_each(|member| {
-                if let Some(m) = user_group_memberships.get(member) {
-                    let mut m = m.clone();
-                    m.remove(name);
-                    cache.add_or_update_user_group_membership(member, &m, now);
-                }
+        let removed: HashSet<_> = members.into_iter().collect();
+        let remove = |mut gi: GroupInfo| {
+            gi.members.retain(|m| !removed.contains(m));
+            gi.update_at = Some(updated_at);
+            gi
+        };
+        if update_cache_only {
+            return self.cache.with_write_lock(|cache| {
+                let gi = cache
+                    .state()
+                    .groups
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
+                self.publish_group_unlocked(cache, name, &remove(gi));
+                Ok(updated_at)
             });
-        });
+        }
+        let (edit, current) = self.api.begin_group_edit(name).await?;
+        let gi = current.ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
+        self.save_group_and_publish(name, &*edit, remove(gi)).await?;
 
         Ok(updated_at)
     }
@@ -2187,7 +2169,6 @@ where
 
         let cache = self.cache.snapshot();
         let users_cache = Arc::clone(&cache.users);
-        let groups_cache = Arc::clone(&cache.groups);
         drop(cache);
 
         for member in members.iter() {
@@ -2200,65 +2181,60 @@ where
             }
         }
 
-        let gi = if members.is_empty() {
-            // Reload from backend so we see latest members (e.g. after user was deleted elsewhere)
-            let mut m = HashMap::new();
-            self.api.load_group(group, &mut m).await?;
-            m.get(group).cloned().ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
-        } else {
-            groups_cache
-                .get(group)
-                .cloned()
-                .ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
-        };
-
-        if members.is_empty() && !gi.members.is_empty() {
+        if !members.is_empty() {
+            return self.remove_members_from_group_at(group, members, false, updated_at).await;
+        }
+        let (edit, current) = self.api.begin_group_edit(group).await?;
+        let gi = current.ok_or_else(|| Error::NoSuchGroup(group.to_string()))?;
+        if !gi.members.is_empty() {
             return Err(Error::GroupNotEmpty);
         }
 
-        if members.is_empty() {
-            if let Err(err) = self.api.delete_mapped_policy(group, UserType::Reg, true).await
-                && !is_err_no_such_policy(&err)
-            {
-                return Err(err);
-            }
+        edit.delete_empty().await?;
 
-            if let Err(err) = self.api.delete_group_info(group).await
-                && !is_err_no_such_group(&err)
-            {
-                return Err(err);
-            }
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            Self::replace_cached_group_members(cache, group, &[], now);
+            cache.delete_group(group, now);
+            cache.delete_group_policy(group, now);
+        });
 
-            self.cache.with_write_lock(|cache| {
-                let now = OffsetDateTime::now_utc();
-                self.remove_group_from_memberships_map_unlocked(cache, group, now);
-                cache.delete_group(group, now);
-                cache.delete_group_policy(group, now);
-            });
-
-            return Ok(updated_at);
-        }
-
-        self.remove_members_from_group_at(group, members, false, updated_at).await
+        Ok(updated_at)
     }
 
-    fn remove_group_from_memberships_map_unlocked(&self, cache: &mut LockedCache, group: &str, now: OffsetDateTime) {
-        let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-        for (k, v) in user_group_memberships.iter() {
-            if v.contains(group) {
-                let mut m = v.clone();
-                m.remove(group);
-                cache.add_or_update_user_group_membership(k, &m, now);
-            }
-        }
+    async fn save_group_and_publish(&self, group: &str, edit: &dyn GroupEdit, gi: GroupInfo) -> Result<()> {
+        edit.save(&gi).await?;
+        self.cache
+            .with_write_lock(|cache| self.publish_group_unlocked(cache, group, &gi));
+        Ok(())
     }
 
-    fn update_group_memberships_map_unlocked(&self, cache: &mut LockedCache, group: &str, gi: &GroupInfo, now: OffsetDateTime) {
-        let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-        for member in gi.members.iter() {
-            let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
-            m.insert(group.to_string());
-            cache.add_or_update_user_group_membership(member, &m, now);
+    fn publish_group_unlocked(&self, cache: &mut LockedCache, group: &str, gi: &GroupInfo) {
+        let now = OffsetDateTime::now_utc();
+        cache.add_or_update_group(group, gi, now);
+        Self::replace_cached_group_members(cache, group, &gi.members, now);
+    }
+
+    fn replace_cached_group_members(cache: &mut LockedCache, group: &str, members: &[String], now: OffsetDateTime) {
+        // This node may have missed peer edits, so reconcile against the complete record,
+        // including memberships that were already stale before this edit began.
+        let mut missing: HashSet<_> = members.iter().collect();
+        let reverse = Arc::clone(&cache.state().user_group_memberships);
+        for (user, groups) in reverse.iter() {
+            if groups.contains(group) && !missing.remove(user) {
+                let mut groups = groups.clone();
+                groups.remove(group);
+                if groups.is_empty() {
+                    cache.delete_user_group_membership(user, now);
+                } else {
+                    cache.add_or_update_user_group_membership(user, &groups, now);
+                }
+            }
+        }
+        for user in missing {
+            let mut groups = reverse.get(user).cloned().unwrap_or_default();
+            groups.insert(group.to_owned());
+            cache.add_or_update_user_group_membership(user, &groups, now);
         }
     }
 
@@ -2283,7 +2259,7 @@ where
 
             self.cache.with_write_lock(|cache| {
                 let now = OffsetDateTime::now_utc();
-                self.remove_group_from_memberships_map_unlocked(cache, group, now);
+                Self::replace_cached_group_members(cache, group, &[], now);
                 cache.delete_group(group, now);
                 cache.delete_group_policy(group, now);
             });
@@ -2293,12 +2269,8 @@ where
 
         let gi = m[group].clone();
 
-        self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
-            cache.add_or_update_group(group, &gi, now);
-            self.remove_group_from_memberships_map_unlocked(cache, group, now);
-            self.update_group_memberships_map_unlocked(cache, group, &gi, now);
-        });
+        self.cache
+            .with_write_lock(|cache| self.publish_group_unlocked(cache, group, &gi));
 
         Ok(())
     }

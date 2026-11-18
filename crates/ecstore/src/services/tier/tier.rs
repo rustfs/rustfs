@@ -3662,6 +3662,9 @@ impl TierConfigMgr {
                 }
             }
         }
+        if !rustfs_data_usage::is_scannable_tier_name(&tier_config.name) {
+            return Err(tier_invalid_config("Remote tier name cannot be represented in lifecycle accounting"));
+        }
         self.ensure_generation_is_idle(&tier_config.name)?;
         let tier_name = tier_config.name.clone();
         if tier_name != tier_name.to_uppercase() {

@@ -1279,7 +1279,7 @@ fn recovery_retry_budget_restarts_after_the_daily_window() {
 }
 
 fn unix_now_for_test() -> u64 {
-    u64::try_from(Utc::now().timestamp()).expect("current time fits")
+    u64::try_from(jiff::Timestamp::now().as_second()).expect("current time fits")
 }
 
 /// Unit view of the automatic rebuild: the first load quarantines and leaves

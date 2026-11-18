@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bridges signed system-status reads to their owned admin handlers.
+//! Bridges signed system-status and catalog-configuration reads to their owned admin handlers.
 //! It owns neither IAM policy decisions nor other admin routes. Upstream: the edge selector;
 //! downstream: the gateway signature verifier and the real admin handlers.
 
 use super::{GatewayAssembly, GatewayAssemblyError, GatewayStack};
+use crate::admin::handlers::cluster_snapshot::GetClusterSnapshotHandler;
+use crate::admin::handlers::extensions::GetExtensionCatalogHandler;
 use crate::admin::handlers::module_switch::GetModuleSwitchesHandler;
 use crate::admin::handlers::object_data_cache::ObjectDataCacheStatsHandler;
 use crate::admin::handlers::plugins_catalog::GetPluginCatalogHandler;
 use crate::admin::handlers::system::{DataUsageInfoHandler, RuntimeCapabilitiesHandler, ServerInfoHandler, StorageInfoHandler};
+use crate::admin::handlers::table_catalog::GetCatalogConfigHandler;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as AdminHandler};
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::ServerContextSlot;
@@ -31,18 +34,23 @@ use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, Req, RequestCo
 use rustfs_gateway_adapter::{IamKeyLookup, RootSource};
 use rustfs_gateway_core::dialect::{ClaimedRoute, Dialect, DialectBuilder, DialectOverlay, OverlayRow};
 use rustfs_gateway_dialect_rustfs_admin::ops::{
-    get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info, get_v3_module_switches::GetV3ModuleSwitches,
-    get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
-    get_v4_plugins_catalog::GetV4PluginsCatalog, get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+    get_iceberg_config::GetIcebergConfig, get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info,
+    get_v3_module_switches::GetV3ModuleSwitches, get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats,
+    get_v3_storageinfo::GetV3Storageinfo, get_v4_cluster_snapshot::GetV4ClusterSnapshot,
+    get_v4_extensions_catalog::GetV4ExtensionsCatalog, get_v4_plugins_catalog::GetV4PluginsCatalog,
+    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_gateway_dialect_rustfs_admin::{AdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY};
 use rustfs_s3_types::{Body, S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
 
-const OPERATIONS: [&str; 7] = [
+const OPERATIONS: [&str; 10] = [
+    GetIcebergConfig::NAME,
     GetV3Info::NAME,
     GetV3Datausageinfo::NAME,
     GetV4PluginsCatalog::NAME,
+    GetV4ClusterSnapshot::NAME,
+    GetV4ExtensionsCatalog::NAME,
     GetV3ModuleSwitches::NAME,
     GetV3Storageinfo::NAME,
     GetV4RuntimeCapabilities::NAME,
@@ -68,15 +76,18 @@ pub(super) fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     let overlay = OVERLAY_READS.get_or_init(|| DialectOverlay {
         name: "rustfs-system-reads",
         vendor: OVERLAY.vendor,
-        claims: &CLAIMS[..2],
+        claims: &CLAIMS[..4],
         operations: ROWS.get_or_init(|| rows),
     });
-    let builder = declare::<GetV3Info>(Dialect::assemble(overlay));
+    let builder = declare::<GetIcebergConfig>(Dialect::assemble(overlay));
+    let builder = declare::<GetV3Info>(builder);
     let builder = declare::<GetV3Storageinfo>(builder);
     let builder = declare::<GetV4RuntimeCapabilities>(builder);
     let builder = declare::<GetV3ObjectDataCacheStats>(builder);
     let builder = declare::<GetV3Datausageinfo>(builder);
     let builder = declare::<GetV4PluginsCatalog>(builder);
+    let builder = declare::<GetV4ClusterSnapshot>(builder);
+    let builder = declare::<GetV4ExtensionsCatalog>(builder);
     declare::<GetV3ModuleSwitches>(builder)
         .build()
         .map_err(GatewayAssemblyError::AdminDialect)
@@ -97,6 +108,10 @@ pub(super) fn assemble(
     let builder = GatewayStack::configured_builder(&assembly, iam, root, gate)?;
     let service = builder
         .dialect(&dialect()?)
+        .register::<GetIcebergConfig, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx.clone(),
+            handler: &GetCatalogConfigHandler {},
+        }))
         .register::<GetV3Info, _>(Arc::new(AdminBridge {
             server_ctx: assembly.server_ctx.clone(),
             handler: &ServerInfoHandler {},
@@ -120,6 +135,14 @@ pub(super) fn assemble(
         .register::<GetV4PluginsCatalog, _>(Arc::new(AdminBridge {
             server_ctx: assembly.server_ctx.clone(),
             handler: &GetPluginCatalogHandler {},
+        }))
+        .register::<GetV4ClusterSnapshot, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx.clone(),
+            handler: &GetClusterSnapshotHandler {},
+        }))
+        .register::<GetV4ExtensionsCatalog, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx.clone(),
+            handler: &GetExtensionCatalogHandler {},
         }))
         .register::<GetV3ModuleSwitches, _>(Arc::new(AdminBridge {
             server_ctx: assembly.server_ctx,
@@ -152,6 +175,10 @@ impl<O: Operation<Output = WireResponse>> Handler<O> for AdminBridge {
             return Err(handler_error(s3_error!(ServiceUnavailable, "server context is not ready")));
         }
         let envelope = envelope(request.context(), &self.server_ctx).map_err(handler_error)?;
+        #[cfg(test)]
+        if O::NAME == GetIcebergConfig::NAME {
+            super::CONFIG_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let response = self
             .handler
             .call(AdminRequest::new(envelope, Body::empty()), matchit::Params::new())

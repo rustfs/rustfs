@@ -219,6 +219,12 @@ fn heal_format_fence_lost_error() -> Error {
 }
 
 impl ECStore {
+    /// Whether this exact storage instance requires an incarnation-bound write
+    /// for the object currently owned by a bucket-heal scope.
+    pub fn object_requires_incarnation(&self, bucket: &str, object: &str) -> bool {
+        bucket_heal_scope_for_object(bucket, object).is_some_and(|scope| std::ptr::eq(Arc::as_ptr(&scope.store), self))
+    }
+
     pub async fn purge_delete_marker_with_proof(
         self: &Arc<Self>,
         bucket: &str,

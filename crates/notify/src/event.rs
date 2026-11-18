@@ -359,7 +359,7 @@ where
 }
 
 fn format_timestamp_rfc3339_millis(value: &Timestamp) -> String {
-    let utc = value.to_zoned(TimeZone::UTC);
+    let utc = value.to_zoned_datetime(TimeZone::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         utc.year(),

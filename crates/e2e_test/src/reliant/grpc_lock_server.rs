@@ -43,6 +43,7 @@ fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLo
         success: response.success,
         error_info: response.error,
         lock_info: response.lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+        cache_fence_stamp: response.cache_fence_stamp.map(|stamp| stamp.encode().to_vec().into()),
         ..Default::default()
     }
 }
@@ -180,6 +181,7 @@ impl NodeService for MinimalLockNodeService {
                     success: result.success,
                     error_info: result.error,
                     lock_info: lock_info_json,
+                    cache_fence_stamp: result.cache_fence_stamp.map(|stamp| stamp.encode().to_vec().into()),
                     ..Default::default()
                 }))
             }
@@ -568,6 +570,15 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    type RenameDataBatchStream = ResponseStream<rustfs_protos::proto_gen::node_service::RenameDataBatchResult>;
+
+    async fn rename_data_batch(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataBatchRequest>,
+    ) -> Result<Response<Self::RenameDataBatchStream>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

@@ -295,7 +295,7 @@ impl Statement {
             let mut matched = false;
             for resource in kms_resources {
                 if resource
-                    .is_match_with_resolver(&requested, args.conditions, Some(resolver))
+                    .is_match_with_unresolved(&requested, args.conditions, Some(resolver), matches!(self.effect, Effect::Deny))
                     .await
                 {
                     matched = true;
@@ -309,7 +309,7 @@ impl Statement {
 
         for resource in kms_not_resources {
             if resource
-                .is_match_with_resolver(&requested, args.conditions, Some(resolver))
+                .is_match_with_unresolved(&requested, args.conditions, Some(resolver), matches!(self.effect, Effect::Allow))
                 .await
             {
                 return false;
@@ -345,7 +345,7 @@ impl Statement {
         if !self.resources.is_empty()
             && !self
                 .resources
-                .is_match_with_resolver(&resource, args.conditions, Some(resolver))
+                .is_match_with_unresolved(&resource, args.conditions, Some(resolver), deny)
                 .await
             && !self.skips_resource_match_for_args(args)
         {
@@ -355,7 +355,7 @@ impl Statement {
         if !self.not_resources.is_empty()
             && self
                 .not_resources
-                .is_match_with_resolver(&resource, args.conditions, Some(resolver))
+                .is_match_with_unresolved(&resource, args.conditions, Some(resolver), !deny)
                 .await
             && !self.skips_resource_match_for_args(args)
         {
@@ -511,11 +511,23 @@ impl BPStatement {
             self.conditions.references_key_name(&KeyName::S3(S3KeyName::S3Prefix)),
         );
 
-        if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
+        // An unresolved resource must not broaden Allow or suppress Deny, even
+        // when the match is inverted by NotResource.
+        if !self.resources.is_empty()
+            && !self
+                .resources
+                .is_match_with_unresolved(&resource, args.conditions, None, deny)
+                .await
+        {
             return false;
         }
 
-        if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions).await {
+        if !self.not_resources.is_empty()
+            && self
+                .not_resources
+                .is_match_with_unresolved(&resource, args.conditions, None, !deny)
+                .await
+        {
             return false;
         }
 

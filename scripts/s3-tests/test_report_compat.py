@@ -19,6 +19,45 @@ SPEC.loader.exec_module(REPORT)
 
 
 class ReportCompatTests(unittest.TestCase):
+    def test_parametrized_node_ids_keep_colons_in_the_case_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            collected = directory / "collected.txt"
+            collected.write_text(
+                "s3tests/functional/test_s3.py::test_one[region::a]\n"
+                "s3tests/functional/test_s3.py::test_one[region::b]\n"
+                "s3tests/functional/test_s3.py::TestClass[class::x]::test_two[part::y]\n"
+            )
+            junit = directory / "junit.xml"
+            junit.write_text(
+                '<testsuite><testcase name="test_one[region::a]"/>'
+                '<testcase name="test_one[region::b]"/>'
+                '<testcase name="test_two[part::y]"/></testsuite>'
+            )
+            for filename in REPORT.LIST_FILES.values():
+                (directory / filename).write_text("")
+            (directory / "implemented_tests.txt").write_text("test_one\ntest_two\n")
+            result = subprocess.run(
+                [
+                    sys.executable, str(REPORT_PATH), "--junit", str(junit), "--lists-dir", str(directory),
+                    "--collected-nodeids", str(collected), "--fail-on-regression", "--fail-on-unclassified",
+                ],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            junit.write_text('<testsuite><testcase name="test_one[region::a]"/><testcase name="test_two[part::y]"/></testsuite>')
+            missing = subprocess.run(
+                [
+                    sys.executable, str(REPORT_PATH), "--junit", str(junit), "--lists-dir", str(directory),
+                    "--collected-nodeids", str(collected), "--fail-on-regression", "--fail-on-unclassified",
+                ],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("1 missing result(s)", missing.stdout)
+            results, _, _ = REPORT.parse_junit(junit)
+            self.assertEqual(REPORT.load_collected_nodeids(collected) - results.keys(), {"test_one[region::b]"})
+
     def test_upstream_names_expose_incomplete_junit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

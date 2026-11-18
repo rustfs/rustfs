@@ -101,7 +101,6 @@ const DEFAULT_RRS_STORAGE_CLASS: &str = "EC:1";
 const ZERO_SET_DRIVE_COUNT_ERROR: &str = "set drive count must be greater than zero";
 
 pub static DEFAULT_INLINE_BLOCK: usize = 128 * 1024;
-const DEFAULT_INLINE_OBJECT_BUDGET: usize = 2 * DEFAULT_INLINE_BLOCK;
 
 pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     let kvs = vec![
@@ -152,6 +151,7 @@ pub struct Config {
     inline_block: usize,
     initialized: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    // Preserve the explicit-limit marker when configurations round-trip through older readers.
     inline_block_explicit: bool,
     #[serde(skip)]
     standard_parities: Vec<PoolParity>,
@@ -245,8 +245,10 @@ impl Config {
             return false;
         }
 
-        let shard_size = shard_size as usize;
-        let inline_block = self.effective_inline_block(data_shards);
+        let Ok(shard_size) = usize::try_from(shard_size) else {
+            return false;
+        };
+        let inline_block = self.inline_block();
 
         if versioned {
             shard_size <= inline_block / 8
@@ -255,27 +257,7 @@ impl Config {
         }
     }
 
-    /// Returns the per-shard inline budget used by both write admission and
-    /// legacy read fallback.
-    ///
-    /// The default budget is scaled by the number of data shards so a wider EC
-    /// layout does not silently increase the maximum inline object size. An
-    /// explicitly configured `inline_block` remains a fixed per-shard limit for
-    /// compatibility with deployments that opted into the historical policy.
-    pub(crate) fn effective_inline_block(&self, data_shards: usize) -> usize {
-        if data_shards == 0 {
-            return 0;
-        }
-
-        if self.initialized && self.inline_block_explicit {
-            self.inline_block
-        } else {
-            // Keep the historical two-data-shard object budget while preventing
-            // wider EC layouts from multiplying the maximum inline object size.
-            DEFAULT_INLINE_OBJECT_BUDGET.div_ceil(data_shards).min(DEFAULT_INLINE_BLOCK)
-        }
-    }
-
+    /// Per-shard inline data budget, defaulting to 128 KiB across EC layouts.
     pub fn inline_block(&self) -> usize {
         if !self.initialized {
             DEFAULT_INLINE_BLOCK
@@ -567,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn should_inline_scales_default_threshold_by_data_shards() {
+    fn should_inline_uses_fixed_default_threshold_for_every_ec_layout() {
         let config = lookup_config_for_pools_with_env(&KVS::new(), &[3, 12], no_env_overrides())
             .expect("default inline policy should resolve for EC2+1 and EC8+4");
 
@@ -576,10 +558,14 @@ mod tests {
             ("EC2+1 unversioned above", 128 * 1024 + 1, 2, false, false),
             ("EC2+1 versioned exact", 16 * 1024, 2, true, true),
             ("EC2+1 versioned above", 16 * 1024 + 1, 2, true, false),
-            ("EC8+4 unversioned exact", 32 * 1024, 8, false, true),
-            ("EC8+4 unversioned above", 32 * 1024 + 1, 8, false, false),
-            ("EC8+4 versioned exact", 4 * 1024, 8, true, true),
-            ("EC8+4 versioned above", 4 * 1024 + 1, 8, true, false),
+            ("EC8+4 unversioned exact", 128 * 1024, 8, false, true),
+            ("EC8+4 unversioned above", 128 * 1024 + 1, 8, false, false),
+            ("EC8+4 versioned exact", 16 * 1024, 8, true, true),
+            ("EC8+4 versioned above", 16 * 1024 + 1, 8, true, false),
+            ("EC12+4 unversioned exact", 128 * 1024, 12, false, true),
+            ("EC12+4 unversioned above", 128 * 1024 + 1, 12, false, false),
+            ("EC12+4 versioned exact", 16 * 1024, 12, true, true),
+            ("EC12+4 versioned above", 16 * 1024 + 1, 12, true, false),
             ("negative", -1, 2, false, false),
             ("zero data shards", 0, 0, false, false),
         ] {
@@ -626,37 +612,35 @@ mod tests {
                 let shard_size = erasure.shard_file_size(object_size);
                 let inline = config.should_inline(shard_size, data_shards, false);
 
-                // The effective policy is monotonic across object sizes. This
-                // table covers the boundaries that previously exposed the
-                // fixed-shard read-ahead mismatch, including the 1 MiB case.
+                // The per-shard budget stays monotonic across object sizes.
+                // PUT separately bounds inline body materialization.
                 assert!(!inline || previous, "inline decision must not re-enable at {object_size} bytes");
                 previous = inline;
             }
 
             assert!(
-                !config.should_inline(erasure.shard_file_size(1024 * 1024), data_shards, false),
-                "1 MiB must use the non-inline path for EC{data_shards}+{parity_shards}"
+                config.should_inline(erasure.shard_file_size(1024 * 1024), data_shards, false),
+                "1 MiB fits the per-shard budget for EC{data_shards}+{parity_shards}"
             );
         }
     }
 
     #[test]
-    fn effective_inline_block_scales_default_budget_and_preserves_explicit_limit() {
+    fn inline_block_preserves_fixed_default_and_explicit_limits() {
         let config = Config::default();
-        assert_eq!(config.effective_inline_block(8), 32 * 1024);
-        assert_eq!(config.effective_inline_block(12), 21_846);
-        assert_eq!(config.effective_inline_block(0), 0);
+        assert_eq!(config.inline_block(), 128 * 1024);
+        assert!(!config.should_inline(0, 0, false));
 
         let explicit = lookup_config_for_pools_with_env(
             &KVS::new(),
             &[12],
             StorageClassEnvOverrides {
-                inline_block: Some("128KiB".to_string()),
+                inline_block: Some("32KiB".to_string()),
                 ..Default::default()
             },
         )
         .expect("explicit inline block should resolve");
-        assert_eq!(explicit.effective_inline_block(12), 128 * 1024);
+        assert_eq!(explicit.inline_block(), 32 * 1024);
     }
 
     #[test]
@@ -903,6 +887,21 @@ mod tests {
         assert!(encoded.contains("\"inline_block_explicit\":true"));
         let decoded: Config = serde_json::from_str(&encoded).expect("explicit inline config should deserialize");
         assert!(decoded.should_inline(100 * 1024, 8, false));
+    }
+
+    #[test]
+    fn legacy_scalar_inline_config_preserves_limit_without_explicit_marker() {
+        let cfg = lookup_config_for_pools_with_env(&KVS::new(), &[12], no_env_overrides())
+            .expect("default storage class should resolve");
+        let mut legacy = serde_json::to_value(cfg).expect("serialize scalar config");
+        legacy["inline_block"] = serde_json::json!(64 * 1024);
+        legacy.as_object_mut().expect("config object").remove("inline_block_explicit");
+        let decoded: Config = serde_json::from_value(legacy).expect("read historical scalar config");
+
+        assert!(decoded.should_inline(64 * 1024, 8, false));
+        assert!(!decoded.should_inline(64 * 1024 + 1, 8, false));
+        assert!(decoded.should_inline(8 * 1024, 8, true));
+        assert!(!decoded.should_inline(8 * 1024 + 1, 8, true));
     }
 
     #[test]

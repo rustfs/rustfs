@@ -89,7 +89,7 @@ fn protocol_copy_runtime_contract() {
         }
         let slot = crate::runtime_sources::ServerContextSlot::new();
         assert!(slot.install(target.clone()));
-        let client = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let client = ProtocolStorageClient::new(slot);
         // Prove that the observer can distinguish zero, one and an edge increment.
         assert_eq!(count(), 0);
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CopyObject);
@@ -99,7 +99,7 @@ fn protocol_copy_runtime_contract() {
         let old_input = legacy_input(old_input).expect("legacy input");
         let before = count();
         client
-            .fs
+            .legacy_fs()
             .copy_object(
                 ProtocolStorageClient::create_request(
                     old_input,
@@ -185,14 +185,14 @@ fn protocol_copy_runtime_contract() {
             rows.push(serde_json::json!({"case":case,"result":result,"count":count()-before}));
         }
         let before = count();
-        let fallback = ProtocolStorageClient::new(FS::with_server_ctx(crate::runtime_sources::ServerContextSlot::new()));
+        let fallback = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new());
         let fallback = outcome(fallback.copy_object(input(), &root).await);
         let present = |context: std::sync::Arc<crate::runtime_sources::AppContext>| {
             let root = root.clone();
             async move {
                 let slot = crate::runtime_sources::ServerContextSlot::new();
                 assert!(slot.install(context));
-                let client = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+                let client = ProtocolStorageClient::new(slot);
                 match client.get_object("copy-target", "destination", &root, None).await {
                     Ok(output) => Ok(output
                         .body
@@ -511,10 +511,22 @@ fn protocol_copy_source_projection_matches_legacy() {
         "",
         "abc\0",
     ] {
-        for key in ["key", "", "/leading", "trailing/", "a?versionId=x", "%FF", "a\0b"] {
+        for key in [
+            "key".to_owned(),
+            "".to_owned(),
+            "/leading".to_owned(),
+            "trailing/".to_owned(),
+            "a?versionId=x".to_owned(),
+            "%FF".to_owned(),
+            "a\0b".to_owned(),
+            "a".repeat(1024),
+            "a".repeat(1025),
+            "é".repeat(512),
+            format!("{}a", "é".repeat(512)),
+        ] {
             let source = rustfs_gateway_types::CopySourceValue::Bucket {
                 bucket: bucket.into(),
-                key: key.into(),
+                key: key.clone(),
                 version_id: Some("ver ?&%é".into()),
             };
             let current = owned::copy_source(source.clone())
@@ -622,6 +634,7 @@ fn protocol_copy_error_answers_match_legacy() {
     for code in [
         S3ErrorCode::InvalidStorageClass,
         S3ErrorCode::PreconditionFailed,
+        S3ErrorCode::UnexpectedContent,
         S3ErrorCode::NotImplemented,
         S3ErrorCode::InternalError,
     ] {

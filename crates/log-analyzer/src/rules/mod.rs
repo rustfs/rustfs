@@ -40,6 +40,7 @@ pub fn seed_rule_set() -> RuleSet {
 mod tests {
     use super::*;
     use crate::model::{EventKind, LogEvent, LogLevel, SourceRef};
+    use crate::time::Rfc3339;
     use std::sync::Arc;
 
     fn event(message: &str, level: Option<LogLevel>, line: u64) -> LogEvent {
@@ -60,7 +61,7 @@ mod tests {
 
     fn event_at(message: &str, ts: &str, line: u64) -> LogEvent {
         LogEvent {
-            timestamp: Some(chrono::DateTime::parse_from_rfc3339(ts).expect("ts")),
+            timestamp: Some(crate::time::parse_rfc3339(ts).expect("ts")),
             ..event(message, Some(LogLevel::Error), line)
         }
     }
@@ -224,8 +225,8 @@ mod tests {
         };
         let f = &findings[0];
         assert_eq!(f.count, 5);
-        assert_eq!(f.first_seen.expect("first").to_rfc3339(), "2026-07-15T01:00:00+08:00");
-        assert_eq!(f.last_seen.expect("last").to_rfc3339(), "2026-07-15T04:00:00+08:00");
+        assert_eq!(f.first_seen.as_ref().expect("first").to_rfc3339(), "2026-07-15T01:00:00+08:00");
+        assert_eq!(f.last_seen.as_ref().expect("last").to_rfc3339(), "2026-07-15T04:00:00+08:00");
         let sample_messages: Vec<_> = f.samples.iter().map(|s| s.message.as_str()).collect();
         assert_eq!(sample_messages, vec!["quorum e2", "quorum e3", "quorum e1"]);
     }

@@ -33,6 +33,7 @@ use crate::app::object::shared::reject_veeam_sosapi_mutation;
 use crate::app::runtime_sources::{AppContext, current_object_store_handle_for_context};
 use crate::app::storage_api::object_meta_usecase::contract::ObjectOperations as _;
 use crate::app::storage_api::object_meta_usecase::validate_bucket_object_lock_enabled;
+use crate::app::storage_api::object_usecase::error::is_err_version_not_found;
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::app::storage_api::object_usecase::{ECStore, StorageObjectInfo as ObjectInfo};
 use crate::error::ApiError;
@@ -63,8 +64,7 @@ impl ObjectMetaUsecase {
     }
 }
 
-/// The version of `key` that `version_id` names, on a bucket with Object Lock enabled. A failed
-/// read is `InternalError`, whatever the store's reason.
+/// Looks up an object's metadata in a bucket with Object Lock enabled.
 async fn locked_object_info(
     store: &ECStore,
     envelope: &RequestEnvelope,
@@ -73,10 +73,14 @@ async fn locked_object_info(
     version_id: Option<String>,
 ) -> S3Result<ObjectInfo> {
     validate_bucket_object_lock_enabled(bucket).await?;
+    let explicit_version = version_id.is_some();
     let opts = get_opts(bucket, key, version_id, None, envelope.headers())
         .await
         .map_err(ApiError::from)?;
     store.get_object_info(bucket, key, &opts).await.map_err(|error| {
+        if explicit_version && is_err_version_not_found(&error) {
+            return ApiError::from(error).into();
+        }
         error!(
             component = "storage",
             subsystem = "object",

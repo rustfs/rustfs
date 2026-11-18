@@ -36,7 +36,7 @@ pub(crate) fn try_parse(line: &str, file: &Arc<str>, line_no: u64, node: &Option
     }
 
     let timestamp = match map.remove("timestamp") {
-        Some(Value::String(raw)) => match chrono::DateTime::parse_from_rfc3339(&raw) {
+        Some(Value::String(raw)) => match crate::time::parse_rfc3339(&raw) {
             Ok(ts) => Some(ts),
             Err(_) => {
                 map.insert("timestamp_raw".to_string(), Value::String(raw));

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestKms, assert_key_not_found, assert_unsupported_capability, ctx};
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use rustfs_kms::backends::local::LocalKmsBackend;
 use rustfs_kms::backends::static_kms::StaticKmsBackend;
 use rustfs_kms::backends::{ExpiredKeyRemoval, KmsBackend};
@@ -79,8 +79,8 @@ async fn schedule(backend: &LocalKmsBackend, key_id: &str, days: u32) {
         .expect("deletion should be scheduled");
 }
 
-fn days_from_now(days: u64) -> Zoned {
-    Zoned::now() + Duration::from_secs(days * 86_400)
+fn days_from_now(days: u64) -> ZonedDateTime {
+    ZonedDateTime::now() + Duration::from_secs(days * 86_400)
 }
 
 async fn exists(backend: &LocalKmsBackend, key_id: &str) -> bool {
@@ -422,7 +422,7 @@ async fn a_backend_without_deletion_support_reports_the_capability_gap() {
         "the static backend must not advertise deletion scheduling"
     );
     assert_unsupported_capability(
-        backend.remove_expired_key(common::STATIC_KEY_ID, &Zoned::now()).await,
+        backend.remove_expired_key(common::STATIC_KEY_ID, &ZonedDateTime::now()).await,
         "remove_expired_key",
     );
 }

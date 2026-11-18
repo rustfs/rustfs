@@ -14,6 +14,7 @@
 
 //! Request and response projections for protocol storage operations.
 //! Protocol clients retain their session checks; use cases own storage and bucket visibility.
+//! CopyObject and UploadPartCopy share source validation, conditions, XML ETags, timestamps and error normalization.
 
 use super::{ProtocolStorageClient, RequestParams};
 use crate::app::object_usecase::{
@@ -64,11 +65,11 @@ impl ProtocolStorageClient {
     }
 
     pub(super) fn owned_bucket_usecase(&self) -> crate::app::bucket_usecase::DefaultBucketUsecase {
-        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.fs.server_ctx().app_context())
+        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.server_ctx.app_context())
     }
 
     pub(super) fn owned_usecase(&self) -> DefaultObjectUsecase {
-        DefaultObjectUsecase::with_context(self.fs.server_ctx().app_context())
+        DefaultObjectUsecase::with_context(self.server_ctx.app_context())
     }
 
     pub(super) fn create_envelope(method: Method, uri: Uri, params: RequestParams<'_>) -> RequestEnvelope {
@@ -119,7 +120,7 @@ fn etag(opaque: String, weak: bool) -> S3Result<ETag> {
 }
 
 // Protocol clients received millisecond timestamps through the legacy response codec.
-fn millisecond_timestamp(value: Timestamp) -> Timestamp {
+pub(super) fn millisecond_timestamp(value: Timestamp) -> Timestamp {
     Timestamp::from_secs_nanos(value.secs(), value.subsec_millis() * 1_000_000)
         .expect("a millisecond remainder is below one second") // subsec_millis is at most 999.
 }
@@ -226,10 +227,14 @@ pub(super) fn put_input(input: dto::PutObjectInput) -> S3Result<crate::app::obje
         bucket: input.bucket.as_str().to_owned(),
         key: input.key.as_str().to_owned(),
         body: input.body.map(|body| body.into_body()),
+        #[cfg(feature = "gateway-stack")]
+        post_archive: None,
         trailing_headers: None,
         frame_trailers: None,
         content_length: (input.content_length >= 0).then_some(input.content_length),
         metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
+        metadata_headers: None,
+        checksum_headers: None,
         specific_if_none_match,
         object_lock_retain_until_date: retain_until,
         cache_control: nonempty(input.cache_control),
@@ -403,7 +408,7 @@ pub(super) fn create_bucket_input(bucket: &str) -> S3Result<dto::CreateBucketInp
     })
 }
 
-fn copy_condition(value: Option<&str>, field: &str) -> S3Result<Option<CopySourceCondition>> {
+pub(super) fn copy_condition(value: Option<&str>, field: &str, operation: &str) -> S3Result<Option<CopySourceCondition>> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -419,7 +424,7 @@ fn copy_condition(value: Option<&str>, field: &str) -> S3Result<Option<CopySourc
     };
     if !valid {
         return Err(super::conversion_error(
-            "CopyObject input",
+            operation,
             format!("{field}: not an entity-tag condition the s3s input can hold"),
         ));
     }
@@ -430,9 +435,10 @@ fn copy_condition(value: Option<&str>, field: &str) -> S3Result<Option<CopySourc
     }))
 }
 
-pub(super) fn copy_source(source: CopySourceValue) -> S3Result<Option<CopySourceValue>> {
-    let CopySourceValue::Bucket { bucket, key, version_id } = source else {
-        return Ok(None);
+// CopyObject and UploadPartCopy share source validation while retaining their source-kind handling.
+pub(super) fn validate_copy_source(source: &CopySourceValue, operation: &str) -> S3Result<()> {
+    let CopySourceValue::Bucket { bucket, key, .. } = source else {
+        return Ok(());
     };
     let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     if !(3..=63).contains(&bucket.len())
@@ -443,12 +449,20 @@ pub(super) fn copy_source(source: CopySourceValue) -> S3Result<Option<CopySource
         || bucket.starts_with("xn--")
         || bucket.parse::<std::net::Ipv4Addr>().is_ok()
     {
-        return Err(super::conversion_error(
-            "CopyObject copy_source",
-            "ParseAmzCopySourceError: InvalidBucketName",
-        ));
+        return Err(super::conversion_error(operation, "ParseAmzCopySourceError: InvalidBucketName"));
     }
-    Ok(Some(CopySourceValue::Bucket { bucket, key, version_id }))
+    if key.len() > 1024 {
+        return Err(super::conversion_error(operation, "ParseAmzCopySourceError: InvalidKey"));
+    }
+    Ok(())
+}
+
+pub(super) fn copy_source(source: CopySourceValue) -> S3Result<Option<CopySourceValue>> {
+    validate_copy_source(&source, "CopyObject copy_source")?;
+    Ok(match source {
+        source @ CopySourceValue::Bucket { .. } => Some(source),
+        _ => None,
+    })
 }
 
 pub(super) fn copy_input(input: dto::CopyObjectInput) -> S3Result<CopyObjectWriteInput> {
@@ -478,30 +492,26 @@ pub(super) fn copy_input(input: dto::CopyObjectInput) -> S3Result<CopyObjectWrit
             ));
         }
     }
-    copy_condition(input.if_match.as_deref(), "if_match")?;
-    let specific_if_none_match = copy_condition(input.if_none_match.as_deref(), "if_none_match")?
+    copy_condition(input.if_match.as_deref(), "if_match", "CopyObject input")?;
+    let specific_if_none_match = copy_condition(input.if_none_match.as_deref(), "if_none_match", "CopyObject input")?
         .is_some_and(|value| !matches!(value, CopySourceCondition::Any));
-    let copy_source_if_match = copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match")?;
-    let copy_source_if_none_match = copy_condition(input.copy_source_if_none_match.as_deref(), "copy_source_if_none_match")?;
+    let copy_source_if_match = copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match", "CopyObject input")?;
+    let copy_source_if_none_match = copy_condition(
+        input.copy_source_if_none_match.as_deref(),
+        "copy_source_if_none_match",
+        "CopyObject input",
+    )?;
     for (field, value) in [
         ("copy_source_if_modified_since", input.copy_source_if_modified_since),
         ("copy_source_if_unmodified_since", input.copy_source_if_unmodified_since),
     ] {
         value
-            .map(|at| {
-                time::OffsetDateTime::from_unix_timestamp_nanos(
-                    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos()),
-                )
-                .map_err(|_| error(field, "an instant outside what the s3s shape can hold"))
-            })
+            .map(|at| super::multipart::multipart_timestamp(at, "CopyObject input", field))
             .transpose()?;
     }
     let retain_until = input
         .object_lock_retain_until_date
-        .map(|at| {
-            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos()))
-                .map_err(|_| error("object_lock_retain_until_date", "an instant outside what the s3s shape can hold"))
-        })
+        .map(|at| super::multipart::multipart_timestamp(at, "CopyObject input", "object_lock_retain_until_date"))
         .transpose()?;
     Ok(CopyObjectWriteInput {
         copy_source,
@@ -540,20 +550,19 @@ pub(super) fn copy_input(input: dto::CopyObjectInput) -> S3Result<CopyObjectWrit
     })
 }
 
+pub(super) fn copy_xml_etag(raw: &str, operation: &str) -> S3Result<ETag> {
+    let (weak, value) = if let Some(rest) = raw.strip_prefix("W/\"") {
+        (true, rest.strip_suffix('"').unwrap_or(rest))
+    } else {
+        (false, raw.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(raw))
+    };
+    let value = quick_xml::escape::escape(value).into_owned();
+    if weak { ETag::new_weak(value) } else { ETag::new(value) }
+        .map_err(|_| super::conversion_error(operation, "e_tag: not an entity tag the gateway can write"))
+}
+
 pub(super) fn copy_output(output: CopyObjectWriteOutput) -> S3Result<dto::CopyObjectOutput> {
-    let e_tag = output
-        .e_tag
-        .map(|raw| {
-            let (weak, value) = if let Some(rest) = raw.strip_prefix("W/\"") {
-                (true, rest.strip_suffix('"').unwrap_or(rest))
-            } else {
-                (false, raw.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(&raw))
-            };
-            let value = quick_xml::escape::escape(value).into_owned();
-            if weak { ETag::new_weak(value) } else { ETag::new(value) }
-                .map_err(|_| super::conversion_error("CopyObject output", "e_tag: not an entity tag the gateway can write"))
-        })
-        .transpose()?;
+    let e_tag = output.e_tag.map(|raw| copy_xml_etag(&raw, "CopyObject output")).transpose()?;
     Ok(dto::CopyObjectOutput {
         e_tag,
         last_modified: output
@@ -588,6 +597,7 @@ pub(super) fn copy_error(mut error: S3Error) -> S3Error {
     let message = match error.code() {
         S3ErrorCode::InvalidStorageClass => "The storage class you specified is not valid.",
         S3ErrorCode::PreconditionFailed => "At least one of the preconditions you specified did not hold.",
+        S3ErrorCode::UnexpectedContent => "This request does not support content.",
         S3ErrorCode::NotImplemented => "A header you provided implies functionality that is not implemented.",
         S3ErrorCode::InternalError => "We encountered an internal error. Please try again.",
         _ => return error,

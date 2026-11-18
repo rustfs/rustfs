@@ -311,9 +311,8 @@ impl LockedCache {
             return false;
         }
 
-        let mut new = CacheEntity::clone(target);
-        op(&mut new);
-        *target = Arc::new(new);
+        // Detach from published snapshots once per partition and transaction.
+        op(Arc::make_mut(target));
         if let Some(changes) = changes {
             changes
                 .lock()
@@ -755,6 +754,24 @@ mod tests {
 
     use crate::cache::Cache;
     use crate::store::MappedPolicy;
+
+    #[test]
+    fn batched_deletes_reuse_private_partition() {
+        let cache = Cache::default();
+        let now = OffsetDateTime::now_utc();
+        for key in ["one", "two"] {
+            cache.add_or_update_sts_account(key, &UserIdentity::default(), now);
+        }
+        let before = cache.snapshot();
+        cache.with_write_lock(|locked| {
+            locked.delete_sts_account("one", now);
+            let private = Arc::as_ptr(&locked.state().sts_accounts);
+            locked.delete_sts_account("two", now);
+            assert_eq!(private, Arc::as_ptr(&locked.state().sts_accounts));
+        });
+        assert_eq!(before.sts_accounts.len(), 2);
+        assert!(cache.snapshot().sts_accounts.is_empty());
+    }
 
     #[tokio::test]
     async fn reload_journal_preserves_same_key_mutations_and_expires_on_cancellation() {

@@ -20,9 +20,9 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+    use rustfs_s3_types::Body;
     use rustfs_signer::sign_v4;
     use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-    use s3s::Body;
     use std::error::Error;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;

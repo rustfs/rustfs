@@ -21,7 +21,7 @@
 use crate::error::{KmsError, Result};
 use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use async_trait::async_trait;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use rand::Rng;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -66,7 +66,7 @@ pub struct DataKeyEnvelope {
     pub nonce: Vec<u8>,
     pub encryption_context: HashMap<String, String>,
     #[serde(with = "crate::time_serde::zoned")]
-    pub created_at: Zoned,
+    pub created_at: ZonedDateTime,
     /// KEK version that wrapped `encrypted_key`; `None` on pre-versioning envelopes.
     ///
     /// Optional and omitted when `None` so envelopes from non-rotating backends stay
@@ -205,7 +205,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
         }
 
         #[derive(Deserialize)]
-        struct ZonedValue(#[serde(with = "crate::time_serde::zoned")] Zoned);
+        struct ZonedValue(#[serde(with = "crate::time_serde::zoned")] ZonedDateTime);
 
         struct DataKeyEnvelopeVisitor;
 
@@ -591,7 +591,7 @@ mod tests {
             encrypted_key: vec![1, 2, 3, 4],
             nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             encryption_context: HashMap::from([("bucket".to_string(), "b".to_string())]),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: None,
         };
@@ -625,7 +625,7 @@ mod tests {
             encrypted_key: vec![1, 2, 3, 4],
             nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: Some(CONTEXT_BINDING_AAD_V1),
         };
@@ -676,7 +676,7 @@ mod tests {
                 map.insert("bucket".to_string(), "test-bucket".to_string());
                 map
             },
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: None,
         };
@@ -694,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_key_envelope_backward_compatibility() {
-        // Test deserialization with current Zoned format (with timezone annotation)
+        // Test deserialization with current ZonedDateTime format (with timezone annotation)
         let envelope_json = r#"{
             "key_id": "test-key-id",
             "master_key_id": "master-key-id",
@@ -812,7 +812,7 @@ mod tests {
             encrypted_key: vec![1, 2, 3, 4],
             nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: None,
         };
@@ -832,7 +832,7 @@ mod tests {
             encrypted_key: vec![1, 2, 3, 4],
             nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: Some(7),
             context_binding: None,
         };

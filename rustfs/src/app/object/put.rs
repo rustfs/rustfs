@@ -984,7 +984,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1043,6 +1043,8 @@ pub(super) struct PutObjectWriteRequest<'a> {
     pub(super) inbound_replication_put: bool,
     /// Request headers, or the object's content headers for an internal write.
     pub(super) headers: &'a HeaderMap,
+    pub(super) metadata_headers: &'a HeaderMap,
+    pub(super) checksum_headers: &'a HeaderMap,
     pub(super) query: Option<&'a str>,
     pub(super) trailing_headers: Option<SharedTrailerSource>,
     pub(super) max_content_length: Option<u64>,
@@ -1236,14 +1238,22 @@ impl DefaultObjectUsecase {
         // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&envelope)
             && get_header(envelope.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
-        if max_content_length.is_some() && is_put_object_extract_requested(envelope.headers()) {
+        #[cfg(feature = "gateway-stack")]
+        let extract_headers = if envelope.is_gateway_post() {
+            super::post_headers::post_effective_headers(&envelope)
+        } else {
+            envelope.headers()
+        };
+        #[cfg(not(feature = "gateway-stack"))]
+        let extract_headers = envelope.headers();
+        if max_content_length.is_some() && is_put_object_extract_requested(extract_headers) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
             ));
         }
         reject_veeam_sosapi_mutation(|| self.object_store(), input.bucket.as_str(), input.key.as_str()).await?;
-        if is_put_object_extract_requested(envelope.headers()) && !inbound_replication_put {
+        if is_put_object_extract_requested(extract_headers) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract_owned(envelope, input)).await;
         }
         // SSE-C ciphertext passthrough (authorized replication only): the body
@@ -1253,6 +1263,8 @@ impl DefaultObjectUsecase {
             inbound_replication_put && rustfs_utils::http::ssec_transport_to_stored_metadata(envelope.headers()).is_some();
 
         let trailing_headers = input.trailing_headers.clone();
+        let metadata_headers = input.metadata_headers.as_ref().unwrap_or_else(|| envelope.headers());
+        let checksum_headers = input.checksum_headers.as_ref().unwrap_or_else(|| envelope.headers());
 
         let PutObjectWriteInput {
             body,
@@ -1298,11 +1310,8 @@ impl DefaultObjectUsecase {
         // Validate archive content encoding (reject when strict mode is enabled)
         validate_archive_content_encoding(
             &key,
-            envelope.headers().get("content-type").and_then(|value| value.to_str().ok()),
-            envelope
-                .headers()
-                .get("content-encoding")
-                .and_then(|value| value.to_str().ok()),
+            metadata_headers.get("content-type").and_then(|value| value.to_str().ok()),
+            metadata_headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_request_shape", request_shape_stage_start);
 
@@ -1351,6 +1360,8 @@ impl DefaultObjectUsecase {
             ciphertext_passthrough,
             inbound_replication_put,
             headers: envelope.headers(),
+            metadata_headers,
+            checksum_headers,
             query: envelope.uri().query(),
             trailing_headers: trailing_headers.clone(),
             max_content_length,
@@ -1478,6 +1489,8 @@ impl DefaultObjectUsecase {
             ciphertext_passthrough,
             inbound_replication_put,
             headers,
+            metadata_headers,
+            checksum_headers,
             query,
             trailing_headers,
             max_content_length,
@@ -1564,7 +1577,7 @@ impl DefaultObjectUsecase {
 
         let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
-            is_disk_compressible(headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
+            is_disk_compressible(metadata_headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
 
         // Resolve the store through the request-bound server context
         // (backlog#1052 S6), not the process-global handle, so an embedded
@@ -1698,7 +1711,7 @@ impl DefaultObjectUsecase {
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
-        apply_put_request_metadata_native(&mut metadata, headers, &key, content)?;
+        apply_put_request_metadata_native(&mut metadata, metadata_headers, &key, content)?;
         apply_bucket_default_lock_retention(
             &bucket,
             &object_lock_config_state,
@@ -1863,7 +1876,7 @@ impl DefaultObjectUsecase {
                 HashReader::from_stream_with_etag(body, size, size, md5hex.take(), sha256hex.take(), false, etag_algorithm)
                     .map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum(headers, trailing_headers.clone(), false) {
+            if let Err(err) = hrd.add_checksum(checksum_headers, trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1986,7 +1999,7 @@ impl DefaultObjectUsecase {
 
         if size >= 0 {
             let checksum_setup_stage_start = put_stage_metrics_enabled.then(Instant::now);
-            if let Err(err) = reader.add_checksum(headers, trailing_headers.clone(), false) {
+            if let Err(err) = reader.add_checksum(checksum_headers, trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -2106,7 +2119,11 @@ impl DefaultObjectUsecase {
         if dsc.replicate_any() {
             opts.drop_lockless_cache_write();
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::ZonedDateTime::now().to_string(),
+            );
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_REPLICATION_STATUS,
@@ -4153,6 +4170,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_object_metadata_cannot_dispatch_legacy_archive_extraction() {
+        let mut req = build_request(PutObjectInput::default(), Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        let err = Box::pin(DefaultObjectUsecase::without_context().execute_put_object_extract(req))
+            .await
+            .expect_err("a legacy form cannot authorize archive replay");
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
     async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
@@ -4169,6 +4196,41 @@ mod tests {
             .await
             .expect_err("POST header-only ETag precondition must fail before storage access");
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "gateway-stack")]
+    async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
+        for direct_extract in [false, true] {
+            let (body, polls) = PollCountingBody::streaming_blob();
+            let input = PutObjectInput::builder()
+                .bucket("test-bucket".to_owned())
+                .key("archive.tar".to_owned())
+                .body(Some(body))
+                .build()
+                .expect("archive input");
+            let mut request = build_request(input, Method::POST);
+            request.extensions.insert(PostObjectRequestMarker);
+            request.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            let mut envelope = RequestEnvelope::from_s3s(&request);
+            assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
+            envelope.mark_gateway_post();
+            assert!(envelope.fork_for_authorization().is_gateway_post());
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let usecase = DefaultObjectUsecase::without_context();
+            let result = if direct_extract {
+                Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await
+            } else {
+                Box::pin(usecase.execute_put_object_owned(envelope, input)).await
+            };
+            let error = result.err().expect("unbound gateway archive must be refused");
+            assert_eq!(error.code().as_str(), "NotImplemented", "direct={direct_extract}");
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "direct={direct_extract}: refused archive must not poll its body"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4689,7 +4751,7 @@ mod tests {
         request
             .headers
             .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::access::ReqInfo {
+        request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
