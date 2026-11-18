@@ -15,16 +15,52 @@
 //! Effective metadata and checksum inputs for an authorized browser upload.
 
 use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::access::AuthorizationRequest as _;
 use crate::app::storage_api::object_usecase::compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
 use http::{HeaderMap, HeaderValue};
 use rustfs_gateway::dto::PostObjectFields;
 use rustfs_s3_types::{S3Result, s3_error};
 
-pub(crate) fn post_effective_headers(envelope: &RequestEnvelope) -> &HeaderMap {
-    envelope
-        .post_object_policy_headers()
-        .map(|headers| &headers.0)
-        .unwrap_or_else(|| envelope.headers())
+/// Project archive controls from accepted form metadata after operation admission has refused raw wire/query metadata.
+///
+/// Ordinary metadata stays opaque unless the form's extract flag is affirmative.
+///
+/// # Errors
+///
+/// `InvalidArgument` when a requested archive control cannot be represented as a readable header.
+pub(crate) fn install_post_archive_form_metadata(envelope: &mut RequestEnvelope, metadata: &[(String, String)]) -> S3Result<()> {
+    let Some((_, flag)) = metadata
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("snowball-auto-extract"))
+    else {
+        return Ok(());
+    };
+    let Ok(flag) = HeaderValue::from_str(flag) else {
+        return Ok(());
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-amz-meta-snowball-auto-extract", flag);
+    if !super::is_put_object_extract_requested(&headers) {
+        return Ok(());
+    }
+    for (name, value) in metadata {
+        if name.eq_ignore_ascii_case("snowball-auto-extract") {
+            continue;
+        }
+        let name = format!("x-amz-meta-{name}");
+        if !super::extract::is_snowball_transport_header(&name) {
+            continue;
+        }
+        let name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid POST archive metadata"))?;
+        let value = HeaderValue::from_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid POST archive metadata"))?;
+        value
+            .to_str()
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid POST archive metadata"))?;
+        headers.insert(name, value);
+    }
+    envelope.headers_mut().extend(headers);
+    Ok(())
 }
 
 pub(crate) fn post_metadata_headers(
@@ -145,7 +181,7 @@ fn post_checksum_headers_inner(
     }
     let selected = form.or(wire);
     if !allow_archive
-        && super::is_put_object_extract_requested(post_effective_headers(envelope))
+        && super::is_put_object_extract_requested(headers)
         && (selected.is_some()
             || algorithm.is_some()
             || header_algorithm.is_some()
@@ -215,6 +251,47 @@ mod tests {
     use crate::app::storage_api::context::PostObjectPolicyHeaders;
     use http::{Extensions, Method, Uri};
     use rustfs_s3_types::S3ErrorCode;
+
+    #[test]
+    fn gateway_post_archive_controls_come_from_validated_form_metadata() {
+        let mut envelope = request(HeaderMap::new(), HeaderMap::new());
+        install_post_archive_form_metadata(
+            &mut envelope,
+            &[
+                ("snowball-auto-extract".to_owned(), "true".to_owned()),
+                ("rustfs-snowball-prefix".to_owned(), "allowed/".to_owned()),
+                ("purpose".to_owned(), "ordinary metadata".to_owned()),
+            ],
+        )
+        .expect("valid form controls");
+        assert!(super::super::is_put_object_extract_requested(envelope.headers()));
+        assert_eq!(envelope.headers()["x-amz-meta-rustfs-snowball-prefix"], "allowed/");
+        assert!(!envelope.headers().contains_key("x-amz-meta-purpose"));
+        for value in ["bad\r\nheader: value", "non-ascii-\u{80}"] {
+            let error = install_post_archive_form_metadata(
+                &mut envelope,
+                &[
+                    ("snowball-auto-extract".to_owned(), "true".to_owned()),
+                    ("snowball-prefix".to_owned(), value.to_owned()),
+                ],
+            )
+            .expect_err("archive controls must remain readable without header injection");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn gateway_post_ordinary_metadata_does_not_enable_archive_controls() {
+        for flag in [None, Some("false"), Some("not-a-boolean"), Some("\u{80}")] {
+            let mut envelope = request(HeaderMap::new(), HeaderMap::new());
+            let mut metadata = vec![("snowball-prefix".to_owned(), "\u{80}".to_owned())];
+            if let Some(flag) = flag {
+                metadata.push(("snowball-auto-extract".to_owned(), flag.to_owned()));
+            }
+            install_post_archive_form_metadata(&mut envelope, &metadata).expect("ordinary metadata remains opaque");
+            assert!(envelope.headers().is_empty());
+        }
+    }
 
     fn request(headers: HeaderMap, policy: HeaderMap) -> RequestEnvelope {
         let mut extensions = Extensions::new();
@@ -311,15 +388,14 @@ mod tests {
     #[test]
     fn post_archive_checksum_projection_preserves_closed_guard_and_rejects_md5_conflicts() {
         let mut wire = HeaderMap::new();
+        wire.insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
         wire.insert("content-md5", HeaderValue::from_static("XUFAKrxLKna5cZ2REBfFkg=="));
-        let mut policy = HeaderMap::new();
-        policy.insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
         let fields = PostObjectFields {
             content_md5: Some("XUFAKrxLKna5cZ2REBfFkg==".to_owned()),
             checksum_crc32: Some("NhCmhg==".to_owned()),
             ..Default::default()
         };
-        let envelope = request(wire.clone(), policy.clone());
+        let envelope = request(wire.clone(), HeaderMap::new());
         assert_eq!(
             post_checksum_headers(&envelope, &fields)
                 .expect_err("closed archive refuses checksums")
@@ -336,7 +412,7 @@ mod tests {
         );
 
         wire.insert("content-md5", HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="));
-        let conflict = request(wire.clone(), policy.clone());
+        let conflict = request(wire.clone(), HeaderMap::new());
         assert_eq!(
             post_archive_content_md5(&conflict, &fields)
                 .expect_err("different MD5 sources")
@@ -344,7 +420,7 @@ mod tests {
             &S3ErrorCode::InvalidRequest
         );
         wire.append("content-md5", HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="));
-        let duplicate = request(wire, policy);
+        let duplicate = request(wire, HeaderMap::new());
         assert_eq!(
             post_archive_content_md5(&duplicate, &PostObjectFields::default())
                 .expect_err("duplicate MD5")

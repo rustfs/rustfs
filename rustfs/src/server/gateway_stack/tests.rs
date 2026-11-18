@@ -17,6 +17,7 @@
 #[path = "admin/tests.rs"]
 mod admin;
 mod keystone;
+mod legacy_layers;
 mod ssec;
 
 use super::*;
