@@ -222,7 +222,7 @@ fn check_notification_write_order() {
                 fail_at,
                 calls: calls.clone(),
             });
-            let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder.clone()));
+            let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder));
             let region = context
                 .region()
                 .get()
@@ -240,7 +240,7 @@ fn check_notification_write_order() {
             let mut timeline = vec![Observation::Rules(
                 Callback::Validate,
                 region.clone(),
-                expected.clone(),
+                expected,
                 OLD_XML.to_vec(),
             )];
             if fail_at != Some(Callback::Validate) {
