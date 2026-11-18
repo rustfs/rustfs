@@ -61,6 +61,7 @@ struct FillRequest {
     response: oneshot::Sender<FillResult>,
 }
 
+#[cfg_attr(test, derive(Debug))]
 struct FilledStripes {
     primary: Vec<u8>,
     queued: VecDeque<Vec<u8>>,
