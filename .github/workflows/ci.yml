@@ -507,6 +507,10 @@ jobs:
         if: matrix.mode == 'fips'
         run: sudo apt-get install -y cmake golang clang libclang-dev
 
+      - name: Check the native SigV4 crypto services
+        if: matrix.mode == 'fips'
+        run: ./scripts/sigv4-fips/check.sh
+
       - name: Verify provider installation
         shell: bash
         run: |
