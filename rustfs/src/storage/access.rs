@@ -29,7 +29,8 @@ use crate::auth::{get_request_auth_type_with_query, get_session_token, reject_un
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 pub(crate) use crate::storage::authorization_actions::{
-    delete_object_authorize_action, versioned_read_action, versioned_tagging_action,
+    complete_multipart_upload_authorize_action, delete_object_authorize_action, list_parts_authorize_action,
+    post_object_authorize_action, versioned_read_action, versioned_tagging_action,
 };
 // `app::metadata_route` still imports this path.
 #[cfg(test)]
@@ -466,18 +467,6 @@ fn put_bucket_policy_authorize_action() -> Action {
 /// `put_bucket_accelerate_configuration`).
 fn bucket_website_config_authorize_action() -> Action {
     Action::S3Action(S3Action::PutBucketPolicyAction)
-}
-
-fn post_object_authorize_action() -> Action {
-    Action::S3Action(S3Action::PutObjectAction)
-}
-
-fn complete_multipart_upload_authorize_action() -> Action {
-    Action::S3Action(S3Action::PutObjectAction)
-}
-
-fn list_parts_authorize_action() -> Action {
-    Action::S3Action(S3Action::ListMultipartUploadPartsAction)
 }
 
 fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()> {
