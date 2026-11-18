@@ -98,13 +98,13 @@ use rustfs_policy::policy::{
     {BucketPolicy, BucketPolicyArgs, Effect},
 };
 use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::Region;
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::http::get_header;
 use rustfs_utils::obj::extract_user_defined_metadata;
-use s3s::region::Region;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::{
     borrow::Cow,

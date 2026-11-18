@@ -156,15 +156,14 @@ mod tests {
     fn put_bucket_tagging_rejects_invalid_shapes_before_storage_mutation() {
         crate::app::gating_test_env::run_large_stack_test("bucket-tag-validation", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
-            use crate::app::storage_api::s3::S3Access as _;
+            use crate::app::storage_api::owned_parity::authorize_bucket_config_mutation;
             use crate::app::storage_api::test::ReqInfo;
-            use crate::app::storage_api::test::ecfs::FS;
+            use rustfs_policy::policy::action::{Action, S3Action};
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let fs = FS::with_server_ctx(slot.clone());
             let usecase = DefaultBucketUsecase::with_context(Some(context));
             let bucket = format!("tag-validation-{}", uuid::Uuid::new_v4().simple());
             store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
@@ -212,7 +211,9 @@ mod tests {
                 let mut req = build_request(input, Method::PUT);
                 req.extensions.insert(ReqInfo::default());
                 req.extensions.insert(slot.clone());
-                fs.put_bucket_tagging(&mut req).await.expect("permission allows tag updates");
+                authorize_bucket_config_mutation(&slot, &mut req, &bucket, Action::S3Action(S3Action::PutBucketTaggingAction))
+                    .await
+                    .expect("permission allows tag updates");
                 let result = usecase
                     .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, persisted)
                     .await;

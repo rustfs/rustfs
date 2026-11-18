@@ -109,7 +109,7 @@ async fn authorize(req: &mut AdminRequest, bucket: Option<&str>, action: Action)
         cred: Some(cred),
         is_owner,
         bucket: bucket.map(str::to_owned),
-        region: current_region(),
+        region: current_region().map(Into::into),
         ..Default::default()
     });
     license_check().map_err(|er| match er.kind() {

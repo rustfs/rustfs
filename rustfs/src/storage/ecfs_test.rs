@@ -296,6 +296,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_retention_metadata_does_not_suppress_bucket_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        for name in [AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER] {
+            let mut metadata = HashMap::from([(name.to_string(), String::new())]);
+            assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&config)), &mut metadata));
+            assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+            assert!(!metadata[AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER].is_empty());
+        }
+    }
+
+    #[test]
     fn test_apply_bucket_default_lock_retention_preserves_explicit_retention_path() {
         let config = ObjectLockConfiguration {
             object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),

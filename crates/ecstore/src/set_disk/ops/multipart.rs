@@ -1054,7 +1054,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         return Ok(upload_dirs
             .into_iter()
             .filter_map(|upload_dir| {
-                let upload_dir = upload_dir.trim_end_matches('/');
+                let upload_dir = upload_dir.strip_suffix('/')?;
                 multipart_upload_leaf_is_safe(upload_dir).then(|| format!("{root_prefix}/{upload_dir}"))
             })
             .collect());
@@ -1102,7 +1102,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         let (sha_dir, upload_dirs) = listed_upload_dirs?;
         upload_paths.reserve(upload_dirs.len());
         upload_paths.extend(upload_dirs.into_iter().filter_map(|upload_dir| {
-            let upload_dir = upload_dir.trim_end_matches('/');
+            let upload_dir = upload_dir.strip_suffix('/')?;
             multipart_upload_leaf_is_safe(upload_dir).then(|| format!("{sha_dir}/{upload_dir}"))
         }));
     }
@@ -3576,7 +3576,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
-        let upload_path = Self::get_multipart_upload_dir(bucket, object, upload_uuid.as_str(), opts.data_movement);
+        let upload_path = Self::get_multipart_upload_dir(bucket, object, &upload_id, opts.data_movement);
 
         #[cfg(any(test, feature = "test-util"))]
         pause_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost).await;
@@ -12842,7 +12842,15 @@ mod tests {
         }
 
         let healthy = set_disks
-            .new_multipart_upload(bucket, "healthy/object.bin", &ObjectOptions::default())
+            .new_multipart_upload(
+                bucket,
+                "healthy/object.bin",
+                &ObjectOptions {
+                    // Keep the source time historical but distinct from the absent-time sentinel.
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("healthy multipart upload should be created");
         set_disks
