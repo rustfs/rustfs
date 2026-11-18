@@ -215,6 +215,7 @@ impl Default for ArnTarget {
     }
 }
 
+#[cfg(test)]
 impl ArnTarget {
     pub fn with_client(client: Arc<TargetClient>) -> Self {
         Self {
@@ -229,7 +230,6 @@ impl ArnTarget {
 pub struct ArnErrs {
     pub count: i64,
     pub update_in_progress: bool,
-    pub bucket: String,
 }
 
 /// A single latency sample tagged with the instant it was recorded.
@@ -1013,7 +1013,6 @@ impl BucketTargetSys {
             .entry(arn.to_string())
             .or_insert_with(|| ArnErrs {
                 count: 1,
-                bucket: bucket.to_string(),
                 ..Default::default()
             });
         err.update_in_progress = true;
@@ -1041,10 +1040,7 @@ impl BucketTargetSys {
             .entry(bucket.to_owned())
             .or_default()
             .entry(arn.to_string())
-            .or_insert_with(|| ArnErrs {
-                bucket: bucket.to_string(),
-                ..Default::default()
-            });
+            .or_default();
         err.count += 1;
     }
 
@@ -5158,13 +5154,15 @@ mod tests {
 
         sys.inc_arn_errs("bucket", "arn:reload").await;
         sys.inc_arn_errs("bucket", "arn:reload").await;
+        sys.inc_arn_errs("peer-bucket", "arn:reload").await;
         let errors = sys.arn_errs_map.read().await;
         assert_eq!(errors["bucket"]["arn:reload"].count, 2);
-        assert_eq!(errors["bucket"]["arn:reload"].bucket, "bucket");
+        assert_eq!(errors["peer-bucket"]["arn:reload"].count, 1);
         drop(errors);
 
         sys.mark_refresh_in_progress("bucket", "arn:reload").await;
         assert!(sys.is_reloading_target("bucket", "arn:reload").await);
+        assert!(!sys.is_reloading_target("peer-bucket", "arn:reload").await);
         sys.mark_refresh_done("bucket", "arn:reload").await;
         assert!(!sys.is_reloading_target("bucket", "arn:reload").await);
         sys.mark_refresh_in_progress("bucket", "arn:reload").await;
