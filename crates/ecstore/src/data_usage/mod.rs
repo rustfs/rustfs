@@ -1429,6 +1429,11 @@ fn select_admin_data_usage_snapshot(
 }
 
 fn merge_partial_observation_for_admin(mut authoritative: DataUsageInfo, observed: DataUsageInfo) -> DataUsageInfo {
+    // The response takes the observation's cycle below. Buckets absent from
+    // that observation retain their old value and original certificate.
+    for usage in authoritative.buckets_usage.values_mut() {
+        usage.mark_carried();
+    }
     for (bucket, usage) in observed.buckets_usage {
         authoritative.buckets_usage.insert(bucket, usage);
     }
@@ -2613,6 +2618,16 @@ pub async fn reload_unknown_bucket_usage(bucket: &str) -> Option<u64> {
 }
 
 pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+    cached_bucket_usage_size(bucket, |cached| cached.usage.size.saturating_add(cached.pending_negative_delta)).await
+}
+
+/// Read-only statistics show the post-delete value. The local hold on deleted
+/// bytes is an admission precaution, not part of the bucket's measured size.
+pub(crate) async fn get_bucket_usage_for_statistics(bucket: &str) -> Option<u64> {
+    cached_bucket_usage_size(bucket, |cached| cached.usage.size).await
+}
+
+async fn cached_bucket_usage_size(bucket: &str, local_size: impl FnOnce(&CachedBucketUsage) -> u64) -> Option<u64> {
     // A process-local mutation cache is authoritative only when every request
     // is handled by this process. In a distributed deployment it contains an
     // absolute count derived from one node's requests, so applying it as the
@@ -2625,10 +2640,7 @@ pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
     update_usage_cache_if_needed().await;
 
     let cache = memory_cache().read().await;
-    cache
-        .get(bucket)
-        .filter(|cached| cached.authoritative)
-        .map(|cached| cached.usage.size.saturating_add(cached.pending_negative_delta))
+    cache.get(bucket).filter(|cached| cached.authoritative).map(local_size)
 }
 
 async fn update_usage_cache_if_needed() {
@@ -4085,6 +4097,16 @@ mod tests {
         let mut authoritative = data_usage_info_for_test("cold", 152_318, 80 * 1024 * 1024 * 1024, baseline_time);
         authoritative.scanner_epoch = Some(4);
         authoritative.scanner_cycle = Some(10);
+        let cold_certificate = rustfs_data_usage::BucketUsageCertification {
+            epoch: 4,
+            cycle: 10,
+            certified_at: baseline_time,
+        };
+        authoritative
+            .buckets_usage
+            .get_mut("cold")
+            .expect("cold baseline")
+            .certify(cold_certificate);
         authoritative.buckets_usage.insert(
             "hot".to_string(),
             BucketUsageInfo {
@@ -4146,6 +4168,7 @@ mod tests {
                 objects_count: 34,
                 versions_count: 34,
                 size: 8 * 1024 * 1024,
+                usage_value_state: Some(rustfs_data_usage::BucketUsageValueState::Observed),
                 ..Default::default()
             },
         );
@@ -4161,6 +4184,13 @@ mod tests {
         assert!(selected.is_valid_partial_snapshot());
         assert_eq!(selected.usage_snapshot_converged, Some(false));
         assert_eq!(selected.buckets_count, 2);
+        assert_eq!(selected.scanner_cycle, Some(11));
+        let cold = &selected.buckets_usage["cold"];
+        assert_eq!(cold.usage_value_state, Some(rustfs_data_usage::BucketUsageValueState::Carried));
+        assert_eq!(cold.usage_certification, Some(cold_certificate));
+        let hot = &selected.buckets_usage["hot"];
+        assert_eq!(hot.usage_value_state, Some(rustfs_data_usage::BucketUsageValueState::Observed));
+        assert_eq!(hot.usage_certification, None);
         assert_eq!(
             selected
                 .buckets_usage
