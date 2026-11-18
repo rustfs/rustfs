@@ -29,6 +29,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64_simd::STANDARD as BASE64;
 use http::header::{CONTENT_TYPE, HOST};
+use jiff::Timestamp;
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
@@ -386,7 +387,7 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "usage": "EncryptDecrypt",
         "status": "Active",
         "metadata": HashMap::<String, String>::new(),
-        "created_at": format!("{}[UTC]", chrono::Utc::now().to_rfc3339()),
+        "created_at": format!("{}[UTC]", Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.fZ")),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
         "encrypted_key_material": BASE64.encode_to_string(key_data),

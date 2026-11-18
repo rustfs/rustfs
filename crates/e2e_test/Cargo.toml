@@ -123,7 +123,7 @@ urlencoding.workspace = true
 walkdir.workspace = true
 base64-simd = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 hex-simd = { workspace = true }
 md-5 = { workspace = true }
 prost.workspace = true
