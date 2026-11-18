@@ -34,5 +34,7 @@ Workload-only providers cannot perform Console authorization-code login. Hiding 
 
 ## Deployment notes
 
+Operators who add, edit or remove OIDC providers through the admin API need both `admin:ConfigUpdate` and `admin:ManageOpenIDConfig`. Grant the latter only to administrators trusted to choose identity providers and their policy mappings. This also applies when a configuration import or history restore changes or removes a provider. Existing policies that grant only `admin:ConfigUpdate` can still update unrelated settings.
+
 - Behind a load balancer, authorize and callback requests must reach the same RustFS node while the `state` is in flight, or set `RUSTFS_BROWSER_REDIRECT_URL` so the callback URL is stable; the callback error text names both remedies.
 - Provider-specific setup (client registration, claim mappers, redirect-URL priority) is covered by the console integration guide for the provider in use; this page states only what any provider must offer.
