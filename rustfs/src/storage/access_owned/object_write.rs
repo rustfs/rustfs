@@ -112,7 +112,9 @@ pub(crate) async fn authorize_post_object<R: AuthorizationRequest + ?Sized>(
     info.object = Some(key.to_owned());
     info.version_id = version_id.map(str::to_owned);
     req.install_post_object_marker();
-    authorize_request(req, post_object_authorize_action()).await
+    authorize_request(req, post_object_authorize_action())
+        .await
+        .map_err(Into::into)
 }
 
 /// Form fields that shadow wire headers in the PutObject policy decision.

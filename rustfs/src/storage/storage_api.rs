@@ -156,14 +156,7 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
     pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
     pub(crate) use super::super::access::access_owned::object_read::authorize_get_object;
-    pub(crate) use super::super::access::{
-        StagedMultipartPartAuthorization, authorize_copy_object_tags, authorize_request, authorize_request_core,
-        log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
-    };
-    #[cfg(feature = "gateway-stack")]
-    pub(crate) use super::super::access::{
-        authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
-    };
+    pub(crate) use super::super::access::{StagedMultipartPartAuthorization, authorize_copy_object_tags};
     pub(crate) use super::super::authorization::ObjectTagConditions;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
@@ -181,6 +174,13 @@ pub(crate) mod access_consumer {
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards,
     };
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use super::super::authorization::{
+        authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
+    };
+    pub(crate) use super::super::authorization::{
+        authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+    };
     pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
@@ -194,14 +194,15 @@ pub(crate) mod access_consumer {
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
-    pub(crate) use super::super::access::{
-        authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
-        authorize_staged_multipart_part, authorize_write_etag_condition, parity_test_support,
-    };
+    pub(crate) use super::super::access::parity_test_support;
     pub(crate) use super::super::authorization::ObjectTagConditions;
     pub(crate) use super::super::authorization::TableDataPlanePublicationGuards;
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
     pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
+    pub(crate) use super::super::authorization::{
+        authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
+        authorize_staged_multipart_part, authorize_write_etag_condition,
+    };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
     pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};

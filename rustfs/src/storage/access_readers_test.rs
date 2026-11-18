@@ -444,8 +444,12 @@ async fn object_request_without_req_info_is_refused_in_both_forms() {
     let mut envelope = RequestEnvelope::from_s3s(&req);
     let action = Action::S3Action(S3Action::GetObjectAclAction);
     for result in [
-        authorize_object_request(&mut req, BUCKET, "key", Some("v1"), action).await,
-        authorize_object_request(&mut envelope, BUCKET, "key", Some("v1"), action).await,
+        authorize_object_request(&mut req, BUCKET, "key", Some("v1"), action)
+            .await
+            .map_err(super::S3Error::from),
+        authorize_object_request(&mut envelope, BUCKET, "key", Some("v1"), action)
+            .await
+            .map_err(super::S3Error::from),
     ] {
         let err = result.expect_err("a request without ReqInfo is refused");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
