@@ -269,6 +269,7 @@ if [[ -e "$REPO_ROOT/.git" ]] \
     && [[ -n "$(git -C "$REPO_ROOT" config --get remote.origin.url || true)" ]]; then
     while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && SCANNED_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
     while IFS= read -r -d '' path; do [[ -f "$REPO_ROOT/$path" ]] && ECSTORE_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
+    echo "s3s footprint scan: tracked Rust files=${#SCANNED_RUST_PATHS[@]}" >&2
 else
     SCANNED_RUST_PATHS=("$E2E_TEST_GLOB" .)
     ECSTORE_RUST_PATHS=(crates/ecstore/src)
