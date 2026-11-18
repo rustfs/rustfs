@@ -31,11 +31,11 @@ use crate::storage::request_markers::{
     PermissionProbeRequestFact, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
     RequestedObjectTags,
 };
+use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions;
 use crate::storage::storage_api::ecfs_consumer::contract::object::ObjectOperations as _;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::{
-    ECStore, ObjectOptions, StorageError, decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found,
-    is_err_version_not_found,
+    ECStore, StorageError, decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use http::HeaderMap;
 use metrics::counter;
@@ -459,49 +459,6 @@ pub(crate) fn resource_free_condition_values<R: AuthorizationRequest + ?Sized>(
     conditions
 }
 
-pub(crate) async fn get_object_tag_conditions_for_policy_from_store(
-    store: &ECStore,
-    bucket: &str,
-    object: &str,
-    version_id: Option<&str>,
-) -> S3Result<HashMap<String, Vec<String>>> {
-    let opts = ObjectOptions {
-        version_id: version_id.map(String::from),
-        ..Default::default()
-    };
-    let tags = match store.get_object_tags(bucket, object, &opts).await {
-        Ok(tags) => tags,
-        Err(err) => {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_bucket_not_found(&err) {
-                tracing::debug!(
-                    target: "rustfs::storage::ecfs",
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?version_id,
-                    error = %err,
-                    "object, version, or bucket not found when fetching tags for policy; treating as no tags"
-                );
-                return Ok(HashMap::new());
-            }
-            tracing::warn!(
-                target: "rustfs::storage::ecfs",
-                bucket = %bucket,
-                object = %object,
-                version_id = ?version_id,
-                error = %err,
-                "get_object_tags failed for policy conditions; denying request"
-            );
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
-    };
-    let map = decode_tags_to_map(&tags);
-    let mut out = HashMap::new();
-    for (key, value) in map {
-        out.insert(format!("ExistingObjectTag/{key}"), vec![value]);
-    }
-    Ok(out)
-}
-
 pub(crate) async fn get_or_fetch_object_tag_conditions<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     store: &ECStore,
@@ -517,9 +474,54 @@ pub(crate) async fn get_or_fetch_object_tag_conditions<R: AuthorizationRequest +
     }
 
     counter!("rustfs_object_tag_conditions_fetched_total", "op" => action_tag_metric_label(&action)).increment(1);
-    let fetched = get_object_tag_conditions_for_policy_from_store(store, bucket, object, version_id).await?;
+    let fetched = existing_object_tag_conditions(store, bucket, object, version_id).await?;
     req.install_object_tag_conditions(ObjectTagConditions::new(bucket, object, version_id, fetched.clone()));
     Ok(fetched)
+}
+
+/// The `ExistingObjectTag/*` condition values of one stored object version. A missing object,
+/// version or bucket has no tags; any other read failure denies the request.
+pub(crate) async fn existing_object_tag_conditions(
+    store: &ECStore,
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+) -> S3Result<HashMap<String, Vec<String>>> {
+    let opts = StorageObjectOptions {
+        version_id: version_id.map(String::from),
+        ..Default::default()
+    };
+    let tags = match store.get_object_tags(bucket, object, &opts).await {
+        Ok(t) => t,
+        Err(e) => {
+            if is_err_object_not_found(&e) || is_err_version_not_found(&e) || is_err_bucket_not_found(&e) {
+                tracing::debug!(
+                    target: "rustfs::storage::authorization",
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?version_id,
+                    error = %e,
+                    "object, version, or bucket not found when fetching tags for policy; treating as no tags"
+                );
+                return Ok(HashMap::new());
+            }
+            tracing::warn!(
+                target: "rustfs::storage::authorization",
+                bucket = %bucket,
+                object = %object,
+                version_id = ?version_id,
+                error = %e,
+                "get_object_tags failed for policy conditions; denying request"
+            );
+            return Err(s3_error!(AccessDenied, "Access Denied"));
+        }
+    };
+    let map = decode_tags_to_map(&tags);
+    let mut out = HashMap::new();
+    for (k, v) in map {
+        out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+    }
+    Ok(out)
 }
 
 pub(crate) async fn maybe_merge_object_tag_conditions<R: AuthorizationRequest + ?Sized>(

@@ -14,7 +14,6 @@
 
 use crate::app::{Answered, RequestEnvelope};
 use crate::error::ApiErrorDiagnostic;
-use crate::storage::authorization::get_object_tag_conditions_for_policy_from_store;
 use crate::storage::s3_api;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use http::StatusCode;
@@ -108,9 +107,9 @@ impl FS {
         let Some(store) = self.server_ctx.object_store() else {
             return Ok(std::collections::HashMap::new());
         };
-        get_object_tag_conditions_for_policy_from_store(store.as_ref(), bucket, object, version_id)
+        crate::storage::authorization::existing_object_tag_conditions(store.as_ref(), bucket, object, version_id)
             .await
-            .map_err(s3s::S3Error::from)
+            .map_err(Into::into)
     }
 }
 

@@ -34,14 +34,15 @@ mod request;
 mod table_data_plane;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
+pub(crate) use conditions::existing_object_tag_conditions;
 #[cfg(test)]
 pub(crate) use conditions::{
     BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, classify_bucket_policy_raw_load_error,
     merge_request_object_tag_conditions, remaining_retention_days,
 };
 pub(crate) use conditions::{
-    ObjectTagConditions, authorization_conditions, get_object_tag_conditions_for_policy_from_store,
-    get_or_fetch_object_tag_conditions, request_authz_facts, request_principal, resource_free_condition_values, root_access_key,
+    ObjectTagConditions, authorization_conditions, get_or_fetch_object_tag_conditions, request_authz_facts, request_principal,
+    resource_free_condition_values, root_access_key,
 };
 #[cfg(test)]
 pub(crate) use conditions::{

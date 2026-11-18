@@ -245,6 +245,8 @@ pub(crate) mod ecfs_consumer {
     pub(crate) mod object_lock {
         pub(crate) use super::super::super::validate_bucket_object_lock_enabled;
     }
+
+    pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
 }
 
 pub(crate) mod ecfs_extend_consumer {
