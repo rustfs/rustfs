@@ -2712,7 +2712,7 @@ mod tests {
     use crate::cache::{Cache, CacheEntity};
     use crate::error::Error;
     use crate::manager::get_default_policies;
-    use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
+    use crate::store::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType};
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
@@ -3448,8 +3448,28 @@ mod tests {
         derived_save_started: Arc<tokio::sync::Notify>,
         release_derived_save: Arc<tokio::sync::Notify>,
         block_group_save: Arc<std::sync::atomic::AtomicBool>,
+        group_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+        saved_groups: Arc<Mutex<HashMap<String, GroupInfo>>>,
         group_save_started: Arc<tokio::sync::Notify>,
         group_save_release: Arc<tokio::sync::Notify>,
+    }
+
+    struct MockGroupEdit {
+        store: StsTestMockStore,
+        name: String,
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl GroupEdit for MockGroupEdit {
+        async fn save(&self, group: &GroupInfo) -> Result<()> {
+            self.store.save_group_info(&self.name, group.clone()).await
+        }
+
+        async fn delete_empty(&self) -> Result<()> {
+            self.store.delete_mapped_policy(&self.name, UserType::Reg, true).await?;
+            self.store.delete_group_info(&self.name).await
+        }
     }
 
     impl StsTestMockStore {
@@ -3472,6 +3492,12 @@ mod tests {
                 derived_save_started: Arc::new(tokio::sync::Notify::new()),
                 release_derived_save: Arc::new(tokio::sync::Notify::new()),
                 block_group_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                group_locks: Default::default(),
+                saved_groups: Arc::new(Mutex::new(if empty_policies {
+                    HashMap::new()
+                } else {
+                    HashMap::from([("testgroup".to_owned(), GroupInfo::new(vec!["sts-fallback-test-parent".to_owned()]))])
+                })),
                 group_save_started: Arc::new(tokio::sync::Notify::new()),
                 group_save_release: Arc::new(tokio::sync::Notify::new()),
             }
@@ -3614,15 +3640,36 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+        async fn begin_group_edit(&self, name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+            let lock = self
+                .group_locks
+                .lock()
+                .expect("group locks")
+                .entry(name.to_owned())
+                .or_default()
+                .clone();
+            let guard = lock.lock_owned().await;
+            Ok((
+                Box::new(MockGroupEdit {
+                    store: self.clone(),
+                    name: name.to_owned(),
+                    _guard: guard,
+                }),
+                self.saved_groups.lock().expect("saved groups").get(name).cloned(),
+            ))
+        }
+
+        async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()> {
             if self.block_group_save.load(std::sync::atomic::Ordering::SeqCst) {
                 self.group_save_started.notify_one();
                 self.group_save_release.notified().await;
             }
+            self.saved_groups.lock().expect("saved groups").insert(name.to_owned(), item);
             Ok(())
         }
 
-        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+        async fn delete_group_info(&self, name: &str) -> Result<()> {
+            self.saved_groups.lock().expect("saved groups").remove(name);
             Ok(())
         }
 
@@ -3675,11 +3722,14 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn delete_mapped_policy(&self, name: &str, user_type: UserType, _is_group: bool) -> Result<()> {
+        async fn delete_mapped_policy(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
             self.deleted_mapped_policies
                 .lock()
                 .expect("deleted_mapped_policies mutex poisoned")
                 .push((name.to_string(), user_type));
+            if is_group {
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
@@ -3788,9 +3838,7 @@ mod tests {
             users.insert(PARENT_USER.to_string(), parent_identity);
             users.extend(saved_users);
 
-            let group = GroupInfo::new(vec![PARENT_USER.to_string()]);
-            let mut groups = HashMap::new();
-            groups.insert(GROUP_NAME.to_string(), group);
+            let groups = self.saved_groups.lock().expect("saved groups").clone();
 
             let group_policy = MappedPolicy::new("readwrite");
             let mut group_policies = HashMap::new();
@@ -3821,6 +3869,82 @@ mod tests {
         let store = StsTestMockStore::new(false);
         let cache = IamCache::new(store).await.expect("IAM cache should initialize");
         IamSys::new(cache)
+    }
+
+    async fn shared_group_caches() -> (StsTestMockStore, Arc<IamCache<StsTestMockStore>>, Arc<IamCache<StsTestMockStore>>) {
+        let store = StsTestMockStore::new(false);
+        let (first, second) = temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+            (
+                IamCache::new(store.clone()).await.expect("first cache"),
+                IamCache::new(store.clone()).await.expect("second cache"),
+            )
+        })
+        .await;
+        (store, first, second)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn group_edit_status_and_removal_survive_shared_backend_reload() {
+        let (store, first, second) = shared_group_caches().await;
+        let group = "testgroup";
+        let member = "sts-fallback-test-parent";
+        second
+            .add_users_to_group("unrelated", vec![member.to_owned()])
+            .await
+            .expect("seed unrelated membership");
+        store.block_group_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut removal = Box::pin(first.remove_users_from_group(group, vec![member.to_owned()]));
+        assert!(futures::poll!(&mut removal).is_pending());
+        store.block_group_save.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut status = Box::pin(second.set_group_status(group, false));
+        assert!(futures::poll!(&mut status).is_pending(), "status must wait for the other writer");
+        store.group_save_release.notify_one();
+        removal.await.expect("commit removal");
+        status.await.expect("commit status");
+
+        store.load_all(&first.cache).await.expect("reload durable groups");
+        for node in [&first, &second] {
+            let state = node.cache.snapshot();
+            assert!(state.groups[group].members.is_empty());
+            assert_eq!(state.groups[group].status, "disabled");
+            assert_eq!(state.user_group_memberships[member], HashSet::from(["unrelated".to_owned()]));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn group_edit_delete_orders_emptiness_check_with_add() {
+        let (store, first, second) = shared_group_caches().await;
+        let group = "testgroup";
+        let member = "sts-fallback-test-parent";
+        second
+            .remove_users_from_group(group, vec![member.to_owned()])
+            .await
+            .expect("empty group");
+        store.block_group_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut add = Box::pin(first.add_users_to_group(group, vec![member.to_owned()]));
+        assert!(futures::poll!(&mut add).is_pending());
+        let mut delete = Box::pin(second.remove_users_from_group(group, vec![]));
+        assert!(futures::poll!(&mut delete).is_pending(), "delete must wait before checking emptiness");
+        store.group_save_release.notify_one();
+        add.await.expect("restore membership");
+        assert!(matches!(delete.await, Err(Error::GroupNotEmpty)));
+        assert!(store.deleted_mapped_policies.lock().expect("policy deletions").is_empty());
+        store.block_group_save.store(false, std::sync::atomic::Ordering::SeqCst);
+        second.set_group_status(group, false).await.expect("refresh from peer add");
+        assert!(second.cache.snapshot().user_group_memberships[member].contains(group));
+        first
+            .remove_users_from_group(group, vec![member.to_owned()])
+            .await
+            .expect("empty group");
+        second
+            .remove_users_from_group(group, vec![])
+            .await
+            .expect("delete empty group");
+        assert!(matches!(first.set_group_status(group, true).await, Err(Error::NoSuchGroup(_))));
+        assert!(!second.cache.snapshot().user_group_memberships.contains_key(member));
+        assert!(!store.saved_groups.lock().expect("durable groups").contains_key(group));
     }
 
     async fn assert_group_write_during_reload_is_published(remove: bool) {
