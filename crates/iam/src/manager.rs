@@ -1122,7 +1122,9 @@ where
 
         let direct_policies = mapped_policy.to_slice();
         let has_identity_mapping = !direct_policies.is_empty();
-        let policies = self.policy_db_get_with_groups(direct_policies, groups).await?;
+        // An uncached group mapping can contain a Deny even when a direct policy exists.
+        let mut policies = direct_policies;
+        policies.extend(self.policy_db_get_with_groups(Vec::new(), groups).await?);
         Ok((policies, has_identity_mapping))
     }
 
