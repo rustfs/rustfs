@@ -18,7 +18,7 @@
 use super::*;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
 use crate::admin::router::{AdminOperation, S3Router};
-use crate::server::gateway_handlers::test_support::signed_body_request;
+use crate::server::gateway_handlers::test_support::{signed_body_request, signed_session_request};
 use crate::server::stack::select_stack;
 use http_body_util::Full;
 use std::sync::Mutex;
@@ -107,6 +107,37 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
     let router = crate::admin::make_admin_router(false, slot.clone()).unwrap();
     let (edge, legacy_calls) = edge(&slot, legacy.clone(), router);
     let mut failures = Vec::new();
+    let iam = slot.installed_app_context().unwrap().iam().handle();
+    iam.create_user(
+        "gone-user",
+        &AddOrUpdateUserReq {
+            secret_key: USER_SECRET.to_owned(),
+            policy: None,
+            status: AccountStatus::Enabled,
+        },
+    )
+    .await
+    .unwrap();
+    iam.delete_user("gone-user", false).await.unwrap();
+    for (parent, key) in [(ROOT, "svc-of-root"), ("info-no-policy", "svc-of-no-policy")] {
+        iam.new_service_account(
+            parent,
+            None,
+            rustfs_iam::sys::NewServiceAccountOpts {
+                session_policy: None,
+                access_key: key.to_owned(),
+                secret_key: USER_SECRET.to_owned(),
+                name: None,
+                description: None,
+                expiration: None,
+                allow_site_replicator_account: false,
+                claims: None,
+                status: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
 
     type Build = Box<dyn Fn() -> HttpRequest<Full<Bytes>>>;
     let to_full = |request: HttpRequest<Empty<Bytes>>| request.map(|_| Full::new(Bytes::new()));
@@ -137,7 +168,7 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
                     Signed::Query,
                 ))
             }),
-            Compare::Json,
+            Compare::Bytes,
         ),
         (
             "user without the admin action",
@@ -171,6 +202,79 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
             "wrong secret",
             Box::new(move || to_full(signed_as(Method::GET, "/rustfs/admin/v3/list-users", "", ROOT, "wrong", Signed::Header))),
             Compare::Refusal,
+        ),
+        (
+            "unknown key",
+            Box::new(move || {
+                to_full(signed_as(
+                    Method::GET,
+                    "/rustfs/admin/v3/list-users",
+                    "",
+                    "no-such-key",
+                    USER_SECRET,
+                    Signed::Header,
+                ))
+            }),
+            Compare::Refusal,
+        ),
+        (
+            "deleted key",
+            Box::new(move || {
+                to_full(signed_as(
+                    Method::GET,
+                    "/rustfs/admin/v3/list-users",
+                    "",
+                    "gone-user",
+                    USER_SECRET,
+                    Signed::Header,
+                ))
+            }),
+            Compare::Refusal,
+        ),
+        (
+            "service account of the root",
+            Box::new(move || {
+                to_full(signed_as(
+                    Method::GET,
+                    "/rustfs/admin/v3/list-users",
+                    "",
+                    "svc-of-root",
+                    USER_SECRET,
+                    Signed::Header,
+                ))
+            }),
+            Compare::Json,
+        ),
+        (
+            "service account of a user without the admin action",
+            Box::new(move || {
+                to_full(signed_as(
+                    Method::GET,
+                    "/rustfs/admin/v3/list-users",
+                    "",
+                    "svc-of-no-policy",
+                    USER_SECRET,
+                    Signed::Header,
+                ))
+            }),
+            Compare::Bytes,
+        ),
+        (
+            "repeated authorization",
+            Box::new(move || {
+                let mut request = to_full(signed_as(
+                    Method::GET,
+                    "/rustfs/admin/v3/target/list",
+                    "",
+                    ROOT,
+                    ROOT_SECRET,
+                    Signed::Header,
+                ));
+                let authorization = request.headers()[http::header::AUTHORIZATION].clone();
+                request.headers_mut().append(http::header::AUTHORIZATION, authorization);
+                request
+            }),
+            Compare::Bytes,
         ),
         (
             "anonymous admin GET",
@@ -218,7 +322,7 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
         (
             "anonymous OIDC provider list",
             Box::new(|| anonymous(Method::GET, "/rustfs/admin/v3/oidc/providers", None, "")),
-            Compare::Json,
+            Compare::Bytes,
         ),
         (
             "zip download with a forged token",
@@ -343,9 +447,7 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
                     && snapshot_error_xml_or_bytes(&old.2) == snapshot_error_xml_or_bytes(&new.2)
             }
             Compare::Json => {
-                old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE)
-                    && serde_json::from_slice::<serde_json::Value>(&old.2).ok()
-                        == serde_json::from_slice::<serde_json::Value>(&new.2).ok()
+                old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE) && json_agrees(&old.2, &new.2)
             }
             // The gateway's authenticator words the disabled-key refusal itself, as on the native routes.
             Compare::Refusal if *label == "disabled user" => {
@@ -428,6 +530,44 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Whether both bodies are JSON documents and the same one: a body that is not JSON never agrees.
+fn json_agrees(old: &[u8], new: &[u8]) -> bool {
+    match (
+        serde_json::from_slice::<serde_json::Value>(old),
+        serde_json::from_slice::<serde_json::Value>(new),
+    ) {
+        (Ok(old), Ok(new)) => old == new,
+        _ => false,
+    }
+}
+
+#[test]
+fn json_agreement_needs_two_equal_documents() {
+    assert!(json_agrees(br#"{"a":[1]}"#, br#"{ "a": [1] }"#));
+    assert!(!json_agrees(br#"{"a":1}"#, br#"{"a":2}"#));
+    assert!(!json_agrees(b"<Error/>", b"<Error/>"), "two bodies that are not JSON");
+    assert!(!json_agrees(b"", b""), "two empty bodies");
+    assert!(!json_agrees(br#"{"a":1}"#, b"not json"));
+}
+
+/// A probe GET signed by `session`, its token where the signature travels.
+fn session_request(session: &rustfs_credentials::Credentials, form: Signed) -> HttpRequest<Full<Bytes>> {
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::HOST, HOST.parse().unwrap());
+    headers.insert("x-request-id", REQUEST_ID.parse().unwrap());
+    signed_session_request(
+        form,
+        Method::GET,
+        "/rustfs/admin/v3/probe",
+        "",
+        &session.access_key,
+        &session.secret_key,
+        Some(&session.session_token),
+        headers,
+    )
+    .map(|_| Full::default())
+}
+
 fn snapshot_error_xml_or_bytes(body: &[u8]) -> Vec<u8> {
     match std::str::from_utf8(body) {
         Ok(text) if text.starts_with("<?xml") => snapshot_error_xml(body).into_bytes(),
@@ -483,8 +623,25 @@ async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
     legacy.set_route(probe_router(&slot));
     let legacy = legacy.build();
     let (edge, legacy_calls) = edge(&slot, legacy.clone(), probe_router(&slot));
+    let claims = std::collections::HashMap::from([
+        ("exp".to_owned(), serde_json::json!(chrono::Utc::now().timestamp() + 900)),
+        ("parent".to_owned(), serde_json::json!(ROOT)),
+    ]);
+    let mut session = rustfs_policy::auth::get_new_credentials_with_metadata(&claims, ROOT_SECRET).unwrap();
+    session.parent_user = ROOT.to_owned();
+    slot.installed_app_context()
+        .unwrap()
+        .iam()
+        .handle()
+        .set_temp_user(&session.access_key, &session, None)
+        .await
+        .unwrap();
+    let token = session.session_token.clone();
+    let (header_session, query_session) = (session.clone(), session.clone());
 
     let requests: Vec<Box<dyn Fn() -> HttpRequest<Full<Bytes>>>> = vec![
+        Box::new(move || session_request(&header_session, Signed::Header)),
+        Box::new(move || session_request(&query_session, Signed::Query)),
         Box::new(|| {
             signed_as(Method::GET, "/rustfs/admin/v3/probe", "", ROOT, ROOT_SECRET, Signed::Header).map(|_| Full::default())
         }),
@@ -523,5 +680,48 @@ async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
         assert_eq!(pair[0].len(), 1, "{pair:?}");
         assert_eq!(pair[0], pair[1], "the gateway handed the handler a different caller");
     }
+    // Both session callers, the token in the header and in the query, reach the handler as the
+    // session: its key and its token, which the handler's IAM lookup resolves to its parent.
+    for pair in &seen[..4] {
+        assert!(pair[0].contains(&format!("key=Some({:?})", session.access_key)), "{pair:?}");
+        assert!(pair[0].contains(&format!("token=Some({token:?})")), "{pair:?}");
+    }
+    assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn the_console_listener_isolates_its_routes_in_front_of_the_control_plane_host() {
+    let (_env, slot, legacy) = admin_fixture().await;
+    let router = crate::admin::make_admin_router(false, slot.clone()).unwrap();
+    let (edge, legacy_calls) = edge(&slot, legacy, router);
+    let reached = Arc::new(AtomicUsize::new(0));
+    let counted = {
+        let reached = Arc::clone(&reached);
+        tower::service_fn(move |request: HttpRequest<ControlRequestBody>| {
+            reached.fetch_add(1, Ordering::SeqCst);
+            edge.clone().oneshot(request)
+        })
+    };
+    let console = ControlBodyDigestService::new(counted, Duration::from_secs(1)).with_console_listener(true);
+    let to_full = |request: HttpRequest<Empty<Bytes>>| request.map(|_| Full::new(Bytes::new()));
+    let signed = |path: &str, query: &str| to_full(signed_as(Method::GET, path, query, ROOT, ROOT_SECRET, Signed::Header));
+    for (label, request) in [
+        ("object read", signed("/bucket/notes.txt", "")),
+        ("replication extension", signed("/missing-bucket", "replication-metrics=")),
+        (
+            "object lambda on an admin path",
+            signed("/rustfs/admin/v3/list-users", "lambdaArn=example"),
+        ),
+        ("anonymous object read", anonymous(Method::GET, "/bucket/notes.txt", None, "")),
+    ] {
+        let before = reached.load(Ordering::SeqCst);
+        let (status, _, _) = answer(console.clone(), request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}");
+        assert_eq!(reached.load(Ordering::SeqCst), before, "{label} reached the stack");
+    }
+    let (status, _, body) = answer(console.clone(), signed("/rustfs/admin/v3/list-users", "")).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", refusal(&body));
+    assert_eq!(reached.load(Ordering::SeqCst), 1, "the admin route did not reach the control-plane host");
     assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 }
