@@ -13,12 +13,15 @@
 // limitations under the License.
 
 #[cfg(test)]
+mod authorization_test;
+#[cfg(test)]
 mod copy_test;
 mod multipart;
 mod owned;
 #[cfg(test)]
 mod upload_copy_test;
 
+#[cfg(test)]
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
@@ -45,6 +48,7 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 #[cfg(test)]
 use s3s::S3;
+#[cfg(test)]
 use s3s::S3Request;
 #[cfg(test)]
 use s3s::S3Result;
@@ -358,6 +362,15 @@ struct RequestParams<'a> {
     credentials: &'a rustfs_credentials::Credentials,
 }
 
+/// The policy action a protocol operation is authorized as; HeadBucket is judged as ListBucket.
+fn protocol_policy_action(action: &S3Action) -> rustfs_policy::policy::action::Action {
+    if matches!(action, S3Action::HeadBucket) {
+        S3Action::ListBucket.into()
+    } else {
+        action.clone().into()
+    }
+}
+
 /// Protocol storage client that implements the StorageBackend trait
 #[derive(Clone, Debug)]
 pub struct ProtocolStorageClient {
@@ -396,48 +409,15 @@ impl ProtocolStorageClient {
         let (credentials, is_owner) = crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref()))
             .await
             .map_err(rustfs_s3_types::S3Error::from)?;
-        let uri = if let Some(input) = listing {
-            build_list_objects_uri(input)?
-        } else if let Some(key) = object {
-            build_object_uri(bucket, key, &[])?
-        } else {
-            build_bucket_uri(bucket, &[])?
-        };
-        let mut request = Self::create_request(
-            (),
-            Method::GET,
-            uri,
-            RequestParams {
-                bucket: Some(bucket.to_owned()),
-                object: object.map(str::to_owned),
-                credentials: &credentials,
-            },
-        )?;
-        request.extensions.insert(self.server_ctx.clone());
-        if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
-            info.is_owner = is_owner;
-        }
-        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
-        request.extensions.insert(Some(RemoteAddr(remote_addr)));
-        let mut client_info = ClientInfo::direct(remote_addr);
-        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
-        request.extensions.insert(client_info);
-        request.headers = session.request_headers.clone();
-        // Preserve staging semantics before distinct operations collapse to PutObject.
-        if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
-            request.extensions.insert(MultipartStagingOperation);
-        }
-        let policy_action = if matches!(action, S3Action::HeadBucket) {
-            S3Action::ListBucket.into()
-        } else {
-            action.clone().into()
-        };
-        authorize_request(&mut request, policy_action)
+        let mut envelope =
+            self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
+        authorize_request(&mut envelope, protocol_policy_action(action))
             .await
             .map_err(rustfs_s3_types::S3Error::from)
     }
 
-    /// Create a proper S3Request with ReqInfo extension for authorization
+    /// The retired s3s request builder, kept as the oracle of differential tests.
+    #[cfg(test)]
     fn create_request<T>(
         input: T,
         method: Method,
@@ -483,6 +463,65 @@ impl ProtocolStorageClient {
             trailing_headers: None,
         };
         Ok(req)
+    }
+
+    /// The request the policy engine judges for one protocol operation: the session's peer,
+    /// transport and policy headers, the re-validated key and owner flag, and the operation's
+    /// bucket, key and listing query.
+    fn protocol_authorization_envelope(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+        listing: Option<&gateway_dto::ListObjectsV2Input>,
+        (credentials, is_owner): (rustfs_credentials::Credentials, bool),
+    ) -> rustfs_s3_types::S3Result<crate::app::RequestEnvelope> {
+        let uri = if let Some(input) = listing {
+            build_list_objects_uri(input)?
+        } else if let Some(key) = object {
+            build_object_uri(bucket, key, &[])?
+        } else {
+            build_bucket_uri(bucket, &[])?
+        };
+        let request_credentials =
+            crate::app::RequestCredentials::new(credentials.access_key.clone(), credentials.secret_key.clone(), None)
+                .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), None));
+        let mut extensions = http::Extensions::default();
+        extensions.insert(ReqInfo {
+            cred: Some(credentials),
+            is_owner,
+            keystone_session_present: None,
+            bucket: Some(bucket.to_owned()),
+            object: object.map(str::to_owned),
+            version_id: None,
+            replication_request_authorized: false,
+            region: None,
+            request_context: Some(RequestContext::fallback()),
+            suppress_denial_log: false,
+            suppress_denial_audit: false,
+        });
+        extensions.insert(self.server_ctx.clone());
+        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
+        extensions.insert(Some(RemoteAddr(remote_addr)));
+        let mut client_info = ClientInfo::direct(remote_addr);
+        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
+        extensions.insert(client_info);
+        // Preserve staging semantics before distinct operations collapse to PutObject.
+        if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
+            extensions.insert(MultipartStagingOperation);
+        }
+        Ok(crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::GET,
+                uri,
+                headers: session.request_headers.clone(),
+                credentials: Some(request_credentials),
+                region: None,
+                service: None,
+            },
+            extensions,
+        ))
     }
 }
 
