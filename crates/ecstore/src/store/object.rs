@@ -5359,7 +5359,7 @@ impl ECStore {
                         .map(|oi| (oi, None));
                 }
                 // Transitioned object self-copy: restore from tier into the same pool.
-                let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), dst_opts);
+                let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
                 if !self.single_pool() {
                     put_opts.decommission_capacity_admission =
                         crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
@@ -5387,7 +5387,7 @@ impl ECStore {
                 // stays consistent with the new version's metadata. Sharing the source data_dir via
                 // a metadata-only version copy would corrupt SSE/compressed objects (issue #4238).
                 if let Some(reader) = src_info.put_object_reader.as_mut() {
-                    let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), dst_opts);
+                    let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
                     if !self.single_pool() {
                         put_opts.decommission_capacity_admission =
                             crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
@@ -5428,7 +5428,7 @@ impl ECStore {
         };
         let dst_object_name = dst_object.as_str();
 
-        let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), dst_opts);
+        let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
         if !self.single_pool() {
             put_opts.decommission_capacity_admission =
                 crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
