@@ -42,10 +42,35 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
 
     async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;
-    /// Create a regular identity or replace one without changing its persisted status.
-    /// Return whether a previous secret was replaced. Backends without conditional writes fail closed.
-    async fn save_regular_user_preserving_status(&self, _name: &str, _item: &UserIdentity) -> Result<bool> {
+    /// Read the authoritative identity and its opaque storage revision. Only confirmed absence yields None.
+    async fn regular_user_revision(&self, _name: &str) -> Result<Option<(UserIdentity, String)>> {
         Err(crate::error::Error::IAMActionNotAllowed)
+    }
+    /// Commit only against the revision just read, or create only if absent. Never retry a stale edit.
+    async fn save_regular_user_revision(&self, _name: &str, _item: &UserIdentity, _revision: Option<&str>) -> Result<()> {
+        Err(crate::error::Error::IAMActionNotAllowed)
+    }
+    /// Persist the secret and its generation in a single conditional write. A same-secret
+    /// upsert preserves sessions, including those predating generation tracking.
+    async fn upsert_regular_user(&self, name: &str, item: &mut UserIdentity, allow_status_change: bool) -> Result<bool> {
+        let current = self.regular_user_revision(name).await?;
+        let previous = current.as_ref().map(|(user, _)| user);
+        if previous.is_some_and(|user| !allow_status_change && user.credentials.status != item.credentials.status) {
+            return Err(crate::error::Error::IAMActionNotAllowed);
+        }
+        let changed = previous.is_some_and(|user| user.credentials.secret_key != item.credentials.secret_key);
+        item.sts_generation = match previous {
+            Some(user) if !changed => user.sts_generation,
+            _ => Some(rand::random()),
+        };
+        self.save_regular_user_revision(name, item, current.as_ref().map(|(_, revision)| revision.as_str()))
+            .await?;
+        Ok(changed)
+    }
+
+    /// Create a regular identity or replace one without changing its durable status.
+    async fn save_regular_user_preserving_status(&self, name: &str, item: &UserIdentity) -> Result<bool> {
+        self.upsert_regular_user(name, &mut item.clone(), false).await
     }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;

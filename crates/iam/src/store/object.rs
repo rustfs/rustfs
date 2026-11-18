@@ -86,29 +86,6 @@ fn get_group_info_path(group: &str) -> String {
     path_join_buf(&[&IAM_CONFIG_GROUPS_PREFIX, group, IAM_GROUP_MEMBERS_FILE])
 }
 
-fn unchanged_status_precondition(
-    previous: &UserIdentity,
-    item: &UserIdentity,
-    etag: Option<String>,
-) -> Result<(HTTPPreconditions, bool)> {
-    if previous.credentials.status != item.credentials.status
-        || previous.credentials.is_temp()
-        || previous.credentials.is_service_account()
-    {
-        return Err(Error::IAMActionNotAllowed);
-    }
-    let tag = etag
-        .filter(|tag| !tag.is_empty() && tag != "*")
-        .ok_or_else(|| Error::other("missing IAM identity revision"))?;
-    Ok((
-        HTTPPreconditions {
-            if_match: Some(tag),
-            ..Default::default()
-        },
-        previous.credentials.secret_key != item.credentials.secret_key,
-    ))
-}
-
 fn get_policy_doc_path(name: &str) -> String {
     path_join_buf(&[&IAM_CONFIG_POLICIES_PREFIX, name, IAM_POLICY_FILE])
 }
@@ -957,6 +934,14 @@ impl Store for ObjectStore {
         user_identity: UserIdentity,
         _ttl: Option<usize>,
     ) -> Result<()> {
+        if user_type == UserType::None {
+            return Err(Error::InvalidArgument);
+        }
+        if user_type == UserType::Reg {
+            let mut identity = user_identity;
+            self.upsert_regular_user(name, &mut identity, true).await?;
+            return Ok(());
+        }
         // Pre-check storage health
         self.check_storage_readiness().await?;
 
@@ -968,23 +953,50 @@ impl Store for ObjectStore {
             e
         })
     }
-    async fn save_regular_user_preserving_status(&self, name: &str, item: &UserIdentity) -> Result<bool> {
+    async fn regular_user_revision(&self, name: &str) -> Result<Option<(UserIdentity, String)>> {
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+            return Err(Error::InvalidArgument);
+        }
         let path = get_user_identity_path(name, UserType::Reg);
         let existing =
             read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await;
-        let (conditions, rotated) = match existing.map_err(Error::from) {
+        match existing.map_err(Error::from) {
             Ok((data, metadata)) => {
-                let previous: UserIdentity = Self::decode_iam_config_strict(&data)?;
-                unchanged_status_precondition(&previous, item, metadata.etag)?
+                let mut identity: UserIdentity = Self::decode_iam_config_strict(&data)?;
+                // As in load_user_identity_with, legacy records may use the object name as their access key.
+                if identity.credentials.access_key.is_empty() {
+                    identity.credentials.access_key = name.to_owned();
+                }
+                let etag = metadata
+                    .etag
+                    .filter(|tag| !tag.is_empty() && tag != "*")
+                    .ok_or_else(|| Error::other("missing IAM identity revision"))?;
+                if identity.credentials.access_key != name
+                    || !matches!(identity.credentials.status.as_str(), "on" | "off")
+                    || !identity.credentials.session_token.is_empty()
+                    || !identity.credentials.parent_user.is_empty()
+                {
+                    return Err(Error::IAMActionNotAllowed);
+                }
+                Ok(Some((identity, etag)))
             }
-            Err(err) if is_err_config_not_found(&err) => (
-                HTTPPreconditions {
-                    if_none_match: Some("*".into()),
-                    ..Default::default()
-                },
-                false,
-            ),
-            Err(err) => return Err(err),
+            Err(err) if is_err_config_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn save_regular_user_revision(&self, name: &str, item: &UserIdentity, revision: Option<&str>) -> Result<()> {
+        let path = get_user_identity_path(name, UserType::Reg);
+        let conditions = match revision {
+            Some("" | "*") => return Err(Error::IAMActionNotAllowed),
+            Some(tag) => HTTPPreconditions {
+                if_match: Some(tag.into()),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".into()),
+                ..Default::default()
+            },
         };
         let opts = IamObjectOptions {
             max_parity: true,
@@ -993,7 +1005,7 @@ impl Store for ObjectStore {
         };
         let data = Self::prepare_data_for_storage(&serde_json::to_vec(item)?)?;
         save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await?;
-        Ok(rotated)
+        Ok(())
     }
 
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
@@ -1624,27 +1636,6 @@ mod tests {
         assert!(matches!(err, Error::NoSuchUser(name) if name == "missing-sts"));
     }
 
-    #[test]
-    fn restricted_user_upsert_requires_unchanged_status_and_exact_revision() {
-        let old = super::UserIdentity::from(Credentials {
-            status: "off".into(),
-            secret_key: "old-fixture".into(),
-            ..Default::default()
-        });
-        let mut new = old.clone();
-        new.credentials.secret_key = "new-fixture".into();
-        let (predicate, rotated) =
-            super::unchanged_status_precondition(&old, &new, Some("rev1".into())).expect("status remains disabled");
-        assert!(rotated);
-        assert_eq!(predicate.if_match.as_deref(), Some("rev1"));
-        assert!(super::unchanged_status_precondition(&old, &new, None).is_err());
-        new.credentials.status = "on".into();
-        assert!(matches!(
-            super::unchanged_status_precondition(&old, &new, Some("rev1".into())),
-            Err(crate::error::Error::IAMActionNotAllowed)
-        ));
-    }
-
     #[tokio::test]
     #[serial]
     async fn restricted_user_upsert_checks_durable_status_before_replacing_credentials() {
@@ -1672,6 +1663,12 @@ mod tests {
                 .await
                 .expect("create absent account")
         );
+        let (original, revision) = store
+            .regular_user_revision(name)
+            .await
+            .expect("read revision")
+            .expect("created identity");
+        assert!(store.save_regular_user_revision(name, &original, Some("*")).await.is_err());
         entry.credentials.status = "on".into();
         entry.credentials.secret_key = "second-fixture".into();
         assert!(matches!(
@@ -1691,7 +1688,16 @@ mod tests {
                 .await
                 .expect("rotate while disabled")
         );
+        assert!(
+            store
+                .save_regular_user_revision(name, &original, Some(&revision))
+                .await
+                .is_err(),
+            "a stale writer cannot restore the old secret or its generation"
+        );
         let persisted = store.load_user_identity(name, UserType::Reg).await.expect("reload rotation");
+        assert!(persisted.sts_generation.is_some());
+        assert_ne!(persisted.sts_generation, original.sts_generation);
         assert_eq!(persisted.credentials.status, "off");
         assert_eq!(persisted.credentials.secret_key, "second-fixture");
     }
