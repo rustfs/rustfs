@@ -232,7 +232,7 @@ impl Served for dto::CreateMultipartUpload {
         let output = DefaultMultipartUsecase::with_context(context)
             .execute_create_multipart_upload(envelope, fields, version)
             .await?;
-        let mut response = Resp::new(dto::CreateMultipartUploadOutput {
+        let response = Resp::new(dto::CreateMultipartUploadOutput {
             bucket: input.bucket,
             key: input.key,
             upload_id: output.upload_id,
@@ -244,8 +244,7 @@ impl Served for dto::CreateMultipartUpload {
             checksum_type: output.checksum_type.map(dto::ChecksumType::custom),
             ..Default::default()
         });
-        response.headers.extend(output.response_headers);
-        Ok(response)
+        Ok(response.with_extra_headers(output.response_headers))
     }
 }
 

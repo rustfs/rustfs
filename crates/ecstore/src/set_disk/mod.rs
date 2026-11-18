@@ -6222,24 +6222,7 @@ fn known_put_object_storage_size(data_size: i64) -> i64 {
     }
 }
 
-/// Shard size the inline admission check evaluates for a single PUT.
-///
-/// A compressed or encrypted stream reports `SIZE_PRESERVE_LAYER` as its
-/// stored size because the transformed length is only known after the write.
-/// MinIO's `putObject` sizes such objects for inline admission by their
-/// plaintext `ActualSize`; without that fallback every transformed object,
-/// however small, lands in `part.1` files. A stream with neither size known
-/// yields a negative shard size, which `should_inline` rejects.
-fn inline_admission_shard_size(erasure: &coding::Erasure, stored_size: i64, actual_size: i64) -> i64 {
-    if stored_size >= 0 {
-        return erasure.shard_file_size(stored_size);
-    }
-    if actual_size > 0 {
-        return erasure.shard_file_size(actual_size);
-    }
-    HashReader::SIZE_PRESERVE_LAYER
-}
-
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers<'a>(
     files: impl Iterator<Item = &'a FileInfo> + Send,

@@ -9034,8 +9034,9 @@ mod tests {
                         assert_eq!(setup.available_shards(), expected);
                         if expected == 2 {
                             assert_eq!(setup.deferred_shards(), 2);
-                            for index in 2..4 {
-                                assert!(!setup.attempted[index]);
+                            for (offset, &attempted) in setup.attempted[2..4].iter().enumerate() {
+                                let index = 2 + offset;
+                                assert!(!attempted);
                                 assert_eq!(calls.for_disk(disk_call_counters::KIND_DISK_SHARD_OPEN, index), 0);
                             }
                         }

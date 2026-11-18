@@ -808,7 +808,7 @@ mod tests {
                 headers.insert(header_name, HeaderValue::from_static("65_536"));
                 let error =
                     extract_multipart_ec_block_size_hint(&headers, &HashMap::new()).expect_err("malformed create-upload hint");
-                assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+                assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
             },
         );
 

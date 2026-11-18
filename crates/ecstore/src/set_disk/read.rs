@@ -17,7 +17,7 @@ use super::{
     GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
     GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
-    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
     build_inline_bitrot_readers_from_refs_with_frame_size, collect_inline_data_shard_fileinfos_by_index, debug, error,
     get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
     is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
