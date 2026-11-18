@@ -843,7 +843,6 @@ mod tests {
 #[cfg(test)]
 mod event_args_tests {
     use super::{EventArgs, NotifyObjectInfo as ObjectInfo};
-    use crate::rules::TargetIdSet;
     use hashbrown::HashMap;
     use rustfs_s3_types::EventName;
 
