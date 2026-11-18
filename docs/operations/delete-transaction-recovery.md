@@ -94,6 +94,8 @@ overflow remains covered by durable discovery, including after a restart.
 These limits bound background work, not the canonical rollback deadline or
 its durability checks.
 
+A key that repeatedly fails for the same transient reason waits 4–8 seconds on its first retry, then uses jittered exponential backoff capped at five minutes. A corrupt record is rechecked after 7.5–15 minutes. A newer foreground delete generation becomes eligible immediately. When inventory observes a returning local drive, keys waiting for quorum in that pool/set become eligible at the next admission. A delayed key does not hold an execution slot. The delays are in memory; they do not change persisted decisions or postpone startup discovery.
+
 When diagnosing high disk reads after a restart, separate raw discovery from settlement of already discovered keys. Sample the `delete_recovery` subsystem's discovery and settlement retry events alongside per-drive operations and foreground latency over the same time interval. These events report changes in retry state; their count is not a count of disk reads. The ECStore recovery worker runs independently of the scanner and HealManager switches. Stopping an admin heal or accepting a legacy MRF responsibility does not settle a delete transaction. Leave the on-disk records in place: they are the evidence recovery needs to finish or roll back that deletion.
 
 Corrupt record contents remain discoverable by their physical key; exact-key
