@@ -1238,22 +1238,14 @@ impl DefaultObjectUsecase {
         // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&envelope)
             && get_header(envelope.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
-        #[cfg(feature = "gateway-stack")]
-        let extract_headers = if envelope.is_gateway_post() {
-            super::post_headers::post_effective_headers(&envelope)
-        } else {
-            envelope.headers()
-        };
-        #[cfg(not(feature = "gateway-stack"))]
-        let extract_headers = envelope.headers();
-        if max_content_length.is_some() && is_put_object_extract_requested(extract_headers) {
+        if max_content_length.is_some() && is_put_object_extract_requested(envelope.headers()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
             ));
         }
         reject_veeam_sosapi_mutation(|| self.object_store(), input.bucket.as_str(), input.key.as_str()).await?;
-        if is_put_object_extract_requested(extract_headers) && !inbound_replication_put {
+        if is_put_object_extract_requested(envelope.headers()) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract_owned(envelope, input)).await;
         }
         // SSE-C ciphertext passthrough (authorized replication only): the body
