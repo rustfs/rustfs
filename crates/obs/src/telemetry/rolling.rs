@@ -670,11 +670,12 @@ mod tests {
     /// The fixtures below use mid-January dates, which sit on no DST or
     /// offset transition in any zone, so every wall-clock time exists exactly once.
     fn local_ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
-        Local
-            .with_ymd_and_hms(year, month, day, hour, min, sec)
-            .single()
+        jiff::civil::DateTime::new(year as i16, month as i8, day as i8, hour as i8, min as i8, sec as i8, 0)
+            .expect("fixture local time must be valid")
+            .to_zoned_datetime(TimeZone::system())
             .expect("fixture local time must exist exactly once")
             .timestamp()
+            .as_second()
     }
 
     #[test]

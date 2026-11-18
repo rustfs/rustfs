@@ -10607,7 +10607,6 @@ name = "rustfs-io-metrics"
 version = "1.0.5"
 dependencies = [
  "criterion",
- "hotpath",
  "metrics",
  "metrics-util",
  "num_cpus",
