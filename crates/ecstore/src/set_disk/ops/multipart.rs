@@ -12846,7 +12846,8 @@ mod tests {
                 bucket,
                 "healthy/object.bin",
                 &ObjectOptions {
-                    mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    // Keep the source time historical but distinct from the absent-time sentinel.
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
                     ..Default::default()
                 },
             )
