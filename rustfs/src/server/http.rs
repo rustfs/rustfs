@@ -109,7 +109,7 @@ use tower_http::trace::TraceLayer;
 #[cfg(feature = "http3")]
 type Http3CoreService = tower::util::BoxCloneService<
     HttpRequest<http3::RequestBody>,
-    Response<HybridBody<s3s::Body, http_body_util::Empty<Bytes>>>,
+    Response<HybridBody<EdgeBody, http_body_util::Empty<Bytes>>>,
     Box<dyn std::error::Error + Send + Sync>,
 >;
 
@@ -1183,14 +1183,14 @@ impl<B> EarlyResponseBodyState<B> {
     }
 }
 
-/// Request body passed into s3s while retaining ownership of the raw transport
+/// Request body passed into the S3 stack while retaining ownership of the raw transport
 /// body if an operation returns before consuming it.
 ///
 /// Hyper closes the HTTP/1 read side as soon as an [`Incoming`] receiver is
 /// dropped before EOF. A streaming reverse proxy can still be writing at that
 /// point and turns the resulting `EPIPE` into a 502, hiding RustFS's actual S3
 /// error response. Moving the raw body back to the outer service keeps Hyper's
-/// receiver alive without running s3s payload hashing or signature transforms.
+/// receiver alive without running payload hashing or signature transforms.
 struct EarlyResponseBody<B>
 where
     B: http_body::Body<Data = Bytes> + Unpin,
@@ -1481,9 +1481,65 @@ where
     }
 }
 
-// Validate control-plane digests before s3s discards the serialized body.
+/// The error of the S3 service under the middleware.
+type EdgeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The body of the S3 service under the middleware: whatever the gateway, the native console or a
+/// refusal written in this file answers, behind one type the middleware is written against.
+pub(crate) struct EdgeBody(http_body_util::combinators::UnsyncBoxBody<Bytes, EdgeError>);
+
+impl EdgeBody {
+    fn new<B>(body: B) -> Self
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<EdgeError>,
+    {
+        use http_body_util::BodyExt;
+        Self(body.map_err(Into::into).boxed_unsync())
+    }
+}
+
+impl Default for EdgeBody {
+    fn default() -> Self {
+        Self::new(http_body_util::Empty::new())
+    }
+}
+
+impl From<Bytes> for EdgeBody {
+    fn from(bytes: Bytes) -> Self {
+        Self::new(http_body_util::Full::new(bytes))
+    }
+}
+
+impl From<rustfs_s3_types::Body> for EdgeBody {
+    fn from(body: rustfs_s3_types::Body) -> Self {
+        Self::new(body)
+    }
+}
+
+impl http_body::Body for EdgeBody {
+    type Data = Bytes;
+    type Error = EdgeError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.0).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.0.size_hint()
+    }
+}
+
+// Validate control-plane digests before the body reaches the stack.
 // Object uploads and multipart/form-data must retain their streaming readers.
-struct ControlRequestBody(s3s::Body);
+struct ControlRequestBody(EdgeBody);
 
 impl http_body::Body for ControlRequestBody {
     type Data = Bytes;
@@ -1507,7 +1563,7 @@ impl http_body::Body for ControlRequestBody {
     }
 }
 
-fn control_request_body(body: s3s::Body) -> ControlRequestBody {
+fn control_request_body(body: EdgeBody) -> ControlRequestBody {
     ControlRequestBody(body)
 }
 
@@ -1524,8 +1580,8 @@ where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    type Response = Response<s3s::Body>;
-    type Error = s3s::HttpError;
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1534,7 +1590,7 @@ where
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         let answer = self.0.call(request);
-        Box::pin(async move { Ok(answer.await.map(s3s::Body::http_body_unsync)) })
+        Box::pin(async move { Ok(answer.await.map(EdgeBody::new)) })
     }
 }
 
@@ -1552,8 +1608,8 @@ where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    type Response = Response<s3s::Body>;
-    type Error = s3s::HttpError;
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1567,7 +1623,7 @@ where
                 Ok(response) => response,
                 Err(never) => match never {},
             };
-            Ok(response.map(s3s::Body::http_body_unsync))
+            Ok(response.map(EdgeBody::new))
         })
     }
 }
@@ -1593,8 +1649,8 @@ where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    type Response = Response<s3s::Body>;
-    type Error = s3s::HttpError;
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1607,7 +1663,7 @@ where
         let (parts, _body) = request.into_parts();
         Box::pin(async move {
             let answer = host.answer(parts.method, parts.uri, parts.headers, parts.extensions).await;
-            Ok(answer.map(s3s::Body::http_body_unsync))
+            Ok(answer.map(EdgeBody::new))
         })
     }
 }
@@ -1772,11 +1828,11 @@ fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Optio
     None
 }
 
-fn control_body_digest_error(code: &'static str) -> Response<s3s::Body> {
+fn control_body_digest_error<R: From<Bytes>>(code: &'static str) -> Response<R> {
     // Only static protocol error codes reach this function; never reflect headers or bodies.
     let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>");
     let length = xml.len();
-    let mut response = Response::new(s3s::Body::from(xml));
+    let mut response = Response::new(R::from(Bytes::from(xml)));
     *response.status_mut() = http::StatusCode::BAD_REQUEST;
     response
         .headers_mut()
@@ -1851,16 +1907,17 @@ fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result:
     Ok(())
 }
 
-impl<S, B> Service<HttpRequest<B>> for ControlBodyDigestService<S>
+impl<S, B, R> Service<HttpRequest<B>> for ControlBodyDigestService<S>
 where
-    S: Service<HttpRequest<ControlRequestBody>, Response = Response<s3s::Body>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ControlRequestBody>, Response = Response<R>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Send + Sync + 'static,
     Box<dyn std::error::Error + Send + Sync>: From<B::Error>,
+    R: From<Bytes> + Default + Send + 'static,
 {
-    type Response = Response<s3s::Body>;
+    type Response = Response<R>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -1871,7 +1928,7 @@ where
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         use http_body_util::BodyExt;
         if self.console_listener && !admin::router::console_listener_route(request.method(), request.uri(), request.headers()) {
-            let mut response = Response::new(s3s::Body::empty());
+            let mut response = Response::new(R::default());
             *response.status_mut() = http::StatusCode::NOT_FOUND;
             return Box::pin(async move { Ok(response) });
         }
@@ -1882,7 +1939,7 @@ where
         let total_timeout = self.total_timeout;
         let limit = self.max_body_size;
         Box::pin(async move {
-            let mut request = request.map(s3s::Body::http_body_unsync);
+            let mut request = request.map(EdgeBody::new);
             let Some(required) = required else {
                 return inner.call(request.map(control_request_body)).await;
             };
@@ -1956,7 +2013,7 @@ where
             if let Err(code) = verify_control_body_digest(request.headers(), &bytes) {
                 return Ok(control_body_digest_error(code));
             }
-            *request.body_mut() = s3s::Body::from(bytes);
+            *request.body_mut() = EdgeBody::from(bytes);
             inner.call(request.map(control_request_body)).await
         })
     }
@@ -2627,13 +2684,9 @@ async fn start_http_server_inner(
             let service = SwiftService::new(true, None, service);
             let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
             let service = ServiceBuilder::new()
-                .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
-                    response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                .layer(tower::util::MapResponseLayer::new(|response: Response<EdgeBody>| {
+                    response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body })
                 }))
-                .service(service);
-            #[cfg(not(feature = "swift"))]
-            let service = ServiceBuilder::new()
-                .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
                 .service(service);
             let service = Http3CoreService::new(service);
             Http3ExternalService::new(external_service_stack!(
@@ -4477,9 +4530,12 @@ mod tests {
             signed_request_with_headers(form, Method::GET, path, query, key, secret, headers)
         }
 
-        async fn answer<S, B>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
+        async fn answer<S, B, R>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
         where
-            S: Service<HttpRequest<B>, Response = Response<s3s::Body>, Error = s3s::HttpError>,
+            S: Service<HttpRequest<B>, Response = Response<R>>,
+            S::Error: std::fmt::Debug,
+            R: http_body::Body<Data = Bytes>,
+            R::Error: std::fmt::Debug,
         {
             let service = tower::Layer::layer(&crate::server::layer::ExternalRequestContextLayer::new(false), service);
             let response = service.oneshot(request).await.unwrap();
@@ -4650,13 +4706,17 @@ mod tests {
             }
         }
 
-        async fn iceberg_answer<S>(service: S, request: HttpRequest<Empty<Bytes>>) -> (StatusCode, HeaderMap, serde_json::Value)
+        async fn iceberg_answer<S, R>(
+            service: S,
+            request: HttpRequest<Empty<Bytes>>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value)
         where
-            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>
-                + Clone
-                + Send
-                + 'static,
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<R>> + Clone + Send + 'static,
+            S::Error: std::fmt::Debug,
             S::Future: Send + 'static,
+            R: http_body::Body<Data = Bytes> + Send + 'static,
+            R::Data: Send,
+            R::Error: std::fmt::Debug,
         {
             use crate::server::hybrid::HybridBody;
             use tower::Layer as _;
@@ -5943,7 +6003,7 @@ mod tests {
             ]
         }
 
-        async fn static_response_body(response: Response<s3s::Body>, method: &Method, target: &str) -> Bytes {
+        async fn static_response_body(response: Response<EdgeBody>, method: &Method, target: &str) -> Bytes {
             use http_body_util::BodyExt;
             let (fixture, content_type): (&[u8], &str) = if target == "/favicon.ico" {
                 (include_bytes!("../../tests/fixtures/native-console/favicon.ico"), "image/x-icon")
@@ -5981,14 +6041,11 @@ mod tests {
             body
         }
 
-        type Probe = tower::util::BoxCloneService<HttpRequest<Empty<Bytes>>, Response<s3s::Body>, s3s::HttpError>;
+        type Probe = tower::util::BoxCloneService<HttpRequest<Empty<Bytes>>, Response<EdgeBody>, EdgeError>;
 
         fn counted<S>(inner: S, calls: Arc<AtomicUsize>) -> Probe
         where
-            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>
-                + Clone
-                + Send
-                + 'static,
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<EdgeBody>, Error = EdgeError> + Clone + Send + 'static,
             S::Future: Send + 'static,
         {
             Probe::new(tower::service_fn(move |request| {
@@ -5999,7 +6056,7 @@ mod tests {
 
         fn answering(status: StatusCode) -> Probe {
             Probe::new(tower::service_fn(move |_| async move {
-                Ok::<_, s3s::HttpError>(Response::builder().status(status).body(s3s::Body::empty()).unwrap())
+                Ok::<_, EdgeError>(Response::builder().status(status).body(EdgeBody::default()).unwrap())
             }))
         }
 
@@ -9757,7 +9814,7 @@ mod tests {
                     assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
                     let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
                     if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body: s3s::Body::from(identity) }))
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body: EdgeBody::from(Bytes::from(identity)) }))
                 });
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
@@ -9804,7 +9861,9 @@ mod tests {
             move |peer| {
                 let inner = ServiceBuilder::new()
                     .map_response(|response: Response<s3s::Body>| {
-                        response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                        response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest {
+                            rest_body: EdgeBody::new(rest_body),
+                        })
                     })
                     .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
                     .service(EarlyResponseBodyService::new(s3.clone(), Duration::from_secs(1)));
