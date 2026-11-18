@@ -83,6 +83,18 @@ const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+const HTTP_SERVER_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_http_server_request_duration_seconds",
+    "rustfs_http_server_response_body_chunk_latency_seconds",
+    "rustfs_http_server_response_body_stream_duration_seconds",
+];
+
+// Resolve sub-millisecond chunk latency while retaining the long tail for streamed responses.
+const HTTP_SERVER_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.002, 0.003, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 600.0,
+    3600.0, 10000.0,
+];
+
 const LOCAL_BATCH_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_io_get_object_local_batch_prepare_seconds",
     "rustfs_io_get_object_local_batch_stage_seconds",
@@ -530,6 +542,8 @@ fn duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
         Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS)
     } else if INTERNODE_DURATION_HISTOGRAM_METRICS.contains(&name) {
         Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS)
+    } else if HTTP_SERVER_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(HTTP_SERVER_DURATION_HISTOGRAM_BUCKETS)
     } else {
         None
     }
@@ -1156,9 +1170,75 @@ mod tests {
             "rustfs_io_get_object_local_batch_shards",
             "rustfs_object_lock_diag_slow_acquire_total",
             "rustfs_object_lock_diag_acquire_duration_seconds_bucket",
+            "rustfs_http_server_response_body_chunk_size_bytes",
         ] {
             assert!(duration_histogram_buckets(name).is_none());
         }
+    }
+
+    #[test]
+    fn http_server_duration_histograms_export_seconds_buckets() {
+        use metrics::Recorder as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let (provider, recorder) = Recorder::builder("http-server-duration-test")
+            .with_meter_provider(|builder| builder.with_reader(reader).with_view(duration_histogram_view))
+            .build();
+        let metadata = metrics::Metadata::new(module_path!(), metrics::Level::INFO, None);
+        let instruments = [
+            "rustfs_http_server_request_duration_seconds",
+            "rustfs_http_server_response_body_chunk_latency_seconds",
+            "rustfs_http_server_response_body_stream_duration_seconds",
+        ];
+        let observations = [0.0008, 0.0024, 0.037, 42.0, 240.0, 1800.0, 12000.0];
+        for name in instruments {
+            let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
+            for seconds in observations {
+                histogram.record(seconds);
+            }
+        }
+
+        provider.force_flush().expect("export HTTP duration observations");
+        let exported = exporter.get_finished_metrics().expect("read exported HTTP histograms");
+        for name in instruments {
+            let metric = exported
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .find(|metric| metric.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be exported"));
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("{name} must export as an f64 histogram");
+            };
+            let mut points = histogram.data_points();
+            let point = points.next().unwrap_or_else(|| panic!("{name} must export a point"));
+            assert!(points.next().is_none(), "{name} must export one point");
+            assert_eq!(point.count(), 7, "{name} must retain every observation");
+            assert!(
+                (point.sum() - observations.iter().sum::<f64>()).abs() < 1e-9,
+                "{name} must retain the sum in seconds"
+            );
+            let occupied: Vec<_> = point
+                .bounds()
+                .zip(point.bucket_counts())
+                .filter(|(_, count)| *count != 0)
+                .collect();
+            assert_eq!(
+                occupied,
+                [(0.001, 1), (0.003, 1), (0.05, 1), (60.0, 1), (600.0, 1), (3600.0, 1)],
+                "{name}"
+            );
+            assert_eq!(point.bounds().last(), Some(10000.0), "{name} must retain the finite range");
+            assert_eq!(point.bucket_counts().last(), Some(1), "{name} must count overflow");
+        }
+        provider.shutdown().expect("stop HTTP histogram test provider");
     }
 
     #[test]
