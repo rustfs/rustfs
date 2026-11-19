@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs, path::Path};
+use std::collections::HashSet;
 
 use super::{
     DiskOption, DiskStore, Endpoint, HealDiskExt as _, local_disk_map_read, new_disk, resume::ReplacementTargetIdentity,
@@ -24,7 +24,7 @@ use super::{
 /// Directory-backed deployments already declare, through
 /// `RUSTFS_UNSAFE_BYPASS_DISK_CHECK`, that their endpoints are plain
 /// directories sharing a device with the host root. Those endpoints can never
-/// satisfy [`auto_replacement_target_identity`], so without this fallback a
+/// pass the independent-mount check, so without this fallback a
 /// runtime-wiped or replaced directory disk would stay deferred forever. The
 /// admission check itself is never bypassed; the fallback only routes the heal
 /// through the ordinary format path that formats every unformatted disk in the
@@ -41,50 +41,66 @@ pub(crate) fn directory_backed_replacement_fallback_enabled() -> bool {
 }
 
 pub(crate) async fn auto_replacement_target_ready(disk: &DiskStore, local_disks: &[DiskStore]) -> bool {
-    auto_replacement_target_identity(disk, local_disks).await.is_some()
+    probe_replacement_mounts(std::slice::from_ref(disk), local_disks)
+        .await
+        .is_some()
 }
 
-pub(crate) async fn auto_replacement_target_identity(
-    disk: &DiskStore,
+pub(super) async fn probe_replacement_mounts(
+    disks: &[DiskStore],
     local_disks: &[DiskStore],
-) -> Option<ReplacementTargetIdentity> {
-    let disk = disk.clone();
-    let endpoint = disk.endpoint().to_string();
-    let siblings = local_disks
-        .iter()
-        .filter(|sibling| sibling.endpoint().is_local && sibling.endpoint().to_string() != endpoint)
-        .cloned()
-        .collect::<Vec<_>>();
+) -> Option<Vec<ReplacementTargetIdentity>> {
+    if disks.is_empty() {
+        return Some(Vec::new());
+    }
+    let disks = disks.to_vec();
+    let local_disks = local_disks.to_vec();
     tokio::task::spawn_blocking(move || {
-        let lease_root = disk.replacement_mount_lease_root()?;
-        let canonical_path = fs::canonicalize(&lease_root).ok()?;
-        let filesystem_identity = filesystem_identity(&lease_root, &canonical_path, Path::new(&disk.endpoint().get_file_path()))?;
-        let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(lease_root.to_string_lossy().as_ref()) else {
-            return None;
-        };
-        let Ok(root_device_ids) = rustfs_utils::os::get_physical_device_ids("/") else {
-            return None;
-        };
-        if target_device_ids.is_empty()
-            || root_device_ids.is_empty()
-            || target_device_ids.iter().any(|target| root_device_ids.contains(target))
-        {
-            return None;
+        let mount_roots = std::env::var_os(rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS)
+            .as_ref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .collect::<Vec<_>>();
+        let mut identities = Vec::with_capacity(disks.len());
+        for disk in &disks {
+            let mount = disk.replacement_mount(&mount_roots)?;
+            if mount.physical_device_ids.is_empty() {
+                return None;
+            }
+            identities.push(ReplacementTargetIdentity {
+                endpoint: disk.endpoint().to_string(),
+                canonical_path: mount.canonical_path.into_os_string().into_string().ok()?,
+                physical_device_ids: mount.physical_device_ids,
+                filesystem_identity: mount.filesystem_identity,
+            });
         }
 
-        for sibling in siblings {
-            let sibling_lease_root = sibling.replacement_mount_lease_root()?;
-            rustfs_utils::os::get_physical_device_ids(sibling_lease_root.to_string_lossy().as_ref())
-                .ok()
-                .filter(|ids| !ids.iter().any(|id| target_device_ids.contains(id)))?;
+        let mut target_devices = HashSet::new();
+        for target in &identities {
+            if target
+                .physical_device_ids
+                .iter()
+                .any(|device| !target_devices.insert(device.as_str()))
+            {
+                return None;
+            }
         }
-
-        Some(ReplacementTargetIdentity {
-            endpoint,
-            canonical_path: canonical_path.to_string_lossy().into_owned(),
-            physical_device_ids: target_device_ids,
-            filesystem_identity,
-        })
+        let root_devices = rustfs_utils::os::get_physical_device_ids("/").ok()?;
+        if root_devices.is_empty() || root_devices.iter().any(|device| target_devices.contains(device.as_str())) {
+            return None;
+        }
+        let targets: HashSet<_> = identities.iter().map(|identity| identity.endpoint.as_str()).collect();
+        for sibling in &local_disks {
+            let endpoint = sibling.endpoint();
+            if endpoint.is_local && !targets.contains(endpoint.to_string().as_str()) {
+                let root = sibling.replacement_mount_lease_root()?;
+                let devices = rustfs_utils::os::get_physical_device_ids(root.to_str()?).ok()?;
+                if devices.iter().any(|device| target_devices.contains(device.as_str())) {
+                    return None;
+                }
+            }
+        }
+        Some(identities)
     })
     .await
     .ok()
@@ -106,98 +122,76 @@ fn local_replacement_endpoint(target: &str, local_grid_hosts: &[String]) -> Opti
     Some(endpoint)
 }
 
-pub(super) async fn replacement_target_disk(target: &str, local_disks: &[DiskStore]) -> Option<DiskStore> {
-    if let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == target) {
-        return Some(disk.clone());
-    }
-
-    let local_grid_hosts = local_disks.iter().map(|disk| disk.endpoint().grid_host()).collect::<Vec<_>>();
-    let endpoint = local_replacement_endpoint(target, &local_grid_hosts)?;
-
-    new_disk(
-        &endpoint,
-        &DiskOption {
-            cleanup: false,
-            health_check: false,
-        },
-    )
-    .await
-    .ok()
-}
-
-pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Option<Vec<ReplacementTargetIdentity>> {
-    let local_disk_map = local_disk_map_read().await;
-    let local_disks = local_disk_map
+pub(super) async fn local_replacement_disks() -> Vec<DiskStore> {
+    local_disk_map_read()
+        .await
         .values()
         .flatten()
         .filter(|disk| disk.endpoint().is_local)
         .cloned()
-        .collect::<Vec<_>>();
-    drop(local_disk_map);
-
-    let mut identities = Vec::with_capacity(targets.len());
-    for target in targets {
-        let disk = replacement_target_disk(target, &local_disks).await?;
-        identities.push(auto_replacement_target_identity(&disk, &local_disks).await?);
-    }
-    identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
-    identities.dedup_by(|left, right| left.endpoint == right.endpoint);
-    (identities.len() == targets.len()).then_some(identities)
+        .collect()
 }
 
-#[cfg(target_os = "linux")]
-fn filesystem_identity(lease_root: &Path, canonical_path: &Path, configured_path: &Path) -> Option<String> {
-    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
-
-    // Use the configured boundary even when its mount is absent. Using the
-    // currently visible enclosing mount could admit a directory exposed by unmount.
-    let roots = std::env::var_os(rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS);
-    let expected_mount = roots
-        .as_ref()
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .filter(|root| root.is_absolute() && (configured_path.starts_with(root) || canonical_path.starts_with(root)))
-        .max_by_key(|root| root.components().count());
-    let expected_mount = expected_mount.as_deref().unwrap_or(canonical_path);
-    if !canonical_path.starts_with(expected_mount) {
-        return None;
-    }
-    let expected_mount = expected_mount
-        .to_str()?
-        .replace('\\', "\\134")
-        .replace('\t', "\\011")
-        .replace('\n', "\\012")
-        .replace(' ', "\\040");
-
-    let directory = fs::File::open(lease_root).ok()?;
-    let metadata = directory.metadata().ok()?;
-    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", directory.as_raw_fd())).ok()?;
-    let mount_id = fdinfo.lines().find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))?;
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let mounted_at_expected_root = mountinfo.lines().any(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        fields.next() == Some(mount_id) && fields.nth(3) == Some(expected_mount.as_str())
-    });
-    if !mounted_at_expected_root {
-        return None;
-    }
-    Some(format!("{mount_id}:{}:{}", metadata.dev(), metadata.ino()))
+pub(super) struct ReplacementTargets {
+    pub(super) disks: Vec<DiskStore>,
+    local_disks: Vec<DiskStore>,
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn filesystem_identity(lease_root: &Path, canonical_path: &Path, _configured_path: &Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt as _;
+impl ReplacementTargets {
+    pub(super) async fn open(targets: &[String]) -> Option<Self> {
+        let mut ordered: Vec<_> = targets.iter().map(String::as_str).collect();
+        ordered.sort_unstable();
+        if ordered.windows(2).any(|pair| pair[0] == pair[1]) {
+            return None;
+        }
 
-    if !rustfs_utils::os::is_mount_point(canonical_path).ok()? {
-        return None;
+        let registry = local_disk_map_read().await;
+        let requested: Vec<_> = ordered
+            .into_iter()
+            .map(|target| {
+                let disk = registry
+                    .get(target)
+                    .and_then(Option::as_ref)
+                    .filter(|disk| disk.endpoint().is_local)
+                    .cloned();
+                (target, disk)
+            })
+            .collect();
+        let local_disks = registry
+            .values()
+            .flatten()
+            .filter(|disk| disk.endpoint().is_local)
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(registry);
+        let mut disks = Vec::with_capacity(requested.len());
+        let mut hosts = None;
+        for (target, disk) in requested {
+            let disk = match disk {
+                Some(disk) => disk,
+                None => {
+                    let local_hosts = hosts
+                        .get_or_insert_with(|| local_disks.iter().map(|disk| disk.endpoint().grid_host()).collect::<Vec<_>>());
+                    let endpoint = local_replacement_endpoint(target, local_hosts)?;
+                    new_disk(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .ok()?
+                }
+            };
+            disks.push(disk);
+        }
+        Some(Self { disks, local_disks })
     }
-    let metadata = fs::metadata(lease_root).ok()?;
-    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
-}
 
-#[cfg(not(unix))]
-fn filesystem_identity(_lease_root: &Path, _canonical_path: &Path, _configured_path: &Path) -> Option<String> {
-    None
+    pub(super) async fn identities(&self) -> Option<Vec<ReplacementTargetIdentity>> {
+        probe_replacement_mounts(&self.disks, &self.local_disks).await
+    }
 }
 
 #[cfg(test)]
@@ -295,8 +289,8 @@ mod tests {
     mod linux_privileged_tests {
         use super::*;
         use std::error::Error;
-        use std::path::Path;
         use std::process::Command;
+        use std::{fs, path::Path};
 
         const ENABLE_ENV: &str = "RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS";
         const NAMESPACE_ENV: &str = "RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS_IN_NAMESPACE";
@@ -449,10 +443,25 @@ mod tests {
                 )
                 .await?;
 
-                let identity = auto_replacement_target_identity(&target_disk, &[target_disk.clone(), sibling_disk.clone()]).await;
                 assert!(
-                    identity.is_some(),
+                    auto_replacement_target_ready(&target_disk, &[target_disk.clone(), sibling_disk.clone()]).await,
                     "a separately mounted replacement target with no sibling device overlap must be admitted"
+                );
+                let disks = [target_disk, sibling_disk];
+                let mut identities = probe_replacement_mounts(&disks, &disks)
+                    .await
+                    .expect("independently mounted replacement targets should be admitted together");
+                assert_eq!(identities[0].endpoint, disks[0].endpoint().to_string());
+                assert_eq!(identities[1].endpoint, disks[1].endpoint().to_string());
+                let endpoints = [identities[0].endpoint.clone(), identities[1].endpoint.clone()];
+                identities.sort_unstable_by(|left, right| left.endpoint.cmp(&right.endpoint));
+                let execution = crate::heal::replacement_execution::ReplacementExecution::acquire(&endpoints).await?;
+                assert_eq!(execution.identities(), identities);
+                assert!(
+                    crate::heal::replacement_execution::ReplacementExecution::acquire(&endpoints)
+                        .await
+                        .is_err(),
+                    "a second executor must not take leases on the same targets"
                 );
                 Ok(())
             })
@@ -481,7 +490,7 @@ mod tests {
                 let disk = new_disk(&endpoint, &options).await?;
                 let key = rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS;
                 temp_env::async_with_vars([(key, None::<&str>)], async {
-                    assert!(auto_replacement_target_identity(&disk, &[]).await.is_none());
+                    assert!(!auto_replacement_target_ready(&disk, &[]).await);
                 })
                 .await;
 
@@ -493,17 +502,19 @@ mod tests {
                     ],
                     async {
                         assert!(!directory_backed_replacement_fallback_enabled());
-                        let identity = auto_replacement_target_identity(&disk, &[])
+                        let identities = probe_replacement_mounts(std::slice::from_ref(&disk), &[])
                             .await
                             .expect("data directory on its configured independent mount should be admitted");
-                        assert_eq!(Path::new(&identity.canonical_path), data.canonicalize()?);
+                        assert_eq!(Path::new(&identities[0].canonical_path), data.canonicalize()?);
+                        let reopened = new_disk(&endpoint, &options).await?;
+                        assert_eq!(probe_replacement_mounts(&[reopened], &[]).await, Some(identities));
 
                         run_command("umount", &["-l", &path_to_string(&mount, "replacement mount")?])?;
-                        assert!(auto_replacement_target_identity(&disk, &[]).await.is_none());
+                        assert!(!auto_replacement_target_ready(&disk, &[]).await);
 
                         let exposed_disk = new_disk(&endpoint, &options).await?;
                         assert!(
-                            auto_replacement_target_identity(&exposed_disk, &[]).await.is_none(),
+                            !auto_replacement_target_ready(&exposed_disk, &[]).await,
                             "a new handle on the exposed parent filesystem must also be rejected"
                         );
                         Ok(())
@@ -548,10 +559,12 @@ mod tests {
                 .await?;
 
                 assert!(
-                    auto_replacement_target_identity(&target_disk, &[target_disk.clone(), sibling_disk.clone()])
-                        .await
-                        .is_none(),
+                    !auto_replacement_target_ready(&target_disk, &[target_disk.clone(), sibling_disk.clone()]).await,
                     "replacement readiness must reject a target sharing its physical device with a sibling endpoint"
+                );
+                assert!(
+                    probe_replacement_mounts(&[target_disk, sibling_disk], &[]).await.is_none(),
+                    "a batch must reject overlapping targets even before they are registered"
                 );
                 Ok(())
             })

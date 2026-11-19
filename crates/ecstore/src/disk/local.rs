@@ -8492,18 +8492,25 @@ fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_id_for_path(path: &Path) -> Option<u64> {
-    use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxFlags, open};
+fn replacement_mount_identity_for_path(path: &Path) -> Option<ReplacementMountIdentity> {
+    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, StatxFlags, makedev, open};
     use std::os::fd::AsRawFd as _;
 
-    rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID)
-        .ok()
-        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
-        .map(|statx| statx.stx_mnt_id)
-        .or_else(|| {
-            let directory = open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?;
-            mount_id_from_fdinfo(directory.as_raw_fd())
-        })
+    let fields = StatxFlags::TYPE | StatxFlags::INO | StatxFlags::MNT_ID;
+    if let Ok(stat) = rustix::fs::statx(CWD, path, AtFlags::empty(), fields)
+        && StatxFlags::from_bits_retain(stat.stx_mask).contains(fields)
+    {
+        return FileType::from_raw_mode(stat.stx_mode.into())
+            .is_dir()
+            .then_some(ReplacementMountIdentity {
+                device: makedev(stat.stx_dev_major, stat.stx_dev_minor),
+                inode: stat.stx_ino,
+                mount_id: stat.stx_mnt_id,
+            });
+    }
+    let directory = std::fs::File::from(open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?);
+    let mount_id = mount_id_from_fdinfo(directory.as_raw_fd())?;
+    Some(replacement_mount_identity(&directory.metadata().ok()?, mount_id))
 }
 
 #[cfg(target_os = "linux")]
@@ -8568,24 +8575,49 @@ impl LocalDisk {
     /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
         #[cfg(target_os = "linux")]
-        {
-            let Ok(configured) = std::fs::metadata(self.endpoint.get_file_path()) else {
-                return false;
-            };
-            let Ok(pinned) = self.mount_lease.metadata() else {
-                return false;
-            };
-            let Some(configured_mount_id) = mount_id_for_path(Path::new(&self.endpoint.get_file_path())) else {
-                return false;
-            };
-            let Some(pinned_mount_id) = self.mount_lease_mount_id else {
-                return false;
-            };
-            replacement_mount_identity(&configured, configured_mount_id) == replacement_mount_identity(&pinned, pinned_mount_id)
-        }
+        return self
+            .current_replacement_mount_identity(Path::new(&self.endpoint.get_file_path()))
+            .is_some();
 
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_replacement_mount_identity(&self, configured_path: &Path) -> Option<ReplacementMountIdentity> {
+        let pinned = replacement_mount_identity(&self.mount_lease.metadata().ok()?, self.mount_lease_mount_id?);
+        (replacement_mount_identity_for_path(configured_path)? == pinned).then_some(pinned)
+    }
+
+    pub(super) fn replacement_mount(&self, _mount_roots: &[PathBuf]) -> Option<super::ReplacementMount> {
+        #[cfg(target_os = "linux")]
+        {
+            let configured_path = self.endpoint.get_file_path();
+            let configured_path = Path::new(&configured_path);
+            let identity = self.current_replacement_mount_identity(configured_path)?;
+            let canonical_path = std::fs::canonicalize(&self.io_root).ok()?;
+            let expected = _mount_roots
+                .iter()
+                .filter(|root| root.is_absolute() && (configured_path.starts_with(root) || canonical_path.starts_with(root)))
+                .max_by_key(|root| root.components().count())
+                .unwrap_or(&canonical_path);
+            // The expected root must be its own mount boundary. If it is
+            // unmounted, the exposed directory and its parent share a mount ID.
+            if !canonical_path.starts_with(expected)
+                || replacement_mount_identity_for_path(expected)?.mount_id != identity.mount_id
+                || replacement_mount_identity_for_path(expected.parent()?)?.mount_id == identity.mount_id
+            {
+                return None;
+            }
+            Some(super::ReplacementMount {
+                canonical_path,
+                physical_device_ids: rustfs_utils::os::get_physical_device_ids(self.io_root.to_str()?).ok()?,
+                filesystem_identity: format!("{}:{}:{}", identity.mount_id, identity.device, identity.inode),
+            })
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 
     /// Return the descriptor-rooted path for the mount instance admitted for
