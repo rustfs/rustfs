@@ -14858,11 +14858,13 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                             // readahead otherwise sizes its first request from the
                             // read size: a small window at offset 0 pulls several
                             // times its size, and a multi-MiB read is split into
-                            // serial readahead chunks. WILLNEED submits exactly the
-                            // window at once. It is advisory, so an unsupported hint
-                            // must not fail the read.
+                            // serial readahead chunks. Disable adaptive readahead on
+                            // this per-window descriptor before WILLNEED submits the
+                            // requested span. A pending or ignored prefetch hint must
+                            // not let pread extend the window. Both hints are advisory.
                             #[cfg(target_os = "linux")]
                             if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
+                                let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random);
                                 let _ = rustix::fs::fadvise(
                                     &file,
                                     start,
