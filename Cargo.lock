@@ -11094,7 +11094,6 @@ name = "rustfs-protos"
 version = "1.0.5"
 dependencies = [
  "flatbuffers",
- "hotpath",
  "hyper",
  "hyper-util",
  "prost 0.14.6",
