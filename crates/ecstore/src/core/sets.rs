@@ -222,33 +222,32 @@ impl Sets {
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
-                let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
 
                 set_endpoints.push(endpoint);
 
-                if disk.is_none() {
+                let Some(mut disk) = disks[idx].clone() else {
                     warn!("sets new set_drive {}-{} is none", i, j);
                     set_drive.push(None);
                     continue;
-                }
+                };
 
-                if disk.as_ref().unwrap().is_local() && instance_ctx.is_dist_erasure().await {
-                    let local_disk = runtime_sources::local_disk_set_drive(&instance_ctx, pool_idx, i, j).await;
-
-                    if local_disk.is_none() {
+                if disk.is_local() && instance_ctx.is_dist_erasure().await {
+                    let Some(local_disk) = runtime_sources::local_disk_set_drive(&instance_ctx, pool_idx, i, j).await else {
                         warn!("sets new set_drive {}-{} local_disk is none", i, j);
                         set_drive.push(None);
                         continue;
+                    };
+
+                    // Format initialization can reuse the registered slot's handle.
+                    if !Arc::ptr_eq(&disk, &local_disk) {
+                        let _ = disk.close().await;
                     }
-
-                    let _ = disk.as_ref().unwrap().close().await;
-
                     disk = local_disk;
                 }
 
-                let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
+                let has_disk_id = disk.get_disk_id().await.unwrap_or_else(|err| {
                     if err == DiskError::UnformattedDisk {
                         error!("get_disk_id err {:?}", err);
                     } else {
@@ -259,7 +258,7 @@ impl Sets {
                 });
 
                 if let Some(_disk_id) = has_disk_id {
-                    set_drive.push(disk);
+                    set_drive.push(Some(disk));
                 } else {
                     error!("sets new set_drive {}-{} get_disk_id is none", i, j);
                     set_drive.push(None);
@@ -2315,6 +2314,57 @@ mod tests {
             platform: "test".to_string(),
         };
         (format, pool_endpoints)
+    }
+
+    #[tokio::test]
+    async fn distributed_sets_only_retire_superseded_local_disk_handles() {
+        let (_dirs, format, fixture) = setup_heal_format_sets(2, false).await;
+        let mut pool = fixture.endpoints.clone();
+        let mut endpoints = pool.endpoints.as_ref().clone();
+        let mut peer = Endpoint::try_from("http://127.0.0.1:9001/data").expect("peer endpoint");
+        peer.set_pool_index(0);
+        peer.set_set_index(0);
+        peer.set_disk_index(2);
+        endpoints[2] = peer;
+        pool.endpoints = endpoints.clone().into();
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let options = DiskOption::default();
+        runtime_sources::initialize_local_disk_maps(&ctx, vec![pool.clone()].into(), &options)
+            .await
+            .expect("initialize distributed drive slots");
+
+        // Slot 0 reuses the registered handle. Removing only the endpoint
+        // route for slot 1 makes init_disks open a separate bootstrap handle.
+        ctx.local_disk_map().write().await.remove(&endpoints[1].to_string());
+        let local_endpoints = Endpoints::from(endpoints[..2].to_vec());
+        let (mut disks, errors) = crate::store::init_format::init_disks(&ctx, &local_endpoints, &options).await;
+        assert!(errors.iter().all(Option::is_none), "initialize local disks: {errors:?}");
+        let registered = runtime_sources::local_disk_set_drive(&ctx, 0, 0, 0)
+            .await
+            .expect("registered disk");
+        let replacement = runtime_sources::local_disk_set_drive(&ctx, 0, 0, 1)
+            .await
+            .expect("replacement disk");
+        let bootstrap = disks[1].as_ref().expect("bootstrap disk");
+        assert!(Arc::ptr_eq(&registered, disks[0].as_ref().expect("reused disk")));
+        assert!(!Arc::ptr_eq(&replacement, bootstrap));
+        let bootstrap_retired = bootstrap.local_retirement_token().expect("local bootstrap token");
+        disks.push(None); // The remote peer has not started.
+
+        let sets = Sets::new_with_instance_ctx(disks, &pool, &format, 0, 1, ctx)
+            .await
+            .expect("construct distributed sets");
+        let inventory = sets.disk_set[0].disk_inventory().await;
+        for (slot, expected) in [registered, replacement].into_iter().enumerate() {
+            let active = inventory[slot].as_ref().expect("active local disk");
+            assert!(Arc::ptr_eq(active, &expected));
+            assert!(
+                !active.local_retirement_token().expect("local disk token").is_cancelled(),
+                "set construction retired the active disk in slot {slot}"
+            );
+        }
+        assert!(bootstrap_retired.is_cancelled(), "superseded bootstrap handle must be retired");
     }
 
     // Phase 5 follow-up (backlog#1052): a pool built through the ctx-explicit
