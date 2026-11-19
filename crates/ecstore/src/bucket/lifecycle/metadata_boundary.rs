@@ -125,6 +125,9 @@ pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifec
 }
 
 #[cfg(test)]
+pub(crate) use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::bucket::metadata::BucketMetadata;
@@ -227,6 +230,3 @@ mod tests {
         assert_eq!(unguarded.validated_bucket_incarnation_for(store_a.id, bucket, None), None);
     }
 }
-
-#[cfg(test)]
-pub(crate) use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support};
