@@ -1652,14 +1652,14 @@ mod tests {
             ] {
                 let (_directory, mut disks) = local_disks_with_set_width(4, 4).await;
                 let reference = FormatV3::new(1, 4);
-                for slot in 0..2 {
+                for (slot, disk) in disks.iter().take(2).enumerate() {
                     let mut format = reference.clone();
                     format.erasure.this = format.erasure.sets[0][slot];
-                    save_format_file(&disks[slot], &Some(format.clone()))
+                    save_format_file(disk, &Some(format.clone()))
                         .await
                         .expect("persist native read quorum");
                     if scenario != "native-remote" {
-                        write_legacy_format(&disks[slot], &format).await;
+                        write_legacy_format(disk, &format).await;
                     }
                 }
                 match scenario {

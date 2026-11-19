@@ -614,6 +614,50 @@ fn probe_router(slot: &Arc<ServerContextSlot>) -> S3Router<AdminOperation> {
     router
 }
 
+/// Raises a custom code nobody gave a status, as the tier handlers do.
+struct Statusless;
+
+#[async_trait::async_trait]
+impl OwnedOperation for Statusless {
+    async fn call(&self, _req: AdminRequest, _params: matchit::Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+        Err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::Custom("TierNotFound".into()),
+            "tier not found",
+        ))
+    }
+}
+
+static STATUSLESS: Statusless = Statusless;
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_custom_code_without_a_status_is_answered_by_both_stacks_alike() {
+    let (_env, slot, _) = admin_fixture().await;
+    let router = |slot: &Arc<ServerContextSlot>| {
+        let mut router = S3Router::new(false);
+        router.set_server_ctx(slot.clone());
+        router
+            .insert(Method::GET, "/rustfs/admin/v3/statusless", AdminOperation(&STATUSLESS))
+            .unwrap();
+        router
+    };
+    let mut legacy = crate::server::http::S3ServiceBuilder::new(UnusedS3);
+    legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
+    legacy.set_route(router(&slot));
+    let legacy = legacy.build();
+    let (edge, _) = edge(&slot, legacy.clone(), router(&slot));
+    let request =
+        || signed_as(Method::GET, "/rustfs/admin/v3/statusless", "", ROOT, ROOT_SECRET, Signed::Header).map(|_| Full::default());
+
+    let old = answer(legacy, request()).await;
+    let new = answer(edge, request()).await;
+
+    assert_eq!(old.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(new.0, old.0);
+    assert_eq!(refusal(&old.2), ("TierNotFound".to_owned(), "tier not found".to_owned()));
+    assert_eq!(refusal(&new.2), refusal(&old.2));
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
