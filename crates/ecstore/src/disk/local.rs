@@ -14854,13 +14854,9 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            // Announce the exact window before reading it. Kernel
-                            // readahead otherwise sizes its first request from the
-                            // read size: a small window at offset 0 pulls several
-                            // times its size, and a multi-MiB read is split into
-                            // serial readahead chunks. WILLNEED submits exactly the
-                            // window at once. It is advisory, so an unsupported hint
-                            // must not fail the read.
+                            // Preload the requested window before reading it. Kernel
+                            // readahead is advisory and may still extend past the
+                            // window, so the tail is reclaimed after the read below.
                             #[cfg(target_os = "linux")]
                             if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
                                 let _ = rustix::fs::fadvise(
@@ -14884,6 +14880,27 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                                     return Err(DiskError::FileCorrupt);
                                 }
                                 total += nbytes;
+                            }
+                            // Keep a cold shard window from evicting unrelated data
+                            // when the kernel over-reads. The requested tail page is
+                            // retained because its final bytes may share a page with
+                            // the readahead range.
+                            #[cfg(target_os = "linux")]
+                            if let Ok(page) = mmap_page_size() {
+                                let aligned_end = end
+                                    .checked_add(page.saturating_sub(1))
+                                    .map(|value| value / page * page)
+                                    .unwrap_or(end);
+                                if aligned_end < meta.len() {
+                                    if let Some(reclaim_len) = std::num::NonZeroU64::new(meta.len() - aligned_end) {
+                                        let _ = rustix::fs::fadvise(
+                                            &file,
+                                            aligned_end,
+                                            Some(reclaim_len),
+                                            rustix::fs::Advice::DontNeed,
+                                        );
+                                    }
+                                }
                             }
                             Ok::<_, DiskError>(())
                         }

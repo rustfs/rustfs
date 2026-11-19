@@ -1071,7 +1071,8 @@ mod tests {
     }
 
     fn signing_time(headers: &[(String, String)]) -> jiff::Timestamp {
-        jiff::Timestamp::strptime("%Y%m%dT%H%M%SZ", recorded_header(headers, "x-amz-date"))
+        let value = recorded_header(headers, "x-amz-date").trim_end_matches('Z');
+        jiff::Timestamp::strptime("%Y%m%dT%H%M%S%z", format!("{value}+0000"))
             .expect("SDK signing timestamp must use the SigV4 format")
     }
 
