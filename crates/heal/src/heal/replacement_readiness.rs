@@ -416,32 +416,28 @@ mod tests {
         #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS=1"]
         fn auto_replacement_readiness_accepts_an_independent_mount() -> Result<(), Box<dyn Error + Send + Sync>> {
             run_privileged_mount_test(|mut mounts| async move {
-                let temp = TempDir::new().expect("temporary replacement roots should be created");
-                let target = temp.path().join("target");
+                let temp = TempDir::new()?;
+                let parent = temp.path().join("parent");
+                let target = parent.join("replacement disk");
+                let data = target.join("data");
                 let sibling = temp.path().join("sibling");
-                std::fs::create_dir(&target).expect("target mountpoint should be created");
-                std::fs::create_dir(&sibling).expect("sibling mountpoint should be created");
+                fs::create_dir(&parent)?;
+                mounts.mount_tmpfs(&parent, "rustfs-readiness-parent")?;
+                // Leave a directory at the same path below the target mount.
+                fs::create_dir_all(&data)?;
                 mounts.mount_tmpfs(&target, "rustfs-readiness-target")?;
+                fs::create_dir(&data)?;
+                fs::create_dir(&sibling)?;
                 mounts.mount_tmpfs(&sibling, "rustfs-readiness-sibling")?;
 
                 let target_endpoint = Endpoint::try_from(target.to_string_lossy().as_ref())?;
                 let sibling_endpoint = Endpoint::try_from(sibling.to_string_lossy().as_ref())?;
-                let target_disk = new_disk(
-                    &target_endpoint,
-                    &DiskOption {
-                        cleanup: false,
-                        health_check: false,
-                    },
-                )
-                .await?;
-                let sibling_disk = new_disk(
-                    &sibling_endpoint,
-                    &DiskOption {
-                        cleanup: false,
-                        health_check: false,
-                    },
-                )
-                .await?;
+                let options = DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                };
+                let target_disk = new_disk(&target_endpoint, &options).await?;
+                let sibling_disk = new_disk(&sibling_endpoint, &options).await?;
 
                 assert!(
                     auto_replacement_target_ready(&target_disk, &[target_disk.clone(), sibling_disk.clone()]).await,
@@ -453,8 +449,8 @@ mod tests {
                     .expect("independently mounted replacement targets should be admitted together");
                 assert_eq!(identities[0].endpoint, disks[0].endpoint().to_string());
                 assert_eq!(identities[1].endpoint, disks[1].endpoint().to_string());
-                let endpoints = [identities[0].endpoint.clone(), identities[1].endpoint.clone()];
                 identities.sort_unstable_by(|left, right| left.endpoint.cmp(&right.endpoint));
+                let endpoints = [identities[1].endpoint.clone(), identities[0].endpoint.clone()];
                 let execution = crate::heal::replacement_execution::ReplacementExecution::acquire(&endpoints).await?;
                 assert_eq!(execution.identities(), identities);
                 assert!(
@@ -463,30 +459,9 @@ mod tests {
                         .is_err(),
                     "a second executor must not take leases on the same targets"
                 );
-                Ok(())
-            })
-        }
-
-        #[test]
-        #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS=1"]
-        fn auto_replacement_readiness_requires_the_configured_mount_for_a_data_subdirectory()
-        -> Result<(), Box<dyn Error + Send + Sync>> {
-            run_privileged_mount_test(|mut mounts| async move {
-                let temp = TempDir::new()?;
-                let parent = temp.path().join("parent");
-                let mount = parent.join("replacement disk");
-                let data = mount.join("data");
-                fs::create_dir(&parent)?;
-                mounts.mount_tmpfs(&parent, "rustfs-readiness-parent")?;
-                fs::create_dir_all(&data)?;
-                mounts.mount_tmpfs(&mount, "rustfs-readiness-child")?;
-                fs::create_dir(&data)?;
+                drop(execution);
 
                 let endpoint = Endpoint::try_from(path_to_string(&data, "data directory")?.as_str())?;
-                let options = DiskOption {
-                    cleanup: false,
-                    health_check: false,
-                };
                 let disk = new_disk(&endpoint, &options).await?;
                 let key = rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS;
                 temp_env::async_with_vars([(key, None::<&str>)], async {
@@ -494,7 +469,7 @@ mod tests {
                 })
                 .await;
 
-                let roots = std::env::join_paths([&parent, &mount])?;
+                let roots = std::env::join_paths([&parent, &target])?;
                 temp_env::async_with_vars(
                     [
                         (key, Some(roots.to_str().ok_or("mount roots are not UTF-8")?)),
@@ -509,7 +484,7 @@ mod tests {
                         let reopened = new_disk(&endpoint, &options).await?;
                         assert_eq!(probe_replacement_mounts(&[reopened], &[]).await, Some(identities));
 
-                        run_command("umount", &["-l", &path_to_string(&mount, "replacement mount")?])?;
+                        run_command("umount", &["-l", &path_to_string(&target, "replacement mount")?])?;
                         assert!(!auto_replacement_target_ready(&disk, &[]).await);
 
                         let exposed_disk = new_disk(&endpoint, &options).await?;
