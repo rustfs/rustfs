@@ -33,13 +33,6 @@ use rustfs_policy::policy::BucketPolicy;
 use std::collections::BTreeMap;
 use std::future::Future;
 
-/// The final committed notification configuration of a successfully deleted bucket.
-#[derive(Debug)]
-pub struct DeletedBucketNotification {
-    pub bucket_incarnation_id: uuid::Uuid,
-    pub notification_config_xml: Vec<u8>,
-}
-
 const DELETED_BUCKETS_PREFIX: &str = ".deleted";
 const SCANNER_BUCKET_LIST_SET_CONCURRENCY: usize = 4;
 const EVENT_BUCKET_DELETE_BLOCKED: &str = "bucket_delete_blocked";
@@ -780,6 +773,15 @@ impl ECStore {
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
+    }
+
+    /// Snapshots this instance's cached bucket metadata without disk IO.
+    ///
+    /// # Errors
+    /// Returns an error when this instance's metadata system is not initialized.
+    pub async fn cached_bucket_metadata(&self) -> Result<Vec<Arc<BucketMetadata>>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        Ok(sys.read().await.cached_metadata().await)
     }
 
     /// Resolve stored tags for authorization. Only confirmed absence returns an
@@ -1949,7 +1951,7 @@ impl ECStore {
         &'a self,
         bucket: &'a str,
         force: bool,
-    ) -> futures::future::BoxFuture<'a, Result<Option<super::DeletedBucketNotification>>> {
+    ) -> futures::future::BoxFuture<'a, Result<Option<Arc<crate::bucket::metadata::BucketMetadata>>>> {
         // Preserve the boxed native-operation boundary instead of propagating the
         // deletion state machine through request and gateway futures.
         Box::pin(async move {
@@ -1972,7 +1974,7 @@ impl ECStore {
         opts: &DeleteBucketOptions,
         diagnostic_budget: BucketDeleteDiagnosticBudget,
         capture_notification: bool,
-    ) -> Result<Option<DeletedBucketNotification>> {
+    ) -> Result<Option<Arc<crate::bucket::metadata::BucketMetadata>>> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()));
         }
@@ -2008,7 +2010,7 @@ impl ECStore {
         opts: &DeleteBucketOptions,
         mut diagnostic_budget: BucketDeleteDiagnosticBudget,
         capture_notification: bool,
-    ) -> Result<Option<DeletedBucketNotification>> {
+    ) -> Result<Option<Arc<crate::bucket::metadata::BucketMetadata>>> {
         let bucket_lifecycle_guard = if !opts.no_lock {
             Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
         } else {
@@ -2156,14 +2158,11 @@ impl ECStore {
 
         let notification = if capture_notification && bucket_exists {
             if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
-                crate::bucket::metadata::load_bucket_metadata_parse_with_presence(store, bucket, false)
+                crate::bucket::metadata::load_bucket_metadata_parse_with_presence(store, bucket, true)
                     .await
                     .ok()
                     .filter(|(metadata, persisted)| *persisted && !metadata.bucket_incarnation_id.is_nil())
-                    .map(|(metadata, _)| DeletedBucketNotification {
-                        bucket_incarnation_id: metadata.bucket_incarnation_id,
-                        notification_config_xml: metadata.notification_config_xml,
-                    })
+                    .map(|(metadata, _)| Arc::new(metadata))
             } else {
                 None
             }

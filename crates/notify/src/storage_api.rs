@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+
 use rustfs_ecstore::api::config::com::{
     read_existing_server_config_no_lock as read_existing_notify_config_from_backend_no_lock,
     read_server_config_snapshot as read_notify_server_config_snapshot_from_backend,
@@ -27,10 +29,7 @@ pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
     resolve_notify_object_store_handle_from_backend()
 }
 
-pub(crate) async fn refresh_notify_bucket_metadata(bucket: &str) -> bool {
-    let Some(store) = resolve_notify_object_store_handle() else {
-        return false;
-    };
+pub(crate) async fn refresh_notify_bucket_metadata(store: Arc<NotifyStore>, bucket: &str) -> bool {
     rustfs_ecstore::api::bucket::metadata_sys::reload_bucket_metadata(store, bucket)
         .await
         .is_ok()

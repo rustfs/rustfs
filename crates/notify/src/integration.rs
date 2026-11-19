@@ -246,6 +246,16 @@ impl NotificationSystem {
         self.services.bucket_config_manager.has_subscriber(bucket, event).await
     }
 
+    /// Binds server dispatch to the store-owned metadata cache. Local writes,
+    /// peer reloads, deletes and periodic metadata refreshes then select rules
+    /// from the same snapshot; delayed name-only rule replacements are ignored
+    /// and clears only evict compiled snapshots. Missing/unreadable metadata or
+    /// a dropped store suppresses external dispatch without falling back to the
+    /// standalone rules. Already queued or in-flight deliveries are not recalled.
+    pub fn bind_bucket_metadata_source(&self, store: &Arc<crate::NotifyStore>) {
+        self.services.bucket_config_manager.bind_bucket_metadata_source(store);
+    }
+
     /// Returns true when at least one in-process consumer is subscribed to live events.
     pub fn has_live_listeners(&self) -> bool {
         self.services.pipeline.has_live_listeners()
@@ -408,13 +418,6 @@ impl NotificationSystem {
             .bucket_config_manager
             .load_bucket_notification_config(bucket, cfg)
             .await
-    }
-
-    /// Applies the current committed bucket rules while the caller holds the metadata publication fence.
-    pub fn publish_bucket_notification_config(&self, bucket: &str, cfg: Option<(uuid::Uuid, &BucketNotificationConfig)>) {
-        self.services
-            .bucket_config_manager
-            .publish_bucket_notification_config(bucket, cfg);
     }
 
     /// Sends an event

@@ -60,7 +60,7 @@ pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sy
 
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
-use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
+use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register, serves};
 use crate::server::ssec_transport::{is_secure_transport, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
@@ -150,6 +150,8 @@ pub(crate) enum GatewayAssemblyError {
     AdminOverlayMissing,
     #[error("the native admin dialect refused its assembly: {0:?}")]
     AdminDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
+    #[error("the metadata listing dialect refused its assembly: {0:?}")]
+    MetadataListingDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
     #[error("RUSTFS_KEYSTONE_ENABLE configuration is invalid: {0}")]
     KeystoneConfig(rustfs_keystone::KeystoneError),
     #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider on RUSTFS_S3_STACK=gateway")]
@@ -209,11 +211,11 @@ impl GatewayStack {
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
-        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?;
+        let listings = metadata_listing::dialect().map_err(GatewayAssemblyError::MetadataListingDialect)?;
+        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?.dialect(&listings);
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
-        let service = register(OPERATIONS, builder, &backend)
-            .build()
-            .map_err(GatewayAssemblyError::Service)?;
+        let builder = metadata_listing::register(register(OPERATIONS, builder, &backend), &assembly.server_ctx);
+        let service = builder.build().map_err(GatewayAssemblyError::Service)?;
         Ok(Self {
             service,
             keystone_auth: assembly.keystone_auth,
@@ -323,11 +325,11 @@ impl GatewayStack {
     }
 }
 
-/// The early gate over `table`: an operation it serves is allowed on to its handler, which decides;
-/// every other operation is denied.
+/// The early gate over `table` and the two metadata listings: an operation it serves is allowed on
+/// to its handler, which decides; every other operation is denied.
 fn early_gate(table: OperationTable) -> impl Authorizer {
     decide_with(move |request| {
-        if serves(table, request.operation) {
+        if serves(table, request.operation) || metadata_listing::NAMES.contains(&request.operation) {
             Decision::Allow
         } else {
             Decision::Deny

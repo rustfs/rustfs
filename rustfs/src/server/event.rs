@@ -16,6 +16,7 @@ use super::{
     module_switch::{resolve_notify_module_state, validate_notify_module_env, with_refreshed_notify_module_state_from},
     refresh_persisted_module_switches_from, runtime_sources,
 };
+use crate::init::reconcile_persisted_bucket_notification_configurations;
 use crate::storage_api::server::event::{
     EventArgs as EcstoreEventArgs, read_existing_server_config_no_lock, register_event_dispatch_hook,
     with_server_config_read_lock,
@@ -35,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
 
 static NOTIFY_RUNTIME_RECONCILED: AtomicBool = AtomicBool::new(false);
+static NOTIFY_BUCKET_RULES_RECONCILED: AtomicBool = AtomicBool::new(false);
 static ECSTORE_EVENT_DISPATCH_HOOK: OnceLock<()> = OnceLock::new();
 
 // Serialize local notification lifecycle publication with the periodic and
@@ -57,6 +59,7 @@ pub(crate) fn mark_event_notifier_reconciled() {
 
 pub(crate) fn mark_event_notifier_unreconciled() {
     NOTIFY_RUNTIME_RECONCILED.store(false, Ordering::Release);
+    NOTIFY_BUCKET_RULES_RECONCILED.store(false, Ordering::Release);
 }
 
 pub(crate) async fn with_notify_runtime_reconcile_lock<Fut, T>(operation: Fut) -> T
@@ -65,6 +68,21 @@ where
 {
     let _guard = NOTIFY_RUNTIME_RECONCILE_LOCK.lock().await;
     operation.await
+}
+
+fn are_bucket_notification_rules_reconciled() -> bool {
+    NOTIFY_BUCKET_RULES_RECONCILED.load(Ordering::Acquire)
+}
+
+fn mark_bucket_notification_rules_reconciled() {
+    NOTIFY_BUCKET_RULES_RECONCILED.store(true, Ordering::Release);
+}
+
+fn should_reconcile_bucket_notification_rules(runtime_changed: bool, notify_enabled: bool) -> bool {
+    // Dispatch follows store-owned metadata snapshots, including the periodic
+    // metadata refresh that repairs lost peer signals. Startup validation need
+    // not rescan all buckets on every five-second target-runtime tick.
+    notify_enabled && (runtime_changed || !are_bucket_notification_rules_reconciled())
 }
 
 pub fn refresh_notify_module_enabled() -> bool {
@@ -173,6 +191,7 @@ async fn reconcile_event_notifier_from_store_unlocked(
     let result = async {
         validate_notify_module_env().map_err(NotificationError::Initialization)?;
         let system = ensure_live_events_initialized();
+        system.bind_bucket_metadata_source(&store);
         let transition_system = system.clone();
         let transition_store = store.clone();
         let transition = with_refreshed_notify_module_state_from(store.clone(), move |resolution| async move {
@@ -203,11 +222,24 @@ async fn reconcile_event_notifier_from_store_unlocked(
         .await
         .map_err(|err| NotificationError::Initialization(format!("failed to refresh notify module switch: {err}")))??;
 
+        let runtime_changed = transition.is_some();
         if let Some(transition) = transition {
             transition.wait().await?;
         }
 
         ensure_event_notifier_converged(&system)?;
+        if should_reconcile_bucket_notification_rules(runtime_changed, is_notify_module_enabled()) {
+            let configured_bucket_count = reconcile_persisted_bucket_notification_configurations(store).await?;
+            mark_bucket_notification_rules_reconciled();
+            info!(
+                event = EVENT_NOTIFY_RUNTIME_RECONCILE,
+                component = "notify",
+                subsystem = "bucket_rules",
+                configured_bucket_count,
+                "Persisted bucket notification rules reconciled"
+            );
+        }
+
         Ok(())
     }
     .await;
@@ -327,6 +359,8 @@ where
         return Ok(());
     };
 
+    system.bind_bucket_metadata_source(&store);
+
     refresh_persisted_module_switches_from(store.clone())
         .await
         .map_err(|err| NotificationError::Initialization(format!("failed to refresh notify module switch: {err}")))?;
@@ -401,8 +435,9 @@ mod tests {
         set_persisted_module_switches,
     };
     use super::{
-        convert_ecstore_object_info, init_event_notifier_with_store, parse_host_and_port,
-        run_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
+        convert_ecstore_object_info, init_event_notifier_with_store, mark_bucket_notification_rules_reconciled,
+        parse_host_and_port, run_persisted_event_notifier_reconciler, should_reconcile_bucket_notification_rules,
+        with_notify_runtime_reconcile_lock,
     };
     use crate::server::is_event_notifier_reconciled;
     use crate::storage_api::server::event::StorageObjectInfo;
@@ -565,6 +600,30 @@ mod tests {
         assert_eq!(converted.restore_expires, Timestamp::new(1_700_000_000, 0).ok());
         assert_eq!(converted.storage_class.as_deref(), Some("GLACIER"));
         assert_eq!(converted.transitioned_tier.as_deref(), Some("DEEP_ARCHIVE"));
+    }
+
+    #[test]
+    fn bucket_rule_reconcile_runs_once_and_after_runtime_change() {
+        super::mark_event_notifier_unreconciled();
+
+        assert!(
+            should_reconcile_bucket_notification_rules(false, true),
+            "enabled notify must restore bucket rules until the first successful replay"
+        );
+
+        mark_bucket_notification_rules_reconciled();
+        assert!(
+            !should_reconcile_bucket_notification_rules(false, true),
+            "steady-state reconcile must not rescan buckets every tick"
+        );
+        assert!(
+            should_reconcile_bucket_notification_rules(true, true),
+            "target runtime changes must replay persisted bucket rules"
+        );
+        assert!(
+            !should_reconcile_bucket_notification_rules(true, false),
+            "disabled notify must not load external target rules"
+        );
     }
 
     #[tokio::test(start_paused = true)]

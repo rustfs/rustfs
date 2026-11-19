@@ -1349,6 +1349,12 @@ pub(crate) async fn all_local_disk() -> Vec<DiskStore> {
     ecstore_storage::all_local_disk().await
 }
 
+pub(crate) async fn get_bucket_notification_config(
+    bucket: &str,
+) -> Result<Option<rustfs_gateway_types::persistence::PersistedNotificationConfiguration>> {
+    ecstore_bucket::metadata_sys::get_notification_config(bucket).await
+}
+
 pub(crate) async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
     ecstore_bucket::metadata_sys::init_bucket_metadata_sys(api, buckets).await;
 }

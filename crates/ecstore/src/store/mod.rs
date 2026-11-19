@@ -431,7 +431,6 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
 }
 
 mod bucket;
-pub use bucket::DeletedBucketNotification;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;

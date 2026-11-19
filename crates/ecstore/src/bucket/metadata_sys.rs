@@ -460,7 +460,7 @@ fn clear_bucket_overrides(bucket: &str) {
 }
 
 /// Publish application-owned bytes on every cache install path.
-fn sync_application_bucket_configs(bucket: &str, bm: &BucketMetadata) {
+fn sync_on_demand_migration(bucket: &str, bm: &BucketMetadata) {
     if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
         hook(
             bucket,
@@ -468,22 +468,12 @@ fn sync_application_bucket_configs(bucket: &str, bm: &BucketMetadata) {
             bm.on_demand_migration_config()
                 .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
         );
-        hook(
-            bucket,
-            super::metadata::BUCKET_NOTIFICATION_CONFIG,
-            (!bm.notification_config_xml.is_empty()).then_some((
-                bm.notification_config_xml.as_slice(),
-                bm.notification_config_updated_at,
-                bm.bucket_incarnation_id,
-            )),
-        );
     }
 }
 
-fn clear_application_bucket_configs(bucket: &str) {
+fn clear_on_demand_migration(bucket: &str) {
     if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
         hook(bucket, super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, None);
-        hook(bucket, super::metadata::BUCKET_NOTIFICATION_CONFIG, None);
     }
 }
 
@@ -2497,7 +2487,7 @@ impl BucketMetadataSys {
                 if removed {
                     BucketTargetSys::get().delete(bucket).await;
                     clear_bucket_overrides(bucket);
-                    clear_application_bucket_configs(bucket);
+                    clear_on_demand_migration(bucket);
                 }
             }
             return Ok(());
@@ -2535,7 +2525,7 @@ impl BucketMetadataSys {
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
                 sync_bucket_overrides(bucket, &bm);
-                sync_application_bucket_configs(bucket, &bm);
+                sync_on_demand_migration(bucket, &bm);
             }
             MetadataLoadMode::Initial => {
                 let _publish_guard = self
@@ -2583,7 +2573,7 @@ impl BucketMetadataSys {
             if removed {
                 BucketTargetSys::get().delete(bucket).await;
                 clear_bucket_overrides(bucket);
-                clear_application_bucket_configs(bucket);
+                clear_on_demand_migration(bucket);
             }
             return Ok(true);
         }
@@ -2606,7 +2596,7 @@ impl BucketMetadataSys {
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
         sync_bucket_overrides(bucket, &metadata);
-        sync_application_bucket_configs(bucket, &metadata);
+        sync_on_demand_migration(bucket, &metadata);
         Ok(true)
     }
 
@@ -2623,6 +2613,10 @@ impl BucketMetadataSys {
         }
     }
 
+    pub(crate) async fn cached_metadata(&self) -> Vec<Arc<BucketMetadata>> {
+        self.metadata_map.read().await.values().cloned().collect()
+    }
+
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
         self.revoke_pending_bucket_creation(&bucket).await;
         bump_local_meta_mutation_gen();
@@ -2636,7 +2630,7 @@ impl BucketMetadataSys {
             self.missing_buckets.invalidate(&bucket).await;
             sync_bucket_target_sys(&bucket, &bm).await;
             sync_bucket_overrides(&bucket, &bm);
-            sync_application_bucket_configs(&bucket, &bm);
+            sync_on_demand_migration(&bucket, &bm);
         }
     }
 
@@ -2660,7 +2654,7 @@ impl BucketMetadataSys {
         if removed {
             BucketTargetSys::get().delete(bucket).await;
             clear_bucket_overrides(bucket);
-            clear_application_bucket_configs(bucket);
+            clear_on_demand_migration(bucket);
         }
         removed || removed_fabricated
     }
@@ -3013,7 +3007,7 @@ impl BucketMetadataSys {
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
                 sync_bucket_overrides(bucket, &bm);
-                sync_application_bucket_configs(bucket, &bm);
+                sync_on_demand_migration(bucket, &bm);
                 return Ok((bm, true));
             } else {
                 let exists = self
@@ -3464,7 +3458,7 @@ impl BucketMetadataSys {
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
         sync_bucket_overrides(bucket, &metadata);
-        sync_application_bucket_configs(bucket, &metadata);
+        sync_on_demand_migration(bucket, &metadata);
         Ok(BucketMetadataAuthority::Authoritative(metadata))
     }
 
@@ -5781,6 +5775,64 @@ mod tests {
         assert_eq!(tags.tag_set.len(), WRITERS, "every concurrent rewrite must survive: {tags:?}");
     }
 
+    #[tokio::test]
+    async fn notification_snapshots_follow_periodic_refresh_after_lost_peer_signals() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let writer = BucketMetadataSys::new(store.clone());
+        let peer = Arc::new(RwLock::new(BucketMetadataSys::new(store.clone())));
+        let bucket = "notification-periodic-snapshots";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("create empty fixture bucket");
+        }
+        let mut original = BucketMetadata::new(bucket);
+        original.notification_config_xml = concat!(
+            "<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:Put</Event>",
+            "<Queue>arn:rustfs:sqs:us-east-1:inert:webhook</Queue></QueueConfiguration></NotificationConfiguration>"
+        )
+        .as_bytes()
+        .to_vec();
+        original.parse_all_configs().expect("parse inert subscription");
+        writer
+            .persist_new_and_set(original)
+            .await
+            .expect("persist initial subscription");
+        peer.read().await.reload_from_store(bucket).await.expect("prime peer cache");
+        let old = peer.read().await.get(bucket).await.expect("cached original snapshot");
+
+        let mut removed = (*old).clone();
+        removed.notification_config_xml = b"<NotificationConfiguration/>".to_vec();
+        removed.parse_all_configs().expect("parse removed subscription");
+        writer
+            .persist_new_and_set(removed)
+            .await
+            .expect("persist removal without peer callback");
+        assert!(Arc::ptr_eq(&old, &peer.read().await.get(bucket).await.expect("peer remains stale")));
+
+        // Exercise the timer's actual one-pass entry point, not the peer RPC.
+        refresh_buckets_metadata_once(peer.clone()).await;
+        let snapshots = peer.read().await.cached_metadata().await;
+        assert_eq!(snapshots.len(), 1);
+        assert!(!Arc::ptr_eq(&old, &snapshots[0]));
+        assert_eq!(old.bucket_incarnation_id, snapshots[0].bucket_incarnation_id);
+        assert_eq!(snapshots[0].notification_config_xml, b"<NotificationConfiguration/>");
+        assert!(
+            snapshots[0]
+                .notification_config
+                .as_ref()
+                .expect("parsed removal")
+                .behavior()
+                .queue_routes
+                .is_empty()
+        );
+
+        for dir in &dirs {
+            std::fs::remove_dir(dir.path().join(bucket)).expect("remove empty fixture bucket without peer callback");
+        }
+        refresh_buckets_metadata_once(peer.clone()).await;
+        assert!(peer.read().await.cached_metadata().await.is_empty());
+        assert!(peer.read().await.get(bucket).await.is_err());
+    }
+
     /// Pins the peer reload-notification contract (`reload_from_store`, the
     /// LoadBucketMetadata RPC path): only metadata actually read from
     /// persisted storage enters the cache. A load miss errors out and leaves
@@ -6813,33 +6865,31 @@ mod tests {
 
     const ODM_JSON: &[u8] = br#"{"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
 
-    const NOTIFY_XML: &[u8] = br#"<NotificationConfiguration><QueueConfiguration><Id>test</Id><Queue>arn:rustfs:sqs:us-east-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>"#;
-    const PUBLISH_TEST_BUCKET: &str = "application-config-hook-paths";
+    type RecordedOdmConfig = Option<(Vec<u8>, OffsetDateTime, Uuid)>;
+    type RecordedOdmHookCall = (String, RecordedOdmConfig);
 
-    type RecordedConfig = Option<(Vec<u8>, OffsetDateTime, Uuid)>;
-    type RecordedConfigCall = (String, RecordedConfig);
+    /// Every `(bucket, config)` the recording hook has seen. Tests filter by
+    /// their own bucket name; the hook is process-wide and set once.
+    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<RecordedOdmHookCall>> = std::sync::Mutex::new(Vec::new());
 
-    static CONFIG_HOOK_CALLS: std::sync::Mutex<Vec<RecordedConfigCall>> = std::sync::Mutex::new(Vec::new());
-
-    fn install_recording_config_hook() {
+    fn install_recording_odm_hook() {
         BUCKET_CONFIG_PUBLISH_HOOK.get_or_init(|| {
             Box::new(|bucket, config_file, config| {
-                if bucket == PUBLISH_TEST_BUCKET {
-                    CONFIG_HOOK_CALLS.lock().unwrap().push((
-                        config_file.to_string(),
-                        config.map(|(bytes, stamp, incarnation)| (bytes.to_vec(), stamp, incarnation)),
-                    ));
-                }
+                assert_eq!(config_file, super::super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG);
+                ODM_HOOK_CALLS.lock().unwrap().push((
+                    bucket.to_string(),
+                    config.map(|(bytes, stamp, incarnation)| (bytes.to_vec(), stamp, incarnation)),
+                ));
             })
         });
     }
 
-    fn config_hook_calls(config_file: &str) -> Vec<RecordedConfig> {
-        CONFIG_HOOK_CALLS
+    fn odm_hook_calls(bucket: &str) -> Vec<RecordedOdmConfig> {
+        ODM_HOOK_CALLS
             .lock()
             .unwrap()
             .iter()
-            .filter(|(file, _)| file == config_file)
+            .filter(|(name, _)| name == bucket)
             .map(|(_, config)| config.clone())
             .collect()
     }
@@ -6849,56 +6899,51 @@ mod tests {
     /// reload, refresh loop, lazy load) and withdraws on removal, mirroring
     /// `sync_bucket_durability`.
     #[tokio::test]
-    async fn application_config_hook_fires_on_every_cache_install_path() {
-        use crate::bucket::metadata::{BUCKET_NOTIFICATION_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
-
-        install_recording_config_hook();
+    async fn on_demand_migration_hook_fires_on_every_cache_install_path() {
+        install_recording_odm_hook();
 
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
-        let bucket = PUBLISH_TEST_BUCKET;
+        let bucket = "odm-hook-paths";
         for dir in &dirs {
             std::fs::create_dir_all(dir.path().join(bucket)).expect("physical bucket should exist");
         }
 
         let incarnation = Uuid::new_v4();
         let expect_publish = |before: usize, label: &str| {
-            for (file, bytes) in [
-                (BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON),
-                (BUCKET_NOTIFICATION_CONFIG, NOTIFY_XML),
-            ] {
-                let calls = config_hook_calls(file);
-                assert_eq!(calls.len(), before + 1, "{label} must publish {file} exactly once");
-                let (stored, _, id) = calls.last().unwrap().as_ref().expect("stored configuration");
-                assert_eq!(stored, bytes, "{label} must publish the stored config");
-                assert_eq!(*id, incarnation);
-            }
+            let calls = odm_hook_calls(bucket);
+            assert_eq!(calls.len(), before + 1, "{label} must publish exactly once");
+            assert_eq!(
+                calls.last().unwrap().as_ref().map(|(bytes, _, _)| bytes.as_slice()),
+                Some(ODM_JSON),
+                "{label} must publish the stored bytes"
+            );
+            assert_eq!(calls.last().unwrap().as_ref().map(|(_, _, id)| *id), Some(incarnation));
         };
 
         // set (via persist_new_and_set, which installs through `set`).
         let mut bm = BucketMetadata::new(bucket);
         bm.bucket_incarnation_id = incarnation;
-        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
+        bm.update_config(crate::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
             .unwrap();
-        bm.update_config(BUCKET_NOTIFICATION_CONFIG, NOTIFY_XML.to_vec()).unwrap();
         let writer = BucketMetadataSys::new(ecstore.clone());
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         writer.persist_new_and_set(bm).await.expect("metadata should persist");
         expect_publish(before, "set");
 
         // init (initial load on a cold system).
         let mut cold = BucketMetadataSys::new(ecstore.clone());
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         cold.init(vec![bucket.to_string()]).await;
         assert!(cold.get(bucket).await.is_ok(), "initial load must cache the bucket");
         expect_publish(before, "init");
 
         // peer reload.
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         cold.reload_from_store(bucket).await.expect("peer reload should publish");
         expect_publish(before, "peer reload");
 
         // refresh loop.
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         let mut failed = HashSet::new();
         cold.concurrent_load(&[bucket.to_string()], &mut failed, MetadataLoadMode::Refresh)
             .await;
@@ -6907,28 +6952,24 @@ mod tests {
 
         // lazy load on another cold system.
         let lazy = BucketMetadataSys::new(ecstore);
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         let (_, loaded) = lazy.get_config(bucket).await.expect("lazy load should publish");
         assert!(loaded, "the lazy path must have gone to disk");
         expect_publish(before, "lazy load");
 
         // Removal withdraws the config.
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         assert!(lazy.remove(bucket).await);
-        let calls = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG);
+        let calls = odm_hook_calls(bucket);
         assert_eq!(calls.len(), before + 1, "remove must withdraw exactly once");
         assert_eq!(calls.last().unwrap(), &None);
-
-        let notify_calls = config_hook_calls(BUCKET_NOTIFICATION_CONFIG);
-        assert_eq!(notify_calls.len(), before + 1);
-        assert_eq!(notify_calls.last(), Some(&None));
 
         // Opaque bytes reach the application even if they are not valid JSON.
         let mut corrupt = BucketMetadata::new(bucket);
         corrupt.on_demand_migration_config_json = b"not-json".to_vec();
-        let before = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG).len();
+        let before = odm_hook_calls(bucket).len();
         lazy.set(bucket.to_string(), Arc::new(corrupt)).await;
-        let calls = config_hook_calls(BUCKET_ON_DEMAND_MIGRATION_CONFIG);
+        let calls = odm_hook_calls(bucket);
         assert_eq!(calls.len(), before + 1);
         assert_eq!(
             calls.last().unwrap().as_ref().map(|(bytes, _, _)| bytes.as_slice()),

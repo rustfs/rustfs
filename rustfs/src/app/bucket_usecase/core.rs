@@ -304,7 +304,7 @@ impl DefaultBucketUsecase {
             .map(|metadata| {
                 (
                     Some(metadata.bucket_incarnation_id),
-                    crate::init::deleted_bucket_notification_targets(&metadata.notification_config_xml),
+                    rustfs_notify::bucket_removed_targets_from_metadata(&metadata),
                 )
             })
             .unwrap_or_default();

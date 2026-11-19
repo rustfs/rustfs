@@ -19,7 +19,7 @@
 //! [`SourceClient`], a circuit breaker, a negative cache, a per-key
 //! singleflight table, a pull concurrency limit and counters. Its lifecycle
 //! follows the bucket metadata cache through the publish hook registered in
-//! `BUCKET_CONFIG_PUBLISH_HOOK`. It fires on every cache install
+//! [`BUCKET_CONFIG_PUBLISH_HOOK`]; the hook fires on every cache install
 //! path (initial load, admin update, peer reload, refresh loop, lazy load).
 //!
 //! Change detection compares the config by value (`PartialEq`) rather than
@@ -52,6 +52,7 @@ use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
 use super::storage_api::remote_s3_client::{
     PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
 };
+use super::storage_api::{BUCKET_CONFIG_PUBLISH_HOOK, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -745,8 +746,20 @@ impl OnDemandMigrationSys {
         self.write_back.read().clone()
     }
 
+    /// Registers `publish` as the bucket-metadata publish hook. Returns
+    /// `false` when a hook was already registered.
+    pub fn register_config_hook(&'static self) -> bool {
+        BUCKET_CONFIG_PUBLISH_HOOK
+            .set(Box::new(move |bucket, config_file, stored| {
+                if config_file == BUCKET_ON_DEMAND_MIGRATION_CONFIG {
+                    self.publish_stored(bucket, stored.map(|(bytes, _, incarnation)| (bytes, incarnation)));
+                }
+            }))
+            .is_ok()
+    }
+
     /// Corrupt persisted bytes withdraw state synchronously, just like deletion.
-    pub(crate) fn publish_stored(&'static self, bucket: &str, stored: Option<(&[u8], uuid::Uuid)>) {
+    fn publish_stored(&'static self, bucket: &str, stored: Option<(&[u8], uuid::Uuid)>) {
         let incarnation_id = stored.map(|(_, id)| id).unwrap_or_default();
         match stored.map(|(bytes, _)| OnDemandMigrationConfig::from_json(bytes)).transpose() {
             Ok(config) => self.publish_for_incarnation(bucket, incarnation_id, config.as_ref()),

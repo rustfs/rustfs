@@ -239,8 +239,7 @@ pub mod notifier_global {
             .await
     }
 
-    /// Compiles event rules into the bucket configuration used by validation and publication.
-    pub fn bucket_notification_config_for_rules(
+    fn bucket_notification_config_for_rules(
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> BucketNotificationConfig {

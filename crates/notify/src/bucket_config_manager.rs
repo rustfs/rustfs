@@ -40,6 +40,10 @@ impl NotifyBucketConfigManager {
         self.rule_engine.has_subscriber(bucket, event).await
     }
 
+    pub(crate) fn bind_bucket_metadata_source(&self, store: &Arc<crate::NotifyStore>) {
+        self.rule_engine.bind_bucket_metadata_source(store);
+    }
+
     /// Validates that the runtime can accept `cfg` for `bucket` without
     /// mutating any state.
     pub async fn validate_bucket_notification_config(
@@ -112,15 +116,6 @@ impl NotifyBucketConfigManager {
         self.validate_bucket_notification_config(bucket, cfg).await?;
         self.apply_bucket_notification_config(bucket, cfg).await;
         Ok(())
-    }
-
-    pub(crate) fn publish_bucket_notification_config(&self, bucket: &str, cfg: Option<(uuid::Uuid, &BucketNotificationConfig)>) {
-        if let Some((incarnation_id, cfg)) = cfg {
-            self.rule_engine
-                .publish_bucket_rules(bucket, Some(incarnation_id), cfg.get_rules_map().clone());
-        } else {
-            self.rule_engine.withdraw_bucket_rules(bucket);
-        }
     }
 
     pub async fn remove_bucket_notification_config(&self, bucket: &str) {

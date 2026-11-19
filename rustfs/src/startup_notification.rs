@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::init::add_bucket_notification_configuration;
 use crate::storage_api::startup::notification::{EndpointServerPools, Result as StorageResult, new_global_notification_sys};
 use std::{
     future::Future,
@@ -26,13 +27,17 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_EMBEDDED_OPTIONAL_SERVICE_SKIPPED: &str = "embedded_optional_service_skipped";
 const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
 
-pub(crate) async fn init_embedded_notification_runtime(endpoint_pools: EndpointServerPools) {
+pub(crate) async fn init_embedded_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) {
+    add_bucket_notification_configuration(buckets).await;
+
     if let Err(err) = init_notification_system(endpoint_pools).await {
         log_embedded_optional_service_skipped("notification", err);
     }
 }
 
-pub(crate) async fn init_notification_runtime(endpoint_pools: EndpointServerPools) -> Result<()> {
+pub(crate) async fn init_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) -> Result<()> {
+    add_bucket_notification_configuration(buckets).await;
+
     init_notification_system(endpoint_pools).await.map_err(|err| {
         error!(
             event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,

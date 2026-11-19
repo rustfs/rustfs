@@ -1538,7 +1538,7 @@ type S3EdgeService = S3Service;
 /// The S3 service mounted under the middleware: the legacy stack or the gateway stack, selected at
 /// startup (`server/stack.rs`).
 #[cfg(feature = "gateway-stack")]
-type S3EdgeService = S3StackService<S3Service, GatewayEdgeService, NativeConsoleEdgeService>;
+type S3EdgeService = S3StackService<S3Service, GatewayEdgeService, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
 
 /// The gateway stack where the legacy service is mounted: the same response and error types, so
 /// the layers around it do not change with the stack.
@@ -1604,12 +1604,56 @@ where
     }
 }
 
+/// The website host on the gateway stack: the owned host the legacy metadata route also serves.
+#[cfg(feature = "gateway-stack")]
+#[derive(Clone)]
+struct NativeWebsiteEdgeService(Arc<crate::app::website::WebsiteHost>);
+
+#[cfg(feature = "gateway-stack")]
+impl NativeWebsiteEdgeService {
+    /// The website service and the requests it claims, when website domains are configured
+    /// (`website_host_domains`, which the console turns off on both stacks).
+    fn claiming(website: Option<crate::app::website::WebsiteHost>) -> Option<(crate::server::stack::HostClaim, Self)> {
+        let host = Arc::new(website?);
+        let claims = Arc::clone(&host);
+        let claim: crate::server::stack::HostClaim =
+            Arc::new(move |uri: &http::Uri, headers: &http::HeaderMap| claims.claims(uri, headers));
+        Some((claim, Self(host)))
+    }
+}
+
+#[cfg(feature = "gateway-stack")]
+impl<B> Service<HttpRequest<B>> for NativeWebsiteEdgeService
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Response = Response<s3s::Body>;
+    type Error = s3s::HttpError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let host = Arc::clone(&self.0);
+        // A website read has no body; it is dropped unread, as the legacy route leaves it.
+        let (parts, _body) = request.into_parts();
+        Box::pin(async move {
+            let answer = host.answer(parts.method, parts.uri, parts.headers, parts.extensions).await;
+            Ok(answer.map(s3s::Body::http_body_unsync))
+        })
+    }
+}
+
 /// Selects the S3 stack of this server, once. A gateway stack that cannot be assembled fails
 /// startup; the legacy stack is never started in its place.
 #[cfg(feature = "gateway-stack")]
 fn select_s3_stack(
     config: &config::Config,
     legacy: S3Service,
+    website: Option<crate::app::website::WebsiteHost>,
     assembly: impl FnOnce() -> Result<GatewayAssembly>,
 ) -> Result<S3EdgeService> {
     let mut native_admin = None;
@@ -1625,6 +1669,7 @@ fn select_s3_stack(
         Ok(GatewayEdgeService(stack))
     })?
     .with_native_console(NativeConsoleEdgeService::for_config(config))
+    .with_native_website(NativeWebsiteEdgeService::claiming(website))
     .with_native_admin(native_admin)
     .with_control_plane(control_plane);
     info!(
@@ -2499,6 +2544,8 @@ async fn start_http_server_inner(
     // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
     let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
 
+    let website_domains = website_host_domains(config)?.unwrap_or_default();
+
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
     let s3_service = {
@@ -2515,8 +2562,11 @@ async fn start_http_server_inner(
             .map(MultiDomain::new)
             .transpose()
             .map_err(Error::other)?;
-        let website_host_sets = website_host_domains(config)?;
-        let website_route_domains = website_host_sets.unwrap_or_default();
+        // The gateway stack's website host is built from the same domains below.
+        #[cfg(feature = "gateway-stack")]
+        let website_route_domains = website_domains.clone();
+        #[cfg(not(feature = "gateway-stack"))]
+        let website_route_domains = website_domains;
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
@@ -2664,7 +2714,9 @@ async fn start_http_server_inner(
         }
     }
     #[cfg(feature = "gateway-stack")]
-    let s3_service = select_s3_stack(config, s3_service, || {
+    let website = crate::app::website::WebsiteHost::new(website_domains, protocol, Arc::clone(&server_ctx));
+    #[cfg(feature = "gateway-stack")]
+    let s3_service = select_s3_stack(config, s3_service, website, || {
         Ok(GatewayAssembly {
             server_ctx: Arc::clone(&server_ctx),
             root_access_key: config.access_key.clone(),
@@ -4511,6 +4563,8 @@ mod tests {
 
         #[path = "control_plane_tests.rs"]
         mod control_plane_tests;
+        #[path = "metadata_route_parity_tests.rs"]
+        mod metadata_route_parity_tests;
 
         struct UnusedS3;
         #[async_trait::async_trait]
@@ -4810,7 +4864,7 @@ mod tests {
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot.clone()))).unwrap();
+            let edge = select_s3_stack(&config, legacy.clone(), None, || Ok(assembly(slot.clone()))).unwrap();
             let native_service = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
             let context = slot.installed_app_context().unwrap();
             let expiration = chrono::Utc::now().timestamp() + 900;
@@ -5088,7 +5142,7 @@ mod tests {
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let edge = select_s3_stack(&config, legacy.clone(), None, || Ok(assembly(slot))).unwrap();
             let mut failures = Vec::new();
             let mut check = |condition: bool, label: String| {
                 if !condition {
@@ -5558,7 +5612,7 @@ mod tests {
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let edge = select_s3_stack(&config, legacy.clone(), None, || Ok(assembly(slot))).unwrap();
             let mut failures = Vec::new();
             let mut check = |condition: bool, label: String| {
                 if !condition {
@@ -5915,7 +5969,7 @@ mod tests {
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let edge = select_s3_stack(&config, legacy.clone(), None, || Ok(assembly(slot))).unwrap();
             let selected = answer(
                 edge.clone(),
                 signed(

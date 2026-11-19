@@ -149,7 +149,8 @@ fn the_assembled_stack_registers_exactly_the_table() {
     let stack = GatewayStack::assemble(assembly()).expect("the stack assembles");
 
     let registered: std::collections::BTreeSet<&str> = stack.service.operations().collect();
-    assert_eq!(registered, rows(OPERATIONS).map(|row| row.name).collect());
+    let table = rows(OPERATIONS).map(|row| row.name);
+    assert_eq!(registered, table.chain(metadata_listing::NAMES).collect());
 }
 
 #[test]

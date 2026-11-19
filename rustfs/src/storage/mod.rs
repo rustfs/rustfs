@@ -70,7 +70,7 @@ pub(crate) use storage_api::{
     ecstore_admin, ecstore_bucket, ecstore_capacity, ecstore_client, ecstore_cluster, ecstore_compression, ecstore_config,
     ecstore_data_usage, ecstore_disk, ecstore_error, ecstore_event, ecstore_layout, ecstore_metrics, ecstore_notification,
     ecstore_rebalance, ecstore_rio, ecstore_rpc, ecstore_set_disk, ecstore_storage, ecstore_tier, encode_tags,
-    find_local_disk_by_ref, get_bucket_cors_config, get_bucket_metadata, get_bucket_sse_config,
+    find_local_disk_by_ref, get_bucket_cors_config, get_bucket_metadata, get_bucket_notification_config, get_bucket_sse_config,
     get_bucket_website_config_for_store, get_local_server_property, get_lock_acquire_timeout, head_prefix_consumer,
     helper_consumer, init_background_replication, init_bucket_metadata_sys, init_ecstore_config,
     init_local_disks_with_instance_ctx, init_lock_clients, is_err_bucket_not_found, is_err_object_not_found,

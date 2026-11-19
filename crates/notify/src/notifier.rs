@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::NotificationError;
-use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine, rules::TargetIdSet};
+use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
 use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
@@ -236,12 +236,6 @@ impl EventNotifier {
         );
     }
 
-    /// Captures the deleted bucket's final delivery targets before its rules are withdrawn.
-    pub fn bucket_removed_targets(&self, bucket: &str, incarnation_id: uuid::Uuid) -> TargetIdSet {
-        self.rule_engine
-            .match_bucket_targets(bucket, Some(incarnation_id), EventName::BucketRemoved, "")
-    }
-
     /// Sends an event to the appropriate targets based on the bucket rules
     ///
     /// # Arguments
@@ -259,13 +253,12 @@ impl EventNotifier {
                     self.rule_engine
                         .match_bucket_targets(bucket_name, event.bucket_incarnation_id, event_name, object_key)
                 };
-                let targets = match_targets();
+                let targets = match_targets().await;
                 if targets.is_empty()
                     && let Some(id) = event.bucket_incarnation_id
-                    && self.rule_engine.request_incarnation_refresh(bucket_name, id)
-                    && crate::storage_api::refresh_notify_bucket_metadata(bucket_name).await
+                    && self.rule_engine.refresh_incarnation(bucket_name, id).await
                 {
-                    match_targets()
+                    match_targets().await
                 } else {
                     targets
                 }
@@ -1148,7 +1141,7 @@ mod tests {
             "*".to_owned(),
             target.target_id(),
         );
-        engine.publish_bucket_rules("bucket", Some(old_id), rules);
+        engine.publish_bucket_rules("bucket", Some(old_id), rules).await;
         notifier
             .target_list()
             .write()
@@ -1156,9 +1149,16 @@ mod tests {
             .add(Arc::new(target.clone()))
             .expect("register target");
 
-        let targets = notifier.bucket_removed_targets("bucket", old_id);
+        let mut metadata = crate::storage_api::BucketMetadata::new("bucket");
+        metadata.bucket_incarnation_id = old_id;
+        metadata.notification_config_xml = b"<NotificationConfiguration><QueueConfiguration><Queue>arn:rustfs:sqs:us-east-1:removed-bucket:webhook</Queue><Event>s3:BucketRemoved:*</Event></QueueConfiguration></NotificationConfiguration>".to_vec();
+        metadata.notification_config = Some(
+            rustfs_ecstore::api::bucket::utils::deserialize(&metadata.notification_config_xml)
+                .expect("parse removal subscription"),
+        );
+        let targets = crate::bucket_removed_targets_from_metadata(&metadata);
         assert!(targets.contains(&target.target_id()));
-        engine.withdraw_bucket_rules("bucket");
+        engine.withdraw_bucket_rules("bucket").await;
 
         let mut removed = Event::new_test_event("bucket", "", EventName::BucketRemoved);
         removed.bucket_incarnation_id = Some(old_id);
