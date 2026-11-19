@@ -14891,15 +14891,11 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                                     .checked_add(page.saturating_sub(1))
                                     .map(|value| value / page * page)
                                     .unwrap_or(end);
-                                if aligned_end < meta.len() {
-                                    if let Some(reclaim_len) = std::num::NonZeroU64::new(meta.len() - aligned_end) {
-                                        let _ = rustix::fs::fadvise(
-                                            &file,
-                                            aligned_end,
-                                            Some(reclaim_len),
-                                            rustix::fs::Advice::DontNeed,
-                                        );
-                                    }
+                                if aligned_end < meta.len()
+                                    && let Some(reclaim_len) = std::num::NonZeroU64::new(meta.len() - aligned_end)
+                                {
+                                    let _ =
+                                        rustix::fs::fadvise(&file, aligned_end, Some(reclaim_len), rustix::fs::Advice::DontNeed);
                                 }
                             }
                             Ok::<_, DiskError>(())
