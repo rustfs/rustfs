@@ -355,9 +355,16 @@ impl Operation for AddUser {
             args.policy = None;
             updated_at
         } else {
-            if authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::EnableUserAdminAction)])
-                .await
-                .is_ok()
+            if validate_admin_request(
+                req.headers(),
+                &cred,
+                owner,
+                false,
+                vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
+                req.policy_source_addr(),
+            )
+            .await
+            .is_ok()
             {
                 iam_store.create_user(ak, &args).await
             } else {
