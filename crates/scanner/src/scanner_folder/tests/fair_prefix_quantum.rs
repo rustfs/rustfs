@@ -162,14 +162,27 @@ async fn scan_one_restart_round(
     cache: DataUsageCache,
     config: ScannerCycleBudgetConfig,
 ) -> RestartRound {
+    scan_one_replica_round(disk_root, None, cache, config).await
+}
+
+async fn scan_one_replica_round(
+    disk_root: &std::path::Path,
+    peer: Option<&std::path::Path>,
+    cache: DataUsageCache,
+    config: ScannerCycleBudgetConfig,
+) -> RestartRound {
     let disk = open_fixture_disk(disk_root).await;
+    let mut disks = vec![disk.clone()];
+    if let Some(peer) = peer {
+        disks.push(open_fixture_disk(peer).await);
+    }
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, config);
     let _observation = install_raw_entry_observer(disk.path());
     let result = scan_data_folder(
         budget.token(),
         budget.clone(),
-        vec![disk.clone()],
+        disks,
         disk,
         cache.clone(),
         None,
@@ -191,7 +204,7 @@ async fn scan_one_restart_round(
     }
 }
 
-async fn run_until_finished(
+pub(super) async fn run_until_finished(
     disk_root: &std::path::Path,
     mut cache: DataUsageCache,
     config: ScannerCycleBudgetConfig,
@@ -316,6 +329,313 @@ async fn fair_prefix_quantum_budget_stop_keeps_progress_without_certifying_it() 
     let totals = finished.checked_flatten("bucket").expect("bucket root");
     let expected = u64::try_from(OBJECTS).expect("fixture size");
     assert_eq!((totals.objects as u64, totals.versions as u64), (expected, expected));
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_compacted_directory_totals_progress_after_every_executor_restart() {
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let root = temp.path().join("disk");
+    let mut cache = seed_flat_bucket(&root, 40).await;
+    let budget = ScannerCycleBudgetConfig {
+        max_objects: Some(6),
+        ..Default::default()
+    };
+    super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            let mut partial_counts = Vec::new();
+            for round in 0..16 {
+                let step = scan_one_restart_round(&root, cache.clone(), budget).await;
+                if !step.finished {
+                    assert!(
+                        step.outcome
+                            .durable_scan_progress()
+                            .advanced_from(&cache.durable_scan_progress()),
+                        "each cold compacted round must earn a coordinator service turn, round {round}"
+                    );
+                }
+                cache = step.outcome;
+                let total = cache.checked_flatten("bucket").expect("connected compact bucket");
+                if step.finished {
+                    assert!(round > 1);
+                    assert!(cache.info.snapshot_complete);
+                    assert_eq!((total.objects, total.size, total.versions), (40, 40, 40));
+                    return;
+                }
+                assert!(!cache.info.snapshot_complete);
+                partial_counts.push(total.objects);
+            }
+            panic!("cold compacted scan did not finish in 16 rounds; objects per partial: {partial_counts:?}");
+        })
+        .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_compacted_replicas_finish_within_their_independent_object_budgets() {
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let first = temp.path().join("a");
+    let other = temp.path().join("b");
+    let mut cache = seed_flat_bucket(&first, 40).await;
+    tokio::fs::create_dir_all(&other).await.expect("fresh replica");
+    for index in (0..40).rev() {
+        let name = format!("object-{index:04}");
+        let metadata = tokio::fs::read(first.join("bucket").join(&name).join("xl.meta"))
+            .await
+            .expect("original metadata");
+        write_test_object_metadata_bytes(&other, "bucket", &name, &metadata).await;
+    }
+    let budget = ScannerCycleBudgetConfig {
+        max_objects: Some(6),
+        ..Default::default()
+    };
+    super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            for round in 0..(2 * 40_usize.div_ceil(6) + 1) {
+                let root = if round % 2 == 0 { &first } else { &other };
+                let peer = if round % 2 == 0 { &other } else { &first };
+                let step = scan_one_replica_round(root, Some(peer), cache.clone(), budget).await;
+                if !step.finished {
+                    assert!(
+                        step.outcome
+                            .durable_scan_progress()
+                            .advanced_from(&cache.durable_scan_progress()),
+                        "cross-disk compacted work should advance durable scheduling, round {round}"
+                    );
+                }
+                cache = step.outcome;
+                if step.finished {
+                    assert!(round > 1);
+                    assert!(cache.info.snapshot_complete);
+                    let total = cache.checked_flatten("bucket").expect("complete switched source");
+                    assert_eq!((total.objects, total.size), (40, 40));
+                    return;
+                }
+            }
+            panic!("two cold physical replicas did not converge within two independent object work budgets");
+        })
+        .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_compacted_identical_names_do_not_mix_replica_version_sizes() {
+    use super::checkpoint_fixture::write_checkpoint_object;
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    let start = seed_flat_bucket(&a, 40).await;
+    seed_flat_bucket(&b, 40).await;
+    write_checkpoint_object(&b, "object-0000", &[(Some(Uuid::from_u128(100)), 11), (Some(Uuid::from_u128(101)), 23)]).await;
+    let config = ScannerCycleBudgetConfig {
+        max_objects: Some(6),
+        ..Default::default()
+    };
+    super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            let first = scan_one_replica_round(&a, Some(&b), start, config).await;
+            assert!(!first.finished);
+            let mut cache = first.outcome;
+            for _ in 0..10 {
+                let round = scan_one_replica_round(&b, Some(&a), cache, config).await;
+                cache = round.outcome;
+                if round.finished {
+                    break;
+                }
+            }
+            let complete = cache;
+            assert!(complete.info.snapshot_complete);
+            let counted = complete.checked_flatten("bucket").expect("complete B accounting");
+            // 39 one-byte objects and both retained versions of the remaining key.
+            assert_eq!((counted.objects, counted.size, counted.versions), (40, 73, 41));
+        })
+        .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn legacy_unbound_partial_restarts_on_the_actual_physical_replica() {
+    use super::checkpoint_fixture::write_checkpoint_object;
+    let temp = tempfile::tempdir().expect("fixture");
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    let cache = seed_flat_bucket(&a, 40).await;
+    seed_flat_bucket(&b, 40).await;
+    write_checkpoint_object(&b, "object-0000", &[(Some(Uuid::from_u128(200)), 12), (Some(Uuid::from_u128(201)), 31)]).await;
+    let config = ScannerCycleBudgetConfig {
+        max_objects: Some(6),
+        ..Default::default()
+    };
+    let first = scan_one_restart_round(&a, cache, config).await;
+    let mut legacy = first.outcome;
+    assert!(legacy.validated_scan_frontier().is_some());
+    legacy.info.scan_directory_source = None;
+    legacy.info.scan_directory_work.clear();
+    legacy.info.scan_source_trees.clear();
+    let upgraded = run_until_finished(&b, legacy, config, 10).await;
+    let total = upgraded.checked_flatten("bucket").expect("B complete");
+    assert_eq!((total.objects, total.size, total.versions), (40, 82, 41));
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_linked_prefixes_resume_their_own_replica_coverage() {
+    use super::checkpoint_fixture::write_checkpoint_object;
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    let mut cache = seed_flat_bucket(&a, 40).await;
+    seed_flat_bucket(&b, 40).await;
+    write_checkpoint_object(&b, "object-0000", &[(Some(Uuid::from_u128(100)), 11), (Some(Uuid::from_u128(101)), 23)]).await;
+    let config = ScannerCycleBudgetConfig {
+        max_objects: Some(6),
+        ..Default::default()
+    };
+    // Six turns per disk leave one final B quantum. Each cold process must
+    // recover that disk's linked tree as well as its complete child coverage.
+    for round in 0..(2 * 40_usize.div_ceil(6) + 1) {
+        let (root, peer) = if round < 12 && round % 2 == 0 { (&a, &b) } else { (&b, &a) };
+        let previous_source = cache.info.scan_directory_source.clone();
+        let before = cache.durable_scan_progress();
+        let result = scan_one_replica_round(root, Some(peer), cache, config).await;
+        if !result.finished {
+            assert!(
+                result.outcome.durable_scan_progress().advanced_from(&before),
+                "linked source must earn another turn, round {round}"
+            );
+        }
+        cache = result.outcome;
+        if round == 1 {
+            let previous_source = previous_source.expect("A's physical source");
+            let endpoints = [
+                previous_source.as_str(),
+                cache.info.scan_directory_source.as_deref().expect("B's physical source"),
+            ]
+            .map(|source| source.split_once('|').expect("disk generation and endpoint").1.to_owned())
+            .into_iter()
+            .collect();
+            let mut only_switched = cache.clone();
+            only_switched.activate_directory_source(previous_source, &endpoints);
+            assert!(only_switched.validated_scan_frontier().is_some(), "A's linked coverage is retained");
+            assert!(
+                !only_switched
+                    .durable_scan_progress()
+                    .advanced_from(&cache.durable_scan_progress()),
+                "moving a linked source between active and dormant earns no new turn"
+            );
+        }
+
+        if result.finished {
+            assert_eq!(root, &b);
+            assert!(cache.info.snapshot_complete);
+            let root = cache.find("bucket").expect("complete linked bucket");
+            assert!(!root.compacted);
+            assert_eq!(root.children.len(), 40);
+            let counted = cache.checked_flatten("bucket").expect("full B view");
+            assert_eq!((counted.objects, counted.size, counted.versions), (40, 73, 41));
+            return;
+        }
+    }
+    panic!("two independent cold linked prefix scans did not converge");
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_compacted_changed_replica_does_not_import_another_disks_totals() {
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let first = temp.path().join("a");
+    let other = temp.path().join("b");
+    let baseline = seed_flat_bucket(&first, 40).await;
+    seed_flat_bucket(&other, 40).await;
+    // Object zero was already counted on A but never existed in B's view.
+    // Importing A's subtotal based only on a matching child boundary would
+    // produce 40 objects on B even though its authoritative listing has 39.
+    tokio::fs::remove_dir_all(other.join("bucket/object-0000"))
+        .await
+        .expect("different replica membership");
+    let config = ScannerCycleBudgetConfig {
+        max_objects: Some(6),
+        ..Default::default()
+    };
+    super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            let first = scan_one_restart_round(&first, baseline, config).await;
+            assert!(!first.finished);
+            let complete = run_until_finished(&other, first.outcome, config, 14).await;
+            let root = complete.checked_flatten("bucket").expect("finished replica");
+            assert_eq!((root.objects, root.versions, root.size), (39, 39, 39));
+        })
+        .await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn cold_wide_listing_rotates_physical_endpoints_before_eof() {
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let first = temp.path().join("a");
+    let other = temp.path().join("b");
+    let mut cache = seed_flat_bucket(&first, 49).await;
+    seed_flat_bucket(&other, 49).await;
+    let config = ScannerCycleBudgetConfig {
+        max_duration: Some(8 * PHYSICAL_READ_COST),
+        ..Default::default()
+    };
+    for round in 0..22 {
+        let disk = if round % 2 == 0 { &first } else { &other };
+        let peer = if round % 2 == 0 { &other } else { &first };
+        let physical = disk.join("bucket").canonicalize().expect("physical directory");
+        let before = cache.durable_scan_progress();
+        let step = SLOW_DIRECTORY
+            .scope((physical, Cell::new(0)), scan_one_replica_round(disk, Some(peer), cache, config))
+            .await;
+        if !step.finished {
+            assert!(
+                step.outcome.durable_scan_progress().advanced_from(&before),
+                "each independent native resume must advance durable scheduling, round {round}"
+            );
+        }
+        cache = step.outcome;
+        if step.finished {
+            assert!(round > 2);
+            assert!(cache.info.snapshot_complete);
+            let total = cache.checked_flatten("bucket").expect("switched cold listing");
+            assert_eq!((total.objects, total.size), (49, 49));
+            return;
+        }
+    }
+    panic!("rotating before EOF repeatedly overwrote an endpoint's physical progress");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn cold_wide_listing_reaches_eof_after_every_executor_restart() {
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let root = temp.path().join("disk");
+    let mut cache = seed_flat_bucket(&root, 49).await;
+    let budget = ScannerCycleBudgetConfig {
+        max_duration: Some(8 * PHYSICAL_READ_COST),
+        ..Default::default()
+    };
+    SLOW_DIRECTORY
+        .scope((root.join("bucket").canonicalize().expect("physical path"), Cell::new(0)), async {
+            for round in 0..16 {
+                let step = scan_one_restart_round(&root, cache.clone(), budget).await;
+                cache = step.outcome;
+                if step.finished {
+                    assert!(round > 1);
+                    assert!(cache.info.snapshot_complete);
+                    let total = cache.checked_flatten("bucket").expect("complete bucket");
+                    assert_eq!((total.objects, total.size), (49, 49));
+                    return;
+                }
+                assert!(!cache.info.snapshot_complete);
+            }
+            let reads = SLOW_DIRECTORY.with(|(_, reads)| reads.get());
+            panic!("cold physical listing did not reach EOF after 16 rounds and {reads} directory reads");
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -461,7 +781,7 @@ async fn wide_directory_deleted_bucket_releases_a_slot_under_pressure() {
         let path = retired.join(index.to_string());
         tokio::fs::create_dir_all(&path).await.expect("create parked directory");
         let path = path.to_str().expect("fixture path");
-        let directory = ScannerDirectory::open(path, "bucket", Some(scope.clone()), budget.clone())
+        let directory = ScannerDirectory::open(path, "bucket", Some(scope.clone()), budget.clone(), None)
             .await
             .expect("open source");
         drop(directory);
@@ -470,13 +790,13 @@ async fn wide_directory_deleted_bucket_releases_a_slot_under_pressure() {
     let next = disk_root.join("replacement");
     tokio::fs::create_dir(&next).await.expect("current source");
     let next = next.to_str().expect("fixture path");
-    let directory = ScannerDirectory::open(next, "bucket", Some(scope.clone()), budget.clone())
+    let directory = ScannerDirectory::open(next, "bucket", Some(scope.clone()), budget.clone(), None)
         .await
         .expect("open next source");
     drop(directory);
     assert!(!is_parked(next), "active owners retain their bounded slots");
     tokio::fs::remove_dir_all(retired).await.expect("retire directories");
-    let directory = ScannerDirectory::open(next, "bucket", Some(scope), budget)
+    let directory = ScannerDirectory::open(next, "bucket", Some(scope), budget, None)
         .await
         .expect("admit after retirement");
     drop(directory);

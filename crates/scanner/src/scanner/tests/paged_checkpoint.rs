@@ -6,7 +6,7 @@ use crate::BUCKET_META_PREFIX;
 
 const NAME: &str = "bucket/.usage-cache.bin";
 
-fn seeded() -> DataUsageCache {
+fn empty_bucket_checkpoint() -> DataUsageCache {
     let mut cache = DataUsageCache::default();
     cache.info.name = "bucket".into();
     cache.info.source = Some(DataUsageCacheSource::new(0, 0));
@@ -19,6 +19,11 @@ fn seeded() -> DataUsageCache {
         scan_mode: HealScanMode::Normal,
     });
     cache.replace("bucket", "", DataUsageEntry::default());
+    cache
+}
+
+fn seeded() -> DataUsageCache {
+    let mut cache = empty_bucket_checkpoint();
     for index in 0..4096 {
         cache.replace(
             &format!("bucket/prefix-{index:05}"),
@@ -43,6 +48,136 @@ async fn layout(store: &MemoryConfigStore) -> HashMap<String, (usize, usize)> {
         .iter()
         .map(|(k, v)| (k.clone(), (puts[k], v.len())))
         .collect()
+}
+
+fn page_bytes_after_save(before: &HashMap<String, (usize, usize)>, after: &HashMap<String, (usize, usize)>) -> (usize, usize) {
+    let mut existing = 0;
+    let mut uploaded = 0;
+    for (path, &(writes, size)) in after.iter().filter(|(path, _)| path.contains(".pages/")) {
+        if let Some(&(previous_writes, _)) = before.get(path) {
+            assert_eq!(writes, previous_writes, "a committed immutable page was resubmitted");
+            existing += size;
+        } else {
+            uploaded += size;
+        }
+    }
+    (existing, uploaded)
+}
+
+#[tokio::test]
+async fn compacted_checkpoint_advances_one_child_without_rewriting_300k_names() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut cache = empty_bucket_checkpoint();
+    let plan = DataUsageScanPlanDigest([1; 32]);
+    cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: plan,
+        requested_plan: plan,
+    });
+    cache.info.scan_directory_source = Some(format!("{}|disk-a", uuid::Uuid::from_u128(1)));
+    let [first, second] = crate::scanner_folder::DirectoryCheckpoint::wide_storage_fixture(&cache.info).await;
+    let mut before: Option<HashMap<String, (usize, usize)>> = None;
+    let mut prior_progress = None;
+    for (objects, receipt) in [(121_034, first), (121_035, second)] {
+        cache.info.scan_directory_work = vec![receipt];
+        cache.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                compacted: true,
+                objects,
+                size: objects * 1024,
+                ..Default::default()
+            },
+        );
+        let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+            .await
+            .expect("current revisions");
+        cache
+            .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+            .await
+            .expect("save compacted receipt");
+        let after = layout(&store).await;
+        if let Some(before) = before.as_ref() {
+            let (old_bytes, new_bytes) = page_bytes_after_save(before, &after);
+            eprintln!("300k-name checkpoint: {new_bytes} bytes in new pages, {old_bytes} bytes in existing pages");
+            assert!(old_bytes > 3_000_000, "fixture must contain the full physical listing");
+            assert!(
+                new_bytes > 0 && new_bytes < old_bytes / 10,
+                "one more completed child wrote {new_bytes} bytes alongside {old_bytes} reused bytes"
+            );
+        }
+        before = Some(after);
+        let mut restored = DataUsageCache::default();
+        restored
+            .load(store.clone(), NAME)
+            .await
+            .expect("cold read of compacted receipt");
+        assert!(restored.info.scan_directory_work[0].is_bound_to(&restored.info));
+        let progress = restored.durable_scan_progress();
+        if let Some(prior) = &prior_progress {
+            assert!(progress.advanced_from(prior), "the new child must earn another durable work turn");
+        }
+        prior_progress = Some(progress);
+        let total = restored.checked_flatten("bucket").expect("connected root after restore");
+        assert_eq!((total.objects, total.size), (objects, objects * 1024));
+        cache = restored;
+    }
+}
+
+#[tokio::test]
+async fn dormant_linked_tree_pages_survive_source_switch_and_cold_reencoding() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut cache = seeded();
+    let plan = DataUsageScanPlanDigest([1; 32]);
+    cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: plan,
+        requested_plan: plan,
+    });
+    let endpoints = std::collections::HashSet::from(["disk-a".to_owned(), "disk-b".to_owned()]);
+    let a = format!("{}|disk-a", uuid::Uuid::from_u128(1));
+    let b = format!("{}|disk-b", uuid::Uuid::from_u128(2));
+    cache.info.scan_directory_source = Some(a.clone());
+    cache.activate_directory_source(b.clone(), &endpoints);
+    cache.replace("bucket", "", DataUsageEntry::default());
+    let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+        .await
+        .expect("before first checkpoint");
+    cache
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .await
+        .expect("persist dormant linked tree");
+    let previous = layout(&store).await;
+
+    let mut cold = DataUsageCache::default();
+    cold.load(store.clone(), NAME)
+        .await
+        .expect("restore checkpoint in a new process");
+    cold.activate_directory_source(a, &endpoints);
+    assert_eq!(cold.checked_flatten("bucket").expect("first source entries").objects, 4096);
+    cold.activate_directory_source(b, &endpoints);
+    assert_eq!(cold.checked_flatten("bucket").expect("second source root").objects, 0);
+    cold.replace(
+        "bucket/new-key",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            size: 99,
+            ..Default::default()
+        },
+    );
+    let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+        .await
+        .expect("before second checkpoint");
+    cold.save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .await
+        .expect("save one new child");
+    let after = layout(&store).await;
+    let (prior_bytes, new_bytes) = page_bytes_after_save(&previous, &after);
+    assert!(prior_bytes > 128 * 1024);
+    assert!(
+        new_bytes > 0 && new_bytes < prior_bytes / 8,
+        "dormant tree rewritten: {new_bytes} new bytes for {prior_bytes} prior bytes"
+    );
 }
 
 #[tokio::test]

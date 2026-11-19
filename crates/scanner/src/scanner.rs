@@ -56,7 +56,7 @@ use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
     CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot,
     ScannerUsagePublicationObservation, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
-    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
+    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_stage, emit_scan_cycle_superseded, global_metrics,
 };
 use rustfs_scanner_metrics::startup::ScannerStartupToken;
 use serde::{Deserialize, Serialize};
@@ -2486,13 +2486,20 @@ where
                 event = EVENT_SCANNER_CYCLE_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                cycle = cycle_info.current,
-                required_cycle,
                 state = "cache_cycle_ahead",
+                partial_stage = "cache_cycle_ahead",
+                cycle = cycle_info.current,
+                leader_epoch,
+                required_cycle,
                 partial_cause = "cache_cycle_ahead",
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
-            emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+            let partial = emit_scan_cycle_partial_with_stage(
+                cycle_start.elapsed(),
+                ScanCyclePartialReason::Unknown,
+                None,
+                Some("cache_cycle_ahead"),
+            );
             let persisted = persist_required_scanner_cycle_floor_for_epoch(
                 ctx,
                 storeapi.clone(),
@@ -2506,6 +2513,7 @@ where
                 },
             )
             .await;
+            partial.observe_state_write(persisted);
             return if persisted {
                 cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
@@ -2556,18 +2564,7 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
-    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
-        "saved_bucket_progress"
-    } else if scan_cycle_result.has_usage_update()
-        && matches!(
-            scan_cycle_result.status,
-            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        )
-    {
-        "activity_unverified_observation"
-    } else {
-        "incomplete_coverage"
-    };
+    let (partial_cause, partial_stage) = partial_cycle_diagnostic(&scan_cycle_result);
     #[cfg(feature = "e2e-test-hooks")]
     let durable_observation = scan_cycle_result
         .publication_expectation()
@@ -2646,25 +2643,35 @@ where
         );
     }
     if cycle_budget.budget_elapsed() {
+        let budget_reason = cycle_budget.reason();
+        let budget_stage = match budget_reason {
+            Some(ScannerCycleBudgetReason::Runtime) => Some("runtime_budget"),
+            Some(ScannerCycleBudgetReason::Objects) => Some("object_budget"),
+            Some(ScannerCycleBudgetReason::Directories) => Some("directory_budget"),
+            Some(ScannerCycleBudgetReason::Entries) => Some("entry_budget"),
+            None => None,
+        };
         warn!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "budget_reached",
+            partial_stage = budget_stage,
             cycle = cycle_info.current,
+            leader_epoch,
             duration = ?now.elapsed(),
-            reason = ?cycle_budget.reason(),
+            reason = ?budget_reason,
             max_duration = ?cycle_budget.max_duration(),
             max_objects = ?cycle_budget.max_objects(),
             max_directories = ?cycle_budget.max_directories(),
-            state = "budget_reached",
             "Scanner cycle budget reached"
         );
-        let budget_reason = cycle_budget.reason();
-        emit_scan_cycle_partial_with_source(
+        let partial = emit_scan_cycle_partial_with_stage(
             cycle_start.elapsed(),
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
+            budget_stage,
         );
         let persisted = finalize_partial_scan_cycle_for_epoch(
             ctx,
@@ -2676,6 +2683,7 @@ where
             publication_epoch,
         )
         .await;
+        partial.observe_state_write(persisted);
         return if persisted {
             cycle_budget.mark_cycle_state_persisted();
             ScannerCycleOutcome::Partial
@@ -2709,29 +2717,56 @@ where
             return ScannerCycleOutcome::Failed;
         }
         ScannerCycleOutcome::Partial => {
-            if ctx.is_cancelled() {
+            let owner_cancelled = ctx.is_cancelled();
+            let partial_stage = if owner_cancelled { "owner_cancelled" } else { partial_stage };
+            if owner_cancelled {
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_CYCLE_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    cycle = cycle_info.current,
                     state = "incomplete_cancelled",
+                    cycle = cycle_info.current,
+                    leader_epoch,
+                    partial_stage,
                     "Scanner cycle stopped before a complete usage snapshot was produced"
                 );
-            } else {
+            } else if partial_cause == "saved_bucket_progress"
+                && matches!(partial_stage, "bucket_checkpoint_saved" | "bucket_walk_incomplete")
+            {
                 warn!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_CYCLE_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    cycle = cycle_info.current,
                     state = "incomplete",
+                    cycle = cycle_info.current,
+                    leader_epoch,
                     partial_cause,
-                    "Scanner cycle ended without a complete usage snapshot"
+                    partial_stage,
+                    "Scanner saved bucket progress before completing coverage"
+                );
+            } else {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_CYCLE_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "incomplete",
+                    cycle = cycle_info.current,
+                    leader_epoch,
+                    partial_cause,
+                    partial_stage,
+                    persist_outcome = ?usage_persist_outcome,
+                    "Scanner cycle could not certify complete usage"
                 );
             }
-            emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+            let partial = emit_scan_cycle_partial_with_stage(
+                cycle_start.elapsed(),
+                ScanCyclePartialReason::Unknown,
+                None,
+                Some(partial_stage),
+            );
             let persisted = finalize_partial_scan_cycle_for_epoch(
                 ctx,
                 storeapi.clone(),
@@ -2742,6 +2777,7 @@ where
                 publication_epoch,
             )
             .await;
+            partial.observe_state_write(persisted);
             return if persisted {
                 cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
@@ -4367,6 +4403,18 @@ fn finalize_scanner_cycle_result(
         pending_maintenance_work || crate::scanner_io::dirty_usage_buckets_pending(),
         remote_dirty_usage_acknowledgements,
     )
+}
+
+fn partial_cycle_diagnostic(scan: &crate::scanner_io::ScannerCycleResult) -> (&'static str, &'static str) {
+    if scan.has_partial_bucket_progress() && !scan.has_usage_update() {
+        ("saved_bucket_progress", scan.partial_stage.unwrap_or("bucket_checkpoint_saved"))
+    } else if scan.has_usage_update()
+        && scan.status == ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    {
+        ("activity_unverified_observation", "activity_baseline_unverified")
+    } else {
+        ("incomplete_coverage", scan.partial_stage.unwrap_or("root_coverage_incomplete"))
+    }
 }
 
 fn scanner_cycle_completion_outcome_for_result(

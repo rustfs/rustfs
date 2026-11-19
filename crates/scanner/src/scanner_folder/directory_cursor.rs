@@ -7,7 +7,12 @@
 
 use std::collections::HashMap;
 
+mod checkpoint;
 mod pages;
+pub use checkpoint::DirectoryCheckpoint;
+pub(super) use checkpoint::Saved;
+pub(crate) use checkpoint::{DirectoryProgress, DirectoryReadProgress};
+use checkpoint::{Physical, Recorder, Scope};
 use pages::NamePages;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,6 +26,35 @@ use crate::scanner_budget::ScannerCycleBudget;
 
 pub(super) const PARKED_DIRECTORIES_PER_DISK: usize = 32;
 
+/// Only a positively identified disk can re-adopt a linked tree. A missing
+/// format on an otherwise visible local drive uses its directory generation;
+/// genuine format I/O errors propagate before any cached subtotals are used.
+pub(super) async fn physical_source(disk: &Arc<Disk>) -> Result<String, super::ScannerError> {
+    use crate::storage_api::owner::EcstoreDiskAPI;
+    use sha2::{Digest, Sha256};
+    let endpoint = disk.endpoint().to_string();
+    let generation = match disk.get_disk_id().await {
+        Ok(Some(id)) if !id.is_nil() => id.to_string(),
+        Ok(None) | Err(super::DiskError::UnformattedDisk) => {
+            let path = disk.path();
+            let stamp = DirectoryStamp::at(path.to_str().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?).await?;
+            // Bucket creation and scanner startup can change the volume root's
+            // mtime/ctime. Birth time distinguishes inode reuse without making
+            // ordinary directory content changes appear to replace the disk.
+            if let Some(generation) = stamp.volume_generation() {
+                let bytes = rmp_serde::to_vec_named(&(std::env::consts::OS, generation)).map_err(io::Error::other)?;
+                hex_simd::encode_to_string(Sha256::digest(bytes), hex_simd::AsciiCase::Lower)
+            } else {
+                // The platform cannot attest the generation across processes.
+                uuid::Uuid::new_v4().to_string()
+            }
+        }
+        Ok(Some(_)) => return Err(io::Error::new(io::ErrorKind::InvalidData, "scanner disk format contains a nil ID").into()),
+        Err(error) => return Err(io::Error::other(error).into()),
+    };
+    Ok(format!("{generation}|{endpoint}"))
+}
+
 #[derive(Clone)]
 pub(super) struct DirectoryScope {
     disk: Weak<Disk>,
@@ -31,6 +65,8 @@ pub(super) struct DirectoryScope {
     mode: FolderScanMode,
     prefix_scope: Option<ScannerBucketPrefixScanScope>,
     owner: (u64, u64),
+    endpoint: String,
+    watch: Option<[u8; 32]>,
     continuing: bool,
 }
 
@@ -41,6 +77,7 @@ impl DirectoryScope {
         mode: FolderScanMode,
         prefix_scope: Option<ScannerBucketPrefixScanScope>,
     ) -> Option<Self> {
+        use crate::storage_api::owner::EcstoreDiskAPI;
         let info = &cache.info;
         Some(Self {
             disk: Arc::downgrade(disk),
@@ -51,17 +88,33 @@ impl DirectoryScope {
             mode,
             prefix_scope,
             owner: (info.leader_epoch, info.next_cycle),
+            endpoint: format!("|{}", disk.endpoint()),
+            watch: info
+                .scan_usage_watch
+                .as_ref()
+                .filter(|proof| proof.is_well_formed())
+                .map(|proof| proof.digest().0),
             continuing: cache.has_scan_position(),
         })
     }
 
+    pub(super) fn bind_source(&mut self, source: Option<&str>) {
+        if let Some(source) = source {
+            self.endpoint = source.to_owned();
+        }
+    }
+    pub(super) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
     fn matches(&self, other: &Self) -> bool {
-        self.disk.ptr_eq(&other.disk)
+        self.endpoint == other.endpoint
+            && self.disk.ptr_eq(&other.disk)
             && self.bucket == other.bucket
             && self.source == other.source
             && self.identity == other.identity
             && self.progress == other.progress
             && self.mode == other.mode
+            && self.watch == other.watch
             && self.prefix_scope == other.prefix_scope
             && (other.continuing || self.owner == other.owner)
     }
@@ -70,6 +123,7 @@ impl DirectoryScope {
 #[derive(PartialEq, Eq)]
 struct DirectoryStamp {
     modified: SystemTime,
+    birth: Option<SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -78,37 +132,59 @@ struct DirectoryStamp {
     changed: (i64, i64),
     #[cfg(windows)]
     identity: same_file::Handle,
+    #[cfg(windows)]
+    physical: Option<(u64, u64, i64)>,
 }
 
 impl DirectoryStamp {
-    async fn at(path: &str) -> io::Result<Self> {
-        let current_path = PathBuf::from(path);
-        let meta =
-            crate::storage_api::ecstore_spawn_blocking_with_resource_ownership(move || std::fs::symlink_metadata(current_path))
-                .await
-                .map_err(io::Error::other)??;
+    fn volume_generation(&self) -> Option<(u64, u64, SystemTime)> {
         #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        if !meta.is_dir() {
-            return Err(io::ErrorKind::NotADirectory.into());
+        {
+            Some((self.device, self.inode, self.birth?))
         }
-        Ok(Self {
-            modified: meta.modified()?,
+        #[cfg(windows)]
+        {
+            let (volume, file, _) = self.physical?;
+            Some((volume, file, self.birth?))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
+    async fn at(path: &str) -> io::Result<Self> {
+        let path = PathBuf::from(path);
+        crate::storage_api::ecstore_spawn_blocking_with_resource_ownership(move || {
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !meta.is_dir() {
+                return Err(io::ErrorKind::NotADirectory.into());
+            }
             #[cfg(unix)]
-            device: meta.dev(),
-            #[cfg(unix)]
-            inode: meta.ino(),
-            #[cfg(unix)]
-            changed: (meta.ctime(), meta.ctime_nsec()),
+            use std::os::unix::fs::MetadataExt;
             #[cfg(windows)]
-            identity: {
-                let path = PathBuf::from(path);
-                crate::storage_api::ecstore_spawn_blocking_with_resource_ownership(move || same_file::Handle::from_path(path))
-                    .await
-                    .map_err(io::Error::other)??
-            },
+            let identity = same_file::Handle::from_path(&path)?;
+            #[cfg(windows)]
+            let physical = winapi_util::file::information(identity.as_file()).ok().and_then(|info| {
+                let created = i64::try_from(info.creation_time()?).ok()?;
+                (info.file_index() != 0).then_some((info.volume_serial_number(), info.file_index(), created))
+            });
+            Ok(Self {
+                modified: meta.modified()?,
+                birth: meta.created().ok(),
+                #[cfg(unix)]
+                device: meta.dev(),
+                #[cfg(unix)]
+                inode: meta.ino(),
+                #[cfg(unix)]
+                changed: (meta.ctime(), meta.ctime_nsec()),
+                #[cfg(windows)]
+                identity,
+                #[cfg(windows)]
+                physical,
+            })
         })
+        .await
+        .map_err(io::Error::other)?
     }
 }
 
@@ -120,18 +196,43 @@ pub(super) struct DirectoryWork {
     pub(super) linked: Vec<String>,
     pub(super) compacted_total: super::DataUsageEntry,
     pub(super) gap: bool,
+    compacted: bool,
+    recorder: Option<Recorder>,
 }
 
 impl DirectoryWork {
+    pub(super) fn restore_mode(&mut self, compacted: bool) {
+        if self.compacted && !compacted {
+            self.rewind();
+        }
+    }
+    fn maybe_checkpoint(&mut self) {
+        if let Some(recorder) = &mut self.recorder
+            && recorder.last_update.elapsed() >= Duration::from_secs(1)
+        {
+            recorder.last_update = Instant::now();
+            self.checkpoint();
+        }
+    }
+    pub(super) fn checkpoint(&self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.save(self);
+        }
+    }
     pub(super) async fn next_name(&mut self) -> io::Result<Option<String>> {
         self.names.next().await
     }
     pub(super) fn acknowledge(&mut self, name: &str, linked: bool, compacted: bool) {
-        if self.names.acknowledge() && linked && !compacted {
-            self.linked.push(name.to_owned());
+        if self.names.acknowledge() {
+            self.compacted = compacted;
+            if linked && !compacted {
+                self.linked.push(name.to_owned());
+            }
+            self.maybe_checkpoint();
         }
     }
     pub(super) fn rewind(&mut self) {
+        self.compacted = false;
         self.names.rewind();
         self.linked.clear();
         self.compacted_total = super::DataUsageEntry::default();
@@ -143,6 +244,7 @@ struct Listing {
     reader: Option<DirectoryStream>,
     pending: Option<native_io::DirEntry>,
     delivery: Option<(native_io::DirEntry, bool)>,
+    classified: Option<Option<std::fs::FileType>>,
     markers: [Option<native_io::DirEntry>; 2],
     abandoned: Option<super::DataUsageHashMap>,
     work: DirectoryWork,
@@ -234,6 +336,17 @@ async fn reclaim_retired(scope: &DirectoryScope, path: &Path) {
     drop(retired);
 }
 
+fn valid_component(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 4096
+        && name != "."
+        && name != ".."
+        && !name.as_bytes().contains(&0)
+        && std::path::Path::new(name)
+            .file_name()
+            .is_some_and(|part| part == std::ffi::OsStr::new(name))
+}
+
 pub(super) struct ScannerDirectory {
     path: Arc<Path>,
     scope: Option<(DirectoryScope, DirectoryStamp)>,
@@ -253,6 +366,7 @@ impl ScannerDirectory {
         directory_name: &str,
         scope: Option<DirectoryScope>,
         budget: Arc<ScannerCycleBudget>,
+        saved: Option<Saved>,
     ) -> io::Result<Self> {
         // A different physical directory must never inherit old names. Directory
         // timestamps supplement (and cannot replace) the scanner's plan fences.
@@ -278,19 +392,110 @@ impl ScannerDirectory {
         let directory_replaced = parked.as_ref().is_some_and(|entry| Some(&entry.stamp) != stamp.as_ref());
         let parked =
             parked.filter(|entry| !directory_replaced && scope.as_ref().is_some_and(|current| entry.scope.matches(current)));
-        let resumed = parked.is_some();
-        let listing = match parked {
-            Some(parked) => parked.listing,
-            None => Box::new(Listing {
-                reader: Some(DirectoryStream::open(path).await?),
+        let mut resumed = parked.is_some();
+        let mut previous = saved
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()).clone());
+        let durable_scope = scope.as_ref().map(Scope::new);
+        let endpoint = scope.as_ref().map(|s| s.endpoint.clone()).unwrap_or_default();
+        let physical = scope
+            .as_ref()
+            .zip(stamp.as_ref())
+            .and_then(|(scope, stamp)| Physical::of(&scope.endpoint, stamp));
+        let mut replaced = directory_replaced
+            || previous
+                .as_ref()
+                .is_some_and(|old| old.endpoint() == endpoint && old.physical.is_some() && old.physical != physical);
+        previous = previous.filter(|old| {
+            durable_scope
+                .as_ref()
+                .is_some_and(|current| old.restore_allowed(directory_name, current, &physical))
+        });
+        let mut listing = if let Some(parked) = parked {
+            parked.listing
+        } else {
+            let mut reader = None;
+            if let Some(checkpoint) = &previous {
+                if checkpoint.sealed {
+                    resumed = true;
+                } else if let Some(anchor) = &checkpoint.anchor {
+                    match DirectoryStream::open_at(path, anchor).await {
+                        Ok(restored) => {
+                            reader = Some(restored);
+                            resumed = true;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::InvalidData
+                                    | io::ErrorKind::Unsupported
+                                    | io::ErrorKind::NotFound
+                                    | io::ErrorKind::InvalidInput
+                            ) =>
+                        {
+                            previous = None;
+                            replaced = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            if !resumed {
+                reader = Some(DirectoryStream::open(path, scope.is_some()).await?);
+            }
+            let mut work = DirectoryWork::default();
+            let mut markers = [None, None];
+            if let Some(saved) = &previous {
+                if resumed && let Some(owner) = &scope {
+                    tracing::debug!(
+                        event = super::EVENT_SCANNER_FOLDER_STATE,
+                        component = super::LOG_COMPONENT_SCANNER,
+                        subsystem = super::LOG_SUBSYSTEM_FOLDER,
+                        state = "directory_checkpoint_restored",
+                        bucket = %owner.bucket,
+                        directory = directory_name,
+                        disk = %endpoint,
+                        leader_epoch = owner.owner.0,
+                        cycle = owner.owner.1,
+                        restore_mode = if saved.sealed { "sealed_membership" } else { "native_position" },
+                        entries_read = saved.entries_read,
+                        completed_through = saved.aggregate.as_ref().map(|aggregate| aggregate.through.as_str()),
+                        "Restored directory checkpoint"
+                    );
+                }
+                work.names = NamePages::restore(&saved.pages, saved.sealed, saved.aggregate.as_ref().map(|a| a.through.as_str()));
+                if let Some(aggregate) = &saved.aggregate {
+                    work.compacted = true;
+                    work.compacted_total = aggregate.value.clone();
+                }
+                let physical_path: Arc<Path> = Arc::from(Path::new(path));
+                if let Some(part) = &saved.part {
+                    markers[0] = Some(native_io::DirEntry::recorded(physical_path.clone(), part.into(), None));
+                }
+                if saved.metadata {
+                    markers[1] = Some(native_io::DirEntry::recorded(physical_path, super::STORAGE_FORMAT_FILE.into(), None));
+                }
+            }
+            Box::new(Listing {
+                reader,
                 pending: None,
                 delivery: None,
-                markers: [None, None],
+                classified: None,
+                markers,
                 abandoned: None,
-                work: DirectoryWork::default(),
+                work,
                 failed: false,
-            }),
+            })
         };
+        if let (Some(slot), Some(durable_scope)) = (saved, durable_scope) {
+            if let Some(recorder) = &mut listing.work.recorder {
+                recorder.slot = slot;
+            } else {
+                let recorder = Recorder::new(slot, directory_name, durable_scope, endpoint, physical, previous.as_ref());
+
+                listing.work.recorder = Some(recorder);
+            }
+        }
         Ok(Self {
             path: Arc::from(Path::new(path)),
             scope: scope.zip(stamp),
@@ -300,7 +505,7 @@ impl ScannerDirectory {
             marker: 0,
             enumeration_only: false,
             resumed,
-            directory_replaced,
+            directory_replaced: replaced,
             batch_entries: 0,
         })
     }
@@ -347,6 +552,15 @@ impl ScannerDirectory {
             && let Some(listing) = &mut self.listing
             && listing.abandoned.is_none()
         {
+            if !baseline.is_empty() && self.resumed {
+                // Cold restore carries classified members, not the previous
+                // process's transient unresolved heal candidates.
+                for page in listing.work.names.snapshot() {
+                    for name in page.names() {
+                        baseline.remove(&super::path_join_buf(&[&self.directory_name, name]));
+                    }
+                }
+            }
             listing.abandoned = Some(std::mem::take(baseline));
         }
     }
@@ -369,9 +583,41 @@ impl ScannerDirectory {
     }
 
     pub(super) fn accept_entry(&mut self) {
-        if let Some(listing) = &mut self.listing {
-            listing.delivery = None;
+        let Some(listing) = &mut self.listing else { return };
+        let Some((entry, _)) = listing.delivery.take() else { return };
+        // Discovering a name can precede the I/O admission wait. Commit its
+        // classification and native position together only after admission;
+        // a cold retry then re-reads any name still pending on cancellation.
+        let Some(kind) = listing.classified.take() else { return };
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if let Some(state) = &mut listing.work.recorder {
+            state.anchor = entry.anchor().cloned();
+            state.entries_read = state.entries_read.saturating_add(1);
+            state.valid_names &= name.to_str().is_some_and(valid_component);
         }
+        if let Some(kind) = kind {
+            let direct_part = kind.is_file() && super::is_erasure_part_name(&text);
+            if kind.is_dir() {
+                if let Some(abandoned) = &mut listing.abandoned
+                    && !abandoned.is_empty()
+                {
+                    abandoned.remove(&super::path_join_buf(&[&self.directory_name, &text]));
+                }
+                listing.work.names.add(text.into_owned());
+            } else if direct_part {
+                if let Some(state) = &mut listing.work.recorder {
+                    state.part.get_or_insert_with(|| text.to_string());
+                }
+                listing.markers[0].get_or_insert_with(|| native_io::DirEntry::recorded(self.path.clone(), name, Some(kind)));
+            } else if text == super::STORAGE_FORMAT_FILE {
+                if let Some(state) = &mut listing.work.recorder {
+                    state.metadata = true;
+                }
+                listing.markers[1] = Some(native_io::DirEntry::recorded(self.path.clone(), name, Some(kind)));
+            }
+        }
+        listing.work.maybe_checkpoint();
     }
 
     async fn next_entry(&mut self) -> io::Result<Option<native_io::DirEntry>> {
@@ -410,37 +656,16 @@ impl ScannerDirectory {
                 };
                 let name = entry.file_name();
                 let text = name.to_string_lossy();
-                if let Some(kind) = kind {
-                    let direct_part = kind.is_file() && super::is_erasure_part_name(&text);
-                    if kind.is_dir() {
-                        if let Some(abandoned) = &mut listing.abandoned
-                            && !abandoned.is_empty()
-                        {
-                            abandoned.remove(&super::path_join_buf(&[&self.directory_name, &text]));
-                        }
-                        listing.work.names.add(text.into_owned());
-                    } else if direct_part {
-                        listing.markers[0]
-                            .get_or_insert_with(|| native_io::DirEntry::recorded(self.path.clone(), name, Some(kind)));
-                    } else if text == super::STORAGE_FORMAT_FILE {
-                        listing.markers[1] = Some(native_io::DirEntry::recorded(self.path.clone(), name, Some(kind)));
-                    }
-                    // Directory symlinks are never namespace work. Retain the
-                    // normal diagnostics for links encountered during discovery.
-                    self.enumeration_only = !kind.is_symlink()
-                        || listing.markers[1]
-                            .as_ref()
-                            .is_some_and(|marker| marker.file_name() == entry.file_name());
-                    if erasure_candidate && direct_part {
-                        self.enumeration_only = false;
-                    }
-                } else {
-                    self.enumeration_only = true;
-                }
+                self.enumeration_only = kind.is_none_or(|kind| {
+                    (!kind.is_symlink() || text == super::STORAGE_FORMAT_FILE)
+                        && !(erasure_candidate && kind.is_file() && super::is_erasure_part_name(&text))
+                });
+                listing.classified = Some(kind);
                 return Ok(listing.pending.take());
             }
             listing.reader = None;
             listing.work.names.finish();
+            listing.work.maybe_checkpoint();
         }
         while self.marker < listing.markers.len() {
             let marker = self.marker;
@@ -458,8 +683,12 @@ impl Drop for ScannerDirectory {
         let Some((scope, stamp)) = self.scope.take() else { return };
         let Some(listing) = self.listing.take() else { return };
         if listing.failed || self.budget.reason().is_none() {
+            if let Some(recorder) = &listing.work.recorder {
+                *recorder.slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
             return;
         }
+        listing.work.checkpoint();
         let mut slots = PARKED.lock().unwrap_or_else(|p| p.into_inner());
         let expired = expired_slots(&mut slots);
         let key = self.path.to_path_buf();

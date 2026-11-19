@@ -3,42 +3,115 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::{Arc, OnceLock};
 
-use crate::storage_api::ecstore_spawn_blocking_with_resource_ownership as spawn_native;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const PAGE_NAMES: usize = 256;
 const PAGE_NAME_BYTES: usize = 32 * 1024;
-const MERGE_WINDOW: usize = 8;
 
-struct Chunk {
-    offset: u64,
-    bytes: usize,
+/// One contiguous UTF-8 string per run. Names from the filesystem cannot
+/// contain NUL. Checkpoint clones share both the payload and its local index.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(super) struct NamePage(Arc<PackedNames>);
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackedNames {
+    text: Box<str>,
     digest: [u8; 32],
+    #[serde(skip)]
+    starts: OnceLock<Box<[usize]>>,
+    #[serde(skip)]
+    valid: OnceLock<bool>,
 }
 
-struct Page {
-    count: usize,
-    first: String,
-    chunks: Vec<Chunk>,
-    window: Option<(usize, Vec<String>)>,
+impl NamePage {
+    fn hash(text: &str) -> [u8; 32] {
+        Sha256::new()
+            .chain_update(b"rustfs-scanner-directory-names-v1")
+            .chain_update(text.as_bytes())
+            .finalize()
+            .into()
+    }
+
+    fn new(mut names: Vec<String>) -> Self {
+        names.sort_unstable();
+        let mut text = String::with_capacity(names.iter().map(|n| n.len() + 1).sum());
+        for name in names {
+            text.push_str(&name);
+            text.push('\0');
+        }
+        Self(Arc::new(PackedNames {
+            digest: Self::hash(&text),
+            text: text.into_boxed_str(),
+            starts: OnceLock::new(),
+            valid: OnceLock::new(),
+        }))
+    }
+
+    fn starts(&self) -> &[usize] {
+        self.0.starts.get_or_init(|| {
+            self.names()
+                .scan(0, |offset, name| {
+                    let start = *offset;
+                    *offset += name.len() + 1;
+                    Some(start)
+                })
+                .collect()
+        })
+    }
+
+    fn at(&self, offset: usize) -> &str {
+        self.0.text[offset..].split('\0').next().unwrap_or_default()
+    }
+
+    fn get(&self, index: usize) -> Option<&str> {
+        self.starts().get(index).map(|&offset| self.at(offset))
+    }
+
+    fn after(&self, last: &str) -> usize {
+        self.starts().partition_point(|&offset| self.at(offset) <= last)
+    }
+
+    pub(super) fn contains(&self, name: &str) -> bool {
+        self.starts().binary_search_by(|&offset| self.at(offset).cmp(name)).is_ok()
+    }
+
+    pub(super) fn digest(&self) -> &[u8; 32] {
+        &self.0.digest
+    }
+
+    pub(super) fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.text.split_terminator('\0')
+    }
+
+    pub(super) fn valid(&self) -> bool {
+        *self.0.valid.get_or_init(|| {
+            let text = &self.0.text;
+            text.ends_with('\0')
+                && text.len() <= PAGE_NAME_BYTES + PAGE_NAMES + 4096
+                && self.names().take(PAGE_NAMES + 1).count() <= PAGE_NAMES
+                && self.names().all(super::valid_component)
+                && self.names().is_sorted()
+                && self.0.digest == Self::hash(text)
+        })
+    }
 }
 
-/// Runs are sorted and sealed as the native directory is read. Their bounded
-/// merge keeps one small lookahead window per run. Interleaved runs still
-/// read each scratch chunk at most once between rewinds.
+/// Immutable sorted runs are shared with checkpoint snapshots. The merge
+/// retains one head per run. At a cold resume each run seeks to the first
+/// name after the authenticated completed child using binary search.
 #[derive(Default)]
 pub(super) struct NamePages {
-    file: Option<Arc<Mutex<File>>>,
-    pages: Vec<Page>,
+    pages: Vec<NamePage>,
     building: Vec<String>,
     name_bytes: usize,
     count: usize,
     heads: BinaryHeap<Reverse<(String, usize, usize)>>,
-    file_end: u64,
     ready: bool,
     pending: Option<String>,
     through: Option<String>,
@@ -51,137 +124,92 @@ impl NamePages {
     pub(super) fn ready(&self) -> bool {
         self.ready
     }
+    pub(super) fn through(&self) -> Option<&str> {
+        self.through.as_deref()
+    }
 
     pub(super) fn add(&mut self, name: String) {
-        self.name_bytes += name.len();
-        self.count += 1;
+        self.name_bytes = self.name_bytes.saturating_add(name.len());
+        self.count = self.count.saturating_add(1);
         self.building.push(name);
     }
 
-    pub(super) async fn flush_full(&mut self) -> io::Result<()> {
-        if self.building.len() < PAGE_NAMES && self.name_bytes < PAGE_NAME_BYTES {
-            return Ok(());
+    fn flush(&mut self) {
+        if self.building.is_empty() {
+            return;
         }
-        self.building.sort_unstable();
-        let Some(first) = self.building.first().cloned() else { return Ok(()) };
-        let mut bytes = Vec::new();
-        let mut chunks = Vec::new();
-        let mut end = self.file_end;
-        for names in self.building.chunks(MERGE_WINDOW) {
-            let start = bytes.len();
-            rmp_serde::encode::write(&mut bytes, &names).map_err(io::Error::other)?;
-            let data = &bytes[start..];
-            chunks.push(Chunk {
-                offset: end,
-                bytes: data.len(),
-                digest: Sha256::digest(data).into(),
-            });
-            end = end
-                .checked_add(u64::try_from(data.len()).map_err(io::Error::other)?)
-                .ok_or_else(|| io::Error::other("scanner name pages exceed scratch file limits"))?;
+        let page = NamePage::new(std::mem::take(&mut self.building));
+        if let Some(first) = page.get(0) {
+            self.heads.push(Reverse((first.to_owned(), self.pages.len(), 0)));
         }
-        let file = match &self.file {
-            Some(file) => file.clone(),
-            None => {
-                let file = spawn_native(tempfile::tempfile).await.map_err(io::Error::other)??;
-                self.file.insert(Arc::new(Mutex::new(file))).clone()
-            }
-        };
-        let offset = self.file_end;
-        // A native write can outlive cancellation. The next attempt writes
-        // the same sorted bytes at the same offset before extending the file.
-        spawn_native(move || {
-            let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&bytes)
-        })
-        .await
-        .map_err(io::Error::other)??;
-        self.heads.push(Reverse((first.clone(), self.pages.len(), 0)));
-        self.pages.push(Page {
-            count: self.building.len(),
-            first,
-            chunks,
-            window: None,
-        });
-        self.file_end = end;
-        self.building.clear();
+        self.pages.push(page);
         self.name_bytes = 0;
+    }
+
+    pub(super) async fn flush_full(&mut self) -> io::Result<()> {
+        if self.building.len() >= PAGE_NAMES || self.name_bytes >= PAGE_NAME_BYTES {
+            self.flush();
+        }
         Ok(())
     }
 
     pub(super) fn finish(&mut self) {
-        if self.ready {
-            return;
-        }
-        self.building.sort_unstable();
-        if let Some(name) = self.building.first() {
-            self.heads.push(Reverse((name.clone(), self.pages.len(), 0)));
-        }
+        self.flush();
         self.ready = true;
     }
 
-    pub(super) fn rewind(&mut self) {
+    pub(super) fn snapshot(&self) -> Vec<NamePage> {
+        let mut pages = self.pages.clone();
+        if !self.building.is_empty() {
+            pages.push(NamePage::new(self.building.clone()));
+        }
+        pages
+    }
+
+    pub(super) fn restore(pages: &[NamePage], ready: bool, through: Option<&str>) -> Self {
+        let mut names = Self {
+            pages: pages.to_vec(),
+            count: pages.iter().map(|p| p.starts().len()).sum(),
+            ready,
+            ..Self::default()
+        };
+        if !ready
+            && names
+                .pages
+                .last()
+                .is_some_and(|page| page.starts().len() < PAGE_NAMES && page.0.text.len() < PAGE_NAME_BYTES)
+            && let Some(page) = names.pages.pop()
+        {
+            names.building = page.names().map(str::to_owned).collect();
+            names.name_bytes = names.building.iter().map(String::len).sum();
+        }
+        names.seek_after(through);
+        names
+    }
+
+    pub(super) fn seek_after(&mut self, through: Option<&str>) {
         self.pending = None;
-        self.through = None;
+        self.through = through.map(str::to_owned);
         self.heads.clear();
-        self.heads.extend(
-            self.pages
-                .iter()
-                .enumerate()
-                .map(|(index, page)| Reverse((page.first.clone(), index, 0))),
-        );
-        if let Some(name) = self.building.first() {
-            self.heads.push(Reverse((name.clone(), self.pages.len(), 0)));
+        for (page_index, page) in self.pages.iter().enumerate() {
+            let start = through.map_or(0, |last| page.after(last));
+            if let Some(next) = page.get(start) {
+                self.heads.push(Reverse((next.to_owned(), page_index, start)));
+            }
         }
     }
 
-    async fn successor(&mut self, page: usize, position: usize) -> io::Result<Option<String>> {
-        let Some(info) = self.pages.get_mut(page) else { return Ok(self.building.get(position).cloned()) };
-        if position >= info.count {
-            return Ok(None);
-        }
-        let chunk_index = position / MERGE_WINDOW;
-        if info.window.as_ref().is_none_or(|(index, _)| *index != chunk_index) {
-            let file = self
-                .file
-                .clone()
-                .ok_or_else(|| io::Error::other("scanner name page file missing"))?;
-            let chunk = &info.chunks[chunk_index];
-            let (offset, len, digest) = (chunk.offset, chunk.bytes, chunk.digest);
-            let names = spawn_native(move || {
-                let mut bytes = vec![0; len];
-                {
-                    let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
-                    file.seek(SeekFrom::Start(offset))?;
-                    file.read_exact(&mut bytes)?;
-                }
-                if <[u8; 32]>::from(Sha256::digest(&bytes)) != digest {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "scanner name page checksum differs"));
-                }
-                rmp_serde::from_slice::<Vec<String>>(&bytes).map_err(io::Error::other)
-            })
-            .await
-            .map_err(io::Error::other)??;
-            info.window = Some((chunk_index, names));
-        }
-        info.window
-            .as_ref()
-            .and_then(|(_, names)| names.get(position % MERGE_WINDOW))
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "scanner name page truncated"))
+    pub(super) fn rewind(&mut self) {
+        self.seek_after(None);
     }
 
     pub(super) async fn next(&mut self) -> io::Result<Option<String>> {
         if self.pending.is_some() {
             return Ok(self.pending.clone());
         }
-        while let Some(Reverse((name, page, index))) = self.heads.peek().cloned() {
-            let next = self.successor(page, index + 1).await?;
-            self.heads.pop();
-            if let Some(next) = next {
-                self.heads.push(Reverse((next, page, index + 1)));
+        while let Some(Reverse((name, page, index))) = self.heads.pop() {
+            if let Some(next) = self.pages[page].get(index + 1) {
+                self.heads.push(Reverse((next.to_owned(), page, index + 1)));
             }
             if self.through.as_ref() == Some(&name) {
                 continue;
@@ -200,10 +228,39 @@ impl NamePages {
         false
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_membership_shares_names_and_rejects_corrupt_payloads() {
+        let page = NamePage::new((0..PAGE_NAMES).rev().map(|i| format!("obj-{i:06}")).collect());
+        assert!(page.valid());
+        let shared = page.clone();
+        assert!(Arc::ptr_eq(&page.0, &shared.0));
+        let encoded = rmp_serde::to_vec_named(&page).expect("serialize packed names");
+        assert!(encoded.len() < PAGE_NAMES * 12, "checkpoint stores one delimited string per page");
+        let restored: NamePage = rmp_serde::from_slice(&encoded).expect("cold name page");
+        assert!(restored.valid());
+        assert!(restored.contains("obj-000137"));
+        assert_eq!(restored.get(restored.after("obj-000137")), Some("obj-000138"));
+        for text in ["", "obj", "a\0\0b\0", "b\0a\0", "../other\0"] {
+            let malformed = NamePage(Arc::new(PackedNames {
+                text: text.into(),
+                digest: NamePage::hash(text),
+                starts: OnceLock::new(),
+                valid: OnceLock::new(),
+            }));
+            assert!(!malformed.valid(), "invalid membership accepted: {text:?}");
+        }
+        let mut bytes = encoded;
+        let offset = bytes
+            .windows(10)
+            .position(|value| value == b"obj-000137")
+            .expect("encoded name");
+        bytes[offset] = b'x';
+        assert!(!rmp_serde::from_slice::<NamePage>(&bytes).expect("decodable payload").valid());
+    }
 
     #[tokio::test]
     async fn interleaved_pages_resume_at_each_unacknowledged_name() {

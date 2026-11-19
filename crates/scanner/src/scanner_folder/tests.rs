@@ -403,6 +403,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         resume_failed_paths: Vec::new(),
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
+        directory_checkpoints: HashMap::new(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,

@@ -709,6 +709,8 @@ pub struct ScannerMetrics {
     pub last_cycle_partial_source: String,
     #[serde(rename = "last_cycle_partial_source_code", default)]
     pub last_cycle_partial_source_code: u64,
+    #[serde(rename = "last_cycle_partial_stage", default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle_partial_stage: Option<String>,
     #[serde(rename = "last_cycle_duration_seconds", default)]
     pub last_cycle_duration_seconds: f64,
     #[serde(rename = "last_cycle_objects_scanned", default)]
@@ -853,6 +855,7 @@ impl ScannerMetrics {
             self.last_cycle_partial_reason_code = other.last_cycle_partial_reason_code;
             self.last_cycle_partial_source = other.last_cycle_partial_source.clone();
             self.last_cycle_partial_source_code = other.last_cycle_partial_source_code;
+            self.last_cycle_partial_stage.clone_from(&other.last_cycle_partial_stage);
             self.last_cycle_duration_seconds = other.last_cycle_duration_seconds;
             self.throttle_idle_mode_enabled = other.throttle_idle_mode_enabled;
             self.throttle_sleep_factor = other.throttle_sleep_factor;
@@ -2138,6 +2141,7 @@ mod tests {
             collected_at: collected_at + SignedDuration::from_secs(1),
             last_cycle_partial_source: "lifecycle".to_string(),
             last_cycle_partial_source_code: 2,
+            last_cycle_partial_stage: Some("object_budget".into()),
             pacing_pressure: ScannerPacingPressureSnapshot {
                 primary_pressure: "queued_scans".to_string(),
                 current_queued_scans: 4,
@@ -2162,6 +2166,7 @@ mod tests {
 
         assert_eq!(scanner.last_cycle_partial_source, "lifecycle");
         assert_eq!(scanner.last_cycle_partial_source_code, 2);
+        assert_eq!(scanner.last_cycle_partial_stage.as_deref(), Some("object_budget"));
         assert_eq!(scanner.pacing_pressure.primary_pressure, "queued_scans");
         assert_eq!(scanner.pacing_pressure.current_queued_scans, 4);
         assert_eq!(scanner.pacing_pressure.current_active_scans, 3);

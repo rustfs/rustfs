@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fs::{FileType, Metadata};
 use std::future::{Future, poll_fn};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -17,6 +17,20 @@ use crate::storage_api::ecstore_spawn_blocking_with_resource_ownership as spawn_
 
 // Keep Tokio's existing bounded prefetch and one native job per refill.
 const DIRECTORY_CHUNK_SIZE: usize = 32;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod positioned;
+
+/// Identifies a verified prefix of a physical directory buffer. Only the
+/// matching directory generation can use its platform-specific kernel cookie.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectoryAnchor {
+    directory: [u8; 32],
+    cookie: u64,
+    entries: u32,
+    prefix: [u8; 32],
+}
 
 #[derive(Clone)]
 pub(super) struct DirEntry {
@@ -27,7 +41,20 @@ pub(super) struct DirEntry {
 #[derive(Clone)]
 enum EntrySource {
     Native(Arc<std::fs::DirEntry>),
-    Recorded { parent: Arc<std::path::Path>, name: OsString },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Positioned(Arc<PositionedEntry>),
+    Recorded {
+        parent: Arc<std::path::Path>,
+        name: OsString,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone)]
+struct PositionedEntry {
+    parent: Arc<Path>,
+    name: OsString,
+    anchor: Option<DirectoryAnchor>,
 }
 
 impl DirEntry {
@@ -36,6 +63,28 @@ impl DirEntry {
             source: EntrySource::Recorded { parent, name },
             file_type,
         }
+    }
+
+    pub(super) fn anchor(&self) -> Option<&DirectoryAnchor> {
+        match &self.source {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            EntrySource::Positioned(entry) => entry.anchor.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn without_anchor(self) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut entry = self;
+            if let EntrySource::Positioned(position) = &mut entry.source {
+                Arc::make_mut(position).anchor = None;
+            }
+            entry
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        self
     }
 
     pub(super) fn is_recorded(&self) -> bool {
@@ -49,6 +98,8 @@ impl DirEntry {
     pub(super) fn path(&self) -> PathBuf {
         match &self.source {
             EntrySource::Native(entry) => entry.path(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            EntrySource::Positioned(entry) => entry.parent.join(&entry.name),
             EntrySource::Recorded { parent, name } => parent.join(name),
         }
     }
@@ -56,6 +107,8 @@ impl DirEntry {
     pub(super) fn file_name(&self) -> OsString {
         match &self.source {
             EntrySource::Native(entry) => entry.file_name(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            EntrySource::Positioned(entry) => entry.name.clone(),
             EntrySource::Recorded { name, .. } => name.clone(),
         }
     }
@@ -69,8 +122,8 @@ impl DirEntry {
                 let entry = entry.clone();
                 spawn_native(move || entry.file_type()).await.map_err(io::Error::other)?
             }
-            EntrySource::Recorded { parent, name } => {
-                let path = parent.join(name);
+            _ => {
+                let path = self.path();
                 spawn_native(move || std::fs::symlink_metadata(path).map(|meta| meta.file_type()))
                     .await
                     .map_err(io::Error::other)?
@@ -79,8 +132,42 @@ impl DirEntry {
     }
 }
 
+enum PhysicalReader {
+    Standard(std::fs::ReadDir),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Positioned(Box<positioned::Reader>),
+}
+
+impl PhysicalReader {
+    fn open(path: &Path, indexed: bool, anchor: Option<&DirectoryAnchor>) -> io::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if indexed {
+            return positioned::Reader::open(path, anchor).map(Box::new).map(Self::Positioned);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = indexed;
+        if anchor.is_some() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        std::fs::read_dir(path).map(Self::Standard)
+    }
+
+    fn next(&mut self) -> Option<io::Result<DirEntry>> {
+        match self {
+            Self::Standard(reader) => reader.next().map(|entry| {
+                entry.map(|entry| DirEntry {
+                    file_type: entry.file_type().ok(),
+                    source: EntrySource::Native(Arc::new(entry)),
+                })
+            }),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Positioned(reader) => reader.next(),
+        }
+    }
+}
+
 struct DirectoryBuffer {
-    reader: std::fs::ReadDir,
+    reader: PhysicalReader,
     entries: VecDeque<io::Result<DirEntry>>,
     more: bool,
 }
@@ -93,10 +180,7 @@ impl DirectoryBuffer {
                 break;
             };
             let success = entry.is_ok();
-            self.entries.push_back(entry.map(|entry| DirEntry {
-                file_type: entry.file_type().ok(),
-                source: EntrySource::Native(Arc::new(entry)),
-            }));
+            self.entries.push_back(entry);
             if !success {
                 break;
             }
@@ -117,13 +201,21 @@ pub(super) struct ReadDir {
 }
 
 impl ReadDir {
-    pub(super) async fn open(path: &str) -> io::Result<Self> {
+    pub(super) async fn open(path: &str, indexed: bool) -> io::Result<Self> {
+        Self::open_directory(path, indexed, None).await
+    }
+
+    pub(super) async fn open_at(path: &str, anchor: &DirectoryAnchor) -> io::Result<Self> {
+        Self::open_directory(path, true, Some(anchor.clone())).await
+    }
+
+    async fn open_directory(path: &str, indexed: bool, anchor: Option<DirectoryAnchor>) -> io::Result<Self> {
         #[cfg(test)]
         let slow_directory = super::tests::fair_prefix_quantum::is_slow_directory(path);
         let path = PathBuf::from(path);
         let buffer = spawn_native(move || {
             let mut buffer = DirectoryBuffer {
-                reader: std::fs::read_dir(path)?,
+                reader: PhysicalReader::open(&path, indexed, anchor.as_ref())?,
                 entries: VecDeque::with_capacity(DIRECTORY_CHUNK_SIZE),
                 more: true,
             };
@@ -249,7 +341,7 @@ mod tests {
                         Resources::Layered(owner.capture(&units.iter().collect::<Vec<_>>()).expect("native ownership"))
                     };
                     drop(units);
-                    let mut reader = ReadDir::open(path).await.expect("prepare reader");
+                    let mut reader = ReadDir::open(path, false).await.expect("prepare reader");
                     let mut entry = reader.next_entry().await.expect("first entry").expect("file");
                     entry.file_type = None;
                     for _ in 1..DIRECTORY_CHUNK_SIZE {
@@ -258,7 +350,7 @@ mod tests {
                     let (release, blocker) = occupy_native_worker().await;
                     let work = async {
                         match operation {
-                            "open" => ReadDir::open(path).await.map(|_| ()),
+                            "open" => ReadDir::open(path, false).await.map(|_| ()),
                             "refill" => reader.next_entry().await.map(|_| ()),
                             "metadata" => metadata(entry.path().to_str().expect("entry path")).await.map(|_| ()),
                             "file_type" => entry.file_type().await.map(|_| ()),
@@ -301,7 +393,9 @@ mod tests {
         runtime().block_on(async {
             let count = DIRECTORY_CHUNK_SIZE * 3 + 7;
             let root = directory(count);
-            let mut reader = ReadDir::open(root.path().to_str().expect("root path")).await.expect("open");
+            let mut reader = ReadDir::open(root.path().to_str().expect("root path"), false)
+                .await
+                .expect("open");
             let mut names = std::collections::BTreeSet::new();
             for _ in 0..DIRECTORY_CHUNK_SIZE {
                 let entry = reader.next_entry().await.expect("entry").expect("file");
@@ -321,12 +415,71 @@ mod tests {
         });
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn reopened_directory_matches_original_suffix_and_rejects_stale_or_corrupt_positions() {
+        runtime().block_on(async {
+            #[cfg(target_os = "linux")]
+            use std::os::unix::ffi::OsStrExt;
+            let root = directory(900);
+            let path = root.path().to_str().expect("root path");
+            #[cfg(target_os = "linux")]
+            let raw_name = std::ffi::OsStr::from_bytes(b"object-\xff");
+            // APFS requires filenames that are valid Unicode.
+            #[cfg(target_os = "macos")]
+            let raw_name = std::ffi::OsStr::new("object-目录");
+            std::fs::write(root.path().join(raw_name), []).expect("platform-native directory entry");
+            let mut reader = ReadDir::open(path, true).await.expect("open indexed directory");
+            let mut names = Vec::new();
+            let mut anchors = Vec::new();
+            while let Some(entry) = reader.next_entry().await.expect("read indexed entry") {
+                assert!(!entry.is_recorded());
+                names.push(entry.file_name());
+                anchors.push(entry.anchor().expect("native directory position").clone());
+            }
+            drop(reader);
+            assert!(names.iter().any(|name| name == raw_name));
+            assert!(anchors.iter().any(|anchor| anchor.cookie != 0), "exercise a later kernel buffer");
+            for i in [0, 32, 145, 419, names.len() - 1] {
+                let mut resumed = ReadDir::open_at(path, &anchors[i])
+                    .await
+                    .expect("reopen directory at verified entry");
+                for expected in &names[i + 1..] {
+                    assert_eq!(
+                        &resumed
+                            .next_entry()
+                            .await
+                            .expect("suffix read")
+                            .expect("suffix entry")
+                            .file_name(),
+                        expected
+                    );
+                }
+                assert!(resumed.next_entry().await.expect("resumed EOF").is_none());
+            }
+
+            let mut corrupt = anchors[0].clone();
+            corrupt.prefix[0] ^= 1;
+            assert!(matches!(ReadDir::open_at(path, &corrupt).await, Err(err) if err.kind() == io::ErrorKind::InvalidData));
+            corrupt.entries = u32::MAX;
+            assert!(matches!(ReadDir::open_at(path, &corrupt).await, Err(err) if err.kind() == io::ErrorKind::InvalidData));
+            let other = directory(1);
+            let another = other.path().to_str().expect("other directory");
+            assert!(matches!(ReadDir::open_at(another, &anchors[0]).await, Err(err) if err.kind() == io::ErrorKind::InvalidData));
+            // Removing the bound entry also invalidates its directory generation.
+            std::fs::remove_file(root.path().join(&names[0])).expect("remove anchor entry");
+            assert!(matches!(ReadDir::open_at(path, &anchors[0]).await, Err(err) if err.kind() == io::ErrorKind::InvalidData));
+        });
+    }
+
     #[test]
     fn directory_prefetch_preserves_empty_and_exact_chunk_boundaries() {
         runtime().block_on(async {
             for count in [0, 1, DIRECTORY_CHUNK_SIZE, DIRECTORY_CHUNK_SIZE + 1] {
                 let root = directory(count);
-                let mut reader = ReadDir::open(root.path().to_str().expect("root path")).await.expect("open");
+                let mut reader = ReadDir::open(root.path().to_str().expect("root path"), false)
+                    .await
+                    .expect("open");
                 let mut names = std::collections::BTreeSet::new();
                 while let Some(entry) = reader.next_entry().await.expect("read entry") {
                     assert!(names.insert(entry.file_name()), "prefetch duplicated an entry");
@@ -341,7 +494,9 @@ mod tests {
     fn failed_refill_is_an_error_after_partial_enumeration() {
         runtime().block_on(async {
             let root = directory(DIRECTORY_CHUNK_SIZE + 1);
-            let mut reader = ReadDir::open(root.path().to_str().expect("root path")).await.expect("open");
+            let mut reader = ReadDir::open(root.path().to_str().expect("root path"), false)
+                .await
+                .expect("open");
             for _ in 0..DIRECTORY_CHUNK_SIZE {
                 assert!(reader.next_entry().await.expect("prefetched entry").is_some());
             }
@@ -370,10 +525,10 @@ mod tests {
             let root = directory(1);
             let path = root.path().join("missing");
             let missing = path.to_str().expect("missing path");
-            assert!(matches!(ReadDir::open(missing).await, Err(error) if error.kind() == io::ErrorKind::NotFound));
+            assert!(matches!(ReadDir::open(missing, false).await, Err(error) if error.kind() == io::ErrorKind::NotFound));
             assert!(matches!(metadata(missing).await, Err(error) if error.kind() == io::ErrorKind::NotFound));
             let file = root.path().join("object-0");
-            assert!(ReadDir::open(file.to_str().expect("file path")).await.is_err());
+            assert!(ReadDir::open(file.to_str().expect("file path"), false).await.is_err());
             #[cfg(unix)]
             {
                 let link = root.path().join("link");

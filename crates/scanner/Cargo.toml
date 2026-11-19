@@ -109,8 +109,12 @@ uuid = { workspace = true, features = ["v4", "serde", "fast-rng"] }
 bytes.workspace = true
 hex-simd.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 same-file.workspace = true
+winapi-util.workspace = true
 
 [dev-dependencies]
 s3s = { workspace = true, features = ["minio"] }

@@ -82,7 +82,13 @@ The startup usage preflight is read-only and has a 30-second deadline. If it can
 
 Cold-cache startup and startup without active replication avoid an extra bucket listing. Maintenance discovery keeps looking for replication after finding lifecycle rules in an earlier bucket. Once replication is found, both scheduling decisions are settled and remaining buckets need no startup inspection. Reapplying an unchanged resolved configuration does not reconfigure per-disk budgets or emit another configuration wakeup.
 
-The `cycle_max_duration`, `cycle_max_objects`, and `cycle_max_directories` controls bound a cycle's work; they do not guarantee that every budget can complete a sweep in bounded chunks. On a stable local disk, the next turn can take ownership of a suspended directory stream and continue enumerating a wide directory. The per-disk pacing and cycle deadline still apply. A process restart or a changed directory identity requires a new enumeration; sealed coverage remains subject to the normal bucket and plan validation. Progress requires successful I/O and enough time to complete individual operations. A constantly changing bucket may need another verification sweep before publication.
+The `cycle_max_duration`, `cycle_max_objects` and `cycle_max_directories` settings also apply to resumed walks. For a stable wide directory, a checkpoint records which child names have been discovered, which children have finished and the usage accumulated from those children. The next executor can restore that work after a cycle deadline or process restart. Objects from a child that was interrupted before completion are accounted for when that child finishes.
+
+On Linux and macOS, the scanner can reopen a partially enumerated physical directory and verify its last saved position against the directory generation and actual entries. Each physical replica has its own position. A replacement or changed directory requires enumeration again. When an executor moves to another disk, it advances that disk's own checkpoint. Returning to the first disk resumes its saved subtotal. This keeps sizes and version counts tied to the replica whose object metadata was read. Other platforms can reuse a live directory handle and already completed work on an identifiable disk. An interrupted native directory read may need to start again after a process restart.
+
+After an upgrade, an older partial traversal without a recorded physical disk starts a fresh walk. This preserves the existing published usage snapshot when the partial checkpoint is discarded. To verify a handoff, enable debug logging for `rustfs_scanner::scanner_folder::directory_cursor` and look for `state="directory_checkpoint_restored"`. The event identifies the bucket, directory, physical disk, leader epoch and cycle. `restore_mode="native_position"` records how many entries had already been read. `restore_mode="sealed_membership"` records reuse of a fully enumerated directory and includes `completed_through` when the checkpoint contains a compacted subtotal.
+
+The bucket usage API can return a carried value or a newer observation while a walk is incomplete. Check `usage_value_state` and `usage_certification` to identify the last certified value. If writes overlap a resumed walk, reaching the end can produce an observation that still needs a fresh sweep before certification. Progress requires enough budget for individual I/O operations and a successful checkpoint save.
 
 Budget cancellation alone does not publish complete usage or acknowledge dirty buckets. A partial cycle must retain that uncertainty; a growing directories-scanned counter is not proof of new coverage or published totals. Inspect checkpoint/frontier changes and publication status across attempts before changing budgets. A budget cancellation does not persist a disabled scheduler flag and does not justify deleting scanner state.
 
@@ -313,6 +319,7 @@ metrics.maintenance_control.primary_control
 metrics.source_work
 metrics.replication_repair
 metrics.scan_checkpoint
+metrics.last_cycle_partial_stage
 metrics.cycle_timeout_total
 metrics.cycle_last_progress_age
 metrics.leader_lease_without_progress
@@ -334,6 +341,8 @@ catch_up_estimate.dirty_usage_buckets
 catch_up_estimate.discovered_expiry_items
 catch_up_estimate.discovered_transition_items
 ```
+
+For a partial cycle, `metrics.last_cycle_partial_stage` records the blocking check for that cycle. For example, `entry_budget` counts raw directory enumeration, `source_result_missing` means an expected set supplied no result, and `activity_baseline_unverified` means the activity proof could not certify publication. A `mixed_plan_recertification_pending` stage means every outstanding bucket completed traversal and supplied a fresh cross-plan observation that still requires certification. Candidate rejections retain the existing candidate outcome labels such as `invalid_root` and `tier_proof`. The field clears on the next non-partial cycle outcome. Inspect `metrics.usage_publication` for the outcome of writing the root snapshot. When a cycle ends with incomplete coverage or an unverifiable observation, the terminal error event includes the cycle, leader epoch and blocking stage. Budget stops and saved checkpoints remain visible in scanner status and warning logs. A supervisor deadline that interrupts the worker before a terminal result increments `metrics.cycle_timeout_total`.
 
 ### Deep scan cadence state
 
