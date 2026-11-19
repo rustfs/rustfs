@@ -15,7 +15,7 @@
 //! Refusal-matrix rows and listing behaviour of migration batch B2 (rustfs/backlog#2766), on both
 //! stacks: object listings, multipart listings, and multipart create and abort.
 
-use super::{GATEWAY, LEGACY, MatrixRow, Outcome, create_bucket_in_the_store, outcome, refusal, s3_client, with_stack};
+use super::{GATEWAY, MatrixRow, Outcome, create_bucket_in_the_store, outcome, refusal, s3_client, with_stack};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::EncodingType;
 use futures::future::BoxFuture;
@@ -326,11 +326,6 @@ fn the_gateway_stack_lists_every_stored_key() {
     with_stack(GATEWAY, the_listing_names_every_stored_key);
 }
 
-#[test]
-fn the_legacy_stack_lists_every_stored_key() {
-    with_stack(LEGACY, the_listing_names_every_stored_key);
-}
-
 /// Entity tags the store holds verbatim (migration write-back and replication receive) are listed
 /// as stored, each on its own object.
 async fn the_listing_shows_every_stored_entity_tag(server: RustFSServer) {
@@ -390,11 +385,6 @@ async fn the_listing_shows_every_stored_entity_tag(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_lists_every_stored_entity_tag() {
     with_stack(GATEWAY, the_listing_shows_every_stored_entity_tag);
-}
-
-#[test]
-fn the_legacy_stack_lists_every_stored_entity_tag() {
-    with_stack(LEGACY, the_listing_shows_every_stored_entity_tag);
 }
 
 /// Both listing edges retain stored bucket names, exact page boundaries, and multipart cursors.
@@ -480,9 +470,4 @@ async fn listings_keep_stored_names_and_page_boundaries(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_keeps_listing_names_and_boundaries() {
     with_stack(GATEWAY, listings_keep_stored_names_and_page_boundaries);
-}
-
-#[test]
-fn the_legacy_stack_keeps_listing_names_and_boundaries() {
-    with_stack(LEGACY, listings_keep_stored_names_and_page_boundaries);
 }

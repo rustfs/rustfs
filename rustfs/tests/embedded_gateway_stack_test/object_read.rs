@@ -155,12 +155,6 @@ async fn head_answers(server: super::RustFSServer) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_head_preserves_stored_headers_and_refusal_order() {
-    super::with_stack(super::LEGACY, head_answers);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_head_preserves_stored_headers_and_refusal_order() {
     super::with_stack(super::GATEWAY, head_answers);
 }

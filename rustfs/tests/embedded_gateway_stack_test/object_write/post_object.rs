@@ -274,12 +274,6 @@ fn gateway_post_response_location_is_absolute_and_percent_encoded() {
 
 #[test]
 #[serial_test::serial]
-fn legacy_post_response_location_is_absolute_and_percent_encoded() {
-    stack::with_stack(stack::LEGACY, post_response_location_is_absolute_and_percent_encoded);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_post_filename_substitution_supports_streamed_uploads() {
     stack::with_stack(stack::GATEWAY, |server| async move {
         const BUCKET: &str = "browser-post-filename";
@@ -302,12 +296,6 @@ fn gateway_post_filename_substitution_supports_streamed_uploads() {
         }
         server.shutdown().await;
     });
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_post_wire_preserves_success_controls_and_storage() {
-    stack::with_stack(stack::LEGACY, |server| post_wire_observes_success_controls_and_storage(server, false));
 }
 
 #[test]
@@ -630,14 +618,6 @@ async fn post_wire_authorizes_form_values_before_success_status(server: rustfs::
 fn gateway_post_wire_authorizes_form_values_before_success_status() {
     stack::with_stack(stack::GATEWAY, |server| {
         post_wire_authorizes_form_values_before_success_status(server, true)
-    });
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_post_wire_authorizes_form_values_before_success_status() {
-    stack::with_stack(stack::LEGACY, |server| {
-        post_wire_authorizes_form_values_before_success_status(server, false)
     });
 }
 

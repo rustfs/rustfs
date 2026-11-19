@@ -16,9 +16,7 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
-#[cfg(feature = "gateway-stack")]
 mod gateway_handlers;
-#[cfg(feature = "gateway-stack")]
 mod gateway_stack;
 mod health;
 mod http;
@@ -34,7 +32,6 @@ mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
 mod ssec_transport;
-#[cfg(feature = "gateway-stack")]
 mod stack;
 pub mod tls_material;
 pub(crate) mod tls_publish;
@@ -84,7 +81,6 @@ pub use layer::s3_http_request_guard;
 pub(crate) use layer::{RequestContextLayer, is_control_plane_route, is_sts_query_request};
 
 /// The S3 operations the gateway stack serves.
-#[cfg(feature = "gateway-stack")]
 pub(crate) fn gateway_operations() -> Vec<&'static str> {
     gateway_handlers::rows(gateway_handlers::OPERATIONS)
         .map(|row| row.name)

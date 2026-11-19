@@ -132,7 +132,6 @@ mod create;
 mod create_values;
 pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
-#[cfg(feature = "gateway-stack")]
 pub(crate) use list::ListPartsInfo;
 pub(crate) use list::{ListPartsFields, ListPartsTarget};
 #[cfg(test)]

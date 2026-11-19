@@ -68,7 +68,6 @@ pub(crate) fn select_input_from_s3s(
 }
 
 /// Moves the gateway's flat request into the shape the query engine reads.
-#[cfg(any(feature = "gateway-stack", test))]
 pub(crate) fn select_input_from_gateway(
     input: rustfs_gateway_types::dto::SelectObjectContentInput,
 ) -> engine::SelectObjectContentInput {
