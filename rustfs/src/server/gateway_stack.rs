@@ -62,10 +62,10 @@ use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
-    AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr,
+    AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr, ConnectionIntent,
     DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces,
     PlaintextCustomerKeyAck, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig,
-    TransportSecurity, UnreadBodyDrain, decide_with,
+    TransportSecurity, connection_intent_of, decide_with,
 };
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, KeystoneEstablished, KeystoneVerifier, RequestIdCarrier, RootCredentials, RootCredentialsError,
@@ -243,8 +243,6 @@ impl GatewayStack {
             // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
             // the refusal once authorization succeeds.
             .defer_encryption_header_refusals_to_handlers()
-            // Keep the profile's inner drain aligned with the host's configured idle bound.
-            .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
             .authenticator(authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile()))
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
@@ -305,17 +303,24 @@ impl GatewayStack {
             (None, _) => true,
         };
         attach_host_facts(extensions);
-        let mut service = self.service.clone();
+        let service = self.service.clone();
         async move {
             if !valid {
                 let mut response = Response::new(rustfs_gateway::Body::empty());
                 *response.status_mut() = http::StatusCode::FORBIDDEN;
                 return response;
             }
-            match tower::Service::call(&mut service, request).await {
-                Ok(response) => response,
-                Err(never) => match never {},
+            // The service's own entry, not its tower adapter: the adapter reads a body the handler
+            // left unread in a detached task of its own, which takes the body away from
+            // `EarlyResponseBodyService`, the drain the HTTP/1-2 shutdown accounting owns. The
+            // adapter's connection verdict is kept.
+            let mut response = service.call(request).await;
+            if connection_intent_of(&response).is_some_and(ConnectionIntent::must_close) {
+                response
+                    .headers_mut()
+                    .insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
             }
+            response
         }
     }
 }

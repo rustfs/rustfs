@@ -7790,6 +7790,48 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
     }
 
+    /// A body the gateway stack refuses unread is drained by `EarlyResponseBodyService` under the
+    /// configured idle bound, and zero leaves that drain unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn gateway_rejected_http1_body_uses_the_configured_drain_timeout() {
+        for timeout in [Duration::from_secs(1), Duration::ZERO] {
+            let stack = GatewayStack::assemble(GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsgatewayroot".to_owned(),
+                root_secret_key: "rustfs-gateway-root-secret".to_owned(),
+                region: None,
+                server_domains: Vec::new(),
+                body_read_timeout: timeout,
+                keystone_auth: None,
+            })
+            .expect("the gateway stack assembles");
+            let mut service = EarlyResponseBodyService::new(GatewayEdgeService(stack), timeout);
+            let (_sender, body, _bytes_polled, dropped) = tracked_request_body();
+            let request = HttpRequest::builder()
+                .method(Method::PUT)
+                .uri("/bucket/object")
+                .version(Version::HTTP_11)
+                .header(http::header::HOST, "localhost")
+                .header(http::header::AUTHORIZATION, "invalid")
+                .body(body)
+                .expect("request");
+
+            let response = service.call(request).await.expect("response");
+            assert!(response.status().is_client_error(), "{}", response.status());
+            assert_eq!(response.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+            tokio::task::yield_now().await;
+            assert!(!dropped.load(Ordering::Acquire), "the host drain must retain the stalled body");
+            let elapsed = if timeout.is_zero() { 301 } else { 2 };
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                dropped.load(Ordering::Acquire),
+                !timeout.is_zero(),
+                "the configured timeout must govern the host drain"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn early_response_http1_closes_a_stalled_chunked_body_after_idle() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
