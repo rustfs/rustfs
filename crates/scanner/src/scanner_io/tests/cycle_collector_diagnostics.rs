@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use rustfs_ecstore::api::disk::HEALING_MARKER_PATH;
+use crate::storage_api::ECSTORE_HEALING_MARKER_PATH;
 
 const LEADER_EPOCH: u64 = 11;
 
@@ -121,7 +121,7 @@ async fn single_drive_cycle_publishes_usage_with_a_leftover_healing_marker() {
         .path()
         .join("pool0-disk0")
         .join(RUSTFS_META_BUCKET)
-        .join(HEALING_MARKER_PATH);
+        .join(ECSTORE_HEALING_MARKER_PATH);
     tokio::fs::write(&marker, b"leftover marker")
         .await
         .expect("fixture healing marker should persist");

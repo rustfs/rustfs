@@ -121,7 +121,8 @@ pub(crate) use rustfs_ecstore::api::disk::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
-    DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk,
+    DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
+    new_disk as ecstore_new_disk,
 };
 #[cfg(all(test, unix))]
 pub(crate) use rustfs_ecstore::api::disk::{
