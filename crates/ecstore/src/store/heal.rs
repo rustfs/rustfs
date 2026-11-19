@@ -29,6 +29,7 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+const EVENT_HEAL_DELETE_RECOVERY_BLOCKED: &str = "heal_delete_recovery_blocked";
 
 /// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
 pub(crate) struct BucketHealScope {
@@ -408,6 +409,24 @@ impl ECStore {
                         summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
                     }
                 }
+            }
+            if let Some(object) = &object
+                && !opts.dry_run
+                && summary.blocked > 0
+            {
+                tracing::debug!(
+                    event = EVENT_HEAL_DELETE_RECOVERY_BLOCKED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
+                    state = "insufficient_evidence",
+                    bucket = ?bucket,
+                    object = ?decode_dir_object(object),
+                    pool = opts.pool,
+                    set = opts.set,
+                    legacy_ambiguous = summary.legacy_ambiguous,
+                    other_blocked = summary.blocked - summary.legacy_ambiguous,
+                    "Exact-key delete recovery is blocked"
+                );
             }
             if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
