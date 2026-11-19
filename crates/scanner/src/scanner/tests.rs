@@ -56,6 +56,7 @@ mod paged_checkpoint;
 mod quota_reset_preservation;
 
 mod recovery_control;
+mod restore_deadline;
 mod scoped_ack_publication;
 mod wakeup_metrics;
 
@@ -1015,6 +1016,7 @@ struct MemoryConfigStore {
     cancel_after_successful_puts: Mutex<HashMap<String, (usize, CancellationToken)>>,
     replace_after_successful_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
     error_after_commit_deletes: Mutex<HashSet<String>>,
+    fail_prefix_deletes: AtomicBool,
     cancel_after_deletes: Mutex<HashMap<String, CancellationToken>>,
     pause_next_publication_admission: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     put_counts: Mutex<HashMap<String, usize>>,
@@ -1061,6 +1063,11 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             .await
             .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         let key = memory_config_key(bucket, object);
+        let _serial_page_read = if object.contains(".pages/") {
+            restore_deadline::admit_page(object).await
+        } else {
+            None
+        };
         if object.contains(".pages/") {
             let delay = self.checkpoint_page_delay_ms.load(Ordering::Relaxed);
             if delay != 0 {
@@ -5025,6 +5032,9 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
         let key = memory_config_key(bucket, object);
         let mut objects = self.objects.lock().await;
         if opts.delete_prefix && !opts.delete_prefix_object {
+            if self.fail_prefix_deletes.load(Ordering::Relaxed) {
+                return Err(EcstoreError::other("injected prefix deletion failure"));
+            }
             assert!(opts.http_preconditions.is_none(), "fixture prefix deletion cannot condition one object");
             objects.retain(|object, _| !object.starts_with(&key));
             self.revisions.lock().await.retain(|object, _| !object.starts_with(&key));

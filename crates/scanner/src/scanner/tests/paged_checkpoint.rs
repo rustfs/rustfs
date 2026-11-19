@@ -4,6 +4,8 @@
 use super::*;
 use crate::BUCKET_META_PREFIX;
 
+mod save_review;
+
 const NAME: &str = "bucket/.usage-cache.bin";
 
 fn empty_bucket_checkpoint() -> DataUsageCache {

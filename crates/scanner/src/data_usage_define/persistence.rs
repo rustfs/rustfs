@@ -201,6 +201,11 @@ impl DataUsageCache {
             let backup_name = format!("{name}.bkp");
             let backup_attempt = Self::try_load_inner(store.clone(), &backup_name, Duration::from_secs(30)).await?;
             let backup_revision = backup_attempt.revision();
+            if backup_revision.is_some()
+                && let Some(DataUsageCacheRevision::Etag(etag)) = &main_revision
+            {
+                scan_load::PendingBackup::finish(&store, name, etag);
+            }
             let backup_state = match backup_attempt {
                 DataUsageCacheLoadAttempt::Loaded {
                     cache,
@@ -323,6 +328,11 @@ impl DataUsageCache {
                         .filter(|etag| !etag.is_empty())
                         .cloned()
                         .map(DataUsageCacheRevision::Etag);
+                    if let Some(DataUsageCacheRevision::Etag(etag)) = &revision
+                        && scan_load::PendingBackup::needs_backup(&store, load_name, etag)
+                    {
+                        return Ok((None, revision, true));
+                    }
                     match reader.read_all().await {
                         Ok(data) => match Box::pin(pages::decode(store.clone(), load_name, &data)).await {
                             Ok(cache) => Ok((Some(cache), revision, false)),
@@ -333,10 +343,15 @@ impl DataUsageCache {
                                 // A concurrent manifest commit can retire the generation
                                 // we were reading. Retry the current root before treating
                                 // missing pages as corruption or falling back to a backup.
-                                if pages::is_manifest(&data)
-                                    && Some(read_config_revision(store.clone(), &path).await?) != revision
-                                {
-                                    return Err(StorageError::PreconditionFailed);
+                                if pages::is_manifest(&data) {
+                                    if Some(read_config_revision(store.clone(), &path).await?) != revision {
+                                        return Err(StorageError::PreconditionFailed);
+                                    }
+                                    if !load_name.ends_with(".bkp")
+                                        && let Some(DataUsageCacheRevision::Etag(etag)) = &revision
+                                    {
+                                        scan_load::PendingBackup::begin(&store, load_name, etag);
+                                    }
                                 }
                                 Ok((None, revision, true))
                             }

@@ -22,6 +22,7 @@ struct Position {
     leaves: u64,
     nodes: u64,
     buffer: Buffer,
+    writer: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     decoder: Option<tokio::task::JoinHandle<StorageResult<DataUsageCache>>>,
 }
 
@@ -76,6 +77,7 @@ impl Recovery {
                 leaves: 0,
                 nodes: 0,
                 buffer,
+                writer: None,
                 decoder: None,
             },
         })))
@@ -83,8 +85,8 @@ impl Recovery {
 }
 
 // Park only verified bytes and traversal state. Outstanding metadata reads
-// and their admissions are dropped with the waiter. A CPU-only decode may
-// finish after cancellation and is joined by the next reader of this root.
+// and their admissions are dropped with the waiter. A local spool write or
+// decode may finish after cancellation and is joined before advancing again.
 impl Drop for Recovery {
     fn drop(&mut self) {
         let Some(mut job) = self.0.take() else { return };
@@ -92,14 +94,27 @@ impl Drop for Recovery {
             return;
         }
         let mut parked = PARKED.lock().unwrap_or_else(|error| error.into_inner());
-        if parked.len() < PARKED_LIMIT && !parked.iter().any(|old| old.owner.ptr_eq(&job.owner) && old.name == job.name) {
-            job.last_polled = WallInstant::now();
+        job.last_polled = WallInstant::now();
+        if let Some(previous) = parked
+            .iter_mut()
+            .find(|previous| previous.owner.ptr_eq(&job.owner) && previous.name == job.name && previous.manifest == job.manifest)
+        {
+            // Readers of an immutable root traverse the same ordered prefix.
+            // Keep the furthest admission regardless of cancellation order.
+            if job.position.verified_progress() > previous.position.verified_progress() {
+                std::mem::swap(previous, &mut job);
+            }
+        } else if parked.len() < PARKED_LIMIT {
             parked.push(job);
         }
     }
 }
 
 impl Position {
+    fn verified_progress(&self) -> (u64, bool) {
+        (self.nodes + self.leaves, self.decoder.is_some())
+    }
+
     async fn restore<S: ScannerObjectIO>(
         &mut self,
         store: Arc<S>,
@@ -107,7 +122,14 @@ impl Position {
         manifest: &Manifest,
     ) -> StorageResult<DataUsageCache> {
         let max_leaves = manifest.length.div_ceil(PAGE_MIN as u64).saturating_add(3);
-        while let Some(&(key, level)) = self.pending.last() {
+        loop {
+            // Retain the local write across cancellation. The verified page already
+            // owns its offset and must not consume another storage read next round.
+            if let Some(writer) = &mut self.writer {
+                writer.await.map_err(Error::other)??;
+                self.writer = None;
+            }
+            let Some(&(key, level)) = self.pending.last() else { break };
             if level != 0 {
                 let node = read_block(store.clone(), name, manifest.bundle, key).await?;
                 if node.is_empty()
@@ -124,53 +146,30 @@ impl Position {
                 self.nodes += 1;
                 continue;
             }
-            let batch: Vec<_> = self
-                .pending
-                .iter()
-                .rev()
-                .take_while(|(_, level)| *level == 0)
-                .take(IO_CONCURRENCY)
-                .map(|(key, _)| *key)
-                .collect();
-            let mut reads = Vec::with_capacity(batch.len());
-            for &key in &batch {
-                reads.push(read_block(store.clone(), name, manifest.bundle, key));
-            }
-            let blocks = try_join_all(reads).await?;
-            let chunk_bytes = blocks.iter().map(|block| block.len()).sum::<usize>();
+            let block = read_block(store.clone(), name, manifest.bundle, key).await?;
             let next = self
                 .length
-                .checked_add(u64::try_from(chunk_bytes).map_err(|_| invalid("invalid restore length"))?)
+                .checked_add(u64::try_from(block.len()).map_err(|_| invalid("invalid restore length"))?)
                 .filter(|len| *len <= manifest.length)
                 .ok_or_else(|| invalid("scanner checkpoint exceeds its committed length"))?;
-            let leaves = self.leaves + u64::try_from(batch.len()).map_err(|_| invalid("too many checkpoint pages"))?;
-            if leaves > max_leaves {
+            if self.leaves >= max_leaves {
                 return Err(invalid("too many scanner checkpoint leaves"));
             }
             match &mut self.buffer {
-                Buffer::Memory(bytes) => {
-                    for block in &blocks {
-                        bytes.extend_from_slice(block);
-                    }
-                }
+                Buffer::Memory(bytes) => bytes.extend_from_slice(&block),
                 Buffer::File(file) => {
                     let file = file.clone();
                     let offset = self.length;
-                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    self.writer = Some(tokio::task::spawn_blocking(move || {
                         let mut file = file.lock().unwrap_or_else(|error| error.into_inner());
                         file.seek(SeekFrom::Start(offset))?;
-                        for block in blocks {
-                            file.write_all(&block)?;
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .map_err(Error::other)??;
+                        file.write_all(&block)
+                    }));
                 }
             }
-            self.pending.truncate(self.pending.len() - batch.len());
+            self.pending.pop();
             self.length = next;
-            self.leaves = leaves;
+            self.leaves += 1;
         }
         if self.length != manifest.length {
             return Err(invalid("incomplete scanner checkpoint"));

@@ -7,6 +7,69 @@ use std::any::Any;
 use std::sync::{Mutex, Weak};
 use tokio_util::sync::CancellationToken;
 
+// Keep only a failed root's identity while its independent backup is being
+// recovered. A fresh primary reader still obtains the current ETag every time.
+pub(super) struct PendingBackup {
+    owner: Weak<dyn Any + Send + Sync>,
+    name: String,
+    failed_etag: String,
+    last_polled: std::time::Instant,
+}
+
+static PENDING_BACKUPS: Mutex<Vec<PendingBackup>> = Mutex::new(Vec::new());
+const MAX_PENDING_BACKUPS: usize = 32;
+
+impl PendingBackup {
+    fn owner<S: ScannerObjectIO>(store: &Arc<S>) -> Weak<dyn Any + Send + Sync> {
+        let erased: Arc<dyn Any + Send + Sync> = store.clone();
+        Arc::downgrade(&erased)
+    }
+
+    pub(super) fn needs_backup<S: ScannerObjectIO>(store: &Arc<S>, name: &str, etag: &str) -> bool {
+        let owner = Self::owner(store);
+        let mut pending = PENDING_BACKUPS.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(index) = pending
+            .iter()
+            .position(|phase| phase.owner.ptr_eq(&owner) && phase.name == name)
+        else {
+            return false;
+        };
+        if pending[index].failed_etag == etag {
+            pending[index].last_polled = std::time::Instant::now();
+            true
+        } else {
+            pending.swap_remove(index);
+            false
+        }
+    }
+
+    pub(super) fn begin<S: ScannerObjectIO>(store: &Arc<S>, name: &str, etag: &str) {
+        let owner = Self::owner(store);
+        let mut pending = PENDING_BACKUPS.lock().unwrap_or_else(|error| error.into_inner());
+        pending.retain(|phase| {
+            phase.owner.strong_count() > 0
+                && phase.last_polled.elapsed() < Duration::from_secs(3600)
+                && !(phase.owner.ptr_eq(&owner) && phase.name == name)
+        });
+        if pending.len() < MAX_PENDING_BACKUPS {
+            pending.push(Self {
+                owner,
+                name: name.to_owned(),
+                failed_etag: etag.to_owned(),
+                last_polled: std::time::Instant::now(),
+            });
+        }
+    }
+
+    pub(super) fn finish<S: ScannerObjectIO>(store: &Arc<S>, name: &str, etag: &str) {
+        let owner = Self::owner(store);
+        PENDING_BACKUPS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|phase| !(phase.owner.ptr_eq(&owner) && phase.name == name && phase.failed_etag == etag));
+    }
+}
+
 struct DecodedCheckpoint {
     owner: Weak<dyn Any + Send + Sync>,
     name: String,

@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 mod restore;
+mod save;
 mod staging;
 
 use super::*;
@@ -57,6 +58,10 @@ struct Manifest {
     length: u64,
     level: u8,
     root: Digest,
+    #[serde(default)]
+    bundle_bytes: u64,
+    #[serde(default)]
+    bundle_commits: u16,
 }
 
 #[derive(Debug, Default)]
@@ -146,6 +151,8 @@ impl Archive {
             length: self.length,
             level,
             root: children.pop().ok_or_else(|| invalid("empty scanner checkpoint"))?,
+            bundle_bytes: 0,
+            bundle_commits: 0,
         })
     }
 }
@@ -454,61 +461,47 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         };
         return Ok((Bytes::from(bytes), retired));
     }
-    if damaged && !allow_rotation {
-        return Err(invalid("failed to reclaim damaged checkpoint generation"));
-    }
-    let rotate = previous
-        .is_some_and(|previous| damaged || (allow_rotation && previous.finished && previous.cycle != cache.info.next_cycle));
-    let parent = previous.filter(|_| !rotate);
-    if rotate {
-        retired = previous.map(|manifest| manifest.bundle);
-    }
-    let bundle = parent.map_or_else(|| build_bundle(name, revision, cache), |manifest| manifest.bundle);
+    let live_bytes = save::block_bytes(encoded.archive.blocks.values());
+    let reuse = match previous {
+        Some(head) if !damaged && !(head.finished && head.cycle != cache.info.next_cycle) => {
+            save::reuse(store.clone(), name, head, &encoded.archive, live_bytes).await?
+        }
+        _ => None,
+    };
+    let verify_backup = name.ends_with(".bkp");
+    let (bundle, known, bundle_bytes, bundle_commits) = if let Some((head, known, total)) = reuse {
+        (head.bundle, known, total, head.bundle_commits + 1)
+    } else {
+        if let Some(head) = previous {
+            if !allow_rotation {
+                // Keep both readable generations and their cleanup obligation.
+                // Further staging into either bundle would defeat the space bound.
+                return Err(Error::other("cannot rotate scanner checkpoint before reclaiming its retired bundle"));
+            }
+            retired = Some(head.bundle);
+        }
+        (build_bundle(name, revision, cache), HashSet::new(), live_bytes, 1)
+    };
     let mut manifest = encoded.root.clone();
     manifest.bundle = bundle;
     manifest.finished = cache.info.snapshot_complete;
     manifest.cycle = cache.info.next_cycle;
-    let known = if let Some(head) = parent {
-        match committed_keys(store.clone(), name, head, &encoded.archive).await {
-            Ok(known) => known,
-            Err(StorageError::FileNotFound | StorageError::ObjectNotFound(..)) => HashSet::new(),
-            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => HashSet::new(),
-            Err(error) => return Err(error),
-        }
-    } else {
-        HashSet::new()
-    };
+    manifest.bundle_bytes = bundle_bytes;
+    manifest.bundle_commits = bundle_commits;
 
-    let staging = staging::Staging::open(&store, name, bundle, epoch, revision);
-    let mut writes = Vec::with_capacity(IO_CONCURRENCY);
-    for (key, bytes) in &encoded.archive.blocks {
-        if known.contains(key) || staging.contains(key) {
-            continue;
+    if let Err(error) = save::stage(store.clone(), name, revision, epoch, &manifest, &encoded.archive, &known).await {
+        // A corrupt XL header need not yield an ETag for a conditional repair.
+        // Rebuild this backup under a fresh namespace; its old root stays visible
+        // until the manifest CAS. Other I/O failures remain retryable in place.
+        if !(verify_backup && manifest.bundle_commits > 1 && allow_rotation && save::unreadable_page(&error)) {
+            return Err(error);
         }
-        let path = block_path(name, bundle, key);
-        let store = store.clone();
-        let bytes = bytes.clone();
-        let key = *key;
-        let receipts = &staging;
-        writes.push(async move {
-            DataUsageCache::save_path_with_retry(
-                store,
-                &path,
-                &bytes,
-                DataUsageCache::cache_save_timeout(),
-                DATA_USAGE_CACHE_SAVE_RETRIES,
-                Some(DataUsageCacheRevision::Missing),
-                Some(epoch),
-            )
-            .await?;
-            receipts.record(key);
-            Ok::<(), Error>(())
-        });
-        if writes.len() == IO_CONCURRENCY {
-            try_join_all(std::mem::take(&mut writes)).await?;
-        }
+        retired = Some(manifest.bundle);
+        manifest.bundle = build_bundle(name, revision, cache);
+        manifest.bundle_bytes = live_bytes;
+        manifest.bundle_commits = 1;
+        save::stage(store.clone(), name, revision, epoch, &manifest, &encoded.archive, &HashSet::new()).await?;
     }
-    try_join_all(writes).await?;
     let header = Header {
         body: Payload::Pages(manifest),
         retired,
