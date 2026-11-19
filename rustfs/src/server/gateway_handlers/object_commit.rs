@@ -46,10 +46,7 @@ impl Served for dto::CompleteMultipartUpload {
             .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
         let input = request.input();
         let specific_etag = input.if_match.as_deref().is_some_and(|value| value.trim() != "*");
-        Ok(
-            authorize_complete_multipart_upload(envelope, &server, input.bucket.as_str(), input.key.as_str(), specific_etag)
-                .await?,
-        )
+        authorize_complete_multipart_upload(envelope, &server, input.bucket.as_str(), input.key.as_str(), specific_etag).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -90,7 +87,7 @@ impl Served for dto::CopyObject {
             legal_hold: input.object_lock_legal_hold_status.is_some(),
             retention: input.object_lock_mode.is_some() || input.object_lock_retain_until_date.is_some(),
         };
-        Ok(authorize_copy_object(envelope, &server, facts).await?)
+        authorize_copy_object(envelope, &server, facts).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -122,7 +119,7 @@ impl Served for dto::UploadPartCopy {
         };
         let input = request.input();
         authorize_upload_part_copy(envelope, &server, input.bucket.as_str(), input.key.as_str(), source).await?;
-        Ok(check_copy_source_owner(envelope.headers())?)
+        check_copy_source_owner(envelope.headers())
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {

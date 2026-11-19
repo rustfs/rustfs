@@ -58,7 +58,7 @@ impl Served for dto::PutObject {
                 retention,
                 post: false,
             };
-            Ok(authorize_put_object(envelope, &server, facts, |_| Ok(())).await?)
+            authorize_put_object(envelope, &server, facts, |_| Ok(())).await
         }
     }
 
@@ -89,7 +89,7 @@ impl Served for dto::UploadPart {
                 .server_context()
                 .cloned()
                 .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
-            Ok(authorize_upload_part(envelope, &server, &bucket, &key).await?)
+            authorize_upload_part(envelope, &server, &bucket, &key).await
         }
     }
 

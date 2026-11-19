@@ -775,6 +775,15 @@ impl ECStore {
         sys.read().await.get(bucket).await
     }
 
+    /// Snapshots this instance's cached bucket metadata without disk IO.
+    ///
+    /// # Errors
+    /// Returns an error when this instance's metadata system is not initialized.
+    pub async fn cached_bucket_metadata(&self) -> Result<Vec<Arc<BucketMetadata>>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        Ok(sys.read().await.cached_metadata().await)
+    }
+
     /// Resolve stored tags for authorization. Only confirmed absence returns an
     /// empty map; unavailable, fabricated or malformed metadata must not grant access.
     pub async fn get_bucket_tags_for_policy(&self, bucket: &str) -> Result<HashMap<String, String>> {

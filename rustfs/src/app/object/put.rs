@@ -1266,6 +1266,11 @@ impl DefaultObjectUsecase {
         }
     }
 
+    #[hotpath::measure(
+        impl_type = "DefaultObjectUsecase",
+        future = true,
+        label = "rustfs::app::object::put::DefaultObjectUsecase::execute_put_object"
+    )]
     pub(crate) async fn execute_put_object_owned(
         &self,
         envelope: RequestEnvelope,

@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+
 use rustfs_ecstore::api::config::com::{
     read_existing_server_config_no_lock as read_existing_notify_config_from_backend_no_lock,
     read_server_config_snapshot as read_notify_server_config_snapshot_from_backend,
