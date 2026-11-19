@@ -1165,6 +1165,15 @@ impl SetDisks {
                     }
                     continue;
                 }
+                if copies
+                    .iter()
+                    .all(|copy| copy.state == DeleteRecoveryState::CommitFinished && copy.commit_data_safe)
+                {
+                    // Both settlement phases would skip every copy. Keep the
+                    // already inspected siblings valid until an actual write.
+                    summary.committed += 1;
+                    continue;
+                }
                 mutated = true;
                 let mut pending = settle_group(
                     &disks,
@@ -3736,6 +3745,81 @@ mod tests {
                 .await
                 .expect("settled receipts must not block removal of the empty bucket");
         }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_finished_receipts_do_not_rescan_blocked_siblings() {
+        let bucket = "recover-finished-before-legacy";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let first = put(&store, bucket, &[11; 4096], true).await.expect("first version");
+        let second = put(&store, bucket, &[12; 4096], true).await.expect("second version");
+        let survivor = put(&store, bucket, &[13; 4096], true).await.expect("surviving version");
+        for (id, version) in [(10, first), (20, second)] {
+            let transaction = applied_at(&store, &disks, bucket, Some(version), disks.len(), Uuid::from_u128(id)).await;
+            for disk in &disks {
+                publish(disk, bucket, transaction).await;
+                let state = disk
+                    .inspect_delete_transaction(bucket, "object", transaction)
+                    .await
+                    .expect("certified transaction");
+                let finished = disk
+                    .settle_delete_transaction(
+                        bucket,
+                        "object",
+                        transaction,
+                        state.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await
+                    .expect("finish certified transaction before coordinator retry");
+                assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+            }
+        }
+        let legacy = Uuid::from_u128(30);
+        for dir in &dirs {
+            let data = dir.path().join(bucket).join("object").join(Uuid::from_u128(40).to_string());
+            tokio::fs::create_dir(&data).await.expect("legacy data directory");
+            tokio::fs::write(data.join(format!("reserve-delete-data.{legacy}")), [])
+                .await
+                .expect("legacy reservation without a decision");
+        }
+
+        // Admit enough work for complete discovery and exactly one inspection
+        // per transaction and drive. No-op settlement must fit this budget.
+        let mut entries = 0;
+        for disk in &disks {
+            let page = disk
+                .discover_delete_transactions_bounded(bucket, "object", 4096)
+                .await
+                .expect("inspect bounded discovery cost");
+            assert!(page.complete);
+            assert_eq!(page.transactions.len(), 3);
+            entries += page.visited;
+            for id in page.transactions {
+                let cost = disk
+                    .inspect_delete_transaction_bounded(bucket, "object", id.transaction, 4096)
+                    .await
+                    .expect("inspect bounded evidence cost");
+                entries += cost.visited;
+            }
+        }
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        let mut context = DeleteRecoveryContext::new(Some(incarnation), &|| true);
+        context.work_budget = Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::new(entries)));
+        let report = store.pools[0].disk_set[0]
+            .recover_delete_object(bucket, "object", context)
+            .await
+            .expect("finished receipts must not invalidate sibling inspections");
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.legacy_ambiguous, 1);
+        for disk in &disks {
+            let page = disk
+                .discover_delete_transactions(bucket, Some("object"), None, 128)
+                .await
+                .expect("unresolved key still retains its evidence");
+            assert_eq!(page.transactions.len(), 3, "the key-wide GC barrier keeps certified receipts");
+        }
+        assert_eq!(body(&store, bucket, Some(survivor)).await, vec![13; 4096]);
     }
 
     #[tokio::test]
