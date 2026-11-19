@@ -7624,45 +7624,64 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct UploadPartTimeoutS3 {
-        timeout: Duration,
-    }
+    /// UploadPart reading its whole body, as RustFS's handler reads one; HeadBucket answers at once.
+    struct UploadPartReader;
 
-    #[async_trait::async_trait]
-    impl s3s::S3 for UploadPartTimeoutS3 {
-        async fn upload_part(
+    impl rustfs_gateway::Handler<rustfs_gateway::dto::UploadPart> for UploadPartReader {
+        async fn call(
             &self,
-            req: s3s::S3Request<s3s::dto::UploadPartInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
+            request: rustfs_gateway::Req<rustfs_gateway::dto::UploadPart>,
+        ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::UploadPart> {
             use futures::StreamExt;
             use tokio_util::io::StreamReader;
 
-            let control = req
-                .extensions
-                .get::<BodyReadControl>()
-                .expect("HTTP route must install the control")
-                .clone();
-            control.activate(self.timeout, "bucket", "object", "request", 1024);
-            let body = req.input.body.expect("upload body");
-            let inner = rustfs_rio::wrap_reader(StreamReader::new(body.map(|item| item.map_err(std::io::Error::other))));
-            let mut reader = crate::app::object::request_body::DemandReader::new(inner, control);
+            let body = request.into_input().body.expect("upload body").into_body();
+            let (chunks, _) = crate::app::object::BodyChunks::with_trailers(body, None);
+            let mut reader = StreamReader::new(chunks.map(|item| item.map_err(std::io::Error::other)));
             reader
                 .read_to_end(&mut Vec::new())
                 .await
-                .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))?;
-            Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput::default()))
-        }
-
-        async fn head_bucket(
-            &self,
-            _req: s3s::S3Request<s3s::dto::HeadBucketInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadBucketOutput>> {
-            Ok(s3s::S3Response::new(s3s::dto::HeadBucketOutput::default()))
+                .map_err(|error| crate::server::gateway_handlers::handler_error(crate::error::ApiError::from(error).into()))?;
+            Ok(rustfs_gateway::Resp::new(Default::default()))
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    impl rustfs_gateway::Handler<rustfs_gateway::dto::HeadBucket> for UploadPartReader {
+        async fn call(
+            &self,
+            _request: rustfs_gateway::Req<rustfs_gateway::dto::HeadBucket>,
+        ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::HeadBucket> {
+            Ok(rustfs_gateway::Resp::new(Default::default()))
+        }
+    }
+
+    /// The gateway stack as production configures it, with `timeout` as its request-body idle
+    /// bound, serving [`UploadPartReader`] to every caller behind the host's early-response drain.
+    fn upload_part_timeout_edge(timeout: Duration, drain_timeout: Duration) -> EarlyResponseBodyService<GatewayEdgeService> {
+        let handler = Arc::new(UploadPartReader);
+        let stack = GatewayStack::assemble_serving(
+            GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsgatewayroot".to_owned(),
+                root_secret_key: "rustfs-gateway-root-secret".to_owned(),
+                region: None,
+                server_domains: Vec::new(),
+                body_read_timeout: timeout,
+                keystone_auth: None,
+            },
+            |builder| {
+                builder
+                    .register::<rustfs_gateway::dto::UploadPart, _>(Arc::clone(&handler))
+                    .register::<rustfs_gateway::dto::HeadBucket, _>(handler)
+            },
+        )
+        .expect("the gateway stack assembles");
+        EarlyResponseBodyService::new(GatewayEdgeService(stack), drain_timeout)
+    }
+
+    // Real time: the gateway times a request body out on its own clock, which a paused tokio
+    // clock does not drive.
+    #[tokio::test]
     async fn upload_part_timeout_preserves_http1_drain_and_http2_stream_drop() {
         for version in [Version::HTTP_11, Version::HTTP_2] {
             let (sender, body, bytes_polled, dropped) = tracked_request_body();
@@ -7670,22 +7689,22 @@ mod tests {
                 .version(version)
                 .method(Method::PUT)
                 .uri("/bucket/object?partNumber=1&uploadId=upload")
+                .header(http::header::HOST, "localhost")
                 .header(CONTENT_LENGTH, "1024")
                 .body(body)
                 .expect("upload request");
-            let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
-                timeout: Duration::from_secs(300),
-            })
-            .build();
-            let mut service = EarlyResponseBodyService::new(inner, Duration::from_secs(30));
+            let mut service = upload_part_timeout_edge(Duration::from_millis(200), Duration::from_secs(30));
             let mut call = Box::pin(service.call(request));
             assert!(futures::poll!(call.as_mut()).is_pending());
-            tokio::time::advance(Duration::from_secs(300)).await;
-            let response = call.await.expect("timeout response");
+            let response = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("the stalled body times out")
+                .expect("timeout response");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(response.headers().get(CONNECTION).is_some(), version == Version::HTTP_11);
             let xml = response.into_body().collect().await.expect("timeout XML").to_bytes();
-            assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+            let xml = String::from_utf8_lossy(&xml);
+            assert!(xml.contains("<Code>RequestTimeout</Code>"), "{xml}");
             if version == Version::HTTP_11 {
                 assert!(
                     !dropped.load(Ordering::Acquire),
@@ -7708,11 +7727,7 @@ mod tests {
     #[tokio::test]
     async fn upload_part_timeout_leaves_other_http2_streams_usable() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
-            timeout: Duration::from_millis(500),
-        })
-        .build();
-        let service = EarlyResponseBodyService::new(inner, Duration::from_secs(1));
+        let service = upload_part_timeout_edge(Duration::from_millis(500), Duration::from_secs(1));
         let server = tokio::spawn(async move {
             hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection(TokioIo::new(server_io), TowerToHyperService::new(service))
@@ -7757,7 +7772,8 @@ mod tests {
             .expect("S3 response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let xml = response.into_body().collect().await.expect("timeout body").to_bytes();
-        assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+        let xml = String::from_utf8_lossy(&xml);
+        assert!(xml.contains("<Code>RequestTimeout</Code>"), "{xml}");
         client.ready().await.expect("connection after failed stream");
         let (sender, body, _, _) = tracked_request_body();
         drop(sender);
@@ -9873,23 +9889,17 @@ mod tests {
         let (config, cert) = configs()?;
         let readiness = Arc::new(GlobalReadiness::new());
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-        let s3 = S3ServiceBuilder::new(UploadPartTimeoutS3 {
-            timeout: Duration::from_secs(1),
-        })
-        .build();
+        let edge = upload_part_timeout_edge(Duration::from_secs(1), Duration::from_secs(1));
         let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
         let (endpoint, task) = http3::spawn(
             config,
             "127.0.0.1:0".parse()?,
             move |peer| {
                 let inner = ServiceBuilder::new()
-                    .map_response(|response: Response<s3s::Body>| {
-                        response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest {
-                            rest_body: EdgeBody::new(rest_body),
-                        })
+                    .map_response(|response: Response<EdgeBody>| {
+                        response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body })
                     })
-                    .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
-                    .service(EarlyResponseBodyService::new(s3.clone(), Duration::from_secs(1)));
+                    .service(edge.clone());
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(
                     inner,

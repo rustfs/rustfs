@@ -200,6 +200,26 @@ impl GatewayStack {
         control_plane::assemble(assembly, iam, root, router)
     }
 
+    /// The stack as [`GatewayStack::assemble`] configures it, admitting every caller to the
+    /// handlers `register` adds instead of RustFS's: for tests of the host layers around it.
+    #[cfg(test)]
+    pub(crate) fn assemble_serving(
+        assembly: GatewayAssembly,
+        register: impl FnOnce(ServiceBuilder) -> ServiceBuilder,
+    ) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        let builder = Self::configured_builder(&assembly, iam, root, decide_with(|_| Decision::Allow), std::convert::identity)?;
+        let service = register(builder).build().map_err(GatewayAssemblyError::Service)?;
+        Ok(Self {
+            service,
+            keystone_auth: assembly.keystone_auth,
+            control_plane: false,
+        })
+    }
+
     fn assemble_with(
         assembly: GatewayAssembly,
         iam: Arc<dyn IamKeyLookup>,
@@ -303,6 +323,8 @@ impl GatewayStack {
             (None, _) => true,
         };
         attach_host_facts(extensions);
+        // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
+        let http1 = request.version() < http::Version::HTTP_2;
         let service = self.service.clone();
         async move {
             if !valid {
@@ -315,7 +337,7 @@ impl GatewayStack {
             // `EarlyResponseBodyService`, the drain the HTTP/1-2 shutdown accounting owns. The
             // adapter's connection verdict is kept.
             let mut response = service.call(request).await;
-            if connection_intent_of(&response).is_some_and(ConnectionIntent::must_close) {
+            if http1 && connection_intent_of(&response).is_some_and(ConnectionIntent::must_close) {
                 response
                     .headers_mut()
                     .insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
