@@ -14,15 +14,6 @@
 
 use std::sync::Arc;
 
-pub(crate) mod bucket {
-    pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
-
-    #[cfg(test)]
-    pub(crate) fn deserialize<T: rustfs_ecstore::api::bucket::utils::BucketConfigXml>(payload: &[u8]) -> Result<T, String> {
-        rustfs_ecstore::api::bucket::utils::deserialize(payload).map_err(|err| err.to_string())
-    }
-}
-
 use rustfs_ecstore::api::config::com::{
     read_existing_server_config_no_lock as read_existing_notify_config_from_backend_no_lock,
     read_server_config_snapshot as read_notify_server_config_snapshot_from_backend,
@@ -30,11 +21,7 @@ use rustfs_ecstore::api::config::com::{
     with_server_config_read_lock as with_notify_server_config_read_lock_from_backend,
 };
 use rustfs_ecstore::api::runtime::object_store_handle as resolve_notify_object_store_handle_from_backend;
-pub mod storage {
-    pub use rustfs_ecstore::api::storage::ECStore as NotifyStore;
-}
-
-use self::storage::NotifyStore;
+pub use rustfs_ecstore::api::storage::ECStore as NotifyStore;
 
 pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
     resolve_notify_object_store_handle_from_backend()
@@ -82,4 +69,11 @@ pub(crate) mod crate_boundary {
         read_existing_notify_server_config_no_lock, read_notify_server_config_snapshot, resolve_notify_object_store_handle,
         save_notify_server_config_snapshot, with_notify_server_config_read_lock,
     };
+}
+
+pub(crate) mod bucket_metadata {
+    pub(crate) use super::NotifyStore;
+    pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::bucket::utils::deserialize as deserialize_bucket_config;
 }
