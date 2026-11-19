@@ -359,17 +359,25 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
     use time::OffsetDateTime;
 
-    /// A `Store` whose methods are never invoked by these tests: the gate only
-    /// reaches the persistence layer for non-owner principals, and the
-    /// `IamCache` we build starts with an empty in-memory snapshot, so
-    /// `get_user` resolves to `None` (unknown user) before any `api` call.
-    #[derive(Clone)]
-    struct EmptyStore;
+    /// An in-memory authorization backend. Regular-user policy tests use only
+    /// the cache; session fixtures can also publish an authoritative parent
+    /// revision without introducing a cluster-backed store.
+    #[derive(Clone, Default)]
+    struct EmptyStore {
+        regular_user: Option<UserIdentity>,
+    }
 
     #[async_trait::async_trait]
     impl Store for EmptyStore {
         fn has_watcher(&self) -> bool {
             false
+        }
+        async fn regular_user_revision(&self, name: &str) -> rustfs_iam::error::Result<Option<(UserIdentity, String)>> {
+            Ok(self
+                .regular_user
+                .as_ref()
+                .filter(|identity| identity.credentials.access_key == name)
+                .map(|identity| (identity.clone(), "test-parent-revision".to_owned())))
         }
         async fn save_iam_config<Item: Serialize + Send>(
             &self,
@@ -496,7 +504,7 @@ mod tests {
         let (send_chan, _rx) = tokio::sync::mpsc::channel::<i64>(1);
         IamCache {
             cache: Cache::default(),
-            api: EmptyStore,
+            api: EmptyStore::default(),
             state: Arc::new(AtomicU8::new(0)),
             loading: Arc::new(AtomicBool::new(false)),
             roles: HashMap::new(),
@@ -857,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_service_mutation_defaults_and_session_boundary() {
-        let store = iam_cache_with_empty_store();
+        let mut store = iam_cache_with_empty_store();
         let now = OffsetDateTime::now_utc();
         let user = Credentials {
             access_key: "self-service-user".into(),
@@ -865,6 +873,7 @@ mod tests {
             status: "on".into(),
             ..Default::default()
         };
+        store.api.regular_user = Some(UserIdentity::new(user.clone()));
         store
             .cache
             .add_or_update_user(&user.access_key, &UserIdentity::new(user.clone()), now);

@@ -1344,11 +1344,16 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
 /// that order; the slice ends at that method's own closing line.
 fn assert_delete_bucket_reserves_before_local_delete(usecase: &crate::guard_sources::SourceSet) {
     let delete = usecase.method_body("execute_delete_bucket_inner");
+    let local_delete = [".delete_bucket(", ".delete_bucket_with_notification("]
+        .into_iter()
+        .filter_map(|call| delete.find(call))
+        .min()
+        .expect("local delete");
     assert!(
         delete
             .find("prepare_site_replication_delete_bucket")
             .expect("durable reservation")
-            < delete.find(".delete_bucket(").expect("local delete"),
+            < local_delete,
         "destructive peer liabilities must be persisted before the local bucket is deleted"
     );
 }
@@ -1372,8 +1377,13 @@ fn delete_bucket_fixture(core: &str) -> crate::guard_sources::SourceSet {
 
 #[test]
 fn delete_bucket_order_guard_passes_after_the_method_moves_into_the_split_directory() {
-    let core = DELETE_BUCKET_INNER_FIXTURE.replace("LOCAL_DELETE", "store.delete_bucket(&bucket).await;");
-    assert_delete_bucket_reserves_before_local_delete(&delete_bucket_fixture(&core));
+    for call in [
+        "store.delete_bucket(&bucket).await;",
+        "store.delete_bucket_with_notification(&bucket, false).await;",
+    ] {
+        let core = DELETE_BUCKET_INNER_FIXTURE.replace("LOCAL_DELETE", call);
+        assert_delete_bucket_reserves_before_local_delete(&delete_bucket_fixture(&core));
+    }
 }
 
 #[test]
@@ -1391,15 +1401,18 @@ fn delete_bucket_order_guard_fails_when_the_local_delete_leaves_the_method() {
 
 #[test]
 fn delete_bucket_order_guard_fails_when_the_delete_precedes_the_reservation() {
-    let core = DELETE_BUCKET_INNER_FIXTURE.replace(
-        "        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;\n        LOCAL_DELETE",
-        "        store.delete_bucket(&bucket).await;\n        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;",
-    );
-    let usecase = delete_bucket_fixture(&core);
-
-    let message = crate::guard_sources::panic_message(move || assert_delete_bucket_reserves_before_local_delete(&usecase));
-
-    assert!(message.contains("destructive peer liabilities"), "{message}");
+    for call in [
+        "store.delete_bucket(&bucket).await;",
+        "store.delete_bucket_with_notification(&bucket, false).await;",
+    ] {
+        let core = DELETE_BUCKET_INNER_FIXTURE.replace(
+            "        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;\n        LOCAL_DELETE",
+            &format!("        {call}\n        let intent = prepare_site_replication_delete_bucket(&bucket, force).await?;"),
+        );
+        let usecase = delete_bucket_fixture(&core);
+        let message = crate::guard_sources::panic_message(move || assert_delete_bucket_reserves_before_local_delete(&usecase));
+        assert!(message.contains("destructive peer liabilities"), "{message}");
+    }
 }
 
 #[test]

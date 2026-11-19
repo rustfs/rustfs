@@ -17393,6 +17393,9 @@ mod metadata_mutation_generation_tests {
                 version_id: old.version_id.map(|id| id.to_string()),
                 versioned: true,
                 mod_time: Some(old_time),
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
                 ..Default::default()
             };
             let mut source = set.get_object_info(bucket, object, &opts).await.expect("read old metadata");

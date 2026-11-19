@@ -227,7 +227,8 @@ fn listen_notification_streams_close_after_identity_policy_or_bucket_revocation(
                 let mut cred = rustfs_policy::auth::get_new_credentials_with_metadata(&claims, "listen-root-secret")
                     .expect("signed temporary credentials");
                 cred.parent_user = key.clone();
-                iam.set_temp_user(&cred.access_key, &cred, None)
+                let parent = iam.check_key(&key).await.expect("parent lookup").0.expect("parent identity");
+                iam.set_temp_user_from_parent(&cred, &parent.credentials)
                     .await
                     .expect("temporary listener");
                 Some(cred)

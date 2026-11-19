@@ -1218,15 +1218,18 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
     iam.policy_db_set(parent_key, UserType::Reg, false, "storage-session-parent-policy")
         .await
         .expect("attach parent policy");
-    let root_key = "storage-session-root";
-    let root_secret = "storage-session-root-secret";
+    if rustfs_credentials::get_global_action_cred().is_none() {
+        rustfs_credentials::init_global_action_credentials(
+            Some("storage-session-root".to_owned()),
+            Some("storage-session-root-secret".to_owned()),
+        )
+        .expect("initialize the IAM root authority");
+    }
+    let root = rustfs_credentials::get_global_action_cred().expect("IAM root authority");
+    let root_key = root.access_key.as_str();
+    let root_secret = root.secret_key.as_str();
     let context = Arc::new(AppContext::new(store, Arc::new(RequestIam { handle: iam.clone() }), Arc::new(RequestKms)));
-    assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
-        access_key: root_key.to_string(),
-        secret_key: root_secret.to_string(),
-        status: "on".to_string(),
-        ..Default::default()
-    }));
+    assert!(context.publish_action_credentials(root.clone()));
     for (key, secret) in [(root_key, root_secret), (parent_key, parent_secret)] {
         authorize_table_catalog_request(
             &table_catalog_handler_request(context.clone(), key, secret),
@@ -1261,7 +1264,13 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
             }
             let mut credential = get_new_credentials_with_metadata(&claims, root_secret).expect("sign a temporary credential");
             credential.parent_user = parent.to_string();
-            iam.set_temp_user(&credential.access_key, &credential, None)
+            let parent_identity = iam
+                .check_key(parent)
+                .await
+                .expect("parent lookup")
+                .0
+                .expect("parent identity");
+            iam.set_temp_user_from_parent(&credential, &parent_identity.credentials)
                 .await
                 .expect("store temporary credential");
             let request = load_table_request_builder(context.clone(), &credential.access_key, &credential.secret_key)
