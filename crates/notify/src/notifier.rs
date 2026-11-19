@@ -1149,11 +1149,11 @@ mod tests {
             .add(Arc::new(target.clone()))
             .expect("register target");
 
-        let mut metadata = crate::storage_api::BucketMetadata::new("bucket");
+        let mut metadata = crate::storage_api::notification::BucketMetadata::new("bucket");
         metadata.bucket_incarnation_id = old_id;
         metadata.notification_config_xml = b"<NotificationConfiguration><QueueConfiguration><Queue>arn:rustfs:sqs:us-east-1:removed-bucket:webhook</Queue><Event>s3:BucketRemoved:*</Event></QueueConfiguration></NotificationConfiguration>".to_vec();
         metadata.notification_config = Some(
-            rustfs_ecstore::api::bucket::utils::deserialize(&metadata.notification_config_xml)
+            crate::storage_api::notification::deserialize_notification_config(&metadata.notification_config_xml)
                 .expect("parse removal subscription"),
         );
         let targets = crate::bucket_removed_targets_from_metadata(&metadata);

@@ -78,3 +78,9 @@ pub(crate) mod crate_boundary {
         save_notify_server_config_snapshot, with_notify_server_config_read_lock,
     };
 }
+
+pub(crate) mod notification {
+    pub(crate) use super::{BucketMetadata, NotifyStore, refresh_notify_bucket_metadata};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::bucket::utils::deserialize as deserialize_notification_config;
+}

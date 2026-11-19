@@ -14,7 +14,7 @@
 
 use crate::rules::xml_config::{FilterRule, S3KeyFilter};
 use crate::rules::{RulesMap, TargetIdSet};
-use crate::storage_api::{BucketMetadata, NotifyStore};
+use crate::storage_api::notification::{BucketMetadata, NotifyStore};
 use percent_encoding::percent_decode_str;
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::{ARN, TargetID};
@@ -307,7 +307,7 @@ impl NotifyRuleEngine {
         if !self.request_incarnation_refresh(bucket, incarnation_id).await {
             return false;
         }
-        crate::storage_api::refresh_notify_bucket_metadata(store, bucket).await
+        crate::storage_api::notification::refresh_notify_bucket_metadata(store, bucket).await
     }
 }
 
@@ -321,7 +321,7 @@ impl Default for NotifyRuleEngine {
 mod tests {
     use super::NotifyRuleEngine;
     use crate::rules::RulesMap;
-    use crate::storage_api::BucketMetadata;
+    use crate::storage_api::notification::{BucketMetadata, deserialize_notification_config};
     use rustfs_s3_types::EventName;
     use rustfs_targets::arn::TargetID;
     use std::sync::{Arc, Weak};
@@ -401,10 +401,8 @@ mod tests {
              <Queue>arn:rustfs:sqs:us-east-1:{target}:webhook</Queue></QueueConfiguration></NotificationConfiguration>"
         )
         .into_bytes();
-        metadata.notification_config = Some(
-            rustfs_ecstore::api::bucket::utils::deserialize(&metadata.notification_config_xml)
-                .expect("parse inert notification fixture"),
-        );
+        metadata.notification_config =
+            Some(deserialize_notification_config(&metadata.notification_config_xml).expect("parse inert notification fixture"));
         Arc::new(metadata)
     }
 
@@ -553,7 +551,7 @@ mod tests {
             "</NotificationConfiguration>"
         ).as_bytes().to_vec();
         metadata.notification_config =
-            Some(rustfs_ecstore::api::bucket::utils::deserialize(&metadata.notification_config_xml).expect("parse destinations"));
+            Some(deserialize_notification_config(&metadata.notification_config_xml).expect("parse destinations"));
         let rules = super::rules_from_metadata(&metadata).expect("compile destinations");
         assert_eq!(rules.match_rules(EventName::ObjectCreatedPut, "logs/data.csv").len(), 2);
         assert_eq!(rules.match_rules(EventName::ObjectCreatedPut, "other/data.csv").len(), 1);
@@ -586,7 +584,7 @@ mod tests {
             )
             .into_bytes();
             metadata.notification_config = Some(
-                rustfs_ecstore::api::bucket::utils::deserialize(&metadata.notification_config_xml)
+                deserialize_notification_config(&metadata.notification_config_xml)
                     .expect("parse invalid but well-formed persisted route"),
             );
             assert!(super::rules_from_metadata(&metadata).is_none(), "invalid route must not dispatch");
