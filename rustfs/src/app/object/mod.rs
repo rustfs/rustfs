@@ -118,6 +118,10 @@ use super::storage_api::object_usecase::sse::{
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+pub(crate) use super::storage_api::object_usecase::{
+    DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY, EC_BLOCK_SIZE_HINT_REASON_HEADER,
+    EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, EcBlockSizeHintOutcome, resolve_ec_block_size_hint,
+};
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
@@ -226,15 +230,12 @@ mod get;
 mod get_response;
 pub(crate) use get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 mod head;
-#[cfg(feature = "gateway-stack")]
 pub(crate) use head::ResponseEtag;
 pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
 mod native_body;
 mod on_demand_migration_put;
-#[cfg(feature = "gateway-stack")]
 pub(crate) mod post_body;
-#[cfg(feature = "gateway-stack")]
 pub(crate) mod post_headers;
 mod put;
 mod put_input;

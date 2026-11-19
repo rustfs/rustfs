@@ -23,6 +23,7 @@
 //! Upstream: both edges' access phases. Downstream: every module of `storage::authorization`,
 //! `storage::access_owned`, and the use cases that read authorization state.
 
+use super::ObjectTagConditions;
 use super::{
     BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, OdmReadGenerationGuard,
     PendingDeleteBucketGenerationGuard,

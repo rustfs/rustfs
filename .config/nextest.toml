@@ -723,9 +723,8 @@ test-group = 'ecstore-serial-flaky'
 # fixture as the existing smoke modules.
 #
 # Dual-stack differential (rustfs/backlog#2740): `dual_stack_differential::`
-# starts two single-node servers from the same binary, one per
-# RUSTFS_S3_STACK value, on random ports with isolated temp dirs, and runs one
-# SDK script covering every operation of `impl S3 for FS` against both. Its
+# starts two single-node servers on random ports with isolated temp
+# dirs, and runs one SDK script covering every S3 operation against both. Its
 # comparator unit tests need no server. It meets the admission criteria
 # unchanged; the module clause admits a new differential test without another
 # filter edit.

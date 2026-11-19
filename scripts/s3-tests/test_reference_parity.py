@@ -338,8 +338,8 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(json.loads(out), TARGETS)
 
     def test_export_env_prints_validated_lines(self):
-        code, out, _ = run("export-env", "--target-json", json.dumps({"env": {"RUSTFS_S3_STACK": "gateway"}}))
-        self.assertEqual((code, out), (0, "RUSTFS_S3_STACK=gateway\n"))
+        code, out, _ = run("export-env", "--target-json", json.dumps({"env": {"RUSTFS_EXAMPLE_SETTING": "on"}}))
+        self.assertEqual((code, out), (0, "RUSTFS_EXAMPLE_SETTING=on\n"))
 
 
 class FailedTests(unittest.TestCase):

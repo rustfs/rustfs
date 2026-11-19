@@ -1077,7 +1077,7 @@ fn is_legacy_null_directory(header: &tokio_tar::Header, path: &str) -> bool {
     header.as_bytes()[TAR_TYPEFLAG_OFFSET] == b'\0' && path.as_bytes().ends_with(b"/")
 }
 
-fn is_snowball_transport_header(key: &str) -> bool {
+pub(super) fn is_snowball_transport_header(key: &str) -> bool {
     if key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT) || key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT_COMPAT) {
         return true;
     }
@@ -1620,8 +1620,8 @@ async fn authorized_extract_member_mod_time<R: AuthorizationRequest + ?Sized>(
     }
     match authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await {
         Ok(()) => Ok(archive_time),
-        Err(err) if !replication_required && err.code() == &S3ErrorCode::AccessDenied => Ok(None),
-        Err(err) => Err(err),
+        Err(err) if !replication_required && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -2018,7 +2018,6 @@ impl DefaultObjectUsecase {
         if envelope.post_object().is_some() && !envelope.is_gateway_post() {
             return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
         }
-        #[cfg(feature = "gateway-stack")]
         let input = if envelope.is_gateway_post() {
             let mut input = input;
             let archive = input
@@ -2045,10 +2044,6 @@ impl DefaultObjectUsecase {
             }
             input
         };
-        #[cfg(not(feature = "gateway-stack"))]
-        if envelope.is_gateway_post() {
-            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
-        }
         Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 
@@ -2627,7 +2622,11 @@ impl DefaultObjectUsecase {
             .await;
             if replication.replicate_any() {
                 insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-                insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+                insert_str(
+                    &mut opts.user_defined,
+                    SUFFIX_REPLICATION_TIMESTAMP,
+                    jiff::ZonedDateTime::now().to_string(),
+                );
                 insert_str(
                     &mut opts.user_defined,
                     SUFFIX_REPLICATION_STATUS,
@@ -2827,7 +2826,6 @@ impl DefaultObjectUsecase {
     }
 }
 
-#[cfg(feature = "gateway-stack")]
 #[path = "extract/post_archive_preflight.rs"]
 pub(super) mod post_archive_preflight;
 

@@ -29,7 +29,7 @@ use aws_sdk_s3::types::{
     DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
     ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
 };
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use tracing::info;
 
 use crate::common::RustFSTestEnvironment;
@@ -126,10 +126,10 @@ pub async fn put_object_with_retention(
     key: &str,
     data: &[u8],
     mode: ObjectLockRetentionMode,
-    retain_until: DateTime<Utc>,
+    retain_until: Timestamp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // AWS SDK requires UTC time without timezone offset (e.g., "2026-01-24T11:20:14Z")
-    let retain_until_str = retain_until.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let retain_until_str = retain_until.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
     let retain_until_datetime =
         aws_sdk_s3::primitives::DateTime::from_str(&retain_until_str, aws_sdk_s3::primitives::DateTimeFormat::DateTime)?;
 
@@ -181,10 +181,10 @@ pub async fn put_object_retention(
     key: &str,
     version_id: Option<&str>,
     mode: ObjectLockRetentionMode,
-    retain_until: DateTime<Utc>,
+    retain_until: Timestamp,
     bypass_governance: bool,
 ) -> Result<(), Box<SdkError<PutObjectRetentionError>>> {
-    let retain_until_datetime = aws_sdk_s3::primitives::DateTime::from_secs(retain_until.timestamp());
+    let retain_until_datetime = aws_sdk_s3::primitives::DateTime::from_secs(retain_until.as_second());
 
     let retention = ObjectLockRetention::builder()
         .mode(mode.clone())
@@ -253,6 +253,6 @@ pub async fn delete_object_with_bypass(
 }
 
 /// Calculate a future retain_until date
-pub fn future_retain_until(days: i64) -> DateTime<Utc> {
-    Utc::now() + Duration::days(days)
+pub fn future_retain_until(days: i64) -> Timestamp {
+    Timestamp::now() + SignedDuration::from_hours(days * 24)
 }

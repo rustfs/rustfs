@@ -56,7 +56,7 @@ type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
 
 #[instrument]
 pub fn print_server_info() {
-    let current_year = jiff::Zoned::now().year();
+    let current_year = jiff::ZonedDateTime::now().year();
     info!(
         target: "rustfs::init",
         event = "server_identity",
@@ -180,7 +180,7 @@ enum BucketNotificationLookup {
     Configured(rustfs_gateway_types::persistence::PersistedNotificationConfiguration),
     Missing,
     /// Stored bytes cannot be parsed. Deterministic, so a retry cannot help,
-    /// and reading it as missing would clear the bucket's rules.
+    /// and registration must not treat it as a readable empty configuration.
     Unreadable,
 }
 
@@ -199,7 +199,7 @@ fn classify_bucket_notification_lookup(
                 subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                 bucket = %bucket,
                 error = %err,
-                "Bucket notification configuration is unreadable; leaving its rules unchanged"
+                "Bucket notification configuration is unreadable; skipping rule registration"
             );
             Ok(BucketNotificationLookup::Unreadable)
         }
@@ -210,8 +210,9 @@ fn classify_bucket_notification_lookup(
 }
 
 /// Apply one bucket's persisted notification rules. An unreadable config is
-/// isolated to its bucket: it neither aborts setup for the other buckets nor
-/// clears the bucket's rules as if it had none.
+/// isolated to its bucket and does not abort setup for the other buckets.
+/// Metadata-bound server dispatch independently suppresses external delivery
+/// for unreadable snapshots rather than retaining an old subscription.
 async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
     match classify_bucket_notification_lookup(bucket, get_bucket_notification_config(bucket).await)? {
         BucketNotificationLookup::Unreadable => Ok(false),

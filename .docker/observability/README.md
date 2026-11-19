@@ -34,6 +34,10 @@ If you want the Kafka-backed HA Tempo path, use `docker-compose-example-for-rust
 - **High Performance**: Optimized configurations for batching, compression, and memory management.
 - **Standardized Protocols**: Built entirely on OpenTelemetry standards.
 
+## HTTP Request Latency Percentiles
+
+The main RustFS dashboard shows request latency percentiles in milliseconds. The HTTP server request, response-body chunk, and response-body stream histograms export bucket boundaries in seconds. During a rolling upgrade or rollback that changes the bucket layout, compute percentiles from nodes that share one layout and from a query window entirely on that layout. The bundled dashboard and recording rules use a five-minute window. The mean from `_sum` divided by `_count` remains usable across the change.
+
 ## GET Performance Optimization Dashboards
 
 Three pre-built Grafana dashboards are included for monitoring RustFS GET performance optimization rollout:

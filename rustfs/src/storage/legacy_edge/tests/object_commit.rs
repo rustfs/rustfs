@@ -90,7 +90,6 @@ fn complete_answer_writes_header_members_as_headers_and_escapes_the_tag() {
         ..Default::default()
     };
 
-    #[cfg(feature = "gateway-stack")]
     {
         use rustfs_gateway::{Limits, MetaView, OperationCodec, TargetKind, WireRequest};
         let request = http::Request::builder()

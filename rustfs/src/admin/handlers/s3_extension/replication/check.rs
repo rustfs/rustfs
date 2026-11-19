@@ -32,7 +32,7 @@ use crate::admin::storage_api::bucket::AdminReplicationConfigExt as _;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use crate::admin::storage_api::bucket::target_sys::{
-    BucketTargetSys, S3ClientError, SsecPassthroughCapability, TargetClient, VersionIdentityCapability,
+    S3ClientError, SsecPassthroughCapability, TargetClient, VersionIdentityCapability,
 };
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::error::StorageError;
@@ -260,12 +260,16 @@ fn validate_replication_check_config_targets(
     targets: &BucketTargets,
     config: &PersistedReplicationConfiguration,
 ) -> S3Result<()> {
-    let configured_arns = targets
-        .targets
-        .iter()
-        .filter(|target| target.target_type == BucketTargetType::ReplicationService)
-        .map(|target| target.arn.as_str())
-        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut configured_arns = HashSet::new();
+    for target in &targets.targets {
+        if !seen.insert(target.arn.as_str()) {
+            return Err(s3_error!(InvalidRequest, "target ARN is ambiguous in this source bucket"));
+        }
+        if target.target_type == BucketTargetType::ReplicationService {
+            configured_arns.insert(target.arn.as_str());
+        }
+    }
 
     let role = config.role.trim();
     if !role.is_empty() {
@@ -408,14 +412,10 @@ async fn check_replication_target(
     // re-learning what the probe just established.
     match (result.phases.ssec_passthrough.status, result.phases.ssec_passthrough.code) {
         ("OK", _) => {
-            BucketTargetSys::get()
-                .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Supported)
-                .await;
+            target_client.record_ssec_passthrough_capability(SsecPassthroughCapability::Supported);
         }
         ("FAILED", Some(REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH)) => {
-            BucketTargetSys::get()
-                .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Unsupported)
-                .await;
+            target_client.record_ssec_passthrough_capability(SsecPassthroughCapability::Unsupported);
         }
         _ => {}
     }
@@ -424,10 +424,10 @@ async fn check_replication_target(
     // re-driving PUTs whenever a version-addressed HEAD answers 404.
     match (result.phases.version_fidelity.status, result.phases.version_fidelity.code) {
         ("OK", _) => {
-            BucketTargetSys::get().record_version_identity_capability(&target.arn, VersionIdentityCapability::Adopts);
+            target_client.record_version_identity_capability(VersionIdentityCapability::Adopts);
         }
         ("FAILED", Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH)) => {
-            BucketTargetSys::get().record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+            target_client.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
         }
         _ => {}
     }

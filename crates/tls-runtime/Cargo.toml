@@ -30,12 +30,11 @@ workspace = true
 [features]
 default = []
 fips = ["rustls/fips"]
-hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-common/hotpath", "rustfs-config/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-common/hotpath-alloc", "rustfs-config/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-common/hotpath-cpu", "rustfs-config/hotpath-cpu"]
+hotpath = ["rustfs-common/hotpath", "rustfs-config/hotpath"]
+hotpath-alloc = ["hotpath", "rustfs-common/hotpath-alloc", "rustfs-config/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "rustfs-common/hotpath-cpu", "rustfs-config/hotpath-cpu"]
 
 [dependencies]
-hotpath.workspace = true
 rustfs-common.workspace = true
 rustfs-config.workspace = true
 arc-swap.workspace = true

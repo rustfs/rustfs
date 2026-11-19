@@ -269,7 +269,6 @@ impl DefaultMultipartUsecase {
                     .map_err(multipart_upload_api_error)?;
                 (upload_id, info)
             }
-            #[cfg(any(feature = "gateway-stack", test))]
             UploadPartTarget::Gateway {
                 bucket: bound_bucket,
                 key: bound_key,

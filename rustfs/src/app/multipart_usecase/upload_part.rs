@@ -20,21 +20,17 @@ use crate::app::object::BodyChunks;
 use crate::app::object::request_body::{DemandReader, UploadChunks, guard_native_upload_progress};
 use crate::app::storage_api::multipart_usecase::access::AuthorizationRequest;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
-#[cfg(any(feature = "gateway-stack", test))]
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOwner;
 use http_body::Body as _;
 use rustfs_gateway_stream::Body;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::{RecordedUpload, resolve_upload_async};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
-#[cfg(any(feature = "gateway-stack", test))]
 pub(super) struct PartUpload {
     pub(super) owner: MultipartOwner,
     pub(super) info: MultipartInfo,
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 impl RecordedUpload for PartUpload {
     fn bucket(&self) -> &str {
         &self.owner.bucket
@@ -50,7 +46,6 @@ async fn lookup_part_upload(store: &ECStore, bucket: &str, key: &str, id: &str, 
     result.map_err(|error| multipart_upload_api_error(error).into())
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 pub(super) async fn lookup_recorded_part_upload(
     store: &ECStore,
     bucket: &str,
@@ -221,7 +216,6 @@ impl DefaultMultipartUsecase {
                 let info = lookup_part_upload(&store, bucket, key, upload_id, &opts).await?;
                 (upload_id.clone(), info)
             }
-            #[cfg(any(feature = "gateway-stack", test))]
             UploadPartTarget::Gateway {
                 bucket: bucket_name,
                 key: object_key,
@@ -514,6 +508,7 @@ mod tests {
     use crate::app::object::legacy_put_body;
     use crate::app::storage_api::s3::S3ErrorCode as LegacyErrorCode;
     use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+    use http::HeaderValue;
 
     fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
         let mut req = build_request(UploadPartInput::default(), Method::PUT);

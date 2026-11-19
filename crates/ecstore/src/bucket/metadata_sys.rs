@@ -2612,6 +2612,10 @@ impl BucketMetadataSys {
         }
     }
 
+    pub(crate) async fn cached_metadata(&self) -> Vec<Arc<BucketMetadata>> {
+        self.metadata_map.read().await.values().cloned().collect()
+    }
+
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
         self.revoke_pending_bucket_creation(&bucket).await;
         bump_local_meta_mutation_gen();
@@ -5758,6 +5762,64 @@ mod tests {
             .await
             .expect("tagging should be readable");
         assert_eq!(tags.tag_set.len(), WRITERS, "every concurrent rewrite must survive: {tags:?}");
+    }
+
+    #[tokio::test]
+    async fn notification_snapshots_follow_periodic_refresh_after_lost_peer_signals() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let writer = BucketMetadataSys::new(store.clone());
+        let peer = Arc::new(RwLock::new(BucketMetadataSys::new(store.clone())));
+        let bucket = "notification-periodic-snapshots";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("create empty fixture bucket");
+        }
+        let mut original = BucketMetadata::new(bucket);
+        original.notification_config_xml = concat!(
+            "<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:Put</Event>",
+            "<Queue>arn:rustfs:sqs:us-east-1:inert:webhook</Queue></QueueConfiguration></NotificationConfiguration>"
+        )
+        .as_bytes()
+        .to_vec();
+        original.parse_all_configs().expect("parse inert subscription");
+        writer
+            .persist_new_and_set(original)
+            .await
+            .expect("persist initial subscription");
+        peer.read().await.reload_from_store(bucket).await.expect("prime peer cache");
+        let old = peer.read().await.get(bucket).await.expect("cached original snapshot");
+
+        let mut removed = (*old).clone();
+        removed.notification_config_xml = b"<NotificationConfiguration/>".to_vec();
+        removed.parse_all_configs().expect("parse removed subscription");
+        writer
+            .persist_new_and_set(removed)
+            .await
+            .expect("persist removal without peer callback");
+        assert!(Arc::ptr_eq(&old, &peer.read().await.get(bucket).await.expect("peer remains stale")));
+
+        // Exercise the timer's actual one-pass entry point, not the peer RPC.
+        refresh_buckets_metadata_once(peer.clone()).await;
+        let snapshots = peer.read().await.cached_metadata().await;
+        assert_eq!(snapshots.len(), 1);
+        assert!(!Arc::ptr_eq(&old, &snapshots[0]));
+        assert_eq!(old.bucket_incarnation_id, snapshots[0].bucket_incarnation_id);
+        assert_eq!(snapshots[0].notification_config_xml, b"<NotificationConfiguration/>");
+        assert!(
+            snapshots[0]
+                .notification_config
+                .as_ref()
+                .expect("parsed removal")
+                .behavior()
+                .queue_routes
+                .is_empty()
+        );
+
+        for dir in &dirs {
+            std::fs::remove_dir(dir.path().join(bucket)).expect("remove empty fixture bucket without peer callback");
+        }
+        refresh_buckets_metadata_once(peer.clone()).await;
+        assert!(peer.read().await.cached_metadata().await.is_empty());
+        assert!(peer.read().await.get(bucket).await.is_err());
     }
 
     /// Pins the peer reload-notification contract (`reload_from_store`, the

@@ -101,7 +101,7 @@ use crate::table_catalog;
 #[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, Uri};
 use metrics::counter;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
@@ -132,7 +132,6 @@ mod create;
 mod create_values;
 pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
-#[cfg(feature = "gateway-stack")]
 pub(crate) use list::ListPartsInfo;
 pub(crate) use list::{ListPartsFields, ListPartsTarget};
 #[cfg(test)]

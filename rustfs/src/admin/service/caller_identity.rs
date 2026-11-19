@@ -132,8 +132,7 @@ impl CallerIdentity {
     /// Authenticate the request and resolve who it acts as.
     ///
     /// Authentication only: callers that need an authorization decision must
-    /// still gate on an admin action. Self-service endpoints deliberately do
-    /// not, because every authenticated identity may inspect and manage itself.
+    /// still enforce their action policy and credential eligibility checks.
     pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
         let Some(input_cred) = envelope.credentials() else {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
