@@ -18,26 +18,64 @@ use crate::storage_api::ecstore_spawn_blocking_with_resource_ownership as spawn_
 // Keep Tokio's existing bounded prefetch and one native job per refill.
 const DIRECTORY_CHUNK_SIZE: usize = 32;
 
+#[derive(Clone)]
 pub(super) struct DirEntry {
-    entry: Arc<std::fs::DirEntry>,
+    source: EntrySource,
     file_type: Option<FileType>,
 }
 
+#[derive(Clone)]
+enum EntrySource {
+    Native(Arc<std::fs::DirEntry>),
+    Recorded { parent: Arc<std::path::Path>, name: OsString },
+}
+
 impl DirEntry {
+    pub(super) fn recorded(parent: Arc<std::path::Path>, name: OsString, file_type: Option<FileType>) -> Self {
+        Self {
+            source: EntrySource::Recorded { parent, name },
+            file_type,
+        }
+    }
+
+    pub(super) fn is_recorded(&self) -> bool {
+        matches!(&self.source, EntrySource::Recorded { .. })
+    }
+
+    pub(super) fn cached_type(&self) -> Option<FileType> {
+        self.file_type
+    }
+
     pub(super) fn path(&self) -> PathBuf {
-        self.entry.path()
+        match &self.source {
+            EntrySource::Native(entry) => entry.path(),
+            EntrySource::Recorded { parent, name } => parent.join(name),
+        }
     }
 
     pub(super) fn file_name(&self) -> OsString {
-        self.entry.file_name()
+        match &self.source {
+            EntrySource::Native(entry) => entry.file_name(),
+            EntrySource::Recorded { name, .. } => name.clone(),
+        }
     }
 
     pub(super) async fn file_type(&self) -> io::Result<FileType> {
         if let Some(file_type) = self.file_type {
             return Ok(file_type);
         }
-        let entry = self.entry.clone();
-        spawn_native(move || entry.file_type()).await.map_err(io::Error::other)?
+        match &self.source {
+            EntrySource::Native(entry) => {
+                let entry = entry.clone();
+                spawn_native(move || entry.file_type()).await.map_err(io::Error::other)?
+            }
+            EntrySource::Recorded { parent, name } => {
+                let path = parent.join(name);
+                spawn_native(move || std::fs::symlink_metadata(path).map(|meta| meta.file_type()))
+                    .await
+                    .map_err(io::Error::other)?
+            }
+        }
     }
 }
 
@@ -57,7 +95,7 @@ impl DirectoryBuffer {
             let success = entry.is_ok();
             self.entries.push_back(entry.map(|entry| DirEntry {
                 file_type: entry.file_type().ok(),
-                entry: Arc::new(entry),
+                source: EntrySource::Native(Arc::new(entry)),
             }));
             if !success {
                 break;
@@ -74,10 +112,14 @@ enum DirectoryState {
 
 pub(super) struct ReadDir {
     state: DirectoryState,
+    #[cfg(test)]
+    slow_directory: bool,
 }
 
 impl ReadDir {
     pub(super) async fn open(path: &str) -> io::Result<Self> {
+        #[cfg(test)]
+        let slow_directory = super::tests::fair_prefix_quantum::is_slow_directory(path);
         let path = PathBuf::from(path);
         let buffer = spawn_native(move || {
             let mut buffer = DirectoryBuffer {
@@ -92,12 +134,18 @@ impl ReadDir {
         .map_err(io::Error::other)??;
         Ok(Self {
             state: DirectoryState::Idle(Some(buffer)),
+            #[cfg(test)]
+            slow_directory,
         })
     }
 
     pub(super) async fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
         // Keep a pending refill on the reader, not in the borrowed next-entry
         // future. Cancelling that future must not skip its prefetched entries.
+        #[cfg(test)]
+        if self.slow_directory {
+            super::tests::fair_prefix_quantum::charge_physical_read().await;
+        }
         poll_fn(|cx| self.poll_next_entry(cx)).await
     }
 

@@ -533,6 +533,18 @@ async fn erasure_candidate_defers_metadata_until_part_classification_finishes() 
 #[tokio::test]
 #[serial]
 async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassifies_on_resume() {
+    check_candidate_resume(true, 136).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn erasure_candidate_warm_resume_avoids_rereading_sealed_root() {
+    check_candidate_resume(false, 135).await;
+}
+
+async fn check_candidate_resume(cold_disk: bool, expected_io: u64) {
+    use crate::storage_api::owner::EcstoreDiskAPI;
+
     let (mut scanner, root, folder) = candidate_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -597,6 +609,19 @@ async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassi
     assert_eq!(index.indexed_entries().expect("index entries").len(), 64);
     let bytes = serde_json::to_vec(&snapshot).expect("serialize partial checkpoint");
     let reloaded: DataUsageCache = serde_json::from_slice(&bytes).expect("reload partial checkpoint");
+    // A cold owner reconstructs the root listing as well as the candidate.
+    // Keeping the same disk handle would resume its process-local root queue.
+    if cold_disk {
+        scanner.local_disk = new_disk(
+            &scanner.local_disk.endpoint(),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("reopen cold scanner disk");
+    }
     scanner.old_cache = reloaded.clone();
     scanner.new_cache = reloaded;
     scanner.raw_enumeration_progress.clear();
@@ -615,8 +640,8 @@ async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassi
     );
     assert_eq!(
         charged_ops(&root),
-        136,
-        "resume recharges actual reads; the raw index is not a filesystem seek"
+        expected_io,
+        "resume charges every physical read, including cold reconstruction of the root"
     );
 }
 

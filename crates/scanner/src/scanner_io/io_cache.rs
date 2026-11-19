@@ -15,6 +15,9 @@ use super::*;
 /// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
 use crate::data_usage_define::clone_cache_value;
 
+mod walker_slots;
+use walker_slots::AvailableWalkers;
+
 pub(super) async fn collect_completed_bucket_results(
     ctx: CancellationToken,
     mut cache: DataUsageCache,
@@ -989,12 +992,12 @@ impl ScannerIOCache for SetDisks {
         if turn_bucket_count == 0 {
             bucket_work_complete.cancel();
         }
-        for NamespaceScannerWalker {
-            disk,
-            mode: worker_mode,
-            local_admission,
-        } in walkers
-        {
+        let walker_count = walkers.len();
+        let available_walkers = Arc::new(AvailableWalkers::new(walkers, |disk| {
+            crate::storage_api::owner::EcstoreDiskAPI::endpoint(disk.as_ref()).to_string()
+        }));
+        for _ in 0..walker_count {
+            let available_walkers = available_walkers.clone();
             let service_cohort_clone = service_cohort.clone();
             let usage_watch_cohort_clone = usage_watch_cohort.clone();
             let usage_watch_store_clone = usage_watch_store.clone();
@@ -1026,18 +1029,18 @@ impl ScannerIOCache for SetDisks {
             let worker_retired_buckets = retired_buckets.clone();
             #[cfg(feature = "e2e-test-hooks")]
             let worker_incarnations = current_bucket_incarnations.clone();
-            let remote_capabilities = match worker_mode {
-                NamespaceScannerWorkerMode::RemoteV4(capabilities) => Some(capabilities),
-                NamespaceScannerWorkerMode::Coordinator => None,
-            };
             #[cfg(test)]
             let worker_index = futs.len();
             futs.push(AbortOnDropHandle::new(tokio::spawn(async move {
                 #[cfg(test)]
                 super::tests::observe_coordinator_bucket_worker_started(worker_index).await;
-                let remote_session_id = uuid::Uuid::new_v4();
-                let mut remote_session_sequence = 0_u64;
+                // Returning at the top of the loop keeps the retiring disk unavailable
+                // on every break, cancellation, or panic, including after requeue.
+                let mut previous_walker = None;
                 loop {
+                    if let Some(slot) = previous_walker.take() {
+                        available_walkers.release(slot);
+                    }
                     // Do not prefetch a FIFO member into an independently
                     // scheduled permit waiter: that can reorder admissions.
                     let permit_wait_start = Instant::now();
@@ -1050,18 +1053,39 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
                     let permit_wait_elapsed = permit_wait_start.elapsed();
-                    let bucket = tokio::select! {
+                    let (bucket, slot) = tokio::select! {
                         _ = bucket_work_complete_clone.cancelled() => break,
                         _ = ctx_clone.cancelled() => break,
-                        bucket = async { bucket_rx_mutex_clone.lock().await.recv().await } => {
-                            let Some(bucket) = bucket else {
-                                break;
-                            };
-                            bucket
+                        selected = async {
+                            let mut receiver = bucket_rx_mutex_clone.lock().await;
+                            let bucket = receiver.recv().await?;
+                            // Select while still owning FIFO admission, so the oldest bucket
+                            // gets its preferred disk before later waiters can borrow it.
+                            let parked = crate::scanner_folder::parked_bucket_disks(&bucket.name);
+                            let slot = available_walkers.take_for_bucket(&bucket.name, |disk| {
+                                parked.iter().any(|owner| owner.ptr_eq(&Arc::downgrade(disk)))
+                            });
+                            Some((bucket, slot))
+                        } => match selected {
+                            Some(pair) => pair,
+                            None => break,
                         }
                     };
                     let mut work_guard =
                         BucketWorkGuard::new(remaining_bucket_work_clone.clone(), bucket_work_complete_clone.clone());
+                    let Some(slot) = slot else {
+                        // Each live queue consumer owns at most one walker. On retirement a
+                        // consumer and its last walker leave together.
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        break;
+                    };
+                    let slot = previous_walker.insert(slot);
+                    let disk = slot.walker.disk.clone();
+                    let local_admission = &slot.walker.local_admission;
+                    let remote_capabilities = match slot.walker.mode {
+                        NamespaceScannerWorkerMode::RemoteV4(capabilities) => Some(capabilities),
+                        NamespaceScannerWorkerMode::Coordinator => None,
+                    };
                     // Prefix hints are process-local. Never hand one to a
                     // remote or legacy-coordinator disk path.
                     let prefix_scan_scope = disk.is_local().then(|| scope_clone.prefix_scope_for(&bucket.name)).flatten();
@@ -1181,8 +1205,8 @@ impl ScannerIOCache for SetDisks {
                     let bucket_checkpoint_plan_digest = bucket_plans.coverage;
 
                     if let Some(capabilities) = remote_capabilities {
-                        let request_sequence = remote_session_sequence;
-                        let Some(next_sequence) = remote_session_sequence.checked_add(1) else {
+                        let request_sequence = slot.remote_session_sequence;
+                        let Some(next_sequence) = request_sequence.checked_add(1) else {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                             error!(
                                 target: "rustfs::scanner::io",
@@ -1195,7 +1219,7 @@ impl ScannerIOCache for SetDisks {
                             );
                             break;
                         };
-                        remote_session_sequence = next_sequence;
+                        slot.remote_session_sequence = next_sequence;
                         let remote_scan = crate::remote_scanner::scan_remote_bucket(
                             &disk,
                             if capabilities.supports_durable_progress || capabilities.supports_complete_observation || capabilities.supports_usage_watch {
@@ -1209,7 +1233,7 @@ impl ScannerIOCache for SetDisks {
                                 next_cycle: want_cycle,
                                 leader_epoch,
                                 server_epoch: capabilities.server_epoch,
-                                session_id: remote_session_id,
+                                session_id: slot.remote_session_id,
                                 session_sequence: request_sequence,
                                 plans: bucket_plans,
                                 supports_durable_progress: capabilities.supports_durable_progress,
@@ -1402,7 +1426,7 @@ impl ScannerIOCache for SetDisks {
                         continue;
                     }
 
-                    let _local_admission = if let Some(share) = &local_admission {
+                    let _local_admission = if let Some(share) = local_admission {
                         match share.acquire(&disk) {
                             Ok(admission) => Some(admission),
                             Err(e) => {
@@ -1485,8 +1509,13 @@ impl ScannerIOCache for SetDisks {
                     };
 
                     let mut cache = DataUsageCache::default();
-                    let mut revisions = match cache.load_with_revisions(store_clone_clone.clone(), &cache_name).await {
-                        Ok(revisions) => revisions,
+                    let mut revisions = match Box::pin(cache.load_for_scan(store_clone_clone.clone(), &cache_name, &scan_ctx, &bucket_budget)).await {
+                        Ok(Some(revisions)) => revisions,
+                        Ok(None) => {
+                            work_guard.mark_service_interrupted();
+                            record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                            continue;
+                        }
                         Err(e) => {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                             error!(

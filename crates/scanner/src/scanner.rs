@@ -34,8 +34,9 @@ use crate::runtime_config::{
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::{
-    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, dirty_usage_bucket_notified, dirty_usage_buckets_pending,
-    dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
+    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, ScannerServiceCohort, dirty_usage_bucket_notified,
+    dirty_usage_buckets_pending, dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed,
+    scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
@@ -1212,6 +1213,8 @@ where
         }
 
         let mut transient_backoff = ScannerRetryBackoff::default();
+        // Only this supervisor, for this storage instance, owns resumable service.
+        let mut service_continuation = None;
         let mut recovery_retry_count = 0_u32;
         loop {
             if ctx_clone.is_cancelled() {
@@ -1226,6 +1229,7 @@ where
                 startup_features,
                 startup_maintenance_generation,
                 startup,
+                &mut service_continuation,
             )
             .await;
             if let Err(e) = &run_result {
@@ -1773,11 +1777,26 @@ where
     }
 }
 
+/// Scheduling and mutation witnesses retained across a clean local deadline.
+/// Only an immediately succeeding leadership claim can resume this cohort.
+struct ScannerServiceContinuation {
+    cohort: Arc<StdMutex<ScannerServiceCohort>>,
+    fenced_epoch: u64,
+    fenced_revision: DataUsageCacheRevision,
+}
+
+impl ScannerServiceContinuation {
+    fn matches_claim(&self, previous_revision: &DataUsageCacheRevision, claimed_epoch: u64) -> bool {
+        &self.fenced_revision == previous_revision && self.fenced_epoch.checked_add(1) == Some(claimed_epoch)
+    }
+}
+
 struct ScannerCycleDeadlineState<'a> {
     cycle_info: &'a mut CurrentCycle,
     cycle_revision: &'a mut DataUsageCacheRevision,
     leader_epoch: &'a mut u64,
     cycle_budget: &'a ScannerCycleBudget,
+    service_cohort: Arc<StdMutex<ScannerServiceCohort>>,
     allow_bootstrap_pending: bool,
 }
 
@@ -1791,7 +1810,8 @@ async fn handle_scanner_cycle_deadline<Store>(
     state: ScannerCycleDeadlineState<'_>,
     worker_stopped: bool,
     guard: &mut NamespaceLockGuard,
-) where
+) -> Option<ScannerServiceContinuation>
+where
     Store: ScannerObjectIO + ScannerConfigObjectDelete,
 {
     let fenced = fence_scanner_epoch_after_cycle_timeout(
@@ -1821,8 +1841,14 @@ async fn handle_scanner_cycle_deadline<Store>(
     global_metrics().record_scanner_cycle_timeout(recovery_required, state.cycle_budget.progress_age());
     // Stop renewing before releasing the lease. A new leader can then claim the
     // higher persisted generation instead of inheriting the expired worker.
+    let may_resume = !recovery_required && !guard.is_lock_lost() && !ctx.is_cancelled();
     guard.release();
     global_metrics().set_cycle(None).await;
+    may_resume.then(|| ScannerServiceContinuation {
+        cohort: state.service_cohort,
+        fenced_epoch: *state.leader_epoch,
+        fenced_revision: state.cycle_revision.clone(),
+    })
 }
 
 async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard: &mut ScannerCycleMetricsGuard) {
@@ -2909,6 +2935,7 @@ where
         maintenance_features,
         maintenance_generation,
         runtime_guard.startup_token(),
+        &mut None,
     )
     .await
 }
@@ -2995,10 +3022,12 @@ async fn run_data_scanner_with_maintenance_state<S>(
     mut maintenance_features: ScannerMaintenanceFeatures,
     mut maintenance_generation_seen: Option<u64>,
     startup: ScannerStartupToken,
+    continuation: &mut Option<ScannerServiceContinuation>,
 ) -> Result<(), ScannerError>
 where
     S: ScannerStorage,
 {
+    let previous = continuation.take();
     reset_scanner_cycle_schedule();
     // Normal scanner entry is an attempt, not evidence of leadership, coverage, or publication.
     global_metrics().startup().record_attempt(startup);
@@ -3108,7 +3137,6 @@ where
     let mut deferred_backoff = ScannerRetryBackoff::default();
     let mut scope_fallback_backoff = ScannerRetryBackoff::default();
     let scope_fallback_slot = Arc::new(ScannerScopeFallbackSlot::default());
-    let service_cohort = Arc::new(StdMutex::new(crate::scanner_io::ScannerServiceCohort::default()));
     let initial_runtime_config = resolve_scanner_runtime_config();
     if clean_idle_topology_supported && maintenance_generation_seen.is_none() {
         let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
@@ -3269,6 +3297,7 @@ where
         finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
         return Ok(());
     }
+    let previous_revision = cycle_revision.clone();
     let claim_ctx = ctx.child_token();
     let leadership_claimed = await_scanner_cycle_with_lock_fence(
         &claim_ctx,
@@ -3318,6 +3347,10 @@ where
         finish_scanner_leader_iteration(false, "epoch_claim_failed", "leadership epoch claim failed".to_string()).await;
         return Ok(());
     }
+    let service_cohort = previous
+        .filter(|previous| previous.matches_claim(&previous_revision, leader_epoch))
+        .map(|previous| previous.cohort)
+        .unwrap_or_default();
     if rebuild_from_quarantine {
         record_scanner_cycle_state_rebuilt_from_quarantine(cycle_info.next, leader_epoch);
     }
@@ -3402,7 +3435,7 @@ where
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
-                handle_scanner_cycle_deadline(
+                *continuation = handle_scanner_cycle_deadline(
                     &ctx,
                     storeapi.clone(),
                     ScannerCycleDeadlineState {
@@ -3410,6 +3443,7 @@ where
                         cycle_revision: &mut cycle_revision,
                         leader_epoch: &mut leader_epoch,
                         cycle_budget: &cycle_budget,
+                        service_cohort,
                         allow_bootstrap_pending: allow_usage_floor_bootstrap_pending,
                     },
                     worker_stopped,
@@ -3747,7 +3781,7 @@ where
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
-                handle_scanner_cycle_deadline(
+                *continuation = handle_scanner_cycle_deadline(
                     &ctx,
                     storeapi.clone(),
                     ScannerCycleDeadlineState {
@@ -3755,6 +3789,7 @@ where
                         cycle_revision: &mut cycle_revision,
                         leader_epoch: &mut leader_epoch,
                         cycle_budget: &cycle_budget,
+                        service_cohort,
                         allow_bootstrap_pending: allow_usage_floor_bootstrap_pending,
                     },
                     worker_stopped,

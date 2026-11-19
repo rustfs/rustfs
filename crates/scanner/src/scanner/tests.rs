@@ -52,6 +52,7 @@ const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 mod cycle_budget_publication;
 pub(super) mod cycle_persist_failure;
 mod gate_self_heal;
+mod paged_checkpoint;
 mod quota_reset_preservation;
 
 mod recovery_control;
@@ -773,7 +774,8 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     );
     budget.mark_cycle_state_persisted();
 
-    handle_scanner_cycle_deadline(
+    let service_cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let continuation = handle_scanner_cycle_deadline(
         &ctx,
         store.clone(),
         ScannerCycleDeadlineState {
@@ -781,12 +783,24 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
             cycle_revision: &mut cycle_revision,
             leader_epoch: &mut leader_epoch,
             cycle_budget: &budget,
+            service_cohort: service_cohort.clone(),
             allow_bootstrap_pending: false,
         },
         true,
         &mut guard,
     )
-    .await;
+    .await
+    .expect("a fully drained and fenced deadline retains the live cohort across supervisor iterations");
+    assert!(Arc::ptr_eq(&continuation.cohort, &service_cohort));
+    assert!(continuation.matches_claim(&cycle_revision, 3));
+    assert!(
+        !continuation.matches_claim(&cycle_revision, 4),
+        "an intervening owner ends the continuation"
+    );
+    assert!(
+        !continuation.matches_claim(&DataUsageCacheRevision::Missing, 3),
+        "a replaced cursor ends the continuation"
+    );
 
     assert!(guard.is_released());
     assert_eq!(leader_epoch, 2, "deadline handler should claim the next epoch");
@@ -989,6 +1003,7 @@ struct MemoryConfigStore {
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
     read_errors: Mutex<HashMap<String, EcstoreError>>,
     delayed_gets: Mutex<HashMap<String, Duration>>,
+    checkpoint_page_delay_ms: AtomicUsize,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
     /// Fail every put whose number is at least the stored value.
@@ -1046,6 +1061,12 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             .await
             .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         let key = memory_config_key(bucket, object);
+        if object.contains(".pages/") {
+            let delay = self.checkpoint_page_delay_ms.load(Ordering::Relaxed);
+            if delay != 0 {
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+            }
+        }
         if let Some(error) = self.read_errors.lock().await.get(&key).cloned() {
             return Err(error);
         }
@@ -5003,6 +5024,12 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
     async fn delete_config_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> EcstoreResult<ObjectInfo> {
         let key = memory_config_key(bucket, object);
         let mut objects = self.objects.lock().await;
+        if opts.delete_prefix && !opts.delete_prefix_object {
+            assert!(opts.http_preconditions.is_none(), "fixture prefix deletion cannot condition one object");
+            objects.retain(|object, _| !object.starts_with(&key));
+            self.revisions.lock().await.retain(|object, _| !object.starts_with(&key));
+            return Ok(ObjectInfo::default());
+        }
         if !objects.contains_key(&key) {
             return Err(EcstoreError::FileNotFound);
         }

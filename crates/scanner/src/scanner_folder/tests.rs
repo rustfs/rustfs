@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
-mod fair_prefix_quantum;
+pub(super) mod fair_prefix_quantum;
 mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;
@@ -3144,6 +3144,12 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
         parent: None,
         object_heal_prob_div: 1,
     };
+    // The sorted queue can reach a budget stop after linking a clean prefix
+    // but before the first dirty child advances the durable sweep frontier.
+    assert!(!scanner.can_reuse_covered_namespace("bucket/clean", false));
+    assert!(scanner.can_restore_linked_child(&folder, &DataUsageEntry::default(), "bucket/clean"));
+    assert!(!scanner.can_restore_linked_child(&folder, &DataUsageEntry::default(), "bucket/dirty"));
+    assert!(!scanner.can_restore_linked_child(&folder, &DataUsageEntry::default(), "bucket/absent"));
     let mut root = DataUsageEntry::default();
     scanner
         .scan_folder(CancellationToken::new(), folder, &mut root)

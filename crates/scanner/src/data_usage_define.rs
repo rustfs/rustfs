@@ -200,10 +200,25 @@ pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub(crate) struct DataUsageCacheRevisions {
     main: DataUsageCacheRevision,
     backup: Option<DataUsageCacheRevision>,
+    damaged_pages: DamagedPages,
+}
+
+// Admissions compare CAS tokens. A reader's local repair hint does not
+// indicate that either committed object changed while its locks were released.
+impl PartialEq for DataUsageCacheRevisions {
+    fn eq(&self, other: &Self) -> bool {
+        self.main == other.main && self.backup == other.backup
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DamagedPages {
+    main: bool,
+    backup: bool,
 }
 
 pub static DATA_USAGE_BUCKET: LazyLock<String> =

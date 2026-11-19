@@ -11378,6 +11378,7 @@ dependencies = [
  "rustfs-test-utils",
  "rustfs-utils",
  "s3s",
+ "same-file",
  "serde",
  "serde_json",
  "serial_test",

@@ -4,6 +4,25 @@
 use super::enumeration_restart::{install_raw_entry_observer, observed_raw_entries, seed_flat_bucket};
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
+use std::cell::Cell;
+use std::path::PathBuf;
+
+const PHYSICAL_READ_COST: Duration = Duration::from_secs(60);
+
+tokio::task_local! {
+    static SLOW_DIRECTORY: (PathBuf, Cell<usize>);
+}
+
+pub(in crate::scanner_folder) fn is_slow_directory(path: &str) -> bool {
+    SLOW_DIRECTORY.try_with(|(directory, _)| directory.as_path() == std::path::Path::new(path)) == Ok(true)
+}
+
+/// Charge every read attempt (including replay and EOF) before entries leave
+/// the native buffer, so cancelling a simulated slow read cannot skip a name.
+pub(in crate::scanner_folder) async fn charge_physical_read() {
+    SLOW_DIRECTORY.with(|(_, reads)| reads.set(reads.get() + 1));
+    tokio::time::advance(PHYSICAL_READ_COST).await;
+}
 
 async fn open_fixture_disk(disk_root: &std::path::Path) -> Arc<Disk> {
     let endpoint = Endpoint::try_from(disk_root.to_string_lossy().as_ref()).expect("fixture endpoint");
@@ -16,6 +35,73 @@ async fn open_fixture_disk(disk_root: &std::path::Path) -> Arc<Disk> {
     )
     .await
     .expect("open synthetic disk")
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn wide_directory_runtime_budget_reaches_eof() {
+    const WIDTH: usize = 48;
+    const ROUNDS: usize = 16;
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let mut cache = seed_flat_bucket(&disk_root, WIDTH).await;
+    let disk = open_fixture_disk(&disk_root).await;
+    let mut anchor = FileInfo::new("large", 4, 2);
+    anchor.volume = "bucket".to_owned();
+    anchor.version_id = Some(Uuid::from_u128(1000));
+    anchor.versioned = true;
+    anchor.mod_time = Some(OffsetDateTime::now_utc());
+    anchor.size = 4096;
+    let mut metadata = FileMeta::new();
+    metadata.add_version(anchor).expect("large fixture object");
+    write_test_object_metadata_bytes(&disk_root, "bucket", "large", &metadata.marshal_msg().expect("encode large object")).await;
+    let parent = CancellationToken::new();
+    let expected = (WIDTH + 1, WIDTH + 4096);
+    let scan = async {
+        for prior_timeouts in 0..ROUNDS {
+            let budget = ScannerCycleBudget::new_with_progress_tracking(
+                &parent,
+                ScannerCycleBudgetConfig {
+                    max_duration: Some(8 * PHYSICAL_READ_COST),
+                    ..Default::default()
+                },
+            );
+            let result = scan_data_folder(
+                budget.token(),
+                budget.clone(),
+                vec![disk.clone()],
+                disk.clone(),
+                cache.clone(),
+                None,
+                HealScanMode::Normal,
+                SCANNER_SLEEPER.clone(),
+            )
+            .await;
+            match result {
+                Ok(complete) => {
+                    assert!(prior_timeouts >= 2, "the wide directory must span multiple actual runtime deadlines");
+                    assert!(complete.info.snapshot_complete);
+                    let totals = complete.checked_flatten("bucket").expect("complete bucket root");
+                    assert_eq!((totals.objects, totals.size), expected);
+                    return;
+                }
+                Err(ScannerError::PartialCache(partial)) => {
+                    assert!(!partial.info.snapshot_complete);
+                    cache = DataUsageCache::unmarshal(&partial.marshal_msg().expect("persist partial")).expect("reload partial");
+                }
+                Err(ScannerError::Other(message)) if budget.token().is_cancelled() && message == "Operation cancelled" => {}
+                Err(error) => panic!("unexpected scan failure: {error}"),
+            }
+            assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime));
+        }
+        let reads = SLOW_DIRECTORY.with(|(_, count)| count.get());
+        let totals = cache.checked_flatten("bucket").expect("last partial root");
+        panic!(
+            "wide directory still incomplete after {ROUNDS} fixed runtime deadlines and {reads} physical reads: {} objects, {} bytes",
+            totals.objects, totals.size
+        );
+    };
+    SLOW_DIRECTORY.scope((disk.path().join("bucket"), Cell::new(0)), scan).await;
 }
 
 /// A count budget is the operator's total work limit. It must also stop the
@@ -230,4 +316,170 @@ async fn fair_prefix_quantum_budget_stop_keeps_progress_without_certifying_it() 
     let totals = finished.checked_flatten("bucket").expect("bucket root");
     let expected = u64::try_from(OBJECTS).expect("fixture size");
     assert_eq!((totals.objects as u64, totals.versions as u64), (expected, expected));
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_compacted_directory_reuses_only_finished_children() {
+    const WIDTH: usize = 40;
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let mut cache = seed_flat_bucket(&disk_root, WIDTH).await;
+    let disk = open_fixture_disk(&disk_root).await;
+    let parent = CancellationToken::new();
+    super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            for round in 0..16 {
+                let budget = ScannerCycleBudget::new_with_progress_tracking(
+                    &parent,
+                    ScannerCycleBudgetConfig {
+                        max_objects: Some(6),
+                        ..Default::default()
+                    },
+                );
+                let result = scan_data_folder(
+                    budget.token(),
+                    budget,
+                    vec![disk.clone()],
+                    disk.clone(),
+                    cache.clone(),
+                    None,
+                    HealScanMode::Normal,
+                    SCANNER_SLEEPER.clone(),
+                )
+                .await;
+                match result {
+                    Ok(completed) => {
+                        assert!(round > 1);
+                        assert!(completed.info.snapshot_complete);
+                        let root = completed.find("bucket").expect("compacted bucket");
+                        assert!(root.compacted);
+                        assert_eq!((root.objects, root.size), (WIDTH, WIDTH));
+                        return;
+                    }
+                    Err(ScannerError::PartialCache(partial)) => {
+                        cache = DataUsageCache::unmarshal(&partial.marshal_msg().expect("save compacted checkpoint"))
+                            .expect("reload partial");
+                    }
+                    Err(error) => panic!("unexpected compacted scan failure: {error}"),
+                }
+            }
+            panic!("fixed object budget failed to finish compacted children");
+        })
+        .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_directory_replacement_invalidates_parked_entries() {
+    const WIDTH: usize = 48;
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let initial = seed_flat_bucket(&disk_root, WIDTH).await;
+    let disk = open_fixture_disk(&disk_root).await;
+    let parent = CancellationToken::new();
+    let config = ScannerCycleBudgetConfig {
+        max_entries: Some(3),
+        ..Default::default()
+    };
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, config);
+    let Err(ScannerError::PartialCache(partial)) = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![disk.clone()],
+        disk.clone(),
+        initial,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await
+    else {
+        panic!("the original listing must stop before EOF")
+    };
+    assert!(
+        super::super::parked_bucket_disks("bucket")
+            .iter()
+            .any(|scope| scope.ptr_eq(&Arc::downgrade(&disk)))
+    );
+    let mut cache = *partial;
+    // Rename pins the old inode. Reusing its open stream or its name pages
+    // would visit the vanished objects and omit this replacement's metadata.
+    tokio::fs::rename(disk_root.join("bucket"), temp.path().join("previous"))
+        .await
+        .expect("move old namespace");
+    let metadata = metadata_for_object_version("bucket", "successor", Some(Uuid::from_u128(100)));
+    write_test_object_metadata_bytes(&disk_root, "bucket", "successor", &metadata).await;
+    for _ in 0..6 {
+        let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, config);
+        match scan_data_folder(
+            budget.token(),
+            budget,
+            vec![disk.clone()],
+            disk.clone(),
+            cache.clone(),
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await
+        {
+            Ok(complete) => {
+                assert!(complete.info.snapshot_complete);
+                let total = complete.checked_flatten("bucket").expect("current root");
+                assert_eq!((total.objects, total.size), (1, 1));
+                assert!(complete.find("bucket/successor").is_some());
+                assert!(
+                    !super::super::parked_bucket_disks("bucket")
+                        .iter()
+                        .any(|scope| scope.ptr_eq(&Arc::downgrade(&disk)))
+                );
+                return;
+            }
+            Err(ScannerError::PartialCache(partial)) => cache = *partial,
+            Err(error) => panic!("replacement scan failed: {error}"),
+        }
+    }
+    panic!("replacement directory never finished");
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_directory_deleted_bucket_releases_a_slot_under_pressure() {
+    use super::super::directory_cursor::{DirectoryScope, PARKED_DIRECTORIES_PER_DISK, ScannerDirectory, is_parked};
+
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let cache = seed_flat_bucket(&disk_root, 0).await;
+    let disk = open_fixture_disk(&disk_root).await;
+    let scope = DirectoryScope::new(&disk, &cache, FolderScanMode::Namespace, None).expect("physical source and owner");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
+    budget.cancel_for_runtime();
+    let retired = disk_root.join("retired");
+    for index in 0..PARKED_DIRECTORIES_PER_DISK {
+        let path = retired.join(index.to_string());
+        tokio::fs::create_dir_all(&path).await.expect("create parked directory");
+        let path = path.to_str().expect("fixture path");
+        let directory = ScannerDirectory::open(path, "bucket", Some(scope.clone()), budget.clone())
+            .await
+            .expect("open source");
+        drop(directory);
+        assert!(is_parked(path));
+    }
+    let next = disk_root.join("replacement");
+    tokio::fs::create_dir(&next).await.expect("current source");
+    let next = next.to_str().expect("fixture path");
+    let directory = ScannerDirectory::open(next, "bucket", Some(scope.clone()), budget.clone())
+        .await
+        .expect("open next source");
+    drop(directory);
+    assert!(!is_parked(next), "active owners retain their bounded slots");
+    tokio::fs::remove_dir_all(retired).await.expect("retire directories");
+    let directory = ScannerDirectory::open(next, "bucket", Some(scope), budget)
+        .await
+        .expect("admit after retirement");
+    drop(directory);
+    assert!(is_parked(next), "an obsolete source must not indefinitely exclude new work");
+    super::super::directory_cursor::forget_bucket(&disk, &cache.info);
 }
