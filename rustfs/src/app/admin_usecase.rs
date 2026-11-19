@@ -21,9 +21,7 @@ use super::storage_api::admin_usecase::capacity::{
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
-use super::storage_api::admin_usecase::data_usage::{
-    apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached,
-};
+use super::storage_api::admin_usecase::data_usage::load_admin_data_usage_with_memory_overlay;
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
@@ -258,7 +256,9 @@ impl DefaultAdminUsecase {
     /// namespace still contains, carries no usable information and is dropped
     /// exactly as before.
     fn narrow_data_usage_snapshot_to_measured_buckets(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
-        if !info.is_complete_bucket_usage_snapshot() && !info.is_valid_partial_snapshot() {
+        let snapshot_measured =
+            info.usage_snapshot_admin_projection || info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot();
+        if !snapshot_measured {
             *info = DataUsageInfo::default();
             return;
         }
@@ -268,18 +268,28 @@ impl DefaultAdminUsecase {
         info.buckets_usage.retain(|bucket, _| current_buckets.contains(bucket));
         info.bucket_sizes.retain(|bucket, _| current_buckets.contains(bucket));
 
-        if info.buckets_usage.is_empty() && !current_buckets.is_empty() {
+        if info.buckets_usage.is_empty() && !current_buckets.is_empty() && !info.usage_snapshot_admin_projection {
             *info = DataUsageInfo::default();
             return;
         }
 
         let covers_namespace = current_buckets.len() == info.buckets_usage.len();
         info.buckets_count = info.buckets_usage.len() as u64;
-        if !covers_namespace {
-            // Some bucket in the namespace was never measured, so the totals
-            // below are a floor rather than the converged truth.
+        if !covers_namespace || !info.is_complete_bucket_usage_snapshot() {
+            // Uncovered buckets or unreconciled mutations keep the displayed
+            // totals from representing converged usage.
             info.usage_snapshot_converged = Some(false);
         }
+    }
+
+    /// Keep already identity-bound display values without accepting a display
+    /// projection as a persistable or quota-authoritative snapshot.
+    fn present_identity_bound_data_usage_snapshot(
+        mut info: DataUsageInfo,
+        buckets: impl IntoIterator<Item = String>,
+    ) -> DataUsageInfo {
+        Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, buckets);
+        info
     }
 
     async fn rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<Option<RebalanceMeta>> {
@@ -323,8 +333,7 @@ impl DefaultAdminUsecase {
     /// This path never triggers a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
-        let mut info = Self::map_data_usage_load_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
-        apply_bucket_usage_memory_overlay(&mut info).await;
+        let info = Self::map_data_usage_load_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
         let buckets = store
             .list_bucket(&BucketOptions {
                 cached: true,
@@ -333,11 +342,7 @@ impl DefaultAdminUsecase {
             })
             .await
             .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
-        // Serve what the scan measured; buckets it never reached stay absent
-        // (absent means unknown on the wire, unlike a present zero) and the
-        // snapshot is flagged non-converged. See rustfs#5806 for why blanking
-        // the whole document instead was worse than the rule it enforced.
-        Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, buckets.into_iter().map(|bucket| bucket.name));
+        let mut info = Self::present_identity_bound_data_usage_snapshot(info, buckets.into_iter().map(|bucket| bucket.name));
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -960,6 +965,108 @@ mod tests {
         DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, [".rustfs.sys".to_string()]);
         assert_eq!(info.usage_snapshot_converged, None);
         assert_eq!(info.buckets_count, 0);
+    }
+
+    #[test]
+    fn identity_bound_partial_display_keeps_valid_buckets_and_unknown_state() {
+        use std::collections::HashMap;
+
+        let mut projected = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            usage_snapshot_admin_projection: true,
+            usage_snapshot_partial: true,
+            usage_snapshot_converged: Some(false),
+            buckets_count: 1,
+            objects_total_count: 7,
+            objects_total_size: 70,
+            buckets_usage: HashMap::from([(
+                "cold".to_string(),
+                rustfs_data_usage::BucketUsageInfo {
+                    size: 70,
+                    objects_count: 7,
+                    ..Default::default()
+                },
+            )]),
+            bucket_sizes: HashMap::from([("cold".to_string(), 70)]),
+            ..Default::default()
+        };
+        projected = DefaultAdminUsecase::present_identity_bound_data_usage_snapshot(
+            projected,
+            ["cold".to_string(), "recreated".to_string()],
+        );
+        assert_eq!(projected.buckets_usage["cold"].objects_count, 7);
+        assert!(!projected.buckets_usage.contains_key("recreated"));
+        assert_eq!(projected.objects_total_count, 7);
+        assert_eq!(projected.usage_snapshot_converged, Some(false));
+        assert!(!projected.is_complete_bucket_usage_snapshot());
+        assert!(!projected.is_valid_partial_snapshot());
+
+        projected.buckets_usage.clear();
+        projected.bucket_sizes.clear();
+        projected.calculate_totals();
+        projected.buckets_count = 0;
+        let unknown = DefaultAdminUsecase::present_identity_bound_data_usage_snapshot(projected, ["recreated".to_string()]);
+        assert!(unknown.buckets_usage.is_empty());
+        assert!(unknown.usage_snapshot_admin_projection);
+        assert_eq!(unknown.usage_snapshot_converged, Some(false));
+        assert!(!unknown.is_complete_bucket_usage_snapshot());
+        assert_eq!(unknown.last_update, Some(std::time::SystemTime::UNIX_EPOCH));
+    }
+
+    /// A write into a bucket without a verified baseline leaves process-local
+    /// counts the overlay cannot reconcile, so it clears
+    /// `usage_snapshot_complete`. That must flag the response non-converged,
+    /// not erase every bucket the persisted scan measured: under continuous
+    /// writes the scanner fence never clears and the blackout never ends.
+    #[tokio::test]
+    async fn unverified_bucket_writes_do_not_blank_measured_usage() {
+        let measured_bucket = "admin-usage-measured";
+        let unverified_bucket = "admin-usage-unverified";
+        let mut persisted = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+            usage_snapshot_complete: true,
+            buckets_count: 1,
+            ..Default::default()
+        };
+        persisted.buckets_usage.insert(
+            measured_bucket.to_string(),
+            rustfs_data_usage::BucketUsageInfo {
+                objects_count: 4_000,
+                versions_count: 4_000,
+                size: 8_192_000,
+                ..Default::default()
+            },
+        );
+        persisted.bucket_sizes.insert(measured_bucket.to_string(), 8_192_000);
+        persisted.calculate_totals();
+        assert!(persisted.is_complete_bucket_usage_snapshot());
+
+        crate::app::storage_api::test::data_usage::record_bucket_object_write_memory(unverified_bucket, None, 1_024).await;
+
+        // Exercise the production overlay, followed by the same identity-bound
+        // presentation function used by the admin query.
+        crate::app::storage_api::test::data_usage::apply_bucket_usage_memory_overlay(&mut persisted).await;
+        persisted.usage_snapshot_admin_projection = true;
+        persisted.usage_snapshot_converged = Some(false);
+        let info = DefaultAdminUsecase::present_identity_bound_data_usage_snapshot(
+            persisted,
+            [measured_bucket.to_string(), unverified_bucket.to_string()],
+        );
+
+        assert_eq!(
+            info.buckets_usage
+                .get(measured_bucket)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((4_000, 8_192_000)),
+            "usage the scanner measured must survive an unrelated unverified bucket"
+        );
+        assert!(
+            !info.buckets_usage.contains_key(unverified_bucket),
+            "a bucket without a verified baseline stays absent (unknown)"
+        );
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        assert!(!info.is_complete_bucket_usage_snapshot());
+        assert_eq!(info.objects_total_count, 4_000);
     }
 
     #[tokio::test]

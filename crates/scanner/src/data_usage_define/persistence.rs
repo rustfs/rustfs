@@ -70,6 +70,7 @@ struct DataUsageCacheLoadResult {
     cache: DataUsageCache,
     main_revision: DataUsageCacheRevision,
     backup_revision: Option<DataUsageCacheRevision>,
+    loaded_from_main: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +107,18 @@ impl DataUsageCache {
         store: Arc<S>,
         name: &str,
     ) -> StorageResult<DataUsageCacheRevisions> {
+        self.load_with_baseline_revisions(store, name)
+            .await
+            .map(|baseline| baseline.revisions)
+    }
+
+    /// Loads cache revisions with provenance for unchanged-primary backup reconciliation.
+    /// Missing or rebuilt caches and a decoded backup do not establish a decoded primary.
+    pub(crate) async fn load_with_baseline_revisions<S: ScannerObjectIO>(
+        &mut self,
+        store: Arc<S>,
+        name: &str,
+    ) -> StorageResult<DataUsageCacheBaselineRevisions> {
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let loaded = Self::load_cache(store.clone(), name).await?;
@@ -133,7 +146,10 @@ impl DataUsageCache {
         let main = loaded.main_revision;
         *self = loaded.cache;
 
-        Ok(DataUsageCacheRevisions { main, backup })
+        Ok(DataUsageCacheBaselineRevisions {
+            revisions: DataUsageCacheRevisions { main, backup },
+            loaded_from_main: loaded.loaded_from_main,
+        })
     }
 
     pub(crate) async fn read_revisions<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheRevisions> {
@@ -156,10 +172,13 @@ impl DataUsageCache {
                     cache,
                     revision: Some(main_revision),
                 } => {
+                    // Legacy-location fallback carries Missing for the primary path.
+                    let loaded_from_main = matches!(&main_revision, DataUsageCacheRevision::Etag(_));
                     return Ok(DataUsageCacheLoadResult {
                         cache: *cache,
                         main_revision,
                         backup_revision: None,
+                        loaded_from_main,
                     });
                 }
                 DataUsageCacheLoadAttempt::Loaded { revision: None, .. } => {
@@ -197,6 +216,7 @@ impl DataUsageCache {
                             cache: *cache,
                             main_revision,
                             backup_revision: Some(backup_revision),
+                            loaded_from_main: false,
                         });
                     }
                     DataUsageCacheLoadState::Loaded
@@ -220,6 +240,7 @@ impl DataUsageCache {
                         main_revision: main_revision
                             .ok_or_else(|| Error::other(format!("scanner cache missing state has no revision: {name}")))?,
                         backup_revision,
+                        loaded_from_main: false,
                     });
                 }
                 (DataUsageCacheLoadState::Corrupt, DataUsageCacheLoadState::Missing)
@@ -239,6 +260,7 @@ impl DataUsageCache {
                         main_revision: main_revision
                             .ok_or_else(|| Error::other(format!("scanner cache corrupt state has no revision: {name}")))?,
                         backup_revision,
+                        loaded_from_main: false,
                     });
                 }
                 _ => {}

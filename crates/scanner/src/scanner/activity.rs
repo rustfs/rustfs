@@ -192,19 +192,16 @@ impl ScannerRetryBackoff {
 pub(super) fn scanner_superseded_retry_interval(
     backoff: ScannerRetryBackoff,
     runtime_config: &ScannerRuntimeConfig,
-    maintenance_features: ScannerMaintenanceFeatures,
 ) -> Option<Duration> {
-    let mut retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?;
-    // Preserve an operator-selected duty-cycle floor during convergence.
+    let cycle_interval = runtime_config.cycle_interval.max(Duration::from_secs(1));
+    let retry_interval = backoff.retry_interval(cycle_interval)?;
+    // Preserve an operator-selected nominal cadence during convergence.
     if runtime_config.cycle_interval_source != ScannerRuntimeConfigSource::Default {
-        retry_interval = retry_interval.max(runtime_config.cycle_interval);
+        return Some(cycle_interval);
     }
-    // A complete but non-authoritative walk must not postpone lifecycle or
-    // replication evaluation beyond its ordinary maintenance cadence.
-    if maintenance_features.needs_regular_cycle() {
-        retry_interval = retry_interval.min(runtime_config.cycle_interval.max(Duration::from_secs(1)));
-    }
-    Some(retry_interval)
+    // A complete but non-authoritative walk must not postpone convergence
+    // beyond the ordinary cadence, even without lifecycle or replication.
+    Some(retry_interval.min(cycle_interval))
 }
 
 /// Pacing for the cycle after a full-namespace scope fallback while dirty
