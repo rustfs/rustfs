@@ -8493,16 +8493,16 @@ fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn mount_id_for_path(path: &Path) -> Option<u64> {
-    use rustix::fs::{AtFlags, CWD, StatxFlags};
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxFlags, open};
+    use std::os::fd::AsRawFd as _;
 
     rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID)
         .ok()
         .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
         .map(|statx| statx.stx_mnt_id)
         .or_else(|| {
-            std::fs::canonicalize(path)
-                .ok()
-                .and_then(|path| mount_id_from_mountinfo(&path))
+            let directory = open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+            mount_id_from_fdinfo(directory.as_raw_fd())
         })
 }
 
@@ -8512,30 +8512,6 @@ fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_from_mountinfo(path: &Path) -> Option<u64> {
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    mount_id_from_mountinfo_contents(&mountinfo, path)
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64> {
-    let mountpoint = path
-        .to_string_lossy()
-        .replace('\\', "\\134")
-        .replace('\t', "\\011")
-        .replace('\n', "\\012")
-        .replace(' ', "\\040");
-    mountinfo.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let mount_id = fields.next()?.parse().ok()?;
-        fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        (fields.next()? == mountpoint).then_some(mount_id)
-    })
 }
 
 impl LocalDisk {
@@ -41357,10 +41333,16 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mountinfo_fallback_uses_the_exact_escaped_mountpoint() {
-        let mountinfo = "101 1 0:30 / / rw - rootfs rootfs rw\n202 101 0:42 / /mnt/replacement\\040disk rw - tmpfs tmpfs rw\n";
-        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement disk")), Some(202));
-        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement")), None);
+    fn mount_id_fdinfo_can_identify_a_directory_below_a_mount() {
+        use std::os::fd::AsRawFd as _;
+
+        let temp = tempfile::tempdir().expect("mount fixture directory");
+        let child = temp.path().join("data");
+        std::fs::create_dir(&child).expect("create data subdirectory");
+        let parent = std::fs::File::open(temp.path()).expect("open parent directory");
+        let child = std::fs::File::open(child).expect("open data subdirectory");
+        let parent_mount = mount_id_from_fdinfo(parent.as_raw_fd()).expect("read mount ID of parent");
+        assert_eq!(mount_id_from_fdinfo(child.as_raw_fd()), Some(parent_mount));
     }
 
     #[cfg(not(windows))]

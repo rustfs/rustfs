@@ -30,6 +30,9 @@ use super::{
 /// through the ordinary format path that formats every unformatted disk in the
 /// set, which is exactly what the pre-admission `heal_disk` path did.
 pub(crate) fn directory_backed_replacement_fallback_enabled() -> bool {
+    if cfg!(target_os = "linux") && std::env::var_os(rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS).is_some() {
+        return false;
+    }
     rustfs_utils::get_env_bool_with_aliases(
         rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK,
         &[rustfs_config::ENV_MINIO_CI],
@@ -45,16 +48,17 @@ pub(crate) async fn auto_replacement_target_identity(
     disk: &DiskStore,
     local_disks: &[DiskStore],
 ) -> Option<ReplacementTargetIdentity> {
-    let lease_root = disk.replacement_mount_lease_root()?;
+    let disk = disk.clone();
     let endpoint = disk.endpoint().to_string();
-    let sibling_lease_roots = local_disks
+    let siblings = local_disks
         .iter()
         .filter(|sibling| sibling.endpoint().is_local && sibling.endpoint().to_string() != endpoint)
-        .map(|sibling| sibling.replacement_mount_lease_root())
-        .collect::<Option<Vec<_>>>()?;
+        .cloned()
+        .collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
+        let lease_root = disk.replacement_mount_lease_root()?;
         let canonical_path = fs::canonicalize(&lease_root).ok()?;
-        let metadata = fs::metadata(&lease_root).ok()?;
+        let filesystem_identity = filesystem_identity(&lease_root, &canonical_path, Path::new(&disk.endpoint().get_file_path()))?;
         let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(lease_root.to_string_lossy().as_ref()) else {
             return None;
         };
@@ -64,20 +68,16 @@ pub(crate) async fn auto_replacement_target_identity(
         if target_device_ids.is_empty()
             || root_device_ids.is_empty()
             || target_device_ids.iter().any(|target| root_device_ids.contains(target))
-            || !rustfs_utils::os::is_mount_point(&canonical_path).unwrap_or(false)
         {
             return None;
         }
 
-        if sibling_lease_roots.iter().any(|sibling_lease_root| {
+        for sibling in siblings {
+            let sibling_lease_root = sibling.replacement_mount_lease_root()?;
             rustfs_utils::os::get_physical_device_ids(sibling_lease_root.to_string_lossy().as_ref())
-                .map(|ids| ids.iter().any(|id| target_device_ids.contains(id)))
-                .unwrap_or(true)
-        }) {
-            return None;
+                .ok()
+                .filter(|ids| !ids.iter().any(|id| target_device_ids.contains(id)))?;
         }
-
-        let filesystem_identity = filesystem_identity(&metadata, &canonical_path)?;
 
         Some(ReplacementTargetIdentity {
             endpoint,
@@ -146,31 +146,57 @@ pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Op
 }
 
 #[cfg(target_os = "linux")]
-fn filesystem_identity(metadata: &fs::Metadata, canonical_path: &Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt as _;
+fn filesystem_identity(lease_root: &Path, canonical_path: &Path, configured_path: &Path) -> Option<String> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
 
-    let escaped_path = canonical_path.to_string_lossy().replace(' ', "\\040");
+    // Use the configured boundary even when its mount is absent. Using the
+    // currently visible enclosing mount could admit a directory exposed by unmount.
+    let roots = std::env::var_os(rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS);
+    let expected_mount = roots
+        .as_ref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|root| root.is_absolute() && (configured_path.starts_with(root) || canonical_path.starts_with(root)))
+        .max_by_key(|root| root.components().count());
+    let expected_mount = expected_mount.as_deref().unwrap_or(canonical_path);
+    if !canonical_path.starts_with(expected_mount) {
+        return None;
+    }
+    let expected_mount = expected_mount
+        .to_str()?
+        .replace('\\', "\\134")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012")
+        .replace(' ', "\\040");
+
+    let directory = fs::File::open(lease_root).ok()?;
+    let metadata = directory.metadata().ok()?;
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", directory.as_raw_fd())).ok()?;
+    let mount_id = fdinfo.lines().find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))?;
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let mount_id = mountinfo.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let mount_id = fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        (fields.next()? == escaped_path).then_some(mount_id)
-    })?;
+    let mounted_at_expected_root = mountinfo.lines().any(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        fields.next() == Some(mount_id) && fields.nth(3) == Some(expected_mount.as_str())
+    });
+    if !mounted_at_expected_root {
+        return None;
+    }
     Some(format!("{mount_id}:{}:{}", metadata.dev(), metadata.ino()))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn filesystem_identity(metadata: &fs::Metadata, _canonical_path: &Path) -> Option<String> {
+fn filesystem_identity(lease_root: &Path, canonical_path: &Path, _configured_path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt as _;
 
+    if !rustfs_utils::os::is_mount_point(canonical_path).ok()? {
+        return None;
+    }
+    let metadata = fs::metadata(lease_root).ok()?;
     Some(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn filesystem_identity(_metadata: &fs::Metadata, _canonical_path: &Path) -> Option<String> {
+fn filesystem_identity(_lease_root: &Path, _canonical_path: &Path, _configured_path: &Path) -> Option<String> {
     None
 }
 
@@ -429,6 +455,61 @@ mod tests {
                     "a separately mounted replacement target with no sibling device overlap must be admitted"
                 );
                 Ok(())
+            })
+        }
+
+        #[test]
+        #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS=1"]
+        fn auto_replacement_readiness_requires_the_configured_mount_for_a_data_subdirectory()
+        -> Result<(), Box<dyn Error + Send + Sync>> {
+            run_privileged_mount_test(|mut mounts| async move {
+                let temp = TempDir::new()?;
+                let parent = temp.path().join("parent");
+                let mount = parent.join("replacement disk");
+                let data = mount.join("data");
+                fs::create_dir(&parent)?;
+                mounts.mount_tmpfs(&parent, "rustfs-readiness-parent")?;
+                fs::create_dir_all(&data)?;
+                mounts.mount_tmpfs(&mount, "rustfs-readiness-child")?;
+                fs::create_dir(&data)?;
+
+                let endpoint = Endpoint::try_from(path_to_string(&data, "data directory")?.as_str())?;
+                let options = DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                };
+                let disk = new_disk(&endpoint, &options).await?;
+                let key = rustfs_config::ENV_HEAL_REPLACEMENT_MOUNT_ROOTS;
+                temp_env::async_with_vars([(key, None::<&str>)], async {
+                    assert!(auto_replacement_target_identity(&disk, &[]).await.is_none());
+                })
+                .await;
+
+                let roots = std::env::join_paths([&parent, &mount])?;
+                temp_env::async_with_vars(
+                    [
+                        (key, Some(roots.to_str().ok_or("mount roots are not UTF-8")?)),
+                        (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
+                    ],
+                    async {
+                        assert!(!directory_backed_replacement_fallback_enabled());
+                        let identity = auto_replacement_target_identity(&disk, &[])
+                            .await
+                            .expect("data directory on its configured independent mount should be admitted");
+                        assert_eq!(Path::new(&identity.canonical_path), data.canonicalize()?);
+
+                        run_command("umount", &["-l", &path_to_string(&mount, "replacement mount")?])?;
+                        assert!(auto_replacement_target_identity(&disk, &[]).await.is_none());
+
+                        let exposed_disk = new_disk(&endpoint, &options).await?;
+                        assert!(
+                            auto_replacement_target_identity(&exposed_disk, &[]).await.is_none(),
+                            "a new handle on the exposed parent filesystem must also be rejected"
+                        );
+                        Ok(())
+                    },
+                )
+                .await
             })
         }
 
