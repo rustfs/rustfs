@@ -136,8 +136,3 @@ pub(super) async fn stage<S: ScannerObjectIO + ScannerConfigObjectDelete>(
     try_join_all(writes).await?;
     Ok(())
 }
-
-pub(super) fn unreadable_page(error: &StorageError) -> bool {
-    matches!(error, StorageError::FileCorrupt)
-        || matches!(error, StorageError::Io(io) if matches!(io.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof))
-}

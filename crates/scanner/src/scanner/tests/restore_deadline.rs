@@ -102,6 +102,10 @@ async fn corrupt_primary(store: &MemoryConfigStore) {
 }
 
 async fn finish(store: &Arc<MemoryConfigStore>, backup: bool) {
+    finish_across_windows(store, backup, None).await;
+}
+
+async fn finish_across_windows(store: &Arc<MemoryConfigStore>, backup: bool, competing: Option<&Arc<MemoryConfigStore>>) {
     let mut loaded = DataUsageCache::default();
     let mut main_reads = 0;
     let mut backup_reads = 0;
@@ -126,6 +130,10 @@ async fn finish(store: &Arc<MemoryConfigStore>, backup: bool) {
                 assert_eq!(backup_reads, 0);
             }
             return;
+        }
+        if let Some(other) = competing {
+            tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+            let _ = window(other, &mut DataUsageCache::default()).await;
         }
     }
     panic!("checkpoint did not converge: {main_reads} primary and {backup_reads} backup page reads");
@@ -241,4 +249,39 @@ async fn backup_phase_is_bound_to_its_storage_instance() {
         .expect("other storage revision");
     assert_eq!(first, second, "both stores must expose the same ETags");
     finish(&healthy, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_restore_keeps_verified_pages_until_another_bucket_needs_its_slot() {
+    let (primary, _) = fixture().await;
+    let (other, _) = fixture().await;
+    finish_across_windows(&primary, false, Some(&other)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_restore_keeps_the_failed_primary_revision_across_scheduled_rounds() {
+    let (primary, _) = fixture().await;
+    let (other, _) = fixture().await;
+    corrupt_primary(&primary).await;
+    corrupt_primary(&other).await;
+    finish_across_windows(&primary, true, Some(&other)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn physical_primary_page_corruption_falls_back_to_the_healthy_copy() {
+    let (store, _) = fixture().await;
+    let keys: Vec<_> = store
+        .objects
+        .lock()
+        .await
+        .keys()
+        .filter(|key| key.contains(".bin.pages/"))
+        .cloned()
+        .collect();
+    store
+        .read_errors
+        .lock()
+        .await
+        .extend(keys.into_iter().map(|key| (key, EcstoreError::FileCorrupt)));
+    finish(&store, true).await;
 }

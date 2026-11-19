@@ -1,12 +1,13 @@
 // Copyright 2026 RustFS Team
 // Licensed under the Apache License, Version 2.0.
 
+use super::super::scan_load::park_restore;
 use super::*;
 use std::any::Any;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::sync::{Mutex, Weak};
-use std::time::Instant as WallInstant;
+use tokio::time::Instant as WallInstant;
 
 const MEMORY_LIMIT: u64 = 1024 * 1024;
 const PARKED_LIMIT: usize = 32;
@@ -45,9 +46,7 @@ impl Recovery {
         let resumed = {
             let mut parked = PARKED.lock().unwrap_or_else(|error| error.into_inner());
             parked.retain(|job| {
-                job.owner.strong_count() != 0
-                    && job.last_polled.elapsed() < Duration::from_secs(3600)
-                    && (!job.owner.ptr_eq(&owner) || job.name != name || job.manifest == *manifest)
+                job.owner.strong_count() != 0 && (!job.owner.ptr_eq(&owner) || job.name != name || job.manifest == *manifest)
             });
             parked
                 .iter()
@@ -104,8 +103,10 @@ impl Drop for Recovery {
             if job.position.verified_progress() > previous.position.verified_progress() {
                 std::mem::swap(previous, &mut job);
             }
-        } else if parked.len() < PARKED_LIMIT {
-            parked.push(job);
+        } else {
+            let displaced = park_restore(&mut parked, PARKED_LIMIT, job, |job| job.last_polled);
+            drop(parked);
+            drop(displaced);
         }
     }
 }

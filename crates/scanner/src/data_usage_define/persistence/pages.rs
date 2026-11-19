@@ -77,6 +77,11 @@ fn invalid(message: &str) -> Error {
     Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_owned()))
 }
 
+pub(super) fn unreadable_page(error: &StorageError) -> bool {
+    matches!(error, StorageError::FileCorrupt)
+        || matches!(error, StorageError::Io(io) if matches!(io.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof))
+}
+
 fn digest(data: &[u8]) -> Digest {
     Sha256::digest(data).into()
 }
@@ -493,7 +498,7 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         // A corrupt XL header need not yield an ETag for a conditional repair.
         // Rebuild this backup under a fresh namespace; its old root stays visible
         // until the manifest CAS. Other I/O failures remain retryable in place.
-        if !(verify_backup && manifest.bundle_commits > 1 && allow_rotation && save::unreadable_page(&error)) {
+        if !(verify_backup && manifest.bundle_commits > 1 && allow_rotation && unreadable_page(&error)) {
             return Err(error);
         }
         retired = Some(manifest.bundle);

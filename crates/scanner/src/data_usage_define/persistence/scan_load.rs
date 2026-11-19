@@ -13,11 +13,31 @@ pub(super) struct PendingBackup {
     owner: Weak<dyn Any + Send + Sync>,
     name: String,
     failed_etag: String,
-    last_polled: std::time::Instant,
+    last_polled: tokio::time::Instant,
 }
 
 static PENDING_BACKUPS: Mutex<Vec<PendingBackup>> = Mutex::new(Vec::new());
 const MAX_PENDING_BACKUPS: usize = 32;
+
+// Age permits reclamation under contention. A scanner whose configured
+// interval exceeds this age can still resume while slots remain available.
+pub(super) fn park_restore<T>(
+    slots: &mut Vec<T>,
+    limit: usize,
+    value: T,
+    last_polled: impl Fn(&T) -> tokio::time::Instant,
+) -> Option<T> {
+    if slots.len() < limit {
+        slots.push(value);
+        return None;
+    }
+    if let Some(oldest) = slots.iter_mut().min_by_key(|slot| last_polled(slot))
+        && last_polled(oldest).elapsed() >= Duration::from_secs(3600)
+    {
+        return Some(std::mem::replace(oldest, value));
+    }
+    Some(value)
+}
 
 impl PendingBackup {
     fn owner<S: ScannerObjectIO>(store: &Arc<S>) -> Weak<dyn Any + Send + Sync> {
@@ -35,7 +55,7 @@ impl PendingBackup {
             return false;
         };
         if pending[index].failed_etag == etag {
-            pending[index].last_polled = std::time::Instant::now();
+            pending[index].last_polled = tokio::time::Instant::now();
             true
         } else {
             pending.swap_remove(index);
@@ -46,19 +66,14 @@ impl PendingBackup {
     pub(super) fn begin<S: ScannerObjectIO>(store: &Arc<S>, name: &str, etag: &str) {
         let owner = Self::owner(store);
         let mut pending = PENDING_BACKUPS.lock().unwrap_or_else(|error| error.into_inner());
-        pending.retain(|phase| {
-            phase.owner.strong_count() > 0
-                && phase.last_polled.elapsed() < Duration::from_secs(3600)
-                && !(phase.owner.ptr_eq(&owner) && phase.name == name)
-        });
-        if pending.len() < MAX_PENDING_BACKUPS {
-            pending.push(Self {
-                owner,
-                name: name.to_owned(),
-                failed_etag: etag.to_owned(),
-                last_polled: std::time::Instant::now(),
-            });
-        }
+        pending.retain(|phase| phase.owner.strong_count() > 0 && !(phase.owner.ptr_eq(&owner) && phase.name == name));
+        let phase = Self {
+            owner,
+            name: name.to_owned(),
+            failed_etag: etag.to_owned(),
+            last_polled: tokio::time::Instant::now(),
+        };
+        let _ = park_restore(&mut pending, MAX_PENDING_BACKUPS, phase, |phase| phase.last_polled);
     }
 
     pub(super) fn finish<S: ScannerObjectIO>(store: &Arc<S>, name: &str, etag: &str) {
@@ -166,5 +181,25 @@ impl DataUsageCache {
             }
         }
         Ok(Some(revisions))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn only_reclaim_idle_restore_slots_under_pressure() {
+        let first = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(7200)).await;
+        let second = tokio::time::Instant::now();
+        let mut slots = vec![first];
+        assert_eq!(park_restore(&mut slots, 2, second, |&time| time), None);
+        assert_eq!(slots, [first, second]);
+        let new = second + Duration::from_secs(1);
+        assert_eq!(park_restore(&mut slots, 2, new, |&time| time), Some(first));
+        assert_eq!(slots, [new, second]);
+        assert_eq!(park_restore(&mut slots, 2, new, |&time| time), Some(new));
+        assert_eq!(slots, [new, second], "active recoveries retain both slots");
     }
 }

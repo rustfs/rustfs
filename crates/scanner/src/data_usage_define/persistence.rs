@@ -338,7 +338,8 @@ impl DataUsageCache {
                             Ok(cache) => Ok((Some(cache), revision, false)),
                             Err(err)
                                 if matches!(err, StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData)
-                                    || matches!(err, StorageError::FileNotFound | StorageError::ObjectNotFound(..)) =>
+                                    || matches!(err, StorageError::FileNotFound | StorageError::ObjectNotFound(..))
+                                    || (pages::is_manifest(&data) && pages::unreadable_page(&err)) =>
                             {
                                 // A concurrent manifest commit can retire the generation
                                 // we were reading. Retry the current root before treating
