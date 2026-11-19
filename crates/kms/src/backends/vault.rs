@@ -35,7 +35,7 @@ use crate::policy::{self, AttemptError, OpClass, OwnWrite, OwnWrites, RetryPolic
 use crate::types::*;
 use async_trait::async_trait;
 use base64_simd::STANDARD as BASE64;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -90,7 +90,7 @@ struct VaultKeyData {
     /// Key usage type
     usage: KeyUsage,
     /// Key creation timestamp
-    created_at: Zoned,
+    created_at: ZonedDateTime,
     /// Key status
     status: KeyStatus,
     /// Key version
@@ -104,7 +104,7 @@ struct VaultKeyData {
     /// Scheduled deletion deadline; absent on records written before deadline
     /// persistence landed, so it must stay optional for backward compatibility.
     #[serde(default)]
-    deletion_date: Option<Zoned>,
+    deletion_date: Option<ZonedDateTime>,
     /// When the key's material last became current through a rotation.
     ///
     /// Written by [`VaultKmsClient::rotate_key`] as part of the same
@@ -117,7 +117,7 @@ struct VaultKeyData {
     /// See [`crate::deletion_worker`] for why collapsing the two is safe for the
     /// rotation-age gauge.
     #[serde(default)]
-    rotated_at: Option<Zoned>,
+    rotated_at: Option<ZonedDateTime>,
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
     /// Version that pre-versioning envelopes (no `master_key_version`) resolve to.
@@ -381,7 +381,7 @@ struct VaultKeyVersionRecord {
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
     /// When this version's material was created
-    created_at: Zoned,
+    created_at: ZonedDateTime,
 }
 
 /// Sub-path (under each key path) reserved for immutable version records.
@@ -1305,7 +1305,7 @@ impl VaultKmsClient {
             encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: Some(key_data.version),
             context_binding,
         };
@@ -1347,7 +1347,7 @@ impl VaultKmsClient {
             encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: Some(key_data.version),
             context_binding,
         };
@@ -1718,7 +1718,7 @@ impl VaultKmsClient {
         let key_data = VaultKeyData {
             algorithm: algorithm.to_string(),
             usage: attributes.map_or(KeyUsage::EncryptDecrypt, |request| request.key_usage.clone()),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             status: KeyStatus::Active,
             version: 1,
             description: attributes.and_then(|request| request.description.clone()),
@@ -2003,7 +2003,7 @@ impl VaultKmsClient {
         let record = VaultKeyVersionRecord {
             version: new_version,
             encrypted_key_material: new_material.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
         };
         if !self.try_create_key_version_record(key_id, &record).await? {
             // A record for the next version already exists: an interrupted rotation
@@ -2027,7 +2027,7 @@ impl VaultKmsClient {
         // the recorded time never runs ahead of the current version.
         key_data.version = new_version;
         key_data.encrypted_key_material = new_material;
-        key_data.rotated_at = Some(Zoned::now());
+        key_data.rotated_at = Some(ZonedDateTime::now());
         // Fresh material, fresh AES-GCM nonce budget: the wrap ceiling is per
         // key material version, so the counter restarts with the same commit
         // that makes the new material current.
@@ -2114,7 +2114,7 @@ impl VaultKmsBackend {
     /// record whose key material is missing: persisting it would cement the
     /// empty-material state under a fresh document version — a damaged key
     /// must go through an explicit repair operation, not a lifecycle update.
-    async fn mark_key_pending_deletion(&self, key_id: &str, deletion_date: &Zoned) -> Result<()> {
+    async fn mark_key_pending_deletion(&self, key_id: &str, deletion_date: &ZonedDateTime) -> Result<()> {
         self.client
             .update_key_data_with_cas(key_id, |key_data| {
                 ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::ScheduleDeletion)?;
@@ -2144,7 +2144,7 @@ impl KmsBackend for VaultKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: request.key_usage,
             description: request.description,
-            creation_date: Zoned::now(),
+            creation_date: ZonedDateTime::now(),
             deletion_date: None,
             origin: "VAULT".to_string(),
             key_manager: "VAULT".to_string(),
@@ -2287,7 +2287,7 @@ impl KmsBackend for VaultKmsBackend {
                 .await?;
             self.client.delete_key(key_id).await?;
             key_metadata.key_state = KeyState::PendingDeletion;
-            key_metadata.deletion_date = Some(Zoned::now());
+            key_metadata.deletion_date = Some(ZonedDateTime::now());
 
             // No deletion date: the key is permanently gone, not scheduled.
             None
@@ -2306,7 +2306,7 @@ impl KmsBackend for VaultKmsBackend {
                 )));
             }
 
-            let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
+            let deletion_date = ZonedDateTime::now() + Duration::from_secs(days as u64 * 86400);
             self.mark_key_pending_deletion(key_id, &deletion_date).await?;
             key_metadata.key_state = KeyState::PendingDeletion;
             key_metadata.deletion_date = Some(deletion_date.clone());
@@ -2415,7 +2415,7 @@ impl KmsBackend for VaultKmsBackend {
             .with_production_supported(true)
     }
 
-    async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
+    async fn remove_expired_key(&self, key_id: &str, now: &ZonedDateTime) -> Result<ExpiredKeyRemoval> {
         // Tombstone under check-and-set with per-attempt re-validation: a
         // cancellation landing between the read and the write makes the write
         // conflict, and the re-read then observes the cancelled state and
@@ -2513,7 +2513,7 @@ mod tests {
         VaultKeyData {
             algorithm: "AES_256".to_string(),
             usage: KeyUsage::EncryptDecrypt,
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             status: KeyStatus::Active,
             version: 1,
             description: None,
@@ -3197,7 +3197,7 @@ mod tests {
         let key_data = VaultKeyData {
             algorithm: "AES_256".to_string(),
             usage: KeyUsage::EncryptDecrypt,
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             status: KeyStatus::Active,
             version: 1,
             description: None,
@@ -3235,8 +3235,8 @@ mod tests {
         let mut key_data = healthy_key_data();
         key_data.wrap_budget_reserved = 7_000_000;
         key_data.baseline_version = Some(2);
-        key_data.rotated_at = Some(Zoned::now());
-        key_data.deletion_date = Some(Zoned::now());
+        key_data.rotated_at = Some(ZonedDateTime::now());
+        key_data.deletion_date = Some(ZonedDateTime::now());
         key_data.description = Some("described".to_string());
 
         let value = serde_json::to_value(&key_data).expect("serialize key data");
@@ -3683,11 +3683,11 @@ mod tests {
     /// of deadline persistence turns this test red.
     #[test]
     fn vault_key_data_deletion_date_round_trips_and_stays_backward_compatible() {
-        let deadline = Zoned::now() + Duration::from_secs(7 * 86400);
+        let deadline = ZonedDateTime::now() + Duration::from_secs(7 * 86400);
         let key_data = VaultKeyData {
             algorithm: "AES_256".to_string(),
             usage: KeyUsage::EncryptDecrypt,
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             status: KeyStatus::PendingDeletion,
             version: 1,
             description: None,
@@ -3703,7 +3703,7 @@ mod tests {
         let mut value = serde_json::to_value(&key_data).expect("serialize");
         let restored: VaultKeyData = serde_json::from_value(value.clone()).expect("round trip");
         assert_eq!(
-            restored.deletion_date.as_ref().map(Zoned::timestamp),
+            restored.deletion_date.as_ref().map(ZonedDateTime::timestamp),
             Some(deadline.timestamp()),
             "deletion deadline must survive the KV2 round trip"
         );
@@ -4055,10 +4055,10 @@ mod tests {
     /// cancellation and destroyed the key.
     #[tokio::test]
     async fn wired_expired_key_sweep_yields_to_concurrent_cancellation() {
-        let now = Zoned::now() + Duration::from_secs(3600);
+        let now = ZonedDateTime::now() + Duration::from_secs(3600);
         let mut pending = healthy_key_data();
         pending.status = KeyStatus::PendingDeletion;
-        pending.deletion_date = Some(Zoned::now());
+        pending.deletion_date = Some(ZonedDateTime::now());
 
         let vault = ScriptedVault::serve(vec![
             ScriptedResponse::ok(kv2_metadata_read_data(1)),
@@ -4103,7 +4103,7 @@ mod tests {
     async fn wired_cancel_deletion_after_sweep_tombstone_fails_closed() {
         let mut pending = healthy_key_data();
         pending.status = KeyStatus::PendingDeletion;
-        pending.deletion_date = Some(Zoned::now());
+        pending.deletion_date = Some(ZonedDateTime::now());
         let mut tombstoned = healthy_key_data();
         tombstoned.status = KeyStatus::Deleted;
 
@@ -4192,7 +4192,7 @@ mod tests {
     async fn wired_immediate_deletion_of_a_pending_key_destroys_it() {
         let mut pending = healthy_key_data();
         pending.status = KeyStatus::PendingDeletion;
-        pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+        pending.deletion_date = Some(ZonedDateTime::now() + Duration::from_secs(7 * 86400));
 
         let vault = ScriptedVault::serve(vec![
             // describe_key: key info plus stored metadata.
@@ -4328,7 +4328,7 @@ mod tests {
     async fn wired_schedule_deletion_regates_after_conflict() {
         let mut already_pending = healthy_key_data();
         already_pending.status = KeyStatus::PendingDeletion;
-        already_pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+        already_pending.deletion_date = Some(ZonedDateTime::now() + Duration::from_secs(7 * 86400));
 
         let vault = ScriptedVault::serve(vec![
             ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
@@ -4747,7 +4747,7 @@ mod tests {
         let record_v2 = VaultKeyVersionRecord {
             version: 2,
             encrypted_key_material: base64_simd::STANDARD.encode_to_string(material_v2),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
         };
         // A well-formed envelope wrapped under version 2 — under a reverted
         // guard this decrypt would *succeed*, which is exactly the masked
@@ -4763,7 +4763,7 @@ mod tests {
             encrypted_key,
             nonce,
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: Some(2),
             context_binding: None,
         };
@@ -4843,7 +4843,7 @@ mod tests {
         let record_v2 = VaultKeyVersionRecord {
             version: 2,
             encrypted_key_material: adopted_material.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
         };
 
         let (vault, client) = scripted_client(vec![
@@ -5042,7 +5042,7 @@ mod tests {
     /// Reverting either half turns this test red.
     #[tokio::test]
     async fn wired_rotate_persists_rotation_time_and_describe_reports_it() {
-        let created_at = Zoned::now() - Duration::from_secs(365 * 86400);
+        let created_at = ZonedDateTime::now() - Duration::from_secs(365 * 86400);
         let mut key_data = healthy_key_data();
         key_data.created_at = created_at.clone();
         key_data.version = 2;
@@ -5069,7 +5069,7 @@ mod tests {
         let persisted: VaultKeyData =
             serde_json::from_value(committed["data"].clone()).expect("the committed record must deserialize");
         assert_eq!(
-            persisted.rotated_at.as_ref().map(Zoned::timestamp),
+            persisted.rotated_at.as_ref().map(ZonedDateTime::timestamp),
             Some(reported.timestamp()),
             "the rotation must persist the time it reports: {committed}"
         );
@@ -5091,12 +5091,12 @@ mod tests {
             .await
             .expect("describe the rotated key");
         assert_eq!(
-            described.rotated_at.as_ref().map(Zoned::timestamp),
+            described.rotated_at.as_ref().map(ZonedDateTime::timestamp),
             Some(reported.timestamp()),
             "describe must report the persisted rotation time"
         );
         assert_ne!(
-            described.rotated_at.as_ref().map(Zoned::timestamp),
+            described.rotated_at.as_ref().map(ZonedDateTime::timestamp),
             Some(created_at.timestamp()),
             "a rotated key must not be aged from its creation"
         );
@@ -5109,7 +5109,7 @@ mod tests {
     #[tokio::test]
     async fn wired_describe_key_invents_no_rotation_time_for_legacy_records() {
         let mut key_data = healthy_key_data();
-        key_data.created_at = Zoned::now() - Duration::from_secs(365 * 86400);
+        key_data.created_at = ZonedDateTime::now() - Duration::from_secs(365 * 86400);
         key_data.version = 4;
         key_data.baseline_version = Some(1);
 
@@ -5143,7 +5143,7 @@ mod tests {
     /// rest of their contents intact.
     #[test]
     fn vault_key_data_rotated_at_round_trips_and_stays_backward_compatible() {
-        let rotated_at = Zoned::now();
+        let rotated_at = ZonedDateTime::now();
         let mut key_data = healthy_key_data();
         key_data.rotated_at = Some(rotated_at.clone());
         key_data.baseline_version = Some(1);
@@ -5153,7 +5153,7 @@ mod tests {
         let mut value = serde_json::to_value(&key_data).expect("serialize");
         let restored: VaultKeyData = serde_json::from_value(value.clone()).expect("round trip");
         assert_eq!(
-            restored.rotated_at.as_ref().map(Zoned::timestamp),
+            restored.rotated_at.as_ref().map(ZonedDateTime::timestamp),
             Some(rotated_at.timestamp()),
             "the rotation time must survive the KV2 round trip"
         );
@@ -5190,7 +5190,7 @@ mod tests {
             encrypted_key,
             nonce,
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: None,
         };
@@ -5250,7 +5250,7 @@ mod tests {
             encrypted_key,
             nonce,
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: None,
         };
@@ -5302,7 +5302,7 @@ mod tests {
             encrypted_key,
             nonce,
             encryption_context: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding: None,
         };

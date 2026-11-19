@@ -1122,7 +1122,9 @@ where
 
         let direct_policies = mapped_policy.to_slice();
         let has_identity_mapping = !direct_policies.is_empty();
-        let policies = self.policy_db_get_with_groups(direct_policies, groups).await?;
+        // An uncached group mapping can contain a Deny even when a direct policy exists.
+        let mut policies = direct_policies;
+        policies.extend(self.policy_db_get_with_groups(Vec::new(), groups).await?);
         Ok((policies, has_identity_mapping))
     }
 
@@ -1374,6 +1376,16 @@ where
     }
 
     pub async fn set_temp_user(&self, access_key: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
+        self.set_temp_user_with_generation(access_key, cred, policy_name, None).await
+    }
+
+    pub(crate) async fn set_temp_user_with_generation(
+        &self,
+        access_key: &str,
+        cred: &Credentials,
+        policy_name: Option<&str>,
+        generation: Option<[u8; 16]>,
+    ) -> Result<OffsetDateTime> {
         if access_key.is_empty() || !cred.is_temp() || cred.is_expired() || cred.parent_user.is_empty() {
             error!(
                 "set temp user invalid argument, access_key: {},  is_temp: {}, is_expired: {}, parent_user_empty: {}",
@@ -1404,7 +1416,8 @@ where
             None
         };
 
-        let u = UserIdentity::new(cred.clone());
+        let mut u = UserIdentity::new(cred.clone());
+        u.sts_generation = generation;
         self.api
             .save_user_identity(access_key, UserType::Sts, u.clone(), None)
             .await?;
@@ -1578,7 +1591,7 @@ where
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        self.add_user_at_with_secret_change(access_key, args, updated_at)
+        self.add_user_at_with_secret_change(access_key, args, updated_at, true)
             .await
             .map(|(updated_at, _, _guard)| updated_at)
     }
@@ -1589,6 +1602,7 @@ where
         access_key: &str,
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
+        allow_status_change: bool,
     ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
         // A virtual OIDC parent is a canonical base64url-encoded SHA-256 digest.
         // It has no stored user record to collide with in the checks below.
@@ -1626,9 +1640,6 @@ where
                 return Err(Error::AccessKeyAlreadyExists);
             }
         }
-        let secret_changed = users
-            .get(access_key)
-            .is_some_and(|user| user.credentials.secret_key != args.secret_key);
         drop(cache);
         drop(users);
 
@@ -1646,8 +1657,9 @@ where
         });
         user_entry.update_at = Some(updated_at);
 
-        self.api
-            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
+        let secret_changed = self
+            .api
+            .upsert_regular_user(access_key, &mut user_entry, allow_status_change)
             .await?;
 
         self.update_user_with_claims(access_key, user_entry)?;
@@ -1795,9 +1807,7 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let parent_guard = parent_lock.lock_owned().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
+        let (u, revision) = match self.api.regular_user_revision(access_key).await? {
             Some(u) => u,
             None if expected_secret.is_some() => return Err(Error::IAMActionNotAllowed),
             None => return Err(Error::NoSuchUser(access_key.to_string())),
@@ -1825,14 +1835,11 @@ where
         } else {
             AccountStatus::Disabled
         };
-        let u = UserIdentity::from(cred);
+        let mut u = UserIdentity::from(cred);
+        u.sts_generation = Some(rand::random());
         let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
-        drop(cache);
-        drop(users);
 
-        self.api
-            .save_user_identity(access_key, UserType::Reg, u.clone(), None)
-            .await?;
+        self.api.save_regular_user_revision(access_key, &u, Some(&revision)).await?;
 
         self.update_user_with_claims(access_key, u)?;
         Ok((updated_at, status, parent_guard))
@@ -1846,20 +1853,15 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let _parent_guard = parent_lock.lock().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
-            Some(u) => u,
-            None => return Err(Error::NoSuchUser(access_key.to_string())),
-        };
-
-        let mut user_identity = u.clone();
+        let (mut user_identity, revision) = self
+            .api
+            .regular_user_revision(access_key)
+            .await?
+            .ok_or_else(|| Error::NoSuchUser(access_key.to_string()))?;
         user_identity.add_ssh_public_key(public_key);
-        drop(cache);
-        drop(users);
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_identity.clone(), None)
+            .save_regular_user_revision(access_key, &user_identity, Some(&revision))
             .await?;
 
         self.update_user_with_claims(access_key, user_identity)
@@ -1887,12 +1889,11 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let _parent_guard = parent_lock.lock().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
-            Some(u) => u,
-            None => return Err(Error::NoSuchUser(access_key.to_string())),
-        };
+        let (u, revision) = self
+            .api
+            .regular_user_revision(access_key)
+            .await?
+            .ok_or_else(|| Error::NoSuchUser(access_key.to_string()))?;
 
         if u.credentials.is_temp() || u.credentials.is_service_account() {
             return Err(Error::IAMActionNotAllowed);
@@ -1912,11 +1913,10 @@ where
             ..Default::default()
         });
         user_entry.update_at = Some(updated_at);
-        drop(cache);
-        drop(users);
+        user_entry.sts_generation = u.sts_generation;
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
+            .save_regular_user_revision(access_key, &user_entry, Some(&revision))
             .await?;
 
         self.update_user_with_claims(access_key, user_entry)?;
@@ -3095,9 +3095,15 @@ mod tests {
             .with_subscriber(subscriber)
             .await;
         assert!(
-            matches!(result, Err(Error::InvalidArgument)),
-            "the test store rejects persistence after the existing-user path"
+            matches!(result, Err(Error::IAMActionNotAllowed)),
+            "a store without conditional regular-user writes must reject the update"
         );
+        let retained = cache.cache.snapshot();
+        let retained = retained
+            .users
+            .get(&identity.credentials.access_key)
+            .expect("existing user retained");
+        assert_eq!(retained.credentials.secret_key, identity.credentials.secret_key);
         let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
         assert!(
             captured.contains(EVENT_USER_UPDATE_EXISTING) || captured.contains("IAM user already exists"),
@@ -3593,6 +3599,7 @@ mod tests {
     fn test_extract_jwt_claims_basic() {
         let user_identity = UserIdentity {
             version: 1,
+            sts_generation: None,
             credentials: Credentials {
                 access_key: "test-access-key".to_string(),
                 secret_key: "test-secret-key".to_string(),
@@ -3622,6 +3629,7 @@ mod tests {
     fn test_extract_jwt_claims_no_claims() {
         let user_identity = UserIdentity {
             version: 1,
+            sts_generation: None,
             credentials: Credentials {
                 access_key: "test-access-key".to_string(),
                 secret_key: "test-secret-key".to_string(),
@@ -3697,6 +3705,7 @@ mod tests {
         let user_identity = UserIdentity {
             version: 1,
             credentials,
+            sts_generation: None,
             update_at: Some(OffsetDateTime::now_utc()),
         };
 

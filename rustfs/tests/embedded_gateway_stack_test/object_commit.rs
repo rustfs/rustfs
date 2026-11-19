@@ -189,184 +189,226 @@ fn part(number: Option<i32>, etag: &str) -> CompletedPart {
     CompletedPart::builder().set_part_number(number).e_tag(etag).build()
 }
 
-/// CompleteMultipartUpload on the legacy stack answers every request shape as before its use case
-/// moved onto the gateway's types. Every answer was measured on `main` before the move.
+/// CompleteMultipartUpload answers every request shape as before its use case moved onto the
+/// gateway's types. Every answer was measured on the legacy stack on `main` before the move, and
+/// both stacks are held to the same table.
+async fn completes_every_upload(server: rustfs::embedded::RustFSServer, divergences: &[(&str, &str)]) {
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    client
+        .create_bucket()
+        .bucket(ORDINARY_BUCKET)
+        .send()
+        .await
+        .expect("CreateBucket");
+    for bucket in RESERVED_SHAPED_BUCKETS {
+        create_bucket_in_the_store(bucket).await;
+    }
+    let mut answered = Vec::new();
+
+    for bucket in [ORDINARY_BUCKET].into_iter().chain(RESERVED_SHAPED_BUCKETS) {
+        let (upload_id, etag) = one_part_upload(&client, bucket, "object").await;
+        let answer = complete(&client, bucket, "object", &upload_id, part(Some(1), &etag), &[]).await;
+        answered.push((format!("bucket {bucket}"), answer));
+    }
+
+    let too_long = "k".repeat(1025);
+    for (label, key) in [("NUL key", "nul\0key"), ("1025-byte key", too_long.as_str())] {
+        let answer = complete(&client, ORDINARY_BUCKET, key, "no-such-upload", part(Some(1), "\"0\""), &[]).await;
+        answered.push((label.to_owned(), answer));
+    }
+
+    type ShapeCase<'a> = (&'a str, Option<i32>, fn(&str) -> String, &'a [(&'a str, &'a str)]);
+    let shapes: [ShapeCase<'_>; 10] = [
+        ("empty part ETag", Some(1), |_| String::new(), &[]),
+        ("weak spelling of the stored part ETag", Some(1), |etag| format!("W/{etag}"), &[]),
+        ("unquoted stored part ETag", Some(1), |etag| etag.trim_matches('"').to_owned(), &[]),
+        (
+            "quoted other part ETag",
+            Some(1),
+            |_| "\"00000000000000000000000000000000\"".to_owned(),
+            &[],
+        ),
+        (
+            "unquoted other part ETag",
+            Some(1),
+            |_| "00000000000000000000000000000000".to_owned(),
+            &[],
+        ),
+        (
+            "weak other part ETag",
+            Some(1),
+            |_| "W/\"00000000000000000000000000000000\"".to_owned(),
+            &[],
+        ),
+        ("part without a number", None, str::to_owned, &[]),
+        (
+            "two checksum headers",
+            Some(1),
+            str::to_owned,
+            &[
+                ("crc32", "AAAAAA=="),
+                ("sha256", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
+            ],
+        ),
+        ("checksum of the wrong width", Some(1), str::to_owned, &[("crc32", "AAAA")]),
+        ("ordinary", Some(1), str::to_owned, &[("crc32", "AAAAAA==")]),
+    ];
+    for (index, (label, number, etag_for, checksums)) in shapes.into_iter().enumerate() {
+        let key = format!("shape-{index}");
+        let (upload_id, etag) = one_part_upload(&client, ORDINARY_BUCKET, &key).await;
+        let answer = complete(&client, ORDINARY_BUCKET, &key, &upload_id, part(number, &etag_for(&etag)), checksums).await;
+        answered.push((label.to_owned(), answer));
+    }
+
+    for (label, upload_id) in [
+        ("upload id with a dot-dot segment", "a/../b"),
+        ("upload id never minted", "bm90LWFuLXVwbG9hZA"),
+    ] {
+        let answer = complete(&client, ORDINARY_BUCKET, "object", upload_id, part(Some(1), "\"0\""), &[]).await;
+        answered.push((label.to_owned(), answer));
+    }
+
+    // No body at all: the legacy decoder refuses it before the operation.
+    let (upload_id, _) = one_part_upload(&client, ORDINARY_BUCKET, "no-body").await;
+    let answer = match client
+        .complete_multipart_upload()
+        .bucket(ORDINARY_BUCKET)
+        .key("no-body")
+        .upload_id(&upload_id)
+        .send()
+        .await
+    {
+        Ok(_) => "200".to_owned(),
+        Err(error) => format!(
+            "{:?} {:?} {:?}",
+            error.raw_response().map(|response| response.status().as_u16()),
+            error.code(),
+            error.message()
+        ),
+    };
+    answered.push(("no body".to_owned(), answer));
+
+    let expected = [
+        (
+            "bucket e1-complete",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "bucket sthree-e1",
+            "200 bucket=Some(\"sthree-e1\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "bucket e1-s3alias",
+            "200 bucket=Some(\"e1-s3alias\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "NUL key",
+            "Some(400) Some(\"InvalidArgument\") Some(\"Object key contains invalid control characters: \\\"nul\\\\0key\\\"\")",
+        ),
+        ("1025-byte key", "Some(400) Some(\"KeyTooLongError\") Some(\"Your key is too long.\")"),
+        (
+            "empty part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "weak spelling of the stored part ETag",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "unquoted stored part ETag",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "quoted other part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "unquoted other part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "weak other part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "part without a number",
+            "Some(400) Some(\"InvalidPart\") Some(\"Part number 0 must be between 1 and 10000\")",
+        ),
+        (
+            "two checksum headers",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=Some(\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\") type=None",
+        ),
+        (
+            "checksum of the wrong width",
+            "Some(400) Some(\"BadDigest\") Some(\"The Content-Md5 you specified did not match what we received.\")",
+        ),
+        (
+            "ordinary",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=None type=None",
+        ),
+        (
+            "upload id with a dot-dot segment",
+            "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.\")",
+        ),
+        (
+            "upload id never minted",
+            "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.\")",
+        ),
+        (
+            "no body",
+            "Some(400) Some(\"MalformedXML\") Some(\"This happens when the user sends malformed XML (XML that doesn't conform to the published XSD) for the configuration. The error message is, \\\"The XML you provided was not well-formed or did not validate against our published schema.\\\"\")",
+        ),
+    ];
+    let mut expected: Vec<(String, String)> = expected
+        .into_iter()
+        .map(|(label, answer)| (label.to_owned(), answer.to_owned()))
+        .collect();
+    for (label, answer) in divergences {
+        let row = expected
+            .iter_mut()
+            .find(|(row_label, _)| row_label == label)
+            .unwrap_or_else(|| panic!("no row named {label}"));
+        assert_ne!(row.1, *answer, "{label}: a divergence that equals the table is no divergence");
+        row.1 = (*answer).to_owned();
+    }
+    assert_eq!(answered, expected);
+    server.shutdown().await;
+}
+
+/// The rows on which the gateway stack answers differently from the legacy stack, with the
+/// gateway's answer. Every other row is held to the legacy table above.
+const GATEWAY_COMPLETION_DIVERGENCES: &[(&str, &str)] = &[
+    ("NUL key", "Some(400) Some(\"InvalidArgument\") Some(\"the name contains a NUL byte\")"),
+    (
+        "1025-byte key",
+        "Some(400) Some(\"KeyTooLongError\") Some(\"the name is longer than the maximum length in bytes\")",
+    ),
+    (
+        "empty part ETag",
+        "Some(400) Some(\"InvalidArgument\") Some(\"the request body carries a value this gateway cannot carry exactly\")",
+    ),
+    (
+        "part without a number",
+        "Some(400) Some(\"MalformedXML\") Some(\"the body omits a member the schema requires\")",
+    ),
+    (
+        "two checksum headers",
+        "Some(400) Some(\"InvalidRequest\") Some(\"Expecting a single x-amz-checksum- header\")",
+    ),
+    (
+        "no body",
+        "Some(400) Some(\"MalformedXML\") Some(\"the request body is not the XML this operation accepts\")",
+    ),
+];
+
 #[test]
 fn the_legacy_stack_completes_every_upload_as_before() {
-    with_stack(LEGACY, |server| async move {
-        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
-        client
-            .create_bucket()
-            .bucket(ORDINARY_BUCKET)
-            .send()
-            .await
-            .expect("CreateBucket");
-        for bucket in RESERVED_SHAPED_BUCKETS {
-            create_bucket_in_the_store(bucket).await;
-        }
-        let mut answered = Vec::new();
+    with_stack(LEGACY, |server| completes_every_upload(server, &[]));
+}
 
-        for bucket in [ORDINARY_BUCKET].into_iter().chain(RESERVED_SHAPED_BUCKETS) {
-            let (upload_id, etag) = one_part_upload(&client, bucket, "object").await;
-            let answer = complete(&client, bucket, "object", &upload_id, part(Some(1), &etag), &[]).await;
-            answered.push((format!("bucket {bucket}"), answer));
-        }
-
-        let too_long = "k".repeat(1025);
-        for (label, key) in [("NUL key", "nul\0key"), ("1025-byte key", too_long.as_str())] {
-            let answer = complete(&client, ORDINARY_BUCKET, key, "no-such-upload", part(Some(1), "\"0\""), &[]).await;
-            answered.push((label.to_owned(), answer));
-        }
-
-        type ShapeCase<'a> = (&'a str, Option<i32>, fn(&str) -> String, &'a [(&'a str, &'a str)]);
-        let shapes: [ShapeCase<'_>; 10] = [
-            ("empty part ETag", Some(1), |_| String::new(), &[]),
-            ("weak spelling of the stored part ETag", Some(1), |etag| format!("W/{etag}"), &[]),
-            ("unquoted stored part ETag", Some(1), |etag| etag.trim_matches('"').to_owned(), &[]),
-            (
-                "quoted other part ETag",
-                Some(1),
-                |_| "\"00000000000000000000000000000000\"".to_owned(),
-                &[],
-            ),
-            (
-                "unquoted other part ETag",
-                Some(1),
-                |_| "00000000000000000000000000000000".to_owned(),
-                &[],
-            ),
-            (
-                "weak other part ETag",
-                Some(1),
-                |_| "W/\"00000000000000000000000000000000\"".to_owned(),
-                &[],
-            ),
-            ("part without a number", None, str::to_owned, &[]),
-            (
-                "two checksum headers",
-                Some(1),
-                str::to_owned,
-                &[
-                    ("crc32", "AAAAAA=="),
-                    ("sha256", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
-                ],
-            ),
-            ("checksum of the wrong width", Some(1), str::to_owned, &[("crc32", "AAAA")]),
-            ("ordinary", Some(1), str::to_owned, &[("crc32", "AAAAAA==")]),
-        ];
-        for (index, (label, number, etag_for, checksums)) in shapes.into_iter().enumerate() {
-            let key = format!("shape-{index}");
-            let (upload_id, etag) = one_part_upload(&client, ORDINARY_BUCKET, &key).await;
-            let answer = complete(&client, ORDINARY_BUCKET, &key, &upload_id, part(number, &etag_for(&etag)), checksums).await;
-            answered.push((label.to_owned(), answer));
-        }
-
-        for (label, upload_id) in [
-            ("upload id with a dot-dot segment", "a/../b"),
-            ("upload id never minted", "bm90LWFuLXVwbG9hZA"),
-        ] {
-            let answer = complete(&client, ORDINARY_BUCKET, "object", upload_id, part(Some(1), "\"0\""), &[]).await;
-            answered.push((label.to_owned(), answer));
-        }
-
-        // No body at all: the legacy decoder refuses it before the operation.
-        let (upload_id, _) = one_part_upload(&client, ORDINARY_BUCKET, "no-body").await;
-        let answer = match client
-            .complete_multipart_upload()
-            .bucket(ORDINARY_BUCKET)
-            .key("no-body")
-            .upload_id(&upload_id)
-            .send()
-            .await
-        {
-            Ok(_) => "200".to_owned(),
-            Err(error) => format!(
-                "{:?} {:?} {:?}",
-                error.raw_response().map(|response| response.status().as_u16()),
-                error.code(),
-                error.message()
-            ),
-        };
-        answered.push(("no body".to_owned(), answer));
-
-        let expected = [
-            (
-                "bucket e1-complete",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "bucket sthree-e1",
-                "200 bucket=Some(\"sthree-e1\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "bucket e1-s3alias",
-                "200 bucket=Some(\"e1-s3alias\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "NUL key",
-                "Some(400) Some(\"InvalidArgument\") Some(\"Object key contains invalid control characters: \\\"nul\\\\0key\\\"\")",
-            ),
-            ("1025-byte key", "Some(400) Some(\"KeyTooLongError\") Some(\"Your key is too long.\")"),
-            (
-                "empty part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "weak spelling of the stored part ETag",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "unquoted stored part ETag",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "quoted other part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "unquoted other part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "weak other part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "part without a number",
-                "Some(400) Some(\"InvalidPart\") Some(\"Part number 0 must be between 1 and 10000\")",
-            ),
-            (
-                "two checksum headers",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=Some(\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\") type=None",
-            ),
-            (
-                "checksum of the wrong width",
-                "Some(400) Some(\"BadDigest\") Some(\"The Content-Md5 you specified did not match what we received.\")",
-            ),
-            (
-                "ordinary",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=None type=None",
-            ),
-            (
-                "upload id with a dot-dot segment",
-                "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.\")",
-            ),
-            (
-                "upload id never minted",
-                "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.\")",
-            ),
-            (
-                "no body",
-                "Some(400) Some(\"MalformedXML\") Some(\"This happens when the user sends malformed XML (XML that doesn't conform to the published XSD) for the configuration. The error message is, \\\"The XML you provided was not well-formed or did not validate against our published schema.\\\"\")",
-            ),
-        ];
-        let expected: Vec<(String, String)> = expected
-            .into_iter()
-            .map(|(label, answer)| (label.to_owned(), answer.to_owned()))
-            .collect();
-        assert_eq!(answered, expected);
-        server.shutdown().await;
-    });
+#[test]
+fn the_gateway_stack_completes_every_upload() {
+    with_stack(super::GATEWAY, |server| completes_every_upload(server, GATEWAY_COMPLETION_DIVERGENCES));
 }
 
 #[test]

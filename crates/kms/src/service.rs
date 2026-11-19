@@ -23,7 +23,7 @@ use crate::encryption::context_aad;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use md5::{Digest as Md5Digest, Md5};
 use rand::random;
 use rustfs_utils::http::object_encryption_keys::{
@@ -543,7 +543,7 @@ impl ObjectEncryptionService {
             iv,
             tag: Some(tag),
             encryption_context: context,
-            encrypted_at: Zoned::now(),
+            encrypted_at: ZonedDateTime::now(),
             // Pinned to the bytes actually fed to the AEAD, so the projection
             // below can store them verbatim instead of re-deriving them.
             context_aad: Some(aad),
@@ -702,7 +702,7 @@ impl ObjectEncryptionService {
             iv,
             tag: Some(tag),
             encryption_context: context,
-            encrypted_at: Zoned::now(),
+            encrypted_at: ZonedDateTime::now(),
             // Pinned to the bytes actually fed to the AEAD, so the projection
             // below can store them verbatim instead of re-deriving them.
             context_aad: Some(aad),
@@ -953,7 +953,7 @@ impl ObjectEncryptionService {
             iv,
             tag,
             encryption_context,
-            encrypted_at: Zoned::now(),
+            encrypted_at: ZonedDateTime::now(),
             original_size: 0, // Not available from headers
             encrypted_data_key,
             context_aad,
@@ -1070,7 +1070,7 @@ mod tests {
             iv: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             tag: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             encryption_context: HashMap::from([("bucket".to_string(), "test-bucket".to_string())]),
-            encrypted_at: Zoned::now(),
+            encrypted_at: ZonedDateTime::now(),
             original_size: 100,
             encrypted_data_key: vec![1, 2, 3, 4],
             // A hand-built record with no sealed bytes to defer to.

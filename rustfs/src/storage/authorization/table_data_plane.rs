@@ -25,8 +25,8 @@
 //! catalog store and its publication locks.
 
 use super::{AuthorizationRequest, object_store_not_initialized_error, request_iam_store, request_object_store};
+use super::{audit_request_denial, iam_authorization_error};
 use crate::error::ApiError;
-use crate::storage::access::{audit_request_denial, iam_authorization_error};
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -628,4 +628,33 @@ pub(crate) async fn deny_anonymous_table_data_plane_if_needed<R: AuthorizationRe
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn table_data_plane_mutations_fence_before_table_bucket_marker_lookup() {
+        let source = include_str!("table_data_plane.rs");
+        for (function, end_marker) in [
+            (
+                "async fn authorize_table_data_plane_if_needed",
+                "async fn deny_anonymous_table_data_plane_if_needed",
+            ),
+            ("async fn deny_anonymous_table_data_plane_if_needed", "\n}\n"),
+        ] {
+            let start = source.find(function).expect("authorization helper should exist");
+            let end = source[start..]
+                .find(end_marker)
+                .map(|offset| start + offset)
+                .expect("authorization helper boundary should exist");
+            let block = &source[start..end];
+            let fence = block
+                .find("retain_table_bucket_publication_guard(req, bucket).await?;")
+                .expect("content mutation should retain the bucket publication fence");
+            let marker = block
+                .find("table_bucket_enabled_for_data_plane(req, bucket).await?")
+                .expect("authorization should load the table bucket marker");
+            assert!(fence < marker, "{function} must fence pre-enable writers before reading the marker");
+        }
+    }
 }

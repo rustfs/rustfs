@@ -12378,6 +12378,7 @@ struct DecommissionCapacityLockOrderBarrierState {
     external_heal_target_lock_attempted: tokio::sync::Notify,
     target_gate_retry_entered: tokio::sync::Notify,
     target_gate_retry_entries: AtomicUsize,
+    target_gate_retry_pause: std::sync::OnceLock<tokio::sync::Semaphore>,
     target_gate_inline_retry_entered: tokio::sync::Notify,
     target_gate_inline_retry_entries: AtomicUsize,
     target_gate_exact_reloads: AtomicUsize,
@@ -12425,6 +12426,7 @@ impl DecommissionCapacityLockOrderBarrier {
             external_heal_target_lock_attempted: tokio::sync::Notify::new(),
             target_gate_retry_entered: tokio::sync::Notify::new(),
             target_gate_retry_entries: AtomicUsize::new(0),
+            target_gate_retry_pause: std::sync::OnceLock::new(),
             target_gate_inline_retry_entered: tokio::sync::Notify::new(),
             target_gate_inline_retry_entries: AtomicUsize::new(0),
             target_gate_exact_reloads: AtomicUsize::new(0),
@@ -12518,6 +12520,13 @@ impl DecommissionCapacityLockOrderBarrier {
         })
         .await
         .expect("decommission entries should observe target gate contention");
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn pause_target_gate_retries(&self) -> &tokio::sync::Semaphore {
+        self.state
+            .target_gate_retry_pause
+            .get_or_init(|| tokio::sync::Semaphore::new(0))
     }
 
     #[cfg(feature = "test-util")]
@@ -12630,6 +12639,9 @@ impl DecommissionCapacityLockOrderBarrier {
 #[cfg(test)]
 impl Drop for DecommissionCapacityLockOrderBarrier {
     fn drop(&mut self) {
+        if let Some(pause) = self.state.target_gate_retry_pause.get() {
+            pause.close();
+        }
         self.state.owner_release.notify_one();
         self.state.external_object_capacity_probe_release.notify_one();
         self.state.external_object_commit_phase_release.notify_one();
@@ -12758,7 +12770,7 @@ async fn pause_decommission_cancel_target_timeout(store_id: uuid::Uuid) {
 }
 
 #[cfg(test)]
-fn notify_decommission_target_gate_retry(store_id: uuid::Uuid) {
+async fn observe_decommission_target_gate_retry(store_id: uuid::Uuid) {
     let barrier = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -12769,6 +12781,11 @@ fn notify_decommission_target_gate_retry(store_id: uuid::Uuid) {
     if let Some(barrier) = barrier {
         barrier.target_gate_retry_entries.fetch_add(1, Ordering::AcqRel);
         barrier.target_gate_retry_entered.notify_one();
+        if let Some(pause) = barrier.target_gate_retry_pause.get()
+            && let Ok(permit) = pause.acquire().await
+        {
+            permit.forget();
+        }
     }
 }
 
@@ -17638,7 +17655,7 @@ impl ECStore {
         target_busy_attempt: usize,
     ) -> Result<Option<DecommissionCapacityTargetPermit>> {
         #[cfg(test)]
-        notify_decommission_target_gate_retry(self.id);
+        observe_decommission_target_gate_retry(self.id).await;
         let mut wait_attempt = target_busy_attempt;
         let target_guard = loop {
             let retry_delay =

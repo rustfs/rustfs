@@ -15,11 +15,10 @@
 //! Both request forms through the one decision: the same answer and the same state handed on
 //! (the caller's `ReqInfo` and the guard), allowed and refused.
 
-use super::decide_delete_object;
+use super::access_owned::object_misc::decide_delete_object;
 use crate::app::RequestEnvelope;
 use crate::storage::access::{
-    AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, ReqInfo, S3Error, S3ErrorCode, S3Request,
-    S3Result,
+    AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, ReqInfo, S3Request,
 };
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
@@ -29,6 +28,7 @@ use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
 use rustfs_policy::policy::Policy;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_SOURCE_VERSION_ID, insert_header};
 use serial_test::serial;
 use std::sync::Arc;

@@ -470,6 +470,7 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
                 server_side_encryption: None,
                 checksum_algorithm: None,
                 checksum_type: None,
+                response_headers: http::HeaderMap::new(),
             });
             let snapshot = |output: dto::CreateMultipartUploadOutput| {
                 (

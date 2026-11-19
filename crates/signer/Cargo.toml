@@ -27,12 +27,11 @@ documentation = "https://docs.rs/rustfs-signer/latest/rustfs_signer/"
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath", "rustfs-utils/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-utils/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-utils/hotpath-cpu"]
+hotpath = ["rustfs-utils/hotpath"]
+hotpath-alloc = ["hotpath", "rustfs-utils/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "rustfs-utils/hotpath-cpu"]
 
 [dependencies]
-hotpath.workspace = true
 tracing.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 http.workspace = true

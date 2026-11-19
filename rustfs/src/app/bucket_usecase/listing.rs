@@ -22,7 +22,7 @@ use crate::app::storage_api::s3::dto::{
     UserMetadata,
 };
 use crate::app::storage_api::s3::xml::{SerResult, SerializeContent};
-use crate::app::storage_api::s3::{S3ErrorCode, S3Request, S3Response, S3Result, xml};
+use crate::app::storage_api::s3::{S3Request, S3Response, S3Result, xml};
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 
@@ -348,8 +348,8 @@ async fn is_list_objects_metadata_action_allowed<T>(
 
     match authorize_request(&mut auth_req, Action::S3Action(action)).await {
         Ok(()) => Ok(true),
-        Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
-        Err(err) => Err(err),
+        Err(err) if err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 

@@ -39,7 +39,7 @@ hotpath-alloc = ["hotpath"]
 hotpath-cpu = ["hotpath"]
 
 [dependencies]
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

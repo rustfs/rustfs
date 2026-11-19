@@ -49,6 +49,10 @@ RustFS is an S3 server. SigV4 requires the server to know the secret key itself 
 | Rotation | `POST /v3/account/password`, requiring the current secret |
 | Session cleanup | Every STS session minted from the identity is revoked on rotation |
 
+For regular IAM users, the secret and its STS generation change in the same storage write. A node checks that generation against shared storage when using a session; it rejects the session if it cannot read the parent. A session created before generation tracking remains usable with its unversioned parent until rotation. An unchanged-secret user upsert preserves the generation.
+
+Upgrade all nodes that serve credentials before relying on this check. Older binaries do not enforce it on lookup. Independent site-replication receivers do not receive a regular user's session generation in the STS replication payload; a receiver with a versioned parent rejects that unbound session. Obtain a new session at the destination site in that case.
+
 Custom IAM user and service-account secret keys require at least eight UTF-8 bytes. The complete value is used for signing; it is not truncated, pre-hashed, or Unicode-normalized. Automatically generated service-account secret keys remain 40 bytes long.
 
 Before using service-account secret keys longer than 40 bytes, upgrade the site-replication receivers that may need to create those accounts. A receiver that still enforces the old creation limit can reject a new account even when the source created it successfully. Loading an existing identity and updating an existing service account use different paths and do not imply that account creation is supported.
@@ -124,7 +128,7 @@ A challenge is `HMAC-SHA256(root_secret, "rustfs-mfa-challenge:v1" ‖ access_ke
 | `DELETE /v3/user/mfa` | `admin:EnableUser` |
 | `PUT /v3/set-user-secret-key` | `admin:CreateUser` |
 
-The self-service routes carry no admin action and are registered as `CredentialOnly` in the route-policy matrix. Giving them one would be wrong in both directions: it would stop an ordinary user from changing their own password, and it would let any holder of that action change somebody else's.
+Eligible callers need no explicit Allow to rotate their password or manage their MFA. A matching Deny on `admin:ChangeOwnPassword` or `admin:CreateUser` blocks self-rotation (including via `add-user`); a Deny on `admin:ManageOwnMFA` blocks enrollment, activation, disabling and recovery-code replacement. The checks use the signing credential, including its applicable session policy. Administrative reset routes still require their ordinary admin permission and also honor the self-service deny when targeting the caller's own identity. Allowing a self-service action grants no authority over another identity.
 
 `POST /v3/account/password` and `POST /v3/account/mfa/disable` require a proof-of-knowledge step because a signature only proves a credential was used. The Console signs with a short-lived session, so without it a hijacked browser tab could rewrite the account's credentials or strip its second factor; requiring the password makes disabling the factor as hard as the thing the factor protects.
 
