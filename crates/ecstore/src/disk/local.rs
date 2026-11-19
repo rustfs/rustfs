@@ -3978,6 +3978,9 @@ enum SyncMode {
     FileOnly,
 }
 
+// Keep 2 MiB of shard data plus up to 128 32-byte hashes in one file buffer.
+const SHARD_FILE_MAX_BUF_SIZE: usize = 2 * 1024 * 1024 + 4096;
+
 #[allow(
     dead_code,
     reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
@@ -4326,7 +4329,8 @@ async fn read_dir_entry_batch_with_walk_stall(
 }
 
 impl FileCacheReclaimReader {
-    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
+    fn new(mut inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_drop {
             let _ = set_fd_nocache(&inner);
@@ -5216,7 +5220,8 @@ impl AsyncWrite for LazyLocalFileWriter {
 
 #[cfg(test)]
 impl FileCacheReclaimWriter {
-    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+    fn new(mut inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_shutdown {
             let _ = set_fd_nocache(&inner);
@@ -11423,6 +11428,20 @@ impl LocalDisk {
         Ok(data)
     }
 
+    fn part_path_resolver(&self) -> impl Fn(&str, &str) -> Result<PathBuf> + Send + use<> {
+        let root = self.io_root().to_owned();
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        move |bucket, key| {
+            let (bucket_path, path) = build_local_disk_object_path(&root, bucket, key);
+            #[cfg(target_os = "linux")]
+            check_local_disk_valid_object_path_at(&root, &mount_lease, &bucket_path, &path)?;
+            #[cfg(not(target_os = "linux"))]
+            check_local_disk_valid_object_path(&root, &bucket_path, &path)?;
+            Ok(path)
+        }
+    }
+
     async fn read_part_metadata(&self, bucket: &str, volume_dir: &Path, path_str: &str) -> Result<ObjectPartInfo> {
         let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
         let path = Path::new(path_str);
@@ -11435,8 +11454,10 @@ impl LocalDisk {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_default();
         let parent_str = path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy();
-        let data_path = self.io_get_object_path(bucket, &path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]))?;
-        let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
+        let data_key = path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]);
+        let metadata_key = path_str.to_owned();
+        let volume = bucket.to_owned();
+        let resolve = self.part_path_resolver();
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
         let root = self.publication_root.clone();
@@ -11446,12 +11467,13 @@ impl LocalDisk {
                 error: Some(error),
                 ..Default::default()
             };
+            let data_path = resolve(&volume, &data_key)?;
             if let Err(err) = std::fs::metadata(data_path) {
                 return Ok(Ok(part_error(err.to_string())));
             }
             // Invalid metadata paths remain request errors, but missing data wins
             // first, as it does in the serial reader.
-            let metadata_path = metadata_path?;
+            let metadata_path = resolve(&volume, &metadata_key)?;
             Ok(read_all_data_std(root.open_readonly(&metadata_path))
                 .map(|(data, _)| ObjectPartInfo::unmarshal(&data).unwrap_or_else(|err| part_error(err.to_string()))))
         })
@@ -12944,7 +12966,10 @@ impl LocalDisk {
                     let name = entry.trim_end_matches(SLASH_SEPARATOR);
                     let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
-                    if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    if opts.limit <= 0
+                        || (opts.forward_to.as_ref().is_none_or(|marker| &name >= marker)
+                            && metadata_counts_toward_limit(&metadata))
+                    {
                         *objs_returned += 1;
                     }
 
@@ -13214,7 +13239,9 @@ impl LocalDisk {
 
                         meta.metadata = read.bytes;
 
-                        if opts.limit <= 0 || read.counts_toward_limit {
+                        if opts.limit <= 0
+                            || (opts.forward_to.as_ref().is_none_or(|marker| &meta.name >= marker) && read.counts_toward_limit)
+                        {
                             *objs_returned += 1;
                         }
 
@@ -14720,12 +14747,38 @@ impl LocalDisk {
     }
 }
 
-/// Batch positioned reads for local EC shard files in a single `spawn_blocking`.
+/// Shard windows at least this large are copy-bound: reading them concurrently
+/// beats one serial blocking pass, while smaller windows stay coalesced to save
+/// blocking-pool round trips.
+#[cfg(unix)]
+const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
+
+/// Positioned reads for local EC shard files, returned in request order.
 ///
-/// Collapses per-shard blocking-pool round-trips that dominate warm GET
-/// fan-out on single-node multi-disk topologies.
+/// Small windows share a single `spawn_blocking`, collapsing per-shard
+/// blocking-pool round-trips that dominate warm GET fan-out on single-node
+/// multi-disk topologies. When every window reaches
+/// `LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES`, each shard gets its own dispatch so
+/// copies and device reads proceed concurrently.
 #[cfg(unix)]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+    if requests.len() < 2
+        || requests
+            .iter()
+            .any(|(_, _, length)| *length < LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES)
+    {
+        return batch_shard_pread_blocking(requests).await;
+    }
+    futures::future::join_all(requests.into_iter().map(|request| batch_shard_pread_blocking(vec![request])))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Read every request in turn inside one `spawn_blocking`.
+#[cfg(unix)]
+async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
     let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
@@ -14733,7 +14786,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
     let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use rustfs_io_metrics::LocalBatchReadStage;
-        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         // The disabled build expands directly to the original operation.
         macro_rules! diagnostic_stage {
@@ -14801,26 +14854,36 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            if offset == 0 {
-                                use std::io::Read as _;
-                                total = (&file)
-                                    .take(u64::try_from(length).unwrap_or(u64::MAX))
-                                    .read_to_end(&mut buf)
-                                    .map_err(DiskError::from)?;
-                                if total < length {
+                            // Announce the exact window before reading it. Kernel
+                            // readahead otherwise sizes its first request from the
+                            // read size: a small window at offset 0 pulls several
+                            // times its size, and a multi-MiB read is split into
+                            // serial readahead chunks. WILLNEED submits exactly the
+                            // window at once. It is advisory, so an unsupported hint
+                            // must not fail the read.
+                            #[cfg(target_os = "linux")]
+                            if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
+                                let _ = rustix::fs::fadvise(
+                                    &file,
+                                    start,
+                                    std::num::NonZeroU64::new(len),
+                                    rustix::fs::Advice::WillNeed,
+                                );
+                            }
+                            // `with_capacity` reserves exactly `length` bytes, so each
+                            // positioned read fills only the remaining requested span
+                            // without zero-initializing it first.
+                            while total < length {
+                                let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
+                                let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
+                                    Ok(nbytes) => nbytes,
+                                    Err(rustix::io::Errno::INTR) => continue,
+                                    Err(err) => return Err(DiskError::from(std::io::Error::from(err))),
+                                };
+                                if nbytes == 0 {
                                     return Err(DiskError::FileCorrupt);
                                 }
-                            } else {
-                                buf.resize(length, 0);
-                                while total < length {
-                                    let nbytes = file
-                                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                                        .map_err(DiskError::from)?;
-                                    if nbytes == 0 {
-                                        return Err(DiskError::FileCorrupt);
-                                    }
-                                    total += nbytes;
-                                }
+                                total += nbytes;
                             }
                             Ok::<_, DiskError>(())
                         }
@@ -15426,6 +15489,14 @@ impl DiskAPI for LocalDisk {
         )
         .map_err(DiskError::from)?;
         fi.validate(ValidationMode::RequireErasure)?;
+        let frame_size = crate::object_api::persisted_ec_read_quantum(
+            &fi.metadata,
+            codec_erasure.block_size,
+            codec_erasure.data_shards,
+            codec_erasure.shard_size(),
+        )
+        .map_err(|_| DiskError::FileCorrupt)?
+        .unwrap_or_else(|| codec_erasure.shard_size());
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -15447,7 +15518,7 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     codec_erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    codec_erasure.shard_size(),
+                    frame_size,
                 )
                 .await
                 .err();
@@ -15487,42 +15558,36 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         if bucket == RUSTFS_META_MULTIPART_BUCKET && !paths.is_empty() {
-            let mut cached_parts = Vec::with_capacity(paths.len());
-            let mut all_cached = true;
-            let mut verified_source: Option<(&str, PathBuf)> = None;
-            for path_str in paths {
-                let Some(num) = Path::new(path_str)
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .and_then(|v| v.strip_prefix("part."))
-                    .and_then(|v| v.strip_suffix(".meta"))
-                    .and_then(|v| v.parse::<usize>().ok())
-                else {
-                    all_cached = false;
-                    break;
-                };
-                let scope_root = multipart_staging::upload_scope_root(path_str, true);
-                let (source, head_already_verified) = match verified_source.as_ref() {
-                    Some((prev_root, prev_source)) if *prev_root == scope_root => (prev_source, true),
-                    _ => {
-                        let Ok(source) = self.io_get_object_open_path(bucket, scope_root) else {
-                            all_cached = false;
-                            break;
-                        };
-                        verified_source = Some((scope_root, source));
-                        (&verified_source.as_ref().expect("just initialized").1, false)
+            let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+            let resolve = self.part_path_resolver();
+            let keys = paths.to_owned();
+            let cached = spawn_blocking_with_disk_io_permit(permit, move || {
+                let mut parts = Vec::with_capacity(keys.len());
+                let mut verified = None;
+                for key in &keys {
+                    let num = Path::new(key)
+                        .file_name()?
+                        .to_str()?
+                        .strip_prefix("part.")?
+                        .strip_suffix(".meta")?
+                        .parse()
+                        .ok()?;
+                    let scope = multipart_staging::upload_scope_root(key, true);
+                    let same_head = verified.as_ref().is_some_and(|(prev, _)| *prev == scope);
+                    if !same_head {
+                        verified = Some((scope, resolve(RUSTFS_META_MULTIPART_BUCKET, scope).ok()?));
                     }
-                };
-                let Some(part) =
-                    multipart_source_state::get_active_multipart_source_part_with_head(source, num, head_already_verified)
-                else {
-                    all_cached = false;
-                    break;
-                };
-                cached_parts.push(part);
-            }
-            if all_cached {
-                return Ok(cached_parts);
+                    let (_, source) = verified.as_ref()?;
+                    parts.push(multipart_source_state::get_active_multipart_source_part_with_head(
+                        source, num, same_head,
+                    )?);
+                }
+                Some(parts)
+            })
+            .await
+            .map_err(DiskError::from)?;
+            if let Some(parts) = cached {
+                return Ok(parts);
             }
         }
         let volume_dir = self.io_get_bucket_path(bucket)?;
@@ -17957,10 +18022,13 @@ fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::c
     }
 
     let part = &fi.parts[0];
-    if !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
+    if part.size > fi.erasure.block_size || !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
         return false;
     }
-    let shard_size = fi.shard_file_size(part.actual_size);
+    let Ok(stored_size) = i64::try_from(part.size) else {
+        return false;
+    };
+    let shard_size = fi.shard_file_size(stored_size.max(part.actual_size));
     let versioned = fi.versioned || fi.version_id.is_some_and(|version_id| !version_id.is_nil());
     storage_class_config.should_inline(shard_size, fi.erasure.data_blocks, versioned)
 }
@@ -18726,6 +18794,8 @@ mod test {
             ec12.shard_file_size(1024 * 1024 + 1) < 128 * 1024,
             "a multi-block external object can still fit the per-shard budget"
         );
+        assert!(!should_read_legacy_inline_part(&ec12, &config));
+        ec12.parts[0].actual_size = 1;
         assert!(!should_read_legacy_inline_part(&ec12, &config));
     }
 
@@ -31781,13 +31851,14 @@ mod test {
             Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str, limit: i32) -> (Vec<String>, i32) {
             let (reader, mut writer) = tokio::io::duplex(4096);
             let mut out = MetacacheWriter::new(&mut writer);
             let opts = WalkDirOptions {
                 bucket: bucket.to_string(),
                 base_dir: base_dir.to_string(),
                 recursive: true,
+                limit,
                 forward_to: Some(forward_to.to_string()),
                 ..Default::default()
             };
@@ -31812,7 +31883,7 @@ mod test {
         }
 
         let (engineering_names, engineering_count) =
-            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001").await;
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             engineering_names,
@@ -31828,7 +31899,7 @@ mod test {
         assert_eq!(engineering_count as usize, engineering_names.len());
 
         let (different_names, different_count) =
-            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001").await;
+            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001", 0).await;
 
         assert_eq!(
             different_names,
@@ -31840,7 +31911,8 @@ mod test {
         );
         assert_eq!(different_count as usize, different_names.len());
 
-        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001").await;
+        let (double_names, double_count) =
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             double_names,
@@ -31852,6 +31924,13 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+
+        fs::write(bucket_dir.join("engineering/engineering").join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("write ancestor metadata");
+        let (names, count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 2).await;
+        assert_eq!(count, 2);
+        assert!(names.iter().any(|name| name == "engineering/engineering/repo-0002"));
     }
 
     #[tokio::test]
@@ -35040,6 +35119,80 @@ mod test {
         let mut body = Vec::new();
         reader.read_to_end(&mut body).await.expect("reader should forward reads");
         assert!(body.ends_with(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn file_cache_reclaim_wrappers_round_trip_checksum_sized_file_buffers() {
+        use sha2::{Digest, Sha256};
+        use std::io::IoSlice;
+
+        let dir = tempfile::tempdir().expect("create wrapper test directory");
+        for checksum_bytes in [32, 64] {
+            let wire_len = 2 * 1024 * 1024 + checksum_bytes;
+            let content: Vec<_> = (0u8..=250).cycle().take(wire_len).collect();
+            let path = dir.path().join(format!("frame-{checksum_bytes}"));
+            let file = File::create(&path).await.expect("create writer file");
+            let mut writer = FileCacheReclaimWriter::new(file, wire_len, true);
+            let mut bufs = Vec::new();
+            for frame in content.chunks(wire_len / (checksum_bytes / 32)) {
+                bufs.push(IoSlice::new(&frame[..32]));
+                bufs.push(IoSlice::new(&frame[32..]));
+            }
+            let accepted = writer.write_vectored(&bufs).await.expect("accept checksum and data slices");
+            assert_eq!(accepted, wire_len, "checksum overhead must fit alongside 2 MiB of data");
+            let tail = b"short final tail!";
+            writer.write_all(tail).await.expect("write after the accepted frame");
+            writer.flush().await.expect("flush pending writes");
+            writer.shutdown().await.expect("finish writes before cache reclaim");
+            writer.inner.sync_all().await.expect("sync the completed test file");
+
+            let file = File::open(&path).await.expect("reopen completed file");
+            let mut reader = FileCacheReclaimReader::new(file, 0, wire_len + tail.len(), true, 0);
+            let mut actual = vec![0; wire_len];
+            let read = reader
+                .read(&mut actual)
+                .await
+                .expect("read the complete large frame in one request");
+            assert_eq!(read, wire_len, "the file buffer must read checksum overhead alongside 2 MiB of data");
+            assert_eq!(actual, content, "large reads must preserve every accepted byte");
+            assert_eq!(Sha256::digest(&actual), Sha256::digest(&content), "frame digest must survive file I/O");
+            let mut actual_tail = [0; 32];
+            assert_eq!(
+                reader
+                    .read_exact(&mut actual_tail)
+                    .await
+                    .expect_err("short tail must report EOF")
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(&actual_tail[..tail.len()], tail, "short read must preserve the available tail");
+            assert_eq!(reader.read(&mut [0; 1]).await.expect("read at EOF"), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_cache_reclaim_writer_propagates_shutdown_error_after_acceptance() {
+        use std::io::IoSlice;
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .await
+            .expect("open full device");
+        let payload = vec![31; 2 * 1024 * 1024 + 64];
+        let mut writer = FileCacheReclaimWriter::new(file, payload.len(), true);
+        let accepted = writer
+            .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+            .await
+            .expect("Tokio may accept bytes before the blocking write fails");
+        assert_eq!(accepted, payload.len(), "the expanded buffer must accept the complete frame");
+        let error = writer
+            .shutdown()
+            .await
+            .expect_err("accepted bytes must not hide a failed blocking write");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!writer.reclaimed, "failed shutdown must not run successful-write cache reclaim");
     }
 
     #[cfg(target_os = "macos")]
@@ -40367,6 +40520,46 @@ mod test {
 
     #[cfg(unix)]
     #[test]
+    fn local_batch_reads_large_windows_per_shard_and_coalesces_small_windows() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let dir = tempfile::tempdir().expect("dispatch shape directory");
+        let large = LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES;
+        let paths: Vec<_> = (0..2)
+            .map(|index| {
+                let path = dir.path().join(format!("shard-{index}"));
+                std::fs::write(&path, vec![u8::try_from(index).expect("small shard index"); large + 64])
+                    .expect("write dispatch shape shard");
+                path
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("dispatch shape runtime");
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let dispatches = |length: usize| {
+            let recorder = CapturingRecorder::default();
+            let requests = paths.iter().map(|path| (path.clone(), 64, length)).collect();
+            let results = metrics::with_local_recorder(&recorder, || runtime.block_on(batch_shard_pread(requests)));
+            for (index, result) in results.iter().enumerate() {
+                let bytes = result.as_ref().expect("window inside the shard");
+                assert_eq!(bytes.len(), length);
+                assert!(bytes.iter().all(|byte| usize::from(*byte) == index), "results keep request order");
+            }
+            recorder.histogram_values("rustfs_io_get_object_local_batch_shards", &[])
+        };
+        let large_shape = dispatches(large);
+        let small_shape = dispatches(large - 1);
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+
+        assert_eq!(large_shape, vec![1.0, 1.0], "copy-bound windows must not serialize in one worker");
+        assert_eq!(small_shape, vec![2.0], "small windows must share one blocking dispatch");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_batch_read_metrics_survive_caller_cancellation() {
         use crate::test_metrics::CapturingRecorder;
 
@@ -40478,6 +40671,81 @@ mod test {
         assert!(results[1].as_ref().expect("empty range at EOF").is_empty());
         for result in &results[2..] {
             assert!(matches!(result, Err(DiskError::FileCorrupt)), "invalid range: {result:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_returns_exact_multi_page_windows() {
+        let dir = tempfile::tempdir().expect("multi-page window fixture");
+        let path = dir.path().join("shard");
+        let window = 1024 * 1024 + 32;
+        let content: Vec<u8> = (0..3 * window).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &content).expect("write multi-page shard");
+        let unaligned = 2 * window + 7;
+        // Windows of one and two q frames, at zero and nonzero offsets.
+        let windows = [
+            (0, window),
+            (window, window),
+            (unaligned, content.len() - unaligned),
+            (0, 2 * window),
+            (window - 5, 2 * window),
+        ];
+        let results = batch_shard_pread(
+            windows
+                .iter()
+                .map(|&(offset, length)| (path.clone(), offset, length))
+                .collect(),
+        )
+        .await;
+        for (result, (offset, length)) in results.iter().zip(windows) {
+            let bytes = result.as_ref().expect("window inside the shard");
+            assert_eq!(bytes.len(), length, "window at {offset} must not over-read");
+            assert_eq!(bytes.as_ref(), &content[offset..offset + length], "window at {offset}");
+        }
+    }
+
+    /// A cold batch read must bring in only its window. Without an exact hint,
+    /// kernel readahead sizes the first request from the read size, so a 16 KiB
+    /// window at offset 0 caches several times its pages and a 2 MiB window
+    /// almost twice its pages.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_batch_shard_pread_cold_read_caches_only_its_window() {
+        use rustix::fs::{Advice, fadvise};
+
+        let dir = tempfile::tempdir().expect("cold window fixture");
+        let path = dir.path().join("shard");
+        std::fs::write(&path, vec![5u8; 8 << 20]).expect("write cold window shard");
+        std::fs::File::open(&path)
+            .expect("open shard for sync")
+            .sync_all()
+            .expect("clean pages before eviction");
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let evict = || {
+            let file = std::fs::File::open(&path).expect("open shard for eviction");
+            fadvise(&file, 0, None, Advice::DontNeed).expect("evict shard pages");
+        };
+        evict();
+        assert_eq!(
+            resident_pages(&path),
+            0,
+            "the temporary filesystem must be able to drop page cache, otherwise residency is unobservable"
+        );
+        for length in [16 * 1024 + 32, 2 * 1024 * 1024 + 64] {
+            evict();
+            let results = batch_shard_pread(vec![(path.clone(), 0, length)]).await;
+            assert_eq!(results[0].as_ref().expect("cold window read").len(), length);
+            let window_pages = length.div_ceil(page);
+            let resident = resident_pages(&path);
+            assert!(
+                resident >= window_pages,
+                "the window itself must be resident: {resident} < {window_pages}"
+            );
+            assert!(
+                resident <= window_pages + window_pages / 8 + 4,
+                "a {length}-byte cold read cached {resident} pages for a {window_pages}-page window"
+            );
         }
     }
 

@@ -224,7 +224,7 @@ impl DefaultBucketUsecase {
         &self,
         envelope: RequestEnvelope,
         bucket: &str,
-        prepare: impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send + 'static,
+        prepare: impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send,
     ) -> S3Result<()> {
         // Preserve the success status recorded by the legacy audit for an empty response.
         RequestEnvelope::audit_only_operation(
@@ -368,9 +368,7 @@ impl DefaultBucketUsecase {
         &self,
         envelope: RequestEnvelope,
         bucket: &str,
-        prepare: impl Future<Output = S3Result<(PersistedReplicationConfiguration, HashSet<String>, OperatorRuleContract)>>
-        + Send
-        + 'static,
+        prepare: impl Future<Output = S3Result<(PersistedReplicationConfiguration, HashSet<String>, OperatorRuleContract)>> + Send,
     ) -> S3Result<()> {
         RequestEnvelope::audit_only_operation(
             envelope,

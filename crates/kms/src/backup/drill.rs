@@ -75,7 +75,7 @@ use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::service::ObjectEncryptionService;
 use crate::types::{CreateKeyRequest, EncryptionAlgorithm, EncryptionMetadata, KeyUsage};
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -272,10 +272,10 @@ pub struct DrillRecoveryEvidence {
 pub struct DrillRpoEvidence {
     /// When the export sealed the bundle.
     #[serde(with = "crate::time_serde::zoned")]
-    pub snapshot_completed_at: Zoned,
+    pub snapshot_completed_at: ZonedDateTime,
     /// When the disaster struck.
     #[serde(with = "crate::time_serde::zoned")]
-    pub disaster_at: Zoned,
+    pub disaster_at: ZonedDateTime,
     /// The data-loss window: work committed inside it is not in the bundle.
     pub rpo_window_millis: u64,
     /// Keys created after the fence closed, which the bundle cannot contain.
@@ -322,7 +322,7 @@ pub struct DrillEvidence {
     pub dataset: DrillDataset,
     /// When the run started.
     #[serde(with = "crate::time_serde::zoned")]
-    pub started_at: Zoned,
+    pub started_at: ZonedDateTime,
     /// Bundle evidence.
     pub bundle: DrillBundleEvidence,
     /// Recovery evidence.
@@ -508,7 +508,7 @@ impl PhaseClock {
 /// still produces the record of *how* it failed.
 pub async fn run_local_drill(kek: &BackupKek, request: &DrillRequest) -> Result<DrillEvidence> {
     request.validate()?;
-    let started_at = Zoned::now();
+    let started_at = ZonedDateTime::now();
     let mut clock = PhaseClock::new();
     let mut findings = Vec::new();
 
@@ -557,7 +557,7 @@ pub async fn run_local_drill(kek: &BackupKek, request: &DrillRequest) -> Result<
             },
         )
         .await?;
-        let snapshot_completed_at = Zoned::now();
+        let snapshot_completed_at = ZonedDateTime::now();
         clock.finish(DrillPhase::Export);
 
         // Past the fence: this key belongs to the window the bundle cannot
@@ -576,7 +576,7 @@ pub async fn run_local_drill(kek: &BackupKek, request: &DrillRequest) -> Result<
     let bundle_digest_before = tree_digest(&bundle_dir).await?;
 
     let destroyed_files = apply_disaster(&live_dir, request.disaster).await?;
-    let disaster_at = Zoned::now();
+    let disaster_at = ZonedDateTime::now();
     clock.finish(DrillPhase::Disaster);
 
     // Recovery step one is always the same: preserve what survived, then
@@ -980,7 +980,7 @@ fn walk_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn elapsed_millis(from: &Zoned, to: &Zoned) -> u64 {
+fn elapsed_millis(from: &ZonedDateTime, to: &ZonedDateTime) -> u64 {
     let nanos = to.timestamp().as_nanosecond() - from.timestamp().as_nanosecond();
     u64::try_from(nanos / 1_000_000).unwrap_or(0)
 }

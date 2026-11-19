@@ -170,6 +170,15 @@ impl DiskFaultHarness {
     /// Start (or restart after [`Self::kill_server`]) the RustFS server with
     /// all volume directories and the same address.
     pub async fn start_server(&mut self) -> ChaosResult<()> {
+        self.start_server_with_readiness(false).await
+    }
+
+    /// Start a process once its node read-readiness probe passes.
+    pub async fn start_server_at_read_quorum(&mut self) -> ChaosResult<()> {
+        self.start_server_with_readiness(true).await
+    }
+
+    async fn start_server_with_readiness(&mut self, read_quorum_only: bool) -> ChaosResult<()> {
         // The common helper always appends `env.temp_dir` as the final storage
         // path: point it at the last disk for startup and pass the remaining
         // disks explicitly, then restore it to the root so Drop cleans up
@@ -181,7 +190,13 @@ impl DiskFaultHarness {
         let arg_refs: Vec<&str> = disk_args.iter().map(String::as_str).collect();
         let env_refs: Vec<(&str, &str)> = self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        let result = self.env.start_rustfs_server_with_env(arg_refs, &env_refs).await;
+        let result = if read_quorum_only {
+            self.env
+                .start_rustfs_server_with_env_at_read_quorum(arg_refs, &env_refs)
+                .await
+        } else {
+            self.env.start_rustfs_server_with_env(arg_refs, &env_refs).await
+        };
         self.env.temp_dir = self.root.to_string_lossy().to_string();
         result
     }

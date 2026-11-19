@@ -28,6 +28,7 @@ use rustfs_rio::SharedTrailerSource;
 
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
+use http::HeaderName;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
@@ -776,6 +777,87 @@ pub(super) fn apply_put_request_metadata_native(
     Ok(())
 }
 
+/// Read the block-size hint from the raw request metadata without losing
+/// duplicate headers.  Once rollout is enabled and fleet-confirmed, multiple
+/// values or case-variant metadata names are rejected before the body is read.
+fn extract_ec_block_size_hint(headers: &HeaderMap, metadata: Option<&HashMap<String, String>>) -> S3Result<Option<String>> {
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE,
+        rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_ENABLE,
+    );
+    let fleet_confirmed = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+    );
+    let strict = enabled && fleet_confirmed;
+    let header_name = HeaderName::from_static("x-amz-meta-rustfs-ec-block-size-hint");
+    let raw_values = headers
+        .get_all(header_name)
+        .iter()
+        .map(|value| {
+            if strict {
+                value.to_str().map(str::to_owned).map_err(|_| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "rustfs-ec-block-size-hint must be ASCII decimal digits".to_string(),
+                    )
+                })
+            } else {
+                Ok(String::from_utf8_lossy(value.as_bytes()).into_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if strict && raw_values.len() > 1 {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "duplicate rustfs-ec-block-size-hint metadata is not allowed".to_string(),
+        ));
+    }
+
+    let metadata_values = metadata
+        .into_iter()
+        .flat_map(|entries| entries.iter())
+        .filter(|(key, _)| key.eq_ignore_ascii_case(EC_BLOCK_SIZE_HINT_METADATA_KEY))
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    if strict && metadata_values.len() > 1 {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "duplicate rustfs-ec-block-size-hint metadata is not allowed".to_string(),
+        ));
+    }
+
+    let hint = raw_values.into_iter().next().or_else(|| metadata_values.into_iter().next());
+    if strict && let Some(value) = hint.as_deref() {
+        resolve_ec_block_size_hint(Some(value), true, true, true).map_err(|error| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, format!("invalid rustfs-ec-block-size-hint: {error}"))
+        })?;
+    }
+    Ok(hint)
+}
+
+fn ec_block_size_hint_write_eligible(
+    should_compress: bool,
+    server_side_encryption_requested: bool,
+    inbound_replication_put: bool,
+    opts: &ObjectOptions,
+) -> bool {
+    let shard_integrity_rollout =
+        rustfs_utils::get_env_bool(rustfs_config::ENV_SHARD_INTEGRITY_WRITE, rustfs_config::DEFAULT_SHARD_INTEGRITY_WRITE)
+            && rustfs_utils::get_env_bool(
+                rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                rustfs_config::DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED,
+            );
+    !should_compress
+        && !server_side_encryption_requested
+        && !inbound_replication_put
+        && !opts.preserve_ciphertext
+        && !opts.data_movement
+        && opts.shard_integrity_write_mode.is_none()
+        && !shard_integrity_rollout
+}
+
 pub(super) fn apply_put_request_object_lock_opts_native(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
@@ -984,7 +1066,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1052,6 +1134,9 @@ pub(super) struct PutObjectWriteRequest<'a> {
     pub(super) sse: PutObjectSseInput,
     /// User metadata keyed the way s3s delivers it (`x-amz-meta-` stripped).
     pub(super) user_metadata: HashMap<String, String>,
+    /// Raw client hint retained separately so the request metadata remains
+    /// ordinary user metadata and storage only receives a trusted marker.
+    pub(super) ec_block_size_hint: Option<String>,
     /// Internal `x-rustfs-internal-*` / `x-minio-internal-*` keys written
     /// verbatim onto the object; empty for S3 requests.
     pub(super) internal_metadata: HashMap<String, String>,
@@ -1117,6 +1202,7 @@ pub(super) struct PutObjectCommitted {
     pub(super) sse_customer_algorithm: Option<String>,
     pub(super) sse_customer_key_md5: Option<String>,
     pub(super) put_extra_checksum_headers: Vec<(&'static str, String)>,
+    pub(super) ec_block_size_hint_outcome: EcBlockSizeHintOutcome,
     completion: Option<PutObjectCompletion>,
     put_request_guard: PutObjectGuard,
     bucket: String,
@@ -1180,6 +1266,11 @@ impl DefaultObjectUsecase {
         }
     }
 
+    #[hotpath::measure(
+        impl_type = "DefaultObjectUsecase",
+        future = true,
+        label = "rustfs::app::object::put::DefaultObjectUsecase::execute_put_object"
+    )]
     pub(crate) async fn execute_put_object_owned(
         &self,
         envelope: RequestEnvelope,
@@ -1286,6 +1377,15 @@ impl DefaultObjectUsecase {
             ..
         } = input;
 
+        // POST form uploads share the storage path but are a distinct S3
+        // operation.  The V1 hint is defined for direct PutObject only, so a
+        // POST field remains ordinary user metadata and never selects layout.
+        let ec_block_size_hint = if envelope.post_object().is_some() {
+            None
+        } else {
+            extract_ec_block_size_hint(envelope.headers(), metadata.as_ref())?
+        };
+
         // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
         let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
@@ -1366,6 +1466,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key_md5,
             },
             user_metadata: metadata.unwrap_or_default(),
+            ec_block_size_hint,
             internal_metadata: HashMap::new(),
             content: PutObjectContentInput {
                 cache_control,
@@ -1449,6 +1550,21 @@ impl DefaultObjectUsecase {
         // Echo XXHash3/64/128 / SHA-512 checksums that s3s PutObjectOutput has no typed
         // field for (#1256).
         inject_additional_checksum_headers(&mut output.headers, &committed.put_extra_checksum_headers);
+        if let Some(block_size) = committed.obj_info.effective_ec_block_size()
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            output.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
+        if let Some(status) = committed.ec_block_size_hint_outcome.status_header() {
+            output
+                .headers
+                .insert(EC_BLOCK_SIZE_HINT_STATUS_HEADER, HeaderValue::from_static(status));
+        }
+        if let Some(reason) = committed.ec_block_size_hint_outcome.reason_header() {
+            output
+                .headers
+                .insert(EC_BLOCK_SIZE_HINT_REASON_HEADER, HeaderValue::from_static(reason));
+        }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_response_build", response_build_stage_start);
         let status = output.status.unwrap_or(http::StatusCode::OK);
         let headers = output.headers.clone();
@@ -1490,6 +1606,7 @@ impl DefaultObjectUsecase {
             sse,
             user_metadata,
             internal_metadata,
+            ec_block_size_hint,
             content,
             object_lock,
             content_md5,
@@ -2092,6 +2209,35 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
+        let ec_block_size_hint_resolution = resolve_ec_block_size_hint(
+            ec_block_size_hint.as_deref(),
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE,
+                rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_ENABLE,
+            ),
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+                rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+            ),
+            ec_block_size_hint_write_eligible(should_compress, server_side_encryption_requested, inbound_replication_put, &opts),
+        )
+        .map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, format!("invalid rustfs-ec-block-size-hint: {err}"))
+        })?;
+        // The historical 1 MiB layout is already the storage default.  Do not
+        // carry a redundant transient marker for that value: it only adds
+        // compatibility-metadata work to the hot PUT path.  The persisted
+        // FileInfo still records the authoritative block size and response
+        // projection remains unchanged.
+        if matches!(ec_block_size_hint_resolution.outcome, EcBlockSizeHintOutcome::Applied)
+            && ec_block_size_hint_resolution.effective_block_size != DEFAULT_EC_BLOCK_SIZE
+        {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut opts.user_defined,
+                EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX,
+                ec_block_size_hint_resolution.effective_block_size.to_string(),
+            );
+        }
         let request_id = request_context
             .as_ref()
             .map(|ctx| ctx.request_id.clone())
@@ -2111,7 +2257,11 @@ impl DefaultObjectUsecase {
         if dsc.replicate_any() {
             opts.drop_lockless_cache_write();
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::ZonedDateTime::now().to_string(),
+            );
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_REPLICATION_STATUS,
@@ -2389,6 +2539,7 @@ impl DefaultObjectUsecase {
                 sse_customer_algorithm,
                 sse_customer_key_md5,
                 put_extra_checksum_headers,
+                ec_block_size_hint_outcome: ec_block_size_hint_resolution.outcome,
                 completion: Some(completion),
                 put_request_guard,
                 bucket,
@@ -2875,6 +3026,52 @@ mod tests {
 
         assert_eq!(limited.next().await.unwrap().unwrap(), Bytes::from_static(b"12345"));
         assert!(limited.next().await.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(ec_block_size_hint)]
+    fn put_ec_block_size_hint_enforces_strict_wire_rules_only_after_rollout() {
+        let vars = [
+            (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE, Some("true")),
+            (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED, Some("true")),
+        ];
+        temp_env::with_vars(vars, || {
+            let header_name = HeaderName::from_static("x-amz-meta-rustfs-ec-block-size-hint");
+            let mut duplicate_headers = HeaderMap::new();
+            duplicate_headers.append(header_name.clone(), HeaderValue::from_static("65536"));
+            duplicate_headers.append(header_name.clone(), HeaderValue::from_static("262144"));
+            let duplicate_error = extract_ec_block_size_hint(&duplicate_headers, None).expect_err("duplicate header");
+            assert_eq!(duplicate_error.code(), &S3ErrorCode::InvalidArgument);
+
+            let duplicate_metadata = HashMap::from([
+                (EC_BLOCK_SIZE_HINT_METADATA_KEY.to_string(), "65536".to_string()),
+                (EC_BLOCK_SIZE_HINT_METADATA_KEY.to_uppercase(), "262144".to_string()),
+            ]);
+            let metadata_error = extract_ec_block_size_hint(&HeaderMap::new(), Some(&duplicate_metadata))
+                .expect_err("case-variant metadata names");
+            assert_eq!(metadata_error.code(), &S3ErrorCode::InvalidArgument);
+
+            let mut malformed_headers = HeaderMap::new();
+            malformed_headers.insert(header_name, HeaderValue::from_static("65_536"));
+            let malformed_error = extract_ec_block_size_hint(&malformed_headers, None).expect_err("malformed value");
+            assert_eq!(malformed_error.code(), &S3ErrorCode::InvalidArgument);
+        });
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE, Some("false")),
+                (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED, Some("false")),
+            ],
+            || {
+                let header_name = HeaderName::from_static("x-amz-meta-rustfs-ec-block-size-hint");
+                let mut ordinary_metadata = HeaderMap::new();
+                ordinary_metadata.insert(header_name, HeaderValue::from_static("not-a-number"));
+                assert_eq!(
+                    extract_ec_block_size_hint(&ordinary_metadata, None).unwrap().as_deref(),
+                    Some("not-a-number")
+                );
+            },
+        );
     }
 
     #[test]
@@ -4739,7 +4936,7 @@ mod tests {
         request
             .headers
             .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::access::ReqInfo {
+        request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });

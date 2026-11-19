@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::access::{RequestedObjectLegalHold, RequestedObjectLockRetention};
+use super::request_markers::{RequestedObjectLegalHold, RequestedObjectLockRetention};
 use super::{StorageError, add_object_lock_years, get_bucket_cors_config};
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
-use crate::storage::ecfs::ListObjectUnorderedQuery;
-use crate::storage::storage_api::ecfs_extend_consumer::contract::bucket::{BucketOperations, BucketOptions};
-use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLockConfigState};
+use crate::storage::storage_api::s3_support_consumer::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage::storage_api::s3_support_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -47,12 +46,37 @@ use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
 
-use crate::storage::storage_api::ecfs_extend_consumer::StorageObjectInfo as ObjectInfo;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::s3_support_consumer::StorageObjectInfo as ObjectInfo;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_OBJECT_KEY: &str = "object_key";
+
+/// Query-string view used to reject `allow-unordered=true` combined with a delimiter.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct ListObjectUnorderedQuery {
+    #[serde(rename = "allow-unordered")]
+    pub(crate) allow_unordered: Option<String>,
+}
+
+/// Parse an optional `versionId` selector: `None` selects the latest version and `"null"` the
+/// stored null version (a nil UUID).
+pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<uuid::Uuid>> {
+    if let Some(vid) = version_id {
+        if vid == "null" {
+            // A nil UUID selects the stored null version; None selects latest.
+            return Ok(Some(uuid::Uuid::nil()));
+        }
+        let uuid = uuid::Uuid::parse_str(&vid).map_err(|e| {
+            tracing::error!("Invalid version ID: {}", e);
+            S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid version ID".to_string())
+        })?;
+        Ok(Some(uuid))
+    } else {
+        Ok(None)
+    }
+}
 
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
@@ -449,6 +473,12 @@ pub(crate) fn parse_object_lock_retention_native(
     let mut eval_metadata = HashMap::new();
 
     if let Some(v) = retention {
+        if v.mode.is_some() != v.retain_until.is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::MalformedXML,
+                "Retention requires both Mode and RetainUntilDate".to_string(),
+            ));
+        }
         let mode = match v.mode {
             Some(mode) => match mode.as_str() {
                 ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
@@ -505,20 +535,16 @@ pub(crate) fn parse_object_lock_legal_hold_native(
 ) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
-        let status = match v.0 {
-            Some(status) => match status.as_str() {
-                ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
-                _ => {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::MalformedXML,
-                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
-                    ));
-                }
-            },
-            None => String::default(),
+        let status = match v.0.as_deref() {
+            Some(status @ (ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON)) => status.to_owned(),
+            _ => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::MalformedXML,
+                    "The XML you provided was not well-formed or did not validate against our published schema",
+                ));
+            }
         };
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         insert_str(
             &mut eval_metadata,

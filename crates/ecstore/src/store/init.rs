@@ -752,18 +752,60 @@ impl ECStore {
         Ok(ec)
     }
 
-    #[instrument(level = "debug", skip(self, rx))]
-    pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
-        runtime_sources::ensure_boot_time().await;
-
+    async fn init_pool_metadata_for_startup(self: &Arc<Self>) -> Result<(PoolMeta, PoolMetaReplicaState)> {
         let should_persist_pool_meta = self
             .pools
             .first()
             .is_some_and(|pool| pool_first_endpoint_is_local(&pool.endpoints));
-        // Lock order is save gate -> distributed metadata writer, matching
+        // Lock order is save gate -> distributed metadata fence, matching
         // runtime mutations. RPC locks are available before ECStore publication
         // and do not depend on the later fleet proof.
         let mut startup_write_state = self.pool_meta_save_gate.write().await;
+        #[cfg(feature = "e2e-test-hooks")]
+        let startup_attempt = uuid::Uuid::new_v4();
+        // A committed snapshot needs only a shared namespace fence. A writer
+        // transition releases this reader and re-reads every observation below
+        // under the existing exclusive fence before applying side effects.
+        if !startup_write_state.bootstrap_identity_proven() && startup_write_state.attested_pool_indices().is_empty() {
+            let pool = self
+                .pools
+                .first()
+                .ok_or_else(|| Error::other("startup has no storage pools"))?;
+            let lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, "pool.bin").await?;
+            let reader = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+            let load = load_pool_meta_for_startup(self.pools.clone(), &mut startup_write_state);
+            #[cfg(feature = "e2e-test-hooks")]
+            let load = crate::core::pools::startup_cas_test_scope(startup_attempt, "load", &self.pools, load);
+            match load.await {
+                Ok((meta, replicas)) => {
+                    let topology_update = meta.validate(self.pools.clone())?;
+                    let requires_writer = should_persist_pool_meta
+                        && (topology_update
+                            || (replicas.needs_repair && replicas.repair_write_safe)
+                            || startup_write_state.identity_requires_repair());
+                    if !topology_update && !requires_writer {
+                        startup_write_state.ensure_startup_identity_initialized()?;
+                        #[cfg(feature = "e2e-test-hooks")]
+                        crate::core::pools::startup_cas_test_observe(serde_json::json!({
+                            "kind": "startup-classifier", "attempt": startup_attempt,
+                            "elected_writer": should_persist_pool_meta,
+                            "needs_repair": replicas.needs_repair,
+                            "repair_write_safe": replicas.repair_write_safe,
+                            "topology_update": topology_update,
+                        }));
+                        self.install_startup_pool_metadata(&meta, Some(&reader)).await?;
+                        return Ok((meta, replicas));
+                    }
+                }
+                Err(err)
+                    if should_persist_pool_meta
+                        && err
+                            .pool_metadata_failure()
+                            .is_some_and(|failure| failure.kind == crate::error::PoolMetadataFailure::ReadUnavailable) => {}
+                Err(err) => return Err(err),
+            }
+            drop(reader);
+        }
         let startup_pool_meta_guard = if should_persist_pool_meta {
             let pool = self
                 .pools
@@ -824,7 +866,6 @@ impl ECStore {
             "repair_write_safe": pool_meta_replica_state.repair_write_safe,
             "topology_update": update,
         }));
-        let endpoints = runtime_sources::endpoint_pools_or_default();
 
         let mut installed_pool_meta = if update {
             PoolMeta::new(&self.pools, &meta)?
@@ -881,18 +922,33 @@ impl ECStore {
             installed_pool_meta = persist.await?;
         }
 
-        if startup_pool_meta_guard
-            .as_ref()
-            .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
-        {
-            return Err(Error::other("startup pool metadata writer fence was lost before publication"));
-        }
-        {
-            let mut pool_meta = self.pool_meta.write().await;
-            *pool_meta = installed_pool_meta.clone();
-        }
+        self.install_startup_pool_metadata(&installed_pool_meta, startup_pool_meta_guard.as_deref())
+            .await?;
         drop(startup_pool_meta_guard);
         drop(startup_write_state);
+
+        Ok((installed_pool_meta, pool_meta_replica_state))
+    }
+
+    async fn install_startup_pool_metadata(
+        &self,
+        metadata: &PoolMeta,
+        fence: Option<&rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<()> {
+        let mut pool_meta = self.pool_meta.write().await;
+        if fence.is_some_and(|guard| guard.is_lock_lost() || guard.is_released()) {
+            return Err(Error::other("startup pool metadata fence was lost before publication"));
+        }
+        *pool_meta = metadata.clone();
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self, rx))]
+    pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
+        runtime_sources::ensure_boot_time().await;
+
+        let (installed_pool_meta, pool_meta_replica_state) = self.init_pool_metadata_for_startup().await?;
+        let endpoints = runtime_sources::endpoint_pools_or_default();
 
         resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
         let rebalance_resume_required = {
@@ -3729,6 +3785,89 @@ mod tests {
         set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| snapshot.clone()).collect());
 
         (instance_ctx, store, shutdown)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn committed_startup_pool_metadata_uses_shared_fence_without_disk_writes() {
+        use crate::disk::{FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET};
+        use crate::storage_api_contracts::namespace::NamespaceLocking;
+
+        for reopen in [false, true] {
+            let directory = tempfile::tempdir().expect("create committed metadata deployment");
+            let (_, seeded, seed_shutdown) =
+                without_storage_class_env(build_isolated_test_store(directory.path(), "startup-read-fence", &[4])).await;
+            let (store, shutdown) = if reopen {
+                seed_shutdown.cancel();
+                drop(seeded);
+                let (_, reopened, shutdown) =
+                    without_storage_class_env(build_isolated_test_store(directory.path(), "startup-read-fence", &[4])).await;
+                (reopened, shutdown)
+            } else {
+                (seeded, seed_shutdown)
+            };
+            let disks = store.pools[0].disk_set[0].disk_inventory().await;
+            let snapshot = || {
+                let mut files = std::collections::BTreeMap::new();
+                for (index, slot) in disks.iter().enumerate() {
+                    let disk = slot.as_ref().expect("committed drive handle");
+                    for object in [POOL_META_NAME, POOL_META_IDENTITY_NAME, FORMAT_CONFIG_FILE] {
+                        let root = disk.path().join(RUSTFS_META_BUCKET).join(object);
+                        assert!(root.exists(), "committed authority must be present: {root:?}");
+                        let mut pending = vec![root];
+                        while let Some(path) = pending.pop() {
+                            let metadata = std::fs::symlink_metadata(&path).expect("inspect authority file type");
+                            assert!(!metadata.file_type().is_symlink(), "authority fixture must not follow symlinks");
+                            if metadata.is_dir() {
+                                for entry in std::fs::read_dir(&path).expect("inspect authority object directory") {
+                                    pending.push(entry.expect("authority directory entry").path());
+                                }
+                            } else {
+                                assert!(metadata.is_file(), "authority fixture must contain regular files");
+                                let contents = std::fs::read(&path).expect("read physical authority bytes");
+                                let relative = path
+                                    .strip_prefix(disk.path())
+                                    .expect("authority stays under fixture drive")
+                                    .to_path_buf();
+                                files.insert((index, relative), contents);
+                            }
+                        }
+                    }
+                }
+                files
+            };
+            let before = snapshot();
+            let lock = store.pools[0]
+                .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+                .await
+                .expect("metadata namespace lock");
+            let mut reader = lock
+                .get_read_lock(Duration::from_secs(1))
+                .await
+                .expect("hold a competing metadata reader");
+            let (metadata, replicas) = tokio::time::timeout(Duration::from_secs(2), store.init_pool_metadata_for_startup())
+                .await
+                .expect("committed startup must not wait for an exclusive lock")
+                .expect("committed startup metadata is readable under a shared fence");
+            assert_eq!(metadata.pools[0].cmd_line, "startup-read-fence-pool-0");
+            assert!(!replicas.needs_repair);
+            assert!(!reader.is_lock_lost());
+            let after = snapshot();
+            assert_eq!(
+                after, before,
+                "shared startup observation cannot mutate metadata, identity, or format authority"
+            );
+            assert!(reader.release(), "release the snapshot's shared fence");
+            let mut invalid = metadata.clone();
+            invalid.pools[0].cmd_line = "must-not-be-published".to_string();
+            store
+                .install_startup_pool_metadata(&invalid, Some(&reader))
+                .await
+                .expect_err("a released fence cannot publish startup metadata");
+            assert_eq!(store.pool_meta.read().await.pools[0].cmd_line, metadata.pools[0].cmd_line);
+            drop(reader);
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]

@@ -3,13 +3,13 @@
 
 //! Table permission probes use the real catalog resource and IAM, without publishing objects.
 
-use super::{
-    Action, AuthorizationRequest, ECStore, ReqInfo, RequestedObjectLockRetention, S3Action, S3ErrorCode, authorize_request_core,
-};
+use super::{AuthorizationRequest, authorize_request_core};
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
+use crate::storage::req_info::ReqInfo;
+use crate::storage::request_markers::RequestedObjectLockRetention;
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage::storage_api::contract::object::ObjectOperations as _;
-use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, ServerContextSlot};
+use crate::storage::storage_api::runtime_sources_consumer::{AppContext, ECStore, IamInterface, ServerContextSlot};
 use crate::table_catalog::{
     Namespace, ObjectTableCatalogStore, TABLE_BUCKET_CATALOG_TYPE, TABLE_BUCKET_MARKER_CONFIG, TABLE_CATALOG_ENTRY_VERSION,
     TableBucketEntry, TableCatalogEntryState, TableCatalogObjectBackend as _, TableCatalogObjectPaths, TableCatalogStore as _,
@@ -23,6 +23,8 @@ use rustfs_iam::{
 };
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
 use rustfs_policy::policy::Policy;
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::S3ErrorCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 

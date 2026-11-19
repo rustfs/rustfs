@@ -20,7 +20,7 @@
 //! owns this file and is the only one that edits it.
 
 use crate::app::RequestEnvelope;
-use crate::storage::access::access_owned::bucket_replication_lifecycle::prepare_replication_config_edit;
+use crate::storage::access_owned::bucket_replication_lifecycle::prepare_replication_config_edit;
 use crate::storage::ecfs::*;
 use crate::storage::s3_api::{self, PreparedLifecycleConfiguration, validate_lifecycle_rule_status};
 use crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s;

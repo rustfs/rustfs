@@ -18,8 +18,7 @@
 //! * `POST /rustfs/admin/v3/account/password` — rotate the caller's own secret
 //!
 //! These act on whoever is calling rather than on a target named in the
-//! request, so they carry no admin-action gate: every authenticated identity
-//! may inspect and manage itself. What they do carry instead is a proof-of-
+//! request. Rotation honors explicit policy denials and requires a proof-of-
 //! knowledge check, because a signature only proves that a credential was
 //! *used* — the Console signs with a short-lived STS session, so a hijacked
 //! browser tab could otherwise rewrite the parent identity's password without
@@ -35,7 +34,7 @@ use super::iam_error::iam_error_to_s3_error;
 use super::owned_admin_json_response;
 use super::site_replication::site_replication_iam_change_hook;
 use super::supervise_admin_mutation;
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::{SelfServiceMutation, validate_admin_request};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_envelope};
@@ -184,6 +183,10 @@ impl Operation for ChangeOwnPasswordHandler {
             );
             return Err(err);
         }
+
+        SelfServiceMutation::Password
+            .check(&req, &caller.credentials, caller.is_owner)
+            .await?;
 
         let path = req.uri().path().to_string();
         let body =
@@ -387,6 +390,12 @@ impl Operation for SetUserSecretKeyHandler {
                 .with_session_access_key(Some(caller.access_key.as_str())),
             );
         })?;
+
+        if target == caller.access_key {
+            SelfServiceMutation::Password
+                .check(&req, &caller.credentials, caller.is_owner)
+                .await?;
+        }
 
         let path = req.uri().path().to_string();
         let body =

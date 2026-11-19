@@ -12,22 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use crate::app::{Answered, RequestEnvelope};
 use crate::error::ApiErrorDiagnostic;
 use crate::storage::s3_api;
-use crate::storage::storage_api::ecfs_consumer::contract::object::ObjectOperations as _;
-use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use http::StatusCode;
 use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders, dto::*, s3_error};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, TrailingHeaders, dto::*};
 use std::fmt::Debug;
 use std::future::Future;
-use tracing::{debug, error, instrument, warn};
-use uuid::Uuid;
+use tracing::{error, instrument};
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
@@ -58,8 +55,6 @@ fn log_object_internal_error(operation: &'static str, request_id: Option<&str>, 
     );
 }
 
-use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
-
 #[derive(Debug, Clone)]
 pub struct FS {
     /// This server's late-bound application-context slot (backlog#1052 S2).
@@ -69,12 +64,6 @@ pub struct FS {
     /// own store once contexts become per-server. An uninstalled slot falls
     /// back to the global `AppContext` — the single-instance legacy default.
     server_ctx: std::sync::Arc<runtime_sources::ServerContextSlot>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-pub(crate) struct ListObjectUnorderedQuery {
-    #[serde(rename = "allow-unordered")]
-    pub(crate) allow_unordered: Option<String>,
 }
 
 impl Default for FS {
@@ -111,66 +100,9 @@ impl FS {
         let Some(store) = self.server_ctx.object_store() else {
             return Ok(std::collections::HashMap::new());
         };
-        Self::get_object_tag_conditions_for_policy_from_store(store.as_ref(), bucket, object, version_id).await
-    }
-
-    pub(crate) async fn get_object_tag_conditions_for_policy_from_store(
-        store: &ECStore,
-        bucket: &str,
-        object: &str,
-        version_id: Option<&str>,
-    ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
-        let opts = ObjectOptions {
-            version_id: version_id.map(String::from),
-            ..Default::default()
-        };
-        let tags = match store.get_object_tags(bucket, object, &opts).await {
-            Ok(t) => t,
-            Err(e) => {
-                if is_err_object_not_found(&e) || is_err_version_not_found(&e) || is_err_bucket_not_found(&e) {
-                    debug!(
-                        target: "rustfs::storage::ecfs",
-                        bucket = %bucket,
-                        object = %object,
-                        version_id = ?version_id,
-                        error = %e,
-                        "object, version, or bucket not found when fetching tags for policy; treating as no tags"
-                    );
-                    return Ok(std::collections::HashMap::new());
-                }
-                warn!(
-                    target: "rustfs::storage::ecfs",
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?version_id,
-                    error = %e,
-                    "get_object_tags failed for policy conditions; denying request"
-                );
-                return Err(s3_error!(AccessDenied, "Access Denied"));
-            }
-        };
-        let map = decode_tags_to_map(&tags);
-        let mut out = std::collections::HashMap::new();
-        for (k, v) in map {
-            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
-        }
-        Ok(out)
-    }
-}
-
-pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
-    if let Some(vid) = version_id {
-        if vid == "null" {
-            // A nil UUID selects the stored null version; None selects latest.
-            return Ok(Some(Uuid::nil()));
-        }
-        let uuid = Uuid::parse_str(&vid).map_err(|e| {
-            error!("Invalid version ID: {}", e);
-            s3_error!(InvalidArgument, "Invalid version ID")
-        })?;
-        Ok(Some(uuid))
-    } else {
-        Ok(None)
+        crate::storage::authorization::existing_object_tag_conditions(store.as_ref(), bucket, object, version_id)
+            .await
+            .map_err(Into::into)
     }
 }
 

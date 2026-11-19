@@ -53,13 +53,14 @@
 compile_error!("gateway-stack is restricted to debug builds");
 
 mod admin;
+mod control_plane;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
-use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
+use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register, serves};
 use crate::server::ssec_transport::{is_secure_transport, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
@@ -149,6 +150,8 @@ pub(crate) enum GatewayAssemblyError {
     AdminOverlayMissing,
     #[error("the native admin dialect refused its assembly: {0:?}")]
     AdminDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
+    #[error("the metadata listing dialect refused its assembly: {0:?}")]
+    MetadataListingDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
     #[error("RUSTFS_KEYSTONE_ENABLE configuration is invalid: {0}")]
     KeystoneConfig(rustfs_keystone::KeystoneError),
     #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider on RUSTFS_S3_STACK=gateway")]
@@ -162,6 +165,8 @@ pub(crate) enum GatewayAssemblyError {
 pub(crate) struct GatewayStack {
     service: rustfs_gateway::S3Service,
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+    /// Whether this is the control-plane host, which reads each request's head before the gateway.
+    control_plane: bool,
 }
 
 impl GatewayStack {
@@ -188,20 +193,33 @@ impl GatewayStack {
         admin::assemble(assembly, iam, root)
     }
 
+    /// Assembles the control-plane host over `router`: every other route the admin router claims.
+    pub(crate) fn assemble_control_plane(
+        assembly: GatewayAssembly,
+        router: Arc<crate::admin::router::S3Router<crate::admin::router::AdminOperation>>,
+    ) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        control_plane::assemble(assembly, iam, root, router)
+    }
+
     fn assemble_with(
         assembly: GatewayAssembly,
         iam: Arc<dyn IamKeyLookup>,
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
-        let builder = Self::configured_builder(&assembly, iam, root, authorizer)?;
+        let listings = metadata_listing::dialect().map_err(GatewayAssemblyError::MetadataListingDialect)?;
+        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?.dialect(&listings);
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
-        let service = register(OPERATIONS, builder, &backend)
-            .build()
-            .map_err(GatewayAssemblyError::Service)?;
+        let builder = metadata_listing::register(register(OPERATIONS, builder, &backend), &assembly.server_ctx);
+        let service = builder.build().map_err(GatewayAssemblyError::Service)?;
         Ok(Self {
             service,
             keystone_auth: assembly.keystone_auth,
+            control_plane: false,
         })
     }
 
@@ -210,6 +228,7 @@ impl GatewayStack {
         iam: Arc<dyn IamKeyLookup>,
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
+        authenticator: impl FnOnce(SigV4Authenticator) -> SigV4Authenticator,
     ) -> Result<ServiceBuilder, GatewayAssemblyError> {
         // A root the gateway could not verify a signature with is a startup error, never a
         // server that silently has no root. Requests read the live root from `root`.
@@ -226,9 +245,12 @@ impl GatewayStack {
         let credentials = Arc::new(IamCredentials::new(iam, root));
         let builder = ServiceBuilder::new()
             .rustfs_profile()
+            // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
+            // the refusal once authorization succeeds.
+            .defer_encryption_header_refusals_to_handlers()
             // Keep the profile's inner drain aligned with the host's configured idle bound.
             .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
-            .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
+            .authenticator(authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile()))
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
             // Both gates follow the deployment setting; transport facts remain per request.
@@ -250,7 +272,7 @@ impl GatewayStack {
         } else {
             builder
         };
-        let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout));
+        let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout, DEFAULT_MAX_BUFFERED_BODY_BYTES));
         Ok(builder)
     }
 
@@ -261,6 +283,9 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        if self.control_plane {
+            control_plane::attach_head(&mut request);
+        }
         let extensions = request.extensions_mut();
         extensions.remove::<KeystoneEstablished>();
         extensions.remove::<OwnedKeystoneIdentity>();
@@ -300,11 +325,11 @@ impl GatewayStack {
     }
 }
 
-/// The early gate over `table`: an operation it serves is allowed on to its handler, which decides;
-/// every other operation is denied.
+/// The early gate over `table` and the two metadata listings: an operation it serves is allowed on
+/// to its handler, which decides; every other operation is denied.
 fn early_gate(table: OperationTable) -> impl Authorizer {
     decide_with(move |request| {
-        if serves(table, request.operation) {
+        if serves(table, request.operation) || metadata_listing::NAMES.contains(&request.operation) {
             Decision::Allow
         } else {
             Decision::Deny
@@ -316,13 +341,14 @@ fn early_gate(table: OperationTable) -> impl Authorizer {
 ///
 /// No handler runs under a total deadline, object data included: the legacy stack has none, and a
 /// large transfer must not be cut off for its duration. A committed answer is not bounded either.
-/// The request body keeps RustFS's own idle bound and no throughput floor.
-fn service_config(body_read_timeout: Duration) -> ServiceConfig {
+/// The request body keeps RustFS's own idle bound and no throughput floor, and at most
+/// `max_buffered_body_bytes` of it is held.
+fn service_config(body_read_timeout: Duration, max_buffered_body_bytes: u64) -> ServiceConfig {
     let handlers = HandlerDeadlineConfig::default()
         .without_deadline(HandlerDeadlineClass::Standard)
         .without_deadline(HandlerDeadlineClass::Extended)
         .without_commit_progress_deadline();
-    ServiceConfig::new(DEFAULT_MAX_BUFFERED_BODY_BYTES)
+    ServiceConfig::new(max_buffered_body_bytes)
         .with_handler_deadlines(handlers)
         .with_request_body_deadlines(body_deadlines(body_read_timeout))
 }

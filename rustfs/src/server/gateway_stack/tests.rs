@@ -16,7 +16,9 @@
 
 #[path = "admin/tests.rs"]
 mod admin;
+mod control_plane;
 mod keystone;
+mod legacy_layers;
 mod ssec;
 
 use super::*;
@@ -147,7 +149,8 @@ fn the_assembled_stack_registers_exactly_the_table() {
     let stack = GatewayStack::assemble(assembly()).expect("the stack assembles");
 
     let registered: std::collections::BTreeSet<&str> = stack.service.operations().collect();
-    assert_eq!(registered, rows(OPERATIONS).map(|row| row.name).collect());
+    let table = rows(OPERATIONS).map(|row| row.name);
+    assert_eq!(registered, table.chain(metadata_listing::NAMES).collect());
 }
 
 #[test]
@@ -288,7 +291,7 @@ fn keystone_is_read_from_configuration_and_an_unreadable_one_is_refused() {
 
 #[test]
 fn no_handler_runs_under_a_total_deadline_and_the_body_keeps_the_rustfs_idle_bound() {
-    let config = service_config(Duration::from_secs(300));
+    let config = service_config(Duration::from_secs(300), DEFAULT_MAX_BUFFERED_BODY_BYTES);
 
     assert_eq!(config.handler_deadline(HandlerDeadlineClass::Standard), NO_DEADLINE);
     assert_eq!(config.handler_deadline(HandlerDeadlineClass::Extended), NO_DEADLINE);

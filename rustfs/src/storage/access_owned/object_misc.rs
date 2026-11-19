@@ -26,16 +26,18 @@
 
 use crate::storage::ReplicationStatusType;
 #[cfg(test)]
-use crate::storage::access::wait_for_object_generation_test_hook;
-use crate::storage::access::{
-    AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, S3Error, S3ErrorCode, S3Result,
-    ServerContextSlot, audit_request_denial, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
-    invalid_force_delete_header, load_bucket_generation, missing_req_info_error, recursive_force_delete_has_authenticated_caller,
-    req_info_mut, s3_error,
+use crate::storage::authorization::wait_for_object_generation_test_hook;
+use crate::storage::authorization::{
+    AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, audit_request_denial, authorize_request,
+    has_bypass_governance_header, invalid_force_delete_header, load_bucket_generation, missing_req_info_error,
+    recursive_force_delete_has_authenticated_caller, req_info_mut,
 };
+use crate::storage::authorization_actions::delete_object_authorize_action;
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::options::destination_version_id;
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, force_delete_header};
 
 /// The bulk engine authorizes each entry after this request-level target setup.
@@ -90,7 +92,7 @@ pub(crate) async fn authorize_delete_object<R: AuthorizationRequest + ?Sized>(
 /// source-version header), `ForceDeleteObject` for a force delete, the authenticated-caller rule
 /// for a recursive force delete, and `BypassGovernanceRetention` when the header asks for it.
 /// Returns the guard `bucket_generation` becomes.
-async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
+pub(crate) async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     bucket: &str,
     key: &str,
@@ -164,7 +166,3 @@ pub(crate) async fn authorize_select_object_content<R: AuthorizationRequest + ?S
     req_info.object = Some(key.to_owned());
     authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
 }
-
-#[cfg(test)]
-#[path = "object_misc_test.rs"]
-mod tests;

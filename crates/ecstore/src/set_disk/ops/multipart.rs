@@ -123,14 +123,14 @@ async fn create_part_writers(
     disks: &[Option<DiskStore>],
     path: &str,
     length: i64,
-    shard_size: usize,
+    frame_size: usize,
 ) -> (Vec<Option<BitrotWriterWrapper>>, Vec<Option<DiskError>>) {
     join_all(disks.iter().map(|disk| async move {
         let Some(disk) = disk else {
             return (None, Some(DiskError::DiskNotFound));
         };
         #[cfg(test)]
-        if let Some(result) = multipart_writer_test_hook::create_writer(disk, path, length, shard_size).await {
+        if let Some(result) = multipart_writer_test_hook::create_writer(disk, path, length, frame_size).await {
             return match result {
                 Ok(writer) => (Some(writer), None),
                 Err(error) => (None, Some(error)),
@@ -143,7 +143,7 @@ async fn create_part_writers(
             RUSTFS_META_TMP_BUCKET,
             path,
             length,
-            shard_size,
+            frame_size,
             HashAlgorithm::HighwayHash256S,
         )
         .await
@@ -1151,6 +1151,10 @@ impl SetDisks {
             upload_id: upload_id.to_owned(),
             user_defined: {
                 strip_internal_multipart_metadata(&mut fi.metadata);
+                rustfs_utils::http::metadata_compat::remove_str(
+                    &mut fi.metadata,
+                    crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX,
+                );
                 fi.metadata.clone()
             },
             ..Default::default()
@@ -2786,14 +2790,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // it is reacquired for the short final rename, so Complete/Abort are
         // not blocked behind a slow body upload.
         let _capped_staging_guard = if multipart_size_limit.is_some() {
+            let semaphore = capped_multipart_staging_semaphore(&upload_id_path);
+            let permit = if opts.multipart_copy_source_locked {
+                semaphore.try_acquire_owned().map_err(|_| Error::SlowDown)?
+            } else {
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::other("capped multipart staging semaphore closed"))?
+            };
             Some(CappedMultipartStagingGuard {
                 upload_id_path: upload_id_path.clone(),
-                permit: Some(
-                    capped_multipart_staging_semaphore(&upload_id_path)
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::other("capped multipart staging semaphore closed"))?,
-                ),
+                permit: Some(permit),
             })
         } else {
             None
@@ -2822,13 +2830,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let erasure =
                 Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
                     .map_err(Error::from)?);
+            let frame_size = crate::object_api::persisted_ec_read_quantum(
+                &fi.metadata,
+                erasure.block_size,
+                erasure.data_shards,
+                erasure.shard_size(),
+            )
+            .map_err(|error| Error::other(error.to_string()))?
+            .unwrap_or_else(|| erasure.shard_size());
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
             let (mut writers, errors) = create_part_writers(
                 &shuffle_disks,
                 &tmp_part_path,
                 erasure.shard_file_size(data.size()),
-                erasure.shard_size(),
+                frame_size,
             )
             .await;
 
@@ -3279,6 +3295,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             user_defined: {
                 let mut metadata = fi.metadata.clone();
                 strip_internal_multipart_metadata(&mut metadata);
+                rustfs_utils::http::metadata_compat::remove_str(
+                    &mut metadata,
+                    crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX,
+                );
                 metadata
             },
             ..Default::default()
@@ -3456,8 +3476,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut user_defined = opts.user_defined.clone();
+        let requested_ec_block_size = crate::object_api::take_ec_block_size_hint(&mut user_defined);
         strip_native_controls(&mut user_defined);
         rustfs_utils::http::remove_str(&mut user_defined, SUFFIX_INLINE_DATA);
+        rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX);
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if protect_upload {
             rustfs_utils::http::insert_str(
@@ -3503,6 +3525,20 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         )?;
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+        if let Some(block_size) = requested_ec_block_size {
+            fi.erasure.block_size = block_size;
+        }
+
+        if !protect_upload && crate::object_api::ec_read_quantum_write_enabled() {
+            let erasure = coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
+                .map_err(Error::from)?;
+            if let Some(frame_size) =
+                crate::object_api::select_ec_read_quantum(fi.erasure.block_size, erasure.data_shards, erasure.shard_size())
+                && frame_size != erasure.shard_size()
+            {
+                crate::object_api::insert_ec_read_quantum(&mut user_defined, frame_size);
+            }
+        }
 
         fi.version_id = if let Some(vid) = &opts.version_id {
             Some(Uuid::parse_str(vid)?)
@@ -3625,6 +3661,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             upload_id,
             checksum_algo: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM).cloned(),
             checksum_type: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE).cloned(),
+            effective_ec_block_size: Some(
+                u64::try_from(fi.erasure.block_size).map_err(|_| Error::other("invalid EC block size"))?,
+            ),
         })
     }
 
@@ -5351,6 +5390,48 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
+
+    #[tokio::test]
+    async fn multipart_upload_persists_block_size_for_later_parts_and_completion() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ec-block-size-multipart";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut create_opts = ObjectOptions::default();
+        create_opts
+            .user_defined
+            .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_string(), "65536".to_string());
+        let upload = set_disks
+            .new_multipart_upload(bucket, "object", &create_opts)
+            .await
+            .expect("multipart upload should be created");
+        assert_eq!(upload.effective_ec_block_size, Some(65_536));
+
+        let mut part_reader = PutObjReader::from_vec(vec![0x61; 5 * 1024 * 1024]);
+        let part = set_disks
+            .put_object_part(bucket, "object", &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("part must use the block size persisted at upload creation");
+        let completed = set_disks
+            .complete_multipart_upload(
+                bucket,
+                "object",
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: 1,
+                    etag: part.etag.clone(),
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("upload should complete using its stored layout");
+        assert_eq!(completed.effective_ec_block_size(), Some(65_536));
+    }
 
     #[tokio::test]
     async fn multipart_writer_setup_opens_disks_concurrently_and_preserves_error_slots() {
@@ -8926,6 +9007,18 @@ mod tests {
         });
         let input = tokio_util::io::StreamReader::new(stream);
         let mut reader = PutObjReader::new(HashReader::from_stream(input, 512, 512, None, None, false).expect("part reader"));
+        let copy_options = ObjectOptions {
+            multipart_copy_source_locked: true,
+            ..Default::default()
+        };
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            set_disks.put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &copy_options),
+        )
+        .await
+        .expect("source-locked copy must not queue");
+        assert!(matches!(refused, Err(Error::SlowDown)));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
         let task = tokio::spawn(async move {
             set_disks
                 .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())

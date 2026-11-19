@@ -35,14 +35,12 @@ use http::header::{CACHE_CONTROL, CONTENT_LOCATION, CONTENT_RANGE, CONTENT_TYPE,
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rustfs_gateway::{
     ErrorHeader, HandlerError, HandlerErrorContext, HttpDate, LegacyRustfsFacts, LegacyRustfsRefusal, RedirectTarget,
-    RegionLabel, StoredHeaderValue, VersionIdLabel,
+    RegionLabel, RustfsErrorCause, StoredHeaderValue, VersionIdLabel,
 };
 use rustfs_gateway_types::{ETag, ErrorCode, Timestamp, TimestampFormat};
 use rustfs_s3_types::S3Error;
 use std::borrow::Cow;
 
-/// Answered when an error names a code without a status: the raiser of a custom code must set one.
-const MISSING_STATUS: &str = "the error carries a code without a status";
 /// Answered when an error carries a response header this edge cannot write.
 const UNWRITABLE_HEADER: &str = "the error carries a response header the gateway cannot write";
 /// Answered when the gateway refuses a legacy refusal as stated.
@@ -68,12 +66,16 @@ const VERSION_ID: &str = "x-amz-version-id";
 
 /// Converts a use-case error into the error the gateway answers with: the same code, status and
 /// message (the code's legacy default when the error carries none), and every response header it
-/// carries.
+/// carries. A custom code without a status is answered `500`, as the legacy writer answers it.
 pub(crate) fn handler_error(error: S3Error) -> HandlerError {
     let parts = error.into_parts();
-    let Some(status) = parts.status.or_else(|| parts.code.status_code()) else {
-        return HandlerError::internal_error(MISSING_STATUS);
-    };
+    // A custom code nobody gave a status is answered `500` with its own code and message, as the
+    // legacy writer answers it (it falls back to 500 when neither the error nor its code has a
+    // status); peers read the code from that body, e.g. the tier handlers' `TierNotFound`.
+    let status = parts
+        .status
+        .or_else(|| parts.code.status_code())
+        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     // A declared code compares equal to the custom code of the same spelling and status.
     let code = ErrorCode::custom(parts.code.as_str().to_owned(), status);
     let headers = parts.headers.unwrap_or_default();
@@ -84,6 +86,10 @@ pub(crate) fn handler_error(error: S3Error) -> HandlerError {
     }
     let mut mapped = HandlerError::new(code, message.unwrap_or(Cow::Borrowed("")));
     for (name, value) in &headers {
+        // The error document's `Content-Type` is the gateway's to write.
+        if name == CONTENT_TYPE {
+            continue;
+        }
         let Some(header) = error_header(name, value) else {
             return HandlerError::internal_error(UNWRITABLE_HEADER);
         };
@@ -179,6 +185,15 @@ fn error_header(name: &HeaderName, value: &HeaderValue) -> Option<ErrorHeader> {
         "retry-after" => Some(ErrorHeader::RetryAfter {
             seconds: value.parse().ok()?,
         }),
+        // The gateway spells the closed set of causes; an unknown one fails the whole error.
+        "x-rustfs-error-cause" => [
+            RustfsErrorCause::NamespaceLockTimeout,
+            RustfsErrorCause::NamespaceLockUnavailable,
+            RustfsErrorCause::StorageWriteQuorum,
+        ]
+        .into_iter()
+        .find(|cause| cause.as_str() == value)
+        .map(|cause| ErrorHeader::RustfsErrorCause { cause }),
         "x-amz-bucket-region" => Some(ErrorHeader::BucketRegion {
             region: RegionLabel::new(value).ok()?,
         }),
@@ -269,12 +284,15 @@ mod tests {
         assert_eq!(mapped.message(), "custom");
     }
 
+    /// A custom code nobody gave a status answers `500` with its own code and message on legacy
+    /// RustFS, so the control-plane peers that match on the code keep matching it.
     #[test]
-    fn a_custom_code_without_a_status_is_a_server_fault_not_a_guess() {
-        let mapped = handler_error(S3Error::with_message(S3ErrorCode::Custom("RustFsOnly".into()), "custom"));
+    fn a_custom_code_without_a_status_answers_500_with_its_own_code() {
+        let mapped = handler_error(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found"));
 
-        assert_eq!(mapped.code(), &ErrorCode::INTERNAL_ERROR);
-        assert_eq!(mapped.message(), MISSING_STATUS);
+        assert_eq!(mapped.code().as_str(), "TierNotFound");
+        assert_eq!(mapped.code().default_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mapped.message(), "tier not found");
     }
 
     /// Legacy RustFS builds every s3s error from its bare code, which attaches the code's default
@@ -329,11 +347,26 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_code_without_a_status_or_message_is_still_a_server_fault() {
+    fn a_custom_code_without_a_status_or_message_answers_500_with_no_message() {
         let mapped = handler_error(S3Error::new(S3ErrorCode::Custom("RustFsOnly".into())));
 
+        assert_eq!(mapped.code().as_str(), "RustFsOnly");
+        assert_eq!(mapped.code().default_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mapped.message(), "");
+    }
+
+    /// The default status does not weaken the refusal of an error the edge cannot carry whole.
+    #[test]
+    fn a_statusless_custom_code_still_refuses_a_header_the_gateway_cannot_write() {
+        let mut error = S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "refused");
+        let mut map = HeaderMap::new();
+        map.append(HeaderName::from_static("x-unknown-header"), HeaderValue::from_static("1"));
+        error.set_headers(map);
+
+        let mapped = handler_error(error);
+
         assert_eq!(mapped.code(), &ErrorCode::INTERNAL_ERROR);
-        assert_eq!(mapped.message(), MISSING_STATUS);
+        assert_eq!(mapped.message(), UNWRITABLE_HEADER);
     }
 
     #[test]
@@ -380,6 +413,52 @@ mod tests {
         assert!(mapped.headers().contains(&ErrorHeader::RetryAfter { seconds: 7 }));
         let rendered: Vec<String> = mapped.headers().iter().map(ErrorHeader::value).collect();
         assert_eq!(rendered[6], "Tue, 14 Nov 2023 22:13:20 GMT");
+    }
+
+    #[test]
+    fn a_content_type_the_raiser_set_is_left_to_the_gateway() {
+        let mapped = with_headers(
+            S3ErrorCode::SlowDown,
+            &[(header::CONTENT_TYPE, "application/xml"), (header::RETRY_AFTER, "1")],
+        );
+
+        assert_eq!(mapped.code().as_str(), "SlowDown");
+        assert_eq!(mapped.headers(), [ErrorHeader::RetryAfter { seconds: 1 }]);
+    }
+
+    #[test]
+    fn an_unavailable_error_states_its_cause_beside_the_retry_advice() {
+        let cause = HeaderName::from_static("x-rustfs-error-cause");
+        let mapped = with_headers(
+            S3ErrorCode::ServiceUnavailable,
+            &[(cause.clone(), "namespace_lock_timeout"), (header::RETRY_AFTER, "1")],
+        );
+
+        assert_eq!(mapped.code().as_str(), "ServiceUnavailable");
+        assert!(mapped.headers().contains(&ErrorHeader::RustfsErrorCause {
+            cause: RustfsErrorCause::NamespaceLockTimeout
+        }));
+        assert!(mapped.headers().contains(&ErrorHeader::RetryAfter { seconds: 1 }));
+        for (value, expected) in [
+            ("namespace_lock_unavailable", RustfsErrorCause::NamespaceLockUnavailable),
+            ("storage_write_quorum", RustfsErrorCause::StorageWriteQuorum),
+        ] {
+            let mapped = with_headers(S3ErrorCode::ServiceUnavailable, &[(cause.clone(), value)]);
+            assert_eq!(mapped.headers(), [ErrorHeader::RustfsErrorCause { cause: expected }], "{value}");
+        }
+    }
+
+    #[test]
+    fn a_cause_outside_the_closed_set_fails_the_whole_error() {
+        for value in ["storage_read_quorum", "NAMESPACE_LOCK_TIMEOUT", ""] {
+            let mapped = with_headers(
+                S3ErrorCode::ServiceUnavailable,
+                &[(HeaderName::from_static("x-rustfs-error-cause"), value)],
+            );
+
+            assert_eq!(mapped.code(), &ErrorCode::INTERNAL_ERROR, "{value:?}");
+            assert_eq!(mapped.message(), UNWRITABLE_HEADER, "{value:?}");
+        }
     }
 
     #[test]

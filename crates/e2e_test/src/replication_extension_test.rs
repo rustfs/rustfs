@@ -2075,12 +2075,18 @@ fn replication_response_hold() -> (ReplicationResponseHoldRuntime, ReplicationRe
     )
 }
 
+#[derive(Clone)]
+struct ReplicationProxyGate {
+    enabled: watch::Receiver<bool>,
+    blocked_admin_commit_path: Option<&'static str>,
+}
+
 async fn forward_replication_proxy_request(
     request: Request<Incoming>,
     backend_url: &str,
     client: &reqwest::Client,
     request_count: &AtomicU64,
-    mut replication_enabled: watch::Receiver<bool>,
+    mut gate: ReplicationProxyGate,
     mut held_tagging: watch::Receiver<Option<String>>,
     mut response_hold: ReplicationResponseHoldRuntime,
 ) -> Response<Full<bytes::Bytes>> {
@@ -2091,8 +2097,8 @@ async fn forward_replication_proxy_request(
         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"REPLICA"));
     if is_replication {
         request_count.fetch_add(1, Ordering::Relaxed);
-        while !*replication_enabled.borrow() {
-            if replication_enabled.changed().await.is_err() {
+        while !*gate.enabled.borrow() {
+            if gate.enabled.changed().await.is_err() {
                 return proxy_error_response("replication gate closed");
             }
         }
@@ -2117,6 +2123,12 @@ async fn forward_replication_proxy_request(
         Ok(body) => body.to_bytes(),
         Err(error) => return proxy_error_response(error),
     };
+    if gate.blocked_admin_commit_path == Some(parts.uri.path())
+        && !*gate.enabled.borrow()
+        && serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|payload| payload["phase"] == "commit")
+    {
+        return proxy_error_response("admin commit blocked by replication gate");
+    }
     let mut forwarded = client.request(parts.method, format!("{backend_url}{path_and_query}"));
     for (name, value) in &parts.headers {
         forwarded = forwarded.header(name, value);
@@ -2153,7 +2165,7 @@ async fn start_replication_counting_proxy(
     tasks: &mut JoinSet<()>,
 ) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>), Box<dyn Error + Send + Sync>> {
     let (proxy_url, request_count, replication_enabled, _held_tagging, _response_hold) =
-        start_replication_counting_proxy_with_tag_hold(backend_url, tasks).await?;
+        start_replication_counting_proxy_with_tag_hold(backend_url, tasks, None).await?;
     Ok((proxy_url, request_count, replication_enabled))
 }
 
@@ -2161,9 +2173,11 @@ async fn start_replication_counting_proxy(
 /// returned `watch::Sender<Option<String>>` holds `Some(tagging)`, replication
 /// requests whose `x-amz-tagging` equals `tagging` are parked (and still
 /// counted); all other traffic flows. Send `None` to release them.
+/// An optional admin commit path rejects its commit phase while the replication gate is closed.
 async fn start_replication_counting_proxy_with_tag_hold(
     backend_url: &str,
     tasks: &mut JoinSet<()>,
+    blocked_admin_commit_path: Option<&'static str>,
 ) -> Result<
     (
         String,
@@ -2180,6 +2194,10 @@ async fn start_replication_counting_proxy_with_tag_hold(
     let request_count = Arc::new(AtomicU64::new(0));
     let task_request_count = request_count.clone();
     let (replication_enabled, task_replication_enabled) = watch::channel(true);
+    let gate = ReplicationProxyGate {
+        enabled: task_replication_enabled,
+        blocked_admin_commit_path,
+    };
     let (held_tagging, task_held_tagging) = watch::channel(None);
     let (response_hold_runtime, response_hold) = replication_response_hold();
     tasks.spawn(async move {
@@ -2192,7 +2210,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                     let backend_url = backend_url.clone();
                     let client = client.clone();
                     let request_count = task_request_count.clone();
-                    let replication_enabled = task_replication_enabled.clone();
+                    let gate = gate.clone();
                     let held_tagging = task_held_tagging.clone();
                     let response_hold = response_hold_runtime.clone();
                     connections.spawn(async move {
@@ -2200,7 +2218,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                             let backend_url = backend_url.clone();
                             let client = client.clone();
                             let request_count = request_count.clone();
-                            let replication_enabled = replication_enabled.clone();
+                            let gate = gate.clone();
                             let held_tagging = held_tagging.clone();
                             let response_hold = response_hold.clone();
                             async move {
@@ -2210,7 +2228,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                                         &backend_url,
                                         &client,
                                         &request_count,
-                                        replication_enabled,
+                                        gate,
                                         held_tagging,
                                         response_hold,
                                     )
@@ -2388,6 +2406,13 @@ async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_repli
     a.start_rustfs_server_with_env(vec![], &env).await?;
     b.start_rustfs_server_without_cleanup_with_env(&env).await?;
     c.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    let mut proxy_tasks = JoinSet::new();
+    let (c_proxy, _, allow_peer_removal, _, _) = start_replication_counting_proxy_with_tag_hold(
+        &c.url,
+        &mut proxy_tasks,
+        Some("/minio/admin/v3/site-replication/peer/remove-v2"),
+    )
+    .await?;
     let added = site_replication_add(
         &a,
         &[
@@ -2416,13 +2441,35 @@ async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_repli
     )
     .await?;
     assert!(added.success, "{added:?}");
+    let info = wait_for_site_replication_enabled(&a, 3).await?;
+    let retired_id = info
+        .sites
+        .iter()
+        .find(|peer| peer.name == "b")
+        .ok_or("site b is missing")?
+        .deployment_id
+        .clone();
+    let mut survivor = info
+        .sites
+        .into_iter()
+        .find(|peer| peer.name == "c")
+        .ok_or("site c is missing")?;
+    let survivor_id = survivor.deployment_id.clone();
+    survivor.endpoint = c_proxy;
+    let edited = site_replication_edit(&a, "", &survivor).await?;
+    assert!(edited.success, "{edited:?}");
     let ca = a.create_s3_client();
     let cb = b.create_s3_client();
     let cc = c.create_s3_client();
     let bucket = "decommission-preserve-live-peers";
+    let operator_bucket = "decommission-operator-target";
+    cc.create_bucket().bucket(operator_bucket).send().await?;
+    enable_bucket_versioning(&c, operator_bucket).await?;
     ca.create_bucket().bucket(bucket).send().await?;
     wait_for_bucket_on_target(&cb, bucket).await?;
     wait_for_bucket_on_target(&cc, bucket).await?;
+    let operator_arn = set_replication_target(&a, bucket, &c, operator_bucket).await?;
+    put_bucket_replication(&a, bucket, &operator_arn).await?;
     ca.put_object()
         .bucket(bucket)
         .key("baseline")
@@ -2430,16 +2477,52 @@ async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_repli
         .send()
         .await?;
     wait_for_object_on_target(&cc, bucket, "baseline").await?;
+    wait_for_object_on_target(&cc, operator_bucket, "baseline").await?;
+    let retired_rule_id = format!("site-repl-{retired_id}");
+    let retired_arn = ca
+        .get_bucket_replication()
+        .bucket(bucket)
+        .send()
+        .await?
+        .replication_configuration
+        .ok_or("source bucket replication is missing")?
+        .rules
+        .into_iter()
+        .find(|rule| rule.id.as_deref() == Some(retired_rule_id.as_str()))
+        .and_then(|rule| rule.destination)
+        .ok_or("site b replication rule is missing")?
+        .bucket;
     b.stop_server();
-    let mut request = rustfs_madmin::SRRemoveV2Req {
+    let preview_request = rustfs_madmin::SRRemoveV2Req {
         mode: "dry-run".to_string(),
         sites: vec!["b".to_string()],
         ..Default::default()
     };
-    let preview = decommission_site_v2(&a, &request).await?;
-    request.mode = "execute".to_string();
-    request.operation_id = Some(preview.operation_id);
-    request.preflight_token = Some(preview.preflight_token);
+    let preview = decommission_site_v2(&a, &preview_request).await?;
+    let request = rustfs_madmin::SRRemoveV2Req {
+        mode: "execute".to_string(),
+        operation_id: Some(preview.operation_id.clone()),
+        preflight_token: Some(preview.preflight_token),
+        ..preview_request.clone()
+    };
+    allow_peer_removal.send(false)?;
+    let partial = decommission_site_v2(&a, &request).await?;
+    assert_eq!(partial.status, "Partial", "{partial:?}");
+    assert!(partial.local_cleanup_complete, "{partial:?}");
+    assert_eq!(partial.pending_peers, [survivor_id]);
+    assert!(partial.errors.iter().any(|error| error.contains("admin commit blocked")), "{partial:?}");
+    let prepared = site_replication_info(&c)
+        .await?
+        .pending_operation
+        .ok_or("site c must have prepared")?;
+    assert_eq!(prepared.id, preview.operation_id);
+    a.restart_server_preserving_data(vec![], &env).await?;
+    let restored = decommission_site_v2(&a, &preview_request).await?;
+    assert_eq!(restored.operation_id, preview.operation_id);
+    assert_eq!(restored.status, "Partial", "{restored:?}");
+    assert!(restored.local_cleanup_complete, "{restored:?}");
+    assert_eq!(restored.pending_peers, partial.pending_peers);
+    allow_peer_removal.send(true)?;
     let result = decommission_site_v2(&a, &request).await?;
     assert_eq!(result.status, "success", "{result:?}");
     let ia = site_replication_info(&a).await?;
@@ -2454,6 +2537,21 @@ async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_repli
         ic.sites.iter().map(|peer| peer.deployment_id.clone()).collect()
     );
     assert!(!ia.sites.iter().any(|peer| peer.name == "b"));
+    let targets: Vec<serde_json::Value> = list_replication_targets_request(&a, Some(bucket))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        targets
+            .iter()
+            .any(|target| target["arn"] == operator_arn && target["targetbucket"] == operator_bucket),
+        "operator target {operator_arn} must survive decommission"
+    );
+    assert!(
+        !targets.iter().any(|target| target["arn"] == retired_arn),
+        "retired site target {retired_arn} must be removed"
+    );
     ca.put_object()
         .bucket(bucket)
         .key("a-to-c")
@@ -2461,6 +2559,7 @@ async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_repli
         .send()
         .await?;
     assert_eq!(wait_for_object_on_target(&cc, bucket, "a-to-c").await?, b"a to c survives");
+    assert_eq!(wait_for_object_on_target(&cc, operator_bucket, "a-to-c").await?, b"a to c survives");
     cc.put_object()
         .bucket(bucket)
         .key("c-to-a")
@@ -8444,7 +8543,7 @@ async fn test_site_replication_tagging_during_initial_pending_window_converges()
             _site_b_replication_enabled,
             _site_b_held_tagging,
             mut site_b_response_hold,
-        ) = start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+        ) = start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks, None).await?;
 
         let add_status = site_replication_add(
             &site_a_env,
@@ -8701,9 +8800,9 @@ async fn test_site_replication_tagging_lww_converges_active_active_real_dual_nod
 
         let mut proxy_tasks = JoinSet::new();
         let (site_a_proxy, site_a_replication_requests, _site_a_replication_enabled, site_a_held_tagging, _site_a_response_hold) =
-            start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks).await?;
+            start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks, None).await?;
         let (site_b_proxy, site_b_replication_requests, _site_b_replication_enabled, site_b_held_tagging, _site_b_response_hold) =
-            start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+            start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks, None).await?;
 
         let site_a_client = site_a_env.create_s3_client();
         let site_b_client = site_b_env.create_s3_client();

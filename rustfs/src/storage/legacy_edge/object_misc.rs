@@ -24,12 +24,12 @@ use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
 use crate::storage::access::legacy_copy_source;
 use crate::storage::ecfs::*;
-use crate::storage::ecfs_extend::validate_new_object_key;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api::{
     self, CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase, DeleteBatchETag,
     DeleteBatchEntry, DeleteBatchInput, DeleteBatchOutput,
 };
+use crate::storage::s3_support::validate_new_object_key;
 use crate::storage::storage_api::to_s3s_xml_etag;
 use http::{HeaderMap, HeaderValue};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;

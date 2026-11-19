@@ -2154,7 +2154,9 @@ mod tests {
         );
         non_utf8.insert("If-Match", HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid header value"));
 
-        for headers in [HeaderMap::new(), blank, non_utf8] {
+        let mut existence_only = HeaderMap::new();
+        existence_only.insert(IF_MATCH, HeaderValue::from_static(" * "));
+        for headers in [HeaderMap::new(), blank, non_utf8, existence_only] {
             let conditions = get_condition_values(&headers, &cred, None, None, None);
 
             assert!(!conditions.contains_key("if-none-match"), "headers {headers:?}");

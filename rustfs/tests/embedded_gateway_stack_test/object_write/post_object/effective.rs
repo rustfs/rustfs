@@ -223,6 +223,42 @@ fn gateway_post_stores_the_authorized_form_metadata_and_bucket_retention() {
             access_key: USER,
             secret_key: stack::USER_SECRET_KEY,
         };
+        for (index, (name, value)) in [
+            ("x-amz-meta-purpose", "wire"),
+            ("x-minio-meta-purpose", "wire"),
+            ("x-rustfs-meta-purpose", "wire"),
+            ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+            ("x-amz-meta-snowball-auto-extract", "true"),
+            ("x-amz-snowball-auto-extract", "true"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("wire-property-{index}");
+            let denied = caller
+                .post_form(
+                    BUCKET,
+                    &[
+                        ("key", &key),
+                        ("x-amz-storage-class", "STANDARD"),
+                        ("x-amz-meta-purpose", "form"),
+                    ],
+                    &[(name, value)],
+                    true,
+                    true,
+                )
+                .await;
+            assert_eq!(denied.status, 403, "{name}: {}", denied.body);
+            assert!(denied.body.contains("<Code>AccessDenied</Code>"), "{name}: {}", denied.body);
+            let error = sdk
+                .head_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .send()
+                .await
+                .expect_err("rejected form must not publish");
+            assert!(error.as_service_error().is_some_and(|error| error.is_not_found()), "{name}: {error}");
+        }
         let answer = caller
             .post_form(
                 BUCKET,
@@ -233,9 +269,7 @@ fn gateway_post_stores_the_authorized_form_metadata_and_bucket_retention() {
                     ("x-amz-meta-purpose", "form"),
                 ],
                 &[
-                    ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
                     ("x-amz-tagging", "classification=private"),
-                    ("x-amz-meta-purpose", "wire"),
                     ("x-amz-object-lock-mode", "GOVERNANCE"),
                     ("x-amz-object-lock-retain-until-date", "2000-01-01T00:00:00Z"),
                 ],
@@ -408,8 +442,11 @@ fn gateway_post_form_checksum_validates_before_publication() {
             ("multipart-suffix", vec![("x-amz-checksum-crc32", "NhCmhg==-2")], vec![]),
             (
                 "extract-checksum",
-                vec![("x-amz-checksum-crc32", "NhCmhg==")],
-                vec![("x-amz-meta-snowball-auto-extract", "true")],
+                vec![
+                    ("x-amz-checksum-crc32", "NhCmhg=="),
+                    ("x-amz-meta-snowball-auto-extract", "true"),
+                ],
+                vec![],
             ),
         ] {
             let mut form = vec![("key", key)];
@@ -454,8 +491,8 @@ fn gateway_post_form_checksum_validates_before_publication() {
         let answer = root
             .post_form(
                 BUCKET,
-                &[("key", "extract-unsupported")],
-                &[("x-amz-meta-snowball-auto-extract", "true")],
+                &[("key", "extract-unsupported"), ("x-amz-meta-snowball-auto-extract", "true")],
+                &[],
                 true,
                 true,
             )

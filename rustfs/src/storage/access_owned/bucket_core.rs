@@ -22,7 +22,7 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/bucket_core.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-use super::super::{
+use crate::storage::authorization::{
     AuthorizationRequest, authorize_request, authorize_request_with_location_constraint, invalid_force_delete_header,
     missing_req_info_error,
 };
@@ -67,7 +67,7 @@ pub(crate) async fn authorize_create_bucket<R: AuthorizationRequest + ?Sized>(
 /// `InvalidRequest` for an `x-rustfs-force-delete` value that is not a boolean.
 pub(crate) fn requested_bucket_force_delete(headers: &HeaderMap) -> S3Result<Option<bool>> {
     check_minio_force_delete(headers)?;
-    force_delete_header(headers).map_err(|_| invalid_force_delete_header().into())
+    force_delete_header(headers).map_err(|_| invalid_force_delete_header())
 }
 
 /// Refuses an `x-minio-force-delete` value other than `true` or `false`.

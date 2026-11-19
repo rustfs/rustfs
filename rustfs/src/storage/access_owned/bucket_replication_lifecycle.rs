@@ -17,7 +17,7 @@
 //! The interface resolves owner privileges and the site contract. The bucket
 //! use case receives those facts without consulting site membership itself.
 
-use crate::storage::access::{AuthorizationRequest, req_info_ref};
+use crate::storage::authorization::{AuthorizationRequest, req_info_ref};
 use crate::storage::storage_api::ecstore_bucket::replication::OperatorRuleContract;
 use http::StatusCode;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
@@ -82,8 +82,8 @@ fn replication_deny_edit_error() -> S3Error {
 /// handlers.
 pub(crate) fn prepare_replication_config_edit<R: AuthorizationRequest + ?Sized>(
     request: &R,
-) -> impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send + 'static {
-    let is_owner = req_info_ref(request).map(|info| info.is_owner).map_err(S3Error::from);
+) -> impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send + use<R> {
+    let is_owner = req_info_ref(request).map(|info| info.is_owner);
     async move {
         if !is_owner? && site_replication_gate_enabled().await? {
             return Err(replication_deny_edit_error());
