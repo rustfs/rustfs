@@ -1639,7 +1639,7 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 #[serial]
 async fn single_drive_cycle_persists_usage_and_advances_with_healing_marker() {
     use crate::scanner_io::{clear_dirty_usage_buckets_for_tests, tests::wait_for_namespace_commit_tails};
-    use crate::storage_api::{ECSTORE_HEALING_MARKER_PATH, scan::MakeBucketOptions};
+    use crate::storage_api::scan::{ECSTORE_HEALING_MARKER_PATH, MakeBucketOptions};
 
     clear_dirty_usage_buckets_for_tests();
     let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
