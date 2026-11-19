@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
-mod fair_prefix_quantum;
+pub(super) mod fair_prefix_quantum;
 mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;
@@ -404,6 +404,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         resume_failed_paths: Vec::new(),
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
+        directory_checkpoints: HashMap::new(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -3126,15 +3127,10 @@ async fn cache_reuse_gates_report_only_the_first_production_condition() {
         parent: None,
         object_heal_prob_div: 1,
     };
-    let child = CachedFolder {
-        name: "bucket/child".to_string(),
-        parent: Some(hash_path("bucket")),
-        object_heal_prob_div: 1,
-    };
     let abandoned = HashSet::from([hash.0.clone()]);
     let before = global_metrics().scan_observation().snapshot();
 
-    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child, &hash, &abandoned));
+    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), "bucket/child", &hash, &abandoned));
     let missing_scope = global_metrics().scan_observation().snapshot();
     assert_eq!(
         missing_scope.reuse_decisions["clean_prefix"].not_evaluated["missing_scope"],
@@ -3142,7 +3138,7 @@ async fn cache_reuse_gates_report_only_the_first_production_condition() {
     );
     scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
     scanner.is_erasure_mode = true;
-    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child, &hash, &abandoned));
+    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), "bucket/child", &hash, &abandoned));
     let erasure = global_metrics().scan_observation().snapshot();
     assert_eq!(
         erasure.reuse_decisions["clean_prefix"].blocked["erasure_health_required"],
@@ -3251,6 +3247,12 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
         parent: None,
         object_heal_prob_div: 1,
     };
+    // The sorted queue can reach a budget stop after linking a clean prefix
+    // but before the first dirty child advances the durable sweep frontier.
+    assert!(!scanner.can_reuse_covered_namespace("bucket/clean", false));
+    assert!(scanner.can_restore_linked_child(&folder, &DataUsageEntry::default(), "bucket/clean"));
+    assert!(!scanner.can_restore_linked_child(&folder, &DataUsageEntry::default(), "bucket/dirty"));
+    assert!(!scanner.can_restore_linked_child(&folder, &DataUsageEntry::default(), "bucket/absent"));
     let before = global_metrics().scan_observation().snapshot();
     let mut root = DataUsageEntry::default();
     scanner

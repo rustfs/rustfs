@@ -96,6 +96,9 @@ mod replication_target_matrix_test;
 #[cfg(test)]
 mod data_usage_test;
 
+#[cfg(test)]
+mod scanner_wide_directory_test;
+
 // KMS-specific test modules
 #[cfg(test)]
 mod kms;
