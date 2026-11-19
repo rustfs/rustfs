@@ -191,6 +191,7 @@ pub(crate) mod access_consumer {
         MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
     };
+    pub(crate) use super::ecstore_bucket::utils::check_object_args;
 }
 
 #[cfg(test)]

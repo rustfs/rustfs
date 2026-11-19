@@ -21,6 +21,7 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_meta.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
+use crate::error::ApiError;
 use crate::storage::authorization::{
     AuthorizationRequest, authorize_object_request, authorize_request, has_bypass_governance_header, load_bucket_generation,
     req_info_mut, set_requested_object_lock_retain_until,
@@ -53,6 +54,11 @@ async fn authorize_metadata_mutation<R: AuthorizationRequest + ?Sized>(
 ) -> S3Result<()> {
     let generation = load_bucket_generation(server, req, bucket).await;
     authorize_object_request(req, bucket, key, version_id, action).await?;
+    // Preserve native argument errors before returning a failed lookup. Successful
+    // captures keep the use case's existing version/header/key validation order.
+    if generation.is_err() {
+        crate::storage::storage_api::access_consumer::check_object_args(bucket, key).map_err(ApiError::from)?;
+    }
     req.install_bucket_generation(generation?);
     Ok(())
 }
