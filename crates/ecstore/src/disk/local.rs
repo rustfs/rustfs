@@ -8268,8 +8268,9 @@ pub struct LocalDisk {
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
     mount_lease: Arc<std::fs::File>,
+    // The descriptor pins this identity even if the configured path is remounted.
     #[cfg(target_os = "linux")]
-    mount_lease_mount_id: Option<u64>,
+    mount_lease_identity: Option<ReplacementMountIdentity>,
     /// Public path for callers that need the configured disk layout. Internal
     /// disk I/O uses `io_format_path`, which is rooted at `mount_lease`.
     pub format_path: PathBuf,
@@ -8469,56 +8470,51 @@ struct ReplacementMountIdentity {
 }
 
 #[cfg(target_os = "linux")]
-fn replacement_mount_identity(metadata: &std::fs::Metadata, mount_id: u64) -> ReplacementMountIdentity {
-    use std::os::unix::fs::MetadataExt as _;
-
-    ReplacementMountIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mount_id,
-    }
+fn statx_replacement_mount_identity(
+    dir: impl std::os::fd::AsFd,
+    path: &Path,
+    flags: rustix::fs::AtFlags,
+) -> Option<ReplacementMountIdentity> {
+    use rustix::fs::{FileType, StatxFlags, makedev, statx};
+    let fields = StatxFlags::TYPE | StatxFlags::INO | StatxFlags::MNT_ID;
+    let stat = statx(dir, path, flags, fields).ok()?;
+    (StatxFlags::from_bits_retain(stat.stx_mask).contains(fields) && FileType::from_raw_mode(stat.stx_mode.into()).is_dir())
+        .then_some(ReplacementMountIdentity {
+            device: makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            inode: stat.stx_ino,
+            mount_id: stat.stx_mnt_id,
+        })
 }
 
 #[cfg(target_os = "linux")]
-fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
-    use rustix::fs::{AtFlags, StatxFlags};
-    use std::os::fd::AsRawFd as _;
-
-    rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
-        .ok()
-        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
-        .map(|statx| statx.stx_mnt_id)
-        .or_else(|| mount_id_from_fdinfo(fd.as_raw_fd()))
+fn replacement_mount_identity_for_fd(directory: &std::fs::File) -> Option<ReplacementMountIdentity> {
+    statx_replacement_mount_identity(directory, Path::new(""), rustix::fs::AtFlags::EMPTY_PATH)
+        .or_else(|| replacement_mount_identity_from_fdinfo(directory))
 }
 
 #[cfg(target_os = "linux")]
 fn replacement_mount_identity_for_path(path: &Path) -> Option<ReplacementMountIdentity> {
-    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, StatxFlags, makedev, open};
-    use std::os::fd::AsRawFd as _;
-
-    let fields = StatxFlags::TYPE | StatxFlags::INO | StatxFlags::MNT_ID;
-    if let Ok(stat) = rustix::fs::statx(CWD, path, AtFlags::empty(), fields)
-        && StatxFlags::from_bits_retain(stat.stx_mask).contains(fields)
-    {
-        return FileType::from_raw_mode(stat.stx_mode.into())
-            .is_dir()
-            .then_some(ReplacementMountIdentity {
-                device: makedev(stat.stx_dev_major, stat.stx_dev_minor),
-                inode: stat.stx_ino,
-                mount_id: stat.stx_mnt_id,
-            });
-    }
-    let directory = std::fs::File::from(open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?);
-    let mount_id = mount_id_from_fdinfo(directory.as_raw_fd())?;
-    Some(replacement_mount_identity(&directory.metadata().ok()?, mount_id))
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, open};
+    statx_replacement_mount_identity(CWD, path, AtFlags::empty()).or_else(|| {
+        let directory = std::fs::File::from(open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?);
+        replacement_mount_identity_from_fdinfo(&directory)
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
-    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+fn replacement_mount_identity_from_fdinfo(directory: &std::fs::File) -> Option<ReplacementMountIdentity> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
+    let fd = directory.as_raw_fd();
+    let mount_id = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())?;
+    let metadata = directory.metadata().ok()?;
+    Some(ReplacementMountIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mount_id,
+    })
 }
 
 impl LocalDisk {
@@ -8585,7 +8581,7 @@ impl LocalDisk {
 
     #[cfg(target_os = "linux")]
     fn current_replacement_mount_identity(&self, configured_path: &Path) -> Option<ReplacementMountIdentity> {
-        let pinned = replacement_mount_identity(&self.mount_lease.metadata().ok()?, self.mount_lease_mount_id?);
+        let pinned = self.mount_lease_identity?;
         (replacement_mount_identity_for_path(configured_path)? == pinned).then_some(pinned)
     }
 
@@ -8594,7 +8590,6 @@ impl LocalDisk {
         {
             let configured_path = self.endpoint.get_file_path();
             let configured_path = Path::new(&configured_path);
-            let identity = self.current_replacement_mount_identity(configured_path)?;
             let canonical_path = std::fs::canonicalize(&self.io_root).ok()?;
             let expected = _mount_roots
                 .iter()
@@ -8603,8 +8598,13 @@ impl LocalDisk {
                 .unwrap_or(&canonical_path);
             // The expected root must be its own mount boundary. If it is
             // unmounted, the exposed directory and its parent share a mount ID.
-            if !canonical_path.starts_with(expected)
-                || replacement_mount_identity_for_path(expected)?.mount_id != identity.mount_id
+            if !canonical_path.starts_with(expected) {
+                return None;
+            }
+            // When the configured endpoint is the expected mount root, this
+            // live observation also supplies the mount ID for the boundary.
+            let identity = self.current_replacement_mount_identity(configured_path)?;
+            if (expected != configured_path && replacement_mount_identity_for_path(expected)?.mount_id != identity.mount_id)
                 || replacement_mount_identity_for_path(expected.parent()?)?.mount_id == identity.mount_id
             {
                 return None;
@@ -8673,10 +8673,10 @@ impl LocalDisk {
             PathBuf::from(format!(".rustfs-format-control/{format_device:x}/{}", Uuid::from_bytes(format_file_id)));
 
         #[cfg(target_os = "linux")]
-        let (mount_lease, io_root, mount_lease_mount_id) = (
+        let (mount_lease, io_root, mount_lease_identity) = (
             publication_root.directory().clone(),
             publication_root.io_path().to_path_buf(),
-            mount_id_for_fd(publication_root.directory()),
+            replacement_mount_identity_for_fd(publication_root.directory()),
         );
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
@@ -8859,7 +8859,7 @@ impl LocalDisk {
             #[cfg(target_os = "linux")]
             mount_lease: mount_lease.clone(),
             #[cfg(target_os = "linux")]
-            mount_lease_mount_id,
+            mount_lease_identity,
             endpoint: ep.clone(),
             format_path,
             io_format_path,
@@ -41379,15 +41379,17 @@ mod test {
     #[cfg(target_os = "linux")]
     #[test]
     fn mount_id_fdinfo_can_identify_a_directory_below_a_mount() {
-        use std::os::fd::AsRawFd as _;
-
         let temp = tempfile::tempdir().expect("mount fixture directory");
-        let child = temp.path().join("data");
-        std::fs::create_dir(&child).expect("create data subdirectory");
+        let child_path = temp.path().join("data");
+        std::fs::create_dir(&child_path).expect("create data subdirectory");
         let parent = std::fs::File::open(temp.path()).expect("open parent directory");
-        let child = std::fs::File::open(child).expect("open data subdirectory");
-        let parent_mount = mount_id_from_fdinfo(parent.as_raw_fd()).expect("read mount ID of parent");
-        assert_eq!(mount_id_from_fdinfo(child.as_raw_fd()), Some(parent_mount));
+        let child = std::fs::File::open(&child_path).expect("open data subdirectory");
+        let parent_identity = replacement_mount_identity_from_fdinfo(&parent).expect("read parent identity");
+        let child_identity = replacement_mount_identity_from_fdinfo(&child).expect("read child identity");
+        assert_eq!(child_identity.mount_id, parent_identity.mount_id);
+        assert_ne!(child_identity.inode, parent_identity.inode);
+        assert_eq!(replacement_mount_identity_for_fd(&child), Some(child_identity));
+        assert_eq!(replacement_mount_identity_for_path(&child_path), Some(child_identity));
     }
 
     #[cfg(not(windows))]

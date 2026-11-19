@@ -538,8 +538,16 @@ mod tests {
                     "replacement readiness must reject a target sharing its physical device with a sibling endpoint"
                 );
                 assert!(
-                    probe_replacement_mounts(&[target_disk, sibling_disk], &[]).await.is_none(),
+                    probe_replacement_mounts(&[target_disk.clone(), sibling_disk], &[])
+                        .await
+                        .is_none(),
                     "a batch must reject overlapping targets even before they are registered"
+                );
+                assert!(auto_replacement_target_ready(&target_disk, &[]).await);
+                mounts.mount_bind(&source, &target)?;
+                assert!(
+                    !auto_replacement_target_ready(&target_disk, &[]).await,
+                    "rebinding the same inode must invalidate the held mount identity"
                 );
                 Ok(())
             })
