@@ -249,36 +249,35 @@ fn odm_read_capture_preserves_access_and_parameter_error_order() {
             assert!(matches!(list.odm_read_generation(), Some(OdmReadGenerationGuard::Unavailable)));
             let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
             assert_eq!(
-                usecase
-                    .execute_get_object_fields(get, get_fields(&bucket, "key", Some(0)))
+                crate::app::test_seams::get_object_fields(&usecase, get, get_fields(&bucket, "key", Some(0)))
                     .await
                     .expect_err("bad GET part number")
                     .code(),
                 &S3ErrorCode::InvalidArgument
             );
             assert_eq!(
-                usecase
-                    .execute_head_object_fields(
-                        head,
-                        head_fields(&bucket, "key", Some(1), Some(ByteRange::FromTo { first: 0, last: 1 }))
-                    )
-                    .await
-                    .expect_err("range and part number conflict")
-                    .code(),
+                crate::app::test_seams::head_object_fields(
+                    &usecase,
+                    head,
+                    head_fields(&bucket, "key", Some(1), Some(ByteRange::FromTo { first: 0, last: 1 }))
+                )
+                .await
+                .expect_err("range and part number conflict")
+                .code(),
                 &S3ErrorCode::InvalidArgument
             );
             assert_eq!(
-                DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
-                    .execute_list_objects_v2(
-                        list,
-                        gateway_dto::ListObjectsV2Input {
-                            max_keys: Some(-1),
-                            ..list_input(&bucket)
-                        }
-                    )
-                    .await
-                    .expect_err("negative max keys")
-                    .code(),
+                crate::app::test_seams::list_objects_v2_owned(
+                    &DefaultBucketUsecase::with_context(Some(Arc::clone(&context))),
+                    list,
+                    gateway_dto::ListObjectsV2Input {
+                        max_keys: Some(-1),
+                        ..list_input(&bucket)
+                    }
+                )
+                .await
+                .expect_err("negative max keys")
+                .code(),
                 &S3ErrorCode::InvalidArgument
             );
         }
@@ -339,33 +338,40 @@ fn odm_read_capture_failure_is_deferred_until_source_miss() {
         sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let bucket_usecase = || DefaultBucketUsecase::with_context(Some(Arc::clone(&context)));
-        usecase
-            .execute_get_object_fields(get.fork_for_authorization(), get_fields(&bucket, "local", None))
+        crate::app::test_seams::get_object_fields(&usecase, get.fork_for_authorization(), get_fields(&bucket, "local", None))
             .await
             .expect("a local GET hit ignores source capture failure");
-        usecase
-            .execute_head_object_fields(head.fork_for_authorization(), head_fields(&bucket, "local", None, None))
+        crate::app::test_seams::head_object_fields(
+            &usecase,
+            head.fork_for_authorization(),
+            head_fields(&bucket, "local", None, None),
+        )
+        .await
+        .expect("a local HEAD hit ignores source capture failure");
+        assert_eq!(
+            crate::app::test_seams::get_object_fields(
+                &usecase,
+                get.fork_for_authorization(),
+                get_fields(&bucket, "missing", None)
+            )
             .await
-            .expect("a local HEAD hit ignores source capture failure");
-        assert_eq!(
-            usecase
-                .execute_get_object_fields(get.fork_for_authorization(), get_fields(&bucket, "missing", None))
-                .await
-                .expect_err("failed capture cannot rebind on GET miss")
-                .code(),
+            .expect_err("failed capture cannot rebind on GET miss")
+            .code(),
             &S3ErrorCode::NoSuchBucket
         );
         assert_eq!(
-            usecase
-                .execute_head_object_fields(head.fork_for_authorization(), head_fields(&bucket, "missing", None, None))
-                .await
-                .expect_err("failed capture cannot rebind on HEAD miss")
-                .code(),
+            crate::app::test_seams::head_object_fields(
+                &usecase,
+                head.fork_for_authorization(),
+                head_fields(&bucket, "missing", None, None)
+            )
+            .await
+            .expect_err("failed capture cannot rebind on HEAD miss")
+            .code(),
             &S3ErrorCode::NoSuchBucket
         );
         assert_eq!(
-            bucket_usecase()
-                .execute_list_objects_v2(list.fork_for_authorization(), list_input(&bucket))
+            crate::app::test_seams::list_objects_v2_owned(&bucket_usecase(), list.fork_for_authorization(), list_input(&bucket))
                 .await
                 .expect_err("failed capture cannot rebind on LIST")
                 .code(),
@@ -374,54 +380,63 @@ fn odm_read_capture_failure_is_deferred_until_source_miss() {
         config.filter.prefix = Some("remote/".into());
         sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
         assert_eq!(
-            usecase
-                .execute_get_object_fields(get.fork_for_authorization(), get_fields(&bucket, "missing", None))
-                .await
-                .expect_err("filtered GET remains local")
-                .code(),
+            crate::app::test_seams::get_object_fields(
+                &usecase,
+                get.fork_for_authorization(),
+                get_fields(&bucket, "missing", None)
+            )
+            .await
+            .expect_err("filtered GET remains local")
+            .code(),
             &S3ErrorCode::NoSuchKey
         );
         assert_eq!(
-            usecase
-                .execute_head_object_fields(head.fork_for_authorization(), head_fields(&bucket, "missing", None, None))
-                .await
-                .expect_err("filtered HEAD remains local")
-                .code(),
+            crate::app::test_seams::head_object_fields(
+                &usecase,
+                head.fork_for_authorization(),
+                head_fields(&bucket, "missing", None, None)
+            )
+            .await
+            .expect_err("filtered HEAD remains local")
+            .code(),
             &S3ErrorCode::NoSuchKey
         );
-        let listing = bucket_usecase()
-            .execute_list_objects_v2(
-                list.fork_for_authorization(),
-                gateway_dto::ListObjectsV2Input {
-                    prefix: Some("local/".into()),
-                    ..list_input(&bucket)
-                },
-            )
-            .await
-            .expect("disjoint prefix needs no source identity");
+        let listing = crate::app::test_seams::list_objects_v2_owned(
+            &bucket_usecase(),
+            list.fork_for_authorization(),
+            gateway_dto::ListObjectsV2Input {
+                prefix: Some("local/".into()),
+                ..list_input(&bucket)
+            },
+        )
+        .await
+        .expect("disjoint prefix needs no source identity");
         assert_eq!(listing.key_count, 0);
-        let listing = bucket_usecase()
-            .execute_list_objects_v2(
-                list,
-                gateway_dto::ListObjectsV2Input {
-                    prefix: Some("remote/".into()),
-                    max_keys: Some(0),
-                    ..list_input(&bucket)
-                },
-            )
-            .await
-            .expect("an empty page needs no source identity");
+        let listing = crate::app::test_seams::list_objects_v2_owned(
+            &bucket_usecase(),
+            list,
+            gateway_dto::ListObjectsV2Input {
+                prefix: Some("remote/".into()),
+                max_keys: Some(0),
+                ..list_input(&bucket)
+            },
+        )
+        .await
+        .expect("an empty page needs no source identity");
         assert_eq!(listing.key_count, 0);
 
         config.filter.prefix = None;
         config.policy.head = crate::on_demand_migration::HeadPolicy::LocalOnly;
         sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
         assert_eq!(
-            usecase
-                .execute_head_object_fields(head.fork_for_authorization(), head_fields(&bucket, "missing", None, None))
-                .await
-                .expect_err("local-only HEAD needs no source identity")
-                .code(),
+            crate::app::test_seams::head_object_fields(
+                &usecase,
+                head.fork_for_authorization(),
+                head_fields(&bucket, "missing", None, None)
+            )
+            .await
+            .expect_err("local-only HEAD needs no source identity")
+            .code(),
             &S3ErrorCode::NoSuchKey
         );
         config.policy.head = crate::on_demand_migration::HeadPolicy::Proxy;
@@ -438,16 +453,14 @@ fn odm_read_capture_failure_is_deferred_until_source_miss() {
             .await
             .expect("create local delete marker");
         assert_eq!(
-            usecase
-                .execute_get_object_fields(get, get_fields(&bucket, "missing", None))
+            crate::app::test_seams::get_object_fields(&usecase, get, get_fields(&bucket, "missing", None))
                 .await
                 .expect_err("GET respects the delete marker before capture failure")
                 .code(),
             &S3ErrorCode::NoSuchKey
         );
         assert_eq!(
-            usecase
-                .execute_head_object_fields(head, head_fields(&bucket, "missing", None, None))
+            crate::app::test_seams::head_object_fields(&usecase, head, head_fields(&bucket, "missing", None, None))
                 .await
                 .expect_err("HEAD respects the delete marker before capture failure")
                 .code(),

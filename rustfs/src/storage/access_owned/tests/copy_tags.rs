@@ -638,7 +638,7 @@ fn copy_tags_rechecks_actual_source_after_access_snapshot() {
                 );
             } else {
                 assert_eq!(
-                    result.err().expect("actual source tags require fresh authorization").code(),
+                    result.expect_err("actual source tags require fresh authorization").code(),
                     &S3ErrorCode::AccessDenied
                 );
                 assert!(

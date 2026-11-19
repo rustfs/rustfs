@@ -1246,8 +1246,8 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("head-metadata-permissions", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
             use crate::app::storage_api::test::ReqInfo;
+            use crate::app::storage_api::test::authorize_head_object;
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-            use crate::storage::access::access_owned::object_read::authorize_head_object;
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));

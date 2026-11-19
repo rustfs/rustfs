@@ -389,8 +389,7 @@ async fn copy_operations_reject_recreated_source_bucket_after_authorization() {
     let err = DefaultObjectUsecase::with_context(Some(Arc::clone(&app_context)))
         .execute_copy_object_owned(envelope, copy_write_input(&dst_bucket, "copied", source()))
         .await
-        .err()
-        .expect("stale authorization must not read from the recreated source bucket");
+        .expect_err("stale authorization must not read from the recreated source bucket");
     assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
     let upload_input = UploadPartCopyWriteInput {
         target: UploadPartTarget::Legacy {
@@ -497,8 +496,7 @@ async fn copy_object_rejects_recreated_destination_bucket_after_authorization() 
     let error = DefaultObjectUsecase::with_context(Some(context))
         .execute_copy_object_owned(envelope, input)
         .await
-        .err()
-        .expect("must refuse before publishing to the recreated bucket");
+        .expect_err("must refuse before publishing to the recreated bucket");
     assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
     let missing = store
         .get_object_info(&dst, "copied", &opts)

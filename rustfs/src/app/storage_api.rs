@@ -1981,6 +1981,7 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
+    pub(crate) use crate::storage::storage_api::test_consumer::authorize_head_object;
     pub(crate) mod sse {
         pub(crate) use crate::storage::storage_api::test_consumer::sse::{
             RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
