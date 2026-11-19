@@ -326,8 +326,8 @@ mod tests {
 
     #[test]
     fn percent_encodes_ampersand_question_hash_and_utf8() {
-        let location = post_object_location("http", Some("host"), "bucket", "café/a&b?c#d.txt", false);
-        assert_eq!(location, "http://host/bucket/caf%C3%A9/a%26b%3Fc%23d.txt");
+        let location = post_object_location("http", Some("host"), "bucket", "naïve/a&b?c#d.txt", false);
+        assert_eq!(location, "http://host/bucket/na%C3%AFve/a%26b%3Fc%23d.txt");
     }
 
     #[test]

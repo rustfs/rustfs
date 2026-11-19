@@ -241,7 +241,7 @@ async fn post_response_location_is_absolute_and_percent_encoded(server: rustfs::
     };
     for (key, encoded_key) in [
         ("test/a+b c%d.txt", "test/a%2Bb%20c%25d.txt"),
-        ("café/résumé.txt", "caf%C3%A9/r%C3%A9sum%C3%A9.txt"),
+        ("naïve/résumé.txt", "na%C3%AFve/r%C3%A9sum%C3%A9.txt"),
         ("a&b?c#d.txt", "a%26b%3Fc%23d.txt"),
         ("a-b_c.d~e/photo.jpg", "a-b_c.d~e/photo.jpg"),
     ] {
