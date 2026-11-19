@@ -15,31 +15,20 @@
 # Gateway black-box acceptance lanes (rustfs/backlog#2775 T3.4, #2776 T3.5).
 #
 # Runs two suites of the rustfs/gateway repository against the candidate binary,
-# once per S3 stack (RUSTFS_S3_STACK=legacy and =gateway), one server per stack:
+# one server:
 #
-#   - the conformance corpus, `--profile rustfs`. That profile describes the
-#     gateway edge, so scripts/check_conformance_rulings.py judges the gateway
-#     stack against .config/conformance-rulings.toml (red: an unruled failure, a
-#     ruled case failing differently, a stale ruling, a skip on the server's own
-#     answer) and publishes the legacy run as a reference that is never judged:
-#     it only has to serve, stay up and complete;
-#   - the client matrix, ci/compat/run_matrix.sh --external, judged per stack by
+#   - the conformance corpus, `--profile rustfs`, judged by
+#     scripts/check_conformance_rulings.py against .config/conformance-rulings.toml
+#     (red: an unruled failure, a ruled case failing differently, a stale ruling,
+#     a skip on the server's own answer);
+#   - the client matrix, ci/compat/run_matrix.sh --external, judged by
 #     scripts/compat_matrix_report.py (no `fail`, no `sut-unregistered`, every
 #     client ran; a client that could not be installed is reported as skipped).
-#     The legacy matrix is the baseline: every cell that passes on legacy must
-#     pass on gateway (`compare`).
 #
 # The suites are checked out at the rustfs/gateway rev Cargo.toml pins, so the
-# suite and the framework under test never drift apart. The verdict of each
-# stack is computed from what the run left on disk (startup record, the stack
-# the server's own log names, runner exit code, liveness after the corpus,
-# report), never from the exit status of an earlier step. Needs
-# scripts/dual_stack.py and the `s3_stack` startup field of rustfs/rustfs#9367.
-#
-# The gateway stack is report-only until T2.10: its job may fail without failing
-# the workflow, and its summary says what it observed (did not start, or how many
-# cases ran, passed, failed and were answered 501). The stack comparison is
-# report-only for the same reason; its conformance half is information only.
+# suite and the framework under test never drift apart. The verdict is computed
+# from what the run left on disk (startup record, runner exit code, liveness
+# after the corpus, report), never from the exit status of an earlier step.
 #
 # Not a pull-request gate. Scheduled failures are owned by the scheduled-validation
 # watchdog (.github/scheduled-validations.json).
@@ -166,21 +155,15 @@ jobs:
           retention-days: 1
 
   acceptance:
-    name: ${{ matrix.stack == 'gateway' && 'Acceptance (gateway, report-only until T2.10)' || 'Acceptance (legacy)' }}
+    name: Acceptance
     needs: [ plan, build-candidate, build-gateway-tools ]
     # GitHub-hosted like the s3-tests targets of reference-parity.yml: the job
     # only runs prebuilt binaries and the pinned clients, none of which needs Docker.
     runs-on: ubuntu-latest
-    # About 3x the 15 minutes the legacy job took in run 43325101234 (client install about
+    # About 3x the 15 minutes the job took in run 43325101234 (client install about
     # 8, matrix about 3, corpus about 3), so a hung server costs 45 runner minutes, not more.
     timeout-minutes: 45
-    continue-on-error: ${{ matrix.stack == 'gateway' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: [ legacy, gateway ]
     env:
-      STACK: ${{ matrix.stack }}
       ENDPOINT: http://127.0.0.1:9000
       # The conformance suite signs with these fixed fixture credentials (the AWS
       # documentation example pair), so the candidate is started with them and the
@@ -213,10 +196,8 @@ jobs:
           name: gateway-acceptance-tools
           path: tools
 
-      # Records `ready`, or what the process said when it exited, in lane/startup.txt. `ready`
-      # also needs the server's own `server_starting` log event to name the requested stack
-      # (its `s3_stack` field comes from rustfs/rustfs#9367; scripts/dual_stack.py reads it).
-      - name: Start candidate (${{ matrix.stack }} stack)
+      # Records `ready`, or what the process said when it exited, in lane/startup.txt.
+      - name: Start candidate
         run: |
           set -uo pipefail
           chmod +x target/debug/rustfs tools/*
@@ -224,7 +205,7 @@ jobs:
           target/debug/rustfs --version | tee lane/candidate-version.txt
           # The four directories share the runner's one disk; the bypass is the CI case the
           # physical-disk guard sanctions (as in mint.yml).
-          RUSTFS_S3_STACK="$STACK" RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address 127.0.0.1:9000 \
+          RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address 127.0.0.1:9000 \
             --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP"/data/rustfs{0..3} \
             > lane/rustfs.log 2>&1 &
           pid=$!
@@ -239,13 +220,8 @@ jobs:
               exit 1
             fi
             if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
-              if python3 scripts/dual_stack.py stack --expect "$STACK" --out lane/stack.json lane/rustfs.log > /dev/null; then
-                echo ready > lane/startup.txt
-                exit 0
-              fi
-              echo "did not start: stack not observed" > lane/startup.txt
-              cat lane/startup.txt
-              exit 1
+              echo ready > lane/startup.txt
+              exit 0
             fi
             sleep 1
           done
@@ -338,58 +314,23 @@ jobs:
         run: |
           set -uo pipefail
           status=0
-          python3 scripts/check_conformance_rulings.py --stack "$STACK" --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
-          python3 scripts/compat_matrix_report.py check --stack "$STACK" --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/check_conformance_rulings.py --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/compat_matrix_report.py check --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           exit "$status"
 
       - name: Upload lane results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gateway-acceptance-lane-${{ matrix.stack }}
+          name: gateway-acceptance-lane
           overwrite: true
           path: |
             lane/*.txt
             lane/*.log
             lane/report.json
-            lane/stack.json
             lane/compat/matrix.json
             lane/compat/probe.jsonl
             lane/compat/sut.log
             lane/compat/results/**
           if-no-files-found: error
           retention-days: 14
-
-  compare:
-    name: Compare stacks (report-only until T2.10)
-    needs: [ acceptance ]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Download lane results
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: gateway-acceptance-lane-*
-          path: lanes
-
-      - name: Diff legacy and gateway
-        run: |
-          set -uo pipefail
-          status=0
-          {
-            python3 scripts/check_conformance_rulings.py \
-              --diff lanes/gateway-acceptance-lane-legacy lanes/gateway-acceptance-lane-gateway || status=1
-            echo
-            python3 scripts/compat_matrix_report.py diff \
-              --legacy lanes/gateway-acceptance-lane-legacy --gateway lanes/gateway-acceptance-lane-gateway || status=1
-          } > diff.md
-          cat diff.md
-          cat diff.md >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"

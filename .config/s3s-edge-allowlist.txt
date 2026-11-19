@@ -28,8 +28,6 @@ rustfs/src/app/storage_api.rs
 rustfs/src/admin/router.rs
 rustfs/src/app/metadata_route.rs
 rustfs/src/server/http.rs
-rustfs/src/server/layer.rs
-rustfs/src/server/hybrid.rs
 rustfs/src/protocols/client.rs
 
 # e2e oracle: the test target that verifies S3 behaviour against s3s

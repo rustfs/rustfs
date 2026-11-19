@@ -12,26 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The S3 protocol stack one server runs, selected once at startup (rustfs/backlog#2734 T2.5).
+//! The S3 protocol stack one server runs (rustfs/backlog#2734 T2.5).
 //!
-//! Responsible for: [`S3StackService`], the service mounted where the legacy S3 service used to
-//! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
-//! other: no request is routed between stacks by its operation, and a request the gateway stack
-//! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
-//! selected, a request to a website host is answered by the website service before any other
-//! routing, as the legacy metadata route claims it first; console static requests and signed
-//! system-status reads use their native services and every other route the admin router claims
-//! goes to the control-plane host; the gateway selection holds no legacy service at all.
-//! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
-//! `server/gateway_stack.rs` the gateway one), or the middleware around them.
-//! Upstream: `server/http.rs`. Downstream: the native console, legacy S3 service, gateway stack
-//! and its control-plane host.
+//! Responsible for: [`S3StackService`], the service mounted under the middleware. A request to a
+//! website host is answered by the website service before any other routing; console static
+//! requests and signed system-status reads use their native services; every other route the
+//! admin router claims goes to the control-plane host, and every remaining request is the gateway
+//! S3 service's.
+//! NOT responsible for: assembling the stack (`server/gateway_stack.rs`), or the middleware around
+//! it (`server/http.rs`).
+//! Upstream: `server/http.rs`. Downstream: the native website and console, the gateway stack and
+//! its control-plane host.
 //!
 //! This file names no stack's types: it is generic over the services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
 
 use crate::admin::router::{claims_native_admin_route, claims_native_console_route, claims_route};
-use crate::config::S3Stack;
 use http::Request;
 use std::future::Future;
 use std::pin::Pin;
@@ -39,24 +35,16 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tower::Service;
 
-/// The S3 service of one server: the legacy stack, or the gateway stack with its control-plane
-/// services. The gateway selection holds no legacy service, so none of its requests can reach one.
+/// The S3 service of one server: the gateway stack with its website and control-plane services.
 #[derive(Clone)]
-pub(crate) struct S3StackService<L, G, C = G, W = G> {
-    stack: Stack<L, G, C, W>,
-}
-
-#[derive(Clone)]
-enum Stack<L, G, C, W> {
-    Legacy(L),
-    Gateway(GatewayServices<G, C, W>),
+pub(crate) struct S3StackService<G, C = G, W = G> {
+    services: GatewayServices<G, C, W>,
 }
 
 /// Whether a request's target and `Host` select the service it is paired with.
 pub(crate) type HostClaim = Arc<dyn Fn(&http::Uri, &http::HeaderMap) -> bool + Send + Sync>;
 
-/// The gateway selection: the S3 service, the website host, and the hosts of the routes the admin
-/// router claims.
+/// The gateway S3 service, the website host, and the hosts of the routes the admin router claims.
 #[derive(Clone)]
 struct GatewayServices<G, C, W> {
     s3: G,
@@ -66,89 +54,62 @@ struct GatewayServices<G, C, W> {
     control_plane: Option<G>,
 }
 
-impl<L, G, C, W> S3StackService<L, G, C, W> {
-    /// Attaches the console service used only by the gateway selection.
-    pub(crate) fn with_native_console<N>(self, native_console: Option<N>) -> S3StackService<L, G, N, W> {
-        let stack = match self.stack {
-            Stack::Legacy(legacy) => Stack::Legacy(legacy),
-            Stack::Gateway(services) => Stack::Gateway(GatewayServices {
+impl<G> S3StackService<G> {
+    /// The stack around the gateway S3 service `s3`, with no other host attached yet.
+    pub(crate) fn new(s3: G) -> Self {
+        Self {
+            services: GatewayServices {
+                s3,
+                native_website: None,
+                native_console: None,
+                native_admin: None,
+                control_plane: None,
+            },
+        }
+    }
+}
+
+impl<G, C, W> S3StackService<G, C, W> {
+    /// Attaches the native console service.
+    pub(crate) fn with_native_console<N>(self, native_console: Option<N>) -> S3StackService<G, N, W> {
+        let services = self.services;
+        S3StackService {
+            services: GatewayServices {
                 s3: services.s3,
                 native_website: services.native_website,
                 native_console,
                 native_admin: services.native_admin,
                 control_plane: services.control_plane,
-            }),
-        };
-        S3StackService { stack }
+            },
+        }
     }
 
-    /// Attaches the website service used only by the gateway selection: every request `claim`
-    /// selects goes to it before any other routing.
-    pub(crate) fn with_native_website<N>(self, native_website: Option<(HostClaim, N)>) -> S3StackService<L, G, C, N> {
-        let stack = match self.stack {
-            Stack::Legacy(legacy) => Stack::Legacy(legacy),
-            Stack::Gateway(services) => Stack::Gateway(GatewayServices {
+    /// Attaches the website service: every request `claim` selects goes to it before any other
+    /// routing.
+    pub(crate) fn with_native_website<N>(self, native_website: Option<(HostClaim, N)>) -> S3StackService<G, C, N> {
+        let services = self.services;
+        S3StackService {
+            services: GatewayServices {
                 s3: services.s3,
                 native_website,
                 native_console: services.native_console,
                 native_admin: services.native_admin,
                 control_plane: services.control_plane,
-            }),
-        };
-        S3StackService { stack }
+            },
+        }
     }
 
-    /// Attaches the signed admin service used only by the gateway selection.
+    /// Attaches the signed admin service.
     pub(crate) fn with_native_admin(mut self, native_admin: Option<G>) -> Self {
-        if let Stack::Gateway(services) = &mut self.stack {
-            services.native_admin = native_admin;
-        }
+        self.services.native_admin = native_admin;
         self
     }
 
-    /// Attaches the host of every other claimed route, used only by the gateway selection.
+    /// Attaches the host of every other claimed route.
     pub(crate) fn with_control_plane(mut self, control_plane: Option<G>) -> Self {
-        if let Stack::Gateway(services) = &mut self.stack {
-            services.control_plane = control_plane;
-        }
+        self.services.control_plane = control_plane;
         self
     }
-
-    /// The stack this service was built with, as the startup line names it: read from the service
-    /// that answers, never from the configuration that asked for it.
-    pub(crate) fn assembled(&self) -> &'static str {
-        match self.stack {
-            Stack::Gateway(_) => "gateway",
-            Stack::Legacy(_) => "legacy",
-        }
-    }
-}
-
-/// Builds the service for the selected stack.
-///
-/// `assemble_gateway` runs only when the gateway stack is selected, and its failure is the
-/// failure of the whole selection: the caller refuses to start. The legacy service is dropped
-/// when the gateway is selected.
-///
-/// # Errors
-///
-/// Whatever `assemble_gateway` refused with. The legacy stack is never substituted.
-pub(crate) fn select_stack<L, G, E>(
-    stack: S3Stack,
-    legacy: L,
-    assemble_gateway: impl FnOnce() -> Result<G, E>,
-) -> Result<S3StackService<L, G>, E> {
-    let stack = match stack {
-        S3Stack::Legacy => Stack::Legacy(legacy),
-        S3Stack::Gateway => Stack::Gateway(GatewayServices {
-            s3: assemble_gateway()?,
-            native_website: None,
-            native_console: None,
-            native_admin: None,
-            control_plane: None,
-        }),
-    };
-    Ok(S3StackService { stack })
 }
 
 type Answer<R, E> = Pin<Box<dyn Future<Output = Result<http::Response<R>, E>> + Send>>;
@@ -203,13 +164,11 @@ impl<G, C, W> GatewayServices<G, C, W> {
     }
 }
 
-impl<L, G, C, W, B, R, E> Service<Request<B>> for S3StackService<L, G, C, W>
+impl<G, C, W, B, R, E> Service<Request<B>> for S3StackService<G, C, W>
 where
-    L: Service<Request<B>, Response = http::Response<R>, Error = E>,
     G: Service<Request<B>, Response = http::Response<R>, Error = E>,
     C: Service<Request<B>, Response = http::Response<R>, Error = E>,
     W: Service<Request<B>, Response = http::Response<R>, Error = E>,
-    L::Future: Send + 'static,
     G::Future: Send + 'static,
     C::Future: Send + 'static,
     W::Future: Send + 'static,
@@ -220,32 +179,25 @@ where
     type Future = Answer<R, E>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match &mut self.stack {
-            Stack::Legacy(legacy) => legacy.poll_ready(cx),
-            Stack::Gateway(services) => {
-                ready!(services.s3.poll_ready(cx))?;
-                for host in [&mut services.native_admin, &mut services.control_plane]
-                    .into_iter()
-                    .flatten()
-                {
-                    ready!(host.poll_ready(cx))?;
-                }
-                if let Some(console) = &mut services.native_console {
-                    ready!(console.poll_ready(cx))?;
-                }
-                if let Some((_, website)) = &mut services.native_website {
-                    ready!(website.poll_ready(cx))?;
-                }
-                Poll::Ready(Ok(()))
-            }
+        let services = &mut self.services;
+        ready!(services.s3.poll_ready(cx))?;
+        for host in [&mut services.native_admin, &mut services.control_plane]
+            .into_iter()
+            .flatten()
+        {
+            ready!(host.poll_ready(cx))?;
         }
+        if let Some(console) = &mut services.native_console {
+            ready!(console.poll_ready(cx))?;
+        }
+        if let Some((_, website)) = &mut services.native_website {
+            ready!(website.poll_ready(cx))?;
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        match &mut self.stack {
-            Stack::Legacy(legacy) => Box::pin(legacy.call(request)),
-            Stack::Gateway(services) => services.call(request),
-        }
+        self.services.call(request)
     }
 }
 
@@ -289,42 +241,12 @@ mod tests {
     }
 
     fn gateway_stack() -> S3StackService<Named, Named> {
-        select_stack(S3Stack::Gateway, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
-            .expect("assembles")
-            .with_control_plane(Some(Named("control-plane")))
-    }
-
-    #[test]
-    fn a_gateway_assembly_failure_fails_the_selection_instead_of_falling_back() {
-        let selection = select_stack::<_, Named, _>(S3Stack::Gateway, Named("legacy"), || Err("the assembly was refused"));
-
-        assert_eq!(selection.err(), Some("the assembly was refused"));
-    }
-
-    #[test]
-    fn the_legacy_selection_never_assembles_a_gateway() {
-        let service = select_stack::<_, Named, &str>(S3Stack::Legacy, Named("legacy"), || {
-            panic!("the legacy stack must not assemble the gateway")
-        })
-        .expect("legacy needs no assembly");
-
-        assert_eq!(service.assembled(), "legacy");
-    }
-
-    #[tokio::test]
-    async fn the_legacy_stack_answers_every_request_itself() {
-        let mut service = select_stack(S3Stack::Legacy, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
-            .expect("legacy needs no assembly");
-
-        for target in ["/", "/bucket/key", "/rustfs/admin/v3/info", "/health"] {
-            assert_eq!(answered_by(&mut service, request(Method::GET, target)).await, "legacy", "{target}");
-        }
+        S3StackService::new(Named("gateway")).with_control_plane(Some(Named("control-plane")))
     }
 
     #[tokio::test]
     async fn the_gateway_stack_answers_every_s3_request_whatever_the_operation() {
         let mut service = gateway_stack();
-        assert_eq!(service.assembled(), "gateway");
 
         for (method, target) in [
             (Method::GET, "/"),
@@ -388,8 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gateway_selection_without_its_host_answers_a_claimed_route_itself() {
-        let mut service =
-            select_stack(S3Stack::Gateway, Named("legacy"), || Ok::<_, Infallible>(Named("gateway"))).expect("assembles");
+        let mut service = S3StackService::new(Named("gateway"));
         let response = service
             .call(request(Method::PUT, "/rustfs/admin/v3/add-user"))
             .await
@@ -419,11 +340,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_keystone_tokens_are_refused_before_non_s3_legacy_dispatch() {
+    async fn gateway_keystone_tokens_are_refused_before_non_s3_dispatch() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let console_path = format!("{}/index.html", crate::server::console_prefix());
-        for stack in [S3Stack::Gateway, S3Stack::Legacy] {
+        {
             for (method, target) in [
                 (Method::GET, "/rustfs/admin/v3/info"),
                 (Method::GET, "/minio/admin/v3/info"),
@@ -438,15 +359,10 @@ mod tests {
                 (Method::GET, console_path.as_str()),
             ] {
                 for header in [None, Some("x-auth-token"), Some("x-storage-token")] {
-                    let legacy_calls = Arc::new(AtomicUsize::new(0));
                     let gateway_calls = Arc::new(AtomicUsize::new(0));
                     let console_calls = Arc::new(AtomicUsize::new(0));
                     let admin_calls = Arc::new(AtomicUsize::new(0));
                     let control_calls = Arc::new(AtomicUsize::new(0));
-                    let legacy = Counting {
-                        name: "legacy",
-                        calls: Arc::clone(&legacy_calls),
-                    };
                     let gateway = Counting {
                         name: "gateway",
                         calls: Arc::clone(&gateway_calls),
@@ -463,8 +379,7 @@ mod tests {
                         name: "control-plane",
                         calls: Arc::clone(&control_calls),
                     };
-                    let mut service = select_stack(stack, legacy, || Ok::<_, Infallible>(gateway))
-                        .unwrap()
+                    let mut service = S3StackService::new(gateway)
                         .with_native_console(Some(console))
                         .with_native_admin(Some(admin))
                         .with_control_plane(Some(control));
@@ -478,46 +393,30 @@ mod tests {
                         request.headers_mut().insert(header, "validated-token".parse().unwrap());
                     }
                     let response = service.call(request).await.unwrap();
-                    if stack == S3Stack::Gateway && header.is_some() {
+                    if header.is_some() {
                         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{target} {header:?}");
-                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0, "refused request reached legacy");
                         assert_eq!(console_calls.load(Ordering::SeqCst), 0, "refused request reached native console");
                         assert_eq!(admin_calls.load(Ordering::SeqCst), 0, "refused request reached native admin");
                         assert_eq!(control_calls.load(Ordering::SeqCst), 0, "refused request reached the control plane");
-                    } else if stack == S3Stack::Gateway && target == console_path {
+                    } else if target == console_path {
                         assert_eq!(response.status(), StatusCode::OK);
                         assert_eq!(response.body(), &"console");
-                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
                         assert_eq!(console_calls.load(Ordering::SeqCst), 1);
-                    } else if stack == S3Stack::Gateway
-                        && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
-                    {
+                    } else if target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/") {
                         assert_eq!(response.status(), StatusCode::OK);
                         assert_eq!(response.body(), &"admin");
-                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
                         assert_eq!(console_calls.load(Ordering::SeqCst), 0);
-                    } else if stack == S3Stack::Gateway {
+                    } else {
                         assert_eq!(response.status(), StatusCode::OK);
                         assert_eq!(response.body(), &"control-plane");
                         assert_eq!(control_calls.load(Ordering::SeqCst), 1);
                         assert_eq!(console_calls.load(Ordering::SeqCst), 0);
-                    } else {
-                        assert_eq!(response.status(), StatusCode::OK);
-                        assert_eq!(response.body(), &"legacy");
-                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
-                        assert_eq!(console_calls.load(Ordering::SeqCst), 0);
-                        assert_eq!(control_calls.load(Ordering::SeqCst), 0);
-                    }
-                    if stack == S3Stack::Gateway {
-                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0, "a gateway request reached legacy");
                     }
                     assert_eq!(gateway_calls.load(Ordering::SeqCst), 0, "non-S3 request reached gateway");
                     assert_eq!(
                         admin_calls.load(Ordering::SeqCst),
                         usize::from(
-                            stack == S3Stack::Gateway
-                                && header.is_none()
-                                && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
+                            header.is_none() && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
                         )
                     );
                 }
@@ -560,23 +459,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_request_of_any_class_reaches_the_legacy_service_on_the_gateway_stack() {
+    async fn every_request_class_reaches_one_gateway_service() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counter = |name| Counting {
             name,
             calls: Arc::new(AtomicUsize::new(0)),
         };
-        let (legacy, gateway, console, admin, control) = (
-            counter("legacy"),
-            counter("gateway"),
-            counter("console"),
-            counter("admin"),
-            counter("control-plane"),
-        );
-        let calls = [&legacy, &gateway, &console, &admin, &control].map(|service| Arc::clone(&service.calls));
-        let mut service = select_stack(S3Stack::Gateway, legacy, || Ok::<_, Infallible>(gateway))
-            .unwrap()
+        let (gateway, console, admin, control) =
+            (counter("gateway"), counter("console"), counter("admin"), counter("control-plane"));
+        let calls = [&gateway, &console, &admin, &control].map(|service| Arc::clone(&service.calls));
+        let mut service = S3StackService::new(gateway)
             .with_native_console(Some(console))
             .with_native_admin(Some(admin))
             .with_control_plane(Some(control));
@@ -586,50 +479,13 @@ mod tests {
             service.call(request).await.unwrap();
         }
 
-        let [legacy, gateway, console, admin, control] = calls.map(|calls| calls.load(Ordering::SeqCst));
-        assert_eq!(legacy, 0, "a gateway-stack request reached the legacy service");
+        let [gateway, console, admin, control] = calls.map(|calls| calls.load(Ordering::SeqCst));
         assert!(
             gateway > 0 && console > 0 && admin > 0 && control > 0,
             "{gateway} {console} {admin} {control}"
         );
         // The Keystone token is refused by the selection itself.
         assert_eq!(gateway + console + admin + control, count - 1);
-    }
-
-    #[tokio::test]
-    async fn no_request_of_any_class_reaches_a_gateway_service_on_the_legacy_stack() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let counter = |name| Counting {
-            name,
-            calls: Arc::new(AtomicUsize::new(0)),
-        };
-        let (legacy, gateway, console, admin, control) = (
-            counter("legacy"),
-            counter("gateway"),
-            counter("console"),
-            counter("admin"),
-            counter("control-plane"),
-        );
-        let calls = [&legacy, &gateway, &console, &admin, &control].map(|service| Arc::clone(&service.calls));
-        let mut service = select_stack(S3Stack::Legacy, legacy, || Ok::<_, Infallible>(gateway))
-            .unwrap()
-            .with_native_console(Some(console))
-            .with_native_admin(Some(admin))
-            .with_control_plane(Some(control));
-        let requests = every_request_class();
-        let count = requests.len();
-        for request in requests {
-            service.call(request).await.unwrap();
-        }
-
-        let [legacy, gateway, console, admin, control] = calls.map(|calls| calls.load(Ordering::SeqCst));
-        assert_eq!(
-            [gateway, console, admin, control],
-            [0; 4],
-            "a legacy-stack request reached a gateway service"
-        );
-        assert_eq!(legacy, count);
     }
 
     #[tokio::test]
@@ -646,7 +502,7 @@ mod tests {
         assert_eq!(answered_by(&mut service, request(Method::POST, "/")).await, "gateway");
     }
     /// A gateway stack whose website host claims every request to `*.website.test`.
-    fn gateway_stack_with_website() -> S3StackService<Named, Named, Named, Named> {
+    fn gateway_stack_with_website() -> S3StackService<Named, Named, Named> {
         let claim: HostClaim = Arc::new(|_uri: &http::Uri, headers: &http::HeaderMap| {
             headers
                 .get(http::header::HOST)
@@ -713,19 +569,7 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::FORBIDDEN, "a Keystone token on a claimed route");
     }
 
-    #[tokio::test]
-    async fn the_legacy_stack_never_reaches_a_website_service() {
-        let claim: HostClaim = Arc::new(|_uri: &http::Uri, _headers: &http::HeaderMap| true);
-        let mut service = select_stack(S3Stack::Legacy, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
-            .expect("legacy needs no assembly")
-            .with_native_website(Some((claim, Named("website"))));
-        for target in ["/", "/index.html", "/rustfs/admin/v3/info"] {
-            let request = to_host(Method::GET, target, "site.website.test", None);
-            assert_eq!(answered_by_any(&mut service, request).await, "legacy", "{target}");
-        }
-    }
-
-    async fn answered_by_any<C, W>(service: &mut S3StackService<Named, Named, C, W>, request: Request<()>) -> &'static str
+    async fn answered_by_any<C, W>(service: &mut S3StackService<Named, C, W>, request: Request<()>) -> &'static str
     where
         C: Service<Request<()>, Response = Response<&'static str>, Error = Infallible>,
         W: Service<Request<()>, Response = Response<&'static str>, Error = Infallible>,
@@ -828,9 +672,5 @@ mod tests {
             };
             assert_eq!(answered_by(&mut service, request(method, target)).await, expected, "{target}");
         }
-        let mut legacy = select_stack(S3Stack::Legacy, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
-            .unwrap()
-            .with_native_admin(Some(Named("admin")));
-        assert_eq!(answered_by(&mut legacy, request(Method::GET, "/rustfs/admin/v3/info")).await, "legacy");
     }
 }

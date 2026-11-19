@@ -12,25 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The two request classes the legacy metadata route claims — website hosts and `metadata=true`
-//! listings — sent to the legacy stack and to the gateway stack over the same store, IAM and
-//! signatures: each answers the same status, body and representation headers on both.
+//! The two request classes the retired legacy metadata route claimed, website hosts and
+//! `metadata=true` listings, sent to the gateway stack over a real store, IAM and signatures.
+//!
+//! The case tables are the ones the legacy-versus-gateway comparison ran before the legacy stack
+//! was removed; each expected status is the one both stacks agreed on then. Table isolation is
+//! observed on the listing a caller receives, because the listing use case filters only when the
+//! authorization attached the table snapshot, and it fails open when nothing was attached.
 
 use super::*;
 use crate::app::storage_api::bucket_usecase::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::app::storage_api::object_usecase::contract::object::ObjectIO as _;
 use crate::app::storage_api::object_usecase::{StorageObjectOptions, StoragePutObjReader};
+use crate::table_catalog::{
+    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, NamespaceEntry, TABLE_BUCKET_CATALOG_TYPE,
+    TABLE_BUCKET_MARKER_CONFIG, TABLE_CATALOG_ENTRY_VERSION, TableBucketEntry, TableCatalogBackingMode, TableCatalogEntryState,
+    TableCatalogStore, TableEntry,
+};
+use std::collections::BTreeMap;
 
 const WEBSITE_DOMAIN: &str = "website.test";
 const S3_HOST: &str = "localhost:9000";
 const BUCKET: &str = "parity-site";
 const EMPTY: &str = "parity-empty";
+const TABLES: &str = "parity-tables";
 
-/// Both stacks, each over the same store: the legacy one with the metadata route mounted as
-/// `server/http.rs` mounts it.
-async fn stacks() -> (rustfs_test_utils::TestECStoreEnv, crate::server::http::S3Service, S3EdgeService) {
+/// The gateway stack over a store holding the website bucket, an empty bucket and a table bucket,
+/// with two IAM users: `list-allowed` may list buckets and versions, `list-none` has no policy.
+async fn stack() -> (rustfs_test_utils::TestECStoreEnv, S3EdgeService) {
     let env = rustfs_test_utils::TestECStoreEnv::builder()
-        .prefix("metadata_route_parity")
+        .prefix("metadata_route_gateway")
         .disk_count(1)
         .init_bucket_metadata(true)
         .build()
@@ -126,50 +137,103 @@ async fn stacks() -> (rustfs_test_utils::TestECStoreEnv, crate::server::http::S3
         )
         .await
         .unwrap();
+    seed_table_bucket(&env).await;
 
-    let website_domains = vec![WEBSITE_DOMAIN.to_owned()];
-    let mut legacy = crate::server::http::S3ServiceBuilder::new(UnusedS3);
-    legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
-    legacy.set_route(crate::app::metadata_route::with_metadata_route(
-        crate::admin::make_admin_route(false, slot.clone()).unwrap(),
-        Some(crate::server::http::MultiDomain::new(["s3.example.test"]).unwrap()),
-        website_domains.clone(),
-        "http",
-        slot.clone(),
-    ));
-    legacy.set_host(crate::server::http::MultiDomain::new(["s3.example.test"]).unwrap());
-    let legacy = legacy.build();
     let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
-    config.s3_stack = config::S3Stack::Gateway;
     config.console_enable = false;
-    let website = crate::app::website::WebsiteHost::new(website_domains, "http", slot.clone());
-    let edge = select_s3_stack(&config, legacy.clone(), website, || Ok(assembly(slot.clone()))).unwrap();
-    (env, legacy, edge)
+    let website = crate::app::website::WebsiteHost::new(vec![WEBSITE_DOMAIN.to_owned()], "http", slot.clone());
+    let edge = assemble_s3_stack(&config, website, assembly(slot)).unwrap();
+    (env, edge)
 }
 
-/// What both stacks must agree on: the status, the body (an S3 error by its code), and the
-/// representation and redirect headers.
-///
-/// An S3 error is compared by its status and code: its framing is the gateway's for every
-/// operation, which states the error document's length where the legacy stack streams it.
-fn observed(response: (StatusCode, HeaderMap, Bytes)) -> String {
-    let (status, mut headers, body) = response;
-    let body = if body.starts_with(b"<?xml") && body.windows(7).any(|window| window == b"<Error>") {
-        headers.remove(http::header::CONTENT_LENGTH);
-        format!("error {:?}", refusal(&body).0)
-    } else {
-        String::from_utf8_lossy(&body).into_owned()
-    };
-    let named = [
-        "content-type",
-        "content-length",
-        "content-range",
-        "etag",
-        "last-modified",
-        "location",
-    ]
-    .map(|name| format!("{name}={:?}", headers.get(name)));
-    format!("{status} {} {body}", named.join(" "))
+/// `TABLES`: a table bucket whose catalog owns the `tables/table-id/` warehouse prefix, with an
+/// ordinary key, a warehouse key and a reserved catalog key, and a policy that lets anyone list.
+async fn seed_table_bucket(env: &rustfs_test_utils::TestECStoreEnv) {
+    let store = &env.ecstore;
+    store.make_bucket(TABLES, &MakeBucketOptions::default()).await.unwrap();
+    store
+        .update_bucket_metadata_config(
+            TABLES,
+            TABLE_BUCKET_MARKER_CONFIG,
+            crate::table_catalog::table_bucket_marker_json().unwrap(),
+        )
+        .await
+        .unwrap();
+    let policy = serde_json::json!({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": "*"},
+        "Action": ["s3:ListBucket", "s3:ListBucketVersions"], "Resource": format!("arn:aws:s3:::{TABLES}")
+    }]});
+    store
+        .update_bucket_metadata_config(
+            TABLES,
+            crate::app::storage_api::bucket::metadata::BUCKET_POLICY_CONFIG,
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .await
+        .unwrap();
+    let catalog = ConfiguredTableCatalogStore::new_for_test(
+        EcStoreTableCatalogObjectBackend::new(Arc::clone(store)),
+        TableCatalogBackingMode::from_env().unwrap(),
+    );
+    catalog
+        .put_table_bucket(TableBucketEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: TABLES.to_owned(),
+            catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_owned(),
+            warehouse_root: format!("s3://{TABLES}/"),
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            active_rename_id: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .create_namespace(NamespaceEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: TABLES.to_owned(),
+            namespace: "sales".to_owned(),
+            namespace_id: "sales".to_owned(),
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .create_table(TableEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: TABLES.to_owned(),
+            namespace: "sales".to_owned(),
+            table: "orders".to_owned(),
+            table_id: "table-id".to_owned(),
+            table_uuid: uuid::Uuid::new_v4().to_string(),
+            format: "ICEBERG".to_owned(),
+            format_version: 2,
+            warehouse_location: format!("s3://{TABLES}/tables/table-id"),
+            metadata_location: format!("s3://{TABLES}/tables/table-id/metadata.json"),
+            version_token: "v1".to_owned(),
+            generation: 1,
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        })
+        .await
+        .unwrap();
+    for key in ["ordinary.txt", "tables/table-id/data.parquet", ".rustfs-table/private.json"] {
+        store
+            .put_object(
+                TABLES,
+                key,
+                &mut StoragePutObjReader::from_vec(b"private metadata".to_vec()),
+                &StorageObjectOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 fn website_request(
@@ -189,31 +253,32 @@ fn website_request(
     builder.body(Empty::new()).unwrap()
 }
 
-/// One website request: method, path, host, an extra header, and the status both stacks answer.
-type WebsiteCase<'a> = (Method, &'a str, String, Option<(&'static str, &'static str)>, StatusCode);
-
-/// One listing request: its label, how to build it, and the status both stacks answer.
-type ListingCase = (&'static str, Box<dyn Fn() -> HttpRequest<Empty<Bytes>>>, StatusCode);
-
-/// Sends `request()` to both stacks and returns each answer as [`observed`] reads it.
-async fn both(
-    legacy: &crate::server::http::S3Service,
-    edge: &S3EdgeService,
-    request: impl Fn() -> HttpRequest<Empty<Bytes>>,
-) -> (String, String) {
-    (
-        observed(answer(legacy.clone(), request()).await),
-        observed(answer(edge.clone(), request()).await),
-    )
+fn signed_listing(bucket: &str, query: &str, key: &str, secret: &str) -> HttpRequest<Empty<Bytes>> {
+    signed(&format!("/{bucket}"), query, S3_HOST, key, secret, Signed::Header)
 }
 
+/// The `<Key>` of every entry a listing document names, in order.
+fn keys(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    text.split("<Key>")
+        .skip(1)
+        .filter_map(|tail| tail.split_once("</Key>").map(|(key, _)| key.to_owned()))
+        .collect()
+}
+
+/// One website request: method, path, host, an extra header, and the status the website answers.
+type WebsiteCase<'a> = (Method, &'a str, String, Option<(&'static str, &'static str)>, StatusCode);
+
+/// One listing request: its label, the request, the status it is answered with and the error code, if any.
+type ListingCase = (&'static str, HttpRequest<Empty<Bytes>>, StatusCode, Option<&'static str>);
+
 #[tokio::test]
-async fn website_and_metadata_route_answers_match_the_legacy_stack() {
-    let (_env, legacy, edge) = stacks().await;
-    let mut failures = Vec::new();
+#[serial_test::serial]
+async fn website_host_answers_each_request_class_with_the_status_the_legacy_table_recorded() {
+    let (_env, edge) = stack().await;
     let site = format!("{BUCKET}.{WEBSITE_DOMAIN}");
     let path_style = format!("/{BUCKET}/index.html");
-    let website_cases: Vec<WebsiteCase<'_>> = vec![
+    let cases: Vec<WebsiteCase<'_>> = vec![
         (Method::GET, "/", site.clone(), None, StatusCode::OK),
         (Method::HEAD, "/", site.clone(), None, StatusCode::OK),
         (Method::GET, "/docs", site.clone(), None, StatusCode::OK),
@@ -226,6 +291,7 @@ async fn website_and_metadata_route_answers_match_the_legacy_stack() {
         ),
         (Method::GET, "/missing", site.clone(), None, StatusCode::NOT_FOUND),
         (Method::HEAD, "/missing", site.clone(), None, StatusCode::NOT_FOUND),
+        // The bucket policy denies everyone this object: a private object is not served.
         (Method::GET, "/private.txt", site.clone(), None, StatusCode::FORBIDDEN),
         (Method::GET, "/section?x=1", site.clone(), None, StatusCode::FOUND),
         (Method::GET, "/move", site.clone(), None, StatusCode::MOVED_PERMANENTLY),
@@ -257,160 +323,197 @@ async fn website_and_metadata_route_answers_match_the_legacy_stack() {
             Some(("if-none-match", "*")),
             StatusCode::NOT_MODIFIED,
         ),
+        // A website host serves reads only.
         (Method::POST, "/", site.clone(), None, StatusCode::METHOD_NOT_ALLOWED),
+        (Method::PUT, "/index.html", site.clone(), None, StatusCode::METHOD_NOT_ALLOWED),
+        (Method::DELETE, "/index.html", site.clone(), None, StatusCode::METHOD_NOT_ALLOWED),
         (Method::GET, "/rustfs/admin/v3/info", site.clone(), None, StatusCode::NOT_FOUND),
         (Method::GET, "/", format!("{EMPTY}.{WEBSITE_DOMAIN}"), None, StatusCode::NOT_FOUND),
         (Method::GET, "/", format!("absent.{WEBSITE_DOMAIN}"), None, StatusCode::NOT_FOUND),
         (Method::GET, path_style.as_str(), WEBSITE_DOMAIN.to_owned(), None, StatusCode::NOT_FOUND),
     ];
-    for (method, path, host, extra, status) in &website_cases {
-        let (old, new) = both(&legacy, &edge, || website_request(method.clone(), path, host, *extra)).await;
-        if old != new || !old.starts_with(status.as_str()) {
-            failures.push(format!("website {method} {host}{path} {extra:?}\n  legacy  {old}\n  gateway {new}"));
+    let mut failures = Vec::new();
+    for (method, path, host, extra, status) in &cases {
+        let (got, _, body) = answer(edge.clone(), website_request(method.clone(), path, host, *extra)).await;
+        if got != *status {
+            failures.push(format!(
+                "website {method} {host}{path} {extra:?}: want {status}, got {got} {}",
+                String::from_utf8_lossy(&body)
+            ));
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    let signed_as = |path: String, query: &'static str, key: &'static str, secret: &'static str| {
-        move || signed(&path, query, S3_HOST, key, secret, Signed::Header)
-    };
-    let listing_cases: Vec<ListingCase> = vec![
+    // The website's own content, not just its status.
+    let (_, _, home) = answer(edge.clone(), website_request(Method::GET, "/", &site, None)).await;
+    assert_eq!(home, "home");
+    let (_, _, missing) = answer(edge.clone(), website_request(Method::GET, "/missing", &site, None)).await;
+    assert_eq!(missing, "error page");
+    let (_, _, private) = answer(edge.clone(), website_request(Method::GET, "/private.txt", &site, None)).await;
+    assert!(
+        !String::from_utf8_lossy(&private).contains("private"),
+        "the denied object's content was served: {private:?}"
+    );
+}
+
+/// A malformed path and a SigV4 `Authorization` header sent to a website host.
+///
+/// `/%zz` is not an encoding the key decoder refuses, so it names the key `%zz`: the website
+/// answers its `404` error document. A bad `Authorization` header neither refuses nor widens a
+/// read: the website service never reads it (`200`; the legacy S3 service refused it with `400
+/// InvalidRequest` before routing, the one difference the comparison recorded).
+#[tokio::test]
+#[serial_test::serial]
+async fn website_host_answers_a_malformed_path_and_ignores_an_authorization_header() {
+    let (_env, edge) = stack().await;
+    let site = format!("{BUCKET}.{WEBSITE_DOMAIN}");
+    let bad_auth = Some(("authorization", "AWS4-HMAC-SHA256 Credential=nobody/20200101/us-east-1/s3/aws4_request"));
+
+    let (status, _, body) = answer(edge.clone(), website_request(Method::GET, "/%zz", &site, None)).await;
+    assert_eq!((status, body.as_ref()), (StatusCode::NOT_FOUND, b"error page".as_slice()));
+
+    let (status, _, body) = answer(edge.clone(), website_request(Method::GET, "/index.html", &site, bad_auth)).await;
+    assert_eq!((status, body.as_ref()), (StatusCode::OK, b"home".as_slice()));
+
+    // The header cannot widen a read either: the denied object stays denied under a bad header.
+    let (status, _, _) = answer(edge.clone(), website_request(Method::GET, "/private.txt", &site, bad_auth)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn metadata_listings_follow_the_callers_iam_policy() {
+    let (_env, edge) = stack().await;
+    let anonymous = |query: &'static str| move || website_request(Method::GET, &format!("/{BUCKET}?{query}"), S3_HOST, None);
+    let cases: Vec<ListingCase> = vec![
         (
             "root v2",
-            Box::new(signed_as(format!("/{BUCKET}"), "list-type=2&metadata=true", ROOT, ROOT_SECRET)),
+            signed_listing(BUCKET, "list-type=2&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::OK,
+            None,
         ),
         (
             "root versions",
-            Box::new(signed_as(format!("/{BUCKET}"), "metadata=true&versions=", ROOT, ROOT_SECRET)),
+            signed_listing(BUCKET, "metadata=true&versions=", ROOT, ROOT_SECRET),
             StatusCode::OK,
+            None,
         ),
         (
             "empty bucket",
-            Box::new(signed_as(format!("/{EMPTY}"), "list-type=2&metadata=true", ROOT, ROOT_SECRET)),
+            signed_listing(EMPTY, "list-type=2&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::OK,
+            None,
         ),
         (
             "first page",
-            Box::new(signed_as(format!("/{BUCKET}"), "list-type=2&max-keys=2&metadata=true", ROOT, ROOT_SECRET)),
+            signed_listing(BUCKET, "list-type=2&max-keys=2&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::OK,
+            None,
         ),
         (
             "url encoding",
-            Box::new(signed_as(
-                format!("/{BUCKET}"),
-                "encoding-type=url&list-type=2&metadata=true&prefix=a",
-                ROOT,
-                ROOT_SECRET,
-            )),
+            signed_listing(BUCKET, "encoding-type=url&list-type=2&metadata=true&prefix=a", ROOT, ROOT_SECRET),
             StatusCode::OK,
+            None,
+        ),
+        // rustfs#4845: a signed user is resolved to its IAM policy, not evaluated as anonymous.
+        (
+            "listing user v2",
+            signed_listing(BUCKET, "list-type=2&metadata=true", "list-allowed", USER_SECRET),
+            StatusCode::OK,
+            None,
         ),
         (
-            "listing user",
-            Box::new(signed_as(format!("/{BUCKET}"), "list-type=2&metadata=true", "list-allowed", USER_SECRET)),
+            "listing user versions",
+            signed_listing(BUCKET, "metadata=true&versions=", "list-allowed", USER_SECRET),
             StatusCode::OK,
+            None,
         ),
         (
             "bad encoding",
-            Box::new(signed_as(
-                format!("/{BUCKET}"),
-                "encoding-type=xml&list-type=2&metadata=true",
-                ROOT,
-                ROOT_SECRET,
-            )),
+            signed_listing(BUCKET, "encoding-type=xml&list-type=2&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::BAD_REQUEST,
+            Some("InvalidArgument"),
         ),
         (
             "bad token",
-            Box::new(signed_as(
-                format!("/{BUCKET}"),
-                "continuation-token=%25%25&list-type=2&metadata=true",
-                ROOT,
-                ROOT_SECRET,
-            )),
+            signed_listing(BUCKET, "continuation-token=%25%25&list-type=2&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::BAD_REQUEST,
+            None,
         ),
         (
             "bad max-keys",
-            Box::new(signed_as(
-                format!("/{BUCKET}"),
-                "list-type=2&max-keys=ten&metadata=true",
-                ROOT,
-                ROOT_SECRET,
-            )),
+            signed_listing(BUCKET, "list-type=2&max-keys=ten&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::BAD_REQUEST,
+            Some("InvalidArgument"),
         ),
         (
-            "no policy user",
-            Box::new(signed_as(format!("/{BUCKET}"), "list-type=2&metadata=true", "list-none", USER_SECRET)),
+            "no policy user v2",
+            signed_listing(BUCKET, "list-type=2&metadata=true", "list-none", USER_SECRET),
             StatusCode::FORBIDDEN,
+            Some("AccessDenied"),
         ),
         (
-            "no policy versions",
-            Box::new(signed_as(format!("/{BUCKET}"), "metadata=true&versions=", "list-none", USER_SECRET)),
+            "no policy user versions",
+            signed_listing(BUCKET, "metadata=true&versions=", "list-none", USER_SECRET),
             StatusCode::FORBIDDEN,
+            Some("AccessDenied"),
         ),
         (
             "missing bucket",
-            Box::new(signed_as("/parity-absent".to_owned(), "list-type=2&metadata=true", ROOT, ROOT_SECRET)),
+            signed_listing("parity-absent", "list-type=2&metadata=true", ROOT, ROOT_SECRET),
             StatusCode::NOT_FOUND,
+            None,
         ),
         (
-            "anonymous",
-            Box::new(move || website_request(Method::GET, &format!("/{BUCKET}?list-type=2&metadata=true"), S3_HOST, None)),
+            "anonymous v2",
+            anonymous("list-type=2&metadata=true")(),
             StatusCode::FORBIDDEN,
+            Some("AccessDenied"),
         ),
         (
             "anonymous versions",
-            Box::new(move || website_request(Method::GET, &format!("/{BUCKET}?versions&metadata=true"), S3_HOST, None)),
+            anonymous("versions&metadata=true")(),
             StatusCode::FORBIDDEN,
+            Some("AccessDenied"),
         ),
     ];
-    for (label, request, status) in &listing_cases {
-        let (old, new) = both(&legacy, &edge, request).await;
-        if old != new || !old.starts_with(status.as_str()) {
-            failures.push(format!("listing {label}\n  legacy  {old}\n  gateway {new}"));
+    let mut failures = Vec::new();
+    for (label, request, status, code) in cases {
+        let (got, _, body) = answer(edge.clone(), request).await;
+        if got != status {
+            failures.push(format!("listing {label}: want {status}, got {got} {}", String::from_utf8_lossy(&body)));
+        } else if let Some(code) = code
+            && refusal(&body).0 != code
+        {
+            failures.push(format!("listing {label}: want code {code}, got {:?}", refusal(&body)));
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 
-    // The listing documents carry what the extension adds, so equal bodies are not two empty ones.
-    let root_v2 = answer(
-        edge.clone(),
-        signed(
-            &format!("/{BUCKET}"),
-            "list-type=2&metadata=true",
-            S3_HOST,
-            ROOT,
-            ROOT_SECRET,
-            Signed::Header,
-        ),
-    )
-    .await;
-    let text = String::from_utf8_lossy(&root_v2.2);
+#[tokio::test]
+#[serial_test::serial]
+async fn metadata_listing_documents_carry_the_extension_and_the_callers_read_rights() {
+    let (_env, edge) = stack().await;
+    let (_, _, root) = answer(edge.clone(), signed_listing(BUCKET, "list-type=2&metadata=true", ROOT, ROOT_SECRET)).await;
+    let text = String::from_utf8_lossy(&root);
     for part in [
         "<ListBucketResult",
         "<UserMetadata>",
         "<project>alpha</project>",
         "<Internal>",
     ] {
-        if !text.contains(part) {
-            failures.push(format!("gateway listing lacks {part}: {text}"));
-        }
+        assert!(text.contains(part), "the listing lacks {part}: {text}");
     }
-    let user = answer(
+    // The bucket policy denies everyone `private.txt`: its entry carries no metadata, while the
+    // entries the policy lets everyone read do.
+    let (_, _, user) = answer(
         edge.clone(),
-        signed(
-            &format!("/{BUCKET}"),
-            "list-type=2&metadata=true",
-            S3_HOST,
-            "list-allowed",
-            USER_SECRET,
-            Signed::Header,
-        ),
+        signed_listing(BUCKET, "list-type=2&metadata=true", "list-allowed", USER_SECRET),
     )
     .await;
-    // The bucket policy denies everyone `private.txt`, so its entry carries no metadata, while
-    // the entries the policy lets everyone read do.
-    let listed = String::from_utf8_lossy(&user.2).into_owned();
+    let listed = String::from_utf8_lossy(&user).into_owned();
     let entry = |key: &str| {
         listed
             .split("<Contents>")
@@ -418,63 +521,56 @@ async fn website_and_metadata_route_answers_match_the_legacy_stack() {
             .unwrap_or_default()
             .to_owned()
     };
-    if entry("private.txt").contains("<UserMetadata>") || !entry("docs").contains("<UserMetadata>") {
-        failures.push(format!("the listing's metadata ignores what the caller may read: {listed}"));
-    }
-    let first = String::from_utf8_lossy(
-        &answer(
-            edge.clone(),
-            signed(
-                &format!("/{BUCKET}"),
-                "list-type=2&max-keys=2&metadata=true",
-                S3_HOST,
-                ROOT,
-                ROOT_SECRET,
-                Signed::Header,
-            ),
-        )
-        .await
-        .2,
+    assert!(
+        !entry("private.txt").contains("<UserMetadata>") && entry("docs").contains("<UserMetadata>"),
+        "the listing's metadata ignores what the caller may read: {listed}"
+    );
+    // A first page of two names a continuation token, and the second page accepts it.
+    let (_, _, first) = answer(
+        edge.clone(),
+        signed_listing(BUCKET, "list-type=2&max-keys=2&metadata=true", ROOT, ROOT_SECRET),
     )
-    .into_owned();
-    match first
+    .await;
+    let first = String::from_utf8_lossy(&first).into_owned();
+    let token = first
         .split_once("<NextContinuationToken>")
         .and_then(|(_, tail)| tail.split_once('<'))
-    {
-        Some((token, _)) => {
-            let query: &'static str = Box::leak(
-                format!("continuation-token={}&list-type=2&metadata=true", urlencoding::encode(token)).into_boxed_str(),
-            );
-            let (old, new) = both(&legacy, &edge, signed_as(format!("/{BUCKET}"), query, ROOT, ROOT_SECRET)).await;
-            if old != new || !old.starts_with("200") || !old.contains("<ContinuationToken>") {
-                failures.push(format!("listing second page\n  legacy  {old}\n  gateway {new}"));
-            }
-        }
-        None => failures.push(format!("the first page has no continuation token: {first}")),
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+        .map(|(token, _)| token.to_owned())
+        .unwrap_or_else(|| panic!("the first page has no continuation token: {first}"));
+    let query = format!("continuation-token={}&list-type=2&metadata=true", urlencoding::encode(&token));
+    let (status, _, second) = answer(edge, signed_listing(BUCKET, &query, ROOT, ROOT_SECRET)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&second));
+    assert!(String::from_utf8_lossy(&second).contains("<ContinuationToken>"));
 }
 
-/// A malformed path and a SigV4 `Authorization` header sent to a website host.
-///
-/// `/%zz` is not a percent-encoding the key decoder refuses, so it names the key `%zz`: both
-/// stacks answer the website's `404` error document. A bad `Authorization` header is the one
-/// difference: the legacy stack's S3 service refuses the header before routing (`400
-/// InvalidRequest`), while the gateway stack's website service never reads it, because a website
-/// read is anonymous and the header can neither refuse nor widen it (`200`).
+/// The gateway handler's listing authorization attaches the table snapshot, so a caller without
+/// table access never receives a warehouse or catalog key. Without the snapshot the use case lists
+/// the bucket unfiltered, so the filtering is observed on what the caller receives.
 #[tokio::test]
-async fn website_host_answers_a_malformed_path_and_ignores_an_authorization_header() {
-    let (_env, legacy, edge) = stacks().await;
-    let site = format!("{BUCKET}.{WEBSITE_DOMAIN}");
-    let bad_auth = Some(("authorization", "AWS4-HMAC-SHA256 Credential=nobody/20200101/us-east-1/s3/aws4_request"));
-
-    let request = || website_request(Method::GET, "/%zz", &site, None);
-    let (old, new) = both(&legacy, &edge, request).await;
-    assert_eq!(old, new);
-    assert!(new.starts_with("404") && new.ends_with("error page"), "{new}");
-
-    let request = || website_request(Method::GET, "/index.html", &site, bad_auth);
-    let (old, new) = both(&legacy, &edge, request).await;
-    assert!(old.starts_with("400") && old.ends_with("error \"InvalidRequest\""), "{old}");
-    assert!(new.starts_with("200") && new.ends_with("home"), "{new}");
+#[serial_test::serial]
+async fn a_metadata_listing_of_a_table_bucket_hides_the_keys_the_caller_has_no_table_access_to() {
+    let (_env, edge) = stack().await;
+    for query in ["list-type=2&metadata=true", "metadata=true&versions="] {
+        let anonymous = website_request(Method::GET, &format!("/{TABLES}?{query}"), S3_HOST, None);
+        for (caller, request, visible) in [
+            // No table-metadata right: the ordinary key only, never the warehouse or catalog keys.
+            ("anonymous", anonymous, vec!["ordinary.txt"]),
+            (
+                "listing user",
+                signed_listing(TABLES, query, "list-allowed", USER_SECRET),
+                vec!["ordinary.txt"],
+            ),
+            // The owner may read table data, so the control shows the filter is selective: the
+            // warehouse key is listed, the reserved catalog prefix still is not.
+            (
+                "root",
+                signed_listing(TABLES, query, ROOT, ROOT_SECRET),
+                vec!["ordinary.txt", "tables/table-id/data.parquet"],
+            ),
+        ] {
+            let (status, _, body) = answer(edge.clone(), request).await;
+            assert_eq!(status, StatusCode::OK, "{caller} {query}: {}", String::from_utf8_lossy(&body));
+            assert_eq!(keys(&body), visible, "{caller} {query}: {}", String::from_utf8_lossy(&body));
+        }
+    }
 }

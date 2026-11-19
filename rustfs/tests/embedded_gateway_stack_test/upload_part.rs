@@ -209,12 +209,6 @@ async fn upload_part_contract(server: super::super::RustFSServer, gateway: bool)
 
 #[test]
 #[serial_test::serial]
-fn legacy_upload_part_fixed_main_contract() {
-    super::super::with_stack(super::super::LEGACY, |server| upload_part_contract(server, false));
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_upload_part_wire_contract() {
     super::super::with_stack(super::super::GATEWAY, |server| upload_part_contract(server, true));
 }
@@ -260,12 +254,6 @@ async fn scoped_user(server: super::super::RustFSServer) {
         }
     }
     server.shutdown().await;
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_upload_part_scoped_policy() {
-    super::super::with_stack(super::super::LEGACY, scoped_user);
 }
 
 #[test]

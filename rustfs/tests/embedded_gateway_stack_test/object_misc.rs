@@ -16,7 +16,7 @@
 
 use super::bucket_configs::StatusCapture;
 use super::{
-    GATEWAY, LEGACY, MatrixRow, NO_POLICY_USER, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
+    GATEWAY, MatrixRow, NO_POLICY_USER, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
     create_user_without_a_policy, outcome, refusal, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -289,11 +289,6 @@ fn the_gateway_stack_admits_and_renews_restore_object() {
     with_stack(GATEWAY, restore_admits_once_and_renews_in_place);
 }
 
-#[test]
-fn the_legacy_stack_admits_and_renews_restore_object() {
-    with_stack(LEGACY, restore_admits_once_and_renews_in_place);
-}
-
 fn batch(keys: &[&str]) -> aws_sdk_s3::types::builders::DeleteBuilder {
     Delete::builder().set_objects(Some(
         keys.iter()
@@ -517,14 +512,6 @@ fn the_gateway_stack_refuses_then_deletes_an_object() {
     with_stack(GATEWAY, |server| delete_object_refuses_then_deletes(server, None));
 }
 
-/// The legacy edge preserves the key validation result and error ordering.
-#[test]
-fn the_legacy_stack_refuses_then_deletes_an_object() {
-    with_stack(LEGACY, |server| {
-        delete_object_refuses_then_deletes(server, Some("Object key contains invalid control characters: \"bad\\0key\""))
-    });
-}
-
 const SELECT_BUCKET: &str = "e2-select-object";
 const SELECT_FIXTURE_KEY: &str = "input.csv";
 const SELECT_FIXTURE: &[u8] = b"value\nold\n";
@@ -734,11 +721,6 @@ fn gateway_select_preserves_the_event_sequence_and_denies_unauthorized_reads() {
     with_stack(GATEWAY, select_parity);
 }
 
-#[test]
-fn legacy_select_preserves_the_event_sequence_and_denies_unauthorized_reads() {
-    with_stack(LEGACY, select_parity);
-}
-
 async fn delete_objects_checks_each_key_and_preserves_quiet_errors(server: RustFSServer) {
     const BUCKET: &str = "e2-delete-batch-scoped";
     const USER: &str = "e2deletebatchscoped";
@@ -820,11 +802,6 @@ async fn delete_objects_checks_each_key_and_preserves_quiet_errors(server: RustF
 #[test]
 fn the_gateway_stack_deletes_only_authorized_batch_entries() {
     with_stack(GATEWAY, delete_objects_checks_each_key_and_preserves_quiet_errors);
-}
-
-#[test]
-fn the_legacy_stack_deletes_only_authorized_batch_entries() {
-    with_stack(LEGACY, delete_objects_checks_each_key_and_preserves_quiet_errors);
 }
 
 #[test]

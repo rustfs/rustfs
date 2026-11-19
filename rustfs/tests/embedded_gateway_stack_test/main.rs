@@ -15,7 +15,7 @@
 // The gateway S3 stack inside an embedded RustFS server (rustfs/backlog#2734). Requests are signed
 // by the AWS SDK and travel through the whole middleware stack, so what is asserted here is what a
 // client sees. Every served operation has a row in the refusal matrix, kept per migration family in
-// the module named after it, or an entry in `ANSWERS_EVERY_CALLER_ALIKE`; both run on both stacks.
+// the module named after it, or an entry in `ANSWERS_EVERY_CALLER_ALIKE`; both run on the gateway stack.
 
 #![recursion_limit = "256"]
 
@@ -36,7 +36,6 @@ mod object_write;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
@@ -53,13 +52,14 @@ const ROOT_SECRET_KEY: &str = "gateway-stack-root-secret";
 const USER_SECRET_KEY: &str = "gateway-stack-user-secret";
 const NO_POLICY_USER: &str = "gatewaystacknopolicy";
 const MATRIX_BUCKET: &str = "gateway-stack-matrix";
-const ENV_S3_STACK: &str = "RUSTFS_S3_STACK";
+/// The retired stack selector. Every server here starts with it unset: set, it refuses startup.
+const ENV_S3_STACK: &str = rustfs::config::RETIRED_S3_STACK_SELECTOR;
 const ENV_KEYSTONE_ENABLE: &str = "RUSTFS_KEYSTONE_ENABLE";
 const ENV_KEYSTONE_AUTH_URL: &str = "RUSTFS_KEYSTONE_AUTH_URL";
 /// A configuration-valid endpoint: these tests start up without sending token requests.
 const UNREACHABLE_KEYSTONE: &str = "https://keystone.example.test";
-const GATEWAY: Option<&str> = Some("gateway");
-const LEGACY: Option<&str> = None;
+/// The value the harness gives [`ENV_S3_STACK`]: unset.
+const GATEWAY: Option<&str> = None;
 
 /// One served operation as a client calls it.
 pub(crate) struct MatrixRow {
@@ -157,7 +157,7 @@ async fn anonymous_client(endpoint: &str) -> Client {
     Client::from_conf(aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build())
 }
 
-/// Runs `test` against an embedded server started with `RUSTFS_S3_STACK` set to `stack`.
+/// Runs `test` against an embedded server started with [`ENV_S3_STACK`] set to `stack`.
 fn with_stack<F, Fut>(stack: Option<&'static str>, test: F)
 where
     F: FnOnce(RustFSServer) -> Fut + Send + 'static,
@@ -345,11 +345,6 @@ fn operations_that_answer_every_caller_alike_do_so_on_the_gateway_stack() {
     with_stack(GATEWAY, every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike);
 }
 
-#[test]
-fn operations_that_answer_every_caller_alike_do_so_on_the_legacy_stack() {
-    with_stack(LEGACY, every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike);
-}
-
 /// Every served operation serves the root caller, counted once under its label, and refuses
 /// each caller it cannot admit with the code the legacy stack answers, counted once.
 async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer, legacy: bool) {
@@ -482,13 +477,6 @@ fn the_refusal_matrix_holds_on_the_gateway_stack() {
     });
 }
 
-#[test]
-fn the_refusal_matrix_holds_on_the_legacy_stack() {
-    bucket_access::with_notification_stack(LEGACY, |server| {
-        every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server, true)
-    });
-}
-
 /// Names RustFS creates and the AWS bucket grammar refuses. An IP-shaped name such as `256.1.1.1`
 /// is also outside the AWS grammar, but RustFS's own create rule refuses it, so no store holds one.
 const RUSTFS_ONLY_NAMES: [&str; 5] = ["a-s3alias", "sthree-x", "x--ol-s3", "x--x-s3", "xn--abc"];
@@ -523,52 +511,6 @@ fn the_gateway_stack_lists_every_stored_bucket() {
     with_stack(GATEWAY, the_listing_names_every_stored_bucket);
 }
 
-#[test]
-fn the_legacy_stack_lists_every_stored_bucket() {
-    with_stack(LEGACY, the_listing_names_every_stored_bucket);
-}
-
-/// HeadBucket on the legacy stack answers every name as before the use case moved onto the
-/// gateway's types: a stored name the AWS grammar refuses is found, a missing one is not, and a
-/// name the edge refuses is refused there, never with a server fault. Every status was measured
-/// on `main` before the move. The SDK sends nothing for a `--x-s3` name: it treats it as a
-/// directory bucket and refuses it on the client.
-#[test]
-fn the_legacy_stack_heads_every_bucket_name_as_before() {
-    with_stack(LEGACY, |server| async move {
-        for name in RUSTFS_ONLY_NAMES {
-            create_bucket_in_the_store(name).await;
-        }
-        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
-        let too_long = "a".repeat(64);
-        let expected = [
-            ("a-s3alias", Some(200)),
-            ("sthree-x", Some(200)),
-            ("x--ol-s3", Some(200)),
-            ("x--x-s3", None),
-            ("xn--abc", Some(400)),
-            ("missing-bucket", Some(404)),
-            ("UPPER", Some(400)),
-            ("256.1.1.1", Some(404)),
-            ("ab", Some(400)),
-            (too_long.as_str(), Some(400)),
-        ];
-
-        let mut answered = Vec::new();
-        let mut wanted = Vec::new();
-        for (name, status) in expected {
-            let observed = match client.head_bucket().bucket(name).send().await {
-                Ok(_) => Some(200),
-                Err(error) => refusal(&error).1,
-            };
-            answered.push((name.to_owned(), observed));
-            wanted.push((name.to_owned(), status));
-        }
-        assert_eq!(answered, wanted);
-        server.shutdown().await;
-    });
-}
-
 /// The PutObject-only upload-size capability is refused on any other operation, before it is
 /// served, with the same answer on both stacks. The legacy stack refuses it in the admission both
 /// edges share; the gateway refuses the query before its handler runs.
@@ -594,11 +536,6 @@ fn the_gateway_stack_refuses_a_misplaced_capability_query() {
 }
 
 #[test]
-fn the_legacy_stack_refuses_a_misplaced_capability_query() {
-    with_stack(LEGACY, a_misplaced_capability_query_is_refused);
-}
-
-#[test]
 fn the_gateway_stack_starts_with_keystone_enabled() {
     let environment = vec![
         (ENV_S3_STACK, GATEWAY),
@@ -612,58 +549,6 @@ fn the_gateway_stack_starts_with_keystone_enabled() {
             .await
             .expect("signed ListBuckets with the Keystone bridge enabled");
         assert!(listing.buckets().is_empty());
-        server.shutdown().await;
-    });
-}
-
-#[test]
-fn the_legacy_stack_starts_with_keystone_enabled() {
-    let environment = vec![
-        (ENV_S3_STACK, LEGACY),
-        (ENV_KEYSTONE_ENABLE, Some("true")),
-        (ENV_KEYSTONE_AUTH_URL, Some(UNREACHABLE_KEYSTONE)),
-    ];
-    with_environment(environment, |server| async move {
-        let listing = s3_client(&server.endpoint(), server.access_key(), server.secret_key())
-            .list_buckets()
-            .send()
-            .await
-            .expect("signed ListBuckets on the legacy stack with Keystone enabled");
-        assert!(listing.buckets().is_empty());
-
-        server.shutdown().await;
-    });
-}
-
-/// The legacy stack still serves operations the gateway stack does not, in the same binary.
-#[test]
-fn the_legacy_stack_still_serves_writes_and_reads() {
-    with_stack(LEGACY, |server| async move {
-        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
-
-        client
-            .create_bucket()
-            .bucket("legacy-stack-alpha")
-            .send()
-            .await
-            .expect("CreateBucket on the legacy stack");
-        client
-            .put_object()
-            .bucket("legacy-stack-alpha")
-            .key("object")
-            .body(ByteStream::from_static(b"payload"))
-            .send()
-            .await
-            .expect("PutObject on the legacy stack");
-        let missing = client
-            .get_object()
-            .bucket("legacy-stack-alpha")
-            .key("missing")
-            .send()
-            .await
-            .expect_err("a missing key");
-        assert_eq!(refusal(&missing), (Some("NoSuchKey".to_owned()), Some(404)));
-
         server.shutdown().await;
     });
 }
@@ -739,27 +624,6 @@ fn the_gateway_stack_serves_only_the_reported_bucket_owner() {
                 Err(Some(403)),
                 Ok(()),
                 Err(Some(403)),
-            ],
-        )
-    });
-}
-
-#[test]
-fn the_legacy_stack_answers_expected_bucket_owner_requests() {
-    with_stack(LEGACY, |server| {
-        expected_bucket_owner_answers(
-            server,
-            [
-                Ok(()),
-                Ok(()),
-                Ok(()),
-                Err(Some(404)),
-                Err(Some(404)),
-                Err(Some(404)),
-                Ok(()),
-                Ok(()),
-                Ok(()),
-                Ok(()),
             ],
         )
     });

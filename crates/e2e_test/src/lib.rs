@@ -31,8 +31,8 @@ pub mod chaos;
 #[cfg(test)]
 pub mod fake_s3_target;
 
-// Dual-stack differential (rustfs/backlog#2740): one binary, two processes on
-// different RUSTFS_S3_STACK values, the same SDK script for every S3 operation,
+// Differential (rustfs/backlog#2740): two processes, the binary under test against
+// itself or a released reference binary, the same SDK script for every S3 operation,
 // compared on status, error code, allowlisted headers and typed body fields.
 #[cfg(test)]
 mod dual_stack_differential;
