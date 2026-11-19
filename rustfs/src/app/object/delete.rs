@@ -1188,7 +1188,6 @@ impl DefaultObjectUsecase {
     /// The access phase has installed `ReqInfo` and the pending bucket-generation guard; this
     /// adds `ReplicateDelete` for a replica delete, repeats `ForceDeleteObject` for a non-owner,
     /// and authorizes every descendant of a recursive force delete.
-    #[cfg(any(feature = "gateway-stack", test))]
     #[instrument(level = "info", skip(self, envelope, input))]
     pub async fn execute_delete_object(
         &self,

@@ -16,7 +16,7 @@
 //! answers CompleteMultipartUpload for every request shape whose conversion onto the gateway's
 //! types needs care. CompleteMultipartUpload is served on both stacks.
 
-use super::{LEGACY, create_bucket_in_the_store, s3_client, with_stack};
+use super::{create_bucket_in_the_store, s3_client, with_stack};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -402,118 +402,8 @@ const GATEWAY_COMPLETION_DIVERGENCES: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn the_legacy_stack_completes_every_upload_as_before() {
-    with_stack(LEGACY, |server| completes_every_upload(server, &[]));
-}
-
-#[test]
 fn the_gateway_stack_completes_every_upload() {
     with_stack(super::GATEWAY, |server| completes_every_upload(server, GATEWAY_COMPLETION_DIVERGENCES));
-}
-
-#[test]
-fn legacy_absent_upload_refusal_order() {
-    with_stack(LEGACY, |server| async move {
-        use rustfs_ecstore::api::bucket::{
-            metadata_sys,
-            quota::{BucketQuota, checker::QuotaChecker},
-        };
-        use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
-        use rustfs_storage_api::{MultipartOperations, ObjectIO};
-        let context = rustfs::app::context::get_global_app_context().expect("embedded context");
-        let store = context.object_store();
-        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
-        for (shape, raw_id) in [("absent", None), ("dot", Some("a/../b")), ("absolute", Some("/upload"))] {
-            for (label, full_quota, locked) in [
-                ("wire-absent-quota", true, false),
-                ("wire-absent", false, false),
-                ("wire-absent-lock", false, true),
-                ("wire-absent-both", true, true),
-            ] {
-                let bucket = format!("{shape}-{label}");
-                let label = bucket.as_str();
-                create_bucket_in_the_store(label).await;
-                let upload = store
-                    .new_multipart_upload(label, "object", &ObjectOptions::default())
-                    .await
-                    .expect("mint");
-                store
-                    .abort_multipart_upload(label, "object", &upload.upload_id, &ObjectOptions::default())
-                    .await
-                    .expect("abort");
-                assert!(
-                    store
-                        .lookup_multipart_completion_binding(label, "object", &upload.upload_id, &ObjectOptions::default())
-                        .await
-                        .expect("binding")
-                        .is_none()
-                );
-                if locked {
-                    metadata_sys::update(
-                        label,
-                        rustfs_ecstore::api::bucket::metadata::OBJECT_LOCK_CONFIG,
-                        b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"
-                            .to_vec(),
-                    )
-                    .await
-                    .expect("lock config");
-                    let mut opts = ObjectOptions::default();
-                    opts.user_defined
-                        .insert("x-amz-object-lock-legal-hold".to_owned(), "ON".to_owned());
-                    let mut reader = PutObjReader::from_vec(b"existing".to_vec());
-                    store
-                        .clone()
-                        .put_object(label, "object", &mut reader, &opts)
-                        .await
-                        .expect("held object");
-                }
-                rustfs_ecstore::api::data_usage::seed_bucket_usage_memory_for_test(label, 2).await;
-                if full_quota {
-                    QuotaChecker::new(store.bucket_metadata_sys().expect("metadata context"))
-                        .set_quota_config(
-                            label,
-                            BucketQuota {
-                                quota: Some(1),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .expect("quota");
-                }
-                let before = super::s3_request_counts();
-                let answer =
-                    complete(&client, label, "object", raw_id.unwrap_or(&upload.upload_id), part(Some(1), "part"), &[]).await;
-                assert_eq!(
-                    super::counted_since(&before),
-                    std::collections::BTreeMap::from([(("POST", "s3:CompleteMultipartUpload", "4xx"), 1)]),
-                    "{shape}/{label}"
-                );
-                let (status, code, message) = if raw_id.is_some() {
-                    (
-                        404,
-                        "NoSuchUpload",
-                        "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
-                    )
-                } else if full_quota {
-                    (400, "InvalidRequest", "Bucket quota exceeded. Current usage: 2 bytes, limit: 1 bytes")
-                } else if locked {
-                    (
-                        403,
-                        "AccessDenied",
-                        "Object has a legal hold and cannot be overwritten. Remove the legal hold first.",
-                    )
-                } else {
-                    (
-                        404,
-                        "NoSuchUpload",
-                        "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
-                    )
-                };
-                assert_eq!(answer, format!("{:?} {:?} {:?}", Some(status), Some(code), Some(message)), "{label}");
-            }
-        }
-        server.shutdown().await;
-    });
 }
 
 #[test]
@@ -849,12 +739,6 @@ async fn copy_authorization_contract(root: &Client, endpoint: &str) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_copy_object_fixed_main_contract() {
-    with_stack(LEGACY, copy_contract);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_copy_object_wire_contract() {
     with_stack(super::GATEWAY, copy_contract);
 }
@@ -980,12 +864,6 @@ async fn upload_part_copy_contract(server: super::RustFSServer) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_upload_part_copy_wire_contract() {
-    with_stack(LEGACY, upload_part_copy_contract);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_upload_part_copy_wire_contract() {
     with_stack(super::GATEWAY, upload_part_copy_contract);
 }
@@ -1073,12 +951,6 @@ fn gateway_upload_part_copy_checks_source_owner() {
 #[serial_test::serial]
 fn gateway_copy_object_checks_source_owner_before_overwriting() {
     with_stack(super::GATEWAY, copy_object_checks_source_owner_before_overwriting);
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_copy_object_checks_source_owner_before_overwriting() {
-    with_stack(LEGACY, copy_object_checks_source_owner_before_overwriting);
 }
 
 async fn copy_object_checks_source_owner_before_overwriting(server: rustfs::embedded::RustFSServer) {

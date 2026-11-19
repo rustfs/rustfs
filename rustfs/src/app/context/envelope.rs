@@ -198,7 +198,6 @@ pub struct RequestEnvelope {
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
     gateway_post: bool,
-    #[cfg(feature = "gateway-stack")]
     gateway_post_archive_identity: Option<Arc<()>>,
     post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
@@ -252,7 +251,6 @@ impl RequestEnvelope {
             website_read: extensions.remove(),
             post_object: extensions.remove(),
             gateway_post: false,
-            #[cfg(feature = "gateway-stack")]
             gateway_post_archive_identity: None,
             post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
@@ -304,7 +302,6 @@ impl RequestEnvelope {
             website_read: self.website_read.clone(),
             post_object: self.post_object.clone(),
             gateway_post: self.gateway_post,
-            #[cfg(feature = "gateway-stack")]
             gateway_post_archive_identity: self.gateway_post_archive_identity.clone(),
             post_object_policy_headers: self.post_object_policy_headers.clone(),
             req_info: self.req_info.clone(),
@@ -465,7 +462,6 @@ impl RequestEnvelope {
         &self.residual_extensions
     }
 
-    #[cfg(feature = "gateway-stack")]
     /// The payloads the connection, request and signature layers attached, back in the extensions
     /// they arrive in, for an edge that hands this request to a handler still taking those.
     pub(crate) fn transport_extensions(&self) -> Extensions {
@@ -528,13 +524,11 @@ impl RequestEnvelope {
         self.gateway_post
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn mark_gateway_post(&mut self) {
         self.gateway_post = true;
         self.gateway_post_archive_identity = None;
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn bind_gateway_post_archive_identity(&mut self) -> Option<&Arc<()>> {
         if !self.gateway_post {
             return None;
@@ -542,7 +536,6 @@ impl RequestEnvelope {
         Some(self.gateway_post_archive_identity.get_or_insert_with(|| Arc::new(())))
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn gateway_post_identity(&self) -> Option<&Arc<()>> {
         self.gateway_post_archive_identity.as_ref()
     }
@@ -563,7 +556,6 @@ impl RequestEnvelope {
         self.bucket_generation.as_ref()
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn take_bucket_generation(&mut self) -> Option<BucketGenerationGuard> {
         self.bucket_generation.take()
     }
@@ -593,7 +585,6 @@ impl RequestEnvelope {
     }
 
     /// Releases preflight guards before uncommitted POST staging; publication must reauthorize.
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn release_table_publication_guards(&mut self) {
         self.table_publication_guards = None;
     }

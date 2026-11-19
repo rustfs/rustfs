@@ -1601,7 +1601,6 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use crate::storage::storage_api::ecstore_compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use crate::storage::storage_api::ecstore_compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
@@ -1871,12 +1870,10 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod multipart {
-            #[cfg(any(feature = "gateway-stack", test))]
             pub(crate) use super::super::super::storage_contracts::multipart::ListPartsOwner;
             pub(crate) use super::super::super::storage_contracts::{
                 CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
-            #[cfg(any(feature = "gateway-stack", test))]
             pub(crate) use super::super::super::storage_contracts::{MultipartAbortAuthorization, MultipartOwner};
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }

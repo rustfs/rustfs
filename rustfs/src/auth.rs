@@ -162,6 +162,7 @@ impl IAMAuth {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_server_context(
         ak: impl Into<String>,
         sk: impl Into<SecretKey>,

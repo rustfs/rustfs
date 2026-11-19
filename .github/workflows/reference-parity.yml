@@ -32,9 +32,9 @@
 #
 # The `differential` job adds the 73-operation dual-stack differential
 # (crates/e2e_test/src/dual_stack_differential, rustfs/backlog#2740) against the
-# same pinned reference: side A is the released binary (RUSTFS_E2E_REFERENCE_BINARY,
-# started without RUSTFS_S3_STACK), side B is the candidate built above on its
-# legacy stack. It reuses the candidate build artifact, never builds the candidate
+# same pinned reference: side A is the released binary (RUSTFS_E2E_REFERENCE_BINARY),
+# side B is the candidate built above.
+# It reuses the candidate build artifact, never builds the candidate
 # twice, and prints reference_side, version_a and version_b from the report the test
 # wrote; it fails when side A was not the reference or both sides report the same
 # version. Every (op, field, a, b) difference goes to the job summary. Report-only
@@ -310,7 +310,7 @@ jobs:
           chmod +x target/debug/rustfs
           test -x "$REFERENCE_PATH"
           mkdir -p "$RUSTFS_E2E_LOG_DIR"
-          # Side A: the released binary. Side B: the candidate on its legacy stack.
+          # Side A: the released binary. Side B: the candidate.
           export RUSTFS_E2E_REFERENCE_BINARY="$REFERENCE_PATH"
           test_name='dual_stack_differential::tests::both_stacks_answer_every_operation_identically'
           python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \

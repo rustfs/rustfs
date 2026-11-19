@@ -242,13 +242,6 @@ impl WireClient<'_> {
         self.exchange(method, path, headers, body, declared).await
     }
 
-    async fn post(&self, bucket: &str, status: Option<&str>, redirect: Option<&str>) -> WireAnswer {
-        let mut fields = vec![("key", "post-object")];
-        fields.extend(status.map(|value| ("success_action_status", value)));
-        fields.extend(redirect.map(|value| ("success_action_redirect", value)));
-        self.post_form(bucket, &fields, &[], true, true).await
-    }
-
     async fn post_form(
         &self,
         bucket: &str,
@@ -331,112 +324,6 @@ impl WireClient<'_> {
         body.push_str(&format!("--{POST_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\n"));
         body
     }
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_owned_put_preserves_refusal_order_checksums_and_short_body() {
-    super::with_stack(super::LEGACY, |server| async move {
-        let endpoint = server.endpoint();
-        let client = WireClient {
-            endpoint: &endpoint,
-            access_key: server.access_key(),
-            secret_key: server.secret_key(),
-        };
-        let long_key = "k".repeat(1025);
-        let sha512 = base64_simd::STANDARD.encode_to_string(sha2::Sha512::digest(b"hello"));
-        for bucket in ["dn-native-wire", "sthree-dn-native-wire", "dn-native-wire-s3alias"] {
-            super::create_bucket_in_the_store(bucket).await;
-            for (key, extra, expected) in [
-                ("bad%00key", vec![], "InvalidArgument"),
-                (long_key.as_str(), vec![], "KeyTooLongError"),
-                ("bad%00key", vec![("x-amz-storage-class", "INVALID")], "InvalidStorageClass"),
-                ("bad-checksum", vec![("x-amz-checksum-crc32", "AAAA")], "BadDigest"),
-            ] {
-                let answer = client
-                    .request("PUT", &format!("/{bucket}/{key}"), b"hello", &extra, Some(5))
-                    .await;
-                assert_eq!(answer.status, 400, "{expected}");
-                assert!(answer.body.contains(&format!("<Code>{expected}</Code>")), "expected {expected}");
-            }
-            for extra in [
-                vec![],
-                vec![("x-amz-checksum-crc32", "NhCmhg==")],
-                vec![
-                    ("x-amz-checksum-crc32", "NhCmhg=="),
-                    ("x-amz-checksum-sha256", "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="),
-                ],
-                vec![("x-amz-checksum-sha512", sha512.as_str())],
-            ] {
-                let answer = client
-                    .request("PUT", &format!("/{bucket}/object"), b"hello", &extra, Some(5))
-                    .await;
-                assert_eq!(answer.status, 200);
-                assert_eq!(
-                    answer.headers.get("etag").map(String::as_str),
-                    Some("\"5d41402abc4b2a76b9719d911017c592\"")
-                );
-                for (name, value) in extra {
-                    assert_eq!(answer.headers.get(name).map(String::as_str), Some(value));
-                }
-            }
-            let answer = client
-                .request(
-                    "PUT",
-                    &format!("/{bucket}/trailers"),
-                    b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n",
-                    &[
-                        ("content-encoding", "aws-chunked"),
-                        ("x-amz-decoded-content-length", "5"),
-                        ("x-amz-trailer", "x-amz-checksum-crc32"),
-                        ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
-                    ],
-                    None,
-                )
-                .await;
-            assert_eq!(answer.status, 200);
-            assert_eq!(answer.headers.get("x-amz-checksum-crc32").map(String::as_str), Some("NhCmhg=="));
-            let answer = client.request("PUT", &format!("/{bucket}/short"), b"abc", &[], Some(5)).await;
-            assert_eq!(answer.status, 400);
-            assert!(answer.body.contains("<Code>IncompleteBody</Code>"));
-            assert_eq!(
-                client
-                    .request("HEAD", &format!("/{bucket}/short"), b"", &[], Some(0))
-                    .await
-                    .status,
-                404
-            );
-        }
-        server.shutdown().await;
-    });
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_owned_post_keeps_implicit_status_and_redirect_selection() {
-    super::with_stack(super::LEGACY, |server| async move {
-        let endpoint = server.endpoint();
-        let client = WireClient {
-            endpoint: &endpoint,
-            access_key: server.access_key(),
-            secret_key: server.secret_key(),
-        };
-        for bucket in ["dn-native-post", "sthree-dn-native-post", "dn-native-post-s3alias"] {
-            super::create_bucket_in_the_store(bucket).await;
-            for (status, expected) in [("200", 200), ("201", 201), ("204", 204)] {
-                assert_eq!(client.post(bucket, Some(status), None).await.status, expected);
-            }
-            let answer = client.post(bucket, None, Some("https://example.invalid/after")).await;
-            assert_eq!(answer.status, 303);
-            assert_eq!(
-                answer.headers.get("location"),
-                Some(&format!(
-                    "https://example.invalid/after?bucket={bucket}&key=post-object&etag=5d41402abc4b2a76b9719d911017c592"
-                ))
-            );
-        }
-        server.shutdown().await;
-    });
 }
 
 #[test]
@@ -687,12 +574,6 @@ async fn destination_version_queries(server: super::RustFSServer) {
         .await;
     assert_eq!(answer.status, 200, "{}", answer.body);
     server.shutdown().await;
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_put_destination_version_query_answers() {
-    super::with_stack(super::LEGACY, destination_version_queries);
 }
 
 #[test]

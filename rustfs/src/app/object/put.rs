@@ -4384,7 +4384,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "gateway-stack")]
     async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
         for direct_extract in [false, true] {
             let (body, polls) = PollCountingBody::streaming_blob();

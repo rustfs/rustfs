@@ -485,3 +485,29 @@ async fn a_presented_credential_on_an_anonymous_class_is_never_served_as_anonymo
         }
     }
 }
+
+/// GHSA-xm99-m3gq-83g8 on the control-plane host: a signed request replayed with an `x-amz-*`
+/// header its signature does not name is refused before any handler, and the same request without
+/// the header is served (the control, which proves the refusal is the header's).
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unsigned_amz_header_is_refused_before_any_control_plane_handler() {
+    for (path, query) in [("/rustfs/admin/v3/probe", ""), ("/missing-bucket", "replication-metrics=")] {
+        let ((status, body), seen) = served(signed(Method::GET, path, query)).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "probe"), "control {path}?{query}");
+        assert_eq!(seen.len(), 1, "the control reached the handler: {path}?{query}");
+
+        for (name, value) in [
+            ("x-amz-copy-source", "/private-bucket/source"),
+            ("x-amz-meta-user", "mallory"),
+        ] {
+            let mut request = signed(Method::GET, path, query);
+            request.headers_mut().insert(name, http::HeaderValue::from_static(value));
+            let ((status, body), seen) = served(request).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name} {path}?{query}: {body}");
+            assert!(body.contains("<Code>AccessDenied</Code>"), "{name} {path}?{query}: {body}");
+            assert!(body.contains("not signed"), "{name} {path}?{query}: {body}");
+            assert!(seen.is_empty(), "{name} {path}?{query} reached a handler: {seen:?}");
+        }
+    }
+}

@@ -27,7 +27,6 @@ pub mod bucket_usecase;
 pub mod context;
 pub(crate) mod dto_values;
 pub(crate) mod metadata_listing;
-pub(crate) mod metadata_route;
 pub mod multipart_usecase;
 pub mod object;
 pub(crate) mod object_data_cache;

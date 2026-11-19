@@ -132,11 +132,6 @@ fn list_objects_v2_input(bucket: String, uri: &Uri, headers: &HeaderMap) -> S3Re
     })
 }
 
-/// Whether the query names `key`.
-pub(crate) fn query_has(query: &str, key: &str) -> bool {
-    form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == key)
-}
-
 /// The first value the query gives `key`.
 pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
     form_urlencoded::parse(query.as_bytes())

@@ -88,21 +88,14 @@ fn operation_counts() -> std::collections::BTreeMap<&'static str, u64> {
 
 #[test]
 #[serial_test::serial]
-fn get_boundary_legacy() {
-    get_boundary(None);
-}
-
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
 fn get_boundary_gateway() {
-    get_boundary(Some("gateway"));
+    get_boundary(None);
 }
 
 fn get_boundary(stack: Option<&str>) {
     temp_env::with_vars(
         [
-            ("RUSTFS_S3_STACK", stack),
+            (crate::config::RETIRED_S3_STACK_SELECTOR, stack),
             ("RUSTFS_AUDIT_ENABLE", Some("true")),
             ("RUSTFS_SSE_C_REQUIRE_TLS", Some("false")),
         ],

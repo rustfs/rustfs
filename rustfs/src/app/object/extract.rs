@@ -2018,7 +2018,6 @@ impl DefaultObjectUsecase {
         if envelope.post_object().is_some() && !envelope.is_gateway_post() {
             return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
         }
-        #[cfg(feature = "gateway-stack")]
         let input = if envelope.is_gateway_post() {
             let mut input = input;
             let archive = input
@@ -2045,10 +2044,6 @@ impl DefaultObjectUsecase {
             }
             input
         };
-        #[cfg(not(feature = "gateway-stack"))]
-        if envelope.is_gateway_post() {
-            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
-        }
         Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 
@@ -2831,7 +2826,6 @@ impl DefaultObjectUsecase {
     }
 }
 
-#[cfg(feature = "gateway-stack")]
 #[path = "extract/post_archive_preflight.rs"]
 pub(super) mod post_archive_preflight;
 

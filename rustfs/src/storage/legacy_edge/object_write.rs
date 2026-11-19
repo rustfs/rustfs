@@ -61,7 +61,6 @@ impl PutObjectWriteInput {
             bucket: input.bucket,
             key: input.key,
             body: input.body.map(s3_api::legacy_put_body),
-            #[cfg(feature = "gateway-stack")]
             post_archive: None,
             frame_trailers: None,
             trailing_headers: crate::app::trailer_adapter::trailer_source(trailing_headers),

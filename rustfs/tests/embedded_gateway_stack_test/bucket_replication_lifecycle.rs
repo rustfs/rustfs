@@ -20,7 +20,7 @@
 
 use super::bucket_configs::StatusCapture;
 use super::{
-    GATEWAY, LEGACY, MatrixRow, Outcome, Refusal, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket,
+    GATEWAY, MatrixRow, Outcome, Refusal, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket,
     outcome, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -352,11 +352,6 @@ fn the_gateway_stack_answers_the_configuration_reads_as_stored() {
     with_stack(GATEWAY, the_configuration_reads_answer_what_is_stored);
 }
 
-#[test]
-fn the_legacy_stack_answers_the_configuration_reads_as_stored() {
-    with_stack(LEGACY, the_configuration_reads_answer_what_is_stored);
-}
-
 /// The ordinary and the reserved-shaped bucket the mutations write to.
 const MUTATED_BUCKETS: [&str; 2] = ["a3-mutated", "sthree-a3-mutated"];
 /// A bucket the writer below is allowed on, so its refusals elsewhere are about the resource.
@@ -515,11 +510,6 @@ async fn lifecycle_put_preserves_responses_and_storage(server: RustFSServer) {
 }
 
 #[test]
-fn legacy_lifecycle_put_preserves_responses_and_storage() {
-    with_stack(LEGACY, lifecycle_put_preserves_responses_and_storage);
-}
-
-#[test]
 fn gateway_lifecycle_put_preserves_responses_and_storage() {
     with_stack(GATEWAY, lifecycle_put_preserves_responses_and_storage);
 }
@@ -632,11 +622,6 @@ async fn lifecycle_delete_preserves_responses_and_storage(server: RustFSServer) 
 }
 
 #[test]
-fn legacy_lifecycle_delete_preserves_responses_and_storage() {
-    with_stack(LEGACY, lifecycle_delete_preserves_responses_and_storage);
-}
-
-#[test]
 fn gateway_lifecycle_delete_preserves_responses_and_storage() {
     with_stack(GATEWAY, lifecycle_delete_preserves_responses_and_storage);
 }
@@ -644,11 +629,6 @@ fn gateway_lifecycle_delete_preserves_responses_and_storage() {
 #[test]
 fn gateway_lifecycle_put_authorization_uses_action_and_bucket() {
     with_stack(GATEWAY, lifecycle_put_authorization_uses_action_and_bucket);
-}
-
-#[test]
-fn legacy_lifecycle_put_authorization_uses_action_and_bucket() {
-    with_stack(LEGACY, lifecycle_put_authorization_uses_action_and_bucket);
 }
 
 #[test]
@@ -916,11 +896,6 @@ fn owned_replication_gateway_writes_and_removes_the_config_and_targets() {
     with_stack(GATEWAY, owned_replication_wire_and_disk);
 }
 
-#[test]
-fn owned_replication_legacy_writes_and_removes_the_config_and_targets() {
-    with_stack(LEGACY, owned_replication_wire_and_disk);
-}
-
 const LOCK_UPDATE: &str = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Years>2</Years></DefaultRetention></Rule></ObjectLockConfiguration>";
 const LOCK_ENABLED_VERSIONING: &[u8] = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
 const LOCK_SUSPENDED_VERSIONING: &[u8] = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
@@ -1049,11 +1024,6 @@ async fn put_lock_preserves_responses_and_storage(server: RustFSServer, native: 
         assert!(rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket) > scanner_before);
     }
     server.shutdown().await;
-}
-
-#[test]
-fn legacy_put_object_lock_preserves_responses_and_storage() {
-    with_stack(LEGACY, |server| put_lock_preserves_responses_and_storage(server, false));
 }
 
 #[test]
