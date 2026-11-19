@@ -14,8 +14,6 @@
 
 use std::sync::Arc;
 
-pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
-
 use rustfs_ecstore::api::config::com::{
     read_existing_server_config_no_lock as read_existing_notify_config_from_backend_no_lock,
     read_server_config_snapshot as read_notify_server_config_snapshot_from_backend,
@@ -71,4 +69,11 @@ pub(crate) mod crate_boundary {
         read_existing_notify_server_config_no_lock, read_notify_server_config_snapshot, resolve_notify_object_store_handle,
         save_notify_server_config_snapshot, with_notify_server_config_read_lock,
     };
+}
+
+pub(crate) mod bucket_metadata {
+    pub(crate) use super::NotifyStore;
+    pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::bucket::utils::deserialize as deserialize_bucket_config;
 }
