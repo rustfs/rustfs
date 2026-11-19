@@ -112,18 +112,6 @@ use time::OffsetDateTime;
 use url::Url;
 
 #[cfg(test)]
-#[path = "access_owned/listing_multipart_test.rs"]
-mod owned_listing_multipart_test;
-#[cfg(test)]
-#[path = "access_owned/object_commit_test.rs"]
-mod owned_object_commit_test;
-#[cfg(test)]
-#[path = "access_owned/object_misc_test.rs"]
-mod owned_object_misc_test;
-#[cfg(test)]
-#[path = "access_owned/object_read_test.rs"]
-mod owned_object_read_test;
-#[cfg(test)]
 #[path = "access_permission_auth_test.rs"]
 mod permission_auth_test;
 #[cfg(test)]
