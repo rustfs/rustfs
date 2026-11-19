@@ -227,3 +227,6 @@ mod tests {
         assert_eq!(unguarded.validated_bucket_incarnation_for(store_a.id, bucket, None), None);
     }
 }
+
+#[cfg(test)]
+pub(crate) use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support};

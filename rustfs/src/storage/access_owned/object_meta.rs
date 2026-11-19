@@ -43,16 +43,67 @@ pub(crate) async fn authorize_object_tagging_request<R: AuthorizationRequest + ?
     authorize_object_request(req, bucket, key, version_id, versioned_tagging_action(action, version_id)).await
 }
 
+async fn authorize_metadata_mutation<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    server: &ServerContextSlot,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    action: Action,
+) -> S3Result<()> {
+    let generation = load_bucket_generation(server, req, bucket).await;
+    authorize_object_request(req, bucket, key, version_id, action).await?;
+    req.install_bucket_generation(generation?);
+    Ok(())
+}
+
+pub(crate) async fn authorize_put_object_acl<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    server: &ServerContextSlot,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<()> {
+    authorize_metadata_mutation(req, server, bucket, key, version_id, Action::S3Action(S3Action::PutObjectAclAction)).await
+}
+
+pub(crate) async fn authorize_delete_object_tagging<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    server: &ServerContextSlot,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<()> {
+    authorize_metadata_mutation(
+        req,
+        server,
+        bucket,
+        key,
+        version_id,
+        versioned_tagging_action(S3Action::DeleteObjectTaggingAction, version_id),
+    )
+    .await
+}
+
 /// Authorize the version and tag conditions using the original query and XML tag set.
 pub(crate) async fn authorize_put_object_tagging<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
+    server: &ServerContextSlot,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
     tags: RequestedObjectTags,
 ) -> S3Result<()> {
     req.install_requested_object_tags(tags);
-    authorize_object_tagging_request(req, bucket, key, version_id, S3Action::PutObjectTaggingAction).await
+    authorize_metadata_mutation(
+        req,
+        server,
+        bucket,
+        key,
+        version_id,
+        versioned_tagging_action(S3Action::PutObjectTaggingAction, version_id),
+    )
+    .await
 }
 
 /// Authorize the hold from the decoded XML for the exact version the request names.

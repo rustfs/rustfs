@@ -98,9 +98,10 @@ impl ObjectMetaUsecase {
     ) -> S3Result<PutObjectAclOutput> {
         let mut helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let store = self.store_outside_veeam_sosapi(bucket, key).await?;
-        let opts = get_opts(bucket, key, version_id.clone(), None, envelope.headers())
+        let mut opts = get_opts(bucket, key, version_id.clone(), None, envelope.headers())
             .await
             .map_err(ApiError::from)?;
+        crate::app::storage_api::object_usecase::access::apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
         let object_info = store.get_object_info(bucket, key, &opts).await.map_err(ApiError::from)?;
 
         if has_policy {

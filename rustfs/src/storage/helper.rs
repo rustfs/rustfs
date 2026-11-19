@@ -559,6 +559,15 @@ impl OperationHelper {
         }
     }
 
+    pub(crate) fn with_bucket_incarnation_id(mut self, incarnation: Option<uuid::Uuid>) -> Self {
+        if let Self::Enabled(helper) = &mut self
+            && let Some(builder) = helper.event_builder.take()
+        {
+            helper.event_builder = Some(builder.bucket_incarnation_id(incarnation));
+        }
+        self
+    }
+
     pub(crate) fn with_bucket_removed_targets(mut self, targets: rustfs_notify::rules::TargetIdSet) -> Self {
         if let Self::Enabled(state) = &mut self {
             state.event_builder = state

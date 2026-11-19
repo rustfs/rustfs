@@ -178,12 +178,7 @@ pub(crate) fn publish_bucket_notification_configuration(bucket: &str, stored: Op
         }
         return;
     };
-    let parsed = (|| {
-        let config = deserialize::<rustfs_gateway_types::persistence::PersistedNotificationConfiguration>(bytes)
-            .map_err(|_| "invalid_xml")?;
-        let config = notification_config_to_s3s(&config).map_err(|_| "invalid_configuration")?;
-        notification_config_to_event_rules(&config).map_err(|_| "invalid_target_arn")
-    })();
+    let parsed = stored_notification_rules(bytes);
     match parsed {
         Ok(rules) => {
             let config = rustfs_notify::notifier_global::bucket_notification_config_for_rules(&notification_region(), &rules);
@@ -201,6 +196,25 @@ pub(crate) fn publish_bucket_notification_configuration(bucket: &str, stored: Op
             );
         }
     }
+}
+
+fn stored_notification_rules(bytes: &[u8]) -> Result<Vec<NotificationEventRule>, &'static str> {
+    let config =
+        deserialize::<rustfs_gateway_types::persistence::PersistedNotificationConfiguration>(bytes).map_err(|_| "invalid_xml")?;
+    let config = notification_config_to_s3s(&config).map_err(|_| "invalid_configuration")?;
+    notification_config_to_event_rules(&config).map_err(|_| "invalid_target_arn")
+}
+
+/// Compiles removal targets from metadata captured by the fenced storage delete.
+pub(crate) fn deleted_bucket_notification_targets(bytes: &[u8]) -> rustfs_notify::rules::TargetIdSet {
+    stored_notification_rules(bytes)
+        .ok()
+        .map(|rules| {
+            rustfs_notify::notifier_global::bucket_notification_config_for_rules(&notification_region(), &rules)
+                .get_rules_map()
+                .match_rules(rustfs_s3_types::EventName::BucketRemoved, "")
+        })
+        .unwrap_or_default()
 }
 
 fn notification_region() -> String {

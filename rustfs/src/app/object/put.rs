@@ -2406,7 +2406,7 @@ impl DefaultObjectUsecase {
 
                 let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let transition_enqueue_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject, opts.expected_bucket_incarnation_id).await;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_post_store_transition_enqueue",
                     transition_enqueue_stage_start,

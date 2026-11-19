@@ -197,6 +197,9 @@ pub(crate) mod access_consumer {
 pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::parity_test_support;
     pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
+    pub(crate) use super::super::access_owned::object_meta::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
+    };
     pub(crate) use super::super::authorization::ObjectTagConditions;
     pub(crate) use super::super::authorization::TableDataPlanePublicationGuards;
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;

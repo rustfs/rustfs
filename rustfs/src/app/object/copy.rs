@@ -825,7 +825,7 @@ impl DefaultObjectUsecase {
                         .await;
                 }
 
-                maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+                maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject, dst_opts.expected_bucket_incarnation_id).await;
                 let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
 
                 let dest_versioned = dst_opts.versioned;

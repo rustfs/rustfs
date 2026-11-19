@@ -559,7 +559,12 @@ impl DefaultMultipartUsecase {
                         }
                     }
 
-                    enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+                    enqueue_transition_immediate(
+                        &obj_info,
+                        LcEventSrc::S3CompleteMultipartUpload,
+                        opts.expected_bucket_incarnation_id,
+                    )
+                    .await;
 
                     if let Some(decision) = completion_replication_decision
                         && decision.replicate_any()

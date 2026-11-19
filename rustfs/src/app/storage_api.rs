@@ -878,9 +878,12 @@ pub(crate) mod bucket {
             pub(crate) async fn enqueue_transition_immediate(
                 oi: &crate::storage::storage_api::StorageObjectInfo,
                 src: LcEventSrc,
+                incarnation: Option<uuid::Uuid>,
             ) {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_immediate(
-                    oi, src,
+                    oi,
+                    src,
+                    incarnation,
                 )
                 .await;
             }
@@ -1769,9 +1772,9 @@ pub(crate) mod admin_usecase {
 pub(crate) mod bucket_usecase {
     pub(crate) mod contract {
         pub(crate) mod bucket {
-            pub(crate) use super::super::super::storage_contracts::{
-                BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-            };
+            #[cfg(test)]
+            pub(crate) use super::super::super::storage_contracts::DeleteBucketOptions;
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions, MakeBucketOptions};
         }
 
         pub(crate) mod list {
@@ -1949,6 +1952,9 @@ pub(crate) mod owned_parity {
         authorize_bucket_config_mutation, authorize_create_bucket, authorize_delete_bucket, authorize_object_request,
         authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
         authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
+    };
+    pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
     };
 }
 

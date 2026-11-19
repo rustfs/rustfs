@@ -1026,3 +1026,108 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     handle.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn test_webhook_metadata_mutations_keep_verified_bucket_identity() -> TestResult {
+    init_logging();
+    let (endpoint, mut rx, collector) = spawn_event_collector().await?;
+    let allowed_origin = endpoint_origin(&endpoint)?;
+    let stack = std::env::var("RUSTFS_S3_STACK").unwrap_or_else(|_| "legacy".to_string());
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            (ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str()),
+            ("RUSTFS_S3_STACK", stack.as_str()),
+        ],
+    )
+    .await?;
+    enable_notify_module(&env).await?;
+    let target = "metadata-events";
+    configure_webhook_target(&env, target, &endpoint).await?;
+    wait_for_target_registered(&env, target).await?;
+    let client = env.create_s3_client();
+    let bucket = "metadata-event-identity";
+    let key = "object";
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"metadata"))
+        .send()
+        .await?;
+    let queue = QueueConfiguration::builder()
+        .id("metadata-events")
+        .queue_arn(target_arn(target))
+        .events(Event::from("s3:ObjectTagging:*"))
+        .events(Event::from("s3:ObjectAcl:Put"))
+        .events(Event::from("s3:BucketRemoved:*"))
+        .build()?;
+    client
+        .put_bucket_notification_configuration()
+        .bucket(bucket)
+        .notification_configuration(NotificationConfiguration::builder().queue_configurations(queue).build())
+        .send()
+        .await?;
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(aws_sdk_s3::types::Tag::builder().key("kind").value("test").build()?)
+        .build()?;
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .tagging(tagging)
+        .send()
+        .await?;
+    assert_eq!(
+        client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?
+            .tag_set()
+            .len(),
+        1
+    );
+    wait_for_event(&mut rx, key, "s3:ObjectTagging:Put", Duration::from_secs(20)).await?;
+    client.delete_object_tagging().bucket(bucket).key(key).send().await?;
+    assert!(
+        client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?
+            .tag_set()
+            .is_empty()
+    );
+    wait_for_event(&mut rx, key, "s3:ObjectTagging:Delete", Duration::from_secs(20)).await?;
+    client
+        .put_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::Private)
+        .send()
+        .await?;
+    wait_for_event(&mut rx, key, "s3:ObjectAcl:Put", Duration::from_secs(20)).await?;
+    client.delete_object().bucket(bucket).key(key).send().await?;
+    client.delete_bucket().bucket(bucket).send().await?;
+    let removed = timeout(Duration::from_secs(20), async {
+        loop {
+            let event = rx.recv().await.expect("bucket-event collector remains open");
+            if event["EventName"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("s3:BucketRemoved:"))
+            {
+                break event;
+            }
+        }
+    })
+    .await?;
+    assert_eq!(removed["Records"][0]["s3"]["bucket"]["name"].as_str(), Some(bucket));
+    env.stop_server();
+    collector.abort();
+    Ok(())
+}

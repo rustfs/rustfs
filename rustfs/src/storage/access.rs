@@ -705,15 +705,9 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_object_tagging(&self, req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
         let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
-        access_owned::object_meta::authorize_object_tagging_request(
-            req,
-            &bucket,
-            &key,
-            version_id.as_deref(),
-            S3Action::DeleteObjectTaggingAction,
-        )
-        .await
-        .map_err(Into::into)
+        access_owned::object_meta::authorize_delete_object_tagging(req, self.server_ctx(), &bucket, &key, version_id.as_deref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -1394,7 +1388,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_object_acl(&self, req: &mut S3Request<PutObjectAclInput>) -> S3Result<()> {
         let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
-        authorize_object_request(req, &bucket, &key, version_id.as_deref(), Action::S3Action(S3Action::PutObjectAclAction))
+        access_owned::object_meta::authorize_put_object_acl(req, self.server_ctx(), &bucket, &key, version_id.as_deref())
             .await
             .map_err(Into::into)
     }
@@ -1465,9 +1459,16 @@ impl S3Access for FS {
         let input = &req.input;
         let tags = RequestedObjectTags::from(&input.tagging);
         let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
-        access_owned::object_meta::authorize_put_object_tagging(req, &bucket, &key, version_id.as_deref(), tags)
-            .await
-            .map_err(Into::into)
+        access_owned::object_meta::authorize_put_object_tagging(
+            req,
+            self.server_ctx(),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            tags,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.

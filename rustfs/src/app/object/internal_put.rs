@@ -750,7 +750,12 @@ impl DefaultObjectUsecase {
                     }
                 }
 
-                enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+                enqueue_transition_immediate(
+                    &obj_info,
+                    LcEventSrc::S3CompleteMultipartUpload,
+                    opts.expected_bucket_incarnation_id,
+                )
+                .await;
 
                 if completion_replication_decision.replicate_any() {
                     schedule_object_replication(
