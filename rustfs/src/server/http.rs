@@ -4486,6 +4486,8 @@ mod tests {
 
         #[path = "control_plane_tests.rs"]
         mod control_plane_tests;
+        #[path = "metadata_route_parity_tests.rs"]
+        mod metadata_route_parity_tests;
 
         struct UnusedS3;
         #[async_trait::async_trait]
