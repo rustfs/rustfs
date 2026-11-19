@@ -73,7 +73,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput, PutObjectOutput};
+    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     pub(crate) use s3s::header;
@@ -1951,7 +1951,6 @@ pub(crate) mod context {
 #[cfg(test)]
 pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
-    pub(crate) use s3s::access::S3Access;
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{
