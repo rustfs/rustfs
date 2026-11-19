@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use rustfs_ecstore::api::disk::HEALING_MARKER_PATH;
 
 const LEADER_EPOCH: u64 = 11;
 
@@ -97,6 +98,60 @@ fn collector_events(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
         .filter(|event| event["fields"]["state"] == "incomplete_cycle_collector_summary")
         .map(|event| &event["fields"])
         .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn single_drive_cycle_publishes_usage_with_a_leftover_healing_marker() {
+    let (temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    let bucket = "marked-drive-bucket";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("fixture bucket should be created");
+    let mut reader = ScannerPutObjReader::from_vec(vec![7; 16]);
+    store
+        .put_object(bucket, "object", &mut reader, &ScannerObjectOptions::default())
+        .await
+        .expect("fixture object should persist");
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+
+    let marker = temp_dir
+        .path()
+        .join("pool0-disk0")
+        .join(RUSTFS_META_BUCKET)
+        .join(HEALING_MARKER_PATH);
+    tokio::fs::write(&marker, b"leftover marker")
+        .await
+        .expect("fixture healing marker should persist");
+    let set = &store.pools[0].disk_set[0];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !set.get_online_disks_with_healing(false).await.1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("disk info should observe the marker after its cache expires");
+
+    let cycle = 1;
+    let (result, snapshot, budget_elapsed) = run_cycle(&store, cycle, None, true).await;
+    assert!(!budget_elapsed);
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    let snapshot = snapshot.expect("cycle should publish usage");
+    assert!(snapshot.usage_snapshot_complete);
+    assert!(snapshot.last_update.is_some());
+    assert_eq!(snapshot.buckets_usage[bucket].objects_count, 1);
+
+    let mut persisted = DataUsageCache::default();
+    persisted
+        .load_with_revisions(Arc::clone(set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("complete set snapshot should persist");
+    assert!(persisted.info.snapshot_complete);
+    assert_eq!(persisted.info.next_cycle, cycle);
+    assert!(marker.exists(), "scanner must not remove heal markers");
+    clear_dirty_usage_buckets_for_tests();
 }
 
 #[tokio::test]

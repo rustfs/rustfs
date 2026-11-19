@@ -620,7 +620,9 @@ impl ScannerIOCache for SetDisks {
             .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
         }
 
-        let (disks, healing) = self.get_online_disks_with_healing(false).await;
+        // A single-drive set has no alternate scan source. A heal marker
+        // still disables scanner heals, but must not exclude its only usage walk.
+        let (disks, healing) = self.get_online_disks_with_healing(self.set_drive_count == 1).await;
         #[cfg(test)]
         let disks = super::tests::usage_remote_drain::walker_disks(&self, &buckets, disks);
         if disks.is_empty() {
