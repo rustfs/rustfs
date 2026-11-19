@@ -17,7 +17,7 @@
 //! The interface resolves owner privileges and the site contract. The bucket
 //! use case receives those facts without consulting site membership itself.
 
-use crate::storage::access::{AuthorizationRequest, req_info_ref};
+use crate::storage::authorization::{AuthorizationRequest, req_info_ref};
 use crate::storage::storage_api::ecstore_bucket::replication::OperatorRuleContract;
 use http::StatusCode;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};

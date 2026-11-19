@@ -17380,7 +17380,16 @@ mod metadata_mutation_generation_tests {
                 version_id: old.version_id.map(|id| id.to_string()),
                 versioned: true,
                 mod_time: Some(old_time),
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
                 ..Default::default()
+            };
+            let dst_opts = ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..opts.clone()
             };
             let mut source = set.get_object_info(bucket, object, &opts).await.expect("read old metadata");
             assert_eq!(source.user_tags.as_str(), tags);
@@ -17390,7 +17399,7 @@ mod metadata_mutation_generation_tests {
             source.metadata_only = true;
             Arc::make_mut(&mut source.user_defined)
                 .insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"true\"".to_string());
-            set.copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            set.copy_object(bucket, object, bucket, object, &mut source, &opts, &dst_opts)
                 .await
                 .expect("restore metadata update");
             let restored = set

@@ -24,12 +24,12 @@ mod tests {
             "file__XLDIR__/",
             "a__XLDIR__b",
         ] {
-            let error = crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+            let error = crate::storage::s3_support::validate_object_key(key, "PUT")
                 .expect_err("client keys must not alias internal directory markers");
             assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument, "{key}");
         }
         for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
-            crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+            crate::storage::s3_support::validate_object_key(key, "PUT")
                 .expect("ordinary objects and directory objects remain valid");
         }
     }
@@ -37,9 +37,10 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
-    use crate::storage::ecfs::{FS, parse_object_version_id};
-    use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
+    use crate::storage::ecfs::FS;
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+    use crate::storage::s3_support::parse_object_version_id;
+    use crate::storage::s3_support::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,

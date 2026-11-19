@@ -32,14 +32,14 @@
 //! | --- | --- |
 //! | `BodylessStatusFixLayer` | the gateway response invariants (row 1) |
 //! | `HeadRequestBodyFixLayer` | the same invariants on the refusal path (row 2) |
-//! | `DoubleSlashListBucketsCompatLayer` | the route table: `//` and `/` both name `ListBuckets` (row 3) |
-//! | `VirtualHostStyleHintLayer` | `HostResolver`'s diagnostic (row 4) |
-//! | `EmptyBodyContentLengthCompatLayer` | `StageFilter::on_wire` (row 5) |
-//! | `S3ErrorMessageCompatLayer` | the dialect error-render policy, `StageFilter::on_response` as the escape hatch (row 6) |
-//! | `ObjectAttributesEtagFixLayer` | the quirk table (`q-mpu-attributes-etag-0036`), `OpLayer<GetObjectAttributes>` to override (row 7) |
+//! | `EmptyBodyContentLengthCompatLayer` | its S3 half by `StageFilter::on_wire` (row 5); its admin, console and internode halves stay |
 //! | `StsQueryApiCompatLayer` | STS extension operations behind a `QueryPresent` route predicate (row 8) |
 //! | `IcebergRestErrorCompatLayer` | the `rustfs` dialect's claimed table-catalog surface (gateway ADR-0031) |
-//! | `SigV4HeaderGuardLayer` | `rustfs-gateway-sig` signed-header enforcement (`SignedHeaderSet::parse_and_enforce`) |
+//!
+//! The layers the gateway stack replaces outright are gone: `DoubleSlashListBucketsCompatLayer`,
+//! `VirtualHostStyleHintLayer`, `S3ErrorMessageCompatLayer`, `ObjectAttributesEtagFixLayer` and
+//! `SigV4HeaderGuardLayer`. `server::gateway_stack::tests::legacy_layers` pins what each of them
+//! made the legacy stack answer against the gateway stack alone.
 //!
 //! `ConditionalCorsLayer` (row 9) is outside the list rustfs/backlog#2787
 //! moves and stays in `server/layer.rs`.
@@ -49,31 +49,19 @@
 //! fixed-response fixture shared by the response-rewriting layers' tests.
 
 mod bodyless_status_fix;
-mod double_slash_list_buckets_compat;
 mod empty_body_content_length_compat;
 mod head_request_body_fix;
 mod iceberg_rest_error_compat;
-mod object_attributes_etag_fix;
-mod s3_error_message_compat;
-mod sigv4_header_guard;
 mod sts_query_api_compat;
-mod virtual_host_style_hint;
 
 pub(crate) use bodyless_status_fix::BodylessStatusFixLayer;
-pub(crate) use double_slash_list_buckets_compat::DoubleSlashListBucketsCompatLayer;
 pub(crate) use empty_body_content_length_compat::EmptyBodyContentLengthCompatLayer;
 pub(crate) use head_request_body_fix::HeadRequestBodyFixLayer;
 pub(crate) use iceberg_rest_error_compat::IcebergRestErrorCompatLayer;
-pub(crate) use object_attributes_etag_fix::ObjectAttributesEtagFixLayer;
-pub(crate) use s3_error_message_compat::S3ErrorMessageCompatLayer;
-pub(crate) use sigv4_header_guard::SigV4HeaderGuardLayer;
 pub(crate) use sts_query_api_compat::{StsQueryApiCompatLayer, StsQueryRequest};
-pub(crate) use virtual_host_style_hint::VirtualHostStyleHintLayer;
 
 #[cfg(test)]
 pub(super) use empty_body_content_length_compat::is_empty_body_console_path;
-#[cfg(test)]
-pub(super) use object_attributes_etag_fix::is_object_attributes_request;
 
 use http::HeaderMap;
 use http_body::Body;

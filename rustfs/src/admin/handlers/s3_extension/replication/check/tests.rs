@@ -210,6 +210,21 @@ fn filter_replication_check_targets_only_keeps_configured_replication_targets() 
 }
 
 #[test]
+fn replication_check_rejects_ambiguous_target_before_probing() {
+    let target = BucketTarget {
+        arn: "arn:shared".to_string(),
+        target_type: BucketTargetType::ReplicationService,
+        ..Default::default()
+    };
+    let targets = BucketTargets {
+        targets: vec![target.clone(), target],
+    };
+    let err = validate_replication_check_config_targets(&targets, &PersistedReplicationConfiguration::default())
+        .expect_err("a repeated ARN must not select probe credentials");
+    assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+}
+
+#[test]
 fn validate_replication_check_config_targets_rejects_stale_enabled_rule_target() {
     let targets = BucketTargets {
         targets: vec![BucketTarget {

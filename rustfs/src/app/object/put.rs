@@ -1266,6 +1266,11 @@ impl DefaultObjectUsecase {
         }
     }
 
+    #[hotpath::measure(
+        impl_type = "DefaultObjectUsecase",
+        future = true,
+        label = "rustfs::app::object::put::DefaultObjectUsecase::execute_put_object"
+    )]
     pub(crate) async fn execute_put_object_owned(
         &self,
         envelope: RequestEnvelope,
@@ -4379,7 +4384,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "gateway-stack")]
     async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
         for direct_extract in [false, true] {
             let (body, polls) = PollCountingBody::streaming_blob();

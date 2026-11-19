@@ -359,17 +359,21 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
     use time::OffsetDateTime;
 
-    /// A `Store` whose methods are never invoked by these tests: the gate only
-    /// reaches the persistence layer for non-owner principals, and the
-    /// `IamCache` we build starts with an empty in-memory snapshot, so
-    /// `get_user` resolves to `None` (unknown user) before any `api` call.
-    #[derive(Clone)]
-    struct EmptyStore;
+    /// An in-memory test store with the small authoritative revision surface
+    /// needed by derived-session authorization. All other persistence methods
+    /// remain unreachable in these gate tests.
+    #[derive(Clone, Default)]
+    struct EmptyStore {
+        regular_users: Arc<std::sync::RwLock<HashMap<String, (UserIdentity, String)>>>,
+    }
 
     #[async_trait::async_trait]
     impl Store for EmptyStore {
         fn has_watcher(&self) -> bool {
             false
+        }
+        async fn regular_user_revision(&self, name: &str) -> rustfs_iam::error::Result<Option<(UserIdentity, String)>> {
+            Ok(self.regular_users.read().expect("test store lock").get(name).cloned())
         }
         async fn save_iam_config<Item: Serialize + Send>(
             &self,
@@ -496,7 +500,7 @@ mod tests {
         let (send_chan, _rx) = tokio::sync::mpsc::channel::<i64>(1);
         IamCache {
             cache: Cache::default(),
-            api: EmptyStore,
+            api: EmptyStore::default(),
             state: Arc::new(AtomicU8::new(0)),
             loading: Arc::new(AtomicBool::new(false)),
             roles: HashMap::new(),
@@ -868,6 +872,12 @@ mod tests {
         store
             .cache
             .add_or_update_user(&user.access_key, &UserIdentity::new(user.clone()), now);
+        store
+            .api
+            .regular_users
+            .write()
+            .expect("test store lock")
+            .insert(user.access_key.clone(), (UserIdentity::new(user.clone()), "self-service".into()));
         store
             .cache
             .add_or_update_user_policy(&user.access_key, &MappedPolicy::new(""), now);

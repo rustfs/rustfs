@@ -25,7 +25,6 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) bucket: String,
     pub(crate) key: String,
     pub(crate) body: Option<Body>,
-    #[cfg(feature = "gateway-stack")]
     pub(crate) post_archive: Option<super::post_body::PreflightedPostArchive>,
     pub(crate) frame_trailers: Option<std::sync::Arc<super::native_body::FrameTrailers>>,
     pub(crate) trailing_headers: Option<SharedTrailerSource>,
@@ -83,7 +82,6 @@ pub(crate) struct PutObjectWriteOutput {
 
 impl PutObjectWriteInput {
     /// Gateway frames publish to the same source that checksum readers observe.
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn capture_frame_trailers(&mut self) {
         let trailers = std::sync::Arc::new(super::native_body::FrameTrailers::default());
         self.frame_trailers = Some(trailers.clone());

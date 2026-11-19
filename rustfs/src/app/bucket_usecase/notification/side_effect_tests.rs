@@ -457,3 +457,130 @@ fn legacy_put_notification_does_not_write_after_the_bucket_is_recreated() {
         );
     });
 }
+
+#[test]
+fn notification_dispatch_follows_peer_reload_delete_and_recreation() {
+    run_large_stack_test("notification-metadata-authority", || async {
+        let ambient = shared_gating_ambient().await;
+        let store = ambient.object_store();
+        let bucket = format!("notify-authority-{}", uuid::Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let xml = |event: &str| {
+            format!(
+                "<NotificationConfiguration><QueueConfiguration><Event>{event}</Event>\
+                 <Queue>arn:rustfs:sqs:us-east-1:inert:webhook</Queue></QueueConfiguration></NotificationConfiguration>"
+            )
+            .into_bytes()
+        };
+        store
+            .update_bucket_metadata_config(&bucket, BUCKET_NOTIFICATION_CONFIG, xml("s3:ObjectCreated:Put"))
+            .await
+            .expect("persist initial subscription");
+        let old = store.get_bucket_metadata(&bucket).await.expect("initial cached metadata");
+        let system = rustfs_notify::NotificationSystem::new(Default::default());
+        system.bind_bucket_metadata_source(&store);
+        let engine = rustfs_notify::NotifyRuleEngine::new();
+        engine.bind_bucket_metadata_source(&store);
+        let inert_target = TargetID::new("inert".into(), "webhook".into());
+        assert!(system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        assert!(engine.is_target_bound_to_any_bucket(&inert_target).await);
+
+        store
+            .update_bucket_metadata_config(&bucket, BUCKET_NOTIFICATION_CONFIG, EMPTY_XML.to_vec())
+            .await
+            .expect("remove subscription durably");
+        // Stand in for a peer whose cache has not received the reload yet.
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), (*old).clone())
+            .await
+            .expect("install stale peer cache");
+        assert!(system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        crate::storage::storage_api::reload_bucket_metadata(store.clone(), &bucket)
+            .await
+            .expect("peer reload");
+        assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        assert!(
+            engine
+                .match_targets(&bucket, EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+        assert!(!engine.is_target_bound_to_any_bucket(&inert_target).await);
+
+        store
+            .update_bucket_metadata_config(&bucket, BUCKET_NOTIFICATION_CONFIG, xml("s3:ObjectCreated:Put"))
+            .await
+            .expect("restore initial subscription");
+        assert!(system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete bucket");
+        assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        // A peer may still have the deleted incarnation cached until its delete
+        // callback (or the periodic metadata refresh) establishes absence.
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), (*old).clone())
+            .await
+            .expect("install deleted peer snapshot");
+        assert!(system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        assert!(
+            crate::storage::storage_api::remove_bucket_metadata_if_absent(store.clone(), &bucket)
+                .await
+                .expect("peer deletion")
+        );
+        assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        assert!(
+            engine
+                .match_targets(&bucket, EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        assert_ne!(
+            old.bucket_incarnation_id,
+            store.bucket_incarnation_id(&bucket).await.expect("replacement identity")
+        );
+        assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        store
+            .update_bucket_metadata_config(&bucket, BUCKET_NOTIFICATION_CONFIG, xml("s3:ObjectRemoved:Delete"))
+            .await
+            .expect("replacement subscription");
+        assert!(system.has_subscriber(&bucket, &EventName::ObjectRemovedDelete).await);
+        assert!(engine.has_subscriber(&bucket, &EventName::ObjectRemovedDelete).await);
+
+        assert!(
+            !crate::storage::storage_api::remove_bucket_metadata_if_absent(store.clone(), &bucket)
+                .await
+                .expect("delayed peer deletion")
+        );
+        let mut stale = rustfs_notify::BucketNotificationConfig::new("us-east-1");
+        stale.add_rule(&[EventName::ObjectCreatedPut], "*".into(), TargetID::new("old".into(), "webhook".into()));
+        // No runtime targets are activated: all assertions inspect inert rules.
+        system.remove_bucket_notification_config(&bucket).await;
+        // Applying already-validated rules models a delayed PUT completion.
+        engine.set_bucket_rules(&bucket, stale.get_rules_map().clone()).await;
+        assert!(engine.has_subscriber(&bucket, &EventName::ObjectRemovedDelete).await);
+        assert!(!engine.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+        assert!(
+            engine
+                .match_targets(&bucket, EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .match_targets(&bucket, EventName::ObjectRemovedDelete, "object")
+                .await
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![inert_target]
+        );
+        assert!(system.has_subscriber(&bucket, &EventName::ObjectRemovedDelete).await);
+        assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
+    });
+}

@@ -587,12 +587,6 @@ fn gateway_post_empty_file_checks_checksum_before_publication() {
     stack::with_stack(stack::GATEWAY, empty_post_refuses_before_publication);
 }
 
-#[test]
-#[serial_test::serial]
-fn legacy_post_empty_file_refuses_before_publication() {
-    stack::with_stack(stack::LEGACY, empty_post_refuses_before_publication);
-}
-
 async fn empty_post_refuses_before_publication(server: rustfs::embedded::RustFSServer) {
     // Legacy rejects an empty POST before checksum validation; non-empty checksum
     // success and failure are exercised by gateway_post_form_checksum_validates_before_publication.

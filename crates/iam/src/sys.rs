@@ -430,9 +430,27 @@ impl<T: Store> IamSys<T> {
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
         crate::delegation::read_active_for_broker(&self.store.api, id, now).await
     }
+    /// Bind a registration request to the actual signing secret and durable owner revision.
+    /// Call before reading the request body; do not obtain a new snapshot on publication failure.
+    ///
+    /// # Errors
+    /// Rejects missing, stale or non-regular signing authority and unavailable/corrupt storage.
+    pub async fn prepare_plugin_delegation_owner(
+        &self,
+        access_key: &str,
+        signing_secret: &str,
+    ) -> std::result::Result<crate::delegation::RegistrationOwner, crate::delegation::DelegationError> {
+        crate::delegation::prepare_owner(&self.store.api, access_key, signing_secret).await
+    }
+    /// Publish restrictions only while the request-bound owner snapshot remains current.
+    /// Consumes the snapshot; failure requires a new authenticated request, never rebinding by name.
+    /// Cancellation or storage failure can leave unreturned immutable records.
+    ///
+    /// # Errors
+    /// Rejects invalid restrictions, changed owner snapshots, and unavailable/corrupt persistence.
     pub async fn create_plugin_delegation(
         &self,
-        owner: &str,
+        owner: crate::delegation::RegistrationOwner,
         restrictions: crate::delegation::Restrictions,
         now: u64,
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
@@ -453,7 +471,8 @@ impl<T: Store> IamSys<T> {
     ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
         crate::delegation::read_active(&self.store.api, owner, id, now).await
     }
-    /// Reads an owned delegation record for historical lookups, including expired or revoked records.
+    /// Reads an owned delegation record for historical lookups, including expired or explicitly revoked records.
+    /// Owner identity writes invalidate ownership even for historical lookups.
     pub async fn read_owned_plugin_delegation(
         &self,
         owner: &str,
@@ -853,8 +872,8 @@ impl<T: Store> IamSys<T> {
     }
 
     /// Publish a SigV4-derived session only while its authenticated parent is
-    /// unchanged. The parent lock spans validation and durable publication, so
-    /// rotation/deletion either precedes this check or observes the new session.
+    /// unchanged. Bind the child to the generation read with the durable secret;
+    /// a rotation racing publication invalidates even a child absent from its sweep.
     /// Canceling the caller does not cancel an admitted storage write or release
     /// its parent lock before publication completes.
     pub async fn set_temp_user_from_parent(
@@ -882,22 +901,36 @@ impl<T: Store> IamSys<T> {
         }
         let parent_lock = self.store.cache.parent_mutation_lock(&cred.parent_user);
         let _parent_guard = parent_lock.lock().await;
-        let parent = if crate::is_root_access_key(&cred.parent_user) {
-            crate::root_credentials::credentials()
+        let (parent, generation) = if crate::is_root_access_key(&cred.parent_user) {
+            (crate::root_credentials::credentials().ok_or(IamError::IAMActionNotAllowed)?, None)
         } else {
-            self.store.get_user(&cred.parent_user).await.map(|user| user.credentials)
+            let (identity, _) = self
+                .store
+                .api
+                .regular_user_revision(&cred.parent_user)
+                .await?
+                .ok_or(IamError::IAMActionNotAllowed)?;
+            (identity.credentials, identity.sts_generation)
         };
-        let Some(parent) = parent else {
-            return Err(IamError::IAMActionNotAllowed);
-        };
-        if !parent.is_valid()
+        if parent.access_key != cred.parent_user
+            || !parent.is_valid()
             || parent.is_temp()
             || parent.is_service_account()
             || !bool::from(parent.secret_key.as_bytes().ct_eq(authenticated_parent.secret_key.as_bytes()))
         {
             return Err(IamError::IAMActionNotAllowed);
         }
-        self.set_temp_user(&cred.access_key, cred, None).await
+        let updated_at = self
+            .store
+            .set_temp_user_with_generation(&cred.access_key, cred, None, generation)
+            .await?;
+        if !crate::is_root_access_key(&cred.parent_user)
+            && !self.regular_parent_accepts_generation(&cred.parent_user, generation).await?
+        {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        self.notify_for_user(&cred.access_key, true).await;
+        Ok(updated_at)
     }
 
     pub async fn is_temp_user(&self, name: &str) -> Result<(bool, String)> {
@@ -1477,24 +1510,50 @@ impl<T: Store> IamSys<T> {
             return Ok((Some(UserIdentity::new(sys_cred)), true));
         }
 
-        match self.store.get_user(access_key).await {
-            Some(res) => {
-                let ok = res.credentials.is_valid();
-
-                Ok((Some(res), ok))
-            }
+        let identity = match self.store.get_user(access_key).await {
+            Some(user) => user,
             None => {
                 self.store.load_user(access_key).await?;
+                let Some(user) = self.store.get_user(access_key).await else { return Ok((None, false)) };
+                user
+            }
+        };
+        let valid = identity.credentials.is_valid();
+        if !self.sts_generation_is_current(&identity).await? {
+            // Some signature resolvers deliberately ignore the status flag. Do not
+            // return any key material for a revoked generation.
+            return Ok((None, false));
+        }
+        Ok((Some(identity), valid))
+    }
 
-                if let Some(res) = self.store.get_user(access_key).await {
-                    let ok = res.credentials.is_valid();
-
-                    Ok((Some(res), ok))
-                } else {
-                    Ok((None, false))
-                }
+    async fn sts_generation_is_current(&self, identity: &UserIdentity) -> Result<bool> {
+        let cred = &identity.credentials;
+        if cred.session_token.is_empty() {
+            return Ok(true);
+        }
+        if identity.sts_generation.is_none() {
+            if cred.is_service_account() || crate::is_root_access_key(&cred.parent_user) {
+                return Ok(true);
+            }
+            // OIDC and broker-issued plugin attempts have separate parent authorities.
+            // A freshly published identity may not yet have its decoded claims cached.
+            if let Some(key) = crate::root_credentials::token_signing_key()
+                && let Ok(claims) = get_claims_from_token_with_secret(&cred.session_token, &key)
+                && claims.get("parent").and_then(Value::as_str) == Some(cred.parent_user.as_str())
+                && (is_verified_or_legacy_federated_session(&claims, &cred.parent_user)
+                    || claims.get(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM) == Some(&Value::Bool(true)))
+            {
+                return Ok(true);
             }
         }
+        self.regular_parent_accepts_generation(&cred.parent_user, identity.sts_generation)
+            .await
+    }
+
+    async fn regular_parent_accepts_generation(&self, name: &str, generation: Option<[u8; 16]>) -> Result<bool> {
+        let parent = self.store.api.regular_user_revision(name).await?;
+        Ok(parent.is_some_and(|(parent, _)| parent.credentials.is_valid() && parent.sts_generation == generation))
     }
 
     /// Current built-in IAM groups for a user or a derived credential's parent.
@@ -1854,7 +1913,8 @@ impl<T: Store> IamSys<T> {
             let Some(current) = self.store.get_user(&caller.access_key).await else {
                 return Err(IamError::IAMActionNotAllowed);
             };
-            if !current.credentials.is_valid()
+            if !self.sts_generation_is_current(&current).await?
+                || !current.credentials.is_valid()
                 || current.credentials.parent_user != parent_user
                 || !bool::from(current.credentials.secret_key.as_bytes().ct_eq(caller.secret_key.as_bytes()))
             {
@@ -2004,6 +2064,15 @@ impl<T: Store> IamSys<T> {
     /// 1) know whether policy evaluation may need `s3:ExistingObjectTag`, and
     /// 2) evaluate with final conditions without re-merging identity policies.
     pub async fn prepare_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
+        let session = self.store.cache.snapshot().sts_accounts.get(args.account).cloned();
+        if let Some(session) = session
+            && !self.sts_generation_is_current(&session).await.unwrap_or(false)
+        {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::TerminalDeny,
+            };
+        }
         let marked = args.claims.contains_key(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
         if args.is_owner && !marked {
             return PreparedIamAuth {
@@ -2785,6 +2854,9 @@ async fn evaluate_prepared_session_policy(policy: &PreparedSessionPolicy, args: 
         PreparedSessionPolicy::Policy(p) => {
             let mut session_policy_args = args.clone();
             session_policy_args.is_owner = false;
+            // Self-service checks ask whether an explicit session-policy Deny
+            // applies. They must not require an unrelated Allow statement.
+            session_policy_args.deny_only = args.deny_only;
             Some(p.is_allowed(&session_policy_args).await)
         }
     }
@@ -3594,6 +3666,7 @@ mod tests {
         delete_started: Arc<tokio::sync::Notify>,
         release_delete: Arc<tokio::sync::Notify>,
         block_regular_save: Arc<std::sync::atomic::AtomicBool>,
+        fail_regular_read: Arc<std::sync::atomic::AtomicBool>,
         regular_save_started: Arc<tokio::sync::Notify>,
         release_regular_save: Arc<tokio::sync::Notify>,
         block_derived_save: Arc<std::sync::atomic::AtomicBool>,
@@ -3625,12 +3698,37 @@ mod tests {
     }
 
     impl StsTestMockStore {
+        fn revision(identity: &UserIdentity) -> String {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            serde_json::to_vec(identity)
+                .expect("encode fixture identity")
+                .hash(&mut hasher);
+            hasher.finish().to_string()
+        }
+
         fn new(empty_policies: bool) -> Self {
             Self {
                 empty_policies,
                 policy_load_barrier: None,
                 bucket_tags: Arc::new(Mutex::new(Err(Error::other("bucket metadata unavailable")))),
-                saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
+                saved_sts_users: Arc::new(Mutex::new({
+                    let name = if empty_policies {
+                        "sts-empty-parent-policy-test"
+                    } else {
+                        "sts-fallback-test-parent"
+                    };
+                    HashMap::from([(
+                        name.to_owned(),
+                        UserIdentity::new(Credentials {
+                            access_key: name.to_owned(),
+                            secret_key: "longenoughsecret".into(),
+                            status: ACCOUNT_ON.into(),
+                            groups: (!empty_policies).then(|| vec!["testgroup".into()]),
+                            ..Default::default()
+                        }),
+                    )])
+                })),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
                 fail_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 deleted_mapped_policies: Arc::new(Mutex::new(Vec::new())),
@@ -3638,6 +3736,7 @@ mod tests {
                 delete_started: Arc::new(tokio::sync::Notify::new()),
                 release_delete: Arc::new(tokio::sync::Notify::new()),
                 block_regular_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fail_regular_read: Default::default(),
                 regular_save_started: Arc::new(tokio::sync::Notify::new()),
                 release_regular_save: Arc::new(tokio::sync::Notify::new()),
                 block_derived_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3739,6 +3838,30 @@ mod tests {
                 .lock()
                 .expect("saved_sts_users mutex poisoned")
                 .remove(name);
+            Ok(())
+        }
+
+        async fn regular_user_revision(&self, name: &str) -> Result<Option<(UserIdentity, String)>> {
+            if self.fail_regular_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Io(std::io::Error::other("fixture parent read unavailable")));
+            }
+            let saved = self.saved_sts_users.lock().expect("saved identities");
+            Ok(saved
+                .get(name)
+                .filter(|user| user.credentials.session_token.is_empty())
+                .map(|user| (user.clone(), Self::revision(user))))
+        }
+
+        async fn save_regular_user_revision(&self, name: &str, user: &UserIdentity, revision: Option<&str>) -> Result<()> {
+            if self.block_regular_save.load(std::sync::atomic::Ordering::SeqCst) {
+                self.regular_save_started.notify_one();
+                self.release_regular_save.notified().await;
+            }
+            let mut saved = self.saved_sts_users.lock().expect("saved identities");
+            if saved.get(name).map(Self::revision).as_deref() != revision {
+                return Err(Error::IAMActionNotAllowed);
+            }
+            saved.insert(name.to_owned(), user.clone());
             Ok(())
         }
 
@@ -3931,31 +4054,9 @@ mod tests {
             }
 
             if self.empty_policies {
-                const PARENT_USER: &str = "sts-empty-parent-policy-test";
-                let creds = Credentials {
-                    access_key: PARENT_USER.to_string(),
-                    secret_key: "longenoughsecret".to_string(),
-                    session_token: String::new(),
-                    expiration: None,
-                    status: "on".to_string(),
-                    parent_user: String::new(),
-                    groups: None,
-                    claims: None,
-                    name: None,
-                    description: None,
-                };
-                let parent_identity = UserIdentity {
-                    version: 1,
-                    credentials: creds,
-                    update_at: Some(OffsetDateTime::now_utc()),
-                };
-                let mut users = HashMap::new();
-                users.insert(PARENT_USER.to_string(), parent_identity);
-                users.extend(saved_users);
-
                 cache.with_write_lock(|cache| {
                     cache.replace_policy_docs(CacheEntity::new(policy_docs));
-                    cache.replace_users(CacheEntity::new(users));
+                    cache.replace_users(CacheEntity::new(saved_users));
                     cache.replace_groups(CacheEntity::default());
                     cache.replace_group_policies(CacheEntity::default());
                     cache.replace_user_policies(CacheEntity::default());
@@ -3966,29 +4067,7 @@ mod tests {
                 return Ok(());
             }
 
-            const PARENT_USER: &str = "sts-fallback-test-parent";
             const GROUP_NAME: &str = "testgroup";
-
-            let creds = Credentials {
-                access_key: PARENT_USER.to_string(),
-                secret_key: "longenoughsecret".to_string(),
-                session_token: String::new(),
-                expiration: None,
-                status: "on".to_string(),
-                parent_user: String::new(),
-                groups: Some(vec![GROUP_NAME.to_string()]),
-                claims: None,
-                name: None,
-                description: None,
-            };
-            let parent_identity = UserIdentity {
-                version: 1,
-                credentials: creds,
-                update_at: Some(OffsetDateTime::now_utc()),
-            };
-            let mut users = HashMap::new();
-            users.insert(PARENT_USER.to_string(), parent_identity);
-            users.extend(saved_users);
 
             let groups = self.saved_groups.lock().expect("saved groups").clone();
 
@@ -3998,7 +4077,7 @@ mod tests {
 
             cache.with_write_lock(|cache| {
                 cache.replace_policy_docs(CacheEntity::new(policy_docs));
-                cache.replace_users(CacheEntity::new(users));
+                cache.replace_users(CacheEntity::new(saved_users));
                 cache.replace_groups(CacheEntity::new(groups));
                 cache.replace_group_policies(CacheEntity::new(group_policies));
                 cache.replace_user_policies(CacheEntity::default());
@@ -4023,7 +4102,7 @@ mod tests {
         IamSys::new(cache)
     }
 
-    async fn shared_group_caches() -> (StsTestMockStore, Arc<IamCache<StsTestMockStore>>, Arc<IamCache<StsTestMockStore>>) {
+    async fn shared_iam_caches() -> (StsTestMockStore, Arc<IamCache<StsTestMockStore>>, Arc<IamCache<StsTestMockStore>>) {
         let store = StsTestMockStore::new(false);
         let (first, second) = temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
             (
@@ -4038,7 +4117,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn group_edit_status_and_removal_survive_shared_backend_reload() {
-        let (store, first, second) = shared_group_caches().await;
+        let (store, first, second) = shared_iam_caches().await;
         let group = "testgroup";
         let member = "sts-fallback-test-parent";
         second
@@ -4067,7 +4146,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn group_edit_delete_orders_emptiness_check_with_add() {
-        let (store, first, second) = shared_group_caches().await;
+        let (store, first, second) = shared_iam_caches().await;
         let group = "testgroup";
         let member = "sts-fallback-test-parent";
         second
@@ -4175,6 +4254,7 @@ mod tests {
         let member = "group-stamp-member";
         let identity = UserIdentity {
             version: 1,
+            sts_generation: None,
             credentials: Credentials {
                 access_key: member.to_string(),
                 secret_key: "longenoughsecret".to_string(),
@@ -4539,7 +4619,12 @@ mod tests {
                     Error::AccessKeyAlreadyExists
                 );
                 assert_eq!(
-                    iam.get_user(&key).await.expect("preserved identity").credentials.secret_key,
+                    iam.store
+                        .get_user(&key)
+                        .await
+                        .expect("preserved cached identity")
+                        .credentials
+                        .secret_key,
                     child.secret_key
                 );
                 assert_eq!(
@@ -4613,6 +4698,121 @@ mod tests {
             iam.set_temp_user_from_parent(&child, &authenticated).await,
             Err(Error::IAMActionNotAllowed)
         ));
+    }
+
+    #[tokio::test]
+    async fn sts_generation_fences_peer_publication_across_rotation() {
+        use std::sync::atomic::Ordering;
+        let (store, a, b) = shared_iam_caches().await;
+        let issuer = IamSys::new(a);
+        let writer = IamSys::new(b);
+        let name = "shared-rotation-parent";
+        let args = AddOrUpdateUserReq {
+            secret_key: "first-fixture-secret".into(),
+            status: rustfs_madmin::AccountStatus::Enabled,
+            policy: None,
+        };
+        issuer.create_user(name, &args).await.expect("create shared parent");
+        let authenticated = issuer.get_user(name).await.expect("parent").credentials;
+        let issued = rotation_test_session(name, "session-before-rotation");
+        issuer
+            .set_temp_user_from_parent(&issued, &authenticated)
+            .await
+            .expect("publish current generation");
+        assert!(issuer.check_key(&issued.access_key).await.expect("current session").1);
+        store.fail_regular_read.store(true, Ordering::SeqCst);
+        assert!(issuer.check_key(&issued.access_key).await.is_err());
+        assert!(
+            issuer
+                .set_temp_user_from_parent(&rotation_test_session(name, "unavailable-session"), &authenticated)
+                .await
+                .is_err()
+        );
+        store.fail_regular_read.store(false, Ordering::SeqCst);
+
+        // Node A has validated the old durable parent, but has not committed this child.
+        store.block_derived_save.store(true, Ordering::SeqCst);
+        let pending = {
+            let issuer = issuer.clone();
+            let authenticated = authenticated.clone();
+            tokio::spawn(async move {
+                issuer
+                    .set_temp_user_from_parent(&rotation_test_session(name, "pending-session"), &authenticated)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.derived_save_started.notified())
+            .await
+            .expect("issuer reached durable child write");
+        let (_, _, swept) = writer
+            .rotate_user_secret_key(name, "second-fixture-secret")
+            .await
+            .expect("rotate on independent cache");
+        assert_eq!(swept, 0, "writer has no cached children to sweep");
+        store.block_derived_save.store(false, Ordering::SeqCst);
+        store.release_derived_save.notify_one();
+        assert!(matches!(pending.await.expect("publisher task"), Err(Error::IAMActionNotAllowed)));
+        for key in [&issued.access_key[..], "pending-session"] {
+            assert!(issuer.store.get_user(key).await.is_some(), "peer still caches child");
+            assert!(matches!(issuer.check_key(key).await, Ok((None, false))));
+            assert!(
+                matches!(writer.check_key(key).await, Ok((None, false))),
+                "cold lookup checks the persisted binding"
+            );
+            let args = Args {
+                account: key,
+                groups: &None,
+                claims: &HashMap::new(),
+                conditions: &HashMap::new(),
+                action: Action::S3Action(S3Action::GetObjectAction),
+                bucket: "fixture",
+                object: "object",
+                is_owner: false,
+                deny_only: false,
+            };
+            assert!(matches!(issuer.prepare_auth(&args).await.mode, PreparedIamMode::TerminalDeny));
+        }
+        assert!(matches!(
+            issuer
+                .set_temp_user_from_parent(&rotation_test_session(name, "late-session"), &authenticated)
+                .await,
+            Err(Error::IAMActionNotAllowed)
+        ));
+        let fresh = writer.get_user(name).await.expect("new parent").credentials;
+        let next = rotation_test_session(name, "new-generation-session");
+        issuer
+            .set_temp_user_from_parent(&next, &fresh)
+            .await
+            .expect("fresh parent accepted despite stale cache");
+        assert!(issuer.check_key(&next.access_key).await.expect("fresh session").1);
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+        crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(probe, writer.create_user(name, &args))
+            .await
+            .expect("restore original secret via upsert");
+        assert!(
+            matches!(issuer.check_key(&issued.access_key).await, Ok((None, false))),
+            "secret reuse cannot restore an old generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn sts_generation_legacy_parent_is_valid_only_until_rotation() {
+        let (_, a, b) = shared_iam_caches().await;
+        let issuer = IamSys::new(a);
+        let writer = IamSys::new(b);
+        let name = "sts-fallback-test-parent";
+        let legacy = rotation_test_session(name, "unversioned-session");
+        issuer
+            .set_temp_user(&legacy.access_key, &legacy, None)
+            .await
+            .expect("store pre-upgrade session");
+        assert!(issuer.check_key(&legacy.access_key).await.expect("legacy parent and child").1);
+        writer
+            .rotate_user_secret_key(name, "new-fixture-secret")
+            .await
+            .expect("upgrade parent generation atomically");
+        assert!(matches!(issuer.check_key(&legacy.access_key).await, Ok((None, false))));
     }
 
     #[tokio::test]
@@ -4813,7 +5013,8 @@ mod tests {
             .expect("create local user");
         }
         let session = rotation_test_session(caller_parent, "operator-console-session");
-        iam.set_temp_user(&session.access_key, &session, None)
+        let operator = iam.get_user(caller_parent).await.expect("operator").credentials;
+        iam.set_temp_user_from_parent(&session, &operator)
             .await
             .expect("publish STS session");
         store.block_derived_save.store(true, Ordering::SeqCst);
@@ -5086,7 +5287,7 @@ mod tests {
             session_token: "temporary-session-token".to_string(),
             expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
             status: ACCOUNT_ON.to_string(),
-            parent_user: "sts-parent-user".to_string(),
+            parent_user: "sts-fallback-test-parent".to_string(),
             ..Default::default()
         };
 
@@ -5908,7 +6109,13 @@ mod tests {
             ("parent".into(), Value::from(caller.parent_user.clone())),
             (OIDC_VIRTUAL_PARENT_CLAIM.into(), Value::from(caller.parent_user.clone())),
             (POLICYNAME.into(), Value::from("consoleAdmin")),
+            ("exp".into(), Value::from(caller.expiration.expect("session expiration").unix_timestamp())),
         ]));
+        caller.session_token = rustfs_policy::auth::jwt_sign(
+            caller.claims_or_empty(),
+            &crate::root_credentials::token_signing_key().expect("fixture signing key"),
+        )
+        .expect("sign OIDC session");
         iam.set_temp_user(&caller.access_key, &caller, None)
             .await
             .expect("publish OIDC session");

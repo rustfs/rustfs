@@ -49,6 +49,10 @@ RustFS is an S3 server. SigV4 requires the server to know the secret key itself 
 | Rotation | `POST /v3/account/password`, requiring the current secret |
 | Session cleanup | Every STS session minted from the identity is revoked on rotation |
 
+For regular IAM users, the secret and its STS generation change in the same storage write. A node checks that generation against shared storage when using a session; it rejects the session if it cannot read the parent. A session created before generation tracking remains usable with its unversioned parent until rotation. An unchanged-secret user upsert preserves the generation.
+
+Upgrade all nodes that serve credentials before relying on this check. Older binaries do not enforce it on lookup. Independent site-replication receivers do not receive a regular user's session generation in the STS replication payload; a receiver with a versioned parent rejects that unbound session. Obtain a new session at the destination site in that case.
+
 Custom IAM user and service-account secret keys require at least eight UTF-8 bytes. The complete value is used for signing; it is not truncated, pre-hashed, or Unicode-normalized. Automatically generated service-account secret keys remain 40 bytes long.
 
 Before using service-account secret keys longer than 40 bytes, upgrade the site-replication receivers that may need to create those accounts. A receiver that still enforces the old creation limit can reject a new account even when the source created it successfully. Loading an existing identity and updating an existing service account use different paths and do not imply that account creation is supported.

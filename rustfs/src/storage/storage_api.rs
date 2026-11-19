@@ -134,13 +134,14 @@ pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::Prepar
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
-pub(crate) use super::ecfs_extend::{
+pub(crate) use super::s3_support::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
     get_buffer_size_opt_in, get_validated_store, get_validated_store_owned, has_read_preconditions,
     load_bucket_object_lock_config_state, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
-    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
-    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
+    parse_object_version_id, parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations,
+    process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
+    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
+    validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -151,14 +152,12 @@ pub(crate) use super::sse::{
 };
 
 pub(crate) mod access_consumer {
-    #[cfg(feature = "gateway-stack")]
-    pub(crate) use super::super::access::access_owned;
-    pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
-    pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
-    pub(crate) use super::super::access::access_owned::object_read::authorize_get_object;
-    pub(crate) use super::super::access::authorize_copy_object_tags;
+    pub(crate) use super::super::access_owned;
+    pub(crate) use super::super::access_owned::bucket_core::requested_bucket_force_delete;
+    pub(crate) use super::super::access_owned::object_commit::CopySourceObject;
+    pub(crate) use super::super::access_owned::object_commit::authorize_copy_object_tags;
+    pub(crate) use super::super::access_owned::object_read::authorize_get_object;
     pub(crate) use super::super::authorization::ObjectTagConditions;
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
     pub(crate) use super::super::authorization::{
         AuthorizationRequest, has_bypass_governance_header, recursive_force_delete_has_authenticated_caller,
@@ -174,7 +173,6 @@ pub(crate) mod access_consumer {
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards,
     };
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{
         authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
     };
@@ -194,8 +192,8 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::parity_test_support;
+    pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::authorization::ObjectTagConditions;
     pub(crate) use super::super::authorization::TableDataPlanePublicationGuards;
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
@@ -249,7 +247,7 @@ pub(crate) mod ecfs_consumer {
     pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
 }
 
-pub(crate) mod ecfs_extend_consumer {
+pub(crate) mod s3_support_consumer {
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
@@ -531,7 +529,6 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use rustfs_ecstore::api::compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use rustfs_ecstore::api::compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
@@ -862,8 +859,8 @@ pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersio
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
+#[cfg(test)]
 pub(crate) type FS = super::ecfs::FS;
-pub(crate) use super::ecfs::parse_object_version_id;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;

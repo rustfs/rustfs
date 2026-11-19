@@ -30,6 +30,8 @@ mod discovery;
 #[cfg(test)]
 pub(crate) mod envelope_payloads;
 mod guards;
+#[cfg(test)]
+mod permission_probe_test;
 mod request;
 mod table_data_plane;
 
