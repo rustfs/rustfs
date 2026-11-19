@@ -19,9 +19,9 @@
 //! object's own redirect location — read anonymously through the owned GetObject and HeadObject
 //! authorization and use cases, marking each GetObject with `WebsiteRead` so it reports the
 //! object's redirect location.
-//! NOT responsible for: where a stack mounts the host (`app/metadata_route.rs` on the legacy
-//! stack, `server/stack.rs` on the gateway stack), or any object read itself (the use cases).
-//! Upstream: the legacy `MetadataRoute` and the gateway stack's website service. Downstream: the
+//! NOT responsible for: where the stack mounts the host (`server/stack.rs`), or any object read
+//! itself (the use cases).
+//! Upstream: the gateway stack's website service. Downstream: the
 //! owned GetObject and HeadObject authorization and use cases, and the bucket's website
 //! configuration.
 

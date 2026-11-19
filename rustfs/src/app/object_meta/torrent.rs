@@ -19,7 +19,6 @@
 //! NOT responsible for: authorization (there is none: the answer is the same for every caller).
 //! Upstream: both edges. Downstream: none.
 
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::GetObjectTorrentInput;
 use rustfs_gateway_types::dto::GetObjectTorrentOutput;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
@@ -29,7 +28,6 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 /// # Errors
 ///
 /// Always `NoSuchKey`.
-#[cfg(any(feature = "gateway-stack", test))]
 pub(crate) fn execute_get_object_torrent(_input: GetObjectTorrentInput) -> S3Result<GetObjectTorrentOutput> {
     answer_get_object_torrent()
 }

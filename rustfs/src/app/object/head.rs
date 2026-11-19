@@ -21,7 +21,6 @@ use crate::app::dto_values::{stored_etag, timestamp};
 use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
 use crate::app::{Answered, RequestEnvelope};
 use rustfs_gateway_types::ByteRange;
-#[cfg(feature = "gateway-stack")]
 use rustfs_gateway_types::RangeParse;
 use rustfs_gateway_types::dto as gateway_dto;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
@@ -447,7 +446,6 @@ impl DefaultObjectUsecase {
         Ok(response)
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) async fn execute_head_object(
         &self,
         envelope: RequestEnvelope,
