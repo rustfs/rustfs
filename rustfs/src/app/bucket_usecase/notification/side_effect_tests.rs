@@ -256,10 +256,7 @@ fn check_notification_write_order() {
                 NEW_XML
             };
             assert_eq!(read_notification_xml(&bucket).await, stored);
-            let error_message = match fail_at {
-                Some(_) => Some("Failed to add rules: Rule configuration error: fixture failure"),
-                None => None,
-            };
+            let error_message = fail_at.map(|_| "Failed to add rules: Rule configuration error: fixture failure");
             if let Some(message) = error_message {
                 let error = result.expect_err("injected callback failure");
                 assert_eq!(error.code(), &S3ErrorCode::InternalError);
