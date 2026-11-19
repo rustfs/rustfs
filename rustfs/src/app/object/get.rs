@@ -9009,7 +9009,7 @@ mod tests {
         let error = result.expect_err("a read quorum failure before the first byte must reject response construction");
         assert_eq!(error.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
         assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(error.message(), Some("Resource requested is unreadable, please reduce your request rate"));
+        assert_eq!(error.message(), Some("The object could not be read from storage."));
     }
 
     #[tokio::test]

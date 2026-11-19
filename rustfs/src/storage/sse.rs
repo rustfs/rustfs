@@ -8546,7 +8546,7 @@ pub(crate) mod tests {
         let err = map_get_object_reader_error(StorageError::PartMissingOrCorrupt);
 
         assert_eq!(err.code, S3ErrorCode::Custom("SlowDownRead".into()));
-        assert_eq!(err.message, "Resource requested is unreadable, please reduce your request rate");
+        assert_eq!(err.message, "The object could not be read from storage.");
     }
 
     #[test]
