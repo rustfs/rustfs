@@ -269,6 +269,9 @@ fn keys(body: &[u8]) -> Vec<String> {
 /// One website request: method, path, host, an extra header, and the status the website answers.
 type WebsiteCase<'a> = (Method, &'a str, String, Option<(&'static str, &'static str)>, StatusCode);
 
+/// One listing request: its label, the request, the status it is answered with and the error code, if any.
+type ListingCase = (&'static str, HttpRequest<Empty<Bytes>>, StatusCode, Option<&'static str>);
+
 #[tokio::test]
 #[serial_test::serial]
 async fn website_host_answers_each_request_class_with_the_status_the_legacy_table_recorded() {
@@ -382,7 +385,7 @@ async fn website_host_answers_a_malformed_path_and_ignores_an_authorization_head
 async fn metadata_listings_follow_the_callers_iam_policy() {
     let (_env, edge) = stack().await;
     let anonymous = |query: &'static str| move || website_request(Method::GET, &format!("/{BUCKET}?{query}"), S3_HOST, None);
-    let cases: Vec<(&str, HttpRequest<Empty<Bytes>>, StatusCode, Option<&str>)> = vec![
+    let cases: Vec<ListingCase> = vec![
         (
             "root v2",
             signed_listing(BUCKET, "list-type=2&metadata=true", ROOT, ROOT_SECRET),
