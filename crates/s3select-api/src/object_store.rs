@@ -54,6 +54,7 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt, TryStreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
+use jiff::Timestamp;
 use memchr::{memchr, memmem};
 use rustfs_common::DEFAULT_DELIMITER;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
@@ -756,10 +757,22 @@ fn snapshot_last_modified(snapshot: &SelectObjectSnapshot) -> Result<DateTime<Ut
         store: "EcObjectStore",
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot metadata has no modification time").into(),
     })?;
-    DateTime::<Utc>::from_timestamp(mod_time.unix_timestamp(), mod_time.nanosecond()).ok_or_else(|| o_Error::Generic {
+    let timestamp = Timestamp::new(
+        mod_time.unix_timestamp(),
+        i32::try_from(mod_time.nanosecond()).map_err(|_| o_Error::Generic {
+            store: "EcObjectStore",
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot modification time is out of range").into(),
+        })?,
+    )
+    .map_err(|_| o_Error::Generic {
         store: "EcObjectStore",
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot modification time is out of range").into(),
-    })
+    })?;
+    let system_time = std::time::SystemTime::try_from(timestamp).map_err(|_| o_Error::Generic {
+        store: "EcObjectStore",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot modification time is out of range").into(),
+    })?;
+    Ok(DateTime::<Utc>::from(system_time))
 }
 
 pub fn scan_range_from_bounds(start: Option<i64>, end: Option<i64>, object_size: u64) -> Result<Option<SelectScanRange>> {

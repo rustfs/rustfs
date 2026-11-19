@@ -323,7 +323,7 @@ impl LockWrite {
     }
 
     async fn authorize(self, envelope: &mut crate::app::RequestEnvelope, fs: &FS, bucket: &str, version: Option<&str>) {
-        use crate::storage::access::access_owned::object_meta::{
+        use crate::storage::access_owned::object_meta::{
             RequestedObjectLegalHold, authorize_put_object_legal_hold, authorize_put_object_retention,
         };
         match self {

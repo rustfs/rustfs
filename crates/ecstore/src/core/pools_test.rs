@@ -8360,13 +8360,16 @@ mod decommission_lock_order_tests {
             .await
             .expect("hold the target gate before starting both waiters");
         let retry_observer = DecommissionCapacityLockOrderBarrier::install(other_store.id, other_store.id);
+        // Both workers must observe the original gate as busy, but slow disk I/O
+        // in the holder or first waiter must not consume the second waiter's retry budget.
+        let retry_pause = retry_observer.pause_target_gate_retries();
 
-        let mut workers = Vec::new();
+        let mut workers = tokio::task::JoinSet::new();
         for object in objects {
             let worker_store = Arc::clone(&other_store);
             let worker_bucket = bucket.clone();
             let source_set = other_store.pools[0].get_disks_by_key(object);
-            workers.push(tokio::spawn(async move {
+            workers.spawn(async move {
                 worker_store
                     .decommission_entry_for_test(
                         0,
@@ -8378,7 +8381,7 @@ mod decommission_lock_order_tests {
                         source_set,
                     )
                     .await
-            }));
+            });
         }
         retry_observer.wait_until_target_gate_retries(2).await;
         assert_eq!(
@@ -8425,6 +8428,7 @@ mod decommission_lock_order_tests {
         );
 
         drop(target_guard);
+        retry_pause.add_permits(1);
         retry_observer.wait_until_owner_paused().await;
         assert_eq!(
             retry_observer.target_gate_exact_reloads(),
@@ -8443,6 +8447,13 @@ mod decommission_lock_order_tests {
             .expect("a pinned waiter must not hold the alternate target gate");
         drop(alternate_probe);
         retry_observer.release_owner();
+        tokio::time::timeout(Duration::from_secs(30), workers.join_next())
+            .await
+            .expect("the pinned waiter should finish before the other retries")
+            .expect("the pinned waiter must exist")
+            .expect("the pinned waiter task should not panic")
+            .expect("the pinned waiter migration should succeed");
+        retry_pause.add_permits(1);
         retry_observer.wait_until_owner_paused().await;
         assert_eq!(
             retry_observer.target_gate_exact_reloads(),
@@ -8462,13 +8473,12 @@ mod decommission_lock_order_tests {
         drop(original_probe);
         retry_observer.release_owner();
 
-        for worker in workers {
-            tokio::time::timeout(Duration::from_secs(30), worker)
-                .await
-                .expect("same-target waiter should finish after permit transfer")
-                .expect("same-target waiter task should not panic")
-                .expect("same-target waiter migration should succeed");
-        }
+        tokio::time::timeout(Duration::from_secs(30), workers.join_next())
+            .await
+            .expect("the reselected waiter should finish after permit transfer")
+            .expect("the reselected waiter must exist")
+            .expect("the reselected waiter task should not panic")
+            .expect("the reselected waiter migration should succeed");
         assert_eq!(
             retry_observer.target_gate_exact_reloads(),
             2,

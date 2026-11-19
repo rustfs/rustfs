@@ -17,7 +17,7 @@
 
 use super::{build_request, store_uninitialized_premise_holds};
 use crate::storage::access::ReqInfo;
-use crate::storage::access::access_owned::bucket_replication_lifecycle::{
+use crate::storage::access_owned::bucket_replication_lifecycle::{
     SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
 };
 use crate::storage::ecfs::*;

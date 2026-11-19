@@ -94,12 +94,12 @@ pub(super) async fn authorize_bucket_config_mutation(
     action: Action,
 ) -> S3Result<()> {
     let server_ctx = require_server_context(envelope)?;
-    Ok(authorize_config_mutation(&server_ctx, envelope, bucket, action).await?)
+    authorize_config_mutation(&server_ctx, envelope, bucket, action).await
 }
 
 pub(super) async fn authorize_bucket_tag_deletion(envelope: &mut RequestEnvelope, bucket: &str) -> S3Result<()> {
     let server_ctx = require_server_context(envelope)?;
-    Ok(authorize_tag_deletion(&server_ctx, envelope, bucket).await?)
+    authorize_tag_deletion(&server_ctx, envelope, bucket).await
 }
 
 fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerContextSlot>> {

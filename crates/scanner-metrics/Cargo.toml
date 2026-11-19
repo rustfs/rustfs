@@ -28,7 +28,6 @@ categories = ["web-programming", "development-tools", "data-structures"]
 workspace = true
 
 [dependencies]
-chrono = { workspace = true, features = ["serde"] }
 jiff = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 rmp-serde = { workspace = true }

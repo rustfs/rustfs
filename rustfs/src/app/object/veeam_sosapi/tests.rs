@@ -650,7 +650,7 @@ fn veeam_sosapi_http_contract() {
                     builder = builder.header(name, value);
                 }
                 builder
-                    .extension(crate::storage::access::ReqInfo {
+                    .extension(crate::storage::req_info::ReqInfo {
                         cred: Some(rustfs_credentials::Credentials::default()),
                         is_owner: true,
                         ..Default::default()

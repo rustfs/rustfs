@@ -41,7 +41,7 @@ use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO, ScannerObjectOptions};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
 use rustfs_config::{
@@ -1637,7 +1637,7 @@ fn get_cycle_scan_mode(current_cycle: u64, start: ScannerBitrotStart, policy: Sc
         ScannerBitrotStart::Anchor(anchored) => anchored,
     };
 
-    let elapsed = Utc::now().signed_duration_since(started).to_std().unwrap_or(Duration::ZERO);
+    let elapsed = std::time::Duration::try_from(Timestamp::now().duration_since(started)).unwrap_or(Duration::ZERO);
     if elapsed >= bitrot_cycle {
         HealScanMode::Deep
     } else {
@@ -1649,7 +1649,7 @@ fn background_heal_info_for_scan_start(
     mut info: BackgroundHealInfo,
     current_cycle: u64,
     scan_mode: HealScanMode,
-    now: DateTime<Utc>,
+    now: Timestamp,
     policy: ScannerBitrotPolicy,
 ) -> Option<BackgroundHealInfo> {
     let reset_bitrot_start = scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now, policy);
@@ -1666,12 +1666,7 @@ fn background_heal_info_for_scan_start(
     Some(info)
 }
 
-fn should_reset_bitrot_start(
-    info: &BackgroundHealInfo,
-    current_cycle: u64,
-    now: DateTime<Utc>,
-    policy: ScannerBitrotPolicy,
-) -> bool {
+fn should_reset_bitrot_start(info: &BackgroundHealInfo, current_cycle: u64, now: Timestamp, policy: ScannerBitrotPolicy) -> bool {
     let Some(bitrot_start_time) = info.bitrot_start_time else {
         return true;
     };
@@ -1692,10 +1687,7 @@ fn should_reset_bitrot_start(
         return false;
     }
 
-    let elapsed = now
-        .signed_duration_since(bitrot_start_time)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
+    let elapsed = now.duration_since(bitrot_start_time).try_into().unwrap_or(Duration::ZERO);
     elapsed >= bitrot_cycle
 }
 
@@ -1720,7 +1712,7 @@ fn background_heal_info_for_scan_result(
     background_heal_info_for_scan_complete(info, scan_mode)
 }
 
-fn retain_recent_cycle_completions(cycle_completed: &mut Vec<DateTime<Utc>>) {
+fn retain_recent_cycle_completions(cycle_completed: &mut Vec<Timestamp>) {
     let keep = data_usage_update_dir_cycles() as usize;
     if cycle_completed.len() > keep {
         let drop_count = cycle_completed.len() - keep;
@@ -1921,7 +1913,7 @@ where
     let usage_persist_timeout = data_usage_persist_timeout();
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
-    cycle_info.started = Utc::now();
+    cycle_info.started = Timestamp::now();
 
     let mut cycle_metrics_guard =
         ScannerCycleMetricsGuard::new(cycle_info.clone(), leader_epoch, cycle_budget.remote_scan_progress()).await;
@@ -1955,7 +1947,7 @@ where
     // The persisted record wins when it carries a start; the in-memory record
     // covers a save that was skipped or lost since this process recorded it.
     let (mut background_heal_info, mut bitrot_start_source) = resolve_background_heal_info_for_cycle(&background_heal_read);
-    let bitrot_start = scanner_bitrot_start_for_cycle(&background_heal_info, Utc::now());
+    let bitrot_start = scanner_bitrot_start_for_cycle(&background_heal_info, Timestamp::now());
     if matches!(bitrot_start, ScannerBitrotStart::Anchor(_)) {
         bitrot_start_source = ScannerBitrotStartSource::Memory;
     }
@@ -1977,7 +1969,7 @@ where
         background_heal_info.clone(),
         cycle_info.current,
         scan_mode,
-        Utc::now(),
+        Timestamp::now(),
         bitrot_policy,
     ) {
         background_heal_info = new_heal_info.clone();
@@ -1989,7 +1981,7 @@ where
         save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
     }
     record_scanner_bitrot_status(
-        scanner_bitrot_start_for_cycle(&background_heal_info, Utc::now()),
+        scanner_bitrot_start_for_cycle(&background_heal_info, Timestamp::now()),
         bitrot_start_source,
         deep_scan_supported,
         scan_mode,
@@ -2817,7 +2809,7 @@ where
         return ScannerCycleOutcome::Failed;
     }
     cycle_info.current = 0;
-    cycle_info.cycle_completed.push(Utc::now());
+    cycle_info.cycle_completed.push(Timestamp::now());
     global_metrics().clear_current_scan_mode();
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);

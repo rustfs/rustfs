@@ -114,11 +114,25 @@ pub(super) fn response<T: serde::Serialize>(value: &T) -> S3Result<AdminResponse
     Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(bytes), headers))
 }
 
-struct Create;
+pub(super) struct Create;
 #[async_trait::async_trait]
 impl Operation for Create {
     async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        let (iam, owner) = owner(&req, AdminAction::CreatePluginDelegationAction).await?;
+        let (iam, _) = owner(&req, AdminAction::CreatePluginDelegationAction).await?;
+        let signed = req
+            .credentials()
+            .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?;
+        // Authorization may consult a stale IAM cache. Only the request's actual
+        // signing secret can authenticate a durable registration snapshot.
+        let owner = iam
+            .prepare_plugin_delegation_owner(
+                signed.access_key(),
+                signed
+                    .require_secret_key()
+                    .map_err(|_| s3::error(S3ErrorCode::AccessDenied, "request signing secret required"))?,
+            )
+            .await
+            .map_err(storage_error)?;
         let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "delegation body unavailable"))?
@@ -130,7 +144,7 @@ impl Operation for Create {
             .map_err(|_| s3::error(S3ErrorCode::InternalError, "clock unavailable"))?
             .as_secs();
         let record = iam
-            .create_plugin_delegation(&owner, restriction, now)
+            .create_plugin_delegation(owner, restriction, now)
             .await
             .map_err(storage_error)?;
         response(&record)

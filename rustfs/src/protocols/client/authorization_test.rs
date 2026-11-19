@@ -521,7 +521,7 @@ fn protocol_authorization_envelope_reaches_the_legacy_policy_decision() {
         let positives = cases.iter().filter(|case| case.expected.is_none()).count();
         assert!(cases.len() - positives > positives, "negative cases must outnumber positive ones");
         let session = session(Protocol::Sftp, "127.0.0.1", true, &[]);
-        let code = |result: S3Result<()>| result.err().map(|error| error.code().as_str().to_owned());
+        let code = |result: rustfs_s3_types::S3Result<()>| result.err().map(|error| error.code().as_str().to_owned());
         for case in cases {
             let Case {
                 name,

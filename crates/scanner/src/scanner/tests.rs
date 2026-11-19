@@ -32,6 +32,7 @@ use crate::{
     ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests,
     init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
 };
+use jiff::Timestamp;
 use rustfs_scanner_metrics::metrics::{
     ScannerUsagePublicationClass, ScannerUsagePublicationOutcome, ScannerUsagePublicationStatus,
 };
@@ -1458,8 +1459,8 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
     let mut cycle_info = CurrentCycle {
         current: 12,
         next: 13,
-        cycle_completed: vec![Utc::now()],
-        started: Utc::now(),
+        cycle_completed: vec![Timestamp::now()],
+        started: Timestamp::now(),
     };
 
     global_metrics().set_current_scan_mode(HealScanMode::Deep);
@@ -1512,7 +1513,7 @@ async fn scanner_cycle_metrics_guard_installs_budget_remote_progress() {
 #[tokio::test]
 #[serial]
 async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
-    let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+    let cycle_started = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     let mut cycle_info = CurrentCycle {
         current: 0,
         next: 1,
@@ -1523,11 +1524,8 @@ async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
     let setup_report = global_metrics().report().await;
     assert!(setup_report.current_cycle_active);
     assert_eq!(setup_report.current_cycle, 0);
-    assert_eq!(setup_report.current_started.as_second(), cycle_started.timestamp());
-    assert_eq!(
-        setup_report.current_started.subsec_nanosecond(),
-        i32::try_from(cycle_started.timestamp_subsec_nanos()).expect("chrono nanoseconds fit in i32")
-    );
+    assert_eq!(setup_report.current_started.as_second(), cycle_started.as_second());
+    assert_eq!(setup_report.current_started.subsec_nanosecond(), cycle_started.subsec_nanosecond());
 
     mark_scan_cycle_idle(&mut cycle_info, &mut guard).await;
     let idle_report = global_metrics().report().await;
@@ -1542,7 +1540,7 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
     let mut cycle_info = CurrentCycle {
         current: 12,
         next: 13,
-        started: Utc::now(),
+        started: Timestamp::now(),
         ..Default::default()
     };
     let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
@@ -1568,7 +1566,7 @@ async fn scanner_cycle_metrics_guard_drop_clears_activity() {
         CurrentCycle {
             current: 12,
             next: 13,
-            started: Utc::now(),
+            started: Timestamp::now(),
             ..Default::default()
         },
         1,
@@ -1941,7 +1939,7 @@ async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         current: 12,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     let mut cycle_metrics_guard =
         ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
@@ -1978,7 +1976,7 @@ async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
         current: 12,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     let mut cycle_metrics_guard =
         ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
@@ -2019,7 +2017,7 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         current: 12,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     let mut cycle_metrics_guard =
         ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
@@ -2068,7 +2066,7 @@ fn scanner_cycle_state_decodes_legacy_and_fenced_formats() {
         current: 12,
         next: 13,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     let mut legacy = cycle.next.to_le_bytes().to_vec();
     legacy.extend(cycle.marshal().expect("legacy cycle state should encode"));
@@ -2678,7 +2676,7 @@ async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
 #[serial]
 async fn full_rescan_reset_resumes_cleanup_pending_preserved_primary() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
-    let completed_at = Utc::now();
+    let completed_at = Timestamp::now();
     let primary = CurrentCycle {
         current: 3,
         next: 42,
@@ -3309,8 +3307,8 @@ async fn scanner_usage_floor_recovers_rc3_empty_fences_and_preserves_cycle_numbe
     let mut cycle = CurrentCycle {
         current: 17_117,
         next: 17_118,
-        cycle_completed: vec![Utc::now()],
-        started: Utc::now(),
+        cycle_completed: vec![Timestamp::now()],
+        started: Timestamp::now(),
     };
     assert_eq!(
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle, restart_floor, restart_state),
@@ -4757,8 +4755,8 @@ fn missing_usage_floor_discards_unfenced_cycle_progress() {
     let mut cycle = CurrentCycle {
         current: 11,
         next: 12,
-        cycle_completed: vec![Utc::now()],
-        started: Utc::now(),
+        cycle_completed: vec![Timestamp::now()],
+        started: Timestamp::now(),
     };
 
     assert_eq!(
@@ -5077,7 +5075,7 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
         current: 12,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     let mut cycle_metrics_guard =
         ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
@@ -5100,7 +5098,7 @@ async fn test_persist_scanner_cycle_state_reconciles_newer_winner() {
         current: 0,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut initial, &mut initial_revision, 1).await);
 
@@ -5137,7 +5135,7 @@ async fn test_persist_scanner_cycle_state_retries_after_stale_winner() {
         current: 0,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut initial, &mut initial_revision, 1).await);
 
@@ -5171,7 +5169,7 @@ async fn test_persist_scanner_cycle_state_stops_retry_after_leader_fence() {
         current: 0,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut initial, &mut revision, 1).await);
 
@@ -5211,7 +5209,7 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
         current: 0,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
     seed_usage_snapshot_for_leadership_claim(&store).await;
@@ -5316,15 +5314,15 @@ async fn recovered_usage_bootstrap_claim_conflicts_preserve_the_highest_cycle_nu
         cycle = CurrentCycle {
             current: 17_117,
             next: 17_118,
-            cycle_completed: vec![Utc::now()],
-            started: Utc::now(),
+            cycle_completed: vec![Timestamp::now()],
+            started: Timestamp::now(),
         };
         let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
         let winner = CurrentCycle {
             current: winner_next.saturating_sub(1),
             next: winner_next,
-            cycle_completed: vec![Utc::now()],
-            started: Utc::now(),
+            cycle_completed: vec![Timestamp::now()],
+            started: Timestamp::now(),
         };
         store
             .interleaving_puts
@@ -5725,8 +5723,8 @@ async fn scanner_usage_state_reset_publishes_fenced_bootstrap_marker() {
     let cycle = CurrentCycle {
         current: 41,
         next: 42,
-        cycle_completed: vec![Utc::now()],
-        started: Utc::now(),
+        cycle_completed: vec![Timestamp::now()],
+        started: Timestamp::now(),
     };
     save_config(
         store.clone(),
@@ -6109,8 +6107,8 @@ async fn scanner_usage_state_reset_resumes_real_store_cleanup_boundaries_after_r
         let cycle = CurrentCycle {
             current: 12,
             next: 42,
-            cycle_completed: vec![Utc::now()],
-            started: Utc::now(),
+            cycle_completed: vec![Timestamp::now()],
+            started: Timestamp::now(),
         };
         save_config(
             store.clone(),
@@ -6560,7 +6558,7 @@ async fn test_leadership_claim_confirms_commit_after_returned_error() {
         current: 0,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     let mut persisted_epoch = 0;
     seed_usage_snapshot_for_leadership_claim(&store).await;
@@ -6628,7 +6626,7 @@ async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
     let mut revision = DataUsageCacheRevision::Missing;
     let mut cycle = CurrentCycle {
         next: 12,
-        started: Utc::now(),
+        started: Timestamp::now(),
         ..Default::default()
     };
     let mut persisted_epoch = 4;
@@ -6674,7 +6672,7 @@ async fn cycle_budget_lease_takeover_rejects_old_generation() {
         current: 0,
         next: 12,
         cycle_completed: vec![],
-        started: Utc::now(),
+        started: Timestamp::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
     seed_usage_snapshot_for_leadership_claim(&store).await;
@@ -11406,7 +11404,7 @@ fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
         let start = ScannerBitrotStart::Window {
             cycle: 0,
-            started: Utc::now(),
+            started: Timestamp::now(),
         };
         let mode = get_cycle_scan_mode(10, start, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024));
         assert_eq!(mode, HealScanMode::Deep);
@@ -11417,8 +11415,8 @@ fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
 #[serial]
 fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
-        let recent = Utc::now() - chrono::Duration::minutes(30);
-        let old = Utc::now() - chrono::Duration::hours(2);
+        let recent = Timestamp::now() - jiff::SignedDuration::from_mins(30);
+        let old = Timestamp::now() - jiff::SignedDuration::from_hours(2);
 
         let recent = ScannerBitrotStart::Window {
             cycle: 0,
@@ -11447,7 +11445,7 @@ fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
         assert_eq!(
             get_cycle_scan_mode(
                 1,
-                ScannerBitrotStart::Anchor(Utc::now() - chrono::Duration::days(400)),
+                ScannerBitrotStart::Anchor(Timestamp::now() - jiff::SignedDuration::from_hours((400) * 24)),
                 ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)
             ),
             HealScanMode::Normal
@@ -11470,17 +11468,21 @@ fn scan_mode_without_recorded_bitrot_start_stays_normal_until_the_cycle_elapses(
 
     // An in-memory anchor counts the cadence without opening a selection
     // window: Normal until the cycle elapses, Deep afterwards.
-    let anchored = ScannerBitrotStart::Anchor(Utc::now());
+    let anchored = ScannerBitrotStart::Anchor(Timestamp::now());
     let modes: Vec<_> = (1..=3).map(|cycle| get_cycle_scan_mode(cycle, anchored, policy)).collect();
     assert_eq!(modes, vec![HealScanMode::Normal; 3]);
     assert_eq!(
-        get_cycle_scan_mode(4, ScannerBitrotStart::Anchor(Utc::now() - chrono::Duration::hours(2)), policy),
+        get_cycle_scan_mode(
+            4,
+            ScannerBitrotStart::Anchor(Timestamp::now() - jiff::SignedDuration::from_hours(2)),
+            policy
+        ),
         HealScanMode::Deep
     );
 
     // A recorded Deep window keeps its selection window, and an elapsed
     // cadence still triggers the next window.
-    let started = Utc::now();
+    let started = Timestamp::now();
     let window = ScannerBitrotStart::Window { cycle: 1, started };
     assert_eq!(get_cycle_scan_mode(1, window, policy), HealScanMode::Deep);
     assert_eq!(
@@ -11488,7 +11490,7 @@ fn scan_mode_without_recorded_bitrot_start_stays_normal_until_the_cycle_elapses(
             2048,
             ScannerBitrotStart::Window {
                 cycle: 1,
-                started: started - chrono::Duration::hours(2),
+                started: started - jiff::SignedDuration::from_hours(2),
             },
             policy
         ),
@@ -11501,7 +11503,7 @@ fn scan_mode_without_recorded_bitrot_start_stays_normal_until_the_cycle_elapses(
 #[serial]
 fn bitrot_cadence_anchor_is_remembered_in_memory_without_a_persisted_write() {
     reset_bitrot_cadence_anchor_for_test();
-    let now = Utc::now();
+    let now = Timestamp::now();
     let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
 
     // A Normal cycle without a recorded window writes nothing to storage ...
@@ -11514,7 +11516,7 @@ fn bitrot_cadence_anchor_is_remembered_in_memory_without_a_persisted_write() {
     // keeps that anchor for later cycles.
     let first = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now);
     assert_eq!(first, ScannerBitrotStart::Anchor(now));
-    let later = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now + chrono::Duration::hours(2));
+    let later = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now + jiff::SignedDuration::from_hours(2));
     assert_eq!(later, ScannerBitrotStart::Anchor(now));
     assert_eq!(get_cycle_scan_mode(4, later, policy), HealScanMode::Normal);
 
@@ -11543,7 +11545,7 @@ fn bitrot_cadence_anchor_is_remembered_in_memory_without_a_persisted_write() {
 #[serial]
 fn bitrot_start_memory_record_outlives_a_skipped_persisted_save() {
     reset_bitrot_cadence_anchor_for_test();
-    let now = Utc::now();
+    let now = Timestamp::now();
     let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
     let recorded = BackgroundHealInfo {
         bitrot_start_time: Some(now),
@@ -11582,7 +11584,7 @@ fn bitrot_start_memory_record_outlives_a_skipped_persisted_save() {
     // A newer in-memory start (a Deep window opened after the last
     // successful save) wins over the stale persisted record.
     let newer = BackgroundHealInfo {
-        bitrot_start_time: Some(now + chrono::Duration::seconds(1)),
+        bitrot_start_time: Some(now + jiff::SignedDuration::from_secs(1)),
         bitrot_start_cycle: 9,
         current_scan_mode: HealScanMode::Deep,
     };
@@ -11609,7 +11611,7 @@ fn bitrot_start_memory_record_outlives_a_skipped_persisted_save() {
 #[test]
 #[serial]
 fn scan_mode_status_reports_bitrot_start_source_and_topology_support() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let info = BackgroundHealInfo {
         bitrot_start_time: Some(now),
         bitrot_start_cycle: 2,
@@ -11630,7 +11632,7 @@ fn scan_mode_status_reports_bitrot_start_source_and_topology_support() {
     assert_eq!(status.bitrot_start_cycle, 2);
     assert_eq!(
         status.bitrot_start_unix_secs,
-        u64::try_from(now.timestamp()).expect("current time is after the epoch")
+        u64::try_from(now.as_second()).expect("current time is after the epoch")
     );
     assert_eq!(status.current_scan_mode, "normal");
     let encoded = serde_json::to_value(status).expect("bitrot status serializes");
@@ -11656,13 +11658,13 @@ fn scan_mode_status_reports_bitrot_start_source_and_topology_support() {
     assert_eq!(status.bitrot_start_cycle, 0);
     assert_eq!(
         status.bitrot_start_unix_secs,
-        u64::try_from(now.timestamp()).expect("current time is after the epoch")
+        u64::try_from(now.as_second()).expect("current time is after the epoch")
     );
 }
 
 #[test]
 fn test_erasure_sd_does_not_enter_deep_scan_mode() {
-    let started = Utc::now();
+    let started = Timestamp::now();
     let cycle = Some(Duration::from_secs(3600));
 
     let unsupported_policy = ScannerBitrotPolicy::new(cycle, false, 1024);
@@ -11694,7 +11696,7 @@ fn test_erasure_sd_does_not_enter_deep_scan_mode() {
 #[test]
 #[serial]
 fn test_background_heal_info_for_scan_start_marks_deep_active() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let info = background_heal_info_for_scan_start(
         BackgroundHealInfo::default(),
         7,
@@ -11726,7 +11728,7 @@ fn background_heal_read_failures_never_become_initializable_defaults() {
 #[serial]
 fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
     with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
-        let started_at = Utc::now();
+        let started_at = Timestamp::now();
         let info = BackgroundHealInfo {
             bitrot_start_time: Some(started_at),
             bitrot_start_cycle: 7,
@@ -11737,7 +11739,7 @@ fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
             info,
             8,
             HealScanMode::Deep,
-            Utc::now(),
+            Timestamp::now(),
             ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024),
         )
         .expect("deep scan should mark active status");
@@ -11750,7 +11752,7 @@ fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
 
 #[test]
 fn test_background_heal_info_for_scan_complete_marks_deep_idle() {
-    let started_at = Utc::now();
+    let started_at = Timestamp::now();
     let info = BackgroundHealInfo {
         bitrot_start_time: Some(started_at),
         bitrot_start_cycle: 7,
@@ -11768,7 +11770,7 @@ fn test_background_heal_info_for_scan_complete_marks_deep_idle() {
 #[test]
 fn test_background_heal_info_for_scan_complete_leaves_normal_scan_unchanged() {
     let info = BackgroundHealInfo {
-        bitrot_start_time: Some(Utc::now()),
+        bitrot_start_time: Some(Timestamp::now()),
         bitrot_start_cycle: 7,
         current_scan_mode: HealScanMode::Normal,
     };
@@ -11779,7 +11781,7 @@ fn test_background_heal_info_for_scan_complete_leaves_normal_scan_unchanged() {
 #[test]
 fn test_background_heal_info_for_failed_scan_preserves_deep_mode() {
     let info = BackgroundHealInfo {
-        bitrot_start_time: Some(Utc::now()),
+        bitrot_start_time: Some(Timestamp::now()),
         bitrot_start_cycle: 7,
         current_scan_mode: HealScanMode::Deep,
     };
@@ -11789,13 +11791,15 @@ fn test_background_heal_info_for_failed_scan_preserves_deep_mode() {
 
 #[test]
 fn test_retain_recent_cycle_completions_keeps_last_entries() {
-    let base = Utc::now();
+    let base = Timestamp::now();
     let keep = data_usage_update_dir_cycles() as usize;
-    let mut completed: Vec<_> = (0..keep + 2).map(|i| base + chrono::Duration::seconds(i as i64)).collect();
+    let mut completed: Vec<_> = (0..keep + 2)
+        .map(|i| base + jiff::SignedDuration::from_secs(i as i64))
+        .collect();
 
     retain_recent_cycle_completions(&mut completed);
 
     assert_eq!(completed.len(), keep);
-    assert_eq!(completed.first().copied(), Some(base + chrono::Duration::seconds(2)));
-    assert_eq!(completed.last().copied(), Some(base + chrono::Duration::seconds((keep + 1) as i64)));
+    assert_eq!(completed.first().copied(), Some(base + jiff::SignedDuration::from_secs(2)));
+    assert_eq!(completed.last().copied(), Some(base + jiff::SignedDuration::from_secs((keep + 1) as i64)));
 }

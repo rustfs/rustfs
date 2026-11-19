@@ -30,12 +30,13 @@ workspace = true
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+# Kept as no-op compatibility features for dependents that forward the
+# workspace profiling feature set to every crate.
+hotpath = []
+hotpath-alloc = []
+hotpath-cpu = []
 
 [dependencies]
-hotpath.workspace = true
 humantime.workspace = true
 http.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }

@@ -14,6 +14,7 @@
 
 const GET_OBJECT: &str = include_str!("../src/app/object/get.rs");
 const PUT_OBJECT: &str = include_str!("../src/storage/legacy_edge/object_write.rs");
+const PUT_OBJECT_OWNED: &str = include_str!("../src/app/object/put.rs");
 const SELECT_OBJECT: &str = include_str!("../src/app/object/mod.rs");
 
 fn assert_async_method_is_measured(source: &str, method: &str) {
@@ -47,6 +48,11 @@ fn object_request_profiling_is_attached_to_the_matching_operation() {
         "the native entry must retain the established profiling label"
     );
     assert_async_method_is_measured(PUT_OBJECT, "execute_put_object");
+    assert_async_method_is_measured(PUT_OBJECT_OWNED, "execute_put_object_owned");
+    assert!(
+        PUT_OBJECT_OWNED.contains("label = \"rustfs::app::object::put::DefaultObjectUsecase::execute_put_object\""),
+        "the gateway write path must keep the established PutObject profiling label"
+    );
     assert_async_method_is_measured(SELECT_OBJECT, "execute_select_object_content_owned");
     assert!(
         SELECT_OBJECT.contains("label = \"rustfs::app::object::DefaultObjectUsecase::execute_select_object_content\""),

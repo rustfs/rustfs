@@ -14,7 +14,7 @@
 
 //! Multipart initiation policy decisions take precedence over generation-read failures.
 
-use super::{CreateMultipartAuthorization, authorize_create_multipart_upload};
+use super::access_owned::listing_multipart::{CreateMultipartAuthorization, authorize_create_multipart_upload};
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use crate::storage::access::tests::{TestKms, UnreadyIam, build_request, ensure_req_info};

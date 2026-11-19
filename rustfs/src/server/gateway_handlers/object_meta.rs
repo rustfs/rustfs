@@ -52,7 +52,7 @@ async fn authorize_object(
     (bucket, key, version_id): (&BucketName, &ObjectKey, Option<&str>),
     action: S3Action,
 ) -> S3Result<()> {
-    Ok(authorize_object_request(envelope, bucket.as_str(), key.as_str(), version_id, Action::S3Action(action)).await?)
+    authorize_object_request(envelope, bucket.as_str(), key.as_str(), version_id, Action::S3Action(action)).await
 }
 
 impl Served for dto::GetObjectTorrent {
@@ -146,7 +146,7 @@ impl Served for dto::GetObjectTagging {
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let input = request.input();
         let (bucket, key, version_id) = (input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref());
-        Ok(authorize_object_tagging_request(envelope, bucket, key, version_id, S3Action::GetObjectTaggingAction).await?)
+        authorize_object_tagging_request(envelope, bucket, key, version_id, S3Action::GetObjectTaggingAction).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -164,7 +164,7 @@ impl Served for dto::DeleteObjectTagging {
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let input = request.input();
         let (bucket, key, version_id) = (input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref());
-        Ok(authorize_object_tagging_request(envelope, bucket, key, version_id, S3Action::DeleteObjectTaggingAction).await?)
+        authorize_object_tagging_request(envelope, bucket, key, version_id, S3Action::DeleteObjectTaggingAction).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -189,10 +189,7 @@ impl Served for dto::PutObjectTagging {
                 .filter_map(|tag| Some((tag.key.clone()?, tag.value.clone()?)))
                 .collect(),
         );
-        Ok(
-            authorize_put_object_tagging(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref(), tags)
-                .await?,
-        )
+        authorize_put_object_tagging(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref(), tags).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -214,7 +211,7 @@ impl Served for dto::PutObjectLegalHold {
             .cloned()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
         let legal_hold = RequestedObjectLegalHold(input.legal_hold.status.as_ref().map(|status| status.as_str().to_owned()));
-        Ok(authorize_put_object_legal_hold(
+        authorize_put_object_legal_hold(
             envelope,
             &server,
             input.bucket.as_str(),
@@ -222,7 +219,7 @@ impl Served for dto::PutObjectLegalHold {
             input.version_id.as_deref(),
             legal_hold,
         )
-        .await?)
+        .await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -260,7 +257,7 @@ impl Served for dto::PutObjectRetention {
             .server_context()
             .cloned()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
-        Ok(authorize_put_object_retention(
+        authorize_put_object_retention(
             envelope,
             &server,
             input.bucket.as_str(),
@@ -268,7 +265,7 @@ impl Served for dto::PutObjectRetention {
             input.version_id.as_deref(),
             retention_fields(request)?,
         )
-        .await?)
+        .await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
