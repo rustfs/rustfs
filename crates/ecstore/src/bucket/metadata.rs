@@ -1405,7 +1405,7 @@ impl BucketMetadata {
     /// | public access block | Fails closed in `get_public_access_block_config`: degrading grants the anonymous access the operator asked to block. |
     /// | quota | Fails closed in `get_quota_config`; the enforcement path in `quota::checker` already re-parses the raw JSON and refuses on error. |
     /// | lifecycle | `get_lifecycle_config` fails closed, so GetBucketLifecycle reports the fault instead of NoSuchLifecycleConfiguration. ILM, scanner and expiry-header consumers still degrade to "no rules": nothing is deleted or moved on the strength of an unreadable rule set, and the bucket keeps serving reads and writes. |
-    /// | notification | `get_notification_config` fails closed, so GetBucketNotificationConfiguration reports the fault and startup leaves that one bucket's rules unchanged instead of clearing them; other buckets are unaffected. |
+    /// | notification | `get_notification_config` fails closed, so GetBucketNotificationConfiguration reports the fault and startup skips that bucket's rule registration; metadata-bound server dispatch suppresses external delivery for the unreadable snapshot. Other buckets are unaffected. |
     /// | tagging, CORS, logging, website, accelerate, request payment | The getter fails closed so the matching GET API reports the fault instead of "not configured". Per-request consumers (CORS response headers) still degrade to "not configured", which is the restrictive direction. |
     /// | bucket ACL | Safe to degrade: it only shapes an optional response. |
     ///
