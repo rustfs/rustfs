@@ -19,7 +19,7 @@
 //! reads, and the object and IAM stores a request resolves to.
 //! Not responsible for: any policy decision (`decision`), condition building (`conditions`),
 //! or an implementation of the trait — the legacy s3s request implements it in
-//! `storage::access`, the owned `RequestEnvelope` in `app::context::envelope`.
+//! `storage::access`, the owned `RequestEnvelope` in the app layer.
 //! Upstream: both edges' access phases. Downstream: every module of `storage::authorization`,
 //! `storage::access_owned`, and the use cases that read authorization state.
 
@@ -28,7 +28,6 @@ use super::{
     PendingDeleteBucketGenerationGuard,
 };
 use super::{TableDataPlaneListAccess, TableDataPlanePublicationGuards};
-use crate::storage::ECStore;
 use crate::storage::access::ObjectTagConditions;
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::req_info::ReqInfo;
@@ -37,7 +36,7 @@ use crate::storage::request_markers::{
     PermissionProbeRequestFact, PostObjectPolicyHeaders, RequestedCopySource, RequestedObjectLegalHold,
     RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
 };
-use crate::storage::storage_api::runtime_sources_consumer::{ServerContextSlot, runtime_sources};
+use crate::storage::storage_api::runtime_sources_consumer::{ECStore, ServerContextSlot, runtime_sources};
 use http::HeaderMap;
 use rustfs_iam::{error::Error as IamError, store::object::ObjectStore, sys::IamSys};
 use rustfs_policy::policy::action::Action;
