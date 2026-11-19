@@ -760,13 +760,18 @@ impl ScannerIOCache for SetDisks {
             let _ = updates.send(incomplete_scope).await;
             return Ok(ScannerSourceTurnReceipt::default());
         }
-        // Only abandoned-object healing needs the full set inventory. There is
-        // no cross-drive comparison on a single drive or while healing is skipped.
-        let heal_disk_inventory = Arc::new(if single_drive || healing {
-            Vec::new()
+        // Coordinator workers need the full inventory only for cross-drive
+        // healing. Remote workers own their disk inventory on the peer.
+        let heal_disk_inventory = if !single_drive
+            && !healing
+            && workers
+                .iter()
+                .any(|(_, mode)| *mode == NamespaceScannerWorkerMode::Coordinator)
+        {
+            Some(Arc::new(scanner_set_disk_inventory(self.as_ref()).await))
         } else {
-            scanner_set_disk_inventory(self.as_ref()).await
-        });
+            None
+        };
         if unsupported_remote_disks > 0 {
             debug!(
                 target: "rustfs::scanner::io",
@@ -1019,7 +1024,6 @@ impl ScannerIOCache for SetDisks {
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone = bucket_result_tx.clone();
             let bucket_observations_clone = bucket_observations.clone();
-            let heal_disk_inventory = Arc::clone(&heal_disk_inventory);
             let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             let queued_disk_bucket_scans_clone = queued_disk_bucket_scans.clone();
             let active_disk_bucket_scans_clone = active_disk_bucket_scans.clone();
@@ -1035,9 +1039,9 @@ impl ScannerIOCache for SetDisks {
             let worker_retired_buckets = retired_buckets.clone();
             #[cfg(feature = "e2e-test-hooks")]
             let worker_incarnations = current_bucket_incarnations.clone();
-            let remote_capabilities = match worker_mode {
-                NamespaceScannerWorkerMode::RemoteV4(capabilities) => Some(capabilities),
-                NamespaceScannerWorkerMode::Coordinator => None,
+            let (remote_capabilities, heal_disk_inventory) = match worker_mode {
+                NamespaceScannerWorkerMode::Coordinator => (None, heal_disk_inventory.clone()),
+                NamespaceScannerWorkerMode::RemoteV4(capabilities) => (Some(capabilities), None),
             };
             #[cfg(test)]
             let worker_index = futs.len();
@@ -1680,7 +1684,7 @@ impl ScannerIOCache for SetDisks {
                     let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         bucket_budget.clone(),
-                        heal_disk_inventory.as_ref().clone(),
+                        heal_disk_inventory.as_deref().cloned().unwrap_or_default(),
                         cache,
                         None,
                         ScannerDiskScanOptions {

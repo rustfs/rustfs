@@ -121,8 +121,7 @@ pub(crate) use rustfs_ecstore::api::disk::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
-    DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
-    new_disk as ecstore_new_disk,
+    DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk,
 };
 #[cfg(all(test, unix))]
 pub(crate) use rustfs_ecstore::api::disk::{
@@ -404,8 +403,6 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    #[cfg(test)]
-    pub(crate) use super::ECSTORE_HEALING_MARKER_PATH;
     pub(crate) use super::storage_contracts::BucketOperations;
     pub(crate) use super::storage_contracts::{
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
@@ -424,6 +421,8 @@ pub(crate) mod scan {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::HEALING_MARKER_PATH;
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::new_global_notification_sys;
 }

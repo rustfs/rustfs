@@ -1639,7 +1639,7 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 #[serial]
 async fn single_drive_cycle_persists_usage_and_advances_with_healing_marker() {
     use crate::scanner_io::{clear_dirty_usage_buckets_for_tests, tests::wait_for_namespace_commit_tails};
-    use crate::storage_api::scan::{ECSTORE_HEALING_MARKER_PATH, MakeBucketOptions};
+    use crate::storage_api::scan::{HEALING_MARKER_PATH, MakeBucketOptions};
 
     clear_dirty_usage_buckets_for_tests();
     let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
@@ -1660,14 +1660,14 @@ async fn single_drive_cycle_persists_usage_and_advances_with_healing_marker() {
         .path()
         .join("pool0/disk0")
         .join(RUSTFS_META_BUCKET)
-        .join(ECSTORE_HEALING_MARKER_PATH);
+        .join(HEALING_MARKER_PATH);
     let marker_contents = b"leftover marker";
     tokio::fs::write(&marker, marker_contents)
         .await
         .expect("fixture healing marker should persist");
     let set = &store.pools[0].disk_set[0];
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !set.get_online_disks_with_healing(false).await.1 {
+        while !set.get_online_disks_with_healing(true).await.1 {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
