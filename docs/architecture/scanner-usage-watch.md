@@ -9,6 +9,10 @@ A watch proves that one bucket's counted namespace stayed unchanged within the s
 
 The consumer binds the proof to the owning ECStore's full endpoint layout and the expected remote grid-host set. Missing or substituted owners, a different instance with the same pool/set coordinates, and endpoint changes reject reuse before and after the watch query.
 
+Distributed watch owners are derived from the deployment UUID and each node's canonical storage host and port. The deployment UUID remains unchanged for dirty snapshots, acknowledgements, and publication leases. Each node resolves watch owners from its own immutable endpoint topology; unknown or ambiguous routes cannot supply a proof. Ordering the structural inputs by watch owner keeps coverage independent of which node coordinates the next cycle.
+
+A complete watch supplies the coverage plan without an additional coordinator-local dirty-generation salt; that salt still fences completed-cache reuse and coverage without a watch. Bucket configuration cache changes that affect scanner accounting advance the owning bucket's producer witness when the new configuration becomes visible, including local writes, peer reloads, and background refresh after a missed notification. Refreshing identical configuration or changing another bucket preserves the original proof.
+
 The registry linearizes watch installation, mutation begin, mutation end, and observation under one short synchronous lock. Every admitted user-bucket mutation is tracked even when no watch exists yet. Installing a watch during an earlier mutation therefore returns an active count. Both begin and the physical tail's end advance the installed revision; logical cancellation cannot expose an idle interval while detached work is still changing storage.
 
 An unchanged interval requires matching owner, process session, watch token, bucket incarnation, revision, coverage version, and coverage epoch, with no active mutation at either endpoint. Missing, expired, malformed, or unsupported evidence is Unknown. Unknown never becomes revision zero or an empty clean set.

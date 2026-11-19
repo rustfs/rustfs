@@ -927,6 +927,15 @@ impl ECStore {
         if requests.len() > 32 {
             return observations;
         }
+        let Some(owner) = self.scanner_usage_watch_owner_id() else {
+            return requests
+                .iter()
+                .map(|request| ScannerUsageWatchObservation {
+                    bucket: request.bucket.clone(),
+                    known: None,
+                })
+                .collect();
+        };
         let local_map = self.ctx.local_disk_map();
         let local_disks = local_map.read().await;
         let bindings_complete = !local_disks.is_empty()
@@ -941,7 +950,7 @@ impl ECStore {
             if request.release {
                 // Retirement needs the exact saved token, not current bucket
                 // metadata. Deleted buckets must not retain scarce watch slots.
-                self.ctx.usage_watches.observe(self.id, request);
+                self.ctx.usage_watches.observe(owner, request);
                 observations.push(ScannerUsageWatchObservation {
                     bucket: request.bucket.clone(),
                     known: None,
@@ -951,7 +960,7 @@ impl ECStore {
             let current = self.bucket_incarnation_id_from_disk(&request.bucket).await;
             let known = match current {
                 Ok(incarnation) if bindings_complete && incarnation == request.bucket_incarnation && !incarnation.is_nil() => {
-                    self.ctx.usage_watches.observe(self.id, request)
+                    self.ctx.usage_watches.observe(owner, request)
                 }
                 _ => None,
             };
@@ -973,11 +982,49 @@ impl ECStore {
         self.ctx.usage_watches.session_id()
     }
 
+    /// Producer identity for this node's bucket mutation watches. Its session changes on restart.
+    pub fn scanner_usage_watch_owner_id(&self) -> Option<Uuid> {
+        self.scanner_usage_watch_owner_for_route(None)
+    }
+
+    /// Resolve an authenticated notification peer against this instance's storage topology.
+    pub fn scanner_usage_watch_peer_owner_id(&self, grid_host: &str) -> Option<Uuid> {
+        self.scanner_usage_watch_owner_for_route(Some(grid_host))
+    }
+
+    fn scanner_usage_watch_owner_for_route(&self, grid_host: Option<&str>) -> Option<Uuid> {
+        let slot = &self.ctx.usage_watches.owners;
+        let owners = if let Some(owners) = slot.get() {
+            owners
+        } else if let Some(endpoints) = self.instance_endpoints() {
+            // InstanceContext installs this topology once. Publish only a successfully validated table.
+            let owners = crate::runtime::usage_watch::UsageWatchOwners::from_topology(self.id, &endpoints)?;
+            slot.get_or_init(|| owners)
+        } else {
+            // Direct file-backed stores can open before an instance endpoint registry exists.
+            let all_local_paths = !self.pools.is_empty()
+                && self.pools.iter().all(|pool| {
+                    let endpoints = pool.endpoints.endpoints.as_ref();
+                    !endpoints.is_empty() && endpoints.iter().all(|ep| ep.is_local && ep.get_type() == EndpointType::Path)
+                });
+            return (grid_host.is_none() && !self.id.is_nil() && all_local_paths).then_some(self.id);
+        };
+        if owners.deployment != self.id {
+            return None;
+        }
+        match grid_host {
+            Some(host) => owners.peers.get(host).copied(),
+            None => Some(owners.local),
+        }
+    }
+
     /// Revoke an exact local token without awaiting storage or peer I/O. A
     /// failed keepalive must not let a later successful query revive its proof.
     pub fn scanner_release_usage_watch(&self, request: &crate::runtime::usage_watch::ScannerUsageWatchRequest) {
-        if request.release {
-            self.ctx.usage_watches.observe(self.id, request);
+        if request.release
+            && let Some(owner) = self.scanner_usage_watch_owner_id()
+        {
+            self.ctx.usage_watches.observe(owner, request);
         }
     }
 

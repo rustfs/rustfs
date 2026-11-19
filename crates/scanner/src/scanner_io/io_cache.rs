@@ -1268,6 +1268,7 @@ impl ScannerIOCache for SetDisks {
                         reuse_work_digest,
                         scanner_single_bucket_coverage_digest(&bucket, source, checkpoint_identity, checkpoint_work_digest),
                         bucket_dirty_generation,
+                        bucket_usage_watch.as_ref(),
                     );
                     let bucket_scan_plan_digest = bucket_plans.reuse;
                     let bucket_checkpoint_plan_digest = bucket_plans.coverage;

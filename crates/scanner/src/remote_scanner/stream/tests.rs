@@ -830,7 +830,7 @@ async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_bo
                 server_epoch: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
                 session_sequence: 0,
-                plans: ScannerBucketPlanDigests::from_work_plans(reuse, coverage, None),
+                plans: ScannerBucketPlanDigests::from_work_plans(reuse, coverage, None, None),
                 tier_registry_generation: 0,
                 skip_healing: true,
                 scan_mode: HealScanMode::Deep,

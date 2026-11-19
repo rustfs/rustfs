@@ -1164,10 +1164,18 @@ impl ScannerBucketPlanDigests {
         reuse: DataUsageScanPlanDigest,
         coverage: DataUsageScanPlanDigest,
         dirty_generation: Option<u64>,
+        usage_watch: Option<&ScannerUsageWatchProof>,
     ) -> Self {
         Self {
             reuse: scanner_bucket_cache_digest(reuse, dirty_generation),
-            coverage: scanner_bucket_cache_digest(coverage, dirty_generation),
+            // A complete producer watch binds every node's bucket revision.
+            // Coordinator-local dirty history must still fence cache reuse,
+            // but cannot change coverage when that same watch is continued.
+            coverage: if usage_watch.is_some() {
+                coverage
+            } else {
+                scanner_bucket_cache_digest(coverage, dirty_generation)
+            },
         }
     }
 }

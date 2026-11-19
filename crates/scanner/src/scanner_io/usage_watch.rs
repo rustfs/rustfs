@@ -111,9 +111,12 @@ impl ScannerUsageWatchProof {
             return false;
         };
         let mut targets = Vec::new();
-        let mut found = HashSet::from([store.id]);
+        let Some(local_owner) = store.scanner_usage_watch_owner_id() else {
+            return false;
+        };
+        let mut found = HashSet::from([local_owner]);
         for (host, snapshot) in snapshots {
-            let Ok(owner) = Uuid::parse_str(&snapshot.owner_id) else {
+            let Some(owner) = peer_watch_owner(store, &host, &snapshot) else {
                 return false;
             };
             if let Some(peer) = self.peers.get(&owner) {
@@ -130,7 +133,10 @@ impl ScannerUsageWatchProof {
     }
 
     fn revoke_local(&self, store: &ECStore) -> bool {
-        let Some(local) = self.peers.get(&store.id) else {
+        let Some(local_owner) = store.scanner_usage_watch_owner_id() else {
+            return false;
+        };
+        let Some(local) = self.peers.get(&local_owner) else {
             return false;
         };
         store.scanner_release_usage_watch(&ScannerUsageWatchRequest {
@@ -469,11 +475,22 @@ async fn retire_finished_slots(cohort: &Arc<StdMutex<ScannerUsageWatchCohort>>, 
         .await;
 }
 
+fn peer_watch_owner(store: &ECStore, host: &str, snapshot: &EcstoreScannerPeerDirtyUsageSnapshot) -> Option<Uuid> {
+    // Dirty snapshots and their ACKs retain the deployment identity. A watch
+    // belongs to one producer node, resolved only from our configured route.
+    let deployment = Uuid::parse_str(&snapshot.owner_id).ok()?;
+    if deployment.is_nil() || deployment != store.id {
+        return None;
+    }
+    store.scanner_usage_watch_peer_owner_id(host)
+}
+
 fn owner_routes(
-    local_owner: Uuid,
+    store: &ECStore,
     activity: &ScannerActivitySnapshot,
     snapshots: Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)>,
 ) -> Option<BTreeMap<Uuid, Option<String>>> {
+    let local_owner = store.scanner_usage_watch_owner_id()?;
     if local_owner.is_nil() || !activity.contains_key(LOCAL_SCANNER_ACTIVITY_NODE) || activity.len() > MAX_WATCH_OWNERS {
         return None;
     }
@@ -489,7 +506,7 @@ fn owner_routes(
     let mut seen = BTreeSet::new();
     for (host, snapshot) in snapshots {
         let (instance_id, _, _) = crate::scanner::scanner_activity_dirty_usage_state_for_host(activity, &host)?;
-        let owner = Uuid::parse_str(&snapshot.owner_id).ok()?;
+        let owner = peer_watch_owner(store, &host, &snapshot)?;
         // A full dirty bucket list is deliberately not required: overflow in
         // that independent protocol cannot be interpreted as an empty list.
         if !expected_hosts.contains(&host)
@@ -587,7 +604,8 @@ async fn query_watch(
     } else {
         vec![]
     };
-    let routes = owner_routes(store.id, &before, snapshots)?;
+    let local_owner = store.scanner_usage_watch_owner_id()?;
+    let routes = owner_routes(store, &before, snapshots)?;
     let mut structure = Sha256::new();
     structure.update(b"scanner-usage-watch-instance-structure-v1");
     structure.update(watch_structure_digest(&before, &routes)?.0);
@@ -609,7 +627,7 @@ async fn query_watch(
         .iter()
         .filter_map(|(owner, host)| host.as_ref().map(|host| (host.clone(), *owner, vec![request_for(owner)])))
         .collect::<Vec<_>>();
-    let local_request = request_for(&store.id);
+    let local_request = request_for(&local_owner);
     let started = Instant::now();
     let local = store.scanner_usage_watch(std::slice::from_ref(&local_request)).await;
     let remote = if distributed {
@@ -617,7 +635,7 @@ async fn query_watch(
     } else {
         vec![]
     };
-    let mut observations = BTreeMap::from([(store.id, local)]);
+    let mut observations = BTreeMap::from([(local_owner, local)]);
     for (host, values) in remote {
         let owner = routes
             .iter()

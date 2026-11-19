@@ -1398,7 +1398,10 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
         let store = self
             .resolve_object_store()
             .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
-        if store.id.is_nil() || request.owner_id != store.id.to_string() {
+        let owner = store
+            .scanner_usage_watch_owner_id()
+            .ok_or_else(|| Status::failed_precondition("usage watch storage owner unavailable"))?;
+        if request.owner_id != owner.to_string() {
             return Err(Status::failed_precondition("usage watch storage owner changed"));
         }
         let requests = request
@@ -1454,7 +1457,7 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
             .collect();
         let mut response = ScannerUsageWatchResponse {
             protocol_version: USAGE_WATCH_PROTOCOL_VERSION,
-            owner_id: store.id.to_string(),
+            owner_id: owner.to_string(),
             session_id: store.scanner_usage_watch_session_id().as_bytes().to_vec().into(),
             entries,
             response_proof: Bytes::new(),
@@ -3377,6 +3380,97 @@ impl Node for NodeService {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn usage_watch_rpc_authenticates_the_node_owner_without_changing_deployment_identity() {
+        use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::storage::storage_api::{ECStore, init_local_disks_with_instance_ctx, new_instance_ctx};
+        use rustfs_protos::proto_gen::node_service::{ScannerUsageWatchEntry, ScannerUsageWatchRequest};
+        use rustfs_protos::usage_watch::{
+            USAGE_WATCH_PROTOCOL_VERSION, canonical_usage_watch_request, canonical_usage_watch_response,
+        };
+
+        let _ = rustfs_credentials::set_global_rpc_secret("usage-watch-node-owner-test-secret".into());
+        let fixture = target_rpc_fixture().await;
+        let disks = EndpointServerPools::from(vec![fixture.env.ecstore.pools[0].endpoints.clone()]);
+        let instance = new_instance_ctx();
+        init_local_disks_with_instance_ctx(&instance, disks.clone())
+            .await
+            .expect("independent disk registry");
+        let store = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            disks,
+            tokio_util::sync::CancellationToken::new(),
+            instance.clone(),
+        )
+        .await
+        .expect("node storage");
+        let mut local = Endpoint::try_from("http://watch-local.example:9000/disk0").expect("local node endpoint");
+        local.is_local = true;
+        let remote = Endpoint::try_from("http://watch-peer.example:9000/disk1").expect("peer endpoint");
+        instance.set_endpoints(EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(vec![local, remote]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]));
+        crate::storage::storage_api::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "usage-watch-rpc-node-owner";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("watch bucket");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("bucket incarnation");
+        let owner = store.scanner_usage_watch_owner_id().expect("node watch identity");
+        assert_eq!(store.id, fixture.env.ecstore.id, "deployment identity remains unchanged");
+        assert_ne!(owner, store.id, "watch owner belongs to this producer node");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            store.clone(),
+            fixture.iam.clone(),
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = make_server_for_context(Some(context));
+        let mut payload = ScannerUsageWatchRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: USAGE_WATCH_PROTOCOL_VERSION,
+            owner_id: owner.to_string(),
+            entries: vec![ScannerUsageWatchEntry {
+                bucket: bucket.into(),
+                bucket_incarnation: incarnation.as_bytes().to_vec().into(),
+                ..Default::default()
+            }],
+        };
+        let signed = |payload: ScannerUsageWatchRequest| {
+            let canonical = canonical_usage_watch_request(&payload).expect("canonical watch request");
+            let mut request = Request::new(payload);
+            set_tonic_canonical_body_digest(&mut request, &canonical).expect("signed body digest");
+            mark_v2_authenticated(&mut request);
+            request
+        };
+        let response = service
+            .scanner_usage_watch(signed(payload.clone()))
+            .await
+            .expect("node-bound watch")
+            .into_inner();
+        assert_eq!(response.owner_id, owner.to_string());
+        assert!(response.entries[0].known, "real producer issued a watch");
+        let request_body = canonical_usage_watch_request(&payload).expect("request body");
+        let response_body = canonical_usage_watch_response(&request_body, &response).expect("response body");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+            .expect("proof binds the node owner to the exact request");
+        payload.owner_id = store.id.to_string();
+        let error = service
+            .scanner_usage_watch(signed(payload))
+            .await
+            .expect_err("deployment ID cannot stand in for a node");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn usage_watch_receiver_bounds_bursts_without_rejecting_queued_work() {
         let admission = tokio::sync::Semaphore::new(8);

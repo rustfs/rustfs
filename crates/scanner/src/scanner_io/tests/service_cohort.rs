@@ -24,6 +24,10 @@ async fn create_cohort_bucket_objects(store: &ECStore, bucket: &str, objects: us
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("fixture bucket");
+    write_cohort_bucket_objects(store, bucket, objects).await;
+}
+
+async fn write_cohort_bucket_objects(store: &ECStore, bucket: &str, objects: usize) {
     for set in store.all_set_disks() {
         for index in 0..objects {
             let object = format!("object-{index:04}");
@@ -128,6 +132,9 @@ async fn service_cohort_production_dispatch_services_waiters_across_sources() {
         // the original bootstrap in the old dirty-first policy.
         if cycle > 1 {
             create_cohort_bucket(&store, &format!("b-new-{cycle}")).await;
+            // A dirty queue hint alone cannot invalidate a complete producer
+            // witness. Change the actual hot sources before the next turn.
+            write_cohort_bucket_objects(&store, &hot, 1).await;
         }
         record_dirty_usage_bucket(&hot);
         let ctx = CancellationToken::new();
