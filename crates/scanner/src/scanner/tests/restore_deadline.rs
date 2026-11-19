@@ -212,22 +212,22 @@ async fn new_primary_revision_supersedes_an_incomplete_backup_restore() {
     assert_eq!((total.objects, total.size), (1, 19));
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_transient_primary_page_error_does_not_schedule_the_backup() {
-    let (store, _) = fixture().await;
-    let keys: Vec<_> = store
+async fn inject_primary_page_error(store: &MemoryConfigStore, error: EcstoreError) {
+    let errors = store
         .objects
         .lock()
         .await
         .keys()
         .filter(|key| key.contains(".bin.pages/"))
-        .cloned()
+        .map(|key| (key.clone(), error.clone()))
         .collect();
-    store
-        .read_errors
-        .lock()
-        .await
-        .extend(keys.into_iter().map(|key| (key, EcstoreError::SlowDown)));
+    *store.read_errors.lock().await = errors;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transient_primary_page_error_does_not_schedule_the_backup() {
+    let (store, _) = fixture().await;
+    inject_primary_page_error(&store, EcstoreError::SlowDown).await;
     let mut loaded = DataUsageCache::default();
     assert!(window(&store, &mut loaded).await.0.is_none());
     store.read_errors.lock().await.clear();
@@ -270,18 +270,6 @@ async fn idle_restore_keeps_the_failed_primary_revision_across_scheduled_rounds(
 #[tokio::test(start_paused = true)]
 async fn physical_primary_page_corruption_falls_back_to_the_healthy_copy() {
     let (store, _) = fixture().await;
-    let keys: Vec<_> = store
-        .objects
-        .lock()
-        .await
-        .keys()
-        .filter(|key| key.contains(".bin.pages/"))
-        .cloned()
-        .collect();
-    store
-        .read_errors
-        .lock()
-        .await
-        .extend(keys.into_iter().map(|key| (key, EcstoreError::FileCorrupt)));
+    inject_primary_page_error(&store, EcstoreError::FileCorrupt).await;
     finish(&store, true).await;
 }
