@@ -57,7 +57,7 @@ const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 const ADMIN_USAGE_INCARNATION_CONCURRENCY: usize = 4;
-const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
 // A scanner save invalidates only the saving process's snapshot cache; every
 // other node sees it only after reloading. A fail-closed usage lookup for a
 // bucket the cached snapshot does not mention at all may reload a copy this

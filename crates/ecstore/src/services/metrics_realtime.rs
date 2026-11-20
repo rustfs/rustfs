@@ -64,6 +64,10 @@ impl MetricType {
     pub const RPC: MetricType = MetricType(1 << 8);
     pub const HTTP: MetricType = MetricType(1 << 9);
 
+    /// Internal GetMetrics selector for a compact, generation-bound node sample.
+    /// Excluded from ALL so existing HTTP and rolling-upgrade peers keep their wire shape.
+    pub const SCANNER_SUMMARY: MetricType = MetricType(1 << 10);
+
     // MetricsAll must be last.
     pub const ALL: MetricType = MetricType((1 << 10) - 1);
 
@@ -408,6 +412,28 @@ impl MetricType {
 pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts) -> RealtimeMetrics {
     debug!("collect_local_metrics");
     let mut real_time_metrics = RealtimeMetrics::default();
+    if types.0 == MetricType::SCANNER_SUMMARY.0 {
+        let sample = global_metrics().scanner_node_observation().await;
+        real_time_metrics.scanner_node = Some(rustfs_madmin::metrics::ScannerNodeSample {
+            active: sample.active,
+            leader: sample.leader,
+            cycle: sample.cycle,
+            epoch: sample.epoch,
+            started_at: sample.started_at,
+            objects_scanned: sample.objects_scanned,
+            last_success_at: sample.last_success_at,
+            last_attempt: sample
+                .last_attempt
+                .map(|attempt| rustfs_madmin::metrics::ScannerAttemptSample {
+                    epoch: attempt.epoch,
+                    cycle: attempt.cycle,
+                    result: attempt.result.to_string(),
+                    partial_reason: attempt.partial_reason.map(str::to_string),
+                    duration_seconds: attempt.duration.as_secs_f64(),
+                }),
+        });
+        return real_time_metrics;
+    }
     if types.0 == MetricType::NONE.0 {
         info!("types is None, return");
         return real_time_metrics;
