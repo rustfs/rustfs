@@ -811,14 +811,6 @@ impl ScannerIOCache for SetDisks {
             let _ = updates.send(incomplete_scope).await;
             return Ok(ScannerSourceTurnReceipt::default());
         }
-        // A healing-marked multi-drive set still needs its configured siblings for
-        // per-replica directory checkpoints. This does not require probing their handles.
-        let checkpoint_endpoints = (healing
-            && self.set_drive_count > 1
-            && workers
-                .iter()
-                .any(|(_, mode)| *mode == NamespaceScannerWorkerMode::Coordinator))
-        .then(|| Arc::new(self.set_endpoints.iter().map(ToString::to_string).collect()));
         if unsupported_remote_disks > 0 {
             debug!(
                 target: "rustfs::scanner::io",
@@ -1072,7 +1064,6 @@ impl ScannerIOCache for SetDisks {
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone = bucket_result_tx.clone();
             let bucket_observations_clone = bucket_observations.clone();
-            let checkpoint_endpoints = checkpoint_endpoints.clone();
             let local_recovery_attempts_clone = local_recovery_attempts.clone();
             let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             let queued_disk_bucket_scans_clone = queued_disk_bucket_scans.clone();
@@ -1799,6 +1790,7 @@ impl ScannerIOCache for SetDisks {
                             "bucket_incarnation": worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)),
                         })).await;
                     }
+                    let checkpoint_endpoints = scanner_checkpoint_endpoints(&store_clone_clone, &cache);
                     let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         bucket_budget.clone(),
@@ -1806,7 +1798,7 @@ impl ScannerIOCache for SetDisks {
                         cache,
                         None,
                         ScannerDiskScanOptions {
-                            checkpoint_endpoints: checkpoint_endpoints.clone(),
+                            checkpoint_endpoints,
                             scan_mode,
                             prefix_scan_scope,
                             checkpoint_tx: Some(checkpoint_tx),

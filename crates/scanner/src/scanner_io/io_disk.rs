@@ -278,7 +278,7 @@ impl ScannerIODisk for Disk {
                 // Every walker of this local disk shares its background I/O budget.
                 SCANNER_SLEEPER.for_disk(&self.path()),
                 prefix_scan_scope,
-                checkpoint_endpoints.as_deref(),
+                checkpoint_endpoints.as_ref(),
                 checkpoint_tx,
                 Some(local_stop.clone()),
             );

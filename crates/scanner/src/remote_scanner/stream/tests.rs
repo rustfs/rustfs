@@ -165,6 +165,107 @@ async fn retired_remote_source_at_eof_retries_without_certifying_its_walk() {
     assert!(!cache.info.snapshot_complete);
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn remote_checkpoint_survives_replica_detach_and_same_uuid_reconnect() {
+    use crate::scanner_io::tests::{setup_local_scanner_store, wait_for_namespace_commit_tails};
+    use crate::storage_api::owner::EcstoreDiskAPI as _;
+    use crate::storage_api::scan::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
+
+    let (_directory, store) = setup_local_scanner_store(1, 4).await;
+    let set = store.pools[0].disk_set[0].clone();
+    let bucket = "remote-dormant-replica";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    for index in 0..12 {
+        let mut reader = crate::ScannerPutObjReader::from_vec(vec![index]);
+        store
+            .put_object(bucket, &format!("key-{index:02}"), &mut reader, &crate::ScannerObjectOptions::default())
+            .await
+            .expect("write object");
+    }
+    wait_for_namespace_commit_tails(&store).await;
+    let request = test_request(Uuid::new_v4());
+    crate::save_config(
+        store.clone(),
+        crate::DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        crate::scanner::encode_scanner_cycle_fence_for_test(request.next_cycle, request.leader_epoch),
+    )
+    .await
+    .expect("persist cycle fence");
+    let scan = |disk: Arc<Disk>, max_objects| {
+        let store = store.clone();
+        async move {
+            let request = RemoteScannerRequestWire {
+                bucket: bucket.to_owned(),
+                scan_mode: HealScanMode::Normal,
+                skip_healing: false,
+                checkpoint_plan_digest: Some(TEST_PLAN_DIGEST),
+                supports_durable_progress: true,
+                ..test_request(Uuid::new_v4())
+            };
+            let ctx = CancellationToken::new();
+            let budget = ScannerCycleBudget::new_with_progress_tracking(
+                &ctx,
+                ScannerCycleBudgetConfig {
+                    max_objects,
+                    ..Default::default()
+                },
+            );
+            scan_and_persist_local_bucket_with_store(
+                disk,
+                ctx,
+                budget,
+                Arc::new(AtomicU8::new(RemoteScannerPhase::Scanning as u8)),
+                Arc::new(Notify::new()),
+                request,
+                store,
+            )
+            .await
+            .expect("run the admitted V4 worker")
+        }
+    };
+
+    let disks = scanner_set_disk_inventory(&set).await;
+    let disk_b = &disks[1];
+    let endpoint_b = disk_b.endpoint();
+    let uuid_b = disk_b.get_disk_id().await.expect("read disk ID").expect("formatted disk");
+    assert!(
+        matches!(scan(disk_b.clone(), Some(8)).await, RemoteScannerFrameResult::DurableProgress(receipt) if receipt.advanced)
+    );
+    let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+    let mut cache = DataUsageCache::default();
+    cache.load(set.clone(), &cache_name).await.expect("load B's checkpoint");
+    let source_b = cache.info.scan_directory_source.expect("source for the partial traversal");
+
+    let detached = set.disks.write().await[1].take().expect("detach B");
+    assert!(Arc::ptr_eq(&detached, disk_b));
+    detached.close().await.expect("retire B's original handle");
+    assert!(matches!(
+        scan(disks[0].clone(), Some(2)).await,
+        RemoteScannerFrameResult::DurableProgress(_)
+    ));
+    let mut cache = DataUsageCache::default();
+    cache.load(set.clone(), &cache_name).await.expect("load A's checkpoint");
+    assert!(
+        cache.info.scan_source_trees.contains_key(&source_b)
+            || cache.info.scan_directory_work.iter().any(|work| work.endpoint() == source_b),
+        "A must retain the disconnected configured replica's progress"
+    );
+
+    set.renew_disk(&endpoint_b).await;
+    let reopened = set.disks.read().await[1].clone().expect("reconnect B");
+    assert!(!Arc::ptr_eq(&reopened, disk_b));
+    assert_eq!(reopened.get_disk_id().await.expect("reopened disk ID"), Some(uuid_b));
+    // A fresh traversal cannot fit all twelve objects in this last budget.
+    let RemoteScannerFrameResult::Complete(result) = scan(reopened, Some(9)).await else {
+        panic!("the reconnected replica should finish from its saved position")
+    };
+    assert_eq!((result.usage.entry.objects, result.usage.entry.size), (12, 12));
+}
+
 #[test]
 fn semantic_deadline_is_capped_by_rpc_lifetime_without_overflow() {
     let now = Instant::now();
