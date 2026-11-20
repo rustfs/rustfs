@@ -72,6 +72,15 @@ const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis
 const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(1);
 const TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES: usize = 5;
 
+/// Resolve the durable parent of an authenticated or loaded session credential.
+/// Older identities can store the parent only in the verified token claims.
+pub fn session_parent_identity(credentials: &Credentials) -> Option<&str> {
+    if !credentials.parent_user.is_empty() {
+        return Some(credentials.parent_user.as_str());
+    }
+    credentials.claims_or_empty().get("parent").and_then(Value::as_str)
+}
+
 #[derive(Serialize, Deserialize)]
 struct IAMFormat {
     version: i32,
@@ -817,7 +826,7 @@ where
             .values()
             .filter_map(|x| {
                 if !access_key.is_empty()
-                    && x.credentials.parent_user.as_str() == access_key
+                    && session_parent_identity(&x.credentials) == Some(access_key)
                     && x.credentials.is_temp()
                     && !x.credentials.is_service_account()
                 {
@@ -1753,18 +1762,13 @@ where
                             error
                         }
                     })?;
-                let parent = if current.credentials.parent_user.is_empty() {
-                    current.credentials.claims_or_empty().get("parent").and_then(Value::as_str)
-                } else {
-                    Some(current.credentials.parent_user.as_str())
-                };
                 use subtle::ConstantTimeEq as _;
                 if !session.is_valid()
                     || !current.credentials.is_valid()
                     || !current.credentials.is_temp()
                     || current.credentials.is_service_account()
                     || current.credentials.access_key != session.access_key
-                    || parent != Some(access_key)
+                    || session_parent_identity(&current.credentials) != Some(access_key)
                     || !bool::from(current.credentials.secret_key.as_bytes().ct_eq(session.secret_key.as_bytes()))
                     || !bool::from(
                         current

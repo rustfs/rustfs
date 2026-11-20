@@ -4111,6 +4111,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn password_rotation_revokes_sessions_with_a_claim_only_parent() {
+        let iam = test_iam_sys().await;
+        let parent = "claim-only-session-parent";
+        let password = "currentParentSecret123";
+        iam.create_user(
+            parent,
+            &AddOrUpdateUserReq {
+                secret_key: password.to_string(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent");
+
+        // Legacy identities can have a verified parent claim without the denormalized field.
+        let mut session = rotation_test_session(parent, "claim-only-password-session");
+        session.parent_user.clear();
+        session.claims = Some(HashMap::from([("parent".to_owned(), Value::String(parent.to_owned()))]));
+        let identity = UserIdentity::new(session.clone());
+        iam.store
+            .api
+            .save_user_identity(&session.access_key, UserType::Sts, identity.clone(), None)
+            .await
+            .expect("seed persisted legacy session");
+        iam.store
+            .cache
+            .add_or_update_sts_account(&session.access_key, &identity, OffsetDateTime::now_utc());
+
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+        let (_, _, revoked) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::LOAD_USER_NOTIFICATION_PROBE.scope(
+                probe,
+                iam.change_own_secret_key_from_session(parent, password, "replacementParentSecret123", &session),
+            ),
+        )
+        .await
+        .expect("rotation and revocation finish")
+        .expect("rotate using legacy session");
+        assert_eq!(revoked, 1);
+        assert!(iam.get_user(&session.access_key).await.is_none());
+        assert!(matches!(
+            iam.store.api.load_user_identity(&session.access_key, UserType::Sts).await,
+            Err(Error::NoSuchUser(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn self_secret_change_cannot_undo_concurrent_disable_rotation_or_deletion() {
         ensure_test_global_credentials();
         for mutation in ["disable", "rotate", "delete"] {

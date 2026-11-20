@@ -31,29 +31,13 @@ use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Result
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
+use rustfs_iam::manager::session_parent_identity;
 use rustfs_iam::sys::is_rustfs_oidc_claims;
 use rustfs_madmin::account::{AccountMutability, CredentialsSource, IdentityType};
 use serde_json::Value;
 
 /// Claim written by the Keystone middleware onto its synthesized credentials.
 const KEYSTONE_ROLES_CLAIM: &str = "keystone_roles";
-
-/// The durable identity that owns a session credential.
-///
-/// Prefers the `parent_user` field and falls back to the JWT `parent` claim:
-/// some stores persist the parent only inside the session token, so checking
-/// just one of the two silently misidentifies the caller. This mirrors the
-/// resolution order used by the user-management handlers.
-pub(crate) fn session_parent_identity(credentials: &Credentials) -> Option<&str> {
-    if !credentials.parent_user.is_empty() {
-        return Some(credentials.parent_user.as_str());
-    }
-    credentials
-        .claims
-        .as_ref()
-        .and_then(|claims| claims.get("parent"))
-        .and_then(|value| value.as_str())
-}
 
 /// Human-readable OIDC identity metadata for self-service responses. These
 /// values never replace the issuer-scoped virtual parent used for authorization.
