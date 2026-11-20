@@ -1102,7 +1102,38 @@ impl RemoteDisk {
         }
     }
 
-    async fn recover_delete_transaction(
+    pub(crate) async fn probe_delete_residue_disk(&self, volume: &str) -> Result<Uuid> {
+        match self
+            .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::ProbeLegacyDiscard)
+            .await
+        {
+            Ok(DeleteRecoveryRpcReply::LegacyDiscardDisk { disk_id }) if !disk_id.is_nil() => Ok(disk_id),
+            Ok(_) => Err(Error::FileCorrupt),
+            Err(Error::Io(source))
+                if crate::cluster::rpc::client::embedded_tonic_status(&source)
+                    .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument)) =>
+            {
+                Err(Error::UnsupportedDisk)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn list_delete_residue_on_disk(
+        &self,
+        volume: &str,
+        disk_id: Uuid,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        let operation = DeleteRecoveryRpcOperation::ListResidueOnDisk { disk_id, cursor, limit };
+        match self.recover_delete_transaction(volume, operation).await? {
+            DeleteRecoveryRpcReply::ListedResidueOnDisk { disk_id: observed, page } if observed == disk_id => Ok(page),
+            _ => Err(Error::FileCorrupt),
+        }
+    }
+
+    pub(crate) async fn recover_delete_transaction(
         &self,
         volume: &str,
         operation: DeleteRecoveryRpcOperation,
@@ -1115,6 +1146,7 @@ impl RemoteDisk {
             }
             _ => DELETE_RECOVERY_PROTOCOL_VERSION,
         };
+        let bounded_inventory_page = matches!(&operation, DeleteRecoveryRpcOperation::ListResidueOnDisk { .. });
         let payload = rmp_serde::to_vec_named(&operation)?;
         if payload.len() > operation.max_wire_payload_bytes() {
             return Err(Error::other("delete recovery operation exceeds payload limit"));
@@ -1142,6 +1174,9 @@ impl RemoteDisk {
                 } else {
                     self.get_client().await?
                 };
+                if bounded_inventory_page {
+                    client = client.max_decoding_message_size(rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+                }
                 let mut request = Request::new(RecoverDeleteTransactionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_owned(),

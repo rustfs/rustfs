@@ -8103,6 +8103,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_residue_inventory_rpc_binds_the_page_to_the_serving_disk() {
+        use crate::storage::storage_api::{DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply};
+        let fixture = target_rpc_fixture().await;
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let configured = set.disks.read().await.iter().find_map(Clone::clone).expect("configured disk");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let endpoint = configured.endpoint().to_string();
+        let disk = service
+            .find_disk(&endpoint)
+            .await
+            .expect("RPC admission")
+            .expect("RPC target disk");
+        let id = disk
+            .get_disk_id()
+            .await
+            .expect("read fixture disk ID")
+            .expect("formatted disk");
+        let bucket = "residue-inventory-rpc";
+        disk.make_volume(bucket).await.expect("create fixture bucket");
+        let txn = Uuid::new_v4();
+        let record = format!("key/{}/reserve-delete-data.{txn}", Uuid::new_v4());
+        disk.write_all(bucket, &record, Bytes::new())
+            .await
+            .expect("seed a legacy reservation");
+
+        for (disk_id, limit, allowed) in [(Uuid::new_v4(), 1, false), (id, 65, false), (id, 1, true)] {
+            let operation = DeleteRecoveryRpcOperation::ListResidueOnDisk {
+                disk_id,
+                cursor: None,
+                limit,
+            };
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: endpoint.clone(),
+                volume: bucket.to_owned(),
+                protocol_version: 1,
+                operation: rmp_serde::to_vec_named(&operation)
+                    .expect("encode inventory operation")
+                    .into(),
+            });
+            let body =
+                rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("canonical inventory");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("inventory digest");
+            mark_v2_authenticated(&mut request);
+            let reply = service
+                .recover_delete_transaction(request)
+                .await
+                .expect("signed inventory response")
+                .into_inner();
+            assert_eq!(reply.success, allowed);
+            if allowed {
+                let observation =
+                    rustfs_protos::decode_delete_recovery_payload(&reply.result).expect("decode identity-bound page");
+                let DeleteRecoveryRpcReply::ListedResidueOnDisk { disk_id: observed, page } = observation else {
+                    panic!("expected a disk-bound inventory page");
+                };
+                assert_eq!(observed, id);
+                assert_eq!(page.transactions.len(), 1);
+                assert_eq!((&*page.transactions[0].object, page.transactions[0].transaction), ("key", txn));
+            } else {
+                assert!(reply.error.is_some() && reply.result.is_empty());
+            }
+        }
+        assert!(
+            disk.read_all(bucket, &record)
+                .await
+                .expect("reservation is preserved")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_recovery_exists_rpc_reports_exact_key_evidence_without_mutation() {
         use crate::storage::storage_api::{DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply};
         let fixture = target_rpc_fixture().await;

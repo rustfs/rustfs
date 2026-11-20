@@ -10601,7 +10601,9 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

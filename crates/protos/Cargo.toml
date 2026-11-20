@@ -82,3 +82,5 @@ doctest = false
 [dev-dependencies]
 serde_json = { workspace = true }
 temp-env = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tracing-subscriber = { workspace = true }

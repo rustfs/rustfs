@@ -20,7 +20,7 @@ and namespace safety, not independent hardware failure or power-loss durability.
 """
 from pathlib import Path
 import base64, hashlib, inspect, ipaddress, json, os, subprocess, tempfile, threading, time, uuid, xml.etree.ElementTree as ET
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 ROOT = None
 PREFIX = None
 IMAGE = None
@@ -953,6 +953,70 @@ def admin_legacy_dry_run(direct=False):
     finally:
         cluster.remove()
 
+def verify_delete_residue_api(client, bucket, keys):
+    root = 'rustfs/admin/v4/heal/delete-residue'
+    cursor = None
+    seen = set()
+    for _ in range(256):
+        query = {'bucket': bucket, 'limit': 1}
+        if cursor:
+            query['cursor'] = cursor
+        _, body = client.request('GET', root + '?' + urlencode(query), expected=200)
+        page = json.loads(body)
+        assert page['sourceStatus'] == 'scanned' and page['incompleteSources'] == 0, page
+        seen.update((entry['object'], page['source']['drive']) for entry in page['candidates'])
+        cursor = page.get('nextCursor')
+        if cursor is None:
+            assert page['complete'], page
+            break
+    else:
+        raise AssertionError('delete residue discovery did not finish')
+    assert seen == {(key, drive) for key in keys for drive in range(4)}, seen
+
+    def inspect_key(target):
+        _, body = client.request('GET', root + '/inspect?' + urlencode(target), expected=200)
+        return json.loads(body)
+
+    for key in keys:
+        target = {'bucket': bucket, 'object': key, 'pool': 0, 'set': 0}
+        preview = inspect_key(target)
+        assert preview['complete'] and preview['reason'] == 'discard_eligible', preview
+        assert len(preview['participants']) == 4 and len(preview['transactions']) == 1, preview
+        assert preview['fingerprint'] == inspect_key(target)['fingerprint'], preview
+        action = json.dumps({**target, 'expectedFingerprint': preview['fingerprint']}).encode()
+        headers = {'Content-Type': 'application/json'}
+        if key == keys[0]:
+            client.put(bucket, key, b'new current object')
+            client.request('POST', root + '/discard', action, headers, expected=412)
+            assert client.get(bucket, key) == b'new current object'
+            assert 'fingerprint' not in inspect_key(target)
+        else:
+            _, body = client.request('POST', root + '/discard', action, headers, expected=200)
+            assert json.loads(body)['reclaimed'] == 1
+            client.request('POST', root + '/discard', action, headers, expected=412)
+            after = inspect_key(target)
+            assert after['complete'] and not after['transactions'] and 'fingerprint' not in after, after
+
+
+def admin_residue():
+    cluster = Cluster('admin-residue', drives=4)
+    try:
+        cluster.create()
+        client = cluster.clients[0]
+        bucket = 'admin-residue'
+        keys = ['recreated', 'discarded']
+        client.put_bucket(bucket)
+        for key in keys:
+            client.put(bucket, key, b'original inline object')
+        cluster.kill()
+        for key in keys:
+            seed_legacy(cluster, bucket, key, 'backup-only')
+        cluster.restart()
+        verify_delete_residue_api(client, bucket, keys)
+        return {'case': 'admin-residue-inventory-preview-guarded-discard', 'status': 'passed'}
+    finally:
+        cluster.remove()
+
 def admin_prefix_scoped():
     cluster = Cluster('admin-prefix', drives=4)
     try:
@@ -1525,6 +1589,7 @@ def main():
         if existing:
             parser.error('namespace already owns Docker resources; choose a new namespace')
     cases = {'release-batch-crash': release_batch_crash, 'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
+    cases['admin-residue'] = admin_residue
     cases.update({'multipart-sidecars': completed_multipart_sidecars, 'multipart-integrity': lambda: completed_multipart_sidecars(True), 'multipart-sidecars-applied': lambda: completed_multipart_sidecars(False, True), 'multipart-integrity-applied': lambda: completed_multipart_sidecars(True, True)})
     for stage in ('PREPARED', 'APPLIED', 'DECISION'):
         cases['marker-batch-' + stage.lower()] = lambda stage=stage: marker_batch_crash(stage)

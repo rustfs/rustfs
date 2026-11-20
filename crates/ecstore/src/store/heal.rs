@@ -29,6 +29,7 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+const EVENT_HEAL_DELETE_RECOVERY_BLOCKED: &str = "heal_delete_recovery_blocked";
 
 /// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
 pub(crate) struct BucketHealScope {
@@ -314,6 +315,104 @@ impl ECStore {
         .map_err(|error| Error::other_with_context("bucket heal owner task failed", error))?
     }
 
+    /// Inspect every participant and sibling transaction for one user key in its selected set.
+    /// A partial inspection never produces a fingerprint authorizing a subsequent discard.
+    pub async fn inspect_delete_residue(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        pool: usize,
+        set: usize,
+    ) -> Result<rustfs_madmin::heal_commands::DeleteResidueInspection> {
+        self.admin_delete_residue(bucket, object, pool, set, None).await
+    }
+
+    /// Discard only eligible historical evidence under a fresh exact-key inspection.
+    /// A stale or ineligible preview returns PreconditionFailed. If a drive fails after
+    /// others have discarded their copies, inspect again before retrying.
+    pub async fn discard_delete_residue(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        pool: usize,
+        set: usize,
+        expected_fingerprint: &str,
+    ) -> Result<rustfs_madmin::heal_commands::DeleteResidueInspection> {
+        if expected_fingerprint.len() != 64
+            || !expected_fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+        self.admin_delete_residue(bucket, object, pool, set, Some(expected_fingerprint.to_owned()))
+            .await
+    }
+
+    async fn admin_delete_residue(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        pool_index: usize,
+        set_index: usize,
+        expected: Option<String>,
+    ) -> Result<rustfs_madmin::heal_commands::DeleteResidueInspection> {
+        use rustfs_madmin::heal_commands::DeleteResidueInspection;
+        check_valid_bucket_name_strict(bucket)?;
+        check_object_args(bucket, object)?;
+        let incarnation = self.bucket_incarnation_id_from_disk(bucket).await?;
+        let object = object.to_owned();
+        self.run_bucket_heal_at_incarnation(bucket, incarnation, &HealOpts::default(), move |store, bucket, _| async move {
+            let scope = bucket_heal_scope(&bucket).ok_or(StorageError::PreconditionFailed)?;
+            let gate = store.ctx.data_movement_operation_gate();
+            let _movement_guard = gate.read().await;
+            let pool = store
+                .pools
+                .get(pool_index)
+                .ok_or_else(|| invalid_heal_pool_index(pool_index, store.pools.len()))?;
+            let physical_key = encode_dir_object(&object);
+            let set = pool
+                .disk_set
+                .get(set_index)
+                .filter(|set| Arc::ptr_eq(set, &pool.get_disks_by_key(&physical_key)))
+                .ok_or_else(|| {
+                    StorageError::InvalidArgument(
+                        "delete residue".to_owned(),
+                        "set".to_owned(),
+                        "selected set does not own the key".to_owned(),
+                    )
+                })?;
+            if store.is_suspended(pool_index).await || store.is_pool_rebalancing(pool_index).await {
+                return Err(StorageError::SlowDown);
+            }
+            let (config_guard, allows_discard) =
+                metadata_sys::legacy_discard_config_guard_in(&store.ctx, &bucket, incarnation).await?;
+            let report = DeleteResidueInspection {
+                bucket,
+                object,
+                pool: pool_index,
+                set: set_index,
+                incarnation: incarnation.to_string(),
+                complete: false,
+                reason: String::new(),
+                participants: Vec::new(),
+                transactions: Vec::new(),
+                fingerprint: None,
+                reclaimed: 0,
+            };
+            set.operator_delete_residue(
+                &physical_key,
+                report,
+                expected.as_deref(),
+                allows_discard,
+                pool.format.erasure.sets.get(set_index).map(Vec::as_slice).unwrap_or_default(),
+                &|| scope.check().is_ok() && !config_guard.is_lock_lost(),
+            )
+            .await
+        })
+        .await
+    }
+
     /// Recover hidden delete journals through the lifecycle-owned heal boundary.
     pub async fn recover_delete_transactions(self: &Arc<Self>, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         Ok(self
@@ -408,6 +507,24 @@ impl ECStore {
                         summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
                     }
                 }
+            }
+            if let Some(object) = &object
+                && !opts.dry_run
+                && summary.blocked > 0
+            {
+                tracing::debug!(
+                    event = EVENT_HEAL_DELETE_RECOVERY_BLOCKED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
+                    state = "insufficient_evidence",
+                    bucket = ?bucket,
+                    object = ?decode_dir_object(object),
+                    pool = opts.pool,
+                    set = opts.set,
+                    legacy_ambiguous = summary.legacy_ambiguous,
+                    other_blocked = summary.blocked - summary.legacy_ambiguous,
+                    "Exact-key delete recovery is blocked"
+                );
             }
             if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
@@ -1700,6 +1817,74 @@ mod tests {
         )
         .await
         .expect("minimal pool should build")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_recovery_operator_discard_is_scoped_to_the_selected_pool() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "operator-cross-pool";
+        let key = "object";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let options = ObjectOptions {
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        for (pool, contents) in store.pools.iter().zip([b"old bytes", b"new bytes"]) {
+            pool.put_object(bucket, key, &mut PutObjReader::from_vec(contents.to_vec()), &options)
+                .await
+                .expect("put distinct pool copy");
+        }
+        let transaction = Uuid::new_v4();
+        for disk in store.pools[0].disk_set[0].disk_inventory().await.into_iter().flatten() {
+            disk.delete_version(
+                bucket,
+                key,
+                rustfs_filemeta::FileInfo {
+                    name: key.to_owned(),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create legacy source pool residue");
+        }
+        let other_pool_metadata = (0..4)
+            .map(|slot| root.path().join(format!("pool1-disk{slot}/{bucket}/{key}/xl.meta")))
+            .map(|path| {
+                let bytes = std::fs::read(&path).expect("other pool's live copy");
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        let proof = store
+            .inspect_delete_residue(bucket, key, 0, 0)
+            .await
+            .expect("inspect source pool")
+            .fingerprint
+            .expect("source residue");
+        assert!(matches!(
+            store.discard_delete_residue(bucket, key, 1, 0, &proof).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+        assert_eq!(
+            store
+                .discard_delete_residue(bucket, key, 0, 0, &proof)
+                .await
+                .expect("scoped cleanup")
+                .reclaimed,
+            1
+        );
+        for (path, contents) in other_pool_metadata {
+            assert_eq!(std::fs::read(path).expect("other pool remains live"), contents);
+        }
+        shutdown.cancel();
     }
 
     #[tokio::test]

@@ -334,6 +334,76 @@ impl Disk {
         }
     }
 
+    /// Identify the physical participant that supports identity-bound legacy discard.
+    pub async fn probe_delete_residue_disk(&self, volume: &str) -> Result<Uuid> {
+        match self {
+            Self::Local(disk) => disk.get_disk().delete_residue_disk_id().await,
+            Self::Remote(disk) => disk.probe_delete_residue_disk(volume).await,
+        }
+    }
+
+    /// Enumerate one page on the same physical participant verified before and after traversal.
+    pub async fn list_delete_residue_on_disk(
+        &self,
+        volume: &str,
+        expected: Uuid,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        if expected.is_nil() || !(1..=MAX_DELETE_RESIDUE_PAGE_SIZE).contains(&limit) {
+            return Err(Error::InvalidPath);
+        }
+        match self {
+            Self::Local(disk) => {
+                let local = disk.get_disk();
+                local.require_delete_residue_disk_id(expected).await?;
+                let page = disk.discover_delete_transactions(volume, None, cursor, limit).await?;
+                local.require_delete_residue_disk_id(expected).await?;
+                Ok(page)
+            }
+            Self::Remote(disk) => disk.list_delete_residue_on_disk(volume, expected, cursor, limit).await,
+        }
+    }
+
+    /// Bound the physical disk identity to the same owner that performs a single
+    /// bounded discovery or inspection. An old peer cannot substitute an unbound reply.
+    pub async fn read_delete_residue_on_disk(
+        &self,
+        volume: &str,
+        object: &str,
+        disk_id: Uuid,
+        transaction: Option<Uuid>,
+        max_entries: u32,
+    ) -> Result<DeleteRecoveryRpcReply> {
+        match self {
+            Self::Local(disk) => {
+                disk.get_disk().require_delete_residue_disk_id(disk_id).await?;
+                match transaction {
+                    Some(id) => disk
+                        .inspect_delete_transaction_bounded(volume, object, id, max_entries)
+                        .await
+                        .map(DeleteRecoveryRpcReply::InspectedBounded),
+                    None => disk
+                        .discover_delete_transactions_bounded(volume, object, max_entries)
+                        .await
+                        .map(DeleteRecoveryRpcReply::DiscoveredBounded),
+                }
+            }
+            Self::Remote(disk) => {
+                disk.recover_delete_transaction(
+                    volume,
+                    DeleteRecoveryRpcOperation::ReadResidueOnDisk {
+                        object: object.to_owned(),
+                        disk_id,
+                        transaction,
+                        max_entries,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     /// A read-only probe; the physical delete repeats the same leaf checks.
     pub async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
         match self {
@@ -2597,6 +2667,7 @@ pub enum DeleteRecoveryAction {
     Rollback,
     DiscardLegacy,
     AdoptCommit { authority: Box<DeleteRecoveryJournal> },
+    DiscardLegacyOnDisk { disk_id: Uuid },
 }
 
 /// A complete inventory or a work-limit refusal. No public discovery cursor is allocated.
@@ -2609,6 +2680,7 @@ pub struct BoundedDeleteRecoveryDiscovery {
 }
 
 pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+pub const MAX_DELETE_RESIDUE_PAGE_SIZE: u32 = 64;
 pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2686,6 +2758,18 @@ pub enum DeleteRecoveryRpcOperation {
     Exists {
         object: String,
     },
+    ReadResidueOnDisk {
+        object: String,
+        disk_id: Uuid,
+        transaction: Option<Uuid>,
+        max_entries: u32,
+    },
+    ProbeLegacyDiscard,
+    ListResidueOnDisk {
+        disk_id: Uuid,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    },
 }
 
 impl DeleteRecoveryRpcOperation {
@@ -2720,6 +2804,8 @@ pub enum DeleteRecoveryRpcReply {
     AppliedVersion,
     AppliedVersions(Vec<Option<u32>>),
     Evidence { present: bool },
+    LegacyDiscardDisk { disk_id: Uuid },
+    ListedResidueOnDisk { disk_id: Uuid, page: DeleteRecoveryPage },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
