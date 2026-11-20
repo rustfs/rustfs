@@ -119,7 +119,7 @@ async fn cancelled_metadata_replies_keep_channel_usable(bulk: bool) {
         let (requests_tx, requests_rx) = oneshot::channel();
         let (resets_tx, resets_rx) = oneshot::channel();
         let server = tokio::spawn(delayed_peer(listener, requests_tx, resets_tx));
-        let (channel, _) = super::dial_channel(&address, &key, Duration::from_secs(10))
+        let (channel, _) = super::dial_channel(&address, &key, Some(Duration::from_secs(10)))
             .await
             .expect("production channel connects");
         let mut calls = Vec::new();

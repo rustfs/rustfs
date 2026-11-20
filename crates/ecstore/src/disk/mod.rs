@@ -353,19 +353,6 @@ impl Disk {
         }
     }
 
-    /// Open a shard for verification, including the EOF probe after its last frame.
-    pub(crate) async fn read_file_for_bitrot_verify(
-        &self,
-        volume: &str,
-        path: &str,
-        encoded_length: usize,
-    ) -> Result<FileReader> {
-        match self {
-            Self::Local(disk) => disk.read_file(volume, path).await,
-            Self::Remote(disk) => disk.read_file_for_bitrot_verify(volume, path, encoded_length).await,
-        }
-    }
-
     /// Physical ownership belongs to the node hosting the local attachment.
     pub fn physical_admission(&self) -> Option<Arc<PhysicalDiskBinding>> {
         match self {

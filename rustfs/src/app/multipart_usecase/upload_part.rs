@@ -43,7 +43,7 @@ impl RecordedUpload for PartUpload {
 
 async fn lookup_part_upload(store: &ECStore, bucket: &str, key: &str, id: &str, opts: &ObjectOptions) -> S3Result<MultipartInfo> {
     let result = store.get_multipart_info(bucket, key, id, opts).await;
-    result.map_err(|error| multipart_upload_api_error(error).into())
+    result.map_err(multipart_upload_api_error)
 }
 
 pub(super) async fn lookup_recorded_part_upload(
@@ -56,7 +56,7 @@ pub(super) async fn lookup_recorded_part_upload(
     let result = store.lookup_multipart_part_binding(bucket, key, id, opts).await;
     #[cfg(test)]
     let result = tests::observe_lookup(result);
-    match result.map_err(|error| S3Error::from(multipart_upload_api_error(error))) {
+    match result.map_err(multipart_upload_api_error) {
         Ok((info, owner)) => Ok(owner.map(|owner| PartUpload { owner, info })),
         Err(error) if error.code() == &S3ErrorCode::NoSuchUpload => Ok(None),
         Err(error) => Err(error),
@@ -148,20 +148,21 @@ fn normalize_presigned_part_checksums(req: &mut RequestEnvelope, input: &mut Upl
 }
 
 impl DefaultMultipartUsecase {
-    #[instrument(name = "execute_upload_part", level = "debug", skip(self, envelope, input))]
-    #[hotpath::measure(impl_type = "MultipartUsecase")]
-    pub(crate) async fn execute_upload_part_owned(
+    /// Records the gateway audit. The protocol client records its own projected response.
+    pub(crate) async fn execute_upload_part_with_audit(
         &self,
         envelope: RequestEnvelope,
         input: UploadPartWriteInput,
     ) -> S3Result<UploadPartWriteOutput> {
         RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPart, http::StatusCode::OK, |envelope| {
-            self.execute_upload_part_body(envelope, input)
+            self.execute_upload_part_owned(envelope, input)
         })
         .await
     }
 
-    async fn execute_upload_part_body(
+    #[instrument(name = "execute_upload_part", level = "debug", skip(self, req, input))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
+    pub(crate) async fn execute_upload_part_owned(
         &self,
         mut req: RequestEnvelope,
         mut input: UploadPartWriteInput,
@@ -557,7 +558,7 @@ impl DefaultMultipartUsecase {
         };
         let envelope = RequestEnvelope::from_s3s(&req);
         let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
-        let output = self.execute_upload_part_owned(envelope, input).await?;
+        let output = self.execute_upload_part_with_audit(envelope, input).await?;
         let mut response = S3Response::new(UploadPartOutput {
             e_tag: output
                 .e_tag

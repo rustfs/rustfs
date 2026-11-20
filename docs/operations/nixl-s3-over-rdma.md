@@ -157,7 +157,7 @@ stays on the internode HTTP connection; only the data moves over the rails.
   same disk writer as the TCP path (create, or append for later segments),
   checks the declared size on the last segment and flushes. The buffers
   return to the writer's pool only after the node answered.
-- Shard reads and writes require NIXL on both peers. The shard verifier requests the encoded length plus one byte to detect trailing data. Directory walks, scanner requests and format metadata use the control transport, including during first startup.
+- Shard reads and writes require NIXL on both peers. After a non-inline EC:0 upload, the owning peer reads its staged shard locally and returns the verification result over the control channel. Directory walks, scanner requests and format metadata use the control transport, including during first startup.
 - A receive buffer whose request was abandoned (a dropped reader, chunks past
   the end of the file) stays out of the pool for two minutes, longer than
   the serving node's transfer timeout, because the peer may still write it.

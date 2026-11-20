@@ -227,7 +227,9 @@ impl GatewayStack {
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
         let listings = metadata_listing::dialect().map_err(GatewayAssemblyError::MetadataListingDialect)?;
-        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?.dialect(&listings);
+        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?
+            .answer_nul_torrent_keys_as_missing()
+            .dialect(&listings);
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
         let builder = metadata_listing::register(register(OPERATIONS, builder, &backend), &assembly.server_ctx);
         let service = builder.build().map_err(GatewayAssemblyError::Service)?;

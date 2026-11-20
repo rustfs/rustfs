@@ -100,27 +100,13 @@ fn protocol_upload_copy_original_refusal_order() {
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         let probe = crate::app::storage_api::helper::MutationCompletionProbe::install(bucket);
-        let audits = || {
+        let audit_operations = || {
             probe
                 .audits
                 .lock()
                 .expect("audits")
                 .drain(..)
-                .map(|entry| {
-                    (
-                        entry.api.name,
-                        entry.api.bucket,
-                        entry.api.object,
-                        entry.api.status,
-                        entry.api.status_code,
-                        entry.error,
-                        entry.req_header,
-                        entry.resp_header,
-                        entry.req_query,
-                        entry.req_path,
-                        entry.access_key,
-                    )
-                })
+                .map(|entry| entry.api.name)
                 .collect::<Vec<_>>()
         };
         let upload = store
@@ -191,7 +177,11 @@ fn protocol_upload_copy_original_refusal_order() {
             let before_count = copy_count();
             let actual = backend.upload_part_copy(make(), &root).await.expect_err("client refusal");
             assert_eq!(copy_count() - before_count, expected_count);
-            assert_eq!(audits().len(), expected_count as usize);
+            assert_eq!(
+                audit_operations(),
+                vec![Some(rustfs_s3_ops::S3Operation::UploadPartCopy.as_str().to_owned()); expected_count as usize],
+                "audit for case {case}"
+            );
             let actual_facts = error_facts(actual);
             let expected = actual_facts.clone();
             let (code, message, status) = match case {
@@ -434,7 +424,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             .expect("replacement bytes");
         let result = backend
             .owned_multipart_usecase()
-            .execute_upload_part_copy_owned(envelope, multipart::upload_part_copy_input(request).expect("owned input"))
+            .execute_upload_part_copy_with_audit(envelope, multipart::upload_part_copy_input(request).expect("owned input"))
             .await;
         let mut reader = store
             .get_object_reader(destination, "copy-target", None, HeaderMap::new(), &options)
@@ -680,7 +670,7 @@ fn owned_copy_future(
     envelope: crate::app::RequestEnvelope,
     input: UploadPartCopyWriteInput,
 ) -> impl std::future::Future<Output = rustfs_s3_types::S3Result<UploadPartCopyWriteOutput>> + '_ {
-    Box::pin(usecase.execute_upload_part_copy_owned(envelope, input))
+    Box::pin(usecase.execute_upload_part_copy_with_audit(envelope, input))
 }
 
 #[tokio::test]

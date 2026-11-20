@@ -294,7 +294,7 @@ pub struct NsScannerCapabilityRequest {
 /// in `crates/ecstore/docs/internode-transport/`.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
-    /// Whether a stream must declare a nonzero byte limit and may end before that limit.
+    /// Whether shard reads must declare a nonzero byte limit.
     fn requires_bounded_reads(&self) -> bool {
         false
     }

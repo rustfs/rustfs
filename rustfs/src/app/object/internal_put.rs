@@ -22,7 +22,7 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Response, S3Result};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
@@ -213,17 +213,7 @@ impl InternalPutObjectEvent {
         }
     }
 
-    /// Publish the event when `result` is a success; failures publish nothing.
-    pub(super) fn complete<T>(self, result: &S3Result<S3Response<T>>) {
-        if let Ok(response) = result {
-            self.complete_owned(&Ok(()), &response.headers);
-        }
-    }
-
-    pub(super) fn complete_owned<T>(self, result: &rustfs_s3_types::S3Result<T>, headers: &HeaderMap) {
-        if result.is_err() {
-            return;
-        }
+    pub(super) fn publish(self, headers: &HeaderMap) {
         let Self {
             builder,
             notify,
@@ -767,8 +757,7 @@ impl DefaultObjectUsecase {
             if versioned && let Some(version_id) = obj_info.version_id {
                 event = event.version_id(version_id.to_string());
             }
-            let result: S3Result<S3Response<()>> = Ok(S3Response::new(()));
-            event.complete(&result);
+            event.publish(&HeaderMap::new());
         }
         Ok(obj_info)
     }

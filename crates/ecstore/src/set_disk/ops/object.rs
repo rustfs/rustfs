@@ -64,7 +64,9 @@ use super::super::{
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_decode_inline_data_shards, warn,
 };
-use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::bitrot_self_verify::{
+    BitrotSelfVerifyTarget, WrittenBitrotShards, drop_failed_writer_disks, verify_written_bitrot_shards,
+};
 use super::delete_recovery::DeleteRecoveryContext;
 
 const EVENT_SET_DISK_DELETE_OBJECTS_STAGE: &str = "set_disk_delete_objects_stage";
@@ -4697,7 +4699,8 @@ impl SetDisks {
 
         let tmp_dir = Uuid::new_v4().to_string();
 
-        let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
+        let tmp_data_dir = format!("{}/{}", tmp_dir, fi.data_dir.ok_or(Error::FileCorrupt)?);
+        let tmp_object = format!("{tmp_data_dir}/part.1");
 
         let (operation_cancellation, mut commit_cancellation_handoff_tx, cancellation_wait) =
             if let Some(cancellation) = opts.put_object_cancellation.clone() {
@@ -5020,12 +5023,7 @@ impl SetDisks {
                     integrity.part
                 } else {
                     integrity
-                        .write(
-                            &mut shuffle_disks,
-                            bucket,
-                            RUSTFS_META_TMP_BUCKET,
-                            &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
-                        )
+                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_data_dir)
                         .await?
                 })
             } else {
@@ -5132,19 +5130,21 @@ impl SetDisks {
                 verify_written_bitrot_shards(
                     &shuffle_disks,
                     if is_inline_buffer {
-                        Some(parts_metadatas.as_slice())
+                        WrittenBitrotShards::Inline(&parts_metadatas)
                     } else {
-                        None
+                        WrittenBitrotShards::Staged {
+                            directory: &tmp_data_dir,
+                            layout: &parts_metadatas[response_metadata_slot].erasure,
+                            part_size: w_size,
+                        }
                     },
                     BitrotSelfVerifyTarget {
                         operation: "put_object",
                         bucket,
                         object,
                         part_number: None,
-                        volume: RUSTFS_META_TMP_BUCKET,
-                        path: &tmp_object,
                         logical_shard_size,
-                        shard_size,
+                        shard_size: frame_size,
                         write_quorum,
                     },
                 )

@@ -12728,31 +12728,48 @@ impl LocalDisk {
         DiskMetrics::default()
     }
 
-    async fn bitrot_verify(&self, part_path: &PathBuf, part_size: usize, algo: HashAlgorithm, shard_size: usize) -> Result<()> {
+    async fn open_bitrot_reader(&self, part_path: &Path) -> Result<(FileReader, std::fs::Metadata)> {
+        if let Some(resources) = current_resource_unit() {
+            let path = part_path.to_owned();
+            #[cfg(target_os = "linux")]
+            let mount_lease = self.mount_lease.clone();
+            tokio::task::spawn_blocking(move || -> Result<(FileReader, std::fs::Metadata)> {
+                #[cfg(target_os = "linux")]
+                let _mount_lease = mount_lease;
+                #[cfg(test)]
+                run_owned_file_before_open(&path);
+                let file = std::fs::File::open(path).map_err(to_file_error)?;
+                let meta = file.metadata().map_err(to_file_error)?;
+                Ok((Box::new(ResourceFileReader::new(file, resources, None)), meta))
+            })
+            .await
+            .map_err(DiskError::from)?
+        } else {
+            let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+            let meta = file.metadata().await.map_err(to_file_error)?;
+            Ok((Box::new(file), meta))
+        }
+    }
+
+    async fn bitrot_verify(
+        &self,
+        part_path: &Path,
+        part_size: usize,
+        algo: HashAlgorithm,
+        shard_size: usize,
+        read_stall: Duration,
+    ) -> Result<()> {
         let retry_count = bitrot_size_mismatch_retry_count();
         let retry_delay = bitrot_size_mismatch_retry_delay();
 
         for attempt in 0..=retry_count {
-            let (reader, meta): (FileReader, std::fs::Metadata) = if let Some(resources) = current_resource_unit() {
-                let path = part_path.clone();
-                #[cfg(target_os = "linux")]
-                let mount_lease = self.mount_lease.clone();
-                tokio::task::spawn_blocking(move || -> Result<(FileReader, std::fs::Metadata)> {
-                    #[cfg(target_os = "linux")]
-                    let _mount_lease = mount_lease;
-                    #[cfg(test)]
-                    run_owned_file_before_open(&path);
-                    let file = std::fs::File::open(path).map_err(to_file_error)?;
-                    let meta = file.metadata().map_err(to_file_error)?;
-                    Ok((Box::new(ResourceFileReader::new(file, resources, None)), meta))
-                })
-                .await
-                .map_err(DiskError::from)??
+            let open = self.open_bitrot_reader(part_path);
+            let (reader, meta) = if read_stall.is_zero() {
+                open.await?
             } else {
-                let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
-                let meta = file.metadata().await.map_err(to_file_error)?;
-                (Box::new(file), meta)
+                timeout(read_stall, open).await.map_err(|_| DiskError::Timeout)??
             };
+            let reader = StallTimeoutReader::new(reader, read_stall);
             let file_size = usize::try_from(meta.len()).map_err(|_| DiskError::FileCorrupt)?;
 
             match bitrot_verify(reader, file_size, part_size, algo.clone(), shard_size).await {
@@ -12773,6 +12790,7 @@ impl LocalDisk {
                     );
                     tokio::time::sleep(retry_delay).await;
                 }
+                Err(err) if !read_stall.is_zero() && err.kind() == ErrorKind::TimedOut => return Err(DiskError::Timeout),
                 Err(err) if is_bitrot_verification_error(&err) => return Err(DiskError::FileCorrupt),
                 Err(err) => return Err(to_file_error(err).into()),
             }
@@ -15510,6 +15528,13 @@ impl DiskAPI for LocalDisk {
         )
         .map_err(|_| DiskError::FileCorrupt)?
         .unwrap_or_else(|| codec_erasure.shard_size());
+        // Staged writes wait for this scan before publication. Bound each stalled read
+        // independently so a large shard can keep making progress.
+        let read_stall = if volume == RUSTFS_META_TMP_BUCKET {
+            get_object_disk_read_timeout()
+        } else {
+            Duration::ZERO
+        };
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -15532,9 +15557,13 @@ impl DiskAPI for LocalDisk {
                     codec_erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
                     frame_size,
+                    read_stall,
                 )
                 .await
                 .err();
+            if !read_stall.is_zero() && matches!(err, Some(DiskError::Timeout)) {
+                return Err(DiskError::Timeout);
+            }
             resp.results[i] = conv_part_err_to_int(&err);
             if resp.results[i] == CHECK_PART_UNKNOWN
                 && let Some(err) = err
@@ -30330,6 +30359,55 @@ mod test {
         assert_eq!(err.kind(), ErrorKind::TimedOut);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn local_read_timeout_reader_renews_deadline_after_progress() {
+        let (mut tx, rx) = tokio::io::duplex(8);
+        let mut reader = StallTimeoutReader::new(rx, Duration::from_secs(10));
+        let producer = async {
+            for byte in b"abc" {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                tx.write_all(&[*byte]).await.expect("write next byte");
+            }
+            tx.shutdown().await.expect("finish stream");
+        };
+        let mut output = Vec::new();
+        let (_, read) = tokio::join!(producer, reader.read_to_end(&mut output));
+        read.expect("each read made progress within the stall timeout");
+        assert_eq!(output, b"abc");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_disk_verify_file_stalled_staged_shard_returns_timeout() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_str().expect("disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let path = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, "stage/part.1")
+            .expect("staged shard path");
+        std::fs::create_dir_all(path.parent().expect("staging directory")).expect("create staging directory");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
+            .expect("create stalled shard");
+        // A FIFO with an open writer reports length zero but never returns EOF.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("hold FIFO open");
+        let mut fi = FileInfo::new("object", 1, 0);
+        fi.erasure.index = 1;
+        fi.parts.push(ObjectPartInfo {
+            number: 1,
+            ..Default::default()
+        });
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("1"))], async {
+            timeout(Duration::from_secs(8), disk.verify_file(RUSTFS_META_TMP_BUCKET, "stage", &fi)).await
+        })
+        .await;
+        drop(writer);
+        assert!(matches!(result, Ok(Err(DiskError::Timeout))), "stalled verification returned {result:?}");
+    }
+
     #[tokio::test]
     async fn local_read_timeout_reader_with_zero_timeout_stays_pending() {
         let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::ZERO);
@@ -36815,7 +36893,7 @@ mod test {
                     let (resources, gates) = test_resource_units(1);
                     let result = with_optional_resource_unit(
                         Some(resources.with_memory_budget(memory.clone())),
-                        disk.bitrot_verify(&path, payload.len(), algo.clone(), 8),
+                        disk.bitrot_verify(&path, payload.len(), algo.clone(), 8, Duration::ZERO),
                     )
                     .await;
                     if fits {
@@ -36853,7 +36931,7 @@ mod test {
             writer.shutdown().await.expect("complete bitrot frames");
             let path = dir.path().join("part.1");
             std::fs::write(&path, writer.into_inner().into_inner()).expect("write encoded shard");
-            disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size)
+            disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size, Duration::ZERO)
                 .await
                 .expect("fixture verifies before cancellation");
             let mut observations = Vec::new();
@@ -36862,7 +36940,7 @@ mod test {
                     let (resources, gates) = test_resource_units(count);
                     let mut future = Some(Box::pin(with_optional_resource_unit(
                         Some(resources),
-                        disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size),
+                        disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size, Duration::ZERO),
                     )));
                     for step in 0..=resume_step {
                         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -36886,7 +36964,7 @@ mod test {
                     assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
                 }
             }
-            disk.bitrot_verify(&path, payload.len(), algo, shard_size)
+            disk.bitrot_verify(&path, payload.len(), algo, shard_size, Duration::ZERO)
                 .await
                 .expect("cancellation preserves the encoded shard");
             for (count, step, held) in observations {
@@ -37367,7 +37445,10 @@ mod test {
                 match operation {
                     "full" => disk.read_file("test-volume", "shard").await.map(drop),
                     "range" => disk.read_file_stream("test-volume", "shard", 3, 1021).await.map(drop),
-                    "bitrot" => disk.bitrot_verify(&path, 992, HashAlgorithm::HighwayHash256S, 992).await,
+                    "bitrot" => {
+                        disk.bitrot_verify(&path, 992, HashAlgorithm::HighwayHash256S, 992, Duration::ZERO)
+                            .await
+                    }
                     _ => unreachable!("fixed operation list"),
                 }
             }));
