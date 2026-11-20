@@ -12,7 +12,7 @@
 //!
 //! * [`NIXL_AGENT_HEADER`]: its agent name;
 //! * [`NIXL_METADATA_HEADER`]: its agent metadata, base64 (may be omitted on
-//!   later requests once this server has loaded that agent);
+//!   later requests while this server still caches that agent);
 //! * [`NIXL_BUFFER_HEADER`]: `<dram|vram>:<device>:<address>:<length>`, the
 //!   registered buffer the object (or range) lands in from offset 0.
 //!
@@ -29,9 +29,10 @@ use nixl_sys::{Agent, AgentConfig, Backend, MemType, OptArgs, Params, ThreadSync
 
 pub mod devices;
 mod mem;
+mod remotes;
 
 use mem::HostBuffer;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -414,9 +415,6 @@ pub struct NixlServer {
 struct Engine {
     agent: Agent,
     backend: Backend,
-    /// Remote agents loaded so far, by name, with a hash of the metadata that
-    /// was loaded (a client that restarts sends new metadata).
-    remotes: parking_lot::Mutex<HashMap<String, u64>>,
     poll_interval: Duration,
     transfer_timeout: Duration,
 }
@@ -439,6 +437,7 @@ struct Job {
 /// A posted transfer the completion thread is polling.
 struct Pending {
     request: nixl_sys::XferRequest,
+    _remote: Arc<()>,
     /// The remote agent, forgotten if the transfer fails.
     agent: String,
     keep: Option<KeepAlive>,
@@ -497,7 +496,6 @@ impl NixlServer {
         let engine = Arc::new(Engine {
             agent,
             backend,
-            remotes: parking_lot::Mutex::new(HashMap::new()),
             poll_interval: config.poll_interval,
             transfer_timeout: config.transfer_timeout,
         });
@@ -817,42 +815,8 @@ impl NixlServer {
 }
 
 impl Engine {
-    /// Loads the client's agent metadata unless this exact metadata is already loaded.
-    fn ensure_remote(&self, token: &RdmaToken) -> Result<(), NixlError> {
-        let Some(metadata) = &token.metadata else {
-            if self.remotes.lock().contains_key(&token.agent) {
-                return Ok(());
-            }
-            return Err(NixlError::Token(format!(
-                "agent {:?} is unknown to this server; send {NIXL_METADATA_HEADER}",
-                token.agent
-            )));
-        };
-        let hash = metadata_hash(metadata);
-        if self.remotes.lock().get(&token.agent) == Some(&hash) {
-            return Ok(());
-        }
-        // A peer that was loaded before (and dropped after a failed transfer, or
-        // restarted with new metadata) must be invalidated first: NIXL refuses
-        // to load an agent it still holds. For a new agent this is a no-op error.
-        let _ = self.agent.invalidate_remote_md(&token.agent);
-        let loaded = self
-            .agent
-            .load_remote_md(metadata)
-            .map_err(nixl_err("load remote metadata"))?;
-        if loaded != token.agent {
-            return Err(NixlError::Token(format!(
-                "metadata belongs to agent {loaded:?}, request names {:?}",
-                token.agent
-            )));
-        }
-        self.remotes.lock().insert(token.agent.clone(), hash);
-        Ok(())
-    }
-
     /// Posts one transfer; `None` when it completed before returning.
     fn post(&self, op: XferOp, token: &RdmaToken, build: BuildLists) -> Result<Option<nixl_sys::XferRequest>, NixlError> {
-        self.ensure_remote(token)?;
         let (local, remote) = build()?;
         let mut opt_args = OptArgs::new().map_err(nixl_err("opt args"))?;
         opt_args.add_backend(&self.backend).map_err(nixl_err("opt args backend"))?;
@@ -869,17 +833,20 @@ impl Engine {
         Ok(in_progress.then_some(request))
     }
 
-    /// Forgets `agent` after a failed transfer, so the next request reloads its
-    /// metadata and reconnects instead of failing against a peer NIXL dropped.
-    fn forget_remote(&self, agent: &str) {
-        self.remotes.lock().remove(agent);
-    }
-
-    fn admit(&self, job: Job, pending: &mut Vec<Pending>) {
+    fn admit(&self, job: Job, pending: &mut Vec<Pending>, remotes: &mut remotes::RemoteCache) {
+        let lease = match remotes.acquire(&self.agent, &job.token.agent, job.token.metadata.as_deref(), std::time::Instant::now())
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = job.done.send(Err(error));
+                return;
+            }
+        };
         match self.post(job.op, &job.token, job.build) {
             Ok(Some(request)) => pending.push(Pending {
                 request,
-                agent: job.token.agent.clone(),
+                _remote: lease,
+                agent: job.token.agent,
                 keep: Some(job.keep),
                 done: Some(job.done),
                 deadline: std::time::Instant::now() + self.transfer_timeout,
@@ -888,7 +855,7 @@ impl Engine {
                 let _ = job.done.send(Ok(job.keep));
             }
             Err(err) => {
-                self.forget_remote(&job.token.agent);
+                remotes.mark_stale(&job.token.agent);
                 let _ = job.done.send(Err(err));
             }
         }
@@ -902,18 +869,31 @@ impl Engine {
         // alive until the library completes it so its buffers are never
         // reused under a transfer that is still running.
         let mut expired: Vec<Pending> = Vec::new();
+        let mut remotes = remotes::RemoteCache::new(256);
+        let mut next_sweep = std::time::Instant::now() + remotes::SWEEP_INTERVAL;
         let mut idle_polls = 0u32;
         loop {
-            // Take new work: block when nothing is in flight.
+            let now = std::time::Instant::now();
+            if now >= next_sweep {
+                remotes.sweep(&self.agent, now);
+                next_sweep = now + remotes::SWEEP_INTERVAL;
+            }
             if pending.is_empty() && expired.is_empty() {
-                match queue.recv() {
-                    Ok(job) => self.admit(job, &mut pending),
-                    Err(_) => return,
+                use std::sync::mpsc::RecvTimeoutError;
+                let received = if remotes.is_empty() {
+                    queue.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                } else {
+                    queue.recv_timeout(next_sweep.saturating_duration_since(now))
+                };
+                match received {
+                    Ok(job) => self.admit(job, &mut pending, &mut remotes),
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
             loop {
                 match queue.try_recv() {
-                    Ok(job) => self.admit(job, &mut pending),
+                    Ok(job) => self.admit(job, &mut pending, &mut remotes),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         if pending.is_empty() && expired.is_empty() {
@@ -949,12 +929,19 @@ impl Engine {
                     Err(err) => {
                         progressed = true;
                         let mut transfer = pending.swap_remove(index);
-                        self.forget_remote(&transfer.agent);
+                        remotes.mark_stale(&transfer.agent);
                         Self::finish(&mut transfer, Err(nixl_err("transfer status")(err)));
                     }
                 }
             }
-            expired.retain(|transfer| matches!(self.agent.get_xfer_status(&transfer.request), Ok(XferStatus::InProgress)));
+            expired.retain(|transfer| match self.agent.get_xfer_status(&transfer.request) {
+                Ok(XferStatus::InProgress) => true,
+                Ok(XferStatus::Success) => false,
+                Err(_) => {
+                    remotes.mark_stale(&transfer.agent);
+                    false
+                }
+            });
             if progressed {
                 idle_polls = 0;
             } else {
