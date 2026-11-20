@@ -422,9 +422,10 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             )
             .await
             .expect("replacement bytes");
+        let (_, input) = multipart::prepare_upload_part_copy(request).expect("owned input");
         let result = backend
             .owned_multipart_usecase()
-            .execute_upload_part_copy_with_audit(envelope, multipart::upload_part_copy_input(request).expect("owned input"))
+            .execute_upload_part_copy_with_audit(envelope, input)
             .await;
         let mut reader = store
             .get_object_reader(destination, "copy-target", None, HeaderMap::new(), &options)
@@ -509,10 +510,12 @@ fn protocol_upload_copy_input_matches_original_codec() {
                 gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(make(), source)
                     .map_err(|error| conversion_error("UploadPartCopy input", error))
             });
-        let actual = multipart::upload_part_copy_input(make());
+        let actual = multipart::prepare_upload_part_copy(make());
         match (actual, expected) {
             (Err(actual), Err(expected)) => assert_eq!(error_facts(actual), error_facts(expected)),
-            (Ok(actual), Ok(expected)) => {
+            (Ok((uri, actual)), Ok(expected)) => {
+                assert_eq!(uri.path(), "/bucket/copy-target");
+                assert_eq!(uri.query(), Some("partNumber=1&uploadId=upload%20%3F%26"));
                 let crate::app::multipart_usecase::UploadPartTarget::Legacy { bucket, key, upload_id } = actual.target else {
                     panic!("protocol client must use the legacy upload target")
                 };
@@ -726,7 +729,8 @@ async fn protocol_upload_copy_capabilities_precede_part_validation() {
             .err()
             .map(S3Error::from)
             .expect("legacy refusal");
-        let actual = owned_copy_future(&usecase, envelope, multipart::upload_part_copy_input(make()).expect("owned input"))
+        let (_, input) = multipart::prepare_upload_part_copy(make()).expect("owned input");
+        let actual = owned_copy_future(&usecase, envelope, input)
             .await
             .err()
             .expect("owned refusal");

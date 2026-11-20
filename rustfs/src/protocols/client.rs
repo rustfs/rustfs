@@ -1169,18 +1169,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
-        let input = multipart::upload_part_copy_input(input)?;
-        let part_number = input.part_number;
-        let part_number = part_number.to_string();
-        let uri = build_object_uri(
-            &bucket,
-            &key,
-            &[
-                ("partNumber", Some(part_number.as_str())),
-                ("uploadId", Some(upload_id.as_str())),
-            ],
-        )?;
+        let (uri, input) = multipart::prepare_upload_part_copy(input)?;
 
         let envelope = Self::create_envelope(
             Method::PUT,
