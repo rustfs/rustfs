@@ -27,7 +27,7 @@ const CONTENT_SHA256_MISMATCH_MESSAGE: &str = "The provided 'x-amz-content-sha25
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
 const SLOW_DOWN_READ_CODE: &str = "SlowDownRead";
-const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please reduce your request rate";
+const SLOW_DOWN_READ_MESSAGE: &str = "The object could not be read from storage.";
 const NAMESPACE_LOCK_TIMEOUT_CAUSE: &str = "namespace_lock_timeout";
 const RPC_ADMISSION_METADATA_KEY: &str = "x-rustfs-rpc-admission";
 const RPC_REPLAY_ADMISSION_METADATA_VALUE: &str = "replay-cache";
@@ -2740,12 +2740,12 @@ mod tests {
     }
 
     #[test]
-    fn read_quorum_failure_matches_minio_slow_down_read_response() {
+    fn read_quorum_failure_preserves_slow_down_read_code_and_status() {
         for error in [
             StorageError::ErasureReadQuorum,
             StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
         ] {
-            // MinIO-compatible GET object-read response.
+            // MinIO-compatible code and status for GET object reads.
             assert!(is_object_read_unavailable(&error));
             let api_error = slow_down_read_api_error(error);
             assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
