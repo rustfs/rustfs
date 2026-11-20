@@ -507,56 +507,34 @@ async fn keystone_stack_discards_stale_established_and_owned_payloads() {
 }
 
 #[tokio::test]
-async fn keystone_outer_validation_precedes_non_s3_refusal_and_legacy_stays_selected() {
-    use crate::config::S3Stack;
-    use crate::server::stack::select_stack;
-    for stack in [S3Stack::Gateway, S3Stack::Legacy] {
-        let stub = KeystoneStub::new();
-        for (method, path) in [
-            (Method::GET, "/rustfs/admin/v3/info"),
-            (Method::POST, "/?Action=AssumeRole&Version=2011-06-15"),
-        ] {
-            for header in ["x-auth-token", "x-storage-token"] {
-                for (token, expected) in [
-                    ("invalid", StatusCode::UNAUTHORIZED),
-                    (
-                        "admin",
-                        if stack == S3Stack::Gateway {
-                            StatusCode::FORBIDDEN
-                        } else {
-                            StatusCode::OK
-                        },
-                    ),
-                ] {
-                    let legacy = tower::service_fn(|_request: Request<Empty<Bytes>>| async {
-                        Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::from_static(b"legacy"))))
-                    });
-                    let gateway = tower::service_fn(|_request: Request<Empty<Bytes>>| async {
-                        Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::from_static(
-                            b"gateway",
-                        ))))
-                    });
-                    let edge = select_stack(stack, legacy, || Ok::<_, std::convert::Infallible>(gateway)).unwrap();
-                    let mut builder = request(method.clone(), path).header(header, token);
-                    if method == Method::POST {
-                        builder = builder.header(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded");
-                    }
-                    let request = builder.body(Empty::new()).unwrap();
-                    let response = KeystoneAuthLayer::new(Some(Arc::clone(&stub.provider)))
-                        .layer(edge)
-                        .oneshot(request)
-                        .await
-                        .unwrap();
-                    assert_eq!(response.status(), expected, "{stack:?} {header} {token} {path}");
-                    let body = response.into_body().collect().await.unwrap().to_bytes();
-                    if expected == StatusCode::OK {
-                        assert_eq!(body, "legacy");
-                    }
+async fn keystone_outer_validation_precedes_non_s3_refusal() {
+    use crate::server::stack::S3StackService;
+    let stub = KeystoneStub::new();
+    for (method, path) in [
+        (Method::GET, "/rustfs/admin/v3/info"),
+        (Method::POST, "/?Action=AssumeRole&Version=2011-06-15"),
+    ] {
+        for header in ["x-auth-token", "x-storage-token"] {
+            for (token, expected) in [("invalid", StatusCode::UNAUTHORIZED), ("admin", StatusCode::FORBIDDEN)] {
+                let gateway = tower::service_fn(|_request: Request<Empty<Bytes>>| async {
+                    Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::from_static(b"gateway"))))
+                });
+                let edge = S3StackService::new(gateway);
+                let mut builder = request(method.clone(), path).header(header, token);
+                if method == Method::POST {
+                    builder = builder.header(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded");
                 }
+                let request = builder.body(Empty::new()).unwrap();
+                let response = KeystoneAuthLayer::new(Some(Arc::clone(&stub.provider)))
+                    .layer(edge)
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{header} {token} {path}");
             }
         }
-        stub.finish();
     }
+    stub.finish();
 }
 
 #[tokio::test]

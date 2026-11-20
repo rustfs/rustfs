@@ -56,12 +56,10 @@ required-features = ["swift"]
 name = "swift_object_integration_test"
 required-features = ["swift"]
 
-# Starts an embedded server on the gateway stack, which only a build with the
-# feature can select.
+# Starts an embedded server on the gateway stack.
 [[test]]
 name = "embedded_gateway_stack_test"
 path = "tests/embedded_gateway_stack_test/main.rs"
-required-features = ["gateway-stack"]
 
 [features]
 internode-transport = ["rustfs-ecstore/internode-transport", "rustfs-rio/internode-transport"]
@@ -77,19 +75,12 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
-# The debug-only E2E binary also carries the gateway S3 stack, so the gateway smoke
-# lane runs the same artifact as the legacy one with RUSTFS_S3_STACK as its only change.
-e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks", "gateway-stack"]
+e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
-# The rustfs-gateway S3 stack, selected at startup with RUSTFS_S3_STACK=gateway
-# (rustfs/backlog#2734). Under construction: off by default and never enabled in a
-# release build; the stack refuses to compile without debug assertions, and
-# `scripts/check_connect_release_boundary.py` keeps every release-reachable feature from enabling it.
-gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter", "dep:rustfs-gateway-core", "dep:rustfs-gateway-dialect-rustfs-admin"]
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
 cuobject = ["dep:rustfs-cuobject", "rustfs-cuobject/server"]
 # NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
@@ -279,10 +270,10 @@ rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
-rustfs-gateway = { workspace = true, optional = true }
-rustfs-gateway-adapter = { workspace = true, optional = true }
-rustfs-gateway-core = { workspace = true, optional = true }
-rustfs-gateway-dialect-rustfs-admin = { workspace = true, optional = true }
+rustfs-gateway = { workspace = true }
+rustfs-gateway-adapter = { workspace = true }
+rustfs-gateway-core = { workspace = true }
+rustfs-gateway-dialect-rustfs-admin = { workspace = true }
 rustfs-gateway-stream = { workspace = true }
 rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
 rustfs-protos = { workspace = true }
@@ -429,6 +420,7 @@ object = { workspace = true, optional = true, features = ["read", "std", "elf"] 
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
 
 [dev-dependencies]
+h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }

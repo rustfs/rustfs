@@ -152,14 +152,12 @@ pub(crate) use super::sse::{
 };
 
 pub(crate) mod access_consumer {
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access_owned;
     pub(crate) use super::super::access_owned::bucket_core::requested_bucket_force_delete;
     pub(crate) use super::super::access_owned::object_commit::CopySourceObject;
     pub(crate) use super::super::access_owned::object_commit::authorize_copy_object_tags;
     pub(crate) use super::super::access_owned::object_read::authorize_get_object;
     pub(crate) use super::super::authorization::ObjectTagConditions;
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
     pub(crate) use super::super::authorization::{
         AuthorizationRequest, has_bypass_governance_header, recursive_force_delete_has_authenticated_caller,
@@ -175,7 +173,6 @@ pub(crate) mod access_consumer {
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards,
     };
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::authorization::{
         authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
     };
@@ -490,6 +487,7 @@ pub(crate) mod tonic_service_consumer {
 
 #[cfg(test)]
 pub(crate) mod test_consumer {
+    pub(crate) use super::super::access_owned::object_read::authorize_head_object;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::TestAuthorizationHooks;
         pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
@@ -536,7 +534,6 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
-    #[cfg(feature = "gateway-stack")]
     pub(crate) use rustfs_ecstore::api::compression::DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES;
     pub(crate) use rustfs_ecstore::api::compression::{
         MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
@@ -867,6 +864,7 @@ pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersio
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
+#[cfg(test)]
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;

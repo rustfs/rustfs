@@ -359,12 +359,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
     use time::OffsetDateTime;
 
-    /// An in-memory authorization backend. Regular-user policy tests use only
-    /// the cache; session fixtures can also publish an authoritative parent
-    /// revision without introducing a cluster-backed store.
+    /// An in-memory test store with the small authoritative revision surface
+    /// needed by derived-session authorization. All other persistence methods
+    /// remain unreachable in these gate tests.
     #[derive(Clone, Default)]
     struct EmptyStore {
-        regular_user: Option<UserIdentity>,
+        regular_users: Arc<std::sync::RwLock<HashMap<String, (UserIdentity, String)>>>,
     }
 
     #[async_trait::async_trait]
@@ -373,11 +373,7 @@ mod tests {
             false
         }
         async fn regular_user_revision(&self, name: &str) -> rustfs_iam::error::Result<Option<(UserIdentity, String)>> {
-            Ok(self
-                .regular_user
-                .as_ref()
-                .filter(|identity| identity.credentials.access_key == name)
-                .map(|identity| (identity.clone(), "test-parent-revision".to_owned())))
+            Ok(self.regular_users.read().expect("test store lock").get(name).cloned())
         }
         async fn save_iam_config<Item: Serialize + Send>(
             &self,
@@ -865,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_service_mutation_defaults_and_session_boundary() {
-        let mut store = iam_cache_with_empty_store();
+        let store = iam_cache_with_empty_store();
         let now = OffsetDateTime::now_utc();
         let user = Credentials {
             access_key: "self-service-user".into(),
@@ -873,10 +869,15 @@ mod tests {
             status: "on".into(),
             ..Default::default()
         };
-        store.api.regular_user = Some(UserIdentity::new(user.clone()));
         store
             .cache
             .add_or_update_user(&user.access_key, &UserIdentity::new(user.clone()), now);
+        store
+            .api
+            .regular_users
+            .write()
+            .expect("test store lock")
+            .insert(user.access_key.clone(), (UserIdentity::new(user.clone()), "self-service".into()));
         store
             .cache
             .add_or_update_user_policy(&user.access_key, &MappedPolicy::new(""), now);

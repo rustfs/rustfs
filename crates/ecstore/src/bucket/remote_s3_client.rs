@@ -1071,11 +1071,9 @@ mod tests {
     }
 
     fn signing_time(headers: &[(String, String)]) -> jiff::Timestamp {
-        let datetime = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%SZ", recorded_header(headers, "x-amz-date"))
-            .expect("SDK signing timestamp must use the SigV4 format");
-        jiff::tz::Offset::UTC
-            .to_timestamp(datetime)
-            .expect("SigV4 signing timestamps use UTC")
+        let value = recorded_header(headers, "x-amz-date").trim_end_matches('Z');
+        jiff::Timestamp::strptime("%Y%m%dT%H%M%S%z", format!("{value}+0000"))
+            .expect("SDK signing timestamp must use the SigV4 format")
     }
 
     impl SmithyHttpConnector for ClockSkewConnector {

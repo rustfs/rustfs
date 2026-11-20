@@ -1032,16 +1032,9 @@ async fn test_webhook_metadata_mutations_keep_verified_bucket_identity() -> Test
     init_logging();
     let (endpoint, mut rx, collector) = spawn_event_collector().await?;
     let allowed_origin = endpoint_origin(&endpoint)?;
-    let stack = std::env::var("RUSTFS_S3_STACK").unwrap_or_else(|_| "legacy".to_string());
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(
-        vec![],
-        &[
-            (ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str()),
-            ("RUSTFS_S3_STACK", stack.as_str()),
-        ],
-    )
-    .await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str())])
+        .await?;
     enable_notify_module(&env).await?;
     let target = "metadata-events";
     configure_webhook_target(&env, target, &endpoint).await?;

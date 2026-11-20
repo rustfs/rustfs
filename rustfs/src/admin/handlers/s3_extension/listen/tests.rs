@@ -205,6 +205,12 @@ fn listen_notification_streams_close_after_identity_policy_or_bucket_revocation(
             )
             .await
             .expect("listener");
+            let parent_credentials = rustfs_credentials::Credentials {
+                access_key: key.clone(),
+                secret_key: "listen-user-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            };
             let policy = serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow",
                 "Action":["s3:ListenNotification","s3:ListenBucketNotification"],"Resource":"arn:aws:s3:::*"}]});
             iam.set_policy(
@@ -227,8 +233,7 @@ fn listen_notification_streams_close_after_identity_policy_or_bucket_revocation(
                 let mut cred = rustfs_policy::auth::get_new_credentials_with_metadata(&claims, "listen-root-secret")
                     .expect("signed temporary credentials");
                 cred.parent_user = key.clone();
-                let parent = iam.check_key(&key).await.expect("parent lookup").0.expect("parent identity");
-                iam.set_temp_user_from_parent(&cred, &parent.credentials)
+                iam.set_temp_user_from_parent(&cred, &parent_credentials)
                     .await
                     .expect("temporary listener");
                 Some(cred)

@@ -1200,7 +1200,6 @@ mod tests {
                     let response = result.expect("verified key completes and replays");
                     assert!(response.checksum_sha256.is_some(), "verified key retains checksum response");
                     assert_eq!(response.sse_customer_key_md5.as_deref(), Some(customer_md5));
-                    #[cfg(feature = "gateway-stack")]
                     {
                         use rustfs_gateway::{Limits, MetaView, OperationCodec, TargetKind, WireRequest};
                         let request = http::Request::builder()

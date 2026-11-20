@@ -27,7 +27,6 @@ use crate::app::storage_api::object_usecase::helper::OperationHelper;
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::error::ApiError;
 use http::{HeaderMap, StatusCode};
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::{GetObjectAclInput, PutObjectAclInput};
 use rustfs_gateway_types::dto::{GetObjectAclOutput, Grant, Grantee, Permission, PutObjectAclOutput, Type};
 use rustfs_s3_ops::S3Operation;
@@ -40,7 +39,6 @@ impl ObjectMetaUsecase {
     ///
     /// `InternalError` before the store is up; the store's refusal (`NoSuchKey`, `NoSuchVersion`,
     /// `NoSuchBucket`) when the object does not exist.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_get_object_acl(
         &self,
         envelope: RequestEnvelope,
@@ -72,7 +70,6 @@ impl ObjectMetaUsecase {
     ///
     /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up;
     /// the store's refusal when the object does not exist; `NotImplemented` for XML grants.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_put_object_acl(
         &self,
         envelope: RequestEnvelope,

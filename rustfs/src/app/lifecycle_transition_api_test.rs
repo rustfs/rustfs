@@ -79,3 +79,12 @@ mod object_lock;
 mod put;
 mod restore;
 mod transition;
+
+/// PutObject through its test seam, from a test's s3s fixture request.
+async fn put_through_seam(
+    usecase: &DefaultObjectUsecase,
+    req: S3Request<PutObjectInput>,
+) -> rustfs_s3_types::S3Result<crate::app::object_usecase::PutObjectWriteOutput> {
+    let (envelope, input) = crate::app::object_usecase::PutObjectWriteInput::from_test_request(req);
+    crate::app::test_seams::put_object(usecase, envelope, input).await
+}

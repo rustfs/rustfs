@@ -39,9 +39,7 @@ use crate::error::ApiError;
 use http::{HeaderMap, StatusCode};
 use metrics::{counter, histogram};
 use rustfs_gateway_types::cors_tagging::PersistedTag;
-#[cfg(feature = "gateway-stack")]
 use rustfs_gateway_types::dto::PutObjectTaggingInput;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::{DeleteObjectTaggingInput, GetObjectTaggingInput};
 use rustfs_gateway_types::dto::{DeleteObjectTaggingOutput, GetObjectTaggingOutput, PutObjectTaggingOutput, Tag};
 use rustfs_s3_ops::S3Operation;
@@ -68,7 +66,6 @@ impl ObjectMetaUsecase {
     /// `MethodNotAllowed` for a Veeam SOSAPI system object or a named delete marker; `NoSuchKey` for
     /// a missing object or a current delete marker; `NoSuchVersion` for a missing named version;
     /// `InvalidArgument` for a malformed version id; `InternalError` before the store is up.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_get_object_tagging(
         &self,
         envelope: RequestEnvelope,
@@ -171,7 +168,6 @@ impl ObjectMetaUsecase {
     ///
     /// Returns `InvalidTag` for an invalid tag set, a refusal for reserved objects, or the
     /// storage error when the tags cannot be written.
-    #[cfg(feature = "gateway-stack")]
     pub async fn execute_put_object_tagging(
         &self,
         envelope: RequestEnvelope,
@@ -298,7 +294,6 @@ impl ObjectMetaUsecase {
     ///
     /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InvalidRequest` for a reserved table
     /// catalog object; `InternalError` before the store is up; the store's refusal otherwise.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_delete_object_tagging(
         &self,
         envelope: RequestEnvelope,

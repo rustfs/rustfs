@@ -57,7 +57,7 @@ pub(crate) use storage_api::{
     BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_WEBSITE_CONFIG,
     BucketBandwidthMonitor, BucketMetadata, BucketVersioningSys, CheckPartsResp, CollectMetricsOpts, DEFAULT_READ_BUFFER_SIZE,
     DailyAllTierStats, DeleteOptions, DiskError, DiskInfo, DiskInfoOptions, DiskResult, DiskStore, DynReader, DynReplicationPool,
-    ECStore, Endpoint, EndpointServerPools, Error, EventArgs, ExpiryState, FS, FileInfoVersions, FileReader, FileWriter,
+    ECStore, Endpoint, EndpointServerPools, Error, EventArgs, ExpiryState, FileInfoVersions, FileReader, FileWriter,
     GetObjectReader, HashReader, LocalPeerS3Client, MetricType, NotificationSys, ObjectInfo, ObjectLockBlockReason,
     ObjectOptions, ObjectPartInfo, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PolicySys, PutObjReader, QuotaError, RUSTFS_META_BUCKET,
     RawFileInfo, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, ReplicationStats, ReplicationStatusType, Result,

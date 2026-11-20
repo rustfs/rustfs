@@ -25,7 +25,6 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) bucket: String,
     pub(crate) key: String,
     pub(crate) body: Option<Body>,
-    #[cfg(feature = "gateway-stack")]
     pub(crate) post_archive: Option<super::post_body::PreflightedPostArchive>,
     pub(crate) frame_trailers: Option<std::sync::Arc<super::native_body::FrameTrailers>>,
     pub(crate) trailing_headers: Option<SharedTrailerSource>,
@@ -63,7 +62,7 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) checksum_crc64nvme: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct PutObjectWriteOutput {
     pub(crate) e_tag: Option<String>,
     pub(crate) version_id: Option<String>,
@@ -83,10 +82,20 @@ pub(crate) struct PutObjectWriteOutput {
 
 impl PutObjectWriteInput {
     /// Gateway frames publish to the same source that checksum readers observe.
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn capture_frame_trailers(&mut self) {
         let trailers = std::sync::Arc::new(super::native_body::FrameTrailers::default());
         self.frame_trailers = Some(trailers.clone());
         self.trailing_headers = Some(trailers);
+    }
+}
+
+#[cfg(test)]
+impl PutObjectWriteInput {
+    /// A test's s3s fixture request as the envelope and input a gateway handler hands the use case.
+    pub(crate) fn from_test_request(
+        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::PutObjectInput>,
+    ) -> (crate::app::RequestEnvelope, Self) {
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        (envelope, Self::from_legacy(req.input, req.trailing_headers))
     }
 }

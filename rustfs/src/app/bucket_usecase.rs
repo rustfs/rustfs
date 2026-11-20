@@ -121,7 +121,6 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 mod accelerate;
 mod acl;
 mod core;
-#[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
 #[cfg(test)]

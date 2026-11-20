@@ -14854,17 +14854,11 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            // Announce the exact window before reading it. Kernel
-                            // readahead otherwise sizes its first request from the
-                            // read size: a small window at offset 0 pulls several
-                            // times its size, and a multi-MiB read is split into
-                            // serial readahead chunks. Disable adaptive readahead on
-                            // this per-window descriptor before WILLNEED submits the
-                            // requested span. A pending or ignored prefetch hint must
-                            // not let pread extend the window. Both hints are advisory.
+                            // Preload the requested window before reading it. Kernel
+                            // readahead is advisory and may still extend past the
+                            // window, so the tail is reclaimed after the read below.
                             #[cfg(target_os = "linux")]
                             if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
-                                let _ = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random);
                                 let _ = rustix::fs::fadvise(
                                     &file,
                                     start,
@@ -14886,6 +14880,23 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                                     return Err(DiskError::FileCorrupt);
                                 }
                                 total += nbytes;
+                            }
+                            // Keep a cold shard window from evicting unrelated data
+                            // when the kernel over-reads. The requested tail page is
+                            // retained because its final bytes may share a page with
+                            // the readahead range.
+                            #[cfg(target_os = "linux")]
+                            if let Ok(page) = mmap_page_size() {
+                                let aligned_end = end
+                                    .checked_add(page.saturating_sub(1))
+                                    .map(|value| value / page * page)
+                                    .unwrap_or(end);
+                                if aligned_end < meta.len()
+                                    && let Some(reclaim_len) = std::num::NonZeroU64::new(meta.len() - aligned_end)
+                                {
+                                    let _ =
+                                        rustix::fs::fadvise(&file, aligned_end, Some(reclaim_len), rustix::fs::Advice::DontNeed);
+                                }
                             }
                             Ok::<_, DiskError>(())
                         }
@@ -15712,9 +15723,9 @@ impl DiskAPI for LocalDisk {
         let source_owner = self
             .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
             .await?;
-        let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
         let (src_volume_dir, src_file_path) = self.io_get_bucket_and_object_path(src_volume, src_path)?;
         let (dst_volume_dir, dst_file_path) = self.io_get_bucket_and_object_path(dst_volume, dst_path)?;
+        let admission = self.multipart_source_admission_after_validated_part_path(dst_volume, dst_path)?;
         if !skip_access_checks(src_volume) {
             super::fs::access_std(&src_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
         }
@@ -16000,29 +16011,10 @@ impl DiskAPI for LocalDisk {
                 };
 
                 let prepare_result = (|| -> std::io::Result<(bool, bool)> {
-                    let old_data_absent = staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT);
-                    let old_meta_absent = staging_path.join(PART_TRANSACTION_OLD_META_ABSENT);
-                    let had_old_data = snapshot_part_transaction_file(
-                        &dst_file_path,
-                        txn_parent_fd.as_deref(),
-                        &staging_path.join(PART_TRANSACTION_OLD_DATA),
-                        txn_dir_fd.as_deref(),
-                        PART_TRANSACTION_OLD_DATA,
-                        &old_data_absent,
-                        PART_TRANSACTION_OLD_DATA_ABSENT,
-                        None,
-                    )?;
-                    let had_old_meta = snapshot_part_transaction_file(
-                        &dst_meta_path,
-                        txn_parent_fd.as_deref(),
-                        &staging_path.join(PART_TRANSACTION_OLD_META),
-                        txn_dir_fd.as_deref(),
-                        PART_TRANSACTION_OLD_META,
-                        &old_meta_absent,
-                        PART_TRANSACTION_OLD_META_ABSENT,
-                        (!had_old_data).then_some((PART_TRANSACTION_OLD_DATA_ABSENT, old_data_absent.as_path())),
-                    )?;
-
+                    // Create new.meta first inside the private staging directory (which is
+                    // published atomically by rename_in_same_dir_fd below) so absent old-part
+                    // markers can share its immutable inode via linkat instead of allocating
+                    // a second inode with openat(O_CREAT) + close.
                     let new_meta_path = staging_path.join(PART_TRANSACTION_NEW_META);
                     let mut new_meta = create_new_in_dir_fd(txn_dir_fd.as_deref(), PART_TRANSACTION_NEW_META, &new_meta_path)?;
                     std::io::Write::write_all(&mut new_meta, &meta)?;
@@ -16039,6 +16031,30 @@ impl DiskAPI for LocalDisk {
                         PART_TRANSACTION_PUBLISH_META,
                         &staging_path.join(PART_TRANSACTION_PUBLISH_META),
                     );
+
+                    let old_data_absent = staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT);
+                    let old_meta_absent = staging_path.join(PART_TRANSACTION_OLD_META_ABSENT);
+                    let absent_link_source = Some((PART_TRANSACTION_NEW_META, new_meta_path.as_path()));
+                    let had_old_data = snapshot_part_transaction_file(
+                        &dst_file_path,
+                        txn_parent_fd.as_deref(),
+                        &staging_path.join(PART_TRANSACTION_OLD_DATA),
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_OLD_DATA,
+                        &old_data_absent,
+                        PART_TRANSACTION_OLD_DATA_ABSENT,
+                        absent_link_source,
+                    )?;
+                    let had_old_meta = snapshot_part_transaction_file(
+                        &dst_meta_path,
+                        txn_parent_fd.as_deref(),
+                        &staging_path.join(PART_TRANSACTION_OLD_META),
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_OLD_META,
+                        &old_meta_absent,
+                        PART_TRANSACTION_OLD_META_ABSENT,
+                        absent_link_source,
+                    )?;
                     let sync_overwrite_backup = durability.syncs_recovery_protocol_state() && (had_old_data || had_old_meta);
                     if sync_overwrite_backup {
                         os::fsync_directory_handle_std(&staging_path, txn_dir_fd.as_deref())?;
@@ -21713,6 +21729,108 @@ mod test {
                 .expect("old part metadata should be restored"),
             Bytes::from_static(b"old metadata")
         );
+    }
+
+    #[tokio::test]
+    async fn test_part_transaction_rolls_back_first_time_part_via_absent_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, "tmp").await;
+        ensure_test_volume(&disk, "bucket").await;
+
+        let payload = Bytes::from_static(b"new data");
+        let meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all("tmp", "upload/part.1", payload)
+            .await
+            .expect("new part should be staged");
+
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone())
+            .await
+            .expect("part transaction should be prepared");
+
+        let txn_rel = crate::disk::part_transaction_path("object/part.1");
+        let txn_dir = disk.io_get_object_open_path("bucket", &txn_rel).expect("txn path");
+        let new_meta_file = txn_dir.join(PART_TRANSACTION_NEW_META);
+        let old_data_absent_file = txn_dir.join(PART_TRANSACTION_OLD_DATA_ABSENT);
+        let old_meta_absent_file = txn_dir.join(PART_TRANSACTION_OLD_META_ABSENT);
+        assert!(new_meta_file.is_file());
+        assert!(old_data_absent_file.is_file());
+        assert!(old_meta_absent_file.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let probe_src = dir.path().join("hardlink-probe.src");
+            let probe_dst = dir.path().join("hardlink-probe.dst");
+            std::fs::write(&probe_src, b"probe").expect("write hardlink probe");
+            let hardlink_supported = std::fs::hard_link(&probe_src, &probe_dst).is_ok();
+            let _ = std::fs::remove_file(&probe_dst);
+            let _ = std::fs::remove_file(&probe_src);
+            let new_stat = std::fs::symlink_metadata(&new_meta_file).expect("new.meta stat");
+            let data_absent_stat = std::fs::symlink_metadata(&old_data_absent_file).expect("old.data.absent stat");
+            let meta_absent_stat = std::fs::symlink_metadata(&old_meta_absent_file).expect("old.meta.absent stat");
+            if hardlink_supported {
+                assert_eq!((data_absent_stat.dev(), data_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
+                assert_eq!((meta_absent_stat.dev(), meta_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
+                assert_eq!(data_absent_stat.len(), meta.len() as u64);
+                assert_eq!(meta_absent_stat.len(), meta.len() as u64);
+            } else {
+                assert_eq!(data_absent_stat.len(), 0);
+                assert_eq!(meta_absent_stat.len(), 0);
+            }
+        }
+        assert!(
+            disk.read_all("bucket", &format!("{txn_rel}/{PART_TRANSACTION_OLD_META_ABSENT}"))
+                .await
+                .is_ok(),
+            "coordinator recovery reads old.meta.absent to detect first-time part transaction"
+        );
+
+        disk.rename_part("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone())
+            .await
+            .expect("part publication should succeed");
+        disk.settle_part_transaction("bucket", "object/part.1", PartTransactionAction::Rollback)
+            .await
+            .expect("part transaction should roll back");
+
+        assert!(matches!(disk.read_all("bucket", "object/part.1").await, Err(DiskError::FileNotFound)));
+        assert!(matches!(
+            disk.read_all("bucket", "object/part.1.meta").await,
+            Err(DiskError::FileNotFound)
+        ));
+        assert!(!txn_dir.exists());
+
+        // Asymmetric state: old data exists without old metadata.
+        disk.write_all("tmp", "upload/part.1", Bytes::from_static(b"new data 2"))
+            .await
+            .expect("stage replacement part");
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"orphan old data"))
+            .await
+            .expect("stage orphan old data");
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", meta)
+            .await
+            .expect("prepare with old data only");
+        assert!(txn_dir.join(PART_TRANSACTION_OLD_DATA).is_file());
+        assert!(txn_dir.join(PART_TRANSACTION_OLD_META_ABSENT).is_file());
+        disk.settle_part_transaction("bucket", "object/part.1", PartTransactionAction::Rollback)
+            .await
+            .expect("rollback asymmetric part transaction");
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1").await.expect("old data restored"),
+            Bytes::from_static(b"orphan old data")
+        );
+        assert!(matches!(
+            disk.read_all("bucket", "object/part.1.meta").await,
+            Err(DiskError::FileNotFound)
+        ));
     }
 
     #[tokio::test]

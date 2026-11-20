@@ -2021,7 +2021,6 @@ impl DefaultObjectUsecase {
         if envelope.post_object().is_some() && !envelope.is_gateway_post() {
             return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
         }
-        #[cfg(feature = "gateway-stack")]
         let input = if envelope.is_gateway_post() {
             let mut input = input;
             let archive = input
@@ -2048,10 +2047,6 @@ impl DefaultObjectUsecase {
             }
             input
         };
-        #[cfg(not(feature = "gateway-stack"))]
-        if envelope.is_gateway_post() {
-            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
-        }
         Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 
@@ -2834,13 +2829,21 @@ impl DefaultObjectUsecase {
     }
 }
 
-#[cfg(feature = "gateway-stack")]
 #[path = "extract/post_archive_preflight.rs"]
 pub(super) mod post_archive_preflight;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Archive extraction through the owned entry point the gateway handler calls, its error in
+    /// the s3s form these tests compare.
+    async fn extract_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
+        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
+        Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+    }
     use crate::app::storage_api::s3::StdError;
     use crate::app::storage_api::s3::dto::{ObjectLockRetentionMode, StreamingBlob};
     use http::{HeaderMap, HeaderName, HeaderValue};
@@ -3708,8 +3711,7 @@ mod tests {
         request
             .headers
             .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
-        let error = DefaultObjectUsecase::with_context(Some(context))
-            .execute_put_object_extract(request)
+        let error = extract_owned(&DefaultObjectUsecase::with_context(Some(context)), request)
             .await
             .expect_err("a bad payload digest must reject the archive request");
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
@@ -3792,7 +3794,7 @@ mod tests {
                 .expect("extract request");
             let mut request = build_request(input, Method::PUT);
             request.extensions.insert(ReqInfo::default());
-            let result = Box::pin(usecase.execute_put_object_extract(request)).await;
+            let result = Box::pin(extract_owned(&usecase, request)).await;
             if explicit_version && !replicate {
                 assert_eq!(
                     result
@@ -3896,7 +3898,7 @@ mod tests {
                     .expect("allowed member exists");
                 assert_eq!(info.size, 1);
             } else {
-                assert_eq!(result.err().expect("IAM must deny the member").code().as_str(), "AccessDenied");
+                assert_eq!(result.expect_err("IAM must deny the member").code().as_str(), "AccessDenied");
                 if member == "denied-existing" {
                     let after = store
                         .get_object_info(&bucket, member, &options)
@@ -4006,7 +4008,7 @@ mod tests {
                 result.expect("unchanged public member is allowed");
                 assert_eq!(after.size, 1);
             } else {
-                assert_eq!(result.err().expect("private member must be denied").code().as_str(), "AccessDenied");
+                assert_eq!(result.expect_err("private member must be denied").code().as_str(), "AccessDenied");
                 assert_eq!(after.etag, before.etag, "denied member must not overwrite");
                 assert_eq!(after.user_tags.as_str(), "classification=private");
             }
@@ -4085,7 +4087,7 @@ mod tests {
                 result.expect("private member is authorized");
                 assert_eq!(stored.expect("private member stored").user_tags.as_str(), "classification=private");
             } else {
-                assert_eq!(result.err().expect("public member must be denied").code().as_str(), "AccessDenied");
+                assert_eq!(result.expect_err("public member must be denied").code().as_str(), "AccessDenied");
                 assert!(is_err_object_not_found(&stored.expect_err("denied member must not be stored")));
             }
         }
@@ -4186,7 +4188,7 @@ mod tests {
                     }
                 } else {
                     assert_eq!(
-                        result.err().expect("member privilege required").code().as_str(),
+                        result.expect_err("member privilege required").code().as_str(),
                         "AccessDenied",
                         "{action}: {permission}"
                     );

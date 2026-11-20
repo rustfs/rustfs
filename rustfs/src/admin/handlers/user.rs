@@ -355,9 +355,16 @@ impl Operation for AddUser {
             args.policy = None;
             updated_at
         } else {
-            if authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::EnableUserAdminAction)])
-                .await
-                .is_ok()
+            if validate_admin_request(
+                req.headers(),
+                &cred,
+                owner,
+                false,
+                vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
+                req.policy_source_addr(),
+            )
+            .await
+            .is_ok()
             {
                 iam_store.create_user(ak, &args).await
             } else {
@@ -1469,25 +1476,6 @@ mod tests {
         &block[..end]
     }
 
-    fn explicit_authorization_precedes_shared_gate(block: &str) -> bool {
-        let Some(explicit) = block.find("validate_admin_request(") else {
-            return false;
-        };
-        block.find("authorize_admin_envelope(").is_none_or(|shared| explicit < shared)
-    }
-
-    #[test]
-    fn explicit_authorization_guard_allows_secondary_checks_but_rejects_replacement() {
-        assert!(explicit_authorization_precedes_shared_gate("validate_admin_request("));
-        assert!(explicit_authorization_precedes_shared_gate(
-            "validate_admin_request(\nauthorize_admin_envelope("
-        ));
-        assert!(!explicit_authorization_precedes_shared_gate("authorize_admin_envelope("));
-        assert!(!explicit_authorization_precedes_shared_gate(
-            "authorize_admin_envelope(\nvalidate_admin_request("
-        ));
-    }
-
     fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
         assert_eq!(
             block.matches("authorize_admin_envelope(").count(),
@@ -2100,24 +2088,48 @@ mod tests {
             assert_shared_gate_wiring(block, handler, &[action], binds_credentials);
         }
 
-        // AddUser and GetUserInfo derive a per-request `deny_only` from `should_check_deny_only`, and
-        // ImportIam consumes the `owner` flag while restoring service accounts. The shared gate pins
-        // `deny_only = false` and hands back only the credentials, so these three keep the explicit
-        // `check_key_valid` + `validate_admin_request` preamble. AddUser also checks EnableUser
-        // separately after its primary authorization before allowing a status change.
-        for (handler, marker) in [
-            ("AddUser", "should_check_deny_only(ak, &cred)"),
-            ("GetUserInfo", "should_check_deny_only(ak, &cred)"),
-            ("ImportIam", "if !owner {"),
+        // These handlers need context the shared primary gate does not return, so they retain the
+        // explicit `check_key_valid` + `validate_admin_request` preamble. AddUser separately probes
+        // EnableUser after CreateUser authorization to decide whether a requested status may apply.
+        for (handler, marker, secondary_action) in [
+            ("AddUser", "should_check_deny_only(ak, &cred)", Some("EnableUserAdminAction")),
+            ("GetUserInfo", "should_check_deny_only(ak, &cred)", None),
+            ("ImportIam", "if !owner {", None),
         ] {
             let block = source_block(production, &format!("impl Operation for {handler}"));
             assert!(
                 block.contains(marker),
-                "{handler} must keep the context that rules out the shared gate ({marker})"
+                "{handler} must keep the context that rules out the shared primary gate ({marker})"
             );
             assert!(
-                explicit_authorization_precedes_shared_gate(block),
-                "{handler} must keep its explicit authorization before any secondary shared gate"
+                !block.contains("authorize_admin_request("),
+                "{handler} must not be routed through the shared primary gate"
+            );
+            assert!(
+                block.contains("validate_admin_request("),
+                "{handler} must keep its explicit validate_admin_request call"
+            );
+            if let Some(action) = secondary_action {
+                assert_eq!(
+                    block.matches("validate_admin_request(").count(),
+                    2,
+                    "{handler} must perform primary and secondary capability checks"
+                );
+                assert!(block.contains(&format!("AdminAction::{action}")), "{handler} must probe {action}");
+                let primary = block
+                    .find("AdminAction::CreateUserAdminAction")
+                    .expect("explicit primary gate");
+                let secondary = block
+                    .find(&format!("AdminAction::{action}"))
+                    .expect("secondary capability gate");
+                assert!(
+                    primary < secondary,
+                    "{handler} must complete primary authorization before the secondary capability check"
+                );
+            }
+            assert!(
+                !block.contains("authorize_admin_envelope("),
+                "{handler} must not use a secondary shared gate"
             );
         }
     }
