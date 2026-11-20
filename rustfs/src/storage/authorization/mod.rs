@@ -34,8 +34,12 @@ mod guards;
 mod permission_probe_test;
 mod request;
 mod table_data_plane;
+#[cfg(test)]
+pub(crate) mod tests;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
+#[cfg(test)]
+pub(crate) use conditions::authorization_conditions_with_internal;
 pub(crate) use conditions::existing_object_tag_conditions;
 #[cfg(test)]
 pub(crate) use conditions::{

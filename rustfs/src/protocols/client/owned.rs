@@ -227,7 +227,6 @@ pub(super) fn put_input(input: dto::PutObjectInput) -> S3Result<crate::app::obje
         bucket: input.bucket.as_str().to_owned(),
         key: input.key.as_str().to_owned(),
         body: input.body.map(|body| body.into_body()),
-        #[cfg(feature = "gateway-stack")]
         post_archive: None,
         trailing_headers: None,
         frame_trailers: None,

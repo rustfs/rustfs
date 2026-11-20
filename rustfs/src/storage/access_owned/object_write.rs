@@ -185,16 +185,6 @@ impl PostObjectFormPolicy {
         Ok(Self(values))
     }
 
-    #[cfg(all(test, feature = "gateway-stack"))]
-    pub(crate) fn with_metadata(mut self, metadata: &[(String, String)]) -> S3Result<Self> {
-        for (name, value) in metadata {
-            let name = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()).map_err(|_| invalid_post_form_field())?;
-            let value = HeaderValue::from_str(value).map_err(|_| invalid_post_form_field())?;
-            self.0.push((name, Some(value)));
-        }
-        Ok(self)
-    }
-
     pub(crate) fn install<R: AuthorizationRequest + ?Sized>(self, req: &mut R) {
         let mut headers = req.headers().clone();
         for (name, value) in self.0 {
@@ -206,7 +196,6 @@ impl PostObjectFormPolicy {
         req.install_post_object_policy_headers(PostObjectPolicyHeaders(headers));
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn install_gateway<R: AuthorizationRequest + ?Sized>(mut self, req: &mut R) {
         for (name, value) in &mut self.0 {
             match name.as_str() {
