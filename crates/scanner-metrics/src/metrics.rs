@@ -16,7 +16,6 @@ use crate::last_minute::{AccElem, LastMinuteLatency};
 use crate::usage_candidate::{
     ScannerUsageCandidateCount, ScannerUsageCandidateKind, ScannerUsageCandidateOutcome, USAGE_CANDIDATE_COUNTER_SLOTS,
 };
-use chrono::{DateTime, Utc};
 use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use serde::{Deserialize, Serialize};
@@ -705,27 +704,6 @@ impl CurrentPathTracker {
     }
 }
 
-fn chrono_to_jiff_timestamp(dt: DateTime<Utc>) -> Timestamp {
-    let seconds = dt.timestamp();
-    let nanoseconds = match i32::try_from(dt.timestamp_subsec_nanos()) {
-        Ok(nanoseconds) => nanoseconds,
-        Err(_) => {
-            return if seconds < 0 { Timestamp::MIN } else { Timestamp::MAX };
-        }
-    };
-
-    match Timestamp::new(seconds, nanoseconds) {
-        Ok(timestamp) => timestamp,
-        Err(_) => {
-            if seconds < 0 {
-                Timestamp::MIN
-            } else {
-                Timestamp::MAX
-            }
-        }
-    }
-}
-
 fn timestamp_elapsed_seconds_since(now: Timestamp, earlier: Timestamp) -> u64 {
     let duration = now.duration_since(earlier);
     if duration.is_negative() {
@@ -1240,8 +1218,8 @@ impl ScannerUsageSaveResult {
 pub struct CurrentCycle {
     pub current: u64,
     pub next: u64,
-    pub cycle_completed: Vec<DateTime<Utc>>,
-    pub started: DateTime<Utc>,
+    pub cycle_completed: Vec<Timestamp>,
+    pub started: Timestamp,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3150,12 +3128,12 @@ impl Metrics {
         *self.scanner_leader_lock_last_error.write().await = error.into();
         self.scanner_leader_lock_held.store(held, Ordering::Relaxed);
         self.scanner_leader_lock_last_update_unix_secs
-            .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+            .store(Timestamp::now().as_second().max(0) as u64, Ordering::Relaxed);
     }
 
     pub fn record_scanner_cycle_end_time(&self) {
         self.last_scan_cycle_end_unix_secs
-            .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+            .store(Timestamp::now().as_second().max(0) as u64, Ordering::Relaxed);
     }
 
     pub fn record_scan_cycle_complete(&self, success: bool, duration: Duration) {
@@ -3744,8 +3722,8 @@ impl Metrics {
                 .snapshot();
             let has_cycle = if let Some(cycle) = cycle.as_ref() {
                 m.current_cycle = cycle.current;
-                m.cycles_completed_at = cycle.cycle_completed.iter().copied().map(chrono_to_jiff_timestamp).collect();
-                m.current_started = chrono_to_jiff_timestamp(cycle.started);
+                m.cycles_completed_at = cycle.cycle_completed.clone();
+                m.current_started = cycle.started;
                 true
             } else {
                 false
@@ -3783,7 +3761,7 @@ impl Metrics {
         };
 
         if !has_cycle && let Some(init_time) = crate::init_time::get_global_init_time().await {
-            m.current_started = chrono_to_jiff_timestamp(init_time);
+            m.current_started = init_time;
         }
 
         m.collected_at = Timestamp::now();
@@ -5135,8 +5113,8 @@ mod tests {
     #[tokio::test]
     async fn report_preserves_current_cycle_started_time() {
         let previous_init_time = *crate::init_time::GLOBAL_INIT_TIME.read().await;
-        let init_time = Utc::now() - chrono::Duration::hours(1);
-        let cycle_started = Utc::now();
+        let init_time = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        let cycle_started = Timestamp::now();
         *crate::init_time::GLOBAL_INIT_TIME.write().await = Some(init_time);
 
         let metrics = Metrics::new();
@@ -5151,7 +5129,7 @@ mod tests {
         let report = metrics.report().await;
         *crate::init_time::GLOBAL_INIT_TIME.write().await = previous_init_time;
 
-        assert_eq!(report.current_started, chrono_to_jiff_timestamp(cycle_started));
+        assert_eq!(report.current_started, cycle_started);
     }
 
     #[tokio::test]
@@ -5718,7 +5696,7 @@ mod tests {
     #[tokio::test]
     async fn scan_cycle_activity_and_cycle_state_publish_together() {
         let metrics = Metrics::new();
-        let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+        let cycle_started = Timestamp::now() - jiff::SignedDuration::from_secs(5);
         let active_cycle = CurrentCycle {
             current: 12,
             next: 13,
@@ -5738,7 +5716,7 @@ mod tests {
         let active = metrics.report().await;
         assert!(active.current_cycle_active);
         assert_eq!(active.current_cycle, 12);
-        assert_eq!(active.current_started, chrono_to_jiff_timestamp(cycle_started));
+        assert_eq!(active.current_started, cycle_started);
 
         let idle_cycle = CurrentCycle {
             current: 0,
@@ -5764,7 +5742,7 @@ mod tests {
         let cycle_ten = CurrentCycle {
             current: 10,
             next: 11,
-            started: Utc::now() - chrono::Duration::seconds(10),
+            started: Timestamp::now() - jiff::SignedDuration::from_secs(10),
             ..Default::default()
         };
         let cycle_ten_start = metrics.start_scan_cycle_work_with_cycle(cycle_ten.clone()).await;
@@ -5784,7 +5762,7 @@ mod tests {
             .start_scan_cycle_work_with_cycle(CurrentCycle {
                 current: 11,
                 next: 12,
-                started: Utc::now(),
+                started: Timestamp::now(),
                 ..Default::default()
             })
             .await;

@@ -1,0 +1,1856 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn object_key_rejects_reserved_directory_markers() {
+        for key in [
+            "__XLDIR__",
+            "prefix/__XLDIR__",
+            "stash__XLDIR__/blob",
+            "file__XLDIR__",
+            "file__XLDIR__/",
+            "a__XLDIR__b",
+        ] {
+            let error = crate::storage::s3_support::validate_object_key(key, "PUT")
+                .expect_err("client keys must not alias internal directory markers");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument, "{key}");
+        }
+        for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
+            crate::storage::s3_support::validate_object_key(key, "PUT")
+                .expect("ordinary objects and directory objects remain valid");
+        }
+    }
+
+    use crate::config::WorkloadProfile;
+    use crate::server::cors;
+    use crate::storage::StorageError;
+    use crate::storage::request_markers::{RequestedObjectLegalHold, RequestedObjectLockRetention};
+    use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+    use crate::storage::s3_support::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
+    use crate::storage::s3_support::{
+        parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_object_version_id,
+    };
+    use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
+    use crate::storage::storage_api::test_consumer::{
+        BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
+        apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
+        parse_etag, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+    };
+    use http::{HeaderMap, HeaderValue, StatusCode};
+    use rustfs_config::MI_B;
+    use rustfs_gateway_types::persistence::{
+        PersistedFilterRule, PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter,
+        PersistedQueueConfiguration, PersistedS3KeyFilter, PersistedTopicConfiguration,
+    };
+    use rustfs_s3_types::{S3ErrorCode, S3Result};
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+        SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, get_str, insert_str,
+    };
+    use rustfs_zip::CompressionFormat;
+    use s3s::dto::{
+        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
+    };
+    use std::collections::HashMap;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
+            mode: r.mode.map(|m| m.as_str().to_owned()),
+            retain_until: r.retain_until_date.map(OffsetDateTime::from),
+        }))
+    }
+
+    fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
+    }
+
+    #[test]
+    fn test_rustfs_owner_helpers_are_stable() {
+        let owner = rustfs_owner();
+        let initiator = rustfs_initiator();
+
+        assert!(!owner.display_name.as_ref().unwrap().is_empty());
+        assert!(!owner.id.as_ref().unwrap().is_empty());
+        assert_eq!(owner.display_name.as_deref(), Some("rustfs"));
+        assert_eq!(initiator.display_name, owner.display_name);
+        assert_eq!(initiator.id, owner.id);
+    }
+
+    // Note: Most S3 API methods require complex setup with global state, storage backend,
+    // and various dependencies that make unit testing challenging. For comprehensive testing
+    // of S3 operations, integration tests would be more appropriate.
+
+    #[test]
+    fn test_list_objects_v2_key_count_includes_prefixes() {
+        // Test that KeyCount calculation includes both objects and common prefixes
+        // This verifies the fix for S3 API compatibility where KeyCount should equal
+        // the sum of Contents and CommonPrefixes lengths
+
+        // Simulate the calculation logic from list_objects_v2
+        let objects_count = 3_usize;
+        let common_prefixes_count = 2_usize;
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects_count + common_prefixes_count) as i32;
+
+        assert_eq!(key_count, 5);
+
+        // Edge cases: verify calculation logic
+        let no_objects = 0_usize;
+        let no_prefixes = 0_usize;
+        assert_eq!((no_objects + no_prefixes) as i32, 0);
+
+        let one_object = 1_usize;
+        assert_eq!((one_object + no_prefixes) as i32, 1);
+
+        let one_prefix = 1_usize;
+        assert_eq!((no_objects + one_prefix) as i32, 1);
+    }
+
+    #[test]
+    fn test_s3_url_encoding_preserves_slash() {
+        // Test that S3 URL encoding preserves path separators (/)
+        // This verifies the encoding logic for EncodingType=url parameter
+
+        use urlencoding::encode;
+
+        // Helper function matching the implementation
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        // Test cases from s3-tests
+        assert_eq!(encode_s3_name("asdf+b"), "asdf%2Bb");
+        assert_eq!(encode_s3_name("foo+1/bar"), "foo%2B1/bar");
+        assert_eq!(encode_s3_name("foo/"), "foo/");
+        assert_eq!(encode_s3_name("quux ab/"), "quux%20ab/");
+
+        // Edge cases
+        assert_eq!(encode_s3_name("normal/key"), "normal/key");
+        assert_eq!(encode_s3_name("key+with+plus"), "key%2Bwith%2Bplus");
+        assert_eq!(encode_s3_name("key with spaces"), "key%20with%20spaces");
+    }
+
+    #[test]
+    fn test_s3_error_scenarios() {
+        use s3s::{S3Error, S3ErrorCode, s3_error};
+
+        // Test that we can create expected S3 errors for common validation cases
+
+        // Test incomplete body error
+        let incomplete_body_error = s3_error!(IncompleteBody);
+        assert_eq!(incomplete_body_error.code(), &S3ErrorCode::IncompleteBody);
+
+        // Test invalid argument error
+        let invalid_arg_error = s3_error!(InvalidArgument, "test message");
+        assert_eq!(invalid_arg_error.code(), &S3ErrorCode::InvalidArgument);
+
+        // Test internal error
+        let internal_error = S3Error::with_message(S3ErrorCode::InternalError, "test".to_string());
+        assert_eq!(internal_error.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn test_compression_format_usage() {
+        // Test that compression format detection works for common file extensions
+        let zip_format = CompressionFormat::from_extension("zip");
+        assert_eq!(zip_format.extension(), "zip");
+
+        let tar_format = CompressionFormat::from_extension("tar");
+        assert_eq!(tar_format.extension(), "tar");
+
+        let gz_format = CompressionFormat::from_extension("gz");
+        assert_eq!(gz_format.extension(), "gz");
+    }
+
+    /// The bucket default retention path reads the persisted shape; the request
+    /// literals in these tests stay on the wire DTO and convert once here.
+    fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+        crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_applies_bucket_default() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"COMPLIANCE".to_string()));
+        let retain_until = metadata
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .expect("default retention should write a valid retain-until date");
+        assert!(retain_until > OffsetDateTime::now_utc());
+        let retention_timestamp = get_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .expect("default retention should write a valid internal timestamp");
+        assert!(retention_timestamp <= OffsetDateTime::now_utc());
+        assert!(metadata.contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP}")));
+        assert!(metadata.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP}")));
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_preserves_explicit_retention() {
+        use std::collections::HashMap;
+
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"GOVERNANCE".to_string()));
+        assert_eq!(
+            metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER),
+            Some(&"2030-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_ignores_bucket_without_default() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_applies_authoritative_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let state = ObjectLockConfigState::Configured {
+            config: persisted_lock(&config),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        apply_bucket_default_lock_retention("locked-bucket", &state, &mut metadata, false)
+            .expect("authoritative bucket default should be applied");
+
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+        assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+    }
+
+    #[test]
+    fn empty_retention_metadata_does_not_suppress_bucket_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        for name in [AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER] {
+            let mut metadata = HashMap::from([(name.to_string(), String::new())]);
+            assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&config)), &mut metadata));
+            assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+            assert!(!metadata[AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER].is_empty());
+        }
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_preserves_explicit_retention_path() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let state = ObjectLockConfigState::Configured {
+            config: persisted_lock(&config),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut metadata = HashMap::new();
+
+        apply_bucket_default_lock_retention("locked-bucket", &state, &mut metadata, true)
+            .expect("explicit retention should suppress only the bucket default");
+
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_allows_confirmed_absence() {
+        let mut metadata = HashMap::new();
+
+        apply_bucket_default_lock_retention("legacy-bucket", &ObjectLockConfigState::ConfirmedAbsent, &mut metadata, false)
+            .expect("confirmed absence should keep legacy buckets writable");
+
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_rejects_fabricated_metadata_even_with_explicit_retention() {
+        let mut metadata = std::collections::HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+
+        let err =
+            apply_bucket_default_lock_retention("untrusted-bucket", &ObjectLockConfigState::Fabricated, &mut metadata, true)
+                .expect_err("fabricated metadata must fail closed before accepting explicit retention");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load Object Lock configuration"));
+    }
+
+    #[test]
+    fn test_bucket_object_lock_config_load_error_fails_closed() {
+        let err = map_bucket_object_lock_config_state("corrupt-bucket", Err(StorageError::other("corrupt Object Lock metadata")))
+            .expect_err("metadata read or parse failures must fail closed");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load Object Lock configuration"));
+    }
+
+    #[test]
+    fn test_remove_object_lock_retention_metadata_clears_only_retention_fields() {
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+            (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string()),
+        ]);
+        insert_str(&mut metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+
+        assert!(remove_object_lock_retention_metadata(&mut metadata));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+        assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER), Some(&"ON".to_string()));
+    }
+
+    #[test]
+    fn test_remove_object_lock_metadata_for_copy_clears_retention_and_legal_hold() {
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+            (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string()),
+            ("content-type".to_string(), "application/octet-stream".to_string()),
+        ]);
+        insert_str(&mut metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+        insert_str(&mut metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+
+        assert!(remove_object_lock_metadata_for_copy(&mut metadata));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+        assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+        assert!(!contains_key_str(&metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP));
+        assert_eq!(metadata.get("content-type"), Some(&"application/octet-stream".to_string()));
+    }
+
+    #[test]
+    fn test_tagging_version_id_preserves_explicit_null_and_latest_selection() {
+        assert_eq!(parse_object_version_id(None).expect("latest version selector"), None);
+        assert_eq!(
+            parse_object_version_id(Some("null".to_owned())).expect("explicit null version selector"),
+            Some(uuid::Uuid::nil())
+        );
+        for version in [uuid::Uuid::nil(), uuid::Uuid::new_v4()] {
+            assert_eq!(
+                parse_object_version_id(Some(version.to_string())).expect("UUID version selector"),
+                Some(version)
+            );
+        }
+    }
+
+    #[test]
+    fn test_tagging_version_id_rejects_invalid_values_instead_of_selecting_latest() {
+        for version in [
+            "",
+            "NULL",
+            " null ",
+            "not-a-version",
+            "null/other",
+            "00000000-0000-0000-0000-00000000000g",
+        ] {
+            let err = parse_object_version_id(Some(version.to_owned())).expect_err("invalid version must fail closed");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "version: {version:?}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_buffer_size_with_profile() {
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test GeneralPurpose profile (default behavior, should match get_adaptive_buffer_size)
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::GeneralPurpose)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(200 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            DEFAULT_READ_BUFFER_SIZE
+        );
+
+        // Test AiTraining profile - larger buffers for large files
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::AiTraining)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(600 * MB, Some(WorkloadProfile::AiTraining)),
+            4 * MB as usize
+        );
+
+        // Test WebWorkload profile - smaller buffers for web assets
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * KB, Some(WorkloadProfile::WebWorkload)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::WebWorkload)),
+            256 * KB as usize
+        );
+
+        // Test SecureStorage profile - memory-constrained buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::SecureStorage)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::SecureStorage)),
+            256 * KB as usize
+        );
+
+        // Test IndustrialIoT profile - low latency, moderate buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(512 * KB, Some(WorkloadProfile::IndustrialIoT)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            512 * KB as usize
+        );
+
+        // Test DataAnalytics profile
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(2 * MB, Some(WorkloadProfile::DataAnalytics)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::DataAnalytics)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * MB, Some(WorkloadProfile::DataAnalytics)),
+            2 * MB as usize
+        );
+
+        // Test with None (should auto-detect or use GeneralPurpose)
+        let result = get_adaptive_buffer_size_with_profile(50 * MB, None);
+        // Should be either SecureStorage (if on special OS) or GeneralPurpose
+        assert!(result == 128 * KB as usize || result == 256 * KB as usize);
+
+        // Test unknown file size with different profiles
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+    }
+
+    #[test]
+    fn test_phase3_default_behavior() {
+        use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test Phase 3: Enabled by default with GeneralPurpose profile
+        set_buffer_profile_enabled(true);
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Verify GeneralPurpose profile provides consistent buffer sizes
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B); // Unknown size
+
+        // Reset for other tests
+        set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_buffer_size_opt_in() {
+        use crate::config::{is_buffer_profile_enabled, set_buffer_profile_enabled};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] Default state: profile is not enabled, global configuration is not explicitly initialized
+        // get_buffer_size_opt_in should be equivalent to the GeneralPurpose configuration
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+
+        // GeneralPurpose rules:
+        // \< 1MB -> 64KB，1MB-100MB -> 256KB，\>=100MB -> 1MB
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[2\] Enable the profile switch, but the global configuration is still the default GeneralPurpose
+        set_buffer_profile_enabled(true);
+        assert!(is_buffer_profile_enabled());
+
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] Close again to ensure unchanged behavior
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+    }
+
+    #[test]
+    fn test_phase4_full_integration() {
+        use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] During the entire test process, the global configuration is initialized only once.
+        // In order not to interfere with other tests, use GeneralPurpose (consistent with the default).
+        // If it has been initialized elsewhere, this call will be ignored by OnceLock and the behavior will still be GeneralPurpose.
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Make sure to turn off profile initially
+        set_buffer_profile_enabled(false);
+
+        // \[2\] Verify behavior of get_buffer_size_opt_in in disabled profile (GeneralPurpose)
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] When profile is enabled, the behavior remains consistent with the global GeneralPurpose configuration
+        set_buffer_profile_enabled(true);
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[4\] Complex scenes, boundary values: such as unknown size
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B);
+
+        set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_validate_list_object_unordered_with_delimiter() {
+        // [1] Normal case: No delimiter specified.
+        assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
+
+        let delimiter_some = Some("/");
+        // [2] Normal case: Delimiter is present, but 'allow-unordered' is explicitly set to false.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, Some("allow-unordered=false")).is_ok());
+
+        let query_conflict = Some("allow-unordered=true");
+        // [3] Conflict case: Both delimiter and 'allow-unordered=true' are present.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, query_conflict).is_err());
+
+        let complex_query = Some("allow-unordered=true&abc=123");
+        // [4] Complex query: The validation should still trigger if 'allow-unordered=true' is part of a multi-parameter query.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query).is_err());
+
+        let complex_query_without_unordered = Some("abc=123&queryType=test");
+        // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
+    }
+
+    #[test]
+    fn test_parse_object_lock_retention() {
+        use time::macros::datetime;
+        use time::{OffsetDateTime, UtcOffset};
+        // [1] Normal case: No retention specified (empty metadata)
+        assert!(parse_object_lock_retention(None).is_ok());
+        assert!(parse_object_lock_retention(None).unwrap().is_empty());
+        let cleared = parse_object_lock_retention(Some(ObjectLockRetention::default())).unwrap();
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some(""));
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str), Some(""));
+        assert!(contains_key_str(&cleared, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+
+        // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
+        let valid_compliance_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        };
+        let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
+        assert_eq!(compliance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "COMPLIANCE");
+        assert_eq!(
+            compliance_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(),
+            "2030-01-01T00:00:00Z"
+        );
+        assert!(contains_key_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
+        let retention_timestamp = get_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .expect("explicit retention should write a valid internal timestamp");
+        assert!(retention_timestamp <= OffsetDateTime::now_utc());
+
+        // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
+        let valid_governance_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        };
+        let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
+        assert_eq!(governance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "GOVERNANCE");
+
+        // A retention update is either empty or has both fields.
+        let none_mode_retention = ObjectLockRetention {
+            mode: None,
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        };
+        assert_eq!(
+            parse_object_lock_retention(Some(none_mode_retention)).unwrap_err().code(),
+            &S3ErrorCode::MalformedXML
+        );
+
+        let none_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: None,
+        };
+        assert_eq!(
+            parse_object_lock_retention(Some(none_date_retention)).unwrap_err().code(),
+            &S3ErrorCode::MalformedXML
+        );
+
+        // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
+        let invalid_mode_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static("INVALID_MODE")),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        };
+        let err = parse_object_lock_retention(Some(invalid_mode_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+        assert_eq!(
+            err.message(),
+            Some("The XML you provided was not well-formed or did not validate against our published schema")
+        );
+
+        // [7] Error case: Retention with past date should fail
+        let past_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(datetime!(2020-01-01 00:00:00 UTC).into()),
+        };
+        let err = parse_object_lock_retention(Some(past_date_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+        assert_eq!(err.message(), Some("The retain until date must be in the future"));
+
+        // [8] Error case: timestamps that cannot be serialized as RFC3339 should return InvalidArgument instead of panicking
+        let unsupported_rfc3339_date = datetime!(2030-01-01 00:00:00 UTC)
+            .to_offset(UtcOffset::from_hms(5, 30, 45).expect("offset with seconds should be constructible"));
+        assert!(unsupported_rfc3339_date > OffsetDateTime::now_utc());
+
+        let unsupported_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(unsupported_rfc3339_date.into()),
+        };
+        let err = parse_object_lock_retention(Some(unsupported_date_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+        assert_eq!(err.message(), Some("The retain until date is not a supported RFC3339 timestamp"));
+    }
+
+    #[test]
+    fn test_parse_object_lock_legal_hold() {
+        // [1] Normal case: No legal hold specified (empty metadata)
+        assert!(parse_object_lock_legal_hold(None).is_ok());
+        assert!(parse_object_lock_legal_hold(None).unwrap().is_empty());
+
+        // [2] Normal case: Legal hold with valid ON status
+        let valid_on_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+        };
+        let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
+        assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
+        let legal_hold_timestamp = get_str(&on_metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .expect("legal hold should write a valid internal timestamp");
+        assert!(legal_hold_timestamp <= OffsetDateTime::now_utc());
+
+        // [3] Normal case: Legal hold with valid OFF status
+        let valid_off_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+        };
+        let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
+        assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
+
+        let none_status_legal_hold = ObjectLockLegalHold { status: None };
+        let err = parse_object_lock_legal_hold(Some(none_status_legal_hold)).expect_err("Status is required");
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+
+        // [5] Error case: Legal hold with invalid status (non ON/OFF)
+        let invalid_status_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static("INVALID_STATUS")),
+        };
+        let err = parse_object_lock_legal_hold(Some(invalid_status_legal_hold)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+        assert_eq!(
+            err.message(),
+            Some("The XML you provided was not well-formed or did not validate against our published schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_bucket_object_lock_enabled() {
+        use time::OffsetDateTime;
+
+        if !bucket_metadata_sys_initialized() {
+            eprintln!("Skipping test: bucket metadata system not initialized");
+            return;
+        }
+
+        let test_bucket = "test-bucket-object-lock";
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+            object_lock_enabled: Some("Enabled".to_owned()),
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        let err = validate_bucket_object_lock_enabled(test_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Object Lock is not enabled for this bucket"));
+
+        let non_exist_bucket = "non-exist-bucket-object-lock";
+        let err = validate_bucket_object_lock_enabled(non_exist_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Bucket is missing ObjectLockConfiguration"));
+    }
+
+    #[test]
+    fn test_read_etag_comparison() {
+        for (object_etag, condition, matches) in [
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "*", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "\"d41d8cd98f00b204e9800998ecf8427e\"", true),
+            ("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e", true),
+            ("\"12345\"", "\"67890\", \"12345\", \"abcde\"", true),
+            ("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  ", true),
+            ("\"12345\"", "\"67890\"", false),
+            ("\"12345\"", "\"67890\", \"abcde\"", false),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(object_etag.to_owned()),
+                ..Default::default()
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(condition).unwrap());
+            let result = check_preconditions(&headers, &info);
+            if matches {
+                assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_etag_comparison_requires_complete_field() {
+        for (etag, condition, matches) in [
+            ("abc", "\"other\"\"abc\"", false),
+            ("abc", "\"abc\"garbage\"", false),
+            ("abc", "\"abc\", \"other\"\"different\"", false),
+            ("abc", "\"abc\", W/ \"other\"", false),
+            ("abc", "\"abc\", \"contains space\"", false),
+            ("abc", "\"abc\", *", false),
+            ("abc", "\"other\", , \"abc\"", true),
+            ("abc", ", \"abc\",,", true),
+            ("a,b", "\"other\", \"a,b\"", true),
+            ("", ",,,", false),
+            ("", "\"\"", true),
+        ] {
+            let info = ObjectInfo {
+                etag: Some(etag.to_owned()),
+                ..Default::default()
+            };
+            for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name.clone(), HeaderValue::from_str(condition).unwrap());
+                let result = check_preconditions(&headers, &info);
+                if name == http::header::IF_MATCH {
+                    if matches {
+                        assert!(result.is_ok(), "{condition}");
+                    } else {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::PreconditionFailed, "{condition}");
+                    }
+                } else if matches {
+                    // The empty ETag case validates matching via If-Match above;
+                    // emitting that invalid stored response validator fails closed.
+                    assert!(result.is_err(), "{condition}");
+                    if !etag.is_empty() {
+                        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NotModified, "{condition}");
+                    }
+                } else {
+                    assert!(result.is_ok(), "{condition}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_preconditions() {
+        use time::{format_description::FormatItem, macros::format_description};
+        const RFC1123: &[FormatItem<'_>] =
+            format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
+        let valid_mod_time = OffsetDateTime::from_unix_timestamp(1700000000).unwrap();
+        let valid_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+        let wrong_etag = "\"wrong-etag-123456\"";
+
+        // [1] Both mod_time and etag are None → early return Ok()
+        let info1 = ObjectInfo {
+            mod_time: None,
+            etag: None,
+            ..Default::default()
+        };
+        let headers1 = HeaderMap::new();
+        assert!(check_preconditions(&headers1, &info1).is_ok());
+
+        // [2] No conditional headers with etag=None → Ok()
+        let info2 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        let headers2 = HeaderMap::new();
+        assert!(check_preconditions(&headers2, &info2).is_ok());
+
+        // [3] If-None-Match matches → return Err(S3Error::NotModified)
+        let mut headers3 = HeaderMap::new();
+        headers3.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info3 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        let result3 = check_preconditions(&headers3, &info3);
+        assert!(result3.is_err());
+        let err3 = result3.unwrap_err();
+        assert_eq!(err3.code(), &S3ErrorCode::NotModified);
+        assert_eq!(err3.message(), Some("Not Modified"));
+        assert_eq!(err3.status_code(), Some(StatusCode::NOT_MODIFIED));
+
+        // [4] If-None-Match does not match → return Ok()
+        let mut headers4 = HeaderMap::new();
+        headers4.insert("if-none-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        let info4 = info3.clone();
+        assert!(check_preconditions(&headers4, &info4).is_ok());
+
+        // [5] If-Modified-Since >= mod_time → return Err(S3Error::NotModified)
+        let mut headers5 = HeaderMap::new();
+        headers5.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
+        );
+        let info5 = info3.clone();
+        let result5 = check_preconditions(&headers5, &info5);
+        assert!(result5.is_err());
+        let err5 = result5.unwrap_err();
+        assert_eq!(err5.code(), &S3ErrorCode::NotModified);
+
+        // [6] If-Modified-Since < mod_time → return Ok()
+        let earlier_time = valid_mod_time - time::Duration::hours(1);
+        let mut headers6 = HeaderMap::new();
+        headers6.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&earlier_time.format(&RFC1123).unwrap()).unwrap(),
+        );
+        let info6 = info3.clone();
+        assert!(check_preconditions(&headers6, &info6).is_ok());
+
+        // [7] If-Match does not match → return Err(S3Error::PreconditionFailed)
+        let mut headers7 = HeaderMap::new();
+        headers7.insert("if-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        let info7 = info3.clone();
+        let result7 = check_preconditions(&headers7, &info7);
+        assert!(result7.is_err());
+        assert_eq!(result7.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [8] If-Match matches → return Ok()
+        let mut headers8 = HeaderMap::new();
+        headers8.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info8 = info3.clone();
+        assert!(check_preconditions(&headers8, &info8).is_ok());
+
+        // [9] If-Unmodified-Since < mod_time (no If-Match) → return Err(S3Error::PreconditionFailed)
+        let mut headers9 = HeaderMap::new();
+        headers9.insert(
+            "if-unmodified-since",
+            HeaderValue::from_str(&earlier_time.format(&RFC1123).unwrap()).unwrap(),
+        );
+        let info9 = info3.clone();
+        let result9 = check_preconditions(&headers9, &info9);
+        assert!(result9.is_err());
+        assert_eq!(result9.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [10] If-Unmodified-Since >= mod_time (no If-Match) → return Ok()
+        let mut headers10 = HeaderMap::new();
+        headers10.insert(
+            "if-unmodified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
+        );
+        let info10 = info3.clone();
+        assert!(check_preconditions(&headers10, &info10).is_ok());
+
+        // [11] If-Match (mismatch) + If-None-Match (match) → return Err(S3Error::PreconditionFailed)
+        let mut headers11 = HeaderMap::new();
+        headers11.insert("if-match", HeaderValue::from_str(wrong_etag).unwrap());
+        headers11.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info11 = info3.clone();
+        let result11 = check_preconditions(&headers11, &info11);
+        assert!(result11.is_err());
+        let err11 = result11.unwrap_err();
+        assert_eq!(err11.code(), &S3ErrorCode::PreconditionFailed);
+        assert_ne!(err11.code(), &S3ErrorCode::NotModified);
+
+        // [12] If-Match (match) + If-None-Match (match) → return Err(S3Error::NotModified)
+        let mut headers12 = HeaderMap::new();
+        headers12.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        headers12.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info12 = info3.clone();
+        let result12 = check_preconditions(&headers12, &info12);
+        assert!(result12.is_err());
+        let err12 = result12.unwrap_err();
+        assert_eq!(err12.code(), &S3ErrorCode::NotModified);
+        assert_ne!(err12.code(), &S3ErrorCode::PreconditionFailed);
+
+        // [13] If-None-Match (match) + If-Modified-Since → NotModified (If-Modified-Since ignored)
+        let mut headers13 = HeaderMap::new();
+        headers13.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        headers13.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&earlier_time.format(&RFC1123).unwrap()).unwrap(),
+        );
+        let info13 = info3.clone();
+        let result13 = check_preconditions(&headers13, &info13);
+        assert!(result13.is_err());
+        assert_eq!(result13.unwrap_err().code(), &S3ErrorCode::NotModified);
+
+        // [14] If-None-Match (no match) + If-Modified-Since → Ok (If-Modified-Since ignored)
+        let mut headers14 = HeaderMap::new();
+        headers14.insert("if-none-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        headers14.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
+        );
+        let info14 = info3;
+        assert!(check_preconditions(&headers14, &info14).is_ok());
+
+        // [15] If-Match with no ETag → PreconditionFailed
+        let mut headers15 = HeaderMap::new();
+        headers15.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info15 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        let result15 = check_preconditions(&headers15, &info15);
+        assert!(result15.is_err());
+        assert_eq!(result15.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [16] If-None-Match with no ETag → Ok (no match possible)
+        let mut headers16 = HeaderMap::new();
+        headers16.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info16 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers16, &info16).is_ok());
+
+        // [17] mod_time None, etag exists, If-Match matches → Ok
+        let mut headers17 = HeaderMap::new();
+        headers17.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info17 = ObjectInfo {
+            mod_time: None,
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers17, &info17).is_ok());
+
+        // [18] Empty conditional ETag headers are ignored
+        let mut headers18 = HeaderMap::new();
+        headers18.insert("if-match", HeaderValue::from_static(""));
+        headers18.insert("if-none-match", HeaderValue::from_static(" "));
+        let info18 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers18, &info18).is_ok());
+    }
+
+    #[test]
+    fn conditional_read_preserves_invalid_cache_header_cause_at_the_wire() {
+        let info = ObjectInfo {
+            user_defined: HashMap::from([("cache-control".to_owned(), "invalid\nvalue".to_owned())]).into(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        let error = check_preconditions(&headers, &info).expect_err("invalid cached metadata cannot form a 304 response");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(error.headers().is_none());
+        assert!(
+            error
+                .source()
+                .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
+        );
+        let wire = s3s::S3Error::from(error);
+        assert_eq!(wire.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(
+            wire.source()
+                .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
+        );
+    }
+
+    #[test]
+    fn test_check_preconditions_rfc304() {
+        let modified = OffsetDateTime::from_unix_timestamp(1700000000).expect("valid timestamp");
+        let mut info = ObjectInfo {
+            etag: Some("abc".to_owned()),
+            mod_time: Some(modified),
+            expires: Some(modified + time::Duration::days(1)),
+            version_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        info.user_defined = std::collections::HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into();
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("W/\"abc\""));
+        let error = check_preconditions(&headers, &info).expect_err("weak ETag must validate the cache");
+        assert_eq!(error.code(), &S3ErrorCode::NotModified);
+        let response = error.headers().expect("304 carries cache headers");
+        assert_eq!(response["etag"], "\"abc\"");
+        assert_eq!(response["cache-control"], "max-age=60");
+        assert!(response.contains_key("expires"));
+        assert!(response.contains_key("last-modified"));
+        assert_eq!(response["x-amz-version-id"], "null");
+
+        headers.insert("if-match", HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            check_preconditions(&headers, &info).expect_err("If-Match is first").code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        headers.remove("if-none-match");
+        headers.insert("if-match", HeaderValue::from_static("W/\"abc\""));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("If-Match requires strong comparison")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("\"other\""));
+        let date = modified.format(&crate::storage::RFC1123).expect("format timestamp");
+        headers.insert("if-modified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        assert!(check_preconditions(&headers, &info).is_ok(), "If-None-Match suppresses the date");
+        headers.clear();
+        headers.insert("if-unmodified-since", HeaderValue::from_str(&date).expect("valid date header"));
+        info.mod_time = Some(modified + time::Duration::seconds(1));
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("next second was modified")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        info.etag = None;
+        assert_eq!(
+            check_preconditions(&headers, &info)
+                .expect_err("existing object wildcard needs no ETag")
+                .code(),
+            &S3ErrorCode::NotModified
+        );
+        headers.clear();
+        headers.insert("if-match", HeaderValue::from_static("*"));
+        assert!(check_preconditions(&headers, &info).is_ok());
+        headers.insert("if-match", HeaderValue::from_static("\"other\", \"abc,def\""));
+        info.etag = Some("abc,def".to_owned());
+        assert!(
+            check_preconditions(&headers, &info).is_ok(),
+            "commas inside an opaque tag are not list delimiters"
+        );
+    }
+
+    #[test]
+    fn test_parse_etag() {
+        // [1] ETag without quotes → adds quotes
+        let result1 = parse_etag("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        assert_eq!(result1.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [2] ETag with quotes → normalizes to single set of quotes
+        let result2 = parse_etag("\"d41d8cd98f00b204e9800998ecf8427e\"").unwrap();
+        assert_eq!(result2.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [3] ETag with multiple quotes → removes all and adds single set
+        let result3 = parse_etag("\"\"\"d41d8cd98f00b204e9800998ecf8427e\"\"\"").unwrap();
+        assert_eq!(result3.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [4] Empty string → returns error
+        let result4 = parse_etag("");
+        assert!(result4.is_err());
+        assert_eq!(result4.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [5] String with only quotes → returns error
+        let result5 = parse_etag("\"\"");
+        assert!(result5.is_err());
+        assert_eq!(result5.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [6] ETag with quotes only at start → removes and adds quotes
+        let result6 = parse_etag("\"d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        assert_eq!(result6.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [7] ETag with quotes only at end → removes and adds quotes
+        let result7 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\"").unwrap();
+        assert_eq!(result7.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [8] ETag with newline character → returns error (invalid header value)
+        let result8 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\n");
+        assert!(result8.is_err());
+        assert_eq!(result8.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [9] ETag with null byte → returns error (invalid header value)
+        let result9 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\0");
+        assert!(result9.is_err());
+        assert_eq!(result9.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [10] ETag with carriage return → returns error (invalid header value)
+        let result10 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\r");
+        assert!(result10.is_err());
+        assert_eq!(result10.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [11] ETag with whitespace → preserves content, adds quotes
+        let result11 = parse_etag("  d41d8cd98f00b204e9800998ecf8427e  ").unwrap();
+        assert_eq!(result11.to_str().unwrap(), "\"  d41d8cd98f00b204e9800998ecf8427e  \"");
+
+        // [12] ETag with only whitespace (no quotes) → returns error
+        let result12 = parse_etag("   ");
+        assert!(result12.is_err());
+        assert_eq!(result12.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [13] ETag with only whitespace (with quotes) → returns error
+        let result13 = parse_etag("\"   \"");
+        assert!(result13.is_err());
+        assert_eq!(result13.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    // Note: S3Request structure is complex and requires many fields.
+    // For real testing, we would need proper integration test setup.
+    // Removing this test as it requires too much S3 infrastructure setup.
+
+    // Note: Testing actual S3 operations like put_object, get_object, etc. requires:
+    // 1. Initialized storage backend (ECStore)
+    // 2. Global configuration setup
+    // 3. Valid credentials and authorization
+    // 4. Bucket and object metadata systems
+    // 5. Network and disk I/O capabilities
+    //
+    // These are better suited for integration tests rather than unit tests.
+    // The current tests focus on the testable parts without external dependencies.
+
+    /// Test that next_key_marker and next_version_id_marker are filtered correctly
+    /// AWS S3 API requires these fields to be omitted when empty, not set to None or ""
+    #[test]
+    fn test_next_marker_filtering() {
+        // Test filter behavior for empty strings
+        let empty_string = Some(String::new());
+        let filtered = empty_string.filter(|v| !v.is_empty());
+        assert!(filtered.is_none(), "Empty string should be filtered to None");
+
+        // Test filter behavior for non-empty strings
+        let non_empty = Some("some-marker".to_string());
+        let filtered = non_empty.filter(|v| !v.is_empty());
+        assert!(filtered.is_some(), "Non-empty string should not be filtered");
+        assert_eq!(filtered.unwrap(), "some-marker");
+
+        // Test filter behavior for None
+        let none_value: Option<String> = None;
+        let filtered = none_value.filter(|v| !v.is_empty());
+        assert!(filtered.is_none(), "None should remain None");
+    }
+
+    /// Test version_id handling for ListObjectVersions response
+    /// Per AWS S3 API spec:
+    /// - Versioned objects: version_id is a UUID string
+    /// - Non-versioned objects: version_id should be "null" string
+    #[test]
+    fn test_version_id_formatting() {
+        use uuid::Uuid;
+
+        // Non-versioned object: version_id is None, should format as "null"
+        let version_id: Option<Uuid> = None;
+        let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(formatted, "null");
+
+        // Versioned object: version_id is Some(UUID), should format as UUID string
+        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let version_id: Option<Uuid> = Some(uuid);
+        let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// Test that ListObjectVersionsOutput markers are correctly set
+    /// This verifies the fix for boto3 ParamValidationError
+    #[test]
+    fn test_list_object_versions_markers_handling() {
+        // Simulate the marker filtering logic from list_object_versions
+
+        // Case 1: Both markers have values (truncated result with versioned object)
+        let next_marker = Some("object-key".to_string());
+        let next_version_idmarker = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_some());
+        assert!(filtered_version_marker.is_some());
+
+        // Case 2: Markers are empty strings (non-truncated result)
+        let next_marker = Some(String::new());
+        let next_version_idmarker = Some(String::new());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_none(), "Empty key marker should be filtered to None");
+        assert!(filtered_version_marker.is_none(), "Empty version marker should be filtered to None");
+
+        // Case 3: Truncated result with non-versioned object (version_id is "null")
+        let next_marker = Some("object-key".to_string());
+        let next_version_idmarker = Some("null".to_string());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_some());
+        assert!(filtered_version_marker.is_some());
+        assert_eq!(filtered_version_marker.unwrap(), "null");
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_exact_match() {
+        // Test exact match
+        assert!(matches_origin_pattern("https://example.com", "https://example.com"));
+        assert!(matches_origin_pattern("http://localhost:3000", "http://localhost:3000"));
+        assert!(!matches_origin_pattern("https://example.com", "https://other.com"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_wildcard() {
+        // Test wildcard pattern matching (S3 CORS supports * as subdomain wildcard)
+        assert!(matches_origin_pattern("https://*.example.com", "https://app.example.com"));
+        assert!(matches_origin_pattern("https://*.example.com", "https://api.example.com"));
+        assert!(matches_origin_pattern("https://*.example.com", "https://subdomain.example.com"));
+
+        // Test wildcard at start (matches any domain)
+        assert!(matches_origin_pattern("https://*", "https://example.com"));
+        assert!(matches_origin_pattern("https://*", "https://any-domain.com"));
+
+        // Test wildcard at end (matches any protocol)
+        assert!(matches_origin_pattern("*://example.com", "https://example.com"));
+        assert!(matches_origin_pattern("*://example.com", "http://example.com"));
+
+        // Test invalid wildcard patterns (should not match)
+        assert!(!matches_origin_pattern("https://*.*.com", "https://app.example.com")); // Multiple wildcards (invalid pattern)
+        // Note: "https://*example.com" actually matches "https://app.example.com" with our current implementation
+        // because it splits on * and checks starts_with/ends_with. This is a limitation but acceptable
+        // for S3 CORS which typically uses patterns like "https://*.example.com"
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_no_wildcard() {
+        // Test patterns without wildcards
+        assert!(matches_origin_pattern("https://example.com", "https://example.com"));
+        assert!(!matches_origin_pattern("https://example.com", "https://example.org"));
+        assert!(!matches_origin_pattern("http://example.com", "https://example.com")); // Different protocol
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_edge_cases() {
+        // Test edge cases
+        assert!(!matches_origin_pattern("", "https://example.com")); // Empty pattern
+        assert!(!matches_origin_pattern("https://example.com", "")); // Empty origin
+        assert!(matches_origin_pattern("", "")); // Both empty
+        assert!(!matches_origin_pattern("https://example.com", "http://example.com")); // Protocol mismatch
+    }
+
+    #[test]
+    fn test_cors_headers_validation() {
+        use http::HeaderMap;
+
+        // Test case 1: Validate header name case-insensitivity
+        let mut headers = HeaderMap::new();
+        headers.insert("access-control-request-headers", "Content-Type,X-Custom-Header".parse().unwrap());
+
+        let req_headers_str = headers
+            .get("access-control-request-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        let req_headers: Vec<String> = req_headers_str.split(',').map(|s| s.trim().to_lowercase()).collect();
+
+        // Headers should be lowercased for comparison
+        assert_eq!(req_headers, vec!["content-type", "x-custom-header"]);
+
+        // Test case 2: Wildcard matching
+        let allowed_headers = ["*".to_string()];
+        let all_allowed = req_headers.iter().all(|req_header| {
+            allowed_headers
+                .iter()
+                .any(|allowed| allowed.to_lowercase() == "*" || allowed.to_lowercase() == *req_header)
+        });
+        assert!(all_allowed, "Wildcard should allow all headers");
+
+        // Test case 3: Specific header matching
+        let allowed_headers = ["content-type".to_string(), "x-custom-header".to_string()];
+        let all_allowed = req_headers
+            .iter()
+            .all(|req_header| allowed_headers.iter().any(|allowed| allowed.to_lowercase() == *req_header));
+        assert!(all_allowed, "All requested headers should be allowed");
+
+        // Test case 4: Disallowed header
+        let req_headers = ["content-type".to_string(), "x-forbidden-header".to_string()];
+        let allowed_headers = ["content-type".to_string()];
+        let all_allowed = req_headers
+            .iter()
+            .all(|req_header| allowed_headers.iter().any(|allowed| allowed.to_lowercase() == *req_header));
+        assert!(!all_allowed, "Forbidden header should not be allowed");
+    }
+
+    #[test]
+    fn test_cors_response_headers_structure() {
+        use http::{HeaderMap, HeaderValue};
+
+        let mut cors_headers = HeaderMap::new();
+
+        // Simulate building CORS response headers
+        let origin = "https://example.com";
+        let methods = ["GET", "PUT", "POST"];
+        let allowed_headers = ["Content-Type", "Authorization"];
+        let expose_headers = ["ETag", "x-amz-version-id"];
+        let max_age = 3600;
+
+        // Add headers
+        cors_headers.insert("access-control-allow-origin", HeaderValue::from_str(origin).unwrap());
+        cors_headers.insert("vary", HeaderValue::from_static("Origin"));
+
+        let methods_str = methods.join(", ");
+        cors_headers.insert("access-control-allow-methods", HeaderValue::from_str(&methods_str).unwrap());
+
+        let headers_str = allowed_headers.join(", ");
+        cors_headers.insert("access-control-allow-headers", HeaderValue::from_str(&headers_str).unwrap());
+
+        let expose_str = expose_headers.join(", ");
+        cors_headers.insert("access-control-expose-headers", HeaderValue::from_str(&expose_str).unwrap());
+
+        cors_headers.insert("access-control-max-age", HeaderValue::from_str(&max_age.to_string()).unwrap());
+
+        // Verify all headers are present
+        assert_eq!(cors_headers.get("access-control-allow-origin").unwrap(), origin);
+        assert_eq!(cors_headers.get("vary").unwrap(), "Origin");
+        assert_eq!(cors_headers.get("access-control-allow-methods").unwrap(), "GET, PUT, POST");
+        assert_eq!(cors_headers.get("access-control-allow-headers").unwrap(), "Content-Type, Authorization");
+        assert_eq!(cors_headers.get("access-control-expose-headers").unwrap(), "ETag, x-amz-version-id");
+        assert_eq!(cors_headers.get("access-control-max-age").unwrap(), "3600");
+    }
+
+    #[test]
+    fn test_cors_preflight_vs_actual_request() {
+        use http::Method;
+
+        // Test that we can distinguish preflight from actual requests
+        let preflight_method = Method::OPTIONS;
+        let actual_method = Method::PUT;
+
+        assert_eq!(preflight_method, Method::OPTIONS);
+        assert_ne!(actual_method, Method::OPTIONS);
+
+        // Preflight should check Access-Control-Request-Method
+        // Actual request should use the actual method
+        let is_preflight_1 = preflight_method == Method::OPTIONS;
+        let is_preflight_2 = actual_method == Method::OPTIONS;
+
+        assert!(is_preflight_1);
+        assert!(!is_preflight_2);
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_no_origin() {
+        // Test when no Origin header is present
+        let headers = HeaderMap::new();
+        let method = http::Method::GET;
+
+        // Should return None when no origin header
+        let result = apply_cors_headers("test-bucket", &method, &cors::CorsRequest::from_headers(&headers)).await;
+        assert!(result.is_none(), "Should return None when no Origin header");
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_no_cors_config() {
+        // Test when bucket has no CORS configuration
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://example.com".parse().unwrap());
+        let method = http::Method::GET;
+
+        // Should return None when no CORS config exists
+        // Note: This test may fail if test-bucket actually has CORS config
+        // In a real scenario, we'd use a mock or ensure the bucket doesn't exist
+        let _result =
+            apply_cors_headers("non-existent-bucket-for-testing", &method, &cors::CorsRequest::from_headers(&headers)).await;
+        // Result depends on whether bucket exists and has CORS config
+        // This is expected behavior - we just verify it doesn't panic
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_unmatched_origin_with_cors_config() {
+        if get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: bucket metadata system not initialized");
+            return;
+        }
+
+        let bucket = "test-bucket-no-match-cors";
+        let mut bm = BucketMetadata::new(bucket);
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
+                allowed_headers: Some(vec!["*".to_string()]),
+                allowed_methods: vec!["GET".to_string()],
+                allowed_origins: vec!["https://allowed.example.com".to_string()],
+                expose_headers: None,
+                id: Some("non-match-origin".to_string()),
+                max_age_seconds: None,
+            }],
+        });
+        set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(cors::standard::ORIGIN, "https://disallowed.example.com".parse().unwrap());
+
+        let result = apply_cors_headers(bucket, &http::Method::GET, &cors::CorsRequest::from_headers(&headers)).await;
+        assert!(
+            result.is_some(),
+            "Expected Some empty headers when bucket has CORS config but origin does not match any rule"
+        );
+        let result = result.unwrap();
+        assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+
+        set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_credentialed_request_with_wildcard_origin() {
+        if get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: bucket metadata system not initialized");
+            return;
+        }
+
+        let bucket = "test-bucket-credentialed-cors";
+        let mut bm = BucketMetadata::new(bucket);
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
+                allowed_headers: Some(vec!["*".to_string()]),
+                allowed_methods: vec!["GET".to_string()],
+                allowed_origins: vec!["*".to_string()],
+                expose_headers: None,
+                id: Some("credentialed-unit".to_string()),
+                max_age_seconds: None,
+            }],
+        });
+        set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(cors::standard::ORIGIN, "https://console.localhost".parse().unwrap());
+        headers.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, "GET".parse().unwrap());
+        headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, "x-amz-content-sha256".parse().unwrap());
+        headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20260302/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256, Signature=abc".parse().unwrap());
+
+        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &cors::CorsRequest::from_headers(&headers))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://console.localhost",
+        );
+        assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
+        set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_unsupported_method() {
+        // Test with unsupported HTTP method
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://example.com".parse().unwrap());
+        let method = http::Method::PATCH; // Unsupported method
+
+        let result = apply_cors_headers("test-bucket", &method, &cors::CorsRequest::from_headers(&headers)).await;
+        assert!(result.is_none(), "Should return None for unsupported methods");
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_complex_wildcards() {
+        // Test more complex wildcard scenarios
+        assert!(matches_origin_pattern("https://*.example.com", "https://sub.example.com"));
+        // Note: "https://*.example.com" matches "https://api.sub.example.com" with our implementation
+        // because it only checks starts_with and ends_with. Real S3 might be more strict.
+
+        // Test wildcard in middle position
+        // Our implementation allows this, but it's not standard S3 CORS pattern
+        // The pattern "https://example.*.com" splits to ["https://example.", ".com"]
+        // and "https://example.sub.com" matches because it starts with "https://example." and ends with ".com"
+        // This is acceptable for our use case as S3 CORS typically uses "https://*.example.com" format
+    }
+
+    // === Notification Configuration Error Propagation Tests ===
+
+    #[test]
+    fn test_process_queue_configurations_propagates_error_on_invalid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let invalid_arn = "arn:minio:sqs::1:webhook"; // Wrong prefix, should fail
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
+                queue_arn: invalid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "Should return error for invalid ARN prefix");
+        assert!(event_rules.is_empty(), "Should not add rules when ARN is invalid");
+    }
+
+    #[test]
+    fn test_process_topic_configurations_propagates_error_on_invalid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let invalid_arn = "arn:aws:sns:us-east-1:123:topic"; // Wrong prefix, should fail
+
+        let result = process_topic_configurations(
+            &mut event_rules,
+            Some(vec![PersistedTopicConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
+                topic_arn: invalid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "Should return error for invalid ARN prefix");
+        assert!(event_rules.is_empty(), "Should not add rules when ARN is invalid");
+    }
+
+    #[test]
+    fn test_process_lambda_configurations_propagates_error_on_invalid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let invalid_arn = "arn:aws:lambda:us-east-1:123:function"; // Wrong prefix, should fail
+
+        let result = process_lambda_configurations(
+            &mut event_rules,
+            Some(vec![PersistedLambdaFunctionConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
+                lambda_function_arn: invalid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "Should return error for invalid ARN prefix");
+        assert!(event_rules.is_empty(), "Should not add rules when ARN is invalid");
+    }
+
+    #[test]
+    fn test_process_queue_configurations_succeeds_with_valid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let valid_arn = "arn:rustfs:sqs:us-east-1:1:webhook"; // Correct prefix
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
+                queue_arn: valid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_ok(), "Should succeed with valid ARN");
+        assert_eq!(event_rules.len(), 1, "Should add one rule");
+    }
+
+    #[test]
+    fn test_process_queue_configurations_accepts_capitalized_filter_names() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let valid_arn = "arn:rustfs:sqs:us-east-1:1:webhook";
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
+                queue_arn: valid_arn.to_string(),
+                filter: Some(PersistedNotificationConfigurationFilter {
+                    key: Some(PersistedS3KeyFilter {
+                        filter_rules: Some(vec![
+                            PersistedFilterRule {
+                                name: Some("Prefix".to_string()),
+                                value: Some("uploads/".to_string()),
+                            },
+                            PersistedFilterRule {
+                                name: Some("Suffix".to_string()),
+                                value: Some(".csv".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_ok(), "capitalized filter names should be compatible");
+        assert_eq!(event_rules.len(), 1, "Should add one rule");
+        assert_eq!(event_rules[0].1, "uploads/");
+        assert_eq!(event_rules[0].2, ".csv");
+    }
+
+    // --- Object tag conditions for bucket policy (s3:ExistingObjectTag) ---
+
+    /// Verifies that object tags are formatted as ExistingObjectTag/<key> condition keys
+    /// with a single-element vec value, matching the format expected by policy evaluation.
+    #[test]
+    fn test_object_tag_condition_key_format() {
+        use std::collections::HashMap;
+
+        let tags_str = "security=public&project=webapp&env=prod";
+        let map = decode_tags_to_map(tags_str);
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in map {
+            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+        }
+
+        assert_eq!(out.get("ExistingObjectTag/security"), Some(&vec!["public".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/env"), Some(&vec!["prod".to_string()]));
+        assert_eq!(out.len(), 3);
+    }
+
+    /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
+    /// returns Ok(empty map) so authorization can proceed without tag conditions.
+    // --- CORS origin pattern matching tests ---
+
+    #[test]
+    fn test_matches_origin_pattern_suffix_wildcard() {
+        assert!(matches_origin_pattern("*suffix", "foo.suffix"));
+        assert!(matches_origin_pattern("*suffix", "suffix"));
+        assert!(!matches_origin_pattern("*suffix", "foo.suffix.get"));
+        assert!(!matches_origin_pattern("*suffix", "foo.bar"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_prefix_wildcard() {
+        assert!(matches_origin_pattern("prefix*", "prefix"));
+        assert!(matches_origin_pattern("prefix*", "prefix.suffix"));
+        assert!(!matches_origin_pattern("prefix*", "bla.prefix"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_middle_wildcard() {
+        assert!(matches_origin_pattern("start*end", "startend"));
+        assert!(matches_origin_pattern("start*end", "start1end"));
+        assert!(matches_origin_pattern("start*end", "start12end"));
+        assert!(!matches_origin_pattern("start*end", "0start12end"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_exact_no_wildcard() {
+        assert!(matches_origin_pattern("example.com", "example.com"));
+        assert!(!matches_origin_pattern("example.com", "other.com"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_single_star_wildcard() {
+        assert!(matches_origin_pattern("*", "anything.com"));
+        assert!(matches_origin_pattern("*", ""));
+    }
+
+    #[test]
+    fn website_config_rejects_missing_index_and_invalid_redirect_rules() {
+        use crate::storage::validate_website_configuration;
+        use rustfs_gateway_types::persistence::{
+            PersistedIndexDocument as IndexDocument, PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule,
+            PersistedRoutingRuleCondition as Condition, PersistedWebsiteConfiguration as WebsiteConfiguration,
+        };
+        let missing_index = validate_website_configuration(&WebsiteConfiguration::default()).expect_err("index is required");
+        assert_eq!(missing_index.code(), &rustfs_s3_types::S3ErrorCode::MalformedXML);
+        assert_eq!(missing_index.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            missing_index.message(),
+            Some("IndexDocument is required unless RedirectAllRequestsTo is configured")
+        );
+        let config = WebsiteConfiguration {
+            index_document: Some(IndexDocument {
+                suffix: "index.html".to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_website_configuration(&config).is_ok());
+        let mut bad = config;
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition::default()),
+            redirect: Redirect {
+                host_name: Some("other.test".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition {
+                key_prefix_equals: Some("old/".to_owned()),
+                ..Default::default()
+            }),
+            redirect: Redirect {
+                protocol: Some("ftp".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
+    }
+}

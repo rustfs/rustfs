@@ -44,9 +44,9 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
     use aws_sdk_s3::primitives::ByteStream;
     use http::header::HOST;
+    use rustfs_s3_types::Body;
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
-    use s3s::Body;
     use std::error::Error;
 
     /// Signed raw `PUT` copy request with an explicit copy-source conditional

@@ -90,7 +90,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 rmp-serde = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -109,7 +109,6 @@ bytes.workspace = true
 hex-simd.workspace = true
 
 [dev-dependencies]
-s3s = { workspace = true, features = ["minio"] }
 opentelemetry-proto.workspace = true
 opentelemetry_sdk.workspace = true
 prost.workspace = true

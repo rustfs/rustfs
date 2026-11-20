@@ -15,8 +15,6 @@
 use crate::diagnostics::admin_server_info::get_local_server_property;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::admin::StorageAdminApi;
-#[cfg(test)]
-use chrono::Utc;
 use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -600,10 +598,6 @@ mod test {
     use serial_test::serial;
     use std::time::Duration;
 
-    fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<Utc>) -> jiff::Timestamp {
-        jiff::Timestamp::try_from(std::time::SystemTime::from(timestamp)).expect("test timestamp should fit in jiff")
-    }
-
     #[test]
     fn tes_types() {
         let t = MetricType::ALL;
@@ -685,10 +679,10 @@ mod test {
 
     #[test]
     fn scanner_metrics_mapping_preserves_partial_source_status() {
-        let current_started = Utc::now() - chrono::Duration::seconds(5);
+        let current_started = Timestamp::now() - jiff::SignedDuration::from_secs(5);
         let scanner = to_madmin_scanner_metrics(rustfs_scanner_metrics::metrics::ScannerMetricsReport {
             current_cycle_active: true,
-            current_started: chrono_to_jiff_timestamp(current_started),
+            current_started,
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
             cycle_timeout_total: 3,
@@ -703,7 +697,7 @@ mod test {
         });
 
         assert_eq!(scanner.current_cycle_active, Some(true));
-        assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(current_started));
+        assert_eq!(scanner.current_started, current_started);
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
         assert_eq!(scanner.cycle_timeout_total, 3);
@@ -723,8 +717,8 @@ mod test {
     async fn collect_local_metrics_preserves_scanner_cycle_started_time() {
         let previous_init_time = *rustfs_scanner_metrics::GLOBAL_INIT_TIME.read().await;
         let previous_cycle = global_metrics().get_cycle().await;
-        let init_time = Utc::now() - chrono::Duration::hours(1);
-        let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+        let init_time = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        let cycle_started = Timestamp::now() - jiff::SignedDuration::from_secs(5);
         *rustfs_scanner_metrics::GLOBAL_INIT_TIME.write().await = Some(init_time);
         let cycle = CurrentCycle {
             current: 0,
@@ -748,7 +742,7 @@ mod test {
         aggregated.merge(decoded);
         let scanner = aggregated.aggregated.scanner.expect("scanner metrics");
         assert_eq!(scanner.current_cycle_active, Some(true));
-        assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(cycle_started));
+        assert_eq!(scanner.current_started, cycle_started);
     }
 
     #[test]

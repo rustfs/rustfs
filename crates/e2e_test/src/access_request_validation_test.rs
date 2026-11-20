@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Exercise the production validator at the protocol boundary without importing the server crate.
-#[path = "../../../rustfs/src/storage/access_request_validation.rs"]
+#[path = "../../../rustfs/src/storage/authorization/admission/request_validation.rs"]
 mod request_validation;
 
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ use s3s_sigv4::{
     create_presigned_canonical_request, create_string_to_sign,
 };
 use std::sync::{Arc, Mutex};
+use time::{OffsetDateTime, macros::format_description};
 
 #[derive(Default)]
 struct State {
@@ -199,7 +200,9 @@ fn signed_request(method: Method, uri: &str, presigned: bool, secret: &str) -> R
 fn signed_request_with_credentials(method: Method, uri: &str, presigned: bool, access_key: &str, secret: &str) -> Request<Body> {
     let uri: Uri = uri.parse().expect("test URI");
     let host = uri.authority().expect("test authority").as_str();
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let timestamp = OffsetDateTime::now_utc()
+        .format(format_description!("[year][month][day]T[hour][minute][second]Z"))
+        .expect("format SigV4 timestamp");
     let date = AmzDate::parse(&timestamp).expect("test date");
     let credential = format!("{access_key}/{}/us-east-1/s3/aws4_request", date.fmt_date());
     let mut query: Vec<(String, String)> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
@@ -380,12 +383,17 @@ async fn delete_acl_preserves_sigv2_header_and_query_authentication() {
             ("versionId=version-1", "test-secret", StatusCode::NO_CONTENT, None),
         ] {
             let (service, probe) = service(false);
+            let date = OffsetDateTime::now_utc()
+                .format(format_description!(
+                    "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+                ))
+                .expect("format SigV2 HTTP date");
             let request = Request::builder()
                 .method(Method::DELETE)
                 .uri(format!("http://s3.example.test/bucket/key?{query}"))
                 .header("host", "s3.example.test")
                 .header("content-length", "0")
-                .header("date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+                .header("date", date)
                 .body(Body::empty())
                 .expect("SigV2 request");
             let request = if presigned {
@@ -431,16 +439,17 @@ async fn live_delete(
     (status, response.text().await.expect("read DELETE response"))
 }
 
-async fn check_live_admission(stack: &str) {
+#[tokio::test]
+async fn delete_acl_admission_through_gateway_edge() {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, Tag, Tagging, VersioningConfiguration};
 
     let mut env = crate::common::RustFSTestEnvironment::new()
         .await
         .expect("isolated S3 environment");
-    env.start_rustfs_server_without_cleanup_with_env(&[("RUSTFS_S3_STACK", stack), ("RUSTFS_REGION", "us-east-1")])
+    env.start_rustfs_server_without_cleanup_with_env(&[("RUSTFS_REGION", "us-east-1")])
         .await
-        .expect("start the requested S3 edge");
+        .expect("start RustFS");
     let client = env.create_s3_client();
     let bucket = "acl-admission";
     let empty_bucket = "acl-admission-empty";
@@ -469,18 +478,30 @@ async fn check_live_admission(stack: &str) {
     let version_query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("versionId", version)
         .finish();
+    // The gateway wire parser refuses escaped parameter names before signature verification.
+    let encoded_path = format!("/{bucket}/key?%61cl&{version_query}");
+    let (status, body) = live_delete(&env, &encoded_path, false, &env.secret_key).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{encoded_path}: {body}");
+    assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+
     for presigned in [false, true] {
+        // SigV4 canonicalization rejects repeated parameter names before admission.
+        let repeated_path = format!("/{bucket}/key?acl&acl=&tagging");
+        let (status, body) = live_delete(&env, &repeated_path, presigned, &env.secret_key).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{repeated_path}: {body}");
+        assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"), "{body}");
+
         for path in [
             format!("/{empty_bucket}?acl"),
-            format!("/{bucket}/key?%61cl&{version_query}"),
-            format!("/{bucket}/key?acl&acl=&tagging"),
+            format!("/{bucket}/key?acl&{version_query}"),
+            format!("/{bucket}/key?acl&tagging"),
             format!("/{bucket}/key?acl&uploadId=upload-1"),
         ] {
             let (status, body) = live_delete(&env, &path, presigned, &env.secret_key).await;
-            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{stack} {path}: {body}");
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path}: {body}");
             assert!(body.contains("<Code>MethodNotAllowed</Code>"), "{body}");
             let (status, body) = live_delete(&env, &path, presigned, "wrong-secret").await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{stack} {path}: {body}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
             assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"), "{body}");
         }
         client
@@ -489,19 +510,15 @@ async fn check_live_admission(stack: &str) {
             .send()
             .await
             .expect("refused DELETE preserves empty bucket");
-        let body = client
+        let current = client
             .get_object()
             .bucket(bucket)
             .key("key")
-            .version_id(version)
             .send()
             .await
-            .expect("refused DELETE preserves object version")
-            .body
-            .collect()
-            .await
-            .expect("read preserved object")
-            .into_bytes();
+            .expect("refused DELETE leaves the current object readable");
+        assert_eq!(current.version_id(), Some(version));
+        let body = current.body.collect().await.expect("read preserved object").into_bytes();
         assert_eq!(body.as_ref(), b"original object");
 
         client
@@ -520,7 +537,7 @@ async fn check_live_admission(stack: &str) {
             .expect("set object tags");
         let path = format!("/{bucket}/key?tagging&{version_query}");
         let (status, body) = live_delete(&env, &path, presigned, &env.secret_key).await;
-        assert!(status.is_success(), "{stack} {path}: {body}");
+        assert!(status.is_success(), "{path}: {body}");
         let tags = client
             .get_object_tagging()
             .bucket(bucket)
@@ -543,7 +560,7 @@ async fn check_live_admission(stack: &str) {
             .finish();
         let path = format!("/{bucket}/upload?{query}");
         let (status, body) = live_delete(&env, &path, presigned, &env.secret_key).await;
-        assert!(status.is_success(), "{stack} {path}: {body}");
+        assert!(status.is_success(), "{path}: {body}");
         let uploads = client
             .list_multipart_uploads()
             .bucket(bucket)
@@ -554,7 +571,7 @@ async fn check_live_admission(stack: &str) {
     }
     let path = format!("/{bucket}/key?{version_query}");
     let (status, body) = live_delete(&env, &path, false, &env.secret_key).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{stack} {path}: {body}");
+    assert_eq!(status, StatusCode::NO_CONTENT, "{path}: {body}");
     let versions = client
         .list_object_versions()
         .bucket(bucket)
@@ -563,16 +580,6 @@ async fn check_live_admission(stack: &str) {
         .expect("list remaining versions");
     assert!(versions.versions().is_empty());
     let (status, body) = live_delete(&env, &format!("/{empty_bucket}"), false, &env.secret_key).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{stack}: {body}");
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     env.stop_server();
-}
-
-#[tokio::test]
-async fn delete_acl_admission_through_legacy_edge() {
-    check_live_admission("legacy").await;
-}
-
-#[tokio::test]
-async fn delete_acl_admission_through_gateway_edge() {
-    check_live_admission("gateway").await;
 }

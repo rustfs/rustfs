@@ -27,6 +27,7 @@ pub mod parse;
 mod redact;
 pub mod report;
 pub mod rules;
+pub(crate) mod time;
 
 pub use analyze::{AnalysisReport, AnalyzeOptions, Analyzer, Summary, TimeBucket, TimelineAnomaly, UnmatchedCluster};
 pub use ingest::{IngestOptions, IngestReport, SkipReason, ingest_path, ingest_reader};

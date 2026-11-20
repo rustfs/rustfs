@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Builds a [`RequestEnvelope`] from an s3s request at the legacy edge.
-//!
-//! The request is only borrowed: until its call site moves to the envelope
-//! (T1.8), the legacy handler keeps reading the same request.
+//! Builds a [`RequestEnvelope`] from a legacy S3 request for compatibility tests.
 
 use crate::app::storage_api::s3::S3Request;
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
@@ -49,15 +46,17 @@ impl RequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{RequestCredentials, RequestEnvelope, S3Request};
-    use crate::app::metadata_route::WebsiteRead;
     use crate::app::object::request_body::BodyReadControl;
     use crate::app::storage_api::s3::Credentials as S3sCredentials;
     use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
     use crate::runtime_sources::ServerContextSlot;
     use crate::shared_types::{NativeTlsTransport, RemoteAddr};
-    use crate::storage::access::envelope_payloads;
-    use crate::storage::access::{PostObjectRequestMarker, ReqInfo, TableDataPlanePublicationGuards};
+    use crate::storage::authorization::TableDataPlanePublicationGuards;
+    use crate::storage::authorization::envelope_payloads;
+    use crate::storage::req_info::ReqInfo;
     use crate::storage::request_context::RequestContext;
+    use crate::storage::request_markers::PostObjectRequestMarker;
+    use crate::storage::request_markers::WebsiteRead;
     use http::{Extensions, HeaderMap, HeaderValue, Method};
     use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
     use std::fmt::Debug;

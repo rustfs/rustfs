@@ -15,7 +15,7 @@
 //! Refusal-matrix rows of migration batch A4 and of ListBuckets (rustfs/backlog#2765).
 
 use super::{
-    GATEWAY, LEGACY, MatrixRow, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
+    GATEWAY, MatrixRow, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
     create_user_allowed_on_one_bucket, outcome, refusal, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -224,11 +224,6 @@ fn the_gateway_stack_creates_buckets_as_before() {
     with_stack(GATEWAY, create_bucket_answers_as_before);
 }
 
-#[test]
-fn the_legacy_stack_creates_buckets_as_before() {
-    with_stack(LEGACY, create_bucket_answers_as_before);
-}
-
 /// One DeleteBucket request by root: the bucket, the force-delete header it carries, whether the
 /// bucket holds an object, the refusal it gets (`None` when served) and whether the bucket still
 /// exists afterwards.
@@ -312,11 +307,6 @@ fn the_gateway_stack_deletes_buckets_as_before() {
     with_stack(GATEWAY, delete_bucket_answers_as_before);
 }
 
-#[test]
-fn the_legacy_stack_deletes_buckets_as_before() {
-    with_stack(LEGACY, delete_bucket_answers_as_before);
-}
-
 /// A bucket in the default region has an empty location constraint, under an ordinary name and
 /// under one the AWS grammar reserves; a missing bucket is `NoSuchBucket`.
 async fn get_bucket_location_answers_as_before(server: RustFSServer) {
@@ -338,11 +328,6 @@ async fn get_bucket_location_answers_as_before(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_locates_buckets_as_before() {
     with_stack(GATEWAY, get_bucket_location_answers_as_before);
-}
-
-#[test]
-fn the_legacy_stack_locates_buckets_as_before() {
-    with_stack(LEGACY, get_bucket_location_answers_as_before);
 }
 
 async fn force_delete_header_order(server: RustFSServer) {
@@ -381,11 +366,6 @@ async fn force_delete_header_order(server: RustFSServer) {
     let error = outcome(result).expect_err("invalid header must be refused");
     assert_eq!((error.code.as_deref(), error.status), (Some("InvalidArgument"), Some(400)));
     server.shutdown().await;
-}
-
-#[test]
-fn the_legacy_stack_orders_force_delete_headers() {
-    with_stack(LEGACY, force_delete_header_order);
 }
 
 #[test]
@@ -517,11 +497,6 @@ fn the_gateway_stack_reads_core_bucket_configurations() {
     with_stack(GATEWAY, |server| core_configuration_reads(server, true));
 }
 
-#[test]
-fn the_legacy_stack_reads_core_bucket_configurations() {
-    with_stack(LEGACY, |server| core_configuration_reads(server, false));
-}
-
 fn put_bucket_logging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move {
         let enabled = LoggingEnabled::builder()
@@ -617,11 +592,6 @@ async fn bucket_logging_mutations(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_mutates_bucket_logging() {
     with_stack(GATEWAY, bucket_logging_mutations);
-}
-
-#[test]
-fn the_legacy_stack_mutates_bucket_logging() {
-    with_stack(LEGACY, bucket_logging_mutations);
 }
 
 fn put_bucket_accelerate_configuration<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -776,9 +746,4 @@ async fn core_configuration_mutations(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_mutates_core_bucket_configurations() {
     with_stack(GATEWAY, core_configuration_mutations);
-}
-
-#[test]
-fn the_legacy_stack_mutates_core_bucket_configurations() {
-    with_stack(LEGACY, core_configuration_mutations);
 }

@@ -33,23 +33,18 @@ default = []
 diagnostic-internode-http2-ping = []
 diagnostic-read-version-caller = []
 hotpath = [
-    "hotpath/hotpath",
-    "hotpath/tokio",
     "rustfs-s3-ops/hotpath",
 ]
 hotpath-alloc = [
     "hotpath",
-    "hotpath/hotpath-alloc",
     "rustfs-s3-ops/hotpath-alloc",
 ]
 hotpath-cpu = [
     "hotpath",
-    "hotpath/hotpath-cpu",
     "rustfs-s3-ops/hotpath-cpu",
 ]
 
 [dependencies]
-hotpath.workspace = true
 metrics = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 num_cpus = { workspace = true }

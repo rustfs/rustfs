@@ -13,7 +13,7 @@
 
 //! CreateMultipartUpload wire replies and durable session facts.
 
-use super::super::{GATEWAY, LEGACY, create_bucket_in_the_store, s3_client, with_stack};
+use super::super::{GATEWAY, create_bucket_in_the_store, s3_client, with_stack};
 use aws_sdk_s3::config::interceptors::AfterDeserializationInterceptorContextRef;
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3::error::{BoxError, ProvideErrorMetadata};
@@ -351,11 +351,6 @@ async fn create_multipart_wire(server: RustFSServer, legacy: bool) {
 }
 
 #[test]
-fn create_multipart_baseline_legacy_wire() {
-    with_stack(LEGACY, |server| create_multipart_wire(server, true));
-}
-
-#[test]
 fn create_multipart_wire_gateway() {
     with_stack(GATEWAY, |server| create_multipart_wire(server, false));
 }
@@ -610,11 +605,6 @@ async fn create_multipart_authorization(server: RustFSServer) {
 }
 
 #[test]
-fn create_multipart_authorization_legacy() {
-    with_stack(LEGACY, create_multipart_authorization);
-}
-
-#[test]
 fn create_multipart_authorization_gateway() {
     with_stack(GATEWAY, create_multipart_authorization);
 }
@@ -682,10 +672,10 @@ async fn create_multipart_encryption(server: RustFSServer, legacy: bool) {
         let response = ssec(supplied_md5).send().await;
         assert!(uploads().await.expect("list after a refused digest").uploads.is_empty());
         let error = response.expect_err("the gateway refuses a nonmatching customer-key digest");
-        assert_eq!(super::super::refusal(&error), (Some("InvalidArgument".to_owned()), Some(400)));
+        assert_eq!(super::super::refusal(&error), (Some("InvalidRequest".to_owned()), Some(400)));
         assert_eq!(
             error.message(),
-            Some("the customer-provided encryption key and its MD5 must be base64 of 32 and 16 bytes and must agree")
+            Some("The calculated MD5 hash of the key did not match the hash that was provided.")
         );
         assert_eq!(count(), before);
     }
@@ -751,11 +741,6 @@ async fn create_multipart_encryption(server: RustFSServer, legacy: bool) {
 
     kms.stop().await.expect("stop test KMS");
     server.shutdown().await;
-}
-
-#[test]
-fn create_multipart_encryption_legacy() {
-    with_stack(LEGACY, |server| create_multipart_encryption(server, true));
 }
 
 #[test]

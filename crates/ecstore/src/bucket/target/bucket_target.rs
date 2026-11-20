@@ -28,7 +28,7 @@ const REDACTED_CREDENTIAL: &str = "<redacted>";
 const GO_YEAR_ONE_START_UNIX_SECONDS: i64 = -62_135_596_800;
 const GO_YEAR_TWO_START_UNIX_SECONDS: i64 = -62_104_060_800;
 
-#[derive(Deserialize, Serialize, Default, Clone)]
+#[derive(Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 pub struct Credentials {
     #[serde(rename = "accessKey")]
     pub access_key: String,

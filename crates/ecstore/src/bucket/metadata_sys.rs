@@ -1794,9 +1794,12 @@ async fn get_delete_and_quota_config_from_disk_in(
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
             if let Some(expected) = expiry_policy {
-                let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
-                    .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
-                if !expected.matches_configuration(current) {
+                let raw = &metadata.lifecycle_config_xml;
+                let current = (!raw.is_empty())
+                    .then(|| super::utils::deserialize::<PersistedLifecycleConfiguration>(raw))
+                    .transpose()
+                    .map_err(|_| unreadable_config_error(bucket, BUCKET_LIFECYCLE_CONFIG, raw.len()))?;
+                if !expected.matches_configuration(current.as_ref()) {
                     return Err(Error::PreconditionFailed);
                 }
             }
@@ -1832,7 +1835,9 @@ pub(crate) async fn integrity_migration_metadata_in(
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
-            Ok(metadata)
+            let mut metadata = Arc::unwrap_or_clone(metadata);
+            metadata.parse_all_configs()?;
+            Ok(Arc::new(metadata))
         }
         BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
         _ => Err(Error::other("migration requires authoritative bucket metadata")),
@@ -2605,6 +2610,10 @@ impl BucketMetadataSys {
         } else {
             Err(Error::ConfigNotFound)
         }
+    }
+
+    pub(crate) async fn cached_metadata(&self) -> Vec<Arc<BucketMetadata>> {
+        self.metadata_map.read().await.values().cloned().collect()
     }
 
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
@@ -3508,7 +3517,7 @@ impl BucketMetadataSys {
                 Some(guard),
                 bucket,
                 "bucket metadata authoritative snapshot",
-                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, true),
+                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, false),
             )),
         );
         match bucket_info_res {
@@ -3517,11 +3526,12 @@ impl BucketMetadataSys {
             Err(err) => return Err(err),
         }
 
-        let (metadata, persisted) = metadata_res?;
+        let (mut metadata, persisted) = metadata_res?;
         if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {
+            metadata.parse_admission_configs();
             let metadata = Arc::new(metadata);
             if can_use_local_authority_cache
                 && metadata.bucket_incarnation_sidecar
@@ -5752,6 +5762,64 @@ mod tests {
             .await
             .expect("tagging should be readable");
         assert_eq!(tags.tag_set.len(), WRITERS, "every concurrent rewrite must survive: {tags:?}");
+    }
+
+    #[tokio::test]
+    async fn notification_snapshots_follow_periodic_refresh_after_lost_peer_signals() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let writer = BucketMetadataSys::new(store.clone());
+        let peer = Arc::new(RwLock::new(BucketMetadataSys::new(store.clone())));
+        let bucket = "notification-periodic-snapshots";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("create empty fixture bucket");
+        }
+        let mut original = BucketMetadata::new(bucket);
+        original.notification_config_xml = concat!(
+            "<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:Put</Event>",
+            "<Queue>arn:rustfs:sqs:us-east-1:inert:webhook</Queue></QueueConfiguration></NotificationConfiguration>"
+        )
+        .as_bytes()
+        .to_vec();
+        original.parse_all_configs().expect("parse inert subscription");
+        writer
+            .persist_new_and_set(original)
+            .await
+            .expect("persist initial subscription");
+        peer.read().await.reload_from_store(bucket).await.expect("prime peer cache");
+        let old = peer.read().await.get(bucket).await.expect("cached original snapshot");
+
+        let mut removed = (*old).clone();
+        removed.notification_config_xml = b"<NotificationConfiguration/>".to_vec();
+        removed.parse_all_configs().expect("parse removed subscription");
+        writer
+            .persist_new_and_set(removed)
+            .await
+            .expect("persist removal without peer callback");
+        assert!(Arc::ptr_eq(&old, &peer.read().await.get(bucket).await.expect("peer remains stale")));
+
+        // Exercise the timer's actual one-pass entry point, not the peer RPC.
+        refresh_buckets_metadata_once(peer.clone()).await;
+        let snapshots = peer.read().await.cached_metadata().await;
+        assert_eq!(snapshots.len(), 1);
+        assert!(!Arc::ptr_eq(&old, &snapshots[0]));
+        assert_eq!(old.bucket_incarnation_id, snapshots[0].bucket_incarnation_id);
+        assert_eq!(snapshots[0].notification_config_xml, b"<NotificationConfiguration/>");
+        assert!(
+            snapshots[0]
+                .notification_config
+                .as_ref()
+                .expect("parsed removal")
+                .behavior()
+                .queue_routes
+                .is_empty()
+        );
+
+        for dir in &dirs {
+            std::fs::remove_dir(dir.path().join(bucket)).expect("remove empty fixture bucket without peer callback");
+        }
+        refresh_buckets_metadata_once(peer.clone()).await;
+        assert!(peer.read().await.cached_metadata().await.is_empty());
+        assert!(peer.read().await.get(bucket).await.is_err());
     }
 
     /// Pins the peer reload-notification contract (`reload_from_store`, the

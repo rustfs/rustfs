@@ -79,7 +79,7 @@ pub(crate) async fn current_encryption_service() -> Option<Arc<ObjectEncryptionS
     root_runtime_sources::current_encryption_service().await
 }
 
-pub(crate) fn current_region() -> Option<s3s::region::Region> {
+pub(crate) fn current_region() -> Option<rustfs_s3_types::Region> {
     root_runtime_sources::current_region()
 }
 

@@ -214,7 +214,7 @@ const INVALID_HEAD_ETAGS: &[HeadEtagRow] = &[
 fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEtagRow]) {
     temp_env::with_vars(
         [
-            ("RUSTFS_S3_STACK", stack),
+            (crate::config::RETIRED_S3_STACK_SELECTOR, stack),
             ("RUSTFS_AUDIT_ENABLE", Some("true")),
             ("RUSTFS_NOTIFY_ENABLE", Some("false")),
         ],
@@ -307,28 +307,14 @@ fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEta
 
 #[test]
 #[serial_test::serial]
-fn legacy_head_etag_wire_preserves_typed_values_and_audit() {
+fn gateway_head_etag_wire_preserves_typed_values_and_audit() {
     head_etag_wire_and_audit(None, VALID_HEAD_ETAGS);
 }
 
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
-fn gateway_head_etag_wire_preserves_typed_values_and_audit() {
-    head_etag_wire_and_audit(Some("gateway"), VALID_HEAD_ETAGS);
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_head_invalid_etag_is_rejected_after_audit() {
-    head_etag_wire_and_audit(None, INVALID_HEAD_ETAGS);
-}
-
-#[cfg(feature = "gateway-stack")]
 #[test]
 #[serial_test::serial]
 fn gateway_head_invalid_etag_is_rejected_after_audit() {
-    head_etag_wire_and_audit(Some("gateway"), INVALID_HEAD_ETAGS);
+    head_etag_wire_and_audit(None, INVALID_HEAD_ETAGS);
 }
 
 async fn head_test_server() -> crate::embedded::RustFSServer {
@@ -372,11 +358,10 @@ async fn head_wire_response(
     http::Response::from_parts(parts, body)
 }
 
-#[cfg(feature = "gateway-stack")]
 #[test]
 #[serial_test::serial]
 fn gateway_head_authorization_uses_the_request_bound_context() {
-    temp_env::with_var("RUSTFS_S3_STACK", Some("gateway"), || {
+    temp_env::with_var(crate::config::RETIRED_S3_STACK_SELECTOR, None::<&str>, || {
         crate::app::gating_test_env::run_large_stack_test("head-gateway-authorization", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
             use crate::app::storage_api::test::contract::object::ObjectIO as _;
@@ -430,7 +415,7 @@ fn gateway_head_authorization_uses_the_request_bound_context() {
 }
 
 fn head_conditional_headers_preserve_stored_facts(stack: Option<&'static str>) {
-    temp_env::with_var("RUSTFS_S3_STACK", stack, || {
+    temp_env::with_var(crate::config::RETIRED_S3_STACK_SELECTOR, stack, || {
         crate::app::gating_test_env::run_large_stack_test("head-conditional-headers", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
             use crate::app::storage_api::test::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -504,13 +489,6 @@ fn head_conditional_headers_preserve_stored_facts(stack: Option<&'static str>) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_head_conditional_headers_preserve_stored_facts() {
-    head_conditional_headers_preserve_stored_facts(None);
-}
-
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
 fn gateway_head_conditional_headers_preserve_stored_facts() {
-    head_conditional_headers_preserve_stored_facts(Some("gateway"));
+    head_conditional_headers_preserve_stored_facts(None);
 }

@@ -239,7 +239,7 @@ impl KmsCache {
 mod tests {
     use super::*;
     use crate::types::{KeyState, KeyUsage};
-    use jiff::Zoned;
+    use jiff::ZonedDateTime;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::time::Duration;
@@ -264,7 +264,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: None,
-            creation_date: Zoned::now(),
+            creation_date: ZonedDateTime::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -342,7 +342,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: Some("Test key".to_string()),
-            creation_date: Zoned::now(),
+            creation_date: ZonedDateTime::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -376,7 +376,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: Some("TTL test key".to_string()),
-            creation_date: Zoned::now(),
+            creation_date: ZonedDateTime::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -406,7 +406,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: None,
-            creation_date: Zoned::now(),
+            creation_date: ZonedDateTime::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),

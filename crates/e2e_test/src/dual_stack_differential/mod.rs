@@ -12,21 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Dual-stack differential: one `rustfs` binary, two processes, one SDK script (rustfs/backlog#2740).
+//! Differential: two `rustfs` processes, one SDK script (rustfs/backlog#2740).
 //!
-//! Stack A runs `RUSTFS_S3_STACK=legacy` of the binary under test, unless `RUSTFS_E2E_REFERENCE_BINARY`
-//! names a released binary: then A is that binary, started without `RUSTFS_S3_STACK` (older
-//! releases do not know it), and a bad path fails the run instead of falling back (see
-//! `reference`). The report names which side is the reference and the `--version` each side ran. Stack B runs the value of `RUSTFS_E2E_STACK_B`
-//! (default `legacy` until the gateway stack is assembled), and `RUSTFS_E2E_STACK_B_REGION`, when
-//! set, starts B in another region so that a difference can be injected by hand. Both servers
+//! Side B is the binary under test. Side A is the binary under test too, unless
+//! `RUSTFS_E2E_REFERENCE_BINARY` names a released binary: then A is that binary, and a bad path
+//! fails the run instead of falling back (see `reference`). The report names which side is the
+//! reference and the `--version` each side ran. `RUSTFS_E2E_STACK_B_REGION`, when set, starts B
+//! in another region so that a difference can be injected by hand. Neither side is given the
+//! retired stack selector: the binary under test refuses to start with it, and the gateway stack
+//! is its only S3 stack. Both servers
 //! answer the script in `scenarios`, which covers every operation of `impl S3 for FS`; `compare`
 //! reports each `(op, field, a, b)` on which the answers differ, and every run writes its report
 //! to `<target>/dual-stack/<run>.json`. Two processes, not two embedded servers: bucket metadata
 //! is process-global, so two stacks in one process would read each other's buckets.
 
 mod compare;
-mod reference;
+pub(crate) mod reference;
 mod scenarios;
 
 use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path, workspace_root};
@@ -37,20 +38,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const STACK_A: &str = "legacy";
+/// Label of a side that runs the binary under test.
+const UNDER_TEST: &str = "under-test";
 /// Label of side A in the report when it is the released reference binary.
 const STACK_A_REFERENCE: &str = "reference";
-const ENV_STACK_B: &str = "RUSTFS_E2E_STACK_B";
 const ENV_STACK_B_REGION: &str = "RUSTFS_E2E_STACK_B_REGION";
-/// Becomes `gateway` once rustfs/backlog#2734 T2.5 assembles the gateway stack.
-const DEFAULT_STACK_B: &str = "legacy";
 /// The region the negative control gives stack A explicitly, so an inherited `RUSTFS_REGION`
 /// cannot erase the injected difference. Not `us-east-1`: that region answers GetBucketLocation
 /// with an empty LocationConstraint and re-creating an owned bucket with 200, so it would not
 /// report its own name and would add CreateBucket differences to the control.
 const CONTROL_REGION_A: &str = "us-west-2";
 const CONTROL_REGION_B: &str = "eu-west-1";
-/// `normal` cases the legacy stack must answer with a 2xx. The comparison alone cannot tell a
+/// `normal` cases side A must answer with a 2xx. The comparison alone cannot tell a
 /// script that exercises real behavior from one in which both stacks fail the same way. Five of
 /// the 73 fail on legacy by design of this script: PutBucketReplication (no registered remote
 /// target), GetBucketReplication (so no configuration), PutBucketNotificationConfiguration (no
@@ -60,7 +59,6 @@ const MIN_NORMAL_SUCCESSES: usize = 68;
 
 struct PairConfig {
     side_a: SideA,
-    stack_b: String,
     region_a: Option<String>,
     region_b: Option<String>,
 }
@@ -69,7 +67,6 @@ impl PairConfig {
     fn from_env() -> Result<Self, BoxError> {
         Ok(Self {
             side_a: SideA::from_env()?,
-            stack_b: std::env::var(ENV_STACK_B).unwrap_or_else(|_| DEFAULT_STACK_B.to_owned()),
             region_a: None,
             region_b: std::env::var(ENV_STACK_B_REGION).ok(),
         })
@@ -77,16 +74,16 @@ impl PairConfig {
 
     fn stack_a_label(&self) -> &'static str {
         match self.side_a {
-            SideA::SameBinary => STACK_A,
+            SideA::SameBinary => UNDER_TEST,
             SideA::Reference(_) => STACK_A_REFERENCE,
         }
     }
 }
 
-/// Starts one server of the binary under test on `stack`, overriding its region only when asked.
-async fn start_stack(stack: &str, region: Option<&str>) -> Result<RustFSTestEnvironment, BoxError> {
+/// Starts one server of the binary under test, overriding its region only when asked.
+async fn start_under_test(region: Option<&str>) -> Result<RustFSTestEnvironment, BoxError> {
     let mut env = RustFSTestEnvironment::new().await?;
-    let mut vars = vec![("RUSTFS_S3_STACK", stack)];
+    let mut vars = Vec::new();
     if let Some(region) = region {
         vars.push(("RUSTFS_REGION", region));
     }
@@ -94,8 +91,7 @@ async fn start_stack(stack: &str, region: Option<&str>) -> Result<RustFSTestEnvi
     Ok(env)
 }
 
-/// Starts one server of a released binary. `RUSTFS_S3_STACK` is not passed: older releases do not
-/// know it and have exactly one stack.
+/// Starts one server of a released binary.
 async fn start_reference(binary: &Path, region: Option<&str>) -> Result<RustFSTestEnvironment, BoxError> {
     let mut env = RustFSTestEnvironment::new().await?;
     let mut vars = Vec::new();
@@ -111,11 +107,11 @@ async fn start_reference(binary: &Path, region: Option<&str>) -> Result<RustFSTe
 async fn spawn_pair(config: &PairConfig) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment), BoxError> {
     let side_a = async {
         match &config.side_a {
-            SideA::SameBinary => start_stack(STACK_A, config.region_a.as_deref()).await,
+            SideA::SameBinary => start_under_test(config.region_a.as_deref()).await,
             SideA::Reference(binary) => start_reference(binary, config.region_a.as_deref()).await,
         }
     };
-    tokio::try_join!(side_a, start_stack(&config.stack_b, config.region_b.as_deref()))
+    tokio::try_join!(side_a, start_under_test(config.region_b.as_deref()))
 }
 
 fn report_directory() -> PathBuf {
@@ -160,7 +156,7 @@ async fn run_differential(label: &str, config: &PairConfig) -> Run {
         schema: 2,
         run: format!("{label}-{millis}-{}", std::process::id()),
         stack_a: config.stack_a_label().to_owned(),
-        stack_b: config.stack_b.clone(),
+        stack_b: UNDER_TEST.to_owned(),
         reference_side: matches!(config.side_a, SideA::Reference(_)).then_some("a"),
         version_a,
         version_b,
@@ -235,7 +231,6 @@ mod tests {
         init_logging();
         let config = PairConfig {
             side_a: SideA::SameBinary,
-            stack_b: STACK_A.to_owned(),
             region_a: Some(CONTROL_REGION_A.to_owned()),
             region_b: Some(CONTROL_REGION_B.to_owned()),
         };

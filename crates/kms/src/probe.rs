@@ -595,7 +595,7 @@ mod tests {
                 key_state: KeyState::Enabled,
                 key_usage: KeyUsage::EncryptDecrypt,
                 description: None,
-                creation_date: jiff::Zoned::now(),
+                creation_date: jiff::ZonedDateTime::now(),
                 deletion_date: None,
                 origin: "test".to_string(),
                 key_manager: "test".to_string(),

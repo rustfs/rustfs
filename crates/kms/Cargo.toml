@@ -58,8 +58,6 @@ zeroize = { workspace = true, features = ["derive"] }
 
 # Configuration and storage
 url = { workspace = true }
-tempfile = { workspace = true }
-
 # Caching
 moka = { workspace = true, features = ["future"] }
 

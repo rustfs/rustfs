@@ -67,6 +67,7 @@ bytes = { workspace = true, features = ["serde"] }
 base64-simd.workspace = true
 flatbuffers.workspace = true
 chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 crc-fast.workspace = true
 rustfs-common.workspace = true
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }

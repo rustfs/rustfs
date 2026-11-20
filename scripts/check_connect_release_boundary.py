@@ -27,8 +27,6 @@ class Boundary:
 BOUNDARIES = (
     Boundary("connect-e2e-short-credentials", "connect-e2e-short-credentials is restricted to debug builds",
              "rustfs/src/connect/registration.rs", ()),
-    Boundary("gateway-stack", "gateway-stack is restricted to debug builds",
-             "rustfs/src/server/gateway_stack.rs", ("e2e-test-hooks",)),
 )
 
 

@@ -18,7 +18,7 @@
 //! another batch's operations.
 
 use super::{
-    GATEWAY, LEGACY, MatrixRow, Outcome, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome,
+    GATEWAY, MatrixRow, Outcome, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome,
     refusal, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -414,11 +414,6 @@ fn the_gateway_stack_answers_object_metadata_as_stored() {
     with_stack(GATEWAY, object_metadata_answers_as_stored);
 }
 
-#[test]
-fn the_legacy_stack_answers_object_metadata_as_stored() {
-    with_stack(LEGACY, object_metadata_answers_as_stored);
-}
-
 fn put_tags(
     client: &Client,
     bucket: &str,
@@ -607,11 +602,6 @@ fn gateway_put_object_tagging_authorizes_body_version_and_resource() {
     with_stack(GATEWAY, put_object_tagging_authorization);
 }
 
-#[test]
-fn legacy_put_object_tagging_authorizes_body_version_and_resource() {
-    with_stack(LEGACY, put_object_tagging_authorization);
-}
-
 async fn put_object_tagging_validation(server: rustfs::embedded::RustFSServer) {
     const BUCKET: &str = "put-object-tagging-validation";
     create_bucket_in_the_store(BUCKET).await;
@@ -644,11 +634,6 @@ async fn put_object_tagging_validation(server: rustfs::embedded::RustFSServer) {
 #[test]
 fn gateway_put_object_tagging_validates_tags_before_version() {
     with_stack(GATEWAY, put_object_tagging_validation);
-}
-
-#[test]
-fn legacy_put_object_tagging_validates_tags_before_version() {
-    with_stack(LEGACY, put_object_tagging_validation);
 }
 
 fn put_object_tagging_survives_restart(stack: Option<&'static str>) {
@@ -743,11 +728,6 @@ fn gateway_put_object_tagging_replaces_stored_tags() {
     put_object_tagging_survives_restart(GATEWAY);
 }
 
-#[test]
-fn legacy_put_object_tagging_replaces_stored_tags() {
-    put_object_tagging_survives_restart(LEGACY);
-}
-
 /// The tagging actions swap to their version actions when a version is named: a user allowed only
 /// the unversioned action is refused with a version, and one allowed only the version action is
 /// refused without one.
@@ -786,12 +766,8 @@ fn the_gateway_stack_swaps_the_tagging_action_for_a_named_version() {
     with_stack(GATEWAY, the_tagging_action_follows_the_named_version);
 }
 
-#[test]
-fn the_legacy_stack_swaps_the_tagging_action_for_a_named_version() {
-    with_stack(LEGACY, the_tagging_action_follows_the_named_version);
-}
-
-/// Checks boundary keys across bucket configurations.
+/// The gateway rejects boundary keys before consulting the bucket. RustFS serves no torrents,
+/// so a NUL key on GetObjectTorrent retains the release's NoSuchKey response.
 async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServer) {
     const BUCKET: &str = "object-meta-keys";
     let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
@@ -802,26 +778,21 @@ async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServ
     assert!(super::bucket_exists_in_the_store(reserved).await);
     put_object_in_the_store(reserved, KEY, HashMap::new()).await;
     assert_eq!(answer(client.get_object_acl().bucket(reserved).key(KEY).send().await), (None, None, None));
+    let refused = |code: &str, status, message: &str| (Some(code.to_owned()), Some(status), Some(message.to_owned()));
+    let invalid_nul = refused("InvalidArgument", 400, "the name contains a NUL byte");
+    let missing_torrent = refused("NoSuchKey", 404, "The specified key does not exist.");
+    let too_long = refused("KeyTooLongError", 400, "the name is longer than the maximum length in bytes");
     let long_key = "k".repeat(1025);
     for (operation, call) in KEY_CALLS {
-        for (bucket, kind) in [(BUCKET, 0), (locked.as_str(), 1), ("object-meta-missing", 2), (reserved, 0)] {
-            let (code, status, message) = match (*operation, kind) {
-                ("GetObjectTorrent", _) => ("NoSuchKey", 404, "The specified key does not exist."),
-                ("GetObjectLegalHold", 0) | ("GetObjectRetention", 0) => {
-                    ("InvalidRequest", 400, "Bucket is missing ObjectLockConfiguration")
-                }
-                ("GetObjectLegalHold", 1) | ("GetObjectRetention", 1) => {
-                    ("InternalError", 500, "XML response contains a control character")
-                }
-                ("GetObjectLegalHold", _) => ("NoSuchBucket", 404, "The specified bucket does not exist"),
-                ("GetObjectRetention", _) => ("InternalError", 500, "Failed to load Object Lock configuration"),
-                _ => ("InvalidArgument", 400, "Invalid argument"),
-            };
-            let expected = (Some(code.to_owned()), Some(status), Some(message.to_owned()));
-            assert_eq!(call(&client, bucket, "a\0b").await, expected, "{operation} bucket {bucket}");
+        let expected_nul = if *operation == "GetObjectTorrent" {
+            &missing_torrent
+        } else {
+            &invalid_nul
+        };
+        for bucket in [BUCKET, locked.as_str(), "object-meta-missing", reserved] {
+            assert_eq!(&call(&client, bucket, "a\0b").await, expected_nul, "{operation} bucket {bucket}");
         }
-        let expected = (Some("KeyTooLongError".to_owned()), Some(400), Some("Your key is too long.".to_owned()));
-        assert_eq!(call(&client, BUCKET, &long_key).await, expected, "{operation} long key");
+        assert_eq!(call(&client, BUCKET, &long_key).await, too_long, "{operation} long key");
     }
     server.shutdown().await;
 }
@@ -864,8 +835,8 @@ fn answer<T, E: ProvideErrorMetadata>(result: Result<T, SdkError<E>>) -> (Option
 }
 
 #[test]
-fn the_legacy_stack_refuses_keys_outside_the_floor() {
-    with_stack(LEGACY, keys_outside_the_floor_are_refused);
+fn the_gateway_stack_refuses_keys_outside_the_floor() {
+    with_stack(GATEWAY, keys_outside_the_floor_are_refused);
 }
 
 fn legal_hold(status: &str) -> aws_sdk_s3::types::ObjectLockLegalHold {
@@ -1047,18 +1018,8 @@ fn gateway_put_object_legal_hold_edits_only_the_authorized_version() {
 }
 
 #[test]
-fn legacy_put_object_legal_hold_edits_only_the_authorized_version() {
-    put_legal_hold_on_an_explicit_version(LEGACY);
-}
-
-#[test]
 fn gateway_put_object_retention_edits_only_the_authorized_version() {
     put_retention_on_an_explicit_version(GATEWAY);
-}
-
-#[test]
-fn legacy_put_object_retention_edits_only_the_authorized_version() {
-    put_retention_on_an_explicit_version(LEGACY);
 }
 
 const RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";

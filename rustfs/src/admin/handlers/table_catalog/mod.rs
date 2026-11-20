@@ -970,7 +970,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
         bind_table_credential_parent(&mut credential, principal);
 
         self.iam_store
-            .set_temp_user(&credential.access_key, &credential, None)
+            .set_temp_user_from_parent(&credential, principal)
             .await
             .map_err(|_| s3_error!(InternalError, "failed to store table credentials"))?;
 

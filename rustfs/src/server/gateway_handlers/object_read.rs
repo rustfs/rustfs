@@ -43,14 +43,14 @@ impl Served for dto::HeadObject {
             .server_context()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "server context is missing"))?;
-        Ok(authorize_head_object(
+        authorize_head_object(
             &server_ctx,
             envelope,
             input.bucket.as_str(),
             input.key.as_str(),
             input.version_id.as_deref(),
         )
-        .await?)
+        .await
     }
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let result = DefaultObjectUsecase::with_context(context)
@@ -68,21 +68,23 @@ impl Served for dto::GetObject {
             .server_context()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "server context is missing"))?;
-        Ok(authorize_get_object(
+        authorize_get_object(
             &server_ctx,
             envelope,
             input.bucket.as_str(),
             input.key.as_str(),
             input.version_id.as_deref(),
         )
-        .await?)
+        .await
     }
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
-        get_result(
+        let log_error = super::error::object_error_logger("GetObject", request.context().transport_extensions().clone());
+        let result = get_result(
             DefaultObjectUsecase::with_context(context)
                 .execute_get_object(envelope, request.into_input())
                 .await,
-        )
+        );
+        result.inspect_err(log_error)
     }
 }
 
@@ -91,10 +93,7 @@ impl Served for dto::GetObjectAttributes {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let input = request.input();
-        Ok(
-            authorize_get_object_attributes(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref())
-                .await?,
-        )
+        authorize_get_object_attributes(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref()).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -225,15 +224,11 @@ pub(super) fn get_response(answered: Answered<GetObjectOutputFacts>) -> S3Result
 }
 
 fn insert_etag(headers: &mut http::HeaderMap, etag: Option<ResponseEtag>) -> S3Result<()> {
-    if let Some(ResponseEtag { opaque, weak }) = etag {
-        let value = if weak {
-            format!("W/\"{}\"", opaque)
-        } else {
-            format!("\"{}\"", opaque)
-        };
+    if let Some(etag) = etag {
         headers.insert(
             http::header::ETAG,
-            http::HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
+            etag.to_http_header()
+                .map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
         );
     }
     Ok(())

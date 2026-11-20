@@ -104,10 +104,12 @@ def nodeid_to_case(nodeid):
     """Map a pytest node id to the classname::name id that junit_diff uses."""
     if not NODEID.fullmatch(nodeid):
         raise InputError(f"invalid pytest node id {nodeid!r}")
-    path, *parts = nodeid.split("::")
+    # Parameter IDs can contain "::"; only the selector prefix has node separators.
+    selector, bracket, parameter = nodeid.partition("[")
+    path, *parts = selector.split("::")
     module = path[: -len(".py")].replace("/", ".")
     classname = ".".join([module, *parts[:-1]])
-    return junit_diff.case_id(classname, parts[-1])
+    return junit_diff.case_id(classname, parts[-1] + bracket + parameter)
 
 
 def read_selected(path):
