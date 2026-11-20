@@ -58,6 +58,7 @@ async fn disk_scan_withdraws_persisted_lifecycle_policy() {
                 loaded,
                 None,
                 ScannerDiskScanOptions {
+                    checkpoint_endpoints: None,
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,

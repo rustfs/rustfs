@@ -1140,6 +1140,7 @@ async fn scan_and_persist_local_bucket_with_store(
             cache,
             None,
             ScannerDiskScanOptions {
+                checkpoint_endpoints: None,
                 scan_mode,
                 prefix_scan_scope: None,
                 checkpoint_tx: Some(checkpoint_tx),

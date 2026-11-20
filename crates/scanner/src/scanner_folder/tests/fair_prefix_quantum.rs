@@ -179,7 +179,13 @@ async fn scan_one_replica_round(
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, config);
     let _observation = install_raw_entry_observer(disk.path());
-    let result = scan_data_folder(
+    let checkpoint_endpoints = cache.info.skip_healing.then(|| {
+        use crate::storage_api::owner::EcstoreDiskAPI;
+        let endpoints = disks.iter().map(|disk| disk.endpoint().to_string()).collect();
+        disks.clear();
+        endpoints
+    });
+    let result = scan_data_folder_scoped(
         budget.token(),
         budget.clone(),
         disks,
@@ -188,6 +194,10 @@ async fn scan_one_replica_round(
         None,
         HealScanMode::Normal,
         SCANNER_SLEEPER.clone(),
+        None,
+        checkpoint_endpoints.as_ref(),
+        None,
+        Some(Arc::new(crate::scanner_io::ScannerLocalStop::default())),
     )
     .await;
     let observed_entries = observed_raw_entries();
@@ -485,6 +495,8 @@ async fn cold_linked_prefixes_resume_their_own_replica_coverage() {
     let a = temp.path().join("a");
     let b = temp.path().join("b");
     let mut cache = seed_flat_bucket(&a, 40).await;
+    // The configured replicas still own their checkpoints when heal handles are omitted.
+    cache.info.skip_healing = true;
     seed_flat_bucket(&b, 40).await;
     write_checkpoint_object(&b, "object-0000", &[(Some(Uuid::from_u128(100)), 11), (Some(Uuid::from_u128(101)), 23)]).await;
     let config = ScannerCycleBudgetConfig {

@@ -4,6 +4,7 @@
 use super::NamespaceScannerWalker;
 use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_io::current_local_scanner_disk;
+use crate::storage_api::owner::EcstoreDiskAPI as _;
 use crate::{Disk, SetDisks};
 use sha2::{Digest as _, Sha256};
 use std::sync::{Arc, Mutex};
@@ -33,27 +34,50 @@ impl WalkerSlot<Arc<Disk>> {
     }
 }
 
-pub(super) struct AvailableWalkers<T>(Mutex<Vec<WalkerSlot<T>>>);
+pub(super) struct AvailableWalkers<T> {
+    idle: Mutex<Vec<WalkerSlot<T>>>,
+    legacy_peer_heal_disks: tokio::sync::OnceCell<Vec<T>>,
+}
+
+impl AvailableWalkers<Arc<Disk>> {
+    /// Remote V4 workers perform their own walk. A local coordinator refreshes
+    /// its heal inventory after rebinding, while legacy peers share one snapshot.
+    pub(super) async fn coordinator_heal_inventory(&self, set: &SetDisks, disk: &Disk, healing: bool) -> Vec<Arc<Disk>> {
+        if set.set_drive_count == 1 || healing {
+            return Vec::new();
+        }
+        if disk.is_local() {
+            return crate::scanner_io::scanner_set_disk_inventory(set).await;
+        }
+        self.legacy_peer_heal_disks
+            .get_or_init(|| crate::scanner_io::scanner_set_disk_inventory(set))
+            .await
+            .clone()
+    }
+}
 
 impl<T> AvailableWalkers<T> {
     pub(super) fn new(walkers: Vec<NamespaceScannerWalker<T>>, endpoint: impl Fn(&T) -> String) -> Self {
-        Self(Mutex::new(
-            walkers
-                .into_iter()
-                .map(|walker| WalkerSlot {
-                    endpoint: endpoint(&walker.disk),
-                    walker,
-                    remote_session_id: Uuid::new_v4(),
-                    remote_session_sequence: 0,
-                })
-                .collect(),
-        ))
+        Self {
+            idle: Mutex::new(
+                walkers
+                    .into_iter()
+                    .map(|walker| WalkerSlot {
+                        endpoint: endpoint(&walker.disk),
+                        walker,
+                        remote_session_id: Uuid::new_v4(),
+                        remote_session_sequence: 0,
+                    })
+                    .collect(),
+            ),
+            legacy_peer_heal_disks: tokio::sync::OnceCell::new(),
+        }
     }
 
     /// Rank available physical endpoints independently of random inventory
     /// order, waiter wakeups or the number of walker slots on a local disk.
     pub(super) fn take_for_bucket(&self, bucket: &str, parked: impl Fn(&T) -> bool) -> Option<WalkerSlot<T>> {
-        let mut idle = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        let mut idle = self.idle.lock().unwrap_or_else(|err| err.into_inner());
         let mut prefix = Sha256::new();
         prefix.update(bucket.as_bytes());
         prefix.update([0]);
@@ -70,7 +94,7 @@ impl<T> AvailableWalkers<T> {
     }
 
     pub(super) fn release(&self, slot: WalkerSlot<T>) {
-        self.0.lock().unwrap_or_else(|err| err.into_inner()).push(slot);
+        self.idle.lock().unwrap_or_else(|err| err.into_inner()).push(slot);
     }
 }
 
@@ -146,9 +170,26 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn ineligible_coordinator_skips_the_heal_membership_read() {
+        use crate::scanner_io::tests::setup_local_scanner_store;
+
+        for (drive_count, healing) in [(1, false), (4, true)] {
+            let (_dir, store) = setup_local_scanner_store(1, drive_count).await;
+            let set = &store.pools[0].disk_set[0];
+            let slots =
+                AvailableWalkers::new(Vec::<NamespaceScannerWalker<Arc<Disk>>>::new(), |disk| disk.endpoint().to_string());
+            let held = set.disks.write().await;
+            let source = held[0].as_ref().expect("fixture disk");
+            let inventory = futures::FutureExt::now_or_never(slots.coordinator_heal_inventory(set, source, healing))
+                .expect("single-drive and heal-suppressed scans must not wait on disk membership");
+            assert!(inventory.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn rebound_local_walker_follows_parked_readers_and_checks_format_identity() {
         use crate::scanner_io::{scanner_set_disk_inventory, tests::setup_local_scanner_store};
-        use crate::storage_api::owner::EcstoreDiskAPI as _;
         use crate::{DiskOption, new_disk};
 
         let (_dir, store) = setup_local_scanner_store(1, 4).await;
@@ -166,6 +207,8 @@ mod tests {
         let preferred = slots.take_for_bucket("wide", |_| false).expect("preferred endpoint");
         let mut fallback = slots.take_for_bucket("wide", |_| false).expect("fallback endpoint");
         let old = &fallback.walker.disk;
+        let inventory = slots.coordinator_heal_inventory(set, old, false).await;
+        assert!(inventory.iter().any(|disk| Arc::ptr_eq(disk, old)));
         let index = old.get_disk_location().disk_idx.expect("formatted slot");
         let reopened = new_disk(
             &old.endpoint(),
@@ -183,6 +226,11 @@ mod tests {
         let budget = ScannerCycleBudget::new(&ctx, Default::default());
         let bound = fallback.bind_local_disk(set, &ctx, &budget).await.expect("same UUID");
         assert!(Arc::ptr_eq(&bound, &reopened));
+        let inventory = slots.coordinator_heal_inventory(set, &bound, false).await;
+        assert!(
+            inventory.iter().any(|disk| Arc::ptr_eq(disk, &reopened)),
+            "use the rebound handle for healing"
+        );
         slots.release(fallback);
         slots.release(preferred);
         let mut parked = slots

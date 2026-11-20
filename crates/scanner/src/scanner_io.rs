@@ -1800,6 +1800,8 @@ pub struct ScannerSourceTurnReceipt {
 
 #[derive(Debug)]
 pub struct ScannerDiskScanOptions {
+    /// Configured sibling endpoints used to retain per-replica checkpoints when healing is suppressed.
+    pub checkpoint_endpoints: Option<Arc<HashSet<String>>>,
     pub scan_mode: HealScanMode,
     pub prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
     pub checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,

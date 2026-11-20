@@ -811,7 +811,14 @@ impl ScannerIOCache for SetDisks {
             let _ = updates.send(incomplete_scope).await;
             return Ok(ScannerSourceTurnReceipt::default());
         }
-        let set_disk_inventory = Arc::new(scanner_set_disk_inventory(self.as_ref()).await);
+        // A healing-marked multi-drive set still needs its configured siblings for
+        // per-replica directory checkpoints. This does not require probing their handles.
+        let checkpoint_endpoints = (healing
+            && self.set_drive_count > 1
+            && workers
+                .iter()
+                .any(|(_, mode)| *mode == NamespaceScannerWorkerMode::Coordinator))
+        .then(|| Arc::new(self.set_endpoints.iter().map(ToString::to_string).collect()));
         if unsupported_remote_disks > 0 {
             debug!(
                 target: "rustfs::scanner::io",
@@ -1065,7 +1072,7 @@ impl ScannerIOCache for SetDisks {
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone = bucket_result_tx.clone();
             let bucket_observations_clone = bucket_observations.clone();
-            let set_disk_inventory_clone = set_disk_inventory.clone();
+            let checkpoint_endpoints = checkpoint_endpoints.clone();
             let local_recovery_attempts_clone = local_recovery_attempts.clone();
             let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             let queued_disk_bucket_scans_clone = queued_disk_bucket_scans.clone();
@@ -1774,11 +1781,7 @@ impl ScannerIOCache for SetDisks {
                     let local_stop = Arc::new(ScannerLocalStop::default());
                     #[cfg(test)]
                     super::tests::local_drive_recovery::before_attempt(&bucket.name, &disk).await;
-                    let current_set_disks = if disk.is_local() {
-                        scanner_set_disk_inventory(&store_clone_clone).await
-                    } else {
-                        set_disk_inventory_clone.as_ref().clone()
-                    };
+                    let current_set_disks = available_walkers.coordinator_heal_inventory(&store_clone_clone, &disk, healing).await;
                     #[cfg(feature = "e2e-test-hooks")]
                     {
                         let disk_uuid = if crate::e2e_barrier::worker_observation::enabled() {
@@ -1803,6 +1806,7 @@ impl ScannerIOCache for SetDisks {
                         cache,
                         None,
                         ScannerDiskScanOptions {
+                            checkpoint_endpoints: checkpoint_endpoints.clone(),
                             scan_mode,
                             prefix_scan_scope,
                             checkpoint_tx: Some(checkpoint_tx),
