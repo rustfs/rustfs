@@ -676,10 +676,9 @@ impl DefaultObjectUsecase {
             let key = normalize_delete_object_key(&obj_id.key);
             // A rejected wire key has no authorization resource. Its normalized text cannot become a target.
             let key_error = if obj_id.key_too_long {
-                Some((
-                    S3ErrorCode::InvalidArgument,
-                    ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::InvalidArgument),
-                ))
+                let code = rustfs_s3_types::S3ErrorCode::InvalidArgument;
+                let message = ApiError::error_code_to_message(&code);
+                Some((code, message))
             } else {
                 validate_object_key(&key, "DeleteObjects")
                     .err()

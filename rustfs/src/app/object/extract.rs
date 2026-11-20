@@ -1323,7 +1323,7 @@ fn is_empty_extract_entry_path(path: &str) -> bool {
 
 fn validate_extract_member_key(path: &str, limits: ArchiveLimits) -> Result<(), ExtractEntryError> {
     validate_put_object_extract_entry_path(path, limits).map_err(ExtractEntryError::Recoverable)?;
-    validate_new_object_key(path, "PUT").map_err(ExtractEntryError::Recoverable)
+    validate_new_object_key(path, "PUT").map_err(|err| ExtractEntryError::Recoverable(err.into()))
 }
 
 fn record_extract_pax_metadata_bytes(

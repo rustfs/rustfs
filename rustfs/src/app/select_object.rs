@@ -4,8 +4,8 @@ use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
 use super::storage_api::select_object::sse::{SseKmsPrincipal, authorize_sse_kms_object_read, project_sse_read_response_headers};
 use super::storage_api::select_object::{
-    StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store_owned,
-    validate_sse_headers_for_read, validate_ssec_for_read,
+    StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
+    validate_ssec_for_read,
 };
 use crate::app::runtime_sources::current_s3select_db;
 use crate::app::{Answered, RequestEnvelope};
@@ -874,7 +874,7 @@ async fn prepare_select_object_snapshot(
     let opts = get_opts(&input.bucket, &input.key, None, None, headers)
         .await
         .map_err(ApiError::from)?;
-    let store = get_validated_store_owned(&input.bucket).await?;
+    let store = get_validated_store(&input.bucket).await?;
     let snapshot = store
         .prepare_select_object_snapshot(&input.bucket, &input.key, headers, &opts)
         .await
