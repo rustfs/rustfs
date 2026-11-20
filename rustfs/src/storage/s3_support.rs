@@ -18,6 +18,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabl
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLockConfigState};
+use crate::storage::storage_api::ecstore_bucket::object_lock::types::{LegalHoldStatus, RetentionMode};
 use crate::storage::storage_api::s3_support_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::s3_support_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
@@ -34,7 +35,6 @@ use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
-use s3s::dto::{Delimiter, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 #[cfg(test)]
 use s3s::dto::{ObjectLockLegalHold, ObjectLockRetention};
 use s3s::{S3Error, S3ErrorCode, S3Result};
@@ -439,10 +439,7 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
 /// According to S3 compatibility requirements, unordered listing cannot be combined with
 /// hierarchical directory traversal (delimited listing). This validation ensures
 /// conflicting parameters are caught before processing the request.
-pub(crate) fn validate_list_object_unordered_with_delimiter(
-    delimiter: Option<&Delimiter>,
-    query_string: Option<&str>,
-) -> S3Result<()> {
+pub(crate) fn validate_list_object_unordered_with_delimiter(delimiter: Option<&str>, query_string: Option<&str>) -> S3Result<()> {
     if delimiter.is_none() {
         return Ok(());
     }
@@ -485,7 +482,7 @@ pub(crate) fn parse_object_lock_retention_native(
         }
         let mode = match v.mode {
             Some(mode) => match mode.as_str() {
-                ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
+                RetentionMode::COMPLIANCE | RetentionMode::GOVERNANCE => mode.as_str().to_string(),
                 _ => {
                     return Err(S3Error::with_message(
                         S3ErrorCode::MalformedXML,
@@ -540,7 +537,7 @@ pub(crate) fn parse_object_lock_legal_hold_native(
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
         let status = match v.0.as_deref() {
-            Some(status @ (ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON)) => status.to_owned(),
+            Some(status @ (LegalHoldStatus::OFF | LegalHoldStatus::ON)) => status.to_owned(),
             _ => {
                 return Err(S3Error::with_message(
                     S3ErrorCode::MalformedXML,

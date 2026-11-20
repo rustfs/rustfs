@@ -63,7 +63,7 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        DefaultRetention, Delimiter, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
         ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
     };
     use s3s::{S3Error, S3ErrorCode, s3_error};
@@ -616,8 +616,7 @@ mod tests {
         // [1] Normal case: No delimiter specified.
         assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
 
-        let delim_str = "/".to_string();
-        let delimiter_some: Option<&Delimiter> = Some(&delim_str);
+        let delimiter_some = Some("/");
         // [2] Normal case: Delimiter is present, but 'allow-unordered' is explicitly set to false.
         assert!(validate_list_object_unordered_with_delimiter(delimiter_some, Some("allow-unordered=false")).is_ok());
 
