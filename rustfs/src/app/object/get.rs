@@ -2602,8 +2602,9 @@ impl DefaultObjectUsecase {
             };
             return Err(with_delete_marker_read_headers(S3Error::new(code), info, input.version_id.as_deref()));
         }
-        let result =
-            check_preconditions(envelope.headers(), info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
+        let result = check_preconditions(envelope.headers(), info)
+            .map_err(S3Error::from)
+            .and_then(|()| Self::validate_get_object_part_number(part_number, info));
         if result.is_err() {
             let principal = SseKmsPrincipal::from_request(envelope);
             crate::storage::sse::validate_conditional_read(
@@ -12313,7 +12314,7 @@ mod tests {
     fn parse_get_object_part_number_rejects_above_s3_max() {
         let err = parse_part_number_i32_to_usize(Some(10001), "GET").expect_err("partNumber above S3 max must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("GET: partNumber must be between 1 and 10000"));
     }
 

@@ -26,7 +26,7 @@ mod tests {
         ] {
             let error = crate::storage::s3_support::validate_object_key(key, "PUT")
                 .expect_err("client keys must not alias internal directory markers");
-            assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument, "{key}");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument, "{key}");
         }
         for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
             crate::storage::s3_support::validate_object_key(key, "PUT")
@@ -37,18 +37,20 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
+    use crate::storage::request_markers::{RequestedObjectLegalHold, RequestedObjectLockRetention};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::s3_support::parse_object_version_id;
     use crate::storage::s3_support::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
+    use crate::storage::s3_support::{
+        parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_object_version_id,
+    };
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
         apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
-        parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations,
-        process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy,
-        remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
-        validate_list_object_unordered_with_delimiter,
+        parse_etag, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
@@ -56,6 +58,7 @@ mod tests {
         PersistedFilterRule, PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter,
         PersistedQueueConfiguration, PersistedS3KeyFilter, PersistedTopicConfiguration,
     };
+    use rustfs_s3_types::{S3ErrorCode, S3Result};
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -66,9 +69,19 @@ mod tests {
         DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
         ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
     };
-    use s3s::{S3Error, S3ErrorCode, s3_error};
     use std::collections::HashMap;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
+            mode: r.mode.map(|m| m.as_str().to_owned()),
+            retain_until: r.retain_until_date.map(OffsetDateTime::from),
+        }))
+    }
+
+    fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
+    }
 
     #[test]
     fn test_rustfs_owner_helpers_are_stable() {
@@ -142,6 +155,8 @@ mod tests {
 
     #[test]
     fn test_s3_error_scenarios() {
+        use s3s::{S3Error, S3ErrorCode, s3_error};
+
         // Test that we can create expected S3 errors for common validation cases
 
         // Test incomplete body error
@@ -1060,6 +1075,31 @@ mod tests {
             ..Default::default()
         };
         assert!(check_preconditions(&headers18, &info18).is_ok());
+    }
+
+    #[test]
+    fn conditional_read_preserves_invalid_cache_header_cause_at_the_wire() {
+        let info = ObjectInfo {
+            user_defined: HashMap::from([("cache-control".to_owned(), "invalid\nvalue".to_owned())]).into(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        let error = check_preconditions(&headers, &info).expect_err("invalid cached metadata cannot form a 304 response");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(error.headers().is_none());
+        assert!(
+            error
+                .source()
+                .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
+        );
+        let wire = s3s::S3Error::from(error);
+        assert_eq!(wire.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(
+            wire.source()
+                .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
+        );
     }
 
     #[test]
