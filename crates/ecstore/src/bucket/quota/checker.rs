@@ -19,7 +19,7 @@ use super::{
 use crate::bucket::metadata_sys::{
     BucketMetadataSys, update, update_if_incarnation, update_quota_with_sys_if_incarnation_and_revision,
 };
-use crate::data_usage::{get_bucket_usage_memory, reload_unknown_bucket_usage};
+use crate::data_usage::{get_bucket_usage_for_statistics, get_bucket_usage_memory, reload_unknown_bucket_usage};
 use crate::error::StorageError;
 use rustfs_config::QUOTA_CONFIG_FILE;
 use rustfs_scanner_metrics::metrics::Metric;
@@ -96,7 +96,7 @@ impl QuotaChecker {
         // reported as absent instead of failing the write (rustfs/backlog#2904).
         // The snapshot protocol still admits from this value and fails closed.
         let current_usage = if uses_durable_reservations {
-            self.report_only_usage(bucket).await
+            Self::report_usage(bucket, get_bucket_usage_memory(bucket).await)
         } else {
             Some(self.get_real_time_usage(bucket).await?)
         };
@@ -235,8 +235,12 @@ impl QuotaChecker {
         Ok(updated_at)
     }
 
-    /// Return quota configuration with optional scanner usage, independently
-    /// of the usage requirements enforced by write admission.
+    /// Return the configured limit and best-effort usage for read-only statistics.
+    /// Single-process reports reflect known deletes before quota reconciliation;
+    /// distributed reports read the persisted scanner baseline.
+    ///
+    /// # Errors
+    /// Returns an error for a missing bucket or unreadable quota configuration.
     pub async fn get_quota_stats(&self, bucket: &str) -> Result<(BucketQuota, Option<u64>), QuotaError> {
         // If bucket doesn't exist, return ConfigNotFound error
         if !self.bucket_exists(bucket).await {
@@ -246,16 +250,12 @@ impl QuotaChecker {
         }
 
         let quota = self.get_quota_config(bucket).await?;
-        let current_usage = self.report_only_usage(bucket).await;
+        let current_usage = Self::report_usage(bucket, get_bucket_usage_for_statistics(bucket).await);
 
         Ok((quota, current_usage))
     }
 
-    /// Best-effort usage for statistics and durable admission reports.
-    /// Missing scanner coverage is unknown, not an error or a zero-sized bucket.
-    async fn report_only_usage(&self, bucket: &str) -> Option<u64> {
-        // The plain lookup: a report must not wait for an early snapshot reload.
-        let usage = get_bucket_usage_memory(bucket).await;
+    fn report_usage(bucket: &str, usage: Option<u64>) -> Option<u64> {
         if usage.is_none() {
             metrics::counter!(METRIC_QUOTA_USAGE_REPORT_UNAVAILABLE_TOTAL).increment(1);
             debug!(
