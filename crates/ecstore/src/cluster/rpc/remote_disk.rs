@@ -6599,7 +6599,9 @@ mod tests {
         );
         assert_eq!(
             remote
-                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Probe {})
+                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Inspect {
+                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                })
                 .await,
             Err(DiskError::UnsupportedDisk),
         );
@@ -6610,7 +6612,7 @@ mod tests {
                 "/node_service.NodeService/UndoPoolMetaWrite",
                 "/node_service.NodeService/PoolMetaNativeRecovery"
             ],
-            "protected mutations and capability probes must never fall back to legacy RPCs",
+            "protected mutations and native inspection must never fall back to legacy RPCs",
         );
         peer.stop().await;
     }

@@ -32,6 +32,9 @@ pub const DEFAULT_HEAL_BITROT_CYCLE_SECS: u64 = 30 * 24 * 60 * 60;
 /// - Note: Enabling auto-heal can improve system resilience by automatically addressing issues, but may increase resource usage; evaluate based on your operational requirements.
 pub const ENV_HEAL_AUTO_HEAL_ENABLE: &str = "RUSTFS_HEAL_AUTO_HEAL_ENABLE";
 
+/// Colon-separated Linux mount roots for automatic replacement of data directories below a mount point.
+pub const ENV_HEAL_REPLACEMENT_MOUNT_ROOTS: &str = "RUSTFS_HEAL_REPLACEMENT_MOUNT_ROOTS";
+
 /// Environment variable name that specifies the heal queue size.
 ///
 /// - Purpose: Set the maximum number of heal requests that can be queued.
