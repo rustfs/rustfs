@@ -37,7 +37,6 @@ use crate::app::storage_api::object_usecase::helper::OperationHelper;
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::app::storage_api::object_usecase::{StorageObjectOptions as ObjectOptions, parse_object_lock_retention_native};
 use crate::error::ApiError;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::GetObjectRetentionInput;
 use rustfs_gateway_types::dto::{GetObjectRetentionOutput, Mode, ObjectLockRetention};
 use rustfs_gateway_types::dto::{PutObjectRetentionOutput, RequestCharged};
@@ -133,7 +132,7 @@ impl ObjectMetaUsecase {
         let mut eval_metadata = parse_object_lock_retention_native(retention)?;
         if dsc.replicate_any() {
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
         opts.eval_metadata = Some(eval_metadata);
@@ -178,7 +177,6 @@ impl ObjectMetaUsecase {
     /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up,
     /// when the object cannot be read, or for a stored date outside the answerable range; the
     /// Object Lock refusal of a bucket without Object Lock.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_get_object_retention(
         &self,
         envelope: RequestEnvelope,

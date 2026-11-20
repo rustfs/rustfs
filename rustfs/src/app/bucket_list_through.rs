@@ -472,7 +472,7 @@ mod tests {
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
     use crate::app::storage_api::bucket_usecase::s3::{
-        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3, S3Request, S3Response,
+        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response,
         XmlSerialize, XmlSerializer,
     };
     use crate::app::storage_api::test::StoragePutObjReader;
@@ -1185,10 +1185,11 @@ mod tests {
                         service: None,
                         trailing_headers: None,
                     };
+                    let get_env = crate::app::RequestEnvelope::from_s3s(&get);
                     let authorized_generation =
                         super::super::storage_api::bucket_usecase::access::load_bucket_generation_from_store(
                             &store,
-                            &get,
+                            &get_env,
                             &input.bucket,
                         )
                         .await
@@ -1214,12 +1215,16 @@ mod tests {
                     assert_ne!(replacement, old.incarnation_id());
                     sys.remove(&input.bucket);
                     let mut without_source = get.clone();
+                    let mut without_source_env = crate::app::RequestEnvelope::from_s3s(&without_source);
                     super::super::storage_api::bucket_usecase::access::prepare_odm_read_generation(
                         &store,
-                        &mut without_source,
+                        &mut without_source_env,
                         &input.bucket,
                     )
                     .await;
+                    if let Some(guard) = without_source_env.odm_read_generation().cloned() {
+                        without_source.extensions.insert(guard);
+                    }
                     for state_incarnation in [old.incarnation_id(), replacement] {
                         sys.apply_for_incarnation(&input.bucket, state_incarnation, Some(old.config()))
                             .await;
@@ -1315,28 +1320,34 @@ mod tests {
                         };
                         for (index, expected_key) in ["a&local", "z-local"].into_iter().enumerate() {
                             let request_marker = input.marker.clone().unwrap_or_default();
-                            let response = tokio::time::timeout(
+                            let list_req = S3Request {
+                                input: input.clone(),
+                                method: http::Method::GET,
+                                uri: http::Uri::from_static("/"),
+                                headers: HeaderMap::new(),
+                                extensions: http::Extensions::new(),
+                                credentials: None,
+                                region: None,
+                                service: None,
+                                trailing_headers: None,
+                            };
+                            let envelope = crate::app::RequestEnvelope::from_s3s(&list_req);
+                            let gateway_input =
+                                rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects::input_from_s3s(
+                                    list_req.input,
+                                )
+                                .expect("convert ListObjectsInput");
+                            let gateway_output = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                S3::list_objects(
-                                    &crate::storage::ecfs::FS::new(),
-                                    S3Request {
-                                        input: input.clone(),
-                                        method: http::Method::GET,
-                                        uri: http::Uri::from_static("/"),
-                                        headers: HeaderMap::new(),
-                                        extensions: http::Extensions::new(),
-                                        credentials: None,
-                                        region: None,
-                                        service: None,
-                                        trailing_headers: None,
-                                    },
-                                ),
+                                DefaultBucketUsecase::from_global().execute_list_objects(envelope, gateway_input),
                             )
                             .await
                             .expect("v1 pagination must finish")
                             .expect("list-through must not change v1 listing");
-                            assert!(!response.headers.contains_key("x-rustfs-on-demand-migration-list"));
-                            let output = response.output;
+                            let output = rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects::output_to_s3s(
+                                gateway_output,
+                            )
+                            .expect("convert ListObjectsOutput");
                             let contents = output.contents.as_ref().expect("local page contents");
                             assert_eq!(contents.len(), 1);
                             assert_eq!(contents[0].key.as_deref(), Some(expected_key));

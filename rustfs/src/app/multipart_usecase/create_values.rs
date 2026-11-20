@@ -15,6 +15,8 @@
 //! Values consumed and produced by multipart initiation.
 
 use std::collections::HashMap;
+
+use http::HeaderMap;
 use time::OffsetDateTime;
 
 /// Keeps the decoded values in their original form until the use case validates them.
@@ -45,4 +47,5 @@ pub(crate) struct CreateMultipartUploadResult {
     pub(crate) ssekms_key_id: Option<String>,
     pub(crate) checksum_algorithm: Option<String>,
     pub(crate) checksum_type: Option<String>,
+    pub(crate) response_headers: HeaderMap,
 }

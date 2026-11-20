@@ -58,6 +58,12 @@ pub(crate) mod replication_extension {
 }
 
 #[cfg(test)]
+pub(crate) mod persistence_parity {
+    pub(crate) use super::RUSTFS_META_BUCKET;
+    pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+}
+
+#[cfg(test)]
 pub(crate) mod upgrade_compatibility {
     pub(crate) use super::{DiskOption, Endpoint, RUSTFS_META_MULTIPART_BUCKET, new_disk};
 }

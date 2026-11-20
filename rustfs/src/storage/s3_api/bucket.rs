@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::EncodingType;
-use s3s::{S3Error, S3ErrorCode};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 use tracing::debug;
-use urlencoding::encode;
 
 const S3_MAX_KEYS: i32 = 1000;
 
@@ -46,25 +44,6 @@ fn decode_list_objects_v2_continuation_token(token: &str) -> Result<String, S3Er
 
 fn normalize_max_keys(max_keys: i32) -> i32 {
     max_keys.min(S3_MAX_KEYS)
-}
-
-fn should_encode_url(encoding_type: Option<&EncodingType>) -> bool {
-    encoding_type.is_some_and(|e| e.as_str() == EncodingType::URL)
-}
-
-fn encode_s3_name(name: &str) -> String {
-    name.split('/')
-        .map(|part| encode(part).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-pub(crate) fn encode_list_output_value(value: String, encoding_type: Option<&EncodingType>) -> String {
-    if should_encode_url(encoding_type) {
-        encode_s3_name(&value)
-    } else {
-        value
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -99,6 +78,14 @@ pub(crate) fn parse_list_object_versions_params(
     let delimiter = delimiter.filter(|v| !v.is_empty());
     let key_marker = key_marker.filter(|v| !v.is_empty());
     let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
+    // A version cursor resumes inside the versions of its key. Without one the store answers
+    // NotImplemented, a 501 for a malformed request (rustfs/backlog#2684 K-7).
+    if key_marker.is_none() && version_id_marker.is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "A version-id marker cannot be specified without a key marker.".to_string(),
+        ));
+    }
     let max_keys = max_keys.unwrap_or(S3_MAX_KEYS);
     if max_keys < 0 {
         return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
@@ -162,7 +149,7 @@ pub(crate) fn parse_list_objects_v2_params(
 #[cfg(test)]
 mod tests {
     use super::{encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params};
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     // A key that literally ends in the retired metacache tag survives the V2
     // round trip unchanged: the API layer no longer strips anything.
@@ -186,6 +173,24 @@ mod tests {
         assert_eq!(parsed.key_marker, None);
         assert_eq!(parsed.version_id_marker, None);
         assert_eq!(parsed.max_keys, 1000);
+    }
+
+    #[test]
+    fn test_parse_list_object_versions_params_rejects_a_version_marker_without_a_key_marker() {
+        for key_marker in [None, Some(String::new())] {
+            let err = parse_list_object_versions_params(None, None, key_marker, Some("v1".to_string()), None)
+                .expect_err("a version marker needs its key marker");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some("A version-id marker cannot be specified without a key marker."));
+        }
+        let parsed = parse_list_object_versions_params(None, None, Some("k".to_string()), Some("v1".to_string()), None)
+            .expect("a complete cursor parses");
+        assert_eq!(
+            (parsed.key_marker.as_deref(), parsed.version_id_marker.as_deref()),
+            (Some("k"), Some("v1"))
+        );
+        // An empty version marker is no version marker, so it needs no key marker.
+        parse_list_object_versions_params(None, None, None, Some(String::new()), None).expect("no cursor at all parses");
     }
 
     #[test]

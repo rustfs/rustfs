@@ -336,31 +336,21 @@ pub(in crate::disk) fn generation(mut canonical: FileInfo) -> Result<crate::disk
         if !compat::contains_key_str(&canonical.metadata, suffix) {
             continue;
         }
-        // The inline marker is a presence flag whose persisted value is empty.
-        // Compare both declared aliases explicitly before normalizing it; the
-        // general compatibility reader rejects empty strings by design.
-        let value = if suffix == compat::SUFFIX_INLINE_DATA {
-            let rustfs_key = compat::internal_key_rustfs(suffix);
-            let minio_key = format!("{}{suffix}", compat::MINIO_INTERNAL_PREFIX);
-            let mut value = None;
-            for (key, candidate) in &canonical.metadata {
-                if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
-                    continue;
-                }
-                if value.is_some_and(|current: &String| current != candidate) {
-                    return Err(DiskError::FileCorrupt);
-                }
-                value = Some(candidate);
+        // Identity compares persisted bytes, including a consistently empty field.
+        // Conflicting aliases still cannot identify a unique generation.
+        let rustfs_key = compat::internal_key_rustfs(suffix);
+        let minio_key = format!("{}{suffix}", compat::MINIO_INTERNAL_PREFIX);
+        let mut value = None;
+        for (key, candidate) in &canonical.metadata {
+            if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+                continue;
             }
-            value.ok_or(DiskError::FileCorrupt)?.clone()
-        } else {
-            compat::get_consistent_str(&canonical.metadata, suffix)
-                .ok_or(DiskError::FileCorrupt)?
-                .to_owned()
-        };
-        if value.is_empty() && suffix != compat::SUFFIX_INLINE_DATA {
-            continue;
+            if value.is_some_and(|current: &String| current != candidate) {
+                return Err(DiskError::FileCorrupt);
+            }
+            value = Some(candidate);
         }
+        let value = value.ok_or(DiskError::FileCorrupt)?.clone();
         compat::insert_str(&mut canonical.metadata, suffix, value);
     }
     fn sort_json_in_place(value: &mut serde_json::Value) {
@@ -951,6 +941,19 @@ pub(super) fn inspection_with_markers_bounded(
     }
     let current_meta = current.as_deref().map(FileMeta::load).transpose()?;
     let before_meta = before.as_deref().map(FileMeta::load).transpose()?;
+    let mut owned_dirs = HashSet::from([transaction]);
+    if let Some(journal) = &journal {
+        owned_dirs.extend(journal.data_dirs.iter().copied());
+    }
+    for meta in before_meta.iter().chain(current_meta.iter()) {
+        owned_dirs.extend(meta.get_data_dirs()?.into_iter().flatten());
+    }
+    let marker_names = [
+        DELETE_DATA_DIR_MARKER_PREFIX,
+        RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+        RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+    ]
+    .map(|prefix| format!("{prefix}{transaction}"));
     let mut fingerprint = Sha256::new();
     for hash in [prepared_digest, target_digest, backup_digest, current_digest, receipt_digest] {
         fingerprint.update([u8::from(hash.is_some())]);
@@ -982,6 +985,21 @@ pub(super) fn inspection_with_markers_bounded(
                 // keys, which settle under their own exact-key locks and may
                 // vanish or appear concurrently. Settlement never touches it.
                 continue;
+            }
+            if kind.is_dir() && id.is_some_and(|id| !owned_dirs.contains(&id)) {
+                let path = entry.path();
+                // A UUID child with its own xl.meta is an independent object unless
+                // this transaction also has evidence here. Keep ambiguous residue
+                // in the conservative fingerprint used for legacy settlement.
+                if regular_file_exists(&path.join(STORAGE_FORMAT_FILE))? {
+                    let mut marked = false;
+                    for marker in &marker_names {
+                        marked |= regular_marker(&path.join(marker))?;
+                    }
+                    if !marked {
+                        continue;
+                    }
+                }
             }
             descriptions.push((name.clone(), kind.is_dir(), entry.metadata().map_err(to_file_error)?.len()));
             if kind.is_dir() && id.is_some_and(|id| !id.is_nil()) {
@@ -1682,7 +1700,10 @@ impl LocalDisk {
     ) -> Result<(Vec<DeleteTransactionId>, Option<DiscoverySession>)> {
         let lease = os::acquire_namespace_mutation_lease_with_owner(path, None).await;
         self.validate_delete_discovery_owner(&session)?;
-        os::run_blocking_namespace_operation(lease, move || session.advance(limit))
+        // A discovery page can lstat thousands of entries on a cold tree. The
+        // one-worker foreground lane also serves GET metadata reads, so a page
+        // there stalls every read on this disk until the walk finishes.
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || session.advance(limit))
             .await
             .map_err(|error| to_file_error(error).into())
     }
@@ -4472,6 +4493,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_discovery_runs_while_foreground_metadata_lane_is_busy() {
+        let (_temp, disk, _info, _original) = fixture().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let queue = disk.blocking_queue.clone();
+        let foreground = tokio::spawn(async move {
+            queue
+                .run_cancellable(move |_| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("foreground metadata worker entered");
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            disk.delete_recovery_discover("recovery", None, None, 128),
+        )
+        .await;
+        release_tx.send(()).expect("release foreground metadata worker");
+        foreground
+            .await
+            .expect("foreground metadata job joins")
+            .expect("foreground metadata job succeeds");
+        let page = page
+            .expect("bucket discovery must not wait behind the foreground metadata lane")
+            .expect("bucket discovery succeeds");
+        assert!(page.transactions.is_empty(), "fixture holds no delete transactions");
+    }
+
+    #[tokio::test]
     async fn delete_recovery_live_write_backup_preserves_delete_evidence() {
         let (_temp, disk, info, original) = fixture().await;
         let root = disk.io_get_object_path("recovery", "object").unwrap();
@@ -4731,7 +4784,12 @@ mod tests {
         legacy
             .metadata
             .insert(format!("{}{}", compat::MINIO_INTERNAL_PREFIX, compat::SUFFIX_COMPRESSION), "gzip".into());
+        legacy.metadata.insert(
+            format!("{}{}", compat::MINIO_INTERNAL_PREFIX, compat::SUFFIX_REPLICA_STATUS),
+            String::new(),
+        );
         let mut modern = legacy.clone();
+        compat::insert_str(&mut modern.metadata, compat::SUFFIX_REPLICA_STATUS, String::new());
         compat::insert_str(&mut modern.metadata, compat::SUFFIX_INLINE_DATA, String::new());
         compat::insert_str(&mut modern.metadata, compat::SUFFIX_COMPRESSION, "gzip".into());
         assert_eq!(
@@ -6426,7 +6484,11 @@ mod tests {
         // inspection and settlement.
         // A content-addressed child key may look like a UUID in a spelling
         // that this protocol never writes.
-        let names = ["child".to_owned(), Uuid::new_v4().simple().to_string()];
+        let names = [
+            "child".to_owned(),
+            Uuid::new_v4().simple().to_string(),
+            Uuid::new_v4().to_string(),
+        ];
         for (child_appears, name) in [false, true]
             .into_iter()
             .flat_map(|appears| names.iter().map(move |name| (appears, name)))

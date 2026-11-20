@@ -1607,6 +1607,7 @@ fn shard_object(ledger_object: &str, shard_index: u16, bucket_incarnation: Uuid,
 }
 
 fn shard_index(object: &str) -> u16 {
+    let object = rustfs_utils::path::encode_dir_object_ref(object);
     let digest = Sha256::digest(object.as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) % SHARDED_LEDGER_COUNT
 }
@@ -2314,6 +2315,12 @@ fn log_deferred_settlement(data: &ReservationLedgerData, state: &'static str, er
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_shard_agrees_with_directory_listing_name() {
+        for listed in ["photos/", "reports/june/"] {
+            assert_eq!(shard_index(listed), shard_index(&rustfs_utils::path::encode_dir_object(listed)));
+        }
+    }
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use serial_test::serial;
 

@@ -114,33 +114,40 @@ impl<O: Operation<Output = WireResponse>> Handler<O> for Capture {
     }
 }
 
-#[tokio::test]
-async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_info() {
-    let captured = Arc::new(Mutex::new(Vec::new()));
+/// The native admin host as production configures it, with a [`Capture`] on every registered operation.
+fn capturing_stack(captured: &Arc<Mutex<Vec<serde_json::Value>>>) -> GatewayStack {
     let builder = GatewayStack::configured_builder(
         &assembly(),
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
         decide_with(|_| Decision::Allow),
+        std::convert::identity,
     )
     .unwrap();
-    let stack = GatewayStack {
+    GatewayStack {
         keystone_auth: None,
+        control_plane: false,
         service: builder
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())
-            .register::<GetIcebergConfig, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV3Datausageinfo, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV4PluginsCatalog, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV4ExtensionsCatalog, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV3ModuleSwitches, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV3Info, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV3Storageinfo, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV4RuntimeCapabilities, _>(Arc::new(Capture(captured.clone())))
-            .register::<GetV3ObjectDataCacheStats, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetIcebergConfig, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV3Datausageinfo, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV4PluginsCatalog, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV4ExtensionsCatalog, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV3ModuleSwitches, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV3Info, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV3Storageinfo, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV4RuntimeCapabilities, _>(Arc::new(Capture(Arc::clone(captured))))
+            .register::<GetV3ObjectDataCacheStats, _>(Arc::new(Capture(Arc::clone(captured))))
             .build()
             .unwrap(),
-    };
+    }
+}
+
+#[tokio::test]
+async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_info() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let stack = capturing_stack(&captured);
     let paths = [
         "/iceberg/v1/config",
         "/_iceberg/v1/config",
@@ -224,4 +231,42 @@ async fn native_admin_authenticated_request_refuses_an_uninstalled_server_contex
         assert!(body.contains("<Code>ServiceUnavailable</Code>"), "{body}");
         assert!(body.contains("<Message>server context is not ready</Message>"), "{body}");
     }
+}
+
+/// GHSA-xm99-m3gq-83g8 on the native admin host: a signed request replayed with an `x-amz-*`
+/// header its signature does not name is refused before any handler, and the same request without
+/// the header is served (the control, which proves the refusal is the header's).
+#[tokio::test]
+async fn native_admin_refuses_an_unsigned_amz_header_before_any_handler() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let stack = capturing_stack(&captured);
+    let signed = || {
+        let mut request =
+            signed_request(Signed::Header, Method::GET, "/rustfs/admin/v3/info", "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        request.extensions_mut().insert(Some(RemoteAddr(SocketAddr::from(PEER))));
+        request
+            .extensions_mut()
+            .insert(ClientInfo::direct(SocketAddr::from((CLIENT, 42000))));
+        request.extensions_mut().insert(request_context(REQUEST_ID));
+        request
+    };
+
+    let control = stack.call(signed()).await;
+    assert_eq!(control.status(), StatusCode::OK);
+    assert_eq!(captured.lock().unwrap().len(), 1, "the control reached the handler");
+
+    for (name, value) in [
+        ("x-amz-copy-source", "/private-bucket/source"),
+        ("x-amz-meta-user", "mallory"),
+    ] {
+        let mut request = signed();
+        request.headers_mut().insert(name, http::HeaderValue::from_static(value));
+        let response = stack.call(request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "{name}: {body}");
+        assert!(body.contains("not signed"), "{name}: {body}");
+    }
+    assert_eq!(captured.lock().unwrap().len(), 1, "a refused request reached a handler");
 }

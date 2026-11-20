@@ -23,12 +23,7 @@ use std::{
     ops::Deref,
 };
 
-use super::{
-    Error as IamError, Validator,
-    function::key_name::KeyName,
-    utils::{path, wildcard},
-    variables::PolicyVariableResolver,
-};
+use super::{Error as IamError, Validator, function::key_name::KeyName, utils::path, variables::PolicyVariableResolver};
 
 #[derive(Clone, Default, Debug)]
 pub struct ResourceSet(pub Vec<Resource>);
@@ -64,8 +59,21 @@ impl ResourceSet {
         conditions: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
+        self.is_match_with_unresolved(resource, conditions, resolver, false).await
+    }
+
+    pub(crate) async fn is_match_with_unresolved(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+        unresolved_matches: bool,
+    ) -> bool {
         for re in self.0.iter() {
-            if re.is_match_with_resolver(resource, conditions, resolver).await {
+            if re
+                .is_match_with_unresolved(resource, conditions, resolver, unresolved_matches)
+                .await
+            {
                 return true;
             }
         }
@@ -165,6 +173,182 @@ pub enum Resource {
     Kms(String),
 }
 
+enum ResourceToken {
+    Literal(u8),
+    Star,
+    Any,
+    Values(Vec<String>),
+}
+
+fn resource_tokens_match(pattern: &[ResourceToken], name: &str, wildcard: bool) -> bool {
+    let name = name.as_bytes();
+    if pattern.iter().all(|token| !matches!(token, ResourceToken::Values(_))) {
+        let (mut p, mut n) = (0, 0);
+        let mut star = None;
+        while n < name.len() {
+            match pattern.get(p) {
+                Some(ResourceToken::Literal(byte)) if *byte == name[n] => {
+                    p += 1;
+                    n += 1;
+                }
+                Some(ResourceToken::Any) if wildcard => {
+                    p += 1;
+                    n += 1;
+                }
+                Some(ResourceToken::Star) if wildcard => {
+                    star = Some((p, n));
+                    p += 1;
+                }
+                Some(ResourceToken::Star) if name[n] == b'*' => {
+                    p += 1;
+                    n += 1;
+                }
+                Some(ResourceToken::Any) if name[n] == b'?' => {
+                    p += 1;
+                    n += 1;
+                }
+                _ => {
+                    let Some((star_pattern, star_name)) = star else { return false };
+                    n = star_name + 1;
+                    p = star_pattern + 1;
+                    star = Some((star_pattern, n));
+                }
+            }
+        }
+        return wildcard && pattern[p..].iter().all(|token| matches!(token, ResourceToken::Star)) || p == pattern.len();
+    }
+    let mut reachable = vec![false; name.len() + 1];
+    let mut next = vec![false; name.len() + 1];
+    reachable[0] = true;
+    for token in pattern {
+        next.fill(false);
+        match token {
+            ResourceToken::Star if wildcard => {
+                if let Some(first) = reachable.iter().position(|&matched| matched) {
+                    next[first..].fill(true);
+                }
+            }
+            ResourceToken::Any if wildcard => {
+                next[1..].copy_from_slice(&reachable[..name.len()]);
+            }
+            ResourceToken::Literal(byte) => {
+                for (pos, &matched) in reachable[..name.len()].iter().enumerate() {
+                    next[pos + 1] = matched && name[pos] == *byte;
+                }
+            }
+            ResourceToken::Values(values) => {
+                for (pos, &matched) in reachable.iter().enumerate() {
+                    if matched {
+                        for value in values {
+                            if name[pos..].starts_with(value.as_bytes()) {
+                                next[pos + value.len()] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            ResourceToken::Star | ResourceToken::Any => {
+                let byte = if matches!(token, ResourceToken::Star) { b'*' } else { b'?' };
+                for (pos, &matched) in reachable[..name.len()].iter().enumerate() {
+                    next[pos + 1] = matched && name[pos] == byte;
+                }
+            }
+        }
+        if !next.iter().any(|&matched| matched) {
+            return false;
+        }
+        std::mem::swap(&mut reachable, &mut next);
+    }
+    reachable[name.len()]
+}
+
+/// Compile policy operators before interpolation so identity values remain literal data.
+async fn resolve_resource_tokens(
+    pattern: &str,
+    conditions: &HashMap<String, Vec<String>>,
+    resolver: Option<&dyn PolicyVariableResolver>,
+    depth: usize,
+) -> Option<Vec<ResourceToken>> {
+    if depth >= 10 {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let bytes = pattern.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos..].starts_with(b"${") {
+            let start = pos + 2;
+            let mut end = start;
+            let mut brace_depth = 1;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth -= 1,
+                    _ => {}
+                }
+                if brace_depth == 0 {
+                    break;
+                }
+                end += 1;
+            }
+            if brace_depth != 0 {
+                return None;
+            }
+            let variable = &pattern[start..end];
+            let mut values = Vec::new();
+            if variable.contains("${") {
+                // Historical nested syntax substitutes the inner expression as
+                // the value itself, rather than looking it up again. Compile it
+                // recursively without expanding its Cartesian product or treating
+                // resulting wildcard characters as policy operators.
+                let nested = Box::pin(resolve_resource_tokens(variable, conditions, resolver, depth + 1)).await?;
+                tokens.extend(nested.into_iter().map(|token| match token {
+                    ResourceToken::Star => ResourceToken::Literal(b'*'),
+                    ResourceToken::Any => ResourceToken::Literal(b'?'),
+                    other => other,
+                }));
+                pos = end + 1;
+                continue;
+            } else {
+                let name = variable;
+                let resolved = if let Some(resolver) = resolver {
+                    resolver.resolve_multiple(name).await
+                } else {
+                    None
+                };
+                if let Some(resolved) = resolved {
+                    values.extend(resolved);
+                } else if let Some(key) = KeyName::COMMON_KEYS
+                    .iter()
+                    .find(|key| key.var_name() == format!("${{{name}}}"))
+                    && let Some(resolved) = conditions.get(key.name())
+                {
+                    values.extend(resolved.iter().cloned());
+                }
+            }
+            // Missing variables invalidate this resource rather than matching the
+            // placeholder's literal spelling, including for anonymous callers.
+            values.retain(|value| !value.is_empty());
+            if values.is_empty() {
+                return None;
+            }
+            // Keep alternatives separate; expanding their Cartesian product can
+            // exhaust memory or silently suppress an explicit Deny.
+            tokens.push(ResourceToken::Values(values));
+            pos = end + 1;
+        } else {
+            let token = match bytes[pos] {
+                b'*' => ResourceToken::Star,
+                b'?' => ResourceToken::Any,
+                byte => ResourceToken::Literal(byte),
+            };
+            tokens.push(token);
+            pos += 1;
+        }
+    }
+    Some(tokens)
+}
+
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
     /// KMS ARNs use the same empty-account form as [`Self::S3_PREFIX`]; the suffix is
@@ -192,34 +376,25 @@ impl Resource {
         conditions: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
+        self.is_match_with_unresolved(resource, conditions, resolver, false).await
+    }
+
+    pub(crate) async fn is_match_with_unresolved(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+        unresolved_matches: bool,
+    ) -> bool {
         let pattern = match self {
             Resource::All => return true,
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
 
-        let patterns = if let Some(res) = resolver {
-            super::variables::resolve_aws_variables(&pattern, res).await
-        } else {
-            vec![pattern.clone()]
-        };
-
-        for pattern in patterns {
-            let mut resolved_pattern = pattern;
-
-            // Apply condition substitutions
-            if !conditions.is_empty() {
-                for key in KeyName::COMMON_KEYS {
-                    if let Some(rvalue) = conditions.get(key.name())
-                        && matches!(rvalue.first().map(|c| !c.is_empty()), Some(true))
-                    {
-                        resolved_pattern = resolved_pattern.replace(&key.var_name(), &rvalue[0]);
-                    }
-                }
-            }
-
+        if let Some(pattern) = resolve_resource_tokens(&pattern, conditions, resolver, 0).await {
             let cp = path::clean(resource);
-            if cp != "." && cp == resolved_pattern.as_str() {
+            if cp != "." && resource_tokens_match(&pattern, &cp, false) {
                 return true;
             }
 
@@ -230,9 +405,11 @@ impl Resource {
             } else {
                 cp.clone()
             };
-            if cp != "." && wildcard::is_match(resolved_pattern, &wildcard_resource) {
+            if cp != "." && resource_tokens_match(&pattern, &wildcard_resource, true) {
                 return true;
             }
+        } else {
+            return unresolved_matches;
         }
 
         false
@@ -332,6 +509,162 @@ mod tests {
         assert_eq!(resources.len(), unique.len());
         assert_eq!(serde_json::to_value(resources).expect("serialize resources"), serde_json::json!(unique));
         assert!(serde_json::from_str::<super::ResourceSet>(r#"["arn:aws:s3:::bucket/key","invalid"]"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn resource_variables_are_literal_and_missing_values_do_not_match() {
+        use super::KeyName;
+        use crate::policy::variables::{VariableContext, VariableResolver};
+        let resource = Resource::S3("bucket/${aws:username}/*".to_owned());
+        let conditions = HashMap::from([(
+            KeyName::COMMON_KEYS
+                .iter()
+                .find(|key| key.var_name() == "${aws:username}")
+                .expect("username common key")
+                .name()
+                .to_owned(),
+            vec!["team*?".to_owned()],
+        )]);
+        assert!(resource.is_match("bucket/team*?/file", &conditions).await);
+        assert!(!resource.is_match("bucket/team-other/file", &conditions).await);
+        assert!(!resource.is_match("bucket/${aws:username}/file", &HashMap::new()).await);
+        let prefix_resource = Resource::S3("bucket/${aws:username}*".to_owned());
+        let empty_conditions = HashMap::from([(
+            KeyName::COMMON_KEYS
+                .iter()
+                .find(|key| key.var_name() == "${aws:username}")
+                .expect("username common key")
+                .name()
+                .to_owned(),
+            vec![String::new()],
+        )]);
+        assert!(!prefix_resource.is_match("bucket/private", &empty_conditions).await);
+        let empty_resolver = VariableResolver::new(VariableContext {
+            username: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(
+            !prefix_resource
+                .is_match_with_resolver("bucket/private", &HashMap::new(), Some(&empty_resolver))
+                .await
+        );
+        let resolver = VariableResolver::new(VariableContext {
+            username: Some("team*?".to_owned()),
+            ..Default::default()
+        });
+        assert!(
+            resource
+                .is_match_with_resolver("bucket/team*?/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
+        assert!(
+            !resource
+                .is_match_with_resolver("bucket/team-other/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_variable_alternatives_do_not_disappear_when_product_exceeds_limit() {
+        use super::KeyName;
+        let key = KeyName::COMMON_KEYS
+            .iter()
+            .find(|key| key.var_name() == "${aws:username}")
+            .expect("username common key")
+            .name()
+            .to_owned();
+        let values = (0..33).map(|index| format!("user-{index}")).collect();
+        let conditions = HashMap::from([(key, values)]);
+        let resource = Resource::S3("bucket/${aws:username}/${aws:username}/*".to_owned());
+        assert!(resource.is_match("bucket/user-32/user-31/object", &conditions).await);
+        assert!(!resource.is_match("bucket/user-32/not-listed/object", &conditions).await);
+    }
+
+    #[tokio::test]
+    async fn nested_resource_variables_preserve_compatibility_without_glob_injection() {
+        use crate::policy::variables::{VariableContext, VariableResolver};
+        let resolver = VariableResolver::new(VariableContext {
+            claims: Some(HashMap::from([("sub".to_owned(), serde_json::json!("user*"))])),
+            ..Default::default()
+        });
+        let resource = Resource::S3("bucket/${${aws:PrincipalType}-${aws:userid}}/*".to_owned());
+        assert!(
+            resource
+                .is_match_with_resolver("bucket/User-user*/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
+        assert!(
+            !resource
+                .is_match_with_resolver("bucket/User-user-other/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_resource_variables_enforce_recursion_limit() {
+        use crate::policy::variables::{VariableContext, VariableResolver};
+        let resolver = VariableResolver::new(VariableContext {
+            username: Some("alice".to_owned()),
+            ..Default::default()
+        });
+        let mut variable = "${aws:username}".to_owned();
+        for _ in 0..9 {
+            variable = format!("${{{variable}}}");
+        }
+        let within_limit = Resource::S3(format!("bucket/{variable}"));
+        assert!(
+            within_limit
+                .is_match_with_resolver("bucket/alice", &HashMap::new(), Some(&resolver))
+                .await
+        );
+        let beyond_limit = Resource::S3(format!("bucket/${{{variable}}}"));
+        assert!(
+            !beyond_limit
+                .is_match_with_resolver("bucket/alice", &HashMap::new(), Some(&resolver))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_exact_match_preserves_literal_wildcard_compatibility() {
+        let resource = Resource::S3("bucket/name?".to_owned());
+        assert!(resource.is_match("bucket/name?/", &HashMap::new()).await);
+    }
+
+    #[test]
+    fn authored_wildcard_matcher_agrees_with_existing_matcher() {
+        use super::{ResourceToken, resource_tokens_match};
+        fn strings(alphabet: &[u8], max_len: usize) -> Vec<String> {
+            let mut results = vec![String::new()];
+            for _ in 0..max_len {
+                let current = results.clone();
+                for prefix in current {
+                    for &byte in alphabet {
+                        results.push(format!("{prefix}{}", char::from(byte)));
+                    }
+                }
+            }
+            results.sort();
+            results.dedup();
+            results
+        }
+        for pattern in strings(b"ab*?", 4) {
+            let tokens: Vec<_> = pattern
+                .bytes()
+                .map(|byte| match byte {
+                    b'*' => ResourceToken::Star,
+                    b'?' => ResourceToken::Any,
+                    literal => ResourceToken::Literal(literal),
+                })
+                .collect();
+            for name in strings(b"ab", 4) {
+                assert_eq!(
+                    resource_tokens_match(&tokens, &name, true),
+                    crate::policy::utils::wildcard::is_match(&pattern, &name),
+                    "pattern={pattern:?} name={name:?}"
+                );
+            }
+        }
     }
 
     #[test_case("*", "mybucket" => true; "all buckets")]

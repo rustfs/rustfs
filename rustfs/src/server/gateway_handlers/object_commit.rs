@@ -22,7 +22,7 @@ use crate::app::{RequestEnvelope, dto_values, multipart_usecase::DefaultMultipar
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::object_commit::{
     CopyObjectAuthorization, CopySourceObject, authorize_complete_multipart_upload, authorize_copy_object,
-    authorize_upload_part_copy,
+    authorize_upload_part_copy, check_copy_source_owner,
 };
 use rustfs_gateway::{CopySourceForm, Req, Resp, dto};
 use rustfs_gateway_types::{CopySourceValue, ETag};
@@ -46,10 +46,7 @@ impl Served for dto::CompleteMultipartUpload {
             .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
         let input = request.input();
         let specific_etag = input.if_match.as_deref().is_some_and(|value| value.trim() != "*");
-        Ok(
-            authorize_complete_multipart_upload(envelope, &server, input.bucket.as_str(), input.key.as_str(), specific_etag)
-                .await?,
-        )
+        authorize_complete_multipart_upload(envelope, &server, input.bucket.as_str(), input.key.as_str(), specific_etag).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -90,7 +87,7 @@ impl Served for dto::CopyObject {
             legal_hold: input.object_lock_legal_hold_status.is_some(),
             retention: input.object_lock_mode.is_some() || input.object_lock_retain_until_date.is_some(),
         };
-        Ok(authorize_copy_object(envelope, &server, facts).await?)
+        authorize_copy_object(envelope, &server, facts).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -122,7 +119,7 @@ impl Served for dto::UploadPartCopy {
         };
         let input = request.input();
         authorize_upload_part_copy(envelope, &server, input.bucket.as_str(), input.key.as_str(), source).await?;
-        check_copy_source_owner(envelope)
+        check_copy_source_owner(envelope.headers())
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -147,7 +144,7 @@ impl Served for dto::UploadPartCopy {
             copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
         };
         let output = DefaultMultipartUsecase::with_context(context)
-            .execute_upload_part_copy_owned(envelope, input)
+            .execute_upload_part_copy_with_audit(envelope, input)
             .await?;
         let tag = output
             .e_tag
@@ -169,27 +166,6 @@ impl Served for dto::UploadPartCopy {
             ..Default::default()
         }))
     }
-}
-
-fn check_copy_source_owner(envelope: &RequestEnvelope) -> S3Result<()> {
-    let mut values = envelope.headers().get_all("x-amz-source-expected-bucket-owner").iter();
-    let Some(value) = values.next() else {
-        return Ok(());
-    };
-    if values.next().is_some() {
-        return Err(s3_error!(InvalidRequest, "Multiple source expected owner headers"));
-    }
-    let expected = value
-        .to_str()
-        .map_err(|_| s3_error!(InvalidRequest, "Invalid source expected owner header"))?
-        .trim();
-    if expected.is_empty() {
-        return Ok(());
-    }
-    if dto_values::owner().id.as_deref() != Some(expected) {
-        return Err(s3_error!(AccessDenied));
-    }
-    Ok(())
 }
 
 fn copy_source<O: rustfs_gateway::Operation<DerivedResources = rustfs_gateway::CopySourceResources>>(
@@ -333,7 +309,7 @@ mod source_owner_tests {
                 },
                 Extensions::new(),
             );
-            let actual = check_copy_source_owner(&envelope);
+            let actual = check_copy_source_owner(envelope.headers());
             assert_eq!(actual.as_ref().err().map(|error| error.code().as_str()), expected);
         }
     }

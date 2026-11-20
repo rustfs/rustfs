@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
-use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
-use crate::storage::access::ReqInfo;
+#[cfg(test)]
+use crate::shared_types::RemoteAddr;
+use crate::shared_types::convert_ecstore_object_info;
+use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -36,6 +38,7 @@ use rustfs_s3_types::EventName;
 use rustfs_targets::{extract_params_header, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
+#[cfg(test)]
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
@@ -43,6 +46,7 @@ use std::net::SocketAddr;
 use tokio::runtime::{Builder, Handle};
 
 /// Request type seen by the denial auditor, so `denial_audit` stays off the direct s3s surface.
+#[cfg(test)]
 pub(crate) type DenialRequest<T> = S3Request<T>;
 use tracing::{Instrument, info_span, warn};
 
@@ -57,6 +61,7 @@ pub(crate) struct AuditRequestView<'a> {
 }
 
 impl<'a> AuditRequestView<'a> {
+    #[cfg(test)]
     pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
         Self {
             headers: &req.headers,
@@ -204,6 +209,7 @@ impl<'a> OperationOutcome<'a> {
         }
     }
 
+    #[cfg(test)]
     fn legacy<T>(result: &'a S3Result<S3Response<T>>) -> Self {
         match result {
             Ok(res) => Self::Success {
@@ -385,6 +391,7 @@ impl OperationHelper {
     /// For operations that have no notification event of their own (`UploadPart`, the
     /// bucket configuration writes) or whose event is internal (`AbortMultipartUpload`).
     /// The handler records the per-operation metric.
+    #[cfg(test)]
     pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
         Self::audit_only_from_view(&AuditRequestView::legacy(req), op)
     }
@@ -594,6 +601,7 @@ impl OperationHelper {
     /// Complete operational details from S3 results.
     /// This method should be called immediately before the function returns.
     /// It consumes and prepares auxiliary structures for use during `drop`.
+    #[cfg(test)]
     pub fn complete<T>(self, result: &S3Result<S3Response<T>>) -> Self {
         self.complete_with(OperationOutcome::legacy(result))
     }
@@ -710,6 +718,7 @@ pub(crate) enum DenialScope {
 ///
 /// The entry carries the action that was denied and the internal denial reason, so an
 /// audit consumer can tell a refused request from a handler that never ran.
+#[cfg(test)]
 pub(crate) fn authorization_denial_entry<T>(
     req: &S3Request<T>,
     action: &Action,
@@ -772,6 +781,7 @@ pub(crate) fn authorization_denial_entry_for_view(
 ///
 /// The helper is built before the request is handed over so it sees the original headers
 /// and extensions, and it completes with the handler's result, so failed requests are audited too.
+#[cfg(test)]
 pub(crate) async fn audit_only_operation<I, O, F, Fut>(req: S3Request<I>, op: S3Operation, handler: F) -> S3Result<S3Response<O>>
 where
     I: Send + Sync,
@@ -854,7 +864,7 @@ impl Drop for OperationHelper {
 mod tests {
     use super::OperationHelper;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
-    use crate::storage::access::ReqInfo;
+    use crate::storage::req_info::ReqInfo;
     use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
@@ -1944,8 +1954,9 @@ mod tests {
                 // Drive the real data path: the principal built from this request is
                 // what carries the audit slot into the SSE code.
                 let metadata = unreadable_sse_kms_metadata();
+                let envelope = crate::app::RequestEnvelope::from_s3s(&req);
                 let principal =
-                    crate::storage::sse::SseKmsPrincipal::from_request(&req).expect("authenticated request has a principal");
+                    crate::storage::sse::SseKmsPrincipal::from_request(&envelope).expect("authenticated request has a principal");
                 crate::storage::sse::sse_decryption(crate::storage::sse::DecryptionRequest {
                     bucket: "finance",
                     key: "ledger.csv",

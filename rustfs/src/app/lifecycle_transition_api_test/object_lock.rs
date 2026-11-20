@@ -28,11 +28,10 @@ use super::*;
 #[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn object_lock_handlers_schedule_replication() {
     use super::super::storage_api::object_usecase::bucket::replication::MUST_REPLICATE_OBJECT_CALLS;
-    use crate::app::storage_api::s3::S3;
     use std::sync::atomic::Ordering;
 
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
+    let object_meta = crate::app::object_meta::ObjectMetaUsecase::with_context(None);
 
     let bucket = format!("test-lock-repl-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let object = "locked/object.txt";
@@ -52,7 +51,7 @@ async fn object_lock_handlers_schedule_replication() {
 
     // PutObjectRetention must compute a replication decision.
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
-    let retention_input = PutObjectRetentionInput::builder()
+    let _retention_input = PutObjectRetentionInput::builder()
         .bucket(bucket.clone())
         .key(object.to_string())
         .retention(Some(ObjectLockRetention {
@@ -61,7 +60,18 @@ async fn object_lock_handlers_schedule_replication() {
         }))
         .build()
         .unwrap();
-    fs.put_object_retention(build_request(retention_input, Method::PUT))
+    let req = build_request((), Method::PUT);
+    object_meta
+        .put_object_retention_fields(
+            crate::app::RequestEnvelope::from_s3s(&req),
+            &bucket,
+            object,
+            None,
+            Some(crate::storage::request_markers::RequestedObjectLockRetention {
+                mode: Some(ObjectLockRetentionMode::COMPLIANCE.to_owned()),
+                retain_until: Some(time::macros::datetime!(2030-01-01 00:00:00 UTC)),
+            }),
+        )
         .await
         .expect("put_object_retention should succeed");
     assert_eq!(
@@ -73,7 +83,7 @@ async fn object_lock_handlers_schedule_replication() {
 
     // A bucket without a replication configuration can skip the decision.
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
-    let no_replication_input = PutObjectLegalHoldInput::builder()
+    let _no_replication_input = PutObjectLegalHoldInput::builder()
         .bucket(bucket.clone())
         .key(object.to_string())
         .legal_hold(Some(ObjectLockLegalHold {
@@ -81,7 +91,17 @@ async fn object_lock_handlers_schedule_replication() {
         }))
         .build()
         .unwrap();
-    fs.put_object_legal_hold(build_request(no_replication_input, Method::PUT))
+    let req = build_request((), Method::PUT);
+    object_meta
+        .put_object_legal_hold_fields(
+            crate::app::RequestEnvelope::from_s3s(&req),
+            &bucket,
+            object,
+            None,
+            Some(crate::storage::request_markers::RequestedObjectLegalHold(Some(
+                ObjectLockLegalHoldStatus::OFF.to_owned(),
+            ))),
+        )
         .await
         .expect("legal hold without replication should succeed");
     assert_eq!(
@@ -93,7 +113,7 @@ async fn object_lock_handlers_schedule_replication() {
     // A configured bucket must still evaluate the metadata replication decision.
     install_delete_replication_config(&bucket, true, false, None).await;
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
-    let legal_hold_input = PutObjectLegalHoldInput::builder()
+    let _legal_hold_input = PutObjectLegalHoldInput::builder()
         .bucket(bucket.clone())
         .key(object.to_string())
         .legal_hold(Some(ObjectLockLegalHold {
@@ -101,7 +121,17 @@ async fn object_lock_handlers_schedule_replication() {
         }))
         .build()
         .unwrap();
-    fs.put_object_legal_hold(build_request(legal_hold_input, Method::PUT))
+    let req = build_request((), Method::PUT);
+    object_meta
+        .put_object_legal_hold_fields(
+            crate::app::RequestEnvelope::from_s3s(&req),
+            &bucket,
+            object,
+            None,
+            Some(crate::storage::request_markers::RequestedObjectLegalHold(Some(
+                ObjectLockLegalHoldStatus::ON.to_owned(),
+            ))),
+        )
         .await
         .expect("put_object_legal_hold should succeed");
     assert_eq!(

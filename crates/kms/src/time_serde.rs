@@ -1,17 +1,17 @@
-use jiff::{Timestamp, Zoned, tz::TimeZone};
+use jiff::{Timestamp, ZonedDateTime, tz::TimeZone};
 use serde::{Deserialize, Deserializer, Serializer};
 
 pub(crate) mod zoned {
     use super::*;
 
-    pub(crate) fn serialize<S>(value: &Zoned, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(value: &ZonedDateTime, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&value.to_string())
     }
 
-    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Zoned, D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<ZonedDateTime, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -23,7 +23,7 @@ pub(crate) mod zoned {
 pub(crate) mod option_zoned {
     use super::*;
 
-    pub(crate) fn serialize<S>(value: &Option<Zoned>, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(value: &Option<ZonedDateTime>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -33,7 +33,7 @@ pub(crate) mod option_zoned {
         }
     }
 
-    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Zoned>, D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<ZonedDateTime>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -44,15 +44,15 @@ pub(crate) mod option_zoned {
     }
 }
 
-fn parse_zoned_compat(value: &str) -> Result<Zoned, String> {
-    if let Ok(zoned) = value.parse::<Zoned>() {
+fn parse_zoned_compat(value: &str) -> Result<ZonedDateTime, String> {
+    if let Ok(zoned) = value.parse::<ZonedDateTime>() {
         return Ok(zoned);
     }
 
     let timestamp = value
         .parse::<Timestamp>()
         .map_err(|err| format!("failed to parse legacy timestamp '{value}': {err}"))?;
-    Ok(timestamp.to_zoned(TimeZone::UTC))
+    Ok(timestamp.to_zoned_datetime(TimeZone::UTC))
 }
 
 #[cfg(test)]

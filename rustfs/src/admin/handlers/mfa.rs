@@ -43,7 +43,7 @@ use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, MfaMethod, emit as emit_audit,
 };
 use super::owned_admin_json_response;
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::{SelfServiceMutation, validate_admin_request};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_token_signing_key, object_store_from_envelope};
@@ -155,6 +155,18 @@ async fn resolve_self_service_caller(req: &AdminRequest) -> S3Result<CallerIdent
     // second factor even though its secret key is fixed for the life of the
     // process.
     caller.ensure_mfa_management_allowed()?;
+    SelfServiceMutation::Mfa
+        .check(req, &caller.credentials, caller.is_owner)
+        .await?;
+    if caller.identity_type == rustfs_madmin::account::IdentityType::Sts
+        && caller.credentials_source == rustfs_madmin::account::CredentialsSource::Iam
+    {
+        let context = crate::admin::runtime_sources::app_context_from_envelope(req.envelope())
+            .filter(|ctx| ctx.iam().is_ready())
+            .ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "iam unavailable"))?;
+        let parent = context.iam().handle().get_user(&caller.access_key).await;
+        caller.ensure_active_mfa_parent(parent.as_ref().map(|u| &u.credentials))?;
+    }
     Ok(caller)
 }
 
@@ -542,6 +554,11 @@ impl Operation for UserMfaResetHandler {
             );
         })?;
 
+        if target == caller.access_key {
+            SelfServiceMutation::Mfa
+                .check(&req, &caller.credentials, caller.is_owner)
+                .await?;
+        }
         let store = store_from_req(&req)?;
         mfa_service::admin_reset(store, &target).await.map_err(map_service_error)?;
 

@@ -17,6 +17,7 @@
 
 use super::{human_bytes, parse_percentage};
 use crate::analyze::AnalysisReport;
+use crate::time::Rfc3339;
 use std::io;
 
 /// GFM parses a table row into cells before inline code, so a literal `|`
@@ -33,7 +34,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
     writeln!(w)?;
     writeln!(w, "| 项 | 值 |")?;
     writeln!(w, "|---|---|")?;
-    match report.summary.time_range {
+    match report.summary.time_range.as_ref() {
         Some((first, last)) => writeln!(w, "| 时间范围 | {} → {} |", first.to_rfc3339(), last.to_rfc3339())?,
         None => writeln!(w, "| 时间范围 | (无带时间戳的事件) |")?,
     }
@@ -104,7 +105,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
             finding.count
         )?;
         writeln!(w)?;
-        if let (Some(first), Some(last)) = (finding.first_seen, finding.last_seen) {
+        if let (Some(first), Some(last)) = (finding.first_seen.as_ref(), finding.last_seen.as_ref()) {
             writeln!(w, "- 首次: {} · 末次: {}", first.to_rfc3339(), last.to_rfc3339())?;
         }
         if !finding.caused.is_empty() {

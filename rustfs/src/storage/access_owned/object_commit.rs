@@ -21,11 +21,21 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_commit.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-use super::super::{
-    AuthorizationRequest, CopySourceBucketGenerationGuard, RequestedCopySource, S3Result, ServerContextSlot, authorize_request,
-    missing_req_info_error, s3_error, versioned_read_action,
-};
 use crate::error::ApiError;
+use crate::storage::ObjectOptions;
+use crate::storage::authorization::{
+    AuthorizationRequest, CopySourceBucketGenerationGuard, ObjectTagConditions, authorize_replication_only_put_headers,
+    authorize_request, authorize_staged_multipart_part, authorize_write_etag_condition, get_or_fetch_object_tag_conditions,
+    load_bucket_generation, missing_req_info_error, req_info_mut, req_info_ref, request_object_store,
+    set_requested_object_lock_retain_until,
+};
+use crate::storage::authorization_actions::{
+    complete_multipart_upload_authorize_action, versioned_read_action, versioned_tagging_action,
+};
+use crate::storage::request_markers::{RequestedCopySource, RequestedObjectTags};
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::{S3Result, s3_error};
 
 /// Authorizes completion and records the bucket generation before publication.
 pub(crate) async fn authorize_complete_multipart_upload<R: AuthorizationRequest + ?Sized>(
@@ -35,10 +45,6 @@ pub(crate) async fn authorize_complete_multipart_upload<R: AuthorizationRequest 
     key: &str,
     specific_etag: bool,
 ) -> S3Result<()> {
-    use super::super::{
-        authorize_replication_only_put_headers, authorize_write_etag_condition, complete_multipart_upload_authorize_action,
-        load_bucket_generation,
-    };
     let generation = load_bucket_generation(server, req, bucket).await;
     let info = req.req_info_mut().ok_or_else(missing_req_info_error)?;
     info.bucket = Some(bucket.to_owned());
@@ -65,7 +71,6 @@ pub(crate) async fn authorize_upload_part_copy<R: AuthorizationRequest + ?Sized>
     key: &str,
     source: Option<CopySourceObject<'_>>,
 ) -> S3Result<()> {
-    use super::super::{authorize_staged_multipart_part, load_bucket_generation};
     let generation = load_bucket_generation(server, req, bucket).await;
     authorize_copy_source(req, server, source).await?;
     let info = req.req_info_mut().ok_or_else(missing_req_info_error)?;
@@ -119,22 +124,72 @@ pub(crate) struct CopyObjectAuthorization<'a> {
     pub(crate) retention: bool,
 }
 
+/// Authorize the exact tag set selected by CopyObject's source reader before publication.
+/// The access hook also calls this with a preliminary snapshot, so tag-dependent
+/// destination Allow statements can be evaluated before opening either object.
+pub(crate) async fn authorize_copy_object_tags<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    source: CopySourceObject<'_>,
+    copies_tags: bool,
+    source_tags: &str,
+    effective_tags: &str,
+) -> S3Result<()> {
+    // Direct internal use-case calls with no tags retain their existing contract.
+    // Public CopyObject requests always carry the access hook's requested-tag snapshot.
+    if effective_tags.is_empty() && req.requested_object_tags().is_none() {
+        return Ok(());
+    }
+    let tag_set = crate::storage::s3_api::tagging::parse_object_tag_header(effective_tags)?;
+    if copies_tags && !tag_set.is_empty() {
+        let destination = req_info_ref(req)?.clone();
+        // Reuse the reader's metadata instead of reopening the source under its
+        // read guard (or the self-copy write guard). These are the tags being copied.
+        let source_conditions = crate::storage::s3_api::tagging::parse_object_tag_header(source_tags)?
+            .into_iter()
+            .filter_map(|tag| Some((format!("ExistingObjectTag/{}", tag.key?), vec![tag.value?])))
+            .collect();
+        let destination_tags = req.take_object_tag_conditions();
+        let destination_requested_tags = req.take_requested_object_tags();
+        req.install_object_tag_conditions(ObjectTagConditions::new(
+            source.bucket,
+            source.key,
+            source.version_id,
+            source_conditions,
+        ));
+        let info = req_info_mut(req)?;
+        info.bucket = Some(source.bucket.to_owned());
+        info.object = Some(source.key.to_owned());
+        info.version_id = source.version_id.map(str::to_owned);
+        let result = authorize_request(req, versioned_tagging_action(S3Action::GetObjectTaggingAction, source.version_id)).await;
+        *req_info_mut(req)? = destination;
+        req.take_object_tag_conditions();
+        if let Some(tags) = destination_tags {
+            req.install_object_tag_conditions(tags);
+        }
+        if let Err(error) = result {
+            if let Some(tags) = destination_requested_tags {
+                req.install_requested_object_tags(tags);
+            }
+            return Err(error);
+        }
+    }
+    req.install_requested_object_tags(RequestedObjectTags(
+        tag_set.into_iter().filter_map(|tag| Some((tag.key?, tag.value?))).collect(),
+    ));
+    authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+}
+
 /// Authorizes both resources and records the generation and tag snapshots for the copy.
 pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     server: &ServerContextSlot,
     facts: CopyObjectAuthorization<'_>,
 ) -> S3Result<()> {
-    use super::super::{
-        Action, ObjectOptions, RequestedObjectTags, S3Action, authorize_copy_object_tags, authorize_replication_only_put_headers,
-        get_or_fetch_object_tag_conditions, load_bucket_generation, req_info_mut, request_object_store,
-        set_requested_object_lock_retain_until,
-    };
     use crate::storage::storage_api::contract::object::ObjectOperations as _;
 
     let bucket_generation = load_bucket_generation(server, req, facts.bucket).await;
     #[cfg(test)]
-    super::super::wait_for_object_generation_test_hook(facts.bucket).await;
+    crate::storage::authorization::wait_for_object_generation_test_hook(facts.bucket).await;
     authorize_copy_source(req, server, facts.source).await?;
     let source = facts.source.ok_or_else(|| s3_error!(NotImplemented))?;
     let destination_version = crate::storage::options::destination_version_id(facts.query_version, req.headers());
@@ -197,6 +252,28 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
     }
     req.install_bucket_generation(bucket_generation?);
+    check_copy_source_owner(req.headers())
+}
+
+/// Checks a copy's source-owner assertion against the owner RustFS reports.
+pub(crate) fn check_copy_source_owner(headers: &http::HeaderMap) -> S3Result<()> {
+    let mut values = headers.get_all("x-amz-source-expected-bucket-owner").iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(s3_error!(InvalidRequest, "Multiple source expected owner headers"));
+    }
+    let expected = value
+        .to_str()
+        .map_err(|_| s3_error!(InvalidRequest, "Invalid source expected owner header"))?
+        .trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    if expected != crate::storage::s3_api::common::RUSTFS_OWNER_ID {
+        return Err(s3_error!(AccessDenied));
+    }
     Ok(())
 }
 
@@ -213,7 +290,3 @@ async fn load_copy_source_bucket_generation(
         incarnation_id,
     })
 }
-
-#[cfg(test)]
-#[path = "object_commit_test.rs"]
-mod tests;

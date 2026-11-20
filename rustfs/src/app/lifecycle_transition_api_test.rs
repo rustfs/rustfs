@@ -28,7 +28,6 @@ use super::storage_api::test::contract::{
     namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
-use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
 use super::storage_api::test::runtime::{
     MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,
@@ -79,3 +78,12 @@ mod object_lock;
 mod put;
 mod restore;
 mod transition;
+
+/// PutObject through its test seam, from a test's s3s fixture request.
+async fn put_through_seam(
+    usecase: &DefaultObjectUsecase,
+    req: S3Request<PutObjectInput>,
+) -> rustfs_s3_types::S3Result<crate::app::object_usecase::PutObjectWriteOutput> {
+    let (envelope, input) = crate::app::object_usecase::PutObjectWriteInput::from_test_request(req);
+    crate::app::test_seams::put_object(usecase, envelope, input).await
+}

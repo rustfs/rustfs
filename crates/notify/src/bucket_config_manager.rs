@@ -47,10 +47,16 @@ impl NotifyBucketConfigManager {
     }
 
     pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
-        if !self.subscriber_view.has_subscriber(bucket, event) {
+        // The standalone index is only a fast negative check for name-only
+        // rules. Metadata-bound rules can change without an index callback.
+        if !self.rule_engine.uses_bucket_metadata_source() && !self.subscriber_view.has_subscriber(bucket, event) {
             return false;
         }
         self.rule_engine.has_subscriber(bucket, event).await
+    }
+
+    pub(crate) fn bind_bucket_metadata_source(&self, store: &Arc<crate::NotifyStore>) {
+        self.rule_engine.bind_bucket_metadata_source(store);
     }
 
     /// Validates that the runtime can accept `cfg` for `bucket` without
