@@ -838,6 +838,7 @@ pub struct FolderScanner {
     budget: Arc<ScannerCycleBudget>,
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
+    local_stop: Option<Arc<crate::scanner_io::ScannerLocalStop>>,
     /// Tier registry frozen for this folder scan. A refresh applies to the
     /// next scan and cannot mix generations in one aggregate.
     tier_registry: TierRegistrySnapshot,
@@ -2433,6 +2434,17 @@ impl FolderScanner {
                                 self.record_failed(&item.path);
                             }
 
+                            if self.local_disk.is_local() && matches!(e, StorageError::FaultyDisk | StorageError::DiskNotFound) {
+                                if let Some(stop) = &self.local_stop {
+                                    stop.stop(crate::scanner_io::ScannerLocalStopReason::Unavailable, &ctx);
+                                } else {
+                                    ctx.cancel();
+                                }
+                                // Cancellation preserves this unresolved object and
+                                // completed siblings through every recursive path.
+                                return Err(ScannerError::Other("Local scanner drive unavailable".to_string()));
+                            }
+
                             if !retry_suppressed && should_log_failed_object(into.failed_objects) {
                                 if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
                                     error!(
@@ -3358,7 +3370,20 @@ pub async fn scan_data_folder(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
-    scan_data_folder_scoped(ctx, budget, disks, local_disk, cache, updates, scan_mode, sleeper, None, None).await
+    scan_data_folder_scoped(
+        ctx.child_token(),
+        budget,
+        disks,
+        local_disk,
+        cache,
+        updates,
+        scan_mode,
+        sleeper,
+        None,
+        None,
+        Some(Arc::new(crate::scanner_io::ScannerLocalStop::default())),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3373,6 +3398,7 @@ pub(crate) async fn scan_data_folder_scoped(
     sleeper: DynamicSleeper,
     prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
     checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
+    local_stop: Option<Arc<crate::scanner_io::ScannerLocalStop>>,
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
 
@@ -3470,6 +3496,7 @@ pub(crate) async fn scan_data_folder_scoped(
         budget: budget.clone(),
         skip_heal,
         local_disk,
+        local_stop,
         tier_registry,
         pending_heals_changed: false,
         coverage_frontier: clone_cache_value(&resume_frontier),
@@ -3494,11 +3521,13 @@ pub(crate) async fn scan_data_folder_scoped(
     prune_size_reconciliation(&mut scanner.new_cache.info, now);
 
     // Check if context is cancelled
-    if ctx.is_cancelled() {
+    if ctx.is_cancelled() && scanner.local_stop.as_ref().is_none_or(|stop| stop.reason().is_none()) {
         return Err(ScannerError::Other("Operation cancelled".to_string()));
     }
 
-    scanner.retry_pending_scanner_heals().await?;
+    if !ctx.is_cancelled() {
+        scanner.retry_pending_scanner_heals().await?;
+    }
 
     // Read top level in bucket
     let mut root = DataUsageEntry::default();
@@ -3680,7 +3709,9 @@ pub(crate) async fn scan_data_folder_scoped(
                 close_disk_guard.close().await;
                 return Err(ScannerError::NamespaceNotFoundCache(Box::new(partial_cache)));
             }
-            if matches!(&e, ScannerError::ResourceDeferred) {
+            if matches!(&e, ScannerError::ResourceDeferred)
+                || scanner.local_stop.as_ref().is_some_and(|stop| stop.reason().is_some())
+            {
                 // Admission pressure is not disk failure or an empty census.
                 // Keep the previous tree when no new useful progress exists.
                 let mut partial_cache = scanner.old_cache;
@@ -3690,7 +3721,7 @@ pub(crate) async fn scan_data_folder_scoped(
                         .insert(hash_path(&bucket_name).0, DataUsageEntry::default());
                 }
                 partial_cache.info.snapshot_complete = false;
-                partial_cache.info.scan_resource_deferred = true;
+                partial_cache.info.scan_resource_deferred = matches!(&e, ScannerError::ResourceDeferred);
                 close_disk_guard.close().await;
                 return Err(ScannerError::PartialCache(Box::new(partial_cache)));
             }

@@ -1628,6 +1628,8 @@ pub struct LocalDiskWrapper {
     health_check: bool,
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
+    /// Retirement belongs to this wrapper instance, not its monitoring policy.
+    retired: CancellationToken,
     /// Disk ID for stale checking
     disk_id: Arc<RwLock<Option<Uuid>>>,
     /// Timeout policy for scanner-sensitive operations, loaded once on wrapper initialization.
@@ -1781,6 +1783,7 @@ impl LocalDiskWrapper {
             physical_admission: Arc::new(crate::disk::io_admission::PhysicalDiskBinding::default()),
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
+            retired: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
             timeout_health_policy: get_drive_timeout_health_policy(),
         };
@@ -1986,6 +1989,11 @@ impl LocalDiskWrapper {
     /// Stop the disk monitoring
     pub async fn stop_monitoring(&self) {
         self.cancel_token.cancel();
+    }
+
+    /// Observe retirement without granting callers authority to retire this wrapper.
+    pub fn retirement_token(&self) -> CancellationToken {
+        self.retired.child_token()
     }
 
     fn spawn_recovery_monitor_if_needed(&self) {
@@ -2985,6 +2993,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn close(&self) -> Result<()> {
+        self.retired.cancel();
         self.stop_monitoring().await;
         self.disk.close().await
     }

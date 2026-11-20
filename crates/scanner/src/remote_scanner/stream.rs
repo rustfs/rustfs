@@ -1093,6 +1093,7 @@ async fn scan_and_persist_local_bucket_with_store(
                 scan_mode,
                 prefix_scan_scope: None,
                 checkpoint_tx: Some(checkpoint_tx),
+                local_stop: None,
             },
         ),
     );
