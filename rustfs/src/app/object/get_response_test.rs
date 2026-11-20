@@ -482,9 +482,13 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
         .sse_customer_key_md5(Some(digest.clone()))
         .build()
         .unwrap();
-    crate::app::test_seams::put_object(usecase, &FS::new(), build_request(input, Method::PUT))
-        .await
-        .unwrap();
+    {
+        let (envelope, input) =
+            crate::app::object_usecase::PutObjectWriteInput::from_test_request(build_request(input, Method::PUT));
+        crate::app::test_seams::put_object(usecase, envelope, input)
+    }
+    .await
+    .unwrap();
     for (case, valid, wrong_key, condition, range) in [
         ("ordinary", true, false, false, false),
         ("missing", false, false, false, false),

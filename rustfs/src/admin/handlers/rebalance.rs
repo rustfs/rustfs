@@ -936,12 +936,13 @@ impl Operation for RebalanceStatus {
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_REBALANCE,
-                state = "metadata_load_failed",
                 action = "status",
+                result = "metadata_load_failed",
                 request_id = %request_id,
                 actor = %actor,
                 remote_addr = %remote_addr,
-                "admin rebalance metadata could not be loaded"
+                error = %err,
+                "custom route returns error: admin rebalance state"
             );
             return Err(s3_error!(InternalError, "failed to load rebalance metadata from pool 0: {}", err));
         }

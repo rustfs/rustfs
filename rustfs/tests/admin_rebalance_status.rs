@@ -182,7 +182,7 @@ fn rebalance_status_preserves_http_contract_and_log_severity() {
         assert!(
             logs.lines().any(|line| line.contains("ERROR")
                 && line.contains("event=\"admin_rebalance_state\"")
-                && line.contains("state=\"metadata_load_failed\"")),
+                && line.contains("result=\"metadata_load_failed\"")),
             "unexpected failure must retain diagnostics: {logs}"
         );
         server.shutdown().await;

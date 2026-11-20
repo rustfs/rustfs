@@ -17,9 +17,9 @@
 //! Responsible for: [`assemble`], a gateway service that decides each claimed request, once its
 //! signature is verified and before any of its body is read, by the admin router's own access rule
 //! (`S3Router::admit`), and then answers it by the router's route table (`dispatch`), holding at
-//! most 1 MiB of buffered request data. The client devnull upload uses a live body.
-//! This host serves the admin, table-catalog and profiling prefixes, the STS form at `/`, and
-//! the query-discriminated extension and Object Lambda rows the gateway's RustFS dialect declares.
+//! most legacy RustFS's 1 MiB of its body — the admin, table-catalog and profiling prefixes
+//! as one claimed operation, the STS form at `/`, and the query-discriminated extension and
+//! Object Lambda rows the gateway's RustFS dialect declares.
 //! NOT responsible for: which requests reach it (`server/stack.rs`), any access decision or route
 //! (the admin router), or the ten system reads `admin.rs` serves natively.
 //! Upstream: `server/stack.rs`. Downstream: the gateway signature verifier and the admin router.
@@ -32,10 +32,8 @@ use crate::runtime_sources::ServerContextSlot;
 use crate::server::gateway_handlers::handler_error;
 use crate::storage_api::server::http::access::{ReqInfo, VerifiedSignature};
 use bytes::Bytes;
-use futures::Stream;
 use http::{HeaderMap, Method, Request, Uri};
 use http_body::Body as _;
-use http_body_util::BodyDataStream;
 use rustfs_gateway::sig::SigService;
 use rustfs_gateway::{
     Authorizer, AuthzRequest, BoxFuture, Decision, Handler, HandlerError, HandlerResult, InputAuthzRequest, InputDecisions,
@@ -48,21 +46,23 @@ use rustfs_gateway_core::dialect::{
 };
 use rustfs_gateway_core::op::{AuthRequirement, ResourceShape};
 use rustfs_gateway_core::registry::{HandlerDeadlineClass, OperationSpec};
-use rustfs_gateway_core::route::{FormClaim, Predicate, ShadowingDecl};
+use rustfs_gateway_core::route::{FormClaim, ShadowingDecl};
 use rustfs_gateway_core::{DerivedResourceError, NoDerived};
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     check_replication::CheckReplication, get_replication_metrics::GetReplicationMetrics,
     get_replication_metrics_v2::GetReplicationMetricsV2, get_replication_reset_status::GetReplicationResetStatus,
     invoke_object_lambda::InvokeObjectLambda, listen_bucket_notification::ListenBucketNotification,
-    listen_notification::ListenNotification, reset_bucket_replication::ResetBucketReplication,
+    listen_notification::ListenNotification, post_v3_speedtest_client_devnull::PostV3SpeedtestClientDevnull,
+    reset_bucket_replication::ResetBucketReplication,
 };
 use rustfs_gateway_dialect_rustfs_admin::{
-    AdminResponse as WireResponse, CLAIMS, ExtensionOperation, OVERLAY, TABLE_CATALOG_PREFIXES, admin,
+    AdminOperation as DialectAdminOperation, AdminResponse as WireResponse, CLAIMS, ExtensionOperation, OVERLAY,
+    TABLE_CATALOG_PREFIXES, admin,
 };
 use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
 use rustfs_s3_types::{Body, s3_error};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 /// The router whose behaviour this host serves.
@@ -152,68 +152,6 @@ impl OperationCodec for ControlPlane {
     }
 }
 
-/// The client speedtest must acquire its handler permit before pulling upload frames.
-#[derive(Debug)]
-struct ClientDevnull;
-
-const DEVNULL_NAME: &str = "rustfs:ClientDevnull";
-const DEVNULL_ROUTE: ClaimedRoute = ClaimedRoute {
-    precedence: ROUTE.precedence - 1,
-    rows: &[
-        ClaimedRow {
-            template: "/rustfs/admin/v3/speedtest/client/devnull",
-            selector: &[Predicate::Method(Method::POST)],
-        },
-        ClaimedRow {
-            template: "/minio/admin/v3/speedtest/client/devnull",
-            selector: &[Predicate::Method(Method::POST)],
-        },
-    ],
-    shadows: &[ShadowingDecl {
-        winner: DEVNULL_NAME,
-        shadowed: NAME,
-        reason: "The upload streams through the diagnostic handler's admission and byte limits.",
-        evidence: &[ROUTER],
-    }],
-    bucket_param: None,
-};
-
-static DEVNULL_SPEC: OperationSpec = OperationSpec::builder(DEVNULL_NAME, 200, None)
-    .handler_deadline_class(HandlerDeadlineClass::Standard)
-    .required_params(&[])
-    .auth(AuthRequirement::new(DEVNULL_NAME, ResourceShape::Service))
-    .build();
-static DEVNULL_FLOOR: OperationFloor =
-    OperationFloor::builtin_presigned(DEVNULL_NAME, SigService::S3).allow_anonymous_after_listing_in_the_posture_report();
-
-impl Operation for ClientDevnull {
-    const NAME: &'static str = DEVNULL_NAME;
-    type Input = ByteStream;
-    type Output = WireResponse;
-    type DerivedResources = NoDerived;
-    fn derive_resources(_input: &Self::Input) -> Result<NoDerived, DerivedResourceError> {
-        Ok(NoDerived)
-    }
-    fn seal_derived_input(_input: &mut Self::Input) {}
-    fn spec() -> &'static OperationSpec {
-        &DEVNULL_SPEC
-    }
-    fn floor() -> &'static OperationFloor {
-        &DEVNULL_FLOOR
-    }
-}
-
-impl OperationCodec for ClientDevnull {
-    const REQUEST_BODY: RequestBodyMode = RequestBodyMode::Streaming;
-    fn decode(_request: &MetaView<'_>, body: RequestBody) -> Result<ByteStream, CodecError> {
-        body.into_stream()
-            .ok_or_else(|| CodecError::internal("client devnull requires a streaming body"))
-    }
-    fn encode(output: WireResponse, _request: &MetaView<'_>, status: u16) -> Result<EncodedResponse, CodecError> {
-        admin::encode(output, status)
-    }
-}
-
 /// The STS endpoint: a form `POST /`, on every host and whatever the query.
 const STS_NAME: &str = "rustfs:StsForm";
 
@@ -270,9 +208,10 @@ impl OperationCodec for StsForm {
     }
 }
 
-/// The gateway's query-discriminated extension rows this host serves, recorded in the gateway's
-/// own overlay.
-const BORROWED: [&str; 8] = [
+/// The gateway's query-discriminated extension rows and streamed speedtest row this host serves,
+/// recorded in the gateway's own overlay.
+const BORROWED: [&str; 9] = [
+    PostV3SpeedtestClientDevnull::NAME,
     ResetBucketReplication::NAME,
     GetReplicationResetStatus::NAME,
     GetReplicationMetricsV2::NAME,
@@ -283,12 +222,17 @@ const BORROWED: [&str; 8] = [
     ListenBucketNotification::NAME,
 ];
 
+const SPEEDTEST_SHADOWS: &[ShadowingDecl] = &[ShadowingDecl {
+    winner: PostV3SpeedtestClientDevnull::NAME,
+    shadowed: NAME,
+    reason: "The streamed client devnull speedtest precedes the buffered control-plane catch-all.",
+    evidence: &[ROUTER],
+}];
+
 fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     static ROWS: OnceLock<Vec<OverlayRow>> = OnceLock::new();
     static SELECTOR: OnceLock<String> = OnceLock::new();
     static ACTION: OnceLock<String> = OnceLock::new();
-    static DEVNULL_SELECTOR: OnceLock<String> = OnceLock::new();
-    static DEVNULL_ACTION: OnceLock<String> = OnceLock::new();
     static STS_SELECTOR: OnceLock<String> = OnceLock::new();
     static STS_ACTION: OnceLock<String> = OnceLock::new();
     static RECORD: OnceLock<DialectOverlay> = OnceLock::new();
@@ -302,16 +246,6 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
         anonymous: true,
         evidence: &[ROUTER],
     }];
-    rows.push(OverlayRow {
-        name: DEVNULL_NAME,
-        precedence: DEVNULL_ROUTE.precedence,
-        selector: DEVNULL_SELECTOR.get_or_init(|| render_claimed_route(&DEVNULL_ROUTE)),
-        action: DEVNULL_ACTION.get_or_init(|| DEVNULL_SPEC.auth.map(|auth| auth.render()).unwrap_or_default()),
-        resource: ResourceShape::Service,
-        success_status: 200,
-        anonymous: true,
-        evidence: &[ROUTER],
-    });
     rows.push(OverlayRow {
         name: STS_NAME,
         precedence: STS_ROUTE.precedence,
@@ -333,7 +267,12 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     });
     Dialect::assemble(record)
         .declare_claimed::<ControlPlane>(ROUTE)
-        .declare_claimed::<ClientDevnull>(DEVNULL_ROUTE)
+        .declare_claimed::<PostV3SpeedtestClientDevnull>(ClaimedRoute {
+            precedence: PostV3SpeedtestClientDevnull::PRECEDENCE,
+            rows: PostV3SpeedtestClientDevnull::rows(),
+            shadows: SPEEDTEST_SHADOWS,
+            bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
+        })
         .declare_form::<StsForm>(STS_ROUTE)
         .declare::<ResetBucketReplication>(ResetBucketReplication::ROUTE)
         .declare::<GetReplicationResetStatus>(GetReplicationResetStatus::ROUTE)
@@ -374,7 +313,7 @@ pub(super) fn assemble(
         .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
         .dialect(&dialect()?)
         .register::<ControlPlane, _>(Arc::clone(&host))
-        .register::<ClientDevnull, _>(Arc::clone(&host))
+        .register::<PostV3SpeedtestClientDevnull, _>(Arc::clone(&host))
         .register::<StsForm, _>(Arc::clone(&host))
         .register::<ResetBucketReplication, _>(Arc::clone(&host))
         .register::<GetReplicationResetStatus, _>(Arc::clone(&host))
@@ -436,7 +375,7 @@ struct Admission {
 
 /// Whether this host has a handler for `operation`.
 fn served(operation: &str) -> bool {
-    [NAME, DEVNULL_NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation)
+    [NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation)
 }
 
 /// The decision once the rule has admitted a request: a served operation, or any signed request,
@@ -521,11 +460,7 @@ impl AdminBody for Bytes {
 
 impl AdminBody for ByteStream {
     fn into_admin_body(self) -> Body {
-        // Body requires a Sync stream. Polling has exclusive access, so no lock is acquired.
-        let mut stream = Mutex::new(BodyDataStream::new(self.into_body()));
-        Body::from_stream(futures::stream::poll_fn(move |cx| {
-            Pin::new(stream.get_mut().unwrap_or_else(PoisonError::into_inner)).poll_next(cx)
-        }))
+        Body::from_stream(crate::app::object::BodyChunks::with_trailers(self.into_body(), None).0)
     }
 }
 

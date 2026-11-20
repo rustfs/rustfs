@@ -12,19 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Parity of the copy-source authorization across both request edges: the same decision and the
-//! same state handed on, for an `S3Request` and for a `RequestEnvelope`, in both directions.
+//! The copy-source, copy and completion authorization on the owned request envelope: the
+//! decision and the state handed on, allowed and refused.
+//!
+//! Tests: `authorize_copy_source`, `authorize_copy_object`, `authorize_upload_part_copy` and
+//! `authorize_complete_multipart_upload`. Not tested: decoding `x-amz-copy-source` (the facts are
+//! written out as the gateway handler derives them) or the copy body.
+//! Upstream: `storage::authorization::tests::fixture`. Downstream: none.
 
-use super::access_owned::object_commit::{CopySourceObject, authorize_copy_source};
-use crate::app::{RequestEnvelope, RequestHead};
-use crate::storage::access::tests::{TestKms, UnreadyIam, build_request, ensure_req_info};
-use crate::storage::access::{
-    AuthorizationRequest, CopyObjectInput, CopySource, CopySourceBucketGenerationGuard, ECStore, FS, ReqInfo, S3Access as _,
-    UploadPartCopyInput,
+use crate::storage::access_owned::object_commit::{
+    CopyObjectAuthorization, CopySourceObject, authorize_complete_multipart_upload, authorize_copy_object, authorize_copy_source,
+    authorize_upload_part_copy,
 };
+use crate::storage::authorization::tests::fixture::{request, server_context};
+use crate::storage::authorization::{AuthorizationRequest, CopySourceBucketGenerationGuard};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-use crate::storage::storage_api::runtime_sources_consumer::{AppContext, ServerContextSlot};
-use http::{Extensions, HeaderMap, Method, Uri};
+use crate::storage::storage_api::runtime_sources_consumer::{ECStore, ServerContextSlot};
+use http::Method;
 use rustfs_s3_types::{S3ErrorCode, S3Result};
 use serial_test::serial;
 use std::sync::Arc;
@@ -55,42 +59,22 @@ fn observe<R: AuthorizationRequest>(
     }
 }
 
-/// Runs the copy-source authorization once on each edge with the same facts: `served` is the
-/// request's server context, `capture` the one the source incarnation is read from.
-async fn on_both_edges(
+/// Runs the copy-source authorization once with the given facts: `served` is the request's
+/// server context, `capture` the one the source incarnation is read from.
+async fn on_owned_edge(
     served: &Arc<ServerContextSlot>,
     capture: &ServerContextSlot,
     with_req_info: bool,
     source: Option<(&str, &str, Option<&str>)>,
-) -> (Observed, Observed) {
-    let extensions = || {
-        let mut extensions = Extensions::new();
-        if with_req_info {
-            extensions.insert(ReqInfo::default());
-        }
-        extensions.insert(Arc::clone(served));
-        extensions
-    };
-    let object = || source.map(|(bucket, key, version_id)| CopySourceObject { bucket, key, version_id });
-
-    let mut legacy = build_request((), Method::PUT);
-    legacy.extensions = extensions();
-    let result = authorize_copy_source(&mut legacy, capture, object()).await;
-    let generation = legacy.extensions.get::<CopySourceBucketGenerationGuard>();
-    let legacy = observe(&legacy, result, generation);
-
-    let head = RequestHead {
-        method: Method::PUT,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        credentials: None,
-        region: None,
-        service: None,
-    };
-    let mut envelope = RequestEnvelope::from_parts(head, extensions());
-    let result = authorize_copy_source(&mut envelope, capture, object()).await;
-    let owned = observe(&envelope, result, envelope.copy_source_bucket_generation());
-    (legacy, owned)
+) -> Observed {
+    let object = source.map(|(bucket, key, version_id)| CopySourceObject { bucket, key, version_id });
+    let mut builder = request(Method::PUT);
+    if with_req_info {
+        builder = builder.req_info();
+    }
+    let mut envelope = builder.server_context(served).build();
+    let result = authorize_copy_source(&mut envelope, capture, object).await;
+    observe(&envelope, result, envelope.copy_source_bucket_generation())
 }
 
 async fn source_bucket(store: &ECStore, actions: &[&str]) -> String {
@@ -125,9 +109,8 @@ fn copy_source_authorization_decides_and_hands_on_the_same_on_both_edges() {
 
 async fn copy_source_parity_inner() {
     let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-    let server = Arc::new(ServerContextSlot::new());
-    assert!(server.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
-    let unready = Arc::new(ServerContextSlot::new());
+    let server = server_context(Arc::clone(&store));
+    let unready = ServerContextSlot::new();
 
     let readable = source_bucket(&store, &["s3:GetObject"]).await;
     let version_readable = source_bucket(&store, &["s3:GetObjectVersion"]).await;
@@ -238,9 +221,9 @@ async fn copy_source_parity_inner() {
     // Every case is checked before failing, so one run names every case a defect breaks.
     let mut mismatches = Vec::new();
     for (case, slot, with_req_info, source, expected) in cases {
-        let (legacy, owned) = on_both_edges(&server, &slot, with_req_info, source).await;
-        if legacy != expected || owned != expected {
-            mismatches.push(format!("{case}: expected {expected:?}, legacy {legacy:?}, owned {owned:?}"));
+        let owned = on_owned_edge(&server, &slot, with_req_info, source).await;
+        if owned != expected {
+            mismatches.push(format!("{case}: expected {expected:?}, owned {owned:?}"));
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
@@ -256,57 +239,62 @@ fn copy_hooks_decide_the_source_before_the_destination() {
 /// `InvalidRequest`; that refusal must never be reached for a source the caller may not read.
 async fn copy_hooks_source_first_inner() {
     let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-    let server = ServerContextSlot::new();
-    assert!(server.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
-    let fs = FS::with_server_ctx(server);
+    let server = server_context(Arc::clone(&store));
     let closed = source_bucket(&store, &[]).await;
     let readable = source_bucket(&store, &["s3:GetObject"]).await;
     let destination = source_bucket(&store, &["s3:PutObject"]).await;
-    let arn = "arn:aws:s3:us-east-1:123456789012:accesspoint/my-access-point/object/key";
 
-    for (case, spelling, copy_expected, part_expected) in [
+    // The copy source bucket as the request decoder hands it on (key `key`, no version); `None`
+    // is an access-point ARN such as
+    // `arn:aws:s3:us-east-1:123456789012:accesspoint/my-access-point/object/key`.
+    for (case, source_bucket_name, copy_expected, part_expected) in [
         (
             "a denied source",
-            format!("{closed}/key"),
+            Some(closed.as_str()),
             S3ErrorCode::AccessDenied,
             S3ErrorCode::AccessDenied,
         ),
-        ("an ARN source", arn.to_owned(), S3ErrorCode::NotImplemented, S3ErrorCode::NotImplemented),
+        ("an ARN source", None, S3ErrorCode::NotImplemented, S3ErrorCode::NotImplemented),
         // Control: with the source readable, the destination half is reached and refuses.
         (
             "a readable source",
-            format!("{readable}/key"),
+            Some(readable.as_str()),
             S3ErrorCode::InvalidRequest,
             S3ErrorCode::AccessDenied,
         ),
     ] {
-        let source = || CopySource::parse(&spelling).expect("the request parser accepts the source");
-        let copy = CopyObjectInput::builder()
-            .bucket(destination.clone())
-            .key("copy".to_string())
-            .copy_source(source())
-            .tagging(Some("a=b".to_string()))
-            .build()
-            .expect("copy input");
-        let mut copy = build_request(copy, Method::PUT);
-        ensure_req_info(&mut copy);
-        copy.extensions.insert(fs.server_ctx().clone());
-        let copy_error = fs.copy_object(&mut copy).await.expect_err(case);
-        assert_eq!(S3ErrorCode::from(copy_error.code().clone()), copy_expected, "CopyObject: {case}");
+        let source = || {
+            source_bucket_name.map(|bucket| CopySourceObject {
+                bucket,
+                key: "key",
+                version_id: None,
+            })
+        };
+        let mut copy = request(Method::PUT).req_info().server_context(&server).build();
+        let copy_error = authorize_copy_object(
+            &mut copy,
+            &server,
+            CopyObjectAuthorization {
+                bucket: &destination,
+                key: "copy",
+                source: source(),
+                query_version: None,
+                tagging: Some("a=b"),
+                tagging_directive: None,
+                retain_until: None,
+                legal_hold: false,
+                retention: false,
+            },
+        )
+        .await
+        .expect_err(case);
+        assert_eq!(copy_error.code(), &copy_expected, "CopyObject: {case}");
 
-        let part = UploadPartCopyInput::builder()
-            .bucket(closed.clone())
-            .key("copy".to_string())
-            .copy_source(source())
-            .upload_id("unused".to_string())
-            .part_number(1)
-            .build()
-            .expect("part copy input");
-        let mut part = build_request(part, Method::PUT);
-        ensure_req_info(&mut part);
-        part.extensions.insert(fs.server_ctx().clone());
-        let part_error = fs.upload_part_copy(&mut part).await.expect_err(case);
-        assert_eq!(S3ErrorCode::from(part_error.code().clone()), part_expected, "UploadPartCopy: {case}");
+        let mut part = request(Method::PUT).req_info().server_context(&server).build();
+        let part_error = authorize_upload_part_copy(&mut part, &server, &closed, "copy", source())
+            .await
+            .expect_err(case);
+        assert_eq!(part_error.code(), &part_expected, "UploadPartCopy: {case}");
     }
 }
 
@@ -314,8 +302,7 @@ async fn copy_hooks_source_first_inner() {
 #[serial]
 async fn completion_authorization_requires_write_read_and_replication_permissions() {
     let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-    let server = ServerContextSlot::new();
-    assert!(server.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+    let server = server_context(Arc::clone(&store));
     for (actions, specific_etag, replica, allowed) in [
         (vec!["s3:PutObject"], false, false, true),
         (vec![], false, false, false),
@@ -325,40 +312,16 @@ async fn completion_authorization_requires_write_read_and_replication_permission
         (vec!["s3:GetObject"], false, false, false),
     ] {
         let bucket = source_bucket(&store, &actions).await;
-        let mut request = build_request((), Method::POST);
-        request.extensions.insert(Arc::clone(&server));
-        request.extensions.insert(ReqInfo::default());
+        let mut builder = request(Method::POST).server_context(&server).req_info();
         if replica {
-            request
-                .headers
-                .insert("x-amz-replication-status", http::HeaderValue::from_static("REPLICA"));
+            builder = builder.header("x-amz-replication-status", "REPLICA");
         }
-        let mut envelope = RequestEnvelope::from_s3s(&request);
-        for owned in [false, true] {
-            let result = if owned {
-                super::access_owned::object_commit::authorize_complete_multipart_upload(
-                    &mut envelope,
-                    &server,
-                    &bucket,
-                    "object",
-                    specific_etag,
-                )
-                .await
-            } else {
-                super::access_owned::object_commit::authorize_complete_multipart_upload(
-                    &mut request,
-                    &server,
-                    &bucket,
-                    "object",
-                    specific_etag,
-                )
-                .await
-            };
-            if allowed {
-                result.expect("permitted completion");
-            } else {
-                assert_eq!(result.expect_err("completion refused").code(), &S3ErrorCode::AccessDenied);
-            }
+        let mut envelope = builder.build();
+        let result = authorize_complete_multipart_upload(&mut envelope, &server, &bucket, "object", specific_etag).await;
+        if allowed {
+            result.expect("permitted completion");
+        } else {
+            assert_eq!(result.expect_err("completion refused").code(), &S3ErrorCode::AccessDenied);
         }
         assert_eq!(envelope.bucket_generation().is_some(), allowed);
         assert_eq!(envelope.req_info().unwrap().bucket.as_deref(), Some(bucket.as_str()));

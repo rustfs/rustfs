@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Both request forms through the one decision: the same answer and the same state handed on
+//! The DeleteObject decision on the owned request envelope: the answer and the state handed on
 //! (the caller's `ReqInfo` and the guard), allowed and refused.
+//!
+//! Tests: `decide_delete_object` for anonymous, policy-less, IAM and owner callers, the headers
+//! that add actions, and replica deletes. Not tested: the delete handler or the request decoder.
+//! Upstream: `storage::authorization::tests::fixture`. Downstream: none.
 
-use super::access_owned::object_misc::decide_delete_object;
-use crate::app::RequestEnvelope;
-use crate::storage::access::{
-    AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, ReqInfo, S3Request,
-};
+use crate::storage::access_owned::object_misc::decide_delete_object;
+use crate::storage::authorization::tests::fixture::{TestKms, UnreadyIam, request};
+use crate::storage::authorization::{AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard};
+use crate::storage::req_info::ReqInfo;
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
-use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, ServerContextSlot};
+use http::{HeaderMap, Method};
 use rustfs_iam::store::{Store as _, UserType};
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
-use rustfs_kms::KmsServiceManager;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
 use rustfs_policy::policy::Policy;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
@@ -167,28 +169,20 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-fn request(case: &Case, server_ctx: &Arc<ServerContextSlot>) -> S3Request<()> {
+fn case_request(case: &Case, server_ctx: &Arc<ServerContextSlot>) -> crate::app::RequestEnvelope {
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, SOURCE_VERSION);
+    let mut builder = request(Method::DELETE)
+        .uri("/e2-delete-parity/key")
+        .headers(headers)
+        .server_context(server_ctx);
     for (name, value) in case.headers {
-        headers.insert(*name, HeaderValue::from_static(value));
+        builder = builder.header(name, value);
     }
-    let mut extensions = Extensions::new();
     if let Some(caller) = &case.caller {
-        extensions.insert(caller.clone());
+        builder = builder.extension(caller.clone());
     }
-    extensions.insert(Arc::clone(server_ctx));
-    S3Request {
-        input: (),
-        method: Method::DELETE,
-        uri: Uri::from_static("/e2-delete-parity/key"),
-        headers,
-        extensions,
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
+    builder.build()
 }
 
 async fn decide<R: AuthorizationRequest + ?Sized>(req: &mut R, bucket: &str, case: &Case) -> Result<Handed, S3ErrorCode> {
@@ -203,19 +197,14 @@ async fn decide<R: AuthorizationRequest + ?Sized>(req: &mut R, bucket: &str, cas
     })
 }
 
-/// Runs every case in both request forms; one run names every case a defect breaks.
+/// Runs every case; one run names every case a defect breaks.
 async fn assert_cases(cases: Vec<Case>, bucket: &str, server_ctx: &Arc<ServerContextSlot>) {
     let mut wrong = Vec::new();
     for case in cases {
-        let mut legacy = request(&case, server_ctx);
-        let mut envelope = RequestEnvelope::from_s3s(&legacy);
-        for (form, answer) in [
-            ("legacy request", decide(&mut legacy, bucket, &case).await),
-            ("envelope", decide(&mut envelope, bucket, &case).await),
-        ] {
-            if answer != case.expected {
-                wrong.push(format!("{} ({form}): {answer:?}", case.name));
-            }
+        let mut envelope = case_request(&case, server_ctx);
+        let answer = decide(&mut envelope, bucket, &case).await;
+        if answer != case.expected {
+            wrong.push(format!("{}: {answer:?}", case.name));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -373,25 +362,5 @@ impl IamInterface for ReadyIam {
 
     fn is_ready(&self) -> bool {
         true
-    }
-}
-
-struct UnreadyIam;
-
-impl IamInterface for UnreadyIam {
-    fn handle(&self) -> Arc<IamSys<ObjectStore>> {
-        panic!("a bucket-policy decision does not resolve IAM")
-    }
-
-    fn is_ready(&self) -> bool {
-        false
-    }
-}
-
-struct TestKms;
-
-impl KmsInterface for TestKms {
-    fn handle(&self) -> Arc<KmsServiceManager> {
-        Arc::new(KmsServiceManager::new())
     }
 }
