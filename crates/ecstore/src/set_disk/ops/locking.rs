@@ -621,9 +621,14 @@ impl SetDisks {
         let disk::Disk::Local(local) = candidate.as_ref() else { return false };
         let path = candidate.endpoint().to_string();
         let dist = self.ctx.is_dist_erasure().await;
-        // Lock order: distributed drive table -> path map -> set slots -> ID map.
-        // Startup also takes the drive table before the path map, and RPC registration
-        // takes the path map before the ID map. All disk I/O finished before entering.
+        // A busy set must not block RPC lookups across the instance. Lock the set
+        // first, then follow the registry order used by startup and RPC registration:
+        // distributed drive table -> path map -> ID map.
+        let mut disks = self.disks.write().await;
+        let slot = &mut disks[disk_idx];
+        if !Self::same_disk_handle(slot.as_ref(), previous) {
+            return false;
+        }
         let table = self.ctx.local_disk_set_drives();
         let mut table = if dist { Some(table.write().await) } else { None };
         let route_slot = if let Some(table) = table.as_mut() {
@@ -640,11 +645,6 @@ impl SetDisks {
         };
         let routes = self.ctx.local_disk_map();
         let mut routes = routes.write().await;
-        let mut disks = self.disks.write().await;
-        let slot = &mut disks[disk_idx];
-        if !Self::same_disk_handle(slot.as_ref(), previous) {
-            return false;
-        }
         if let Some(id) = format_id {
             self.ctx.local_disk_id_map().write().await.insert(id, path.clone());
         }
