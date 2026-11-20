@@ -1209,8 +1209,8 @@ impl<T: Store> IamSys<T> {
         self.rotate_user_secret_key_checked(access_key, secret_key, None).await
     }
 
-    /// Change an enabled regular caller's secret only if its signing secret is
-    /// still current under the parent mutation lock. Status and policies are kept.
+    /// Change an enabled regular user's secret only if the supplied current
+    /// secret still matches under the parent mutation lock. Status and policies are kept.
     /// Persistence and revocation continue after caller cancellation.
     pub async fn change_own_secret_key(
         &self,
