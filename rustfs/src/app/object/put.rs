@@ -1174,8 +1174,10 @@ impl PutObjectCompletion {
         match self {
             Self::S3(helper) => Self::S3(helper.complete_owned(result, status, headers)),
             Self::Internal(event) => {
-                if let Some(event) = event {
-                    event.complete_owned(result, headers);
+                if result.is_ok()
+                    && let Some(event) = event
+                {
+                    event.publish(headers);
                 }
                 Self::Internal(None)
             }

@@ -58,9 +58,6 @@ pub(crate) mod s3 {
     #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
     pub(crate) use s3s::Body;
     #[cfg(test)]
-    pub(crate) use s3s::S3Request;
-    pub(crate) use s3s::S3Response;
-    #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
@@ -89,6 +86,8 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::{BodySizeLimitExceeded, S3, TrailingHeaders};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
+    #[cfg(test)]
+    pub(crate) use s3s::{S3Request, S3Response};
 }
 
 pub(crate) mod admin {
