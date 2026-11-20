@@ -19,7 +19,6 @@ use super::*;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::server::gateway_handlers::test_support::{signed_body_request, signed_session_request};
-use crate::server::stack::select_stack;
 use http_body_util::Full;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,46 +28,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// the path alone.
 const HOST: &str = "localhost:9000";
 
-/// The legacy service, counting every request it is handed.
-#[derive(Clone)]
-struct Recorded(crate::server::http::S3Service, Arc<AtomicUsize>);
+type Edge = crate::server::stack::S3StackService<GatewayEdgeService>;
 
-impl<B> Service<HttpRequest<B>> for Recorded
-where
-    crate::server::http::S3Service: Service<HttpRequest<B>>,
-{
-    type Response = <crate::server::http::S3Service as Service<HttpRequest<B>>>::Response;
-    type Error = <crate::server::http::S3Service as Service<HttpRequest<B>>>::Error;
-    type Future = <crate::server::http::S3Service as Service<HttpRequest<B>>>::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        Service::<HttpRequest<B>>::poll_ready(&mut self.0, cx)
-    }
-
-    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
-        self.1.fetch_add(1, Ordering::SeqCst);
-        Service::call(&mut self.0, request)
-    }
-}
-
-type Edge = crate::server::stack::S3StackService<Recorded, GatewayEdgeService>;
-
-/// The gateway selection over `router`, with a legacy service that records every call.
-fn edge(
-    slot: &Arc<ServerContextSlot>,
-    legacy: crate::server::http::S3Service,
-    router: S3Router<AdminOperation>,
-) -> (Edge, Arc<AtomicUsize>) {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let gateway =
-        || Ok::<_, std::convert::Infallible>(GatewayEdgeService(GatewayStack::assemble(assembly(slot.clone())).unwrap()));
-    let service = select_stack(config::S3Stack::Gateway, Recorded(legacy, Arc::clone(&calls)), gateway)
-        .unwrap()
+/// The gateway stack over `router`.
+fn edge(slot: &Arc<ServerContextSlot>, router: S3Router<AdminOperation>) -> Edge {
+    crate::server::stack::S3StackService::new(GatewayEdgeService(GatewayStack::assemble(assembly(slot.clone())).unwrap()))
         .with_native_admin(Some(GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap())))
         .with_control_plane(Some(GatewayEdgeService(
             GatewayStack::assemble_control_plane(assembly(slot.clone()), Arc::new(router)).unwrap(),
-        )));
-    (service, calls)
+        )))
 }
 
 fn anonymous(method: Method, target: &str, content_type: Option<&str>, body: &'static str) -> HttpRequest<Full<Bytes>> {
@@ -105,7 +73,7 @@ enum Compare {
 async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
     let (_env, slot, legacy) = admin_fixture().await;
     let router = crate::admin::make_admin_router(false, slot.clone()).unwrap();
-    let (edge, legacy_calls) = edge(&slot, legacy.clone(), router);
+    let edge = edge(&slot, router);
     let mut failures = Vec::new();
     let iam = slot.installed_app_context().unwrap().iam().handle();
     iam.create_user(
@@ -522,11 +490,6 @@ async fn every_control_plane_class_answers_as_legacy_and_never_reaches_it() {
         failures.push(format!("tampered body: {} {:?}", refused.0, refusal(&refused.2)));
     }
 
-    assert_eq!(
-        legacy_calls.load(Ordering::SeqCst),
-        0,
-        "a gateway-stack request reached the legacy service"
-    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -641,11 +604,11 @@ async fn a_custom_code_without_a_status_is_answered_by_both_stacks_alike() {
             .unwrap();
         router
     };
-    let mut legacy = crate::server::http::S3ServiceBuilder::new(UnusedS3);
+    let mut legacy = S3ServiceBuilder::new(UnusedS3);
     legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
     legacy.set_route(router(&slot));
     let legacy = legacy.build();
-    let (edge, _) = edge(&slot, legacy.clone(), router(&slot));
+    let edge = edge(&slot, router(&slot));
     let request =
         || signed_as(Method::GET, "/rustfs/admin/v3/statusless", "", ROOT, ROOT_SECRET, Signed::Header).map(|_| Full::default());
 
@@ -662,11 +625,11 @@ async fn a_custom_code_without_a_status_is_answered_by_both_stacks_alike() {
 #[serial_test::serial]
 async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
     let (_env, slot, _) = admin_fixture().await;
-    let mut legacy = crate::server::http::S3ServiceBuilder::new(UnusedS3);
+    let mut legacy = S3ServiceBuilder::new(UnusedS3);
     legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
     legacy.set_route(probe_router(&slot));
     let legacy = legacy.build();
-    let (edge, legacy_calls) = edge(&slot, legacy.clone(), probe_router(&slot));
+    let edge = edge(&slot, probe_router(&slot));
     let claims = std::collections::HashMap::from([
         ("exp".to_owned(), serde_json::json!(chrono::Utc::now().timestamp() + 900)),
         ("parent".to_owned(), serde_json::json!(ROOT)),
@@ -730,15 +693,14 @@ async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
         assert!(pair[0].contains(&format!("key=Some({:?})", session.access_key)), "{pair:?}");
         assert!(pair[0].contains(&format!("token=Some({token:?})")), "{pair:?}");
     }
-    assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn the_console_listener_isolates_its_routes_in_front_of_the_control_plane_host() {
-    let (_env, slot, legacy) = admin_fixture().await;
+    let (_env, slot, _) = admin_fixture().await;
     let router = crate::admin::make_admin_router(false, slot.clone()).unwrap();
-    let (edge, legacy_calls) = edge(&slot, legacy, router);
+    let edge = edge(&slot, router);
     let reached = Arc::new(AtomicUsize::new(0));
     let counted = {
         let reached = Arc::clone(&reached);
@@ -767,5 +729,4 @@ async fn the_console_listener_isolates_its_routes_in_front_of_the_control_plane_
     let (status, _, body) = answer(console.clone(), signed("/rustfs/admin/v3/list-users", "")).await;
     assert_eq!(status, StatusCode::OK, "{:?}", refusal(&body));
     assert_eq!(reached.load(Ordering::SeqCst), 1, "the admin route did not reach the control-plane host");
-    assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 }

@@ -25,70 +25,35 @@ use rustfs_config::{
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 use rustfs_policy::auth::{is_access_key_valid, is_secret_key_valid};
 use std::collections::HashSet;
-use std::fmt;
 use std::io::{Error, ErrorKind};
-use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
 pub(crate) const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 static LEGACY_CREDENTIAL_WARNED_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-/// Development-only selector between the s3s-based S3 stack and the gateway
-/// stack while both coexist on the integration branch (rustfs/backlog#2734).
-/// It is removed when the gateway stack becomes the only one.
-const ENV_RUSTFS_S3_STACK: &str = "RUSTFS_S3_STACK";
+/// The selector between the s3s-based S3 stack and the gateway stack while both
+/// existed (rustfs/backlog#2734). The gateway stack is the only one now, so a set
+/// selector, whatever its value, refuses startup rather than being ignored.
+pub const RETIRED_S3_STACK_SELECTOR: &str = "RUSTFS_S3_STACK";
 
-/// The S3 protocol stack that serves requests.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum S3Stack {
-    /// The s3s-based stack every release ships today.
-    #[default]
-    Legacy,
-    /// The rustfs-gateway stack under construction.
-    Gateway,
-}
-
-/// A `RUSTFS_S3_STACK` value other than the exact names `legacy` and `gateway`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidS3Stack {
-    value: String,
-}
-
-impl fmt::Display for InvalidS3Stack {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, r#"{ENV_RUSTFS_S3_STACK} must be "legacy" or "gateway", got {:?}"#, self.value)
+/// Refuses startup when the retired S3 stack selector is set to any value,
+/// the empty string included.
+///
+/// # Errors
+///
+/// `InvalidInput` naming the variable and this release when it is set.
+pub(crate) fn refuse_retired_s3_stack_selector() -> std::io::Result<()> {
+    if std::env::var_os(RETIRED_S3_STACK_SELECTOR).is_none() {
+        return Ok(());
     }
-}
-
-impl std::error::Error for InvalidS3Stack {}
-
-impl FromStr for S3Stack {
-    type Err = InvalidS3Stack;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // Exact names only: a near miss must refuse startup rather than fall
-        // back to a stack the operator did not ask for.
-        match value {
-            "legacy" => Ok(Self::Legacy),
-            "gateway" => Ok(Self::Gateway),
-            _ => Err(InvalidS3Stack { value: value.to_owned() }),
-        }
-    }
-}
-
-impl S3Stack {
-    /// Unset selects the default; a set but invalid value, including an empty
-    /// one, is a startup error.
-    pub(crate) fn from_env() -> std::io::Result<Self> {
-        match std::env::var_os(ENV_RUSTFS_S3_STACK) {
-            None => Ok(Self::default()),
-            Some(value) => value
-                .to_string_lossy()
-                .parse()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err)),
-        }
-    }
+    Err(Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "{RETIRED_S3_STACK_SELECTOR} is no longer supported; the gateway stack is the only S3 stack since {}",
+            env!("CARGO_PKG_VERSION")
+        ),
+    ))
 }
 
 fn warn_legacy_credential_env_once(legacy_key: &str, canonical_key: &str) {
@@ -209,9 +174,6 @@ pub struct Config {
 
     /// Workload profile for adaptive buffer sizing
     pub buffer_profile: String,
-
-    /// S3 protocol stack selected by `RUSTFS_S3_STACK`
-    pub s3_stack: S3Stack,
 }
 
 impl Config {
@@ -243,7 +205,6 @@ impl Config {
             kms_allow_insecure_dev_defaults: false,
             buffer_profile_disable: false,
             buffer_profile: "GeneralPurpose".to_string(),
-            s3_stack: S3Stack::default(),
         }
     }
 
@@ -308,7 +269,7 @@ impl Config {
 
         // Region is optional, but if not set, we should default to "us-east-1" for signing compatibility with AWS S3 clients
         let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));
-        let s3_stack = S3Stack::from_env()?;
+        refuse_retired_s3_stack_selector()?;
 
         Ok(Config {
             volumes,
@@ -333,7 +294,6 @@ impl Config {
             kms_allow_insecure_dev_defaults,
             buffer_profile_disable,
             buffer_profile,
-            s3_stack,
         })
     }
 
@@ -377,7 +337,6 @@ impl std::fmt::Debug for Config {
             .field("kms_allow_insecure_dev_defaults", &self.kms_allow_insecure_dev_defaults)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
             .field("buffer_profile", &self.buffer_profile)
-            .field("s3_stack", &self.s3_stack)
             .finish()
     }
 }

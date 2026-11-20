@@ -13,7 +13,7 @@ Applies to `crates/policy/`.
 - Validate compatibility with IAM and request-auth call sites:
   - `crates/iam/`
   - `rustfs/src/auth.rs`
-  - `rustfs/src/storage/access.rs`
+  - `rustfs/src/storage/authorization/`
 
 ## Error and Observability
 

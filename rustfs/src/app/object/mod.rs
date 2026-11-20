@@ -79,8 +79,6 @@ use super::storage_api::object_usecase::data_usage::{
     record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::object_usecase::deadlock_detector;
-#[cfg(test)]
-use super::storage_api::object_usecase::ecfs::FS;
 use super::storage_api::object_usecase::error::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
@@ -230,23 +228,23 @@ mod get;
 mod get_response;
 pub(crate) use get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 mod head;
-#[cfg(feature = "gateway-stack")]
 pub(crate) use head::ResponseEtag;
 pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
 mod native_body;
 mod on_demand_migration_put;
-#[cfg(feature = "gateway-stack")]
 pub(crate) mod post_body;
-#[cfg(feature = "gateway-stack")]
 pub(crate) mod post_headers;
 mod put;
 mod put_input;
+#[cfg(test)]
 pub(crate) use native_body::from_legacy as legacy_put_body;
 pub(crate) use native_body::{BodyChunks, FrameTrailers};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
+#[cfg(test)]
+mod s3s_compat;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;

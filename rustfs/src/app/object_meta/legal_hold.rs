@@ -34,7 +34,6 @@ use crate::app::storage_api::object_usecase::helper::OperationHelper;
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::app::storage_api::object_usecase::{StorageObjectOptions as ObjectOptions, parse_object_lock_legal_hold_native};
 use crate::error::ApiError;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::GetObjectLegalHoldInput;
 use rustfs_gateway_types::dto::{GetObjectLegalHoldOutput, ObjectLockLegalHold, Status};
 use rustfs_gateway_types::dto::{PutObjectLegalHoldOutput, RequestCharged};
@@ -70,7 +69,7 @@ impl ObjectMetaUsecase {
                 .get_bucket_info(bucket, &BucketOptions::default())
                 .await
                 .map_err(ApiError::from)?;
-            return Err(err.into());
+            return Err(err);
         }
 
         let opts: ObjectOptions = get_opts(bucket, key, version_id.clone(), None, envelope.headers())
@@ -158,7 +157,6 @@ impl ObjectMetaUsecase {
     /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up
     /// or when the object cannot be read; `NoSuchBucket`; the Object Lock refusal of a bucket
     /// without Object Lock.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_get_object_legal_hold(
         &self,
         envelope: RequestEnvelope,

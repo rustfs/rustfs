@@ -14,9 +14,7 @@
 
 //! Signed GetObjectAttributes observations against the embedded server.
 
-use super::{
-    GATEWAY, LEGACY, USER_SECRET_KEY, create_bucket_in_the_store, create_user_without_a_policy, s3_client, with_environment,
-};
+use super::{USER_SECRET_KEY, create_bucket_in_the_store, create_user_without_a_policy, s3_client, with_environment};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, ServerSideEncryption};
 use bytes::Bytes;
@@ -104,7 +102,7 @@ async fn observe(server: &RustFSServer, path: &str, headers: &[(&str, &str)], us
     }
 }
 
-async fn attributes_wire(server: RustFSServer, stack: Option<&str>) {
+async fn attributes_wire(server: RustFSServer) {
     for bucket in [BUCKET, RESERVED] {
         create_bucket_in_the_store(bucket).await;
     }
@@ -147,18 +145,18 @@ async fn attributes_wire(server: RustFSServer, stack: Option<&str>) {
         .await;
         assert_eq!((observed.status, observed.count), (200, 1), "{key}");
         assert!(observed.headers.contains_key(http::header::LAST_MODIFIED), "{key} date");
-        let expected = ["abc", "abc", "abc", "", "", "a&amp;b", "a&quot;b"];
-        if stack == LEGACY {
-            let body = std::str::from_utf8(&observed.body).unwrap();
-            assert_eq!(
-                body,
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>{}</ETag><ObjectSize>7</ObjectSize><StorageClass>STANDARD</StorageClass></GetObjectAttributesResponse>",
-                    expected[index]
-                ),
-                "{key} raw XML"
-            );
-        }
+        // The legacy writer escapes a double quote in element text; the gateway's writes it as is.
+        let quote = "a\"b";
+        let expected = ["abc", "abc", "abc", "", "", "a&amp;b", quote];
+        let body = std::str::from_utf8(&observed.body).unwrap();
+        assert_eq!(
+            body,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>{}</ETag><ObjectSize>7</ObjectSize><StorageClass>STANDARD</StorageClass></GetObjectAttributesResponse>",
+                expected[index]
+            ),
+            "{key} raw XML"
+        );
     }
 
     sdk.put_object()
@@ -277,8 +275,12 @@ async fn attributes_wire(server: RustFSServer, stack: Option<&str>) {
             path.push_str(&format!("&versionId={version}"));
         }
         let observed = observe(&server, &path, &headers, None).await;
-        if stack == LEGACY {
+        {
+            // The gateway refuses an empty selection, and a malformed SSE-C header on a missing
+            // object or a delete marker, before the object is looked up; the legacy stack looks up first.
+            let refused_first = matches!(label, "empty-selection" | "missing-object" | "current-marker" | "explicit-marker");
             let (status, count, code) = match label {
+                _ if refused_first => (400, 0, "InvalidRequest"),
                 "absent-selection" => (400, 0, "InvalidRequest"),
                 "bad-version-before-lookup" | "empty-version" => (400, 1, "InvalidArgument"),
                 "preserved-short-tag-parts" => (400, 1, "InvalidArgument"),
@@ -297,7 +299,7 @@ async fn attributes_wire(server: RustFSServer, stack: Option<&str>) {
             }
         }
         match label {
-            "normalized-selection" | "etag-only" if stack == LEGACY => observed.contains("ETag", "abc", label),
+            "normalized-selection" | "etag-only" => observed.contains("ETag", "abc", label),
             "size-only" => {
                 observed.contains("ObjectSize", "7", label);
                 observed.omits("ObjectParts", label);
@@ -531,15 +533,13 @@ async fn attributes_wire(server: RustFSServer, stack: Option<&str>) {
             observed.contains("ChecksumSHA256", "lU0buD2Au29udGso8N4+xMTtmAz+Z+0jqRWc1GT/M5o=", label);
         } else {
             assert_eq!(observed.status, 400, "{label}: {}", observed.xml());
-            if stack == LEGACY {
-                observed.contains("Code", "InvalidRequest", label);
-                if label == "ssec-wrong" {
-                    observed.contains(
-                        "Message",
-                        "The provided encryption parameters did not match the ones used originally to encrypt the object.",
-                        label,
-                    );
-                }
+            observed.contains("Code", "InvalidRequest", label);
+            if label == "ssec-wrong" {
+                observed.contains(
+                    "Message",
+                    "The provided encryption parameters did not match the ones used originally to encrypt the object.",
+                    label,
+                );
             }
         }
     }
@@ -624,17 +624,6 @@ async fn attributes_wire(server: RustFSServer, stack: Option<&str>) {
 }
 
 #[test]
-fn legacy_get_object_attributes_wire() {
-    with_environment(
-        vec![(super::ENV_S3_STACK, LEGACY), ("RUSTFS_SSE_C_REQUIRE_TLS", Some("false"))],
-        |server| attributes_wire(server, LEGACY),
-    );
-}
-
-#[test]
 fn gateway_get_object_attributes_wire() {
-    with_environment(
-        vec![(super::ENV_S3_STACK, GATEWAY), ("RUSTFS_SSE_C_REQUIRE_TLS", Some("false"))],
-        |server| attributes_wire(server, GATEWAY),
-    );
+    with_environment(vec![("RUSTFS_SSE_C_REQUIRE_TLS", Some("false"))], attributes_wire);
 }

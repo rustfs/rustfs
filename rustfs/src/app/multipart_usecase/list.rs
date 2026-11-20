@@ -19,22 +19,15 @@ use crate::app::RequestEnvelope;
 use crate::app::dto_values;
 use crate::app::storage_api::multipart_usecase::contract::multipart::ListMultipartsInfo;
 pub(crate) use crate::app::storage_api::multipart_usecase::contract::multipart::ListPartsInfo;
-#[cfg(any(feature = "gateway-stack", test))]
 use crate::app::storage_api::multipart_usecase::contract::multipart::ListPartsOwner;
 use rustfs_gateway_types::dto as gateway_dto;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::{BucketName, ObjectKey, RecordedUpload, UploadIdClaim, resolve_upload_async};
 use rustfs_s3_types::S3Result;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 pub(crate) enum ListPartsTarget {
-    Legacy {
-        bucket: String,
-        key: String,
-        upload_id: String,
-    },
-    #[cfg(any(feature = "gateway-stack", test))]
+    #[allow(dead_code)]
+    Legacy { bucket: String, key: String, upload_id: String },
     Gateway {
         bucket: BucketName,
         key: ObjectKey,
@@ -46,7 +39,6 @@ impl ListPartsTarget {
     fn resource(&self) -> (&str, &str) {
         match self {
             Self::Legacy { bucket, key, .. } => (bucket, key),
-            #[cfg(any(feature = "gateway-stack", test))]
             Self::Gateway { bucket, key, .. } => (bucket.as_str(), key.as_str()),
         }
     }
@@ -58,13 +50,11 @@ pub(crate) struct ListPartsFields {
     pub(crate) max_parts: Option<i32>,
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 struct RecordedListParts {
     owner: ListPartsOwner,
     page: ListPartsInfo,
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 impl RecordedUpload for RecordedListParts {
     fn bucket(&self) -> &str {
         &self.owner.bucket
@@ -75,7 +65,6 @@ impl RecordedUpload for RecordedListParts {
     }
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 async fn resolve_list_parts<'a, F>(
     upload_id: &'a UploadIdClaim,
     bucket: &BucketName,
@@ -90,7 +79,7 @@ where
         Ok::<_, StorageError>(page.recorded_owner.take().map(|owner| RecordedListParts { owner, page }))
     })
     .await
-    .map_err(|error| S3Error::from(multipart_upload_api_error(error)))?
+    .map_err(multipart_upload_api_error)?
     .map_err(|refusal| S3Error::with_message(S3ErrorCode::NoSuchUpload, refusal.reason()))?;
     Ok(record.page)
 }
@@ -209,8 +198,7 @@ impl DefaultMultipartUsecase {
             ListPartsTarget::Legacy { upload_id, .. } => store
                 .list_object_parts(bucket, key, upload_id, params.part_number_marker, params.max_parts, &opts)
                 .await
-                .map_err(|error| multipart_upload_api_error(error).into()),
-            #[cfg(any(feature = "gateway-stack", test))]
+                .map_err(multipart_upload_api_error),
             ListPartsTarget::Gateway {
                 bucket: bucket_name,
                 key: object_key,

@@ -15,7 +15,7 @@
 //! Which binary side A of the differential runs, and what it reports about itself.
 //!
 //! `RUSTFS_E2E_REFERENCE_BINARY` names a released `rustfs` binary to use as the reference. Unset,
-//! side A is the binary under test on `RUSTFS_S3_STACK=legacy`. Set, it must resolve to an
+//! side A is the binary under test. Set, it must resolve to an
 //! executable file or the run fails: a reference that was asked for and silently replaced by the
 //! binary under test would report an agreement with itself as agreement with the release.
 
@@ -28,9 +28,9 @@ pub(super) const ENV_REFERENCE_BINARY: &str = "RUSTFS_E2E_REFERENCE_BINARY";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SideA {
-    /// Both sides are the binary under test; A runs `RUSTFS_S3_STACK=legacy`.
+    /// Both sides are the binary under test.
     SameBinary,
-    /// A is this released binary, started without `RUSTFS_S3_STACK`.
+    /// A is this released binary.
     Reference(PathBuf),
 }
 
@@ -78,7 +78,7 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 
 /// What `<binary> --version` printed, trimmed. Fails when the binary does not run, exits
 /// non-zero, or prints nothing, because an empty version would report nothing as observed.
-pub(super) async fn binary_version(binary: &Path) -> Result<String, BoxError> {
+pub(crate) async fn binary_version(binary: &Path) -> Result<String, BoxError> {
     let output = tokio::process::Command::new(binary).arg("--version").output().await?;
     if !output.status.success() {
         return Err(format!("{} --version failed with {}", binary.display(), output.status).into());

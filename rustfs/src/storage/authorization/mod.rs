@@ -34,9 +34,10 @@ mod guards;
 mod permission_probe_test;
 mod request;
 mod table_data_plane;
+#[cfg(test)]
+pub(crate) mod tests;
 
 pub(crate) use admission::{AccessMarkers, VerifiedSignature, admit_operation, resolve_req_info};
-pub(crate) use conditions::existing_object_tag_conditions;
 #[cfg(test)]
 pub(crate) use conditions::{
     BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, classify_bucket_policy_raw_load_error,
@@ -46,6 +47,8 @@ pub(crate) use conditions::{
     ObjectTagConditions, authorization_conditions, get_or_fetch_object_tag_conditions, request_authz_facts, request_principal,
     resource_free_condition_values, root_access_key,
 };
+#[cfg(test)]
+pub(crate) use conditions::{authorization_conditions_with_internal, existing_object_tag_conditions};
 #[cfg(test)]
 pub(crate) use conditions::{
     bucket_policy_needs_existing_object_tag_from_hint, load_bucket_policy_existing_object_tag_hint,
@@ -92,3 +95,48 @@ pub(crate) use table_data_plane::{
     TableDataPlanePublicationGuards, retain_table_bucket_publication_guard, table_bucket_enabled_for_data_plane,
     table_catalog_store_for_data_plane, table_data_plane_list_internal_error, table_list_catalog_error,
 };
+
+#[cfg(test)]
+pub(crate) mod parity_test_support {
+    pub(crate) use super::envelope_payloads::bucket_config_mutation;
+    use super::{AuthorizationRequest, ObjectTagConditions, TableDataPlanePublicationGuards};
+    use crate::auth::facts::{AuthzFacts, AuthzPrincipal, AuthzTarget};
+    use crate::storage::storage_api::ECStore;
+    use rustfs_s3_types::S3Result;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Whether `guards` retains `key`, and how many lock guards it holds.
+    pub(crate) fn publication_guard_holds(guards: &TableDataPlanePublicationGuards, key: &(String, String)) -> (bool, usize) {
+        let state = guards.state.lock();
+        (state.keys.contains(key), state.guards.len())
+    }
+
+    pub(crate) fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, target: AuthzTarget<'_>) -> AuthzFacts {
+        super::request_authz_facts(req, target)
+    }
+
+    pub(crate) fn authorization_conditions<R: AuthorizationRequest + ?Sized>(
+        req: &R,
+        principal: &AuthzPrincipal<'_>,
+        facts: &AuthzFacts,
+    ) -> S3Result<HashMap<String, Vec<String>>> {
+        super::authorization_conditions(req, principal, facts)
+    }
+
+    pub(crate) fn request_object_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<ECStore>> {
+        super::request_object_store(req)
+    }
+
+    /// The cached tag evidence as `(bucket, object, version_id, values)`.
+    pub(crate) fn tag_conditions_parts(
+        conditions: &ObjectTagConditions,
+    ) -> (&str, &str, Option<&str>, &HashMap<String, Vec<String>>) {
+        (
+            conditions.bucket.as_str(),
+            conditions.object.as_str(),
+            conditions.version_id.as_deref(),
+            &conditions.values,
+        )
+    }
+}

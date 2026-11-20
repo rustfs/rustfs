@@ -18,12 +18,16 @@
 //! The select use case validates it before building the engine.
 //! The s3s conversion is deleted with the legacy edge (rustfs/backlog#2783).
 
+#[cfg(test)]
 use rustfs_gateway_types::compat::ConversionError;
+#[cfg(test)]
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::shapes::input_serialization::input_serialization_from_s3s;
+#[cfg(test)]
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::shapes::output_serialization::output_serialization_from_s3s;
 use rustfs_s3select_api::request as engine;
 
 /// Converts the decoded request, keeping the SSE-C members as the client sent them.
+#[cfg(test)]
 pub(crate) fn select_input_from_s3s(
     input: s3s::dto::SelectObjectContentInput,
 ) -> Result<engine::SelectObjectContentInput, ConversionError> {
@@ -68,7 +72,6 @@ pub(crate) fn select_input_from_s3s(
 }
 
 /// Moves the gateway's flat request into the shape the query engine reads.
-#[cfg(any(feature = "gateway-stack", test))]
 pub(crate) fn select_input_from_gateway(
     input: rustfs_gateway_types::dto::SelectObjectContentInput,
 ) -> engine::SelectObjectContentInput {

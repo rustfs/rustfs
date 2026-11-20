@@ -77,7 +77,7 @@ fn uri_for(template: &str, bucket: &str) -> String {
 
 async fn send(router: &S3Router<AdminOperation>, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
     router.check_access(&mut req).await?;
-    router.call(req).await
+    router.call(req).await.map_err(Into::into)
 }
 
 fn error_code(result: S3Result<S3Response<Body>>, context: &str) -> S3ErrorCode {
@@ -147,7 +147,7 @@ async fn install_identities() -> (Callers, String) {
         .await
         .expect("IAM format");
     let iam = ambient.iam().handle();
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = format!("test{}", uuid::Uuid::new_v4().simple());
     let bucket = format!("ext-routes-{suffix}");
     let all = [
         Action::ResetReplication,
@@ -222,7 +222,7 @@ async fn extension_routes_refuse_anonymous_callers_before_dispatch() {
             .check_access(&mut req)
             .await
             .expect_err("an anonymous extension request is refused");
-        assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{method} {uri}");
+        assert_eq!(S3ErrorCode::from(error.code().clone()), S3ErrorCode::AccessDenied, "{method} {uri}");
     }
 }
 
