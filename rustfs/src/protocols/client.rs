@@ -1506,6 +1506,7 @@ mod tests {
             };
             use http_body_util::BodyExt;
             use rustfs_protocols::common::client::s3::StorageBackend;
+            use rustfs_s3_types::S3ErrorCode;
             let root = rustfs_credentials::Credentials {
                 access_key: "protocol-oracle-root".into(),
                 secret_key: "protocol-oracle-secret".into(),
@@ -1517,9 +1518,16 @@ mod tests {
             let slot = ServerContextSlot::new();
             assert!(slot.install(context));
             let backend = ProtocolStorageClient::new(slot);
-            for (bucket, key, data, versioned) in [
-                ("protocol-version-oracle", "versioned-key", b"versioned data".as_slice(), true),
-                ("protocol-marker-oracle", "folder/", b"".as_slice(), false),
+            for (bucket, key, data, versioned, deleted_get_code) in [
+                (
+                    "protocol-version-oracle",
+                    "versioned-key",
+                    b"versioned data".as_slice(),
+                    true,
+                    S3ErrorCode::NoSuchKey,
+                ),
+                // RustFS 1.0.5 returns NoSuchVersion for a missing directory marker.
+                ("protocol-marker-oracle", "folder/", b"".as_slice(), false, S3ErrorCode::NoSuchVersion),
             ] {
                 store
                     .make_bucket(
@@ -1582,7 +1590,7 @@ mod tests {
                     .get_object(bucket, key, &root, None)
                     .await
                     .expect_err("protocol GET deleted object");
-                assert_eq!(current.code(), &rustfs_s3_types::S3ErrorCode::NoSuchKey);
+                assert_eq!(current.code(), &deleted_get_code, "GET {bucket}/{key} after DELETE");
                 assert_eq!(current.status_code(), Some(http::StatusCode::NOT_FOUND));
                 if versioned {
                     let headers = current.headers().expect("delete marker error headers");
