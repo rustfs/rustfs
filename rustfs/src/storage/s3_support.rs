@@ -18,6 +18,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabl
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLockConfigState};
+use crate::storage::storage_api::ecstore_bucket::object_lock::types::{LegalHoldStatus, RetentionMode};
 use crate::storage::storage_api::s3_support_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::s3_support_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
@@ -28,16 +29,13 @@ use rustfs_gateway_types::persistence::{
     PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter, PersistedQueueConfiguration,
     PersistedTopicConfiguration,
 };
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
-use s3s::dto::{Delimiter, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
-#[cfg(test)]
-use s3s::dto::{ObjectLockLegalHold, ObjectLockRetention};
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -386,7 +384,7 @@ pub(crate) fn validate_new_object_key(key: &str, operation: &str) -> S3Result<()
 /// 2. Rejects reserved directory markers and invalid path segments
 /// 3. Logs debug information for keys containing spaces, plus signs, or percent signs
 ///
-/// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
+/// Request routing decodes the key before this validation.
 /// This validation ensures that invalid characters that could cause issues are rejected early.
 pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
     // Validate object key doesn't contain control characters
@@ -439,10 +437,7 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
 /// According to S3 compatibility requirements, unordered listing cannot be combined with
 /// hierarchical directory traversal (delimited listing). This validation ensures
 /// conflicting parameters are caught before processing the request.
-pub(crate) fn validate_list_object_unordered_with_delimiter(
-    delimiter: Option<&Delimiter>,
-    query_string: Option<&str>,
-) -> S3Result<()> {
+pub(crate) fn validate_list_object_unordered_with_delimiter(delimiter: Option<&str>, query_string: Option<&str>) -> S3Result<()> {
     if delimiter.is_none() {
         return Ok(());
     }
@@ -463,14 +458,6 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
-    parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
-        mode: r.mode.map(|m| m.as_str().to_owned()),
-        retain_until: r.retain_until_date.map(OffsetDateTime::from),
-    }))
-}
-
 pub(crate) fn parse_object_lock_retention_native(
     retention: Option<RequestedObjectLockRetention>,
 ) -> S3Result<HashMap<String, String>> {
@@ -485,7 +472,7 @@ pub(crate) fn parse_object_lock_retention_native(
         }
         let mode = match v.mode {
             Some(mode) => match mode.as_str() {
-                ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
+                RetentionMode::COMPLIANCE | RetentionMode::GOVERNANCE => mode.as_str().to_string(),
                 _ => {
                     return Err(S3Error::with_message(
                         S3ErrorCode::MalformedXML,
@@ -529,18 +516,13 @@ pub(crate) fn parse_object_lock_retention_native(
     Ok(eval_metadata)
 }
 
-#[cfg(test)]
-pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
-    parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
-}
-
 pub(crate) fn parse_object_lock_legal_hold_native(
     legal_hold: Option<RequestedObjectLegalHold>,
 ) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
         let status = match v.0.as_deref() {
-            Some(status @ (ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON)) => status.to_owned(),
+            Some(status @ (LegalHoldStatus::OFF | LegalHoldStatus::ON)) => status.to_owned(),
             _ => {
                 return Err(S3Error::with_message(
                     S3ErrorCode::MalformedXML,
@@ -929,15 +911,11 @@ pub fn invalidate_bucket_validation_cache(bucket: &str) {
 /// Uses adaptive cache with 5s TTL to avoid repeated stat_volume() calls.
 /// Returns store directly on cache hit without calling get_bucket_info().
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
-    Ok(get_validated_store_owned(bucket).await?)
-}
-
-pub(crate) async fn get_validated_store_owned(bucket: &str) -> rustfs_s3_types::S3Result<Arc<super::ECStore>> {
     let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
     };
 
-    validate_bucket_exists_owned(&store, bucket).await?;
+    validate_bucket_exists(&store, bucket).await?;
 
     Ok(store)
 }
@@ -947,10 +925,6 @@ pub(crate) async fn get_validated_store_owned(bucket: &str) -> rustfs_s3_types::
 /// store through the request-bound server context (backlog#1052 S6) use this
 /// to keep bucket validation on that store instead of the process-global one.
 pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str) -> S3Result<()> {
-    Ok(validate_bucket_exists_owned(store, bucket).await?)
-}
-
-async fn validate_bucket_exists_owned(store: &super::ECStore, bucket: &str) -> rustfs_s3_types::S3Result<()> {
     // Check cache — TTL is checked manually.
     if let Some(inserted_at) = cache_get(bucket)
         && inserted_at.elapsed() < BUCKET_VALIDATION_TTL

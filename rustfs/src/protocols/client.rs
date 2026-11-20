@@ -1169,18 +1169,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
-        let input = multipart::upload_part_copy_input(input)?;
-        let part_number = input.part_number;
-        let part_number = part_number.to_string();
-        let uri = build_object_uri(
-            &bucket,
-            &key,
-            &[
-                ("partNumber", Some(part_number.as_str())),
-                ("uploadId", Some(upload_id.as_str())),
-            ],
-        )?;
+        let (uri, input) = multipart::prepare_upload_part_copy(input)?;
 
         let envelope = Self::create_envelope(
             Method::PUT,
@@ -1196,9 +1185,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             &envelope.audit_view(),
             rustfs_s3_ops::S3Operation::UploadPartCopy,
         );
-        let result = self
-            .owned_multipart_usecase()
-            .execute_upload_part_copy_owned(envelope, input)
+        let result = Box::pin(self.owned_multipart_usecase().execute_upload_part_copy_owned(envelope, input))
             .await
             .map_err(owned::copy_error);
         let _helper = helper.complete_owned(&result, http::StatusCode::OK, &HeaderMap::new());
@@ -1519,6 +1506,7 @@ mod tests {
             };
             use http_body_util::BodyExt;
             use rustfs_protocols::common::client::s3::StorageBackend;
+            use rustfs_s3_types::S3ErrorCode;
             let root = rustfs_credentials::Credentials {
                 access_key: "protocol-oracle-root".into(),
                 secret_key: "protocol-oracle-secret".into(),
@@ -1530,9 +1518,16 @@ mod tests {
             let slot = ServerContextSlot::new();
             assert!(slot.install(context));
             let backend = ProtocolStorageClient::new(slot);
-            for (bucket, key, data, versioned) in [
-                ("protocol-version-oracle", "versioned-key", b"versioned data".as_slice(), true),
-                ("protocol-marker-oracle", "folder/", b"".as_slice(), false),
+            for (bucket, key, data, versioned, deleted_get_code) in [
+                (
+                    "protocol-version-oracle",
+                    "versioned-key",
+                    b"versioned data".as_slice(),
+                    true,
+                    S3ErrorCode::NoSuchKey,
+                ),
+                // RustFS 1.0.5 returns NoSuchVersion for a missing directory marker.
+                ("protocol-marker-oracle", "folder/", b"".as_slice(), false, S3ErrorCode::NoSuchVersion),
             ] {
                 store
                     .make_bucket(
@@ -1595,7 +1590,7 @@ mod tests {
                     .get_object(bucket, key, &root, None)
                     .await
                     .expect_err("protocol GET deleted object");
-                assert_eq!(current.code(), &rustfs_s3_types::S3ErrorCode::NoSuchKey);
+                assert_eq!(current.code(), &deleted_get_code, "GET {bucket}/{key} after DELETE");
                 assert_eq!(current.status_code(), Some(http::StatusCode::NOT_FOUND));
                 if versioned {
                     let headers = current.headers().expect("delete marker error headers");

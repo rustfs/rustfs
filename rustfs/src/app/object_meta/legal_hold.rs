@@ -69,7 +69,7 @@ impl ObjectMetaUsecase {
                 .get_bucket_info(bucket, &BucketOptions::default())
                 .await
                 .map_err(ApiError::from)?;
-            return Err(err.into());
+            return Err(err);
         }
 
         let opts: ObjectOptions = get_opts(bucket, key, version_id.clone(), None, envelope.headers())

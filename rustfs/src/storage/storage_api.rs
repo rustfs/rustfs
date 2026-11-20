@@ -137,12 +137,11 @@ pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::s3_support::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
-    get_buffer_size_opt_in, get_validated_store, get_validated_store_owned, has_read_preconditions,
-    load_bucket_object_lock_config_state, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
-    parse_object_version_id, parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations,
-    process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
-    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
-    validate_object_key,
+    get_buffer_size_opt_in, get_validated_store, has_read_preconditions, load_bucket_object_lock_config_state,
+    parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_object_version_id,
+    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
+    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -490,9 +489,9 @@ pub(crate) mod test_consumer {
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, matches_origin_pattern, parse_etag,
-        parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
-        process_topic_configurations, remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
-        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+        process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, validate_bucket_object_lock_enabled,
+        validate_list_object_unordered_with_delimiter,
     };
     pub(crate) use super::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, bucket_metadata_sys_initialized, get_global_bucket_metadata_sys,
