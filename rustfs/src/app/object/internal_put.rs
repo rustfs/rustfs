@@ -22,7 +22,7 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
@@ -80,7 +80,8 @@ pub(crate) struct InternalPutContext {
 
 const INTERNAL_PUT_METHOD_NAME: &str = "PUT";
 
-fn api_error_from_s3(err: S3Error) -> ApiError {
+fn api_error_from_s3(err: impl Into<S3Error>) -> ApiError {
+    let err = err.into();
     ApiError {
         code: err.code().clone(),
         message: err.message().unwrap_or_default().to_string(),
@@ -139,7 +140,7 @@ async fn validate_internal_write_target(key: &str, bucket: &str, headers: &Heade
         headers.get("content-type").and_then(|value| value.to_str().ok()),
         headers.get("content-encoding").and_then(|value| value.to_str().ok()),
     )
-    .map_err(|err| api_error_from_s3(err.into()))
+    .map_err(api_error_from_s3)
 }
 
 fn internal_events_wanted() -> bool {
@@ -333,7 +334,7 @@ impl DefaultObjectUsecase {
             .put_object_core(write, super::native_body::from_io_stream(body), None, start_time)
             .await
             .map_err(|error| ApiError {
-                code: error.code().clone().into(),
+                code: error.code().clone(),
                 message: error.message().unwrap_or_default().to_owned(),
                 source: None,
             })?;

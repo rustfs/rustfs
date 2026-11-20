@@ -165,7 +165,7 @@ fn list_parts_resolves_real_owners_and_retains_storage_errors() {
             storage_error,
             StorageError::InvalidUploadID(..) | StorageError::MalformedUploadID(..)
         ));
-        let expected = multipart_upload_api_error(storage_error);
+        let expected: LegacyS3Error = ApiError::from(storage_error).into();
         for target in [
             gateway_fields(&bucket, key, id, None, None),
             ListPartsFields {

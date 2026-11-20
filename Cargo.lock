@@ -4238,6 +4238,7 @@ dependencies = [
  "s3s",
  "same-file",
  "serde",
+ "serde-value",
  "serde_json",
  "serde_urlencoded",
  "sha1 0.11.0",

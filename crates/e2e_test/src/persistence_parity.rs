@@ -27,6 +27,7 @@ use aws_sdk_s3::types::{BucketCannedAcl, Tag, Tagging};
 use http::{HeaderMap, Method};
 use md5::{Digest, Md5};
 use rustfs_filemeta::{FileMeta, MetaObject};
+use serde_value::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -71,7 +72,9 @@ fn bucket_metadata(volume: &Path, bucket: &str) -> Result<BucketMetadata, Error>
     Ok(BucketMetadata::unmarshal(fields)?)
 }
 
-fn read_object(volume: &Path, key: &str) -> Result<MetaObject, Error> {
+type VersionFields = BTreeMap<String, Value>;
+
+fn read_object(volume: &Path, key: &str) -> Result<(MetaObject, VersionFields), Error> {
     let meta = FileMeta::load(&std::fs::read(volume.join(OBJECTS).join(key).join("xl.meta"))?)?;
     let [version] = meta.versions.as_slice() else {
         return Err(format!("{key}: expected one version").into());
@@ -80,7 +83,23 @@ fn read_object(volume: &Path, key: &str) -> Result<MetaObject, Error> {
     if object.mod_time.is_none() || object.data_dir.is_none_or(|id| id.is_nil()) {
         return Err(format!("{key}: missing modification time or data directory").into());
     }
-    Ok(object)
+    Ok((object, nonvolatile_fields(&version.meta, key)?))
+}
+
+fn nonvolatile_fields(raw: &[u8], key: &str) -> Result<VersionFields, Error> {
+    // The production reader skips unknown keys and supplies defaults for some missing keys.
+    // Keep the raw maps so both the version envelope and V2Obj preserve every field and value.
+    let mut fields: VersionFields = rmp_serde::from_slice(raw)?;
+    let Some(Value::Map(object_fields)) = fields.get_mut("V2Obj") else {
+        return Err(format!("{key}: missing raw V2Obj map").into());
+    };
+    for volatile in ["MTime", "DDir"] {
+        let value = object_fields
+            .get_mut(&Value::String(volatile.to_owned()))
+            .ok_or_else(|| format!("{key}: missing {volatile}"))?;
+        *value = Value::Unit;
+    }
+    Ok(fields)
 }
 
 async fn put_xml(env: &RustFSTestEnvironment, query: &str, xml: &str) -> Result<(), Error> {
@@ -104,7 +123,7 @@ async fn put_xml(env: &RustFSTestEnvironment, query: &str, xml: &str) -> Result<
 
 struct Snapshot {
     configs: BTreeMap<&'static str, Vec<u8>>,
-    objects: BTreeMap<&'static str, MetaObject>,
+    objects: BTreeMap<&'static str, VersionFields>,
     multipart_files: BTreeMap<String, Vec<u8>>,
 }
 
@@ -295,12 +314,10 @@ fn read_snapshot(volume: &Path) -> Result<Snapshot, Error> {
     ]);
     let mut objects = BTreeMap::new();
     for key in ["put", "copy", "tagged"] {
-        let mut object = read_object(volume, key)?;
-        object.mod_time = None;
-        object.data_dir = None;
-        objects.insert(key, object);
+        let (_, fields) = read_object(volume, key)?;
+        objects.insert(key, fields);
     }
-    let multipart = read_object(volume, "multipart")?;
+    let (multipart, _) = read_object(volume, "multipart")?;
     if multipart.part_numbers != [1, 2] || multipart.part_sizes != [FIRST_PART_SIZE, 100] {
         return Err("xl.meta does not describe both uploaded parts".into());
     }
@@ -408,5 +425,25 @@ async fn persistence_byte_parity() -> Result<(), Error> {
         reference.configs.len(),
         reference.objects.len()
     );
+    Ok(())
+}
+
+#[test]
+fn version_comparison_preserves_unknown_fields_and_absent_values() -> Result<(), Error> {
+    let mut sample = serde_json::json!({"Type": 1, "v": 1, "V2Obj": {"DDir": vec![1; 16], "MTime": 1}});
+    let fields = |value: &serde_json::Value| nonvolatile_fields(&rmp_serde::to_vec(value)?, "fixture");
+    let original = fields(&sample)?;
+    sample["V2Obj"]["DDir"] = serde_json::json!(vec![2; 16]);
+    sample["V2Obj"]["MTime"] = serde_json::json!(2);
+    assert_eq!(fields(&sample)?, original);
+    sample["V2Obj"]["Future"] = serde_json::Value::Null;
+    let with_nil = fields(&sample)?;
+    assert_ne!(with_nil, original);
+    sample["V2Obj"]["Future"] = serde_json::json!(false);
+    let with_value = fields(&sample)?;
+    assert_ne!(with_value, with_nil);
+    sample["FutureEnvelope"] = serde_json::json!(1);
+    assert_ne!(fields(&sample)?, with_value);
+    assert!(fields(&serde_json::json!({"V2Obj": {"MTime": 1}})).is_err());
     Ok(())
 }
