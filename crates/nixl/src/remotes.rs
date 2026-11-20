@@ -1,8 +1,9 @@
 //! Native peer registrations owned by one NIXL completion thread.
 
 use super::{Agent, NIXL_METADATA_HEADER, NixlError, metadata_hash, nixl_err};
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const IDLE_TTL: Duration = Duration::from_secs(300);
@@ -26,15 +27,28 @@ impl MetadataRegistry for Agent {
 
 struct Peer {
     hash: Option<u64>,
-    last_used: Instant,
-    // Each outstanding native request pins this registration until its request
-    // handle has been dropped, including work whose caller has timed out.
-    lease: Arc<()>,
+    idle_since: Rc<Cell<Instant>>,
 }
 
 impl Peer {
     fn idle(&self) -> bool {
-        Arc::strong_count(&self.lease) == 1
+        Rc::strong_count(&self.idle_since) == 1
+    }
+
+    fn acquire(&self) -> RemoteLease {
+        RemoteLease(Rc::clone(&self.idle_since))
+    }
+}
+
+/// The completion thread drops this lease after the native request handle.
+pub(super) struct RemoteLease(Rc<Cell<Instant>>);
+
+impl Drop for RemoteLease {
+    fn drop(&mut self) {
+        // The cache and this final request are the two remaining owners.
+        if Rc::strong_count(&self.0) == 2 {
+            self.0.set(Instant::now());
+        }
     }
 }
 
@@ -61,12 +75,11 @@ impl RemoteCache {
         name: &str,
         metadata: Option<&[u8]>,
         now: Instant,
-    ) -> Result<Arc<()>, NixlError> {
+    ) -> Result<RemoteLease, NixlError> {
         let hash = metadata.map(metadata_hash);
-        if let Some(peer) = self.peers.get_mut(name) {
+        if let Some(peer) = self.peers.get(name) {
             if peer.hash.is_some() && (hash.is_none() || hash == peer.hash) {
-                peer.last_used = now;
-                return Ok(peer.lease.clone());
+                return Ok(peer.acquire());
             }
             if !peer.idle() {
                 return Err(NixlError::Token("peer metadata changed while transfers are active".to_owned()));
@@ -79,13 +92,12 @@ impl RemoteCache {
                 .peers
                 .iter()
                 .filter(|(_, peer)| peer.idle())
-                .min_by_key(|(_, peer)| peer.last_used)
+                .min_by_key(|(_, peer)| peer.idle_since.get())
         {
             let oldest = oldest.clone();
             self.evict(registry, &oldest)?;
         }
         let loaded = registry.load(metadata)?;
-        let lease = Arc::new(());
         if loaded != name {
             if !self.peers.contains_key(&loaded)
                 && let Err(error) = registry.unload(&loaded)
@@ -94,22 +106,19 @@ impl RemoteCache {
                     loaded,
                     Peer {
                         hash: None,
-                        last_used: now,
-                        lease,
+                        idle_since: Rc::new(Cell::new(now)),
                     },
                 );
                 return Err(error);
             }
             return Err(NixlError::Token(format!("metadata belongs to agent {loaded:?}, request names {name:?}")));
         }
-        self.peers.insert(
-            loaded,
-            Peer {
-                hash,
-                last_used: now,
-                lease: lease.clone(),
-            },
-        );
+        let peer = Peer {
+            hash,
+            idle_since: Rc::new(Cell::new(now)),
+        };
+        let lease = peer.acquire();
+        self.peers.insert(loaded, peer);
         Ok(lease)
     }
 
@@ -130,7 +139,7 @@ impl RemoteCache {
 
     pub(super) fn sweep(&mut self, registry: &impl MetadataRegistry, now: Instant) {
         self.peers.retain(|name, peer| {
-            if !peer.idle() || (peer.hash.is_some() && now.duration_since(peer.last_used) < IDLE_TTL) {
+            if !peer.idle() || (peer.hash.is_some() && now.duration_since(peer.idle_since.get()) < IDLE_TTL) {
                 return true;
             }
             peer.hash = None;

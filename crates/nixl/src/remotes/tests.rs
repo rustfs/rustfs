@@ -34,7 +34,7 @@ fn pressure_and_expiry_skip_live_transfers_and_unload_native_metadata() {
     drop(cache.acquire(&backend, "c", Some(b"c"), now).expect("evict b"));
     assert!(!backend.0.borrow().contains("b"));
     assert!(cache.acquire(&backend, "b", None, now).is_err());
-    let later = now + IDLE_TTL;
+    let later = Instant::now() + IDLE_TTL;
     cache.sweep(&backend, later);
     assert_eq!(*backend.0.borrow(), HashSet::from(["a".to_owned()]));
     assert!(cache.acquire(&backend, "a", Some(b"a:new"), later).is_err());
@@ -74,4 +74,21 @@ fn failed_eviction_cannot_reuse_a_partially_invalidated_registration() {
     assert!(cache.acquire(&backend, "b", Some(b"b"), now).is_err());
     assert!(cache.acquire(&backend, "a", None, now).is_err());
     drop(cache.acquire(&backend, "a", Some(b"a"), now).expect("reload peer"));
+}
+
+#[test]
+fn idle_lifetime_starts_after_the_last_native_request_finishes() {
+    let backend = Registry::default();
+    let mut cache = RemoteCache::new(2);
+    let start = Instant::now() - IDLE_TTL - SWEEP_INTERVAL;
+    let first = cache.acquire(&backend, "a", Some(b"a"), start).unwrap();
+    let last = cache.acquire(&backend, "a", None, start).unwrap();
+    drop(first);
+    cache.sweep(&backend, Instant::now());
+    assert!(backend.0.borrow().contains("a"));
+    drop(last);
+    cache.sweep(&backend, Instant::now() + SWEEP_INTERVAL);
+    assert!(cache.acquire(&backend, "a", None, Instant::now()).is_ok());
+    cache.sweep(&backend, Instant::now() + IDLE_TTL);
+    assert!(backend.0.borrow().is_empty());
 }

@@ -96,7 +96,7 @@ Request headers (GET, PUT, UploadPart):
 | Header | Value |
 |---|---|
 | `x-rustfs-nixl-agent` | The client's agent name (printable ASCII, up to 128 bytes). |
-| `x-rustfs-nixl-metadata` | The client's agent metadata (`get_local_md`), base64. Send on each request for reliable reuse across nodes and cache eviction. The server can accept an omitted value while the registration is cached. In-flight requests pin the registration, including timed-out transfers until native completion. Idle registrations expire after five minutes, checked once a minute, or are reclaimed sooner under cache pressure. |
+| `x-rustfs-nixl-metadata` | The client's agent metadata (`get_local_md`), base64. Send on each request for reliable reuse across nodes and cache eviction. The server can accept an omitted value while the registration is cached. In-flight requests pin the registration, including timed-out transfers until native completion. The five-minute idle period starts when the last native request finishes. The server checks once a minute and may reclaim idle registrations sooner under cache pressure. |
 | `x-rustfs-nixl-buffer` | `<dram|vram>:<device>:<address>:<length>`: the registered buffer the object (or the requested range) lands in from offset 0, or is read from for a PUT. Address and length are decimal or `0x` hex. |
 
 Reply headers: `x-amz-rdma-reply` (`200`, `206` for a range, `501` when the

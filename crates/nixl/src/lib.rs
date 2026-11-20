@@ -437,7 +437,7 @@ struct Job {
 /// A posted transfer the completion thread is polling.
 struct Pending {
     request: nixl_sys::XferRequest,
-    _remote: Arc<()>,
+    _remote: remotes::RemoteLease,
     /// The remote agent, forgotten if the transfer fails.
     agent: String,
     keep: Option<KeepAlive>,
