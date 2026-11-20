@@ -365,7 +365,7 @@ async fn complete_pending_multipart(
         .await?)
 }
 
-async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
+pub(crate) async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
     let pending = stage_multipart(client, bucket, key, parts).await?;
     complete_pending_multipart(client, bucket, key, &pending).await?;
     Ok(())
@@ -2832,7 +2832,7 @@ async fn restart_from_binary(env: &mut RustFSTestEnvironment, binary: &Path, ser
     env.start_rustfs_server_from_binary(binary, vec![], server_env).await
 }
 
-async fn set_bucket_quota(env: &RustFSTestEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
+pub(crate) async fn set_bucket_quota(env: &RustFSTestEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
     let path = format!("/rustfs/admin/v3/quota/{bucket}");
     let body = serde_json::json!({ "quota": quota_bytes, "quota_type": "HARD" }).to_string();
     let deadline = Instant::now() + QUOTA_READINESS_TIMEOUT;

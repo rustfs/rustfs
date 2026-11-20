@@ -227,7 +227,9 @@ impl GatewayStack {
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
         let listings = metadata_listing::dialect().map_err(GatewayAssemblyError::MetadataListingDialect)?;
-        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?.dialect(&listings);
+        let builder = Self::configured_builder(&assembly, iam, root, authorizer, std::convert::identity)?
+            .answer_nul_torrent_keys_as_missing()
+            .dialect(&listings);
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
         let builder = metadata_listing::register(register(OPERATIONS, builder, &backend), &assembly.server_ctx);
         let service = builder.build().map_err(GatewayAssemblyError::Service)?;
@@ -357,6 +359,10 @@ pub(crate) struct TestGateway(GatewayStack);
 impl TestGateway {
     pub(crate) const ACCESS_KEY: &str = "gatewaytestroot";
     pub(crate) const SECRET_KEY: &str = "gateway-test-root-secret";
+
+    pub(crate) async fn call(&self, request: Request<rustfs_gateway::Body>) -> Response<rustfs_gateway::Body> {
+        self.0.call(request).await
+    }
 
     /// Publishes the root on `context` and assembles the stack over `slot`, which holds `context`.
     pub(crate) fn over(context: &crate::runtime_sources::AppContext, slot: Arc<ServerContextSlot>) -> Self {

@@ -88,11 +88,13 @@ fn rebalance_status_preserves_http_contract_and_log_severity() {
         .with_ansi(false)
         .without_time()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::new("off").add_directive(
-                "rustfs::admin::handlers::rebalance=debug"
-                    .parse()
-                    .expect("rebalance log filter"),
-            ),
+            tracing_subscriber::EnvFilter::new("off")
+                .add_directive("s3s::ops=debug".parse().expect("S3 route log filter"))
+                .add_directive(
+                    "rustfs::admin::handlers::rebalance=debug"
+                        .parse()
+                        .expect("rebalance log filter"),
+                ),
         )
         .with_writer(log.reopen().expect("open captured log writer"))
         .try_init()
@@ -180,9 +182,12 @@ fn rebalance_status_preserves_http_contract_and_log_severity() {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(String::from_utf8_lossy(&body).contains("<Code>InternalError</Code>"));
         assert!(
-            logs.lines().any(|line| line.contains("ERROR")
-                && line.contains("event=\"admin_rebalance_state\"")
-                && line.contains("result=\"metadata_load_failed\"")),
+            logs.lines().any(|line| {
+                line.contains("ERROR")
+                    && line.contains(r#"event="admin_rebalance_state""#)
+                    && line.contains(r#"action="status""#)
+                    && line.contains(r#"result="metadata_load_failed""#)
+            }),
             "unexpected failure must retain diagnostics: {logs}"
         );
         server.shutdown().await;

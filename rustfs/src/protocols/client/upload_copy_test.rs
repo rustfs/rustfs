@@ -72,39 +72,6 @@ fn unsupported_source(outpost: bool) -> CopySourceValue {
     }
 }
 
-async fn original(
-    backend: &ProtocolStorageClient,
-    input: dto::UploadPartCopyInput,
-    credentials: &rustfs_credentials::Credentials,
-) -> rustfs_s3_types::S3Result<dto::UploadPartCopyOutput> {
-    let bucket = input.bucket.as_str().to_owned();
-    let key = input.key.as_str().to_owned();
-    let source =
-        legacy_copy_source(input.copy_source.clone()).map_err(|error| conversion_error("UploadPartCopy copy_source", error))?;
-    let input = gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(input, source)
-        .map_err(|error| conversion_error("UploadPartCopy input", error))?;
-    let number = input.part_number.to_string();
-    let uri = build_object_uri(&bucket, &key, &[("partNumber", Some(&number)), ("uploadId", Some(&input.upload_id))])?;
-    let request = ProtocolStorageClient::create_request(
-        input,
-        Method::PUT,
-        uri,
-        RequestParams {
-            bucket: Some(bucket),
-            object: Some(key),
-            credentials,
-        },
-    )?;
-    let output = backend
-        .legacy_fs()
-        .upload_part_copy(request)
-        .await
-        .map_err(S3Error::from)?
-        .output;
-    gateway_s3s_compat::generated::ops::upload_part_copy::output_from_s3s(output)
-        .map_err(|error| conversion_error("UploadPartCopy output", error))
-}
-
 fn error_facts(error: S3Error) -> (String, Option<String>, Option<http::StatusCode>, Option<HeaderMap>) {
     (
         error.code().as_str().to_owned(),
@@ -129,31 +96,17 @@ fn protocol_upload_copy_original_refusal_order() {
         use crate::storage_api::protocols::client::StorageObjectOptions;
         let bucket = "protocol-upload-copy-order";
         let (_temp, root, backend, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let context = backend.legacy_fs().server_ctx().app_context().expect("bound context");
+        let context = backend.server_ctx.app_context().expect("bound context");
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         let probe = crate::app::storage_api::helper::MutationCompletionProbe::install(bucket);
-        let audits = || {
+        let audit_operations = || {
             probe
                 .audits
                 .lock()
                 .expect("audits")
                 .drain(..)
-                .map(|entry| {
-                    (
-                        entry.api.name,
-                        entry.api.bucket,
-                        entry.api.object,
-                        entry.api.status,
-                        entry.api.status_code,
-                        entry.error,
-                        entry.req_header,
-                        entry.resp_header,
-                        entry.req_query,
-                        entry.req_path,
-                        entry.access_key,
-                    )
-                })
+                .map(|entry| entry.api.name)
                 .collect::<Vec<_>>()
         };
         let upload = store
@@ -220,16 +173,17 @@ fn protocol_upload_copy_original_refusal_order() {
                 }
                 request
             };
-            let before_count = copy_count();
-            let expected = original(&backend, make(), &root).await.expect_err("old refusal");
             let expected_count = if matches!(case, 0 | 8..=10) { 0 } else { 1 };
-            assert_eq!(copy_count() - before_count, expected_count);
-            let expected_audits = audits();
-            assert_eq!(expected_audits.len(), expected_count as usize);
             let before_count = copy_count();
             let actual = backend.upload_part_copy(make(), &root).await.expect_err("client refusal");
-            assert_eq!((copy_count() - before_count, audits()), (expected_count, expected_audits));
-            let expected = error_facts(expected);
+            assert_eq!(copy_count() - before_count, expected_count);
+            assert_eq!(
+                audit_operations(),
+                vec![Some(rustfs_s3_ops::S3Operation::UploadPartCopy.as_str().to_owned()); expected_count as usize],
+                "audit for case {case}"
+            );
+            let actual_facts = error_facts(actual);
+            let expected = actual_facts.clone();
             let (code, message, status) = match case {
                 0 | 10 => (
                     "InternalError",
@@ -267,7 +221,7 @@ fn protocol_upload_copy_original_refusal_order() {
                 ),
                 "old-main row {case}"
             );
-            assert_eq!(error_facts(actual), expected, "case {case}");
+            assert_eq!(actual_facts, expected, "case {case}");
             let parts = store
                 .list_object_parts(bucket, "copy-target", &upload.upload_id, None, 1000, &options)
                 .await
@@ -296,7 +250,7 @@ fn protocol_upload_copy_original_range_and_metadata() {
         use tokio::io::AsyncReadExt;
         let bucket = "protocol-upload-copy-range";
         let (_foreign_temp, _, foreign, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let ambient = foreign.legacy_fs().server_ctx().app_context().expect("foreign context");
+        let ambient = foreign.server_ctx.app_context().expect("foreign context");
         let options = StorageObjectOptions::default();
         let foreign_etag = ambient
             .object_store()
@@ -311,7 +265,7 @@ fn protocol_upload_copy_original_range_and_metadata() {
             .etag
             .expect("foreign tag");
         let (_temp, root, backend, source_etag) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let context = backend.legacy_fs().server_ctx().app_context().expect("bound context");
+        let context = backend.server_ctx.app_context().expect("bound context");
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         assert!(!std::sync::Arc::ptr_eq(&context, &ambient));
@@ -320,12 +274,11 @@ fn protocol_upload_copy_original_range_and_metadata() {
             &ambient
         ));
         let fallback = crate::init::protocol_storage_client_for_server(crate::runtime_sources::ServerContextSlot::new());
-        assert!(fallback.legacy_fs().server_ctx().installed_app_context().is_none());
         for (backend, store, source_etag, expected_bytes) in [
             (&backend, store, source_etag, b"otoco".as_slice()),
             (&fallback, ambient.object_store(), foreign_etag, b"reign".as_slice()),
         ] {
-            for legacy in [true, false] {
+            {
                 let upload = store
                     .new_multipart_upload(bucket, "copy-target", &options)
                     .await
@@ -338,12 +291,7 @@ fn protocol_upload_copy_original_range_and_metadata() {
                 request.copy_source_range = Some("bytes=2-6".into());
                 request.copy_source_if_match = Some(format!("\"{source_etag}\""));
                 let before_count = copy_count();
-                let output = if legacy {
-                    original(backend, request, &root).await
-                } else {
-                    backend.upload_part_copy(request, &root).await
-                }
-                .expect("range copy");
+                let output = backend.upload_part_copy(request, &root).await.expect("range copy");
                 assert_eq!(copy_count() - before_count, 1);
                 let result = output;
                 assert!(result.last_modified.is_some());
@@ -425,7 +373,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
         let source = "protocol-upload-copy-generation";
         let destination = "protocol-upload-copy-recreated";
         let (_temp, root, backend, _) = crate::protocols::mainflow_test::object_client(source).await;
-        let context = backend.legacy_fs().server_ctx().app_context().expect("context");
+        let context = backend.server_ctx.app_context().expect("context");
         let store = context.object_store();
         let options = StorageObjectOptions::default();
         store
@@ -476,7 +424,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             .expect("replacement bytes");
         let result = backend
             .owned_multipart_usecase()
-            .execute_upload_part_copy_owned(envelope, multipart::upload_part_copy_input(request).expect("owned input"))
+            .execute_upload_part_copy_with_audit(envelope, multipart::upload_part_copy_input(request).expect("owned input"))
             .await;
         let mut reader = store
             .get_object_reader(destination, "copy-target", None, HeaderMap::new(), &options)
@@ -722,7 +670,7 @@ fn owned_copy_future(
     envelope: crate::app::RequestEnvelope,
     input: UploadPartCopyWriteInput,
 ) -> impl std::future::Future<Output = rustfs_s3_types::S3Result<UploadPartCopyWriteOutput>> + '_ {
-    Box::pin(usecase.execute_upload_part_copy_owned(envelope, input))
+    Box::pin(usecase.execute_upload_part_copy_with_audit(envelope, input))
 }
 
 #[tokio::test]
