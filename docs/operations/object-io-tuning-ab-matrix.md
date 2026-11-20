@@ -137,7 +137,7 @@ For batch-delete codec acceptance, run `delete_versions_request_encoding_preserv
 ```bash
 cargo nextest run -p rustfs-ecstore --lib --features test-util --no-tests fail \
   -E 'test(delete_versions_request_encoding_preserves_batches_and_fleet_guards)'
-NO_PROXY='*' no_proxy='*' cargo nextest run -p rustfs --lib --features gateway-stack --no-tests fail \
+NO_PROXY='*' no_proxy='*' cargo nextest run -p rustfs --lib --no-tests fail \
   -E 'test(delete_versions_wire_roundtrip_preserves_json_and_binary_only_batches)'
 ```
 

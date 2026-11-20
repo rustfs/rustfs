@@ -4502,7 +4502,6 @@ impl DefaultObjectUsecase {
         crate::app::test_seams::get_object(self, request).await
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) async fn execute_get_object(
         &self,
         envelope: RequestEnvelope,

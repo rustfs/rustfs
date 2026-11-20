@@ -15,8 +15,8 @@
 //! AbortMultipartUpload wire responses and staged part removal.
 
 use super::super::{
-    ENV_S3_STACK, GATEWAY, LEGACY, Outcome, ROOT_ACCESS_KEY, ROOT_SECRET_KEY, USER_SECRET_KEY, common,
-    create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome, refusal, s3_client, with_stack,
+    ENV_S3_STACK, GATEWAY, Outcome, ROOT_ACCESS_KEY, ROOT_SECRET_KEY, USER_SECRET_KEY, common, create_bucket_in_the_store,
+    create_user_allowed_on_one_bucket, outcome, refusal, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -259,12 +259,6 @@ fn wire_contract(stack: Option<&'static str>) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_abort_multipart_fixed_main_contract() {
-    wire_contract(LEGACY);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_abort_multipart_wire_contract() {
     wire_contract(GATEWAY);
 }
@@ -274,12 +268,6 @@ async fn empty_upload_id(server: rustfs::embedded::RustFSServer) {
     let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
     abort(&client, BUCKET, KEY, "", Some(("NoSuchUpload", 404))).await;
     server.shutdown().await;
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_abort_multipart_empty_upload_id_returns_no_such_upload() {
-    with_stack(LEGACY, empty_upload_id);
 }
 
 #[test]

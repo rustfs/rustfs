@@ -27,11 +27,19 @@ pub(crate) async fn head_object(
     use crate::app::{Answered, RequestEnvelope};
     rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
     let envelope = RequestEnvelope::from_s3s(&req);
-    let Answered { output, status, headers } = usecase
-        .execute_head_object_fields(envelope, HeadObjectFields::from_s3s(req.input))
-        .await?;
+    let Answered { output, status, headers } =
+        head_object_fields(usecase, envelope, HeadObjectFields::from_s3s(req.input)).await?;
     let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
     response.status = status;
     response.headers = headers;
     Ok(response)
+}
+
+/// Calls `DefaultObjectUsecase::execute_head_object_fields` with owned inputs.
+pub(crate) async fn head_object_fields(
+    usecase: &DefaultObjectUsecase,
+    envelope: crate::app::RequestEnvelope,
+    input: crate::app::object_usecase::HeadObjectFields,
+) -> rustfs_s3_types::S3Result<crate::app::Answered<crate::app::object_usecase::HeadObjectOutputFacts>> {
+    usecase.execute_head_object_fields(envelope, input).await
 }

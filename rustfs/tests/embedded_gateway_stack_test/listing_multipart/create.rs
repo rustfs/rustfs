@@ -13,7 +13,7 @@
 
 //! CreateMultipartUpload wire replies and durable session facts.
 
-use super::super::{GATEWAY, LEGACY, create_bucket_in_the_store, s3_client, with_stack};
+use super::super::{GATEWAY, create_bucket_in_the_store, s3_client, with_stack};
 use aws_sdk_s3::config::interceptors::AfterDeserializationInterceptorContextRef;
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3::error::{BoxError, ProvideErrorMetadata};
@@ -351,11 +351,6 @@ async fn create_multipart_wire(server: RustFSServer, legacy: bool) {
 }
 
 #[test]
-fn create_multipart_baseline_legacy_wire() {
-    with_stack(LEGACY, |server| create_multipart_wire(server, true));
-}
-
-#[test]
 fn create_multipart_wire_gateway() {
     with_stack(GATEWAY, |server| create_multipart_wire(server, false));
 }
@@ -610,11 +605,6 @@ async fn create_multipart_authorization(server: RustFSServer) {
 }
 
 #[test]
-fn create_multipart_authorization_legacy() {
-    with_stack(LEGACY, create_multipart_authorization);
-}
-
-#[test]
 fn create_multipart_authorization_gateway() {
     with_stack(GATEWAY, create_multipart_authorization);
 }
@@ -751,11 +741,6 @@ async fn create_multipart_encryption(server: RustFSServer, legacy: bool) {
 
     kms.stop().await.expect("stop test KMS");
     server.shutdown().await;
-}
-
-#[test]
-fn create_multipart_encryption_legacy() {
-    with_stack(LEGACY, |server| create_multipart_encryption(server, true));
 }
 
 #[test]

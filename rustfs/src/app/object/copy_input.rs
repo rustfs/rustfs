@@ -70,6 +70,7 @@ pub(crate) struct CopyObjectWriteInput {
     pub(crate) checksum_algorithm: Option<String>,
 }
 
+#[derive(Debug)]
 pub(crate) struct CopyObjectWriteOutput {
     pub(crate) e_tag: Option<String>,
     pub(crate) last_modified: Option<OffsetDateTime>,
@@ -90,4 +91,15 @@ pub(crate) struct CopyObjectWriteOutput {
     pub(crate) checksum_xxhash64: Option<String>,
     pub(crate) checksum_xxhash128: Option<String>,
     pub(crate) checksum_type: Option<String>,
+}
+
+#[cfg(test)]
+impl CopyObjectWriteInput {
+    /// A test's s3s fixture request as the envelope and input a gateway handler hands the use case.
+    pub(crate) fn from_test_request(
+        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::CopyObjectInput>,
+    ) -> (crate::app::RequestEnvelope, Self) {
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        (envelope, crate::storage::ecfs::copy_input_from_legacy(req.input))
+    }
 }

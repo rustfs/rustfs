@@ -1261,7 +1261,16 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
             }
             let mut credential = get_new_credentials_with_metadata(&claims, root_secret).expect("sign a temporary credential");
             credential.parent_user = parent.to_string();
-            iam.set_temp_user(&credential.access_key, &credential, None)
+            // A regular parent's sessions must carry its durable STS generation, so publish
+            // through the parent-bound path instead of storing an unversioned session.
+            let parent_secret = if parent == root_key { root_secret } else { parent_secret };
+            let authenticated_parent = rustfs_credentials::Credentials {
+                access_key: parent.to_string(),
+                secret_key: parent_secret.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            };
+            iam.set_temp_user_from_parent(&credential, &authenticated_parent)
                 .await
                 .expect("store temporary credential");
             let request = load_table_request_builder(context.clone(), &credential.access_key, &credential.secret_key)

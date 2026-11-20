@@ -24,7 +24,16 @@ pub(crate) async fn list_objects_v2(
     req: S3Request<ListObjectsV2Input>,
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
     crate::storage::ecfs::list_objects_v2_through_legacy_edge(req, |envelope, input| {
-        usecase.execute_list_objects_v2(envelope, input)
+        list_objects_v2_owned(usecase, envelope, input)
     })
     .await
+}
+
+/// Calls `DefaultBucketUsecase::execute_list_objects_v2` with owned inputs.
+pub(crate) async fn list_objects_v2_owned(
+    usecase: &DefaultBucketUsecase,
+    envelope: crate::app::RequestEnvelope,
+    input: rustfs_gateway::dto::ListObjectsV2Input,
+) -> rustfs_s3_types::S3Result<rustfs_gateway::dto::ListObjectsV2Output> {
+    usecase.execute_list_objects_v2(envelope, input).await
 }
