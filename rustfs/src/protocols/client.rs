@@ -1196,9 +1196,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             &envelope.audit_view(),
             rustfs_s3_ops::S3Operation::UploadPartCopy,
         );
-        let result = self
-            .owned_multipart_usecase()
-            .execute_upload_part_copy_owned(envelope, input)
+        let result = Box::pin(self.owned_multipart_usecase().execute_upload_part_copy_owned(envelope, input))
             .await
             .map_err(owned::copy_error);
         let _helper = helper.complete_owned(&result, http::StatusCode::OK, &HeaderMap::new());

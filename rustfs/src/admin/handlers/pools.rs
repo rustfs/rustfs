@@ -332,7 +332,7 @@ fn is_lock_timeout(err: &crate::storage_api::error::StorageError) -> bool {
 fn decommission_start_api_error(err: crate::storage_api::error::StorageError) -> ApiError {
     if crate::storage_api::capacity::is_pool_activation_fleet_proof_error(&err) {
         return ApiError {
-            code: S3ErrorCode::InternalError.into(),
+            code: S3ErrorCode::InternalError,
             message: POOL_ACTIVATION_FLEET_PROOF_REQUIRED.to_string(),
             source: Some(Box::new(err)),
         };
@@ -341,7 +341,7 @@ fn decommission_start_api_error(err: crate::storage_api::error::StorageError) ->
     // movement gate has a queued writer: the same transient contention.
     if is_lock_timeout(&err) || matches!(err, crate::storage_api::error::StorageError::SlowDown) {
         return ApiError {
-            code: S3ErrorCode::ServiceUnavailable.into(),
+            code: S3ErrorCode::ServiceUnavailable,
             message: err.to_string(),
             source: Some(Box::new(err)),
         };
@@ -350,7 +350,7 @@ fn decommission_start_api_error(err: crate::storage_api::error::StorageError) ->
     // should say so, not just "Invalid Request".
     if matches!(err, crate::storage_api::error::StorageError::DecommissionAlreadyRunning) {
         return ApiError {
-            code: S3ErrorCode::InvalidRequest.into(),
+            code: S3ErrorCode::InvalidRequest,
             message: err.to_string(),
             source: Some(Box::new(err)),
         };
@@ -1261,14 +1261,14 @@ mod pools_handler_tests {
     #[test]
     fn test_contextualize_admin_pool_api_error_preserves_code_and_adds_pool_context() {
         let err = crate::error::ApiError {
-            code: rustfs_s3_types::S3ErrorCode::InvalidRequest.into(),
+            code: rustfs_s3_types::S3ErrorCode::InvalidRequest,
             message: "decommission already running".to_string(),
             source: None,
         };
 
         let err = contextualize_admin_pool_api_error(err, "start decommission", "pools [1, 3]");
 
-        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InvalidRequest.into());
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(
             err.message,
             "admin start decommission failed for pools [1, 3]: decommission already running"
@@ -1281,12 +1281,12 @@ mod pools_handler_tests {
 
         let err = decommission_start_api_error(err);
 
-        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InternalError.into());
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(err.message, POOL_ACTIVATION_FLEET_PROOF_REQUIRED);
         assert!(err.source.is_some());
 
         let unrelated = decommission_start_api_error(crate::storage_api::error::StorageError::other("disk read failed"));
-        assert_eq!(unrelated.code, rustfs_s3_types::S3ErrorCode::InternalError.into());
+        assert_eq!(unrelated.code, rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(unrelated.message, "We encountered an internal error, please try again.");
     }
 
@@ -1299,7 +1299,7 @@ mod pools_handler_tests {
 
         let err = decommission_start_api_error(err);
 
-        assert_eq!(err.code, S3ErrorCode::ServiceUnavailable.into());
+        assert_eq!(err.code, S3ErrorCode::ServiceUnavailable);
         assert!(err.message.contains("data movement gate (decommission activation)"), "{}", err.message);
         let err = rustfs_s3_types::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
         assert_eq!(
@@ -1313,7 +1313,7 @@ mod pools_handler_tests {
     fn test_decommission_start_api_error_reports_a_refused_preflight_heal_as_retryable() {
         let err = decommission_start_api_error(crate::storage_api::error::StorageError::SlowDown);
 
-        assert_eq!(err.code, S3ErrorCode::ServiceUnavailable.into());
+        assert_eq!(err.code, S3ErrorCode::ServiceUnavailable);
         let err = rustfs_s3_types::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
         assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }

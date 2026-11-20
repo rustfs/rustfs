@@ -1840,18 +1840,11 @@ fn control_body_digest_error<R: From<Bytes>>(code: &'static str) -> Response<R> 
     response
 }
 
-const CONTROL_BODY_CHECKSUM_HEADERS: [&str; 10] = [
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-crc64nvme",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-sha512",
-    "x-amz-checksum-xxhash64",
-    "x-amz-checksum-xxhash3",
-    "x-amz-checksum-xxhash128",
-    "x-amz-checksum-md5",
-];
+fn control_body_checksum_headers() -> impl Iterator<Item = (&'static str, rustfs_rio::ChecksumType)> {
+    rustfs_rio::BASE_CHECKSUM_TYPES
+        .iter()
+        .filter_map(|&kind| kind.key().map(|name| (name, kind)))
+}
 
 fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result::Result<(), &'static str> {
     use md5::Digest;
@@ -1869,37 +1862,16 @@ fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result:
             return Err("BadDigest");
         }
     }
-    let mut checksums = s3s::checksum::ChecksumHasher {
-        crc32: headers.contains_key("x-amz-checksum-crc32").then(Default::default),
-        crc32c: headers.contains_key("x-amz-checksum-crc32c").then(Default::default),
-        crc64nvme: headers.contains_key("x-amz-checksum-crc64nvme").then(Default::default),
-        sha1: headers.contains_key("x-amz-checksum-sha1").then(Default::default),
-        sha256: headers.contains_key("x-amz-checksum-sha256").then(Default::default),
-        sha512: headers.contains_key("x-amz-checksum-sha512").then(Default::default),
-        xxhash64: headers.contains_key("x-amz-checksum-xxhash64").then(Default::default),
-        xxhash3: headers.contains_key("x-amz-checksum-xxhash3").then(Default::default),
-        xxhash128: headers.contains_key("x-amz-checksum-xxhash128").then(Default::default),
-        md5: headers.contains_key("x-amz-checksum-md5").then(Default::default),
-    };
-    checksums.update(bytes);
-    let checksums = checksums.finalize();
-    let computed = [
-        checksums.checksum_crc32,
-        checksums.checksum_crc32c,
-        checksums.checksum_crc64nvme,
-        checksums.checksum_sha1,
-        checksums.checksum_sha256,
-        checksums.checksum_sha512,
-        checksums.checksum_xxhash64,
-        checksums.checksum_xxhash3,
-        checksums.checksum_xxhash128,
-        checksums.checksum_md5,
-    ];
-    for (name, computed) in CONTROL_BODY_CHECKSUM_HEADERS.into_iter().zip(computed) {
-        if let Some(computed) = computed
-            && (headers.get_all(name).iter().count() != 1
-                || headers.get(name).map(HeaderValue::as_bytes) != Some(computed.as_bytes()))
-        {
+    for (name, kind) in control_body_checksum_headers() {
+        let mut values = headers.get_all(name).iter();
+        let Some(expected) = values.next() else {
+            continue;
+        };
+        if values.next().is_some() {
+            return Err("BadDigest");
+        }
+        let computed = rustfs_rio::Checksum::new_from_data(kind, bytes).ok_or("BadDigest")?;
+        if expected.as_bytes() != computed.encoded.as_bytes() {
             return Err("BadDigest");
         }
     }
@@ -1948,7 +1920,7 @@ where
                 .is_some_and(|value| value.as_bytes().starts_with(b"AWS "))
                 || url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
                     .any(|(key, _)| key == "AWSAccessKeyId");
-            let has_checksum = CONTROL_BODY_CHECKSUM_HEADERS.iter().any(|name| headers.contains_key(*name));
+            let has_checksum = control_body_checksum_headers().any(|(name, _)| headers.contains_key(name));
             let has_md5 = headers.contains_key("content-md5");
             if required && !has_md5 && (sig_v2 || !has_checksum) {
                 return Ok(control_body_digest_error("MissingContentMD5"));
@@ -4209,6 +4181,39 @@ mod tests {
                 .await;
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             }
+        }
+    }
+
+    #[test]
+    fn control_body_checksums_match_wire_values_for_all_algorithms() {
+        let body = b"123456789";
+        let vectors = [
+            ("x-amz-checksum-crc32", "y/Q5Jg=="),
+            ("x-amz-checksum-crc32c", "4waSgw=="),
+            ("x-amz-checksum-crc64nvme", "rosUhgp5mIg="),
+            ("x-amz-checksum-sha1", "98O8HYCOBHMq32eZZczDTKeuNEE="),
+            ("x-amz-checksum-sha256", "FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU="),
+            (
+                "x-amz-checksum-sha512",
+                "2eZ2LdHI6vbWGzxhkvxAjU1tXxF20MKRabwk5xw/J0rSf81YEbMT1oH35V7ALXPUmclUVba1u1A6z1dPuo/+hQ==",
+            ),
+            ("x-amz-checksum-xxhash64", "jLhB20DmroM="),
+            ("x-amz-checksum-xxhash3", "ctyxi2ehff8="),
+            ("x-amz-checksum-xxhash128", "MxGUd+3l3NXpcWQnaB1YYA=="),
+            ("x-amz-checksum-md5", "JfnnlDI7RTiF9RgfG2JNCw=="),
+        ];
+        let mut headers = HeaderMap::new();
+        for (name, value) in vectors {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        assert_eq!(verify_control_body_digest(&headers, body), Ok(()));
+        for (name, value) in vectors {
+            headers.insert(name, HeaderValue::from_static("mismatch"));
+            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "{name}");
+            headers.insert(name, HeaderValue::from_static(value));
+            headers.append(name, HeaderValue::from_static(value));
+            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "duplicate {name}");
+            headers.insert(name, HeaderValue::from_static(value));
         }
     }
 
