@@ -182,7 +182,12 @@ fn rebalance_status_preserves_http_contract_and_log_severity() {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(String::from_utf8_lossy(&body).contains("<Code>InternalError</Code>"));
         assert!(
-            logs.contains("ERROR") && logs.contains("custom route returns error"),
+            logs.lines().any(|line| {
+                line.contains("ERROR")
+                    && line.contains(r#"event="admin_rebalance_state""#)
+                    && line.contains(r#"action="status""#)
+                    && line.contains(r#"result="metadata_load_failed""#)
+            }),
             "unexpected failure must retain diagnostics: {logs}"
         );
         server.shutdown().await;
