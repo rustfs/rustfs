@@ -222,7 +222,7 @@ async fn extension_routes_refuse_anonymous_callers_before_dispatch() {
             .check_access(&mut req)
             .await
             .expect_err("an anonymous extension request is refused");
-        assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{method} {uri}");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied, "{method} {uri}");
     }
 }
 

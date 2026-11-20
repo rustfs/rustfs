@@ -1421,7 +1421,7 @@ mod tests {
             .call(router_request(Method::GET, "/__owned_admin/identity"))
             .await
             .expect_err("missing credentials must stay denied");
-        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
 
         let mut request = router_request(Method::GET, "/__owned_admin/identity");
         request.headers.insert("x-owned-probe", HeaderValue::from_static("present"));
@@ -1542,7 +1542,7 @@ mod tests {
             .await
             .expect_err("unknown v3 admin route must keep the existing error");
 
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
