@@ -1692,7 +1692,7 @@ where
     }
 
     pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<(OffsetDateTime, AccountStatus)> {
-        self.update_user_secret_key_with_guard(access_key, secret_key, None)
+        self.update_user_secret_key_with_guard(access_key, secret_key, None, None)
             .await
             .map(|(updated_at, status, _guard)| (updated_at, status))
     }
@@ -1702,6 +1702,7 @@ where
         access_key: &str,
         secret_key: &str,
         expected_secret: Option<&str>,
+        session: Option<&Credentials>,
     ) -> Result<(
         OffsetDateTime,
         AccountStatus,
@@ -1713,13 +1714,17 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let parent_guard = parent_lock.lock_owned().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
-            Some(u) => u,
-            None if expected_secret.is_some() => return Err(Error::IAMActionNotAllowed),
-            None => return Err(Error::NoSuchUser(access_key.to_string())),
-        };
+        let u = self
+            .api
+            .load_user_identity(access_key, UserType::Reg)
+            .await
+            .map_err(|error| {
+                if expected_secret.is_some() && is_err_no_such_user(&error) {
+                    Error::IAMActionNotAllowed
+                } else {
+                    error
+                }
+            })?;
 
         if let Some(expected) = expected_secret {
             use subtle::ConstantTimeEq as _;
@@ -1731,6 +1736,50 @@ where
                 return Err(Error::IAMActionNotAllowed);
             }
         }
+
+        // Lock order is parent, then the presenting STS credential. Deletion and
+        // session refresh use the same STS lock. Release it before the revocation sweep.
+        let _session_guard = match session {
+            Some(session) => {
+                let guard = self.cache.sts_account_mutation_lock(&session.access_key).lock_owned().await;
+                let current = self
+                    .api
+                    .load_user_identity(&session.access_key, UserType::Sts)
+                    .await
+                    .map_err(|error| {
+                        if is_err_no_such_user(&error) {
+                            Error::IAMActionNotAllowed
+                        } else {
+                            error
+                        }
+                    })?;
+                let parent = if current.credentials.parent_user.is_empty() {
+                    current.credentials.claims_or_empty().get("parent").and_then(Value::as_str)
+                } else {
+                    Some(current.credentials.parent_user.as_str())
+                };
+                use subtle::ConstantTimeEq as _;
+                if !session.is_valid()
+                    || !current.credentials.is_valid()
+                    || !current.credentials.is_temp()
+                    || current.credentials.is_service_account()
+                    || current.credentials.access_key != session.access_key
+                    || parent != Some(access_key)
+                    || !bool::from(current.credentials.secret_key.as_bytes().ct_eq(session.secret_key.as_bytes()))
+                    || !bool::from(
+                        current
+                            .credentials
+                            .session_token
+                            .as_bytes()
+                            .ct_eq(session.session_token.as_bytes()),
+                    )
+                {
+                    return Err(Error::IAMActionNotAllowed);
+                }
+                Some(guard)
+            }
+            None => None,
+        };
 
         let mut cred = u.credentials.clone();
         cred.secret_key = secret_key.to_string();
@@ -1745,8 +1794,6 @@ where
         };
         let u = UserIdentity::from(cred);
         let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
-        drop(cache);
-        drop(users);
 
         self.api
             .save_user_identity(access_key, UserType::Reg, u.clone(), None)
