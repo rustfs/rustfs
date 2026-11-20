@@ -213,8 +213,15 @@ impl Operation for ChangeOwnPasswordHandler {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
         };
 
+        // An STS session signs with its own secret. A direct IAM request must
+        // have been signed with the same password the caller is replacing.
+        let expected_signing_secret = if caller.identity_type == IdentityType::Sts {
+            &caller.credentials.secret_key
+        } else {
+            &request.current_secret_key
+        };
         if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key)
-            || !constant_time_eq(&request.current_secret_key, &signing_secret)
+            || !constant_time_eq(expected_signing_secret, &signing_secret)
         {
             warn!(
                 component = LOG_COMPONENT_ADMIN,
@@ -256,7 +263,8 @@ impl Operation for ChangeOwnPasswordHandler {
         }
 
         let access_key = caller.access_key.clone();
-        let new_secret_key = request.new_secret_key.clone();
+        let current_secret_key = request.current_secret_key;
+        let new_secret_key = request.new_secret_key;
         let identity_type = caller.identity_type;
         let session_access_key = caller.session_access_key.clone();
         let audit_for_task = audit.clone();
@@ -269,7 +277,7 @@ impl Operation for ChangeOwnPasswordHandler {
                 current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
             let (updated_at, status, revoked) = iam_store
-                .change_own_secret_key(&access_key, &signing_secret, &new_secret_key)
+                .change_own_secret_key(&access_key, &current_secret_key, &new_secret_key)
                 .await
                 .map_err(|error| {
                     if matches!(error, rustfs_iam::error::Error::IAMActionNotAllowed) {
