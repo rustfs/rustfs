@@ -319,8 +319,8 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::DiskAPI;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::disk::DiskAPI;
     use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
 
     async fn fixture(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
