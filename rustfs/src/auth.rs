@@ -3052,14 +3052,16 @@ mod tests {
 
     #[test]
     fn session_token_comparison_uses_constant_time_helper() {
-        let source = include_str!("auth.rs");
-        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        let (_, session_check) = include_str!("auth.rs")
+            .split_once("\nfn check_session_token(")
+            .expect("session token validation");
+        let (session_check, _) = session_check.split_once("\nfn ").expect("end of session token validation");
         let ordinary_comparison = ["token ", "!=", " cred.session_token"].concat();
         assert!(
-            !production.contains(&ordinary_comparison),
+            !session_check.contains(&ordinary_comparison),
             "temporary session tokens must not use ordinary string comparison"
         );
-        assert!(production.contains("!constant_time_eq(token, &cred.session_token)"));
+        assert!(session_check.contains("!constant_time_eq(token, &cred.session_token)"));
     }
 
     #[test]

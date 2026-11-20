@@ -932,6 +932,17 @@ impl Operation for RebalanceStatus {
                 return Ok(AdminResponse::with_headers(parts.status, body.into(), parts.headers));
             }
 
+            error!(
+                event = EVENT_ADMIN_REBALANCE_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                state = "metadata_load_failed",
+                action = "status",
+                request_id = %request_id,
+                actor = %actor,
+                remote_addr = %remote_addr,
+                "admin rebalance metadata could not be loaded"
+            );
             return Err(s3_error!(InternalError, "failed to load rebalance metadata from pool 0: {}", err));
         }
 
