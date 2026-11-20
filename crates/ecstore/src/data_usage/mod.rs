@@ -1473,7 +1473,7 @@ async fn project_admin_data_usage_for_current_buckets(
 ) -> DataUsageInfo {
     use futures::StreamExt as _;
     let snapshot_measured = response.is_complete_bucket_usage_snapshot() || response.is_valid_partial_snapshot();
-    let overlay_authoritative = with_memory_overlay && !runtime_sources::setup_is_dist_erasure().await;
+    let overlay_authoritative = with_memory_overlay && snapshot_measured && !runtime_sources::setup_is_dist_erasure().await;
     let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
     let mut incarnations = HashMap::new();
     {
@@ -1514,10 +1514,7 @@ async fn project_admin_data_usage_for_current_buckets(
         }
     }
     response.project_bucket_observations_for_admin(&incarnations);
-    if with_memory_overlay
-        && apply_bucket_usage_memory_overlay_if_authoritative(&mut response, overlay_authoritative).await
-        && snapshot_measured
-    {
+    if apply_bucket_usage_memory_overlay_if_authoritative(&mut response, overlay_authoritative).await {
         response.usage_snapshot_complete = false;
         response.usage_snapshot_partial = true;
         response.usage_snapshot_converged = Some(false);
@@ -1784,8 +1781,8 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
 
 /// Load the admin view with the existing authoritative single-process overlay.
 ///
-/// The overlay is applied before current-identity projection so it cannot
-/// reintroduce statistics from a retired or unverified bucket generation.
+/// Only a complete or valid partial scanner snapshot can receive memory values.
+/// The final identity check excludes statistics from retired or unverified buckets.
 /// Distributed nodes continue to use scanner statistics without local totals.
 /// Cancellation, unknown values, and per-bucket read semantics are the same as
 /// [`load_admin_data_usage_from_backend_cached`]. No overlay is persisted.

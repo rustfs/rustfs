@@ -404,6 +404,54 @@ async fn cached_canonical_admin_usage_rechecks_current_identity_without_peer_inv
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn admin_memory_overlay_requires_a_measured_scanner_baseline() {
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::config::com::save_config;
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    assert!(!runtime_sources::setup_is_dist_erasure().await);
+    let bucket = "usage-unmeasured-overlay";
+    store.make_bucket(bucket, &MakeBucketOptions::default()).await.unwrap();
+    let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.unwrap();
+    let mut baseline = data_usage_info_for_test(bucket, 1, 100, SystemTime::UNIX_EPOCH);
+    let usage = baseline.buckets_usage.get_mut(bucket).unwrap();
+    usage.bucket_incarnation = Some(incarnation.to_string());
+    let memory_usage = BucketUsageInfo {
+        size: 150,
+        ..usage.clone()
+    };
+    clear_usage_memory_cache_for_test().await;
+    replace_bucket_usage_memory_from_authoritative(bucket, memory_usage, SystemTime::now()).await;
+
+    // A missing snapshot and a mismatched bucket count both leave usage unknown.
+    for (buckets_count, expected_size) in [(None, None), (Some(2), None), (Some(1), Some(150))] {
+        if let Some(count) = buckets_count {
+            baseline.buckets_count = count;
+            save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), serde_json::to_vec(&baseline).unwrap())
+                .await
+                .unwrap();
+        }
+        invalidate_data_usage_snapshot_cache().await;
+        let response = load_admin_data_usage_with_memory_overlay(store.clone()).await.unwrap();
+        assert_eq!(
+            response.buckets_usage.get(bucket).map(|usage| usage.size),
+            expected_size,
+            "baseline count {buckets_count:?}"
+        );
+        assert_eq!(response.bucket_sizes.get(bucket).copied(), expected_size);
+        assert_eq!(response.objects_total_size, expected_size.unwrap_or_default());
+        assert_eq!(response.usage_snapshot_admin_projection, expected_size.is_some());
+        assert!(!response.is_complete_bucket_usage_snapshot());
+        assert!(!response.is_valid_partial_snapshot());
+    }
+    clear_usage_memory_cache_for_test().await;
+    invalidate_data_usage_snapshot_cache().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn admin_memory_overlay_cannot_reintroduce_a_predecessor_identity() {
     use crate::bucket::metadata::save_bucket_incarnation;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
