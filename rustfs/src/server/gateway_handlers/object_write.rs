@@ -96,7 +96,7 @@ impl Served for dto::UploadPart {
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let input = native_part_input(request.into_input(), trailer_checksum_algorithm(&envelope)?);
         let output = DefaultMultipartUsecase::with_context(context)
-            .execute_upload_part_owned(envelope, input)
+            .execute_upload_part_with_audit(envelope, input)
             .await?;
         native_part_output(output)
     }

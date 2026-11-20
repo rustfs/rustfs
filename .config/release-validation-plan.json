@@ -114,8 +114,14 @@
     }
   ],
   "upgrade_sources": {
-    "basis": "Exactly the two previous-release sources pinned in .github/workflows/e2e-upgrade.yml are exercised today (source.version / source.asset / source.sha256). No other N-1/N-2 compatibility is claimed, and these digests are not inferred from tags.",
+    "basis": "The three previous-release sources pinned in .github/workflows/e2e-upgrade.yml are exercised today (source.version / source.asset / source.sha256). No other N-1/N-2 compatibility is claimed, and these digests are not inferred from tags.",
     "sources": [
+      {
+        "version": "1.0.5",
+        "role": "gateway compatibility baseline",
+        "artifact_name": "rustfs-linux-x86_64-gnu-v1.0.5.zip",
+        "artifact_sha256": "5addae2f74756bf80104d0975e6347cda843bc2daffdfcd1f0cb80118b95cbd0"
+      },
       {
         "version": "1.0.1",
         "role": "N-1",
@@ -130,6 +136,6 @@
       }
     ],
     "rollback_supported": false,
-    "rollback_basis": "Only the bucket-config-rollback case (rollback_to_previous_release_reads_current_bucket_metadata) is exercised. Full data-plane rollback is not certified and is never a default claim."
+    "rollback_basis": "The release upgrade lane checks bucket-config rollback. The hosted compatibility workflow also checks in-flight multipart rollback to 1.0.5. Full data-plane rollback is not certified and is never a default claim."
   }
 }

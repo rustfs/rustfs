@@ -17,8 +17,9 @@ use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unr
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use rustfs_lock::LockError;
+use rustfs_s3_types::S3ErrorCode;
+use s3s::S3Error as LegacyS3Error;
 use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
-use s3s::{S3Error, S3ErrorCode};
 
 const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
 const CONTENT_SHA256_MISMATCH_MESSAGE: &str = "The provided 'x-amz-content-sha256' header does not match what was computed.";
@@ -347,7 +348,7 @@ impl ApiErrorDiagnostic {
         let mut diagnostic = ApiErrorDiagnostic::default();
         // S3Error retains its payload through an inherent accessor; its
         // std::error::Error implementation does not expose that source.
-        let mut current = if let Some(error) = error.downcast_ref::<S3Error>() {
+        let mut current = if let Some(error) = error.downcast_ref::<LegacyS3Error>() {
             error.source().map(|source| source as &(dyn std::error::Error + 'static))
         } else {
             std::error::Error::source(error)
@@ -384,7 +385,7 @@ impl ApiErrorDiagnostic {
                 diagnostic.io_os_error = io.raw_os_error();
                 // io::Error::source can skip the wrapped error itself.
                 io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
-            } else if let Some(error) = error.downcast_ref::<S3Error>() {
+            } else if let Some(error) = error.downcast_ref::<LegacyS3Error>() {
                 error.source().map(|source| source as &(dyn std::error::Error + 'static))
             } else {
                 error.source()
@@ -616,14 +617,14 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
         if let Some(chunked) = error.downcast_ref::<AwsChunkedStreamError>()
             && !matches!(chunked, AwsChunkedStreamError::Underlying(_))
         {
-            aws_chunked_error = Some(chunked.to_s3_error_code());
+            aws_chunked_error = Some(chunked.to_s3_error_code().into());
         }
         incomplete_body |= error.is::<rustfs_rio::IncompleteBody>()
             || matches!(upload_error, Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete))
             || is_hyper_body_eof(error);
         None
     });
-    digest.or_else(|| {
+    digest.or({
         if upload_limit_exceeded {
             Some(S3ErrorCode::EntityTooLarge)
         } else if server_source_failed {
@@ -711,7 +712,7 @@ impl From<ApiError> for rustfs_s3_types::S3Error {
         } else {
             None
         };
-        let mut s3e = rustfs_s3_types::S3Error::with_message(err.code.into(), err.message);
+        let mut s3e = rustfs_s3_types::S3Error::with_message(err.code, err.message);
         if let Some(cause) = cause {
             let mut headers = http::HeaderMap::new();
             // s3s replaces the generated headers when a custom map is supplied.
@@ -736,7 +737,7 @@ impl From<ApiError> for rustfs_s3_types::S3Error {
 /// with `From`, which yields field for field what the s3s constructor builds
 /// (code, message, explicit status, the cause itself), so both error types
 /// come from one mapping.
-impl From<ApiError> for S3Error {
+impl From<ApiError> for LegacyS3Error {
     fn from(err: ApiError) -> Self {
         rustfs_s3_types::S3Error::from(err).into()
     }
@@ -964,8 +965,9 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
     use rustfs_s3_ops::S3Operation;
+    use rustfs_s3_types::S3ErrorCode;
     use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
-    use s3s::{S3Error, S3ErrorCode};
+    use s3s::{S3Error, S3ErrorCode as LegacyS3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
 
     fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
@@ -982,7 +984,7 @@ mod tests {
         let storage_error =
             StorageError::Lock(LockError::timeout("private-bucket/private-key@latest", std::time::Duration::from_secs(5)));
         let error = S3Error::from(ApiError::from(storage_error));
-        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.code(), &LegacyS3ErrorCode::ServiceUnavailable);
         let source = error.source().expect("retain the typed storage cause");
         assert!(source.downcast_ref::<StorageError>().is_some());
         assert!(error_chain_has_type::<LockError>(source));
@@ -1008,7 +1010,7 @@ mod tests {
         use http_body_util::BodyExt as _;
 
         let error = S3Error::from(ApiError::from(StorageError::UnsupportedDisk));
-        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.code(), &LegacyS3ErrorCode::ServiceUnavailable);
         assert_eq!(error.message(), Some(UNSUPPORTED_PARTICIPANT_MESSAGE));
         assert!(matches!(
             error.source().and_then(|source| source.downcast_ref::<StorageError>()),
@@ -1049,7 +1051,7 @@ mod tests {
         ] {
             let expected_code = failure.code();
             let error = S3Error::from(ApiError::from(failure));
-            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.code(), &LegacyS3ErrorCode::ServiceUnavailable);
             assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
             let source = error
                 .source()
@@ -1082,7 +1084,7 @@ mod tests {
                     code: code.clone(),
                     source: Some(Box::new(source)),
                 });
-                assert_eq!(error.code(), &code);
+                assert_eq!(error.code(), &code.clone().into());
                 let source = error.source().expect("preserve wrapped lock timeout");
                 assert!(error_chain_has_type::<LockError>(source));
                 let response = error.to_http_response().expect("serialize wrapped timeout");
@@ -1126,7 +1128,7 @@ mod tests {
         ] {
             let expected_code = failure.code();
             let error = S3Error::from(ApiError::from(failure));
-            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.code(), &LegacyS3ErrorCode::ServiceUnavailable);
             assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
             let source = error
                 .source()
@@ -1344,7 +1346,7 @@ mod tests {
             assert_eq!(diagnostic.lock_reason, Some(expected));
             assert!(!format!("{diagnostic:?}").contains("private"));
             let s3: S3Error = api.into();
-            assert_eq!(s3.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(s3.code(), &LegacyS3ErrorCode::ServiceUnavailable);
             assert_eq!(super::ApiErrorDiagnostic::from_error(&s3).lock_reason, Some(expected));
         }
 
@@ -1634,7 +1636,7 @@ mod tests {
                     AwsChunkedStreamError::TrailersTooLarge(16385, 16384),
                     AwsChunkedStreamError::TooManyTrailerHeaders(101, 100),
                 ] {
-                    let expected = error.to_s3_error_code();
+                    let expected: S3ErrorCode = error.to_s3_error_code().into();
                     let expected_status = if expected == S3ErrorCode::SignatureDoesNotMatch {
                         StatusCode::FORBIDDEN
                     } else {
@@ -2367,6 +2369,28 @@ mod tests {
     }
 
     #[test]
+    fn custom_error_keeps_its_identity_and_cause_across_both_edges() {
+        let api = ApiError {
+            code: S3ErrorCode::Custom("InvalidRequest".into()),
+            message: "custom refusal".into(),
+            source: Some(Box::new(IoError::other("original cause"))),
+        };
+        let owned = rustfs_s3_types::S3Error::from(api);
+        assert!(matches!(owned.code(), S3ErrorCode::Custom(name) if name == "InvalidRequest"));
+        assert_eq!(owned.status_code(), None);
+        assert_eq!(owned.message(), Some("custom refusal"));
+        assert!(owned.headers().is_none());
+        assert!(owned.source().is_some_and(|source| source.is::<IoError>()));
+
+        let legacy = S3Error::from(owned);
+        assert!(matches!(legacy.code(), LegacyS3ErrorCode::Custom(name) if name == "InvalidRequest"));
+        assert_eq!(legacy.status_code(), None);
+        assert_eq!(legacy.message(), Some("custom refusal"));
+        assert!(legacy.headers().is_none());
+        assert!(legacy.source().is_some_and(|source| source.is::<IoError>()));
+    }
+
+    #[test]
     fn test_generated_error_codes_keep_their_own_status() {
         let s3_error = S3Error::from(ApiError::from(StorageError::other(rustfs_kms::KmsError::backend_error("down"))));
 
@@ -2397,7 +2421,7 @@ mod tests {
                 headers.insert("retry-after", http::HeaderValue::from_static("2"));
                 err.set_headers(headers);
 
-                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(err.code(), &LegacyS3ErrorCode::ServiceUnavailable);
                 assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
                 assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
                 assert_eq!(err.request_id(), Some("put-quorum-request"));
@@ -2428,16 +2452,16 @@ mod tests {
     #[test]
     fn put_read_quorum_error_preserves_other_error_contracts() {
         for code in [
-            S3ErrorCode::SlowDown,
-            S3ErrorCode::AccessDenied,
-            S3ErrorCode::InvalidRequest,
-            S3ErrorCode::PreconditionFailed,
-            S3ErrorCode::BadDigest,
-            S3ErrorCode::IncompleteBody,
-            S3ErrorCode::NoSuchKey,
-            S3ErrorCode::NoSuchBucket,
-            S3ErrorCode::InternalError,
-            S3ErrorCode::ServiceUnavailable,
+            LegacyS3ErrorCode::SlowDown,
+            LegacyS3ErrorCode::AccessDenied,
+            LegacyS3ErrorCode::InvalidRequest,
+            LegacyS3ErrorCode::PreconditionFailed,
+            LegacyS3ErrorCode::BadDigest,
+            LegacyS3ErrorCode::IncompleteBody,
+            LegacyS3ErrorCode::NoSuchKey,
+            LegacyS3ErrorCode::NoSuchBucket,
+            LegacyS3ErrorCode::InternalError,
+            LegacyS3ErrorCode::ServiceUnavailable,
         ] {
             let mut err = S3Error::with_message(code.clone(), "original message");
             err.set_source(Box::new(StorageError::ErasureReadQuorum));
@@ -2693,7 +2717,7 @@ mod tests {
         };
 
         let s3_error: S3Error = api_error.into();
-        assert_eq!(*s3_error.code(), S3ErrorCode::NoSuchBucket);
+        assert_eq!(*s3_error.code(), LegacyS3ErrorCode::NoSuchBucket);
         assert!(s3_error.message().unwrap_or("").contains("Bucket not found"));
         assert!(s3_error.source().is_some());
     }
@@ -2711,7 +2735,7 @@ mod tests {
 
         let s3_error: S3Error = api_error.into();
 
-        assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
+        assert_eq!(*s3_error.code(), LegacyS3ErrorCode::ServiceUnavailable);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
@@ -2748,7 +2772,7 @@ mod tests {
         assert_eq!(api_error.message, MAX_VERSIONS_EXCEEDED_MESSAGE);
 
         let s3_error: S3Error = api_error.into();
-        assert_eq!(s3_error.code(), &S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()));
+        assert_eq!(s3_error.code(), &LegacyS3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()));
         assert_eq!(s3_error.message(), Some(MAX_VERSIONS_EXCEEDED_MESSAGE));
         assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
     }
@@ -2762,7 +2786,7 @@ mod tests {
         };
 
         let s3_error: S3Error = api_error.into();
-        assert_eq!(*s3_error.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(*s3_error.code(), LegacyS3ErrorCode::InvalidArgument);
         assert!(s3_error.message().unwrap_or("").contains("Invalid argument"));
     }
 

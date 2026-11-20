@@ -609,7 +609,9 @@ async fn restart_replays_a_pending_heartbeat_from_before_environment_collection(
     let server = server(&pki, vec![Reply::ok("2026-08-22T01:02:03Z")]).await;
     let temp = tempfile::tempdir().expect("tempdir");
     let shutdown = CancellationToken::new();
-    let config = config(&temp, &pki, &server);
+    let mut config = config(&temp, &pki, &server);
+    // Observe one acknowledged replay before another heartbeat is due.
+    config.schedule = HeartbeatSchedule::default();
     let directory = config.state_path.parent().expect("state directory");
     fs::create_dir_all(directory).expect("create state directory");
     let state = json!({

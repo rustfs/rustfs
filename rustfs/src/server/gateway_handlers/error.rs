@@ -41,6 +41,47 @@ use rustfs_gateway_types::{ETag, ErrorCode, Timestamp, TimestampFormat};
 use rustfs_s3_types::S3Error;
 use std::borrow::Cow;
 
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_OBJECT: &str = "object";
+const EVENT_OBJECT_INTERNAL_ERROR: &str = "object_internal_error";
+
+pub(super) fn object_error_logger(
+    operation: &'static str,
+    transport: rustfs_gateway::TransportExtensions,
+) -> impl FnOnce(&S3Error) {
+    move |error| {
+        let request_id = transport
+            .get::<crate::storage_api::server::http::request_context::RequestContext>()
+            .map(|context| context.request_id.as_str());
+        log_object_internal_error(operation, request_id, error);
+    }
+}
+
+fn log_object_internal_error(operation: &'static str, request_id: Option<&str>, error: &S3Error) {
+    if error.code() != &rustfs_s3_types::S3ErrorCode::InternalError {
+        return;
+    }
+    // Generated S3 adapters serialize handler errors without retaining their
+    // typed sources in logs. Keep only bounded classifications at this boundary.
+    let diagnostic = crate::error::ApiErrorDiagnostic::from_error(error);
+    tracing::error!(
+        event = EVENT_OBJECT_INTERNAL_ERROR,
+        component = LOG_COMPONENT_STORAGE,
+        subsystem = LOG_SUBSYSTEM_OBJECT,
+        result = "error",
+        operation,
+        request_id = request_id.unwrap_or("unavailable"),
+        storage_error_code = ?diagnostic.storage_code,
+        io_error_kind = ?diagnostic.io_kind,
+        io_os_error = diagnostic.io_os_error,
+        rpc_error_code = ?diagnostic.rpc_code,
+        pool_metadata_reason = diagnostic.pool_metadata.map(|context| context.reason),
+        pool_metadata_phase = diagnostic.pool_metadata.map(|context| context.phase),
+        source_chain_truncated = diagnostic.truncated,
+        "Object request returned an internal error"
+    );
+}
+
 /// Answered when an error carries a response header this edge cannot write.
 const UNWRITABLE_HEADER: &str = "the error carries a response header the gateway cannot write";
 /// Answered when the gateway refuses a legacy refusal as stated.
@@ -232,6 +273,75 @@ mod tests {
     use http::{HeaderMap, StatusCode, header};
     use rustfs_gateway::{ErrorContext, ErrorResolution, InvalidErrorContext, ResponseKind, resolve};
     use rustfs_s3_types::S3ErrorCode;
+
+    #[test]
+    fn object_internal_error_logs_only_correlated_bounded_classifications() {
+        #[derive(Clone, Default)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let writer = Writer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(writer.clone())
+            .finish();
+        let mut status = tonic::Status::internal("secret source message");
+        status
+            .metadata_mut()
+            .insert("authorization", "secret-token".parse().expect("metadata"));
+        let error: S3Error =
+            crate::error::ApiError::from(crate::app::storage_api::bucket_usecase::error::StorageError::from(status)).into();
+        let original_code = error.code().clone();
+        let original_status = error.status_code();
+        let original_message = error.message().map(str::to_owned);
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_object_internal_error("GetObject", Some("server-owned-request"), &error);
+            let mut opaque = S3Error::with_message(S3ErrorCode::InternalError, "secret outer message");
+            opaque.set_source(Box::new(std::io::Error::other("secret inner message")));
+            super::log_object_internal_error("DeleteObject", None, &opaque);
+            let unavailable: S3Error =
+                crate::error::ApiError::from(crate::app::storage_api::bucket_usecase::error::StorageError::from(
+                    tonic::Status::unavailable("secret transport message"),
+                ))
+                .into();
+            assert_eq!(unavailable.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(unavailable.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+            super::log_object_internal_error("GetObject", None, &unavailable);
+        });
+        let output = String::from_utf8(writer.0.lock().expect("log buffer").clone()).expect("UTF8 log");
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("authorization"));
+        let rows = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON log"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row["fields"]["event"], "object_internal_error");
+            assert_eq!(row["fields"]["source_chain_truncated"], false);
+        }
+        assert_eq!(rows[0]["fields"]["request_id"], "server-owned-request");
+        assert_eq!(rows[0]["fields"]["rpc_error_code"], "Some(Internal)");
+        assert_eq!(rows[1]["fields"]["request_id"], "unavailable");
+        assert_eq!(rows[1]["fields"]["io_error_kind"], "Some(Other)");
+        assert_eq!(error.code(), &original_code);
+        assert_eq!(error.status_code(), original_status);
+        assert_eq!(error.message(), original_message.as_deref());
+    }
 
     fn with_headers(code: S3ErrorCode, headers: &[(HeaderName, &'static str)]) -> HandlerError {
         let mut map = HeaderMap::new();

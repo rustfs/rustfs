@@ -6,7 +6,7 @@ Applies to `crates/kms/`.
 
 When changing key-management behavior, verify compatibility with:
 
-- `rustfs/src/storage/ecfs.rs`
+- `rustfs/src/storage/sse.rs`
 - `rustfs/src/admin/handlers/kms.rs`
 - `rustfs/src/admin/handlers/kms_dynamic.rs`
 - `rustfs/src/admin/handlers/kms_keys.rs`

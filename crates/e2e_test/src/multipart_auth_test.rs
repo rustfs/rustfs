@@ -1543,6 +1543,30 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
     let uploaded = get_out.body.collect().await?.into_bytes();
     assert_eq!(uploaded.as_ref(), expected_body.as_slice(), "uploaded object body should match");
 
+    // An empty redirect is rejected when rendering the response, after storage succeeds.
+    for (field, value, expected_status) in [
+        ("success_action_status", "200", reqwest::StatusCode::OK),
+        ("success_action_status", "204", reqwest::StatusCode::NO_CONTENT),
+        ("success_action_redirect", "", reqwest::StatusCode::BAD_REQUEST),
+    ] {
+        let key = format!("{field}-{value}.txt");
+        let form = reqwest::multipart::Form::new()
+            .text("key", key.clone())
+            .text(field, value)
+            .part("file", reqwest::multipart::Part::bytes(expected_body.clone()).file_name("upload.txt"));
+        let response = local_http_client()
+            .post(format!("{}/{bucket}", env.url))
+            .multipart(form)
+            .send()
+            .await?;
+        assert_eq!(response.status(), expected_status);
+        if value.is_empty() {
+            assert!(response.text().await?.contains("<Code>InvalidArgument</Code>"));
+        }
+        let stored = admin_client.get_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), expected_body.as_slice());
+    }
+
     Ok(())
 }
 
