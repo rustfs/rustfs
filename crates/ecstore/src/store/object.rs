@@ -2856,6 +2856,28 @@ fn check_batch_delete_condition(object: &ObjectToDelete, snapshot: &ConditionalD
 /// `handle_copy_object` shares the same fail-safe boundary. Metadata-only and
 /// version-only same-key copies do not use this helper and continue to preserve
 /// the existing version's protected state.
+fn materialized_copy_options(source: &HashMap<String, String>, dst_opts: &ObjectOptions) -> ObjectOptions {
+    ObjectOptions {
+        user_defined: materialized_copy_user_defined(source),
+        versioned: dst_opts.versioned,
+        version_suspended: dst_opts.version_suspended,
+        shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
+        version_id: dst_opts.version_id.clone(),
+        no_lock: dst_opts.no_lock,
+        write_completion: dst_opts.write_completion,
+        mod_time: dst_opts.mod_time,
+        http_preconditions: dst_opts.http_preconditions.clone(),
+        expected_current_version_id: dst_opts.expected_current_version_id.clone(),
+        expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
+        namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+        write_lock_context: dst_opts.write_lock_context.clone(),
+        bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+        object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
+        quota_admission: dst_opts.quota_admission,
+        ..Default::default()
+    }
+}
+
 fn materialized_copy_user_defined(source: &HashMap<String, String>) -> HashMap<String, String> {
     let mut metadata = source.clone();
     for suffix in [
@@ -5337,24 +5359,7 @@ impl ECStore {
                         .map(|oi| (oi, None));
                 }
                 // Transitioned object self-copy: restore from tier into the same pool.
-                let mut put_opts = ObjectOptions {
-                    user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
-                    versioned: dst_opts.versioned,
-                    shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
-                    version_id: dst_opts.version_id.clone(),
-                    no_lock: dst_opts.no_lock,
-                    write_completion: dst_opts.write_completion,
-                    mod_time: dst_opts.mod_time,
-                    http_preconditions: dst_opts.http_preconditions.clone(),
-                    expected_current_version_id: dst_opts.expected_current_version_id.clone(),
-                    expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
-                    namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
-                    write_lock_context: dst_opts.write_lock_context.clone(),
-                    bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
-                    object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
-                    quota_admission: dst_opts.quota_admission,
-                    ..Default::default()
-                };
+                let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
                 if !self.single_pool() {
                     put_opts.decommission_capacity_admission =
                         crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
@@ -5382,24 +5387,7 @@ impl ECStore {
                 // stays consistent with the new version's metadata. Sharing the source data_dir via
                 // a metadata-only version copy would corrupt SSE/compressed objects (issue #4238).
                 if let Some(reader) = src_info.put_object_reader.as_mut() {
-                    let mut put_opts = ObjectOptions {
-                        user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
-                        versioned: dst_opts.versioned,
-                        shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
-                        version_id: dst_opts.version_id.clone(),
-                        no_lock: dst_opts.no_lock,
-                        write_completion: dst_opts.write_completion,
-                        mod_time: dst_opts.mod_time,
-                        http_preconditions: dst_opts.http_preconditions.clone(),
-                        expected_current_version_id: dst_opts.expected_current_version_id.clone(),
-                        expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
-                        namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
-                        write_lock_context: dst_opts.write_lock_context.clone(),
-                        bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
-                        object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
-                        quota_admission: dst_opts.quota_admission,
-                        ..Default::default()
-                    };
+                    let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
                     if !self.single_pool() {
                         put_opts.decommission_capacity_admission =
                             crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
@@ -5440,24 +5428,7 @@ impl ECStore {
         };
         let dst_object_name = dst_object.as_str();
 
-        let mut put_opts = ObjectOptions {
-            user_defined: materialized_copy_user_defined(src_info.user_defined.as_ref()),
-            versioned: dst_opts.versioned,
-            shard_integrity_write_mode: dst_opts.shard_integrity_write_mode,
-            version_id: dst_opts.version_id.clone(),
-            no_lock: dst_opts.no_lock,
-            write_completion: dst_opts.write_completion,
-            mod_time: dst_opts.mod_time,
-            http_preconditions: dst_opts.http_preconditions.clone(),
-            expected_current_version_id: dst_opts.expected_current_version_id.clone(),
-            expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
-            namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
-            write_lock_context: dst_opts.write_lock_context.clone(),
-            bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
-            object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
-            quota_admission: dst_opts.quota_admission,
-            ..Default::default()
-        };
+        let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
         if !self.single_pool() {
             put_opts.decommission_capacity_admission =
                 crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
@@ -7735,6 +7706,19 @@ mod tests {
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .expect("target metadata should be visible after the commit boundary");
+    }
+
+    #[test]
+    fn materialized_copy_preserves_suspended_destination() {
+        let opts = materialized_copy_options(
+            &HashMap::new(),
+            &ObjectOptions {
+                version_suspended: true,
+                ..Default::default()
+            },
+        );
+        assert!(opts.version_suspended);
+        assert!(!opts.versioned);
     }
 
     #[test]

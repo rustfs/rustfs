@@ -162,7 +162,7 @@ impl DefaultObjectUsecase {
             envelope.uri().query(),
             envelope.verified_presigned().is_some(),
         )?;
-        reject_non_wildcard_write_if_none_match_native(input.specific_if_none_match, envelope.headers())?;
+        reject_non_wildcard_write_if_none_match(input.specific_if_none_match, envelope.headers())?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -762,7 +762,7 @@ impl DefaultObjectUsecase {
         .await;
         if dsc.replicate_any() {
             insert_str(&mut user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(&mut user_defined, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
 
@@ -931,6 +931,16 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CopyObject through the owned entry point the gateway handler calls, its error in the s3s
+    /// form these tests compare.
+    async fn copy_owned(
+        usecase: &DefaultObjectUsecase,
+        req: S3Request<CopyObjectInput>,
+    ) -> crate::app::storage_api::s3::S3Result<crate::app::object_usecase::CopyObjectWriteOutput> {
+        let (envelope, input) = crate::app::object_usecase::CopyObjectWriteInput::from_test_request(req);
+        usecase.execute_copy_object_owned(envelope, input).await.map_err(Into::into)
+    }
     use crate::app::storage_api::s3::S3ErrorCode;
     use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderValue, Method};
@@ -1041,8 +1051,8 @@ mod tests {
             .expect_err("short copy source must fail before destination write succeeds");
         let api_error = ApiError::from(err);
 
-        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
-        assert_ne!(api_error.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(api_error.code, rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert_ne!(api_error.code, rustfs_s3_types::S3ErrorCode::IncompleteBody);
     }
 
     #[tokio::test]
@@ -1061,7 +1071,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1077,8 +1087,7 @@ mod tests {
             .key(".rustfs-table/metadata/current.json".to_string())
             .build()
             .unwrap();
-        let error = DefaultObjectUsecase::without_context()
-            .execute_copy_object(build_request(input, Method::PUT))
+        let error = copy_owned(&DefaultObjectUsecase::without_context(), build_request(input, Method::PUT))
             .await
             .expect_err("reserved catalog destination must fail closed without bucket metadata");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
@@ -1102,7 +1111,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -1123,7 +1132,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         // Self-copy with explicit storage class change must pass the self-copy guard.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
@@ -1132,7 +1141,9 @@ mod tests {
     #[serial_test::serial]
     async fn execute_self_copy_when_object_name_equals_bucket_observes_lock_order() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
-        use s3s::access::S3Access as _;
+        use crate::storage_api::server::http::access::access_owned::object_commit::{
+            CopyObjectAuthorization, CopySourceObject, authorize_copy_object,
+        };
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         if current_app_context().is_none() {
@@ -1142,7 +1153,6 @@ mod tests {
         let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
         let server_ctx = crate::app::runtime_sources::ServerContextSlot::new();
         assert!(server_ctx.install(Arc::clone(&context)));
-        let fs = FS::with_server_ctx(server_ctx);
 
         let bucket = format!("self-copy-lock-order-{}", Uuid::new_v4());
         store
@@ -1186,19 +1196,34 @@ mod tests {
             .build()
             .expect("self-copy input should build");
         let mut req = build_request(input, Method::PUT);
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
-        fs.copy_object(&mut req)
+        req.extensions.insert(crate::storage::req_info::ReqInfo::default());
+        let (mut envelope, input) = CopyObjectWriteInput::from_test_request(req);
+        let facts = CopyObjectAuthorization {
+            bucket: &bucket,
+            key: &bucket,
+            source: Some(CopySourceObject {
+                bucket: &bucket,
+                key: &bucket,
+                version_id: None,
+            }),
+            query_version: None,
+            tagging: None,
+            tagging_directive: None,
+            retain_until: None,
+            legal_hold: false,
+            retention: false,
+        };
+        authorize_copy_object(&mut envelope, &server_ctx, facts)
             .await
             .expect("authorize self-copy whose object key equals its bucket");
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(req),
-        )
-        .await
-        .expect("lifecycle, authority, and exact object locks must not deadlock")
-        .expect("self-copy whose object key equals its bucket should succeed");
-        assert!(response.output.copy_object_result.is_some());
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), usecase.execute_copy_object_owned(envelope, input))
+                .await
+                .expect("lifecycle, authority, and exact object locks must not deadlock")
+                .expect("self-copy whose object key equals its bucket should succeed");
+        assert!(response.e_tag.is_some());
         let info = store
             .get_object_info(&bucket, &bucket, &ObjectOptions::default())
             .await
@@ -1235,7 +1260,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         // Tiered self-copy with STANDARD storage class must pass all validation checks.
         // The call fails at store init (no store in unit tests), not at validation.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -1260,7 +1285,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         // Must not be rejected by the self-copy guard; it fails later at store init instead.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
@@ -1341,17 +1366,16 @@ mod tests {
             [(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))],
             tokio::time::timeout(
                 Duration::from_secs(10),
-                DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(req),
+                copy_owned(&DefaultObjectUsecase::with_context(Some(context)), req),
             ),
         )
         .await
         .expect("nonbuffered source reader must not deadlock behind the self-copy write lock")
         .expect("expected-current historical self-copy should succeed");
-        assert!(response.output.copy_object_result.is_some());
+        assert!(response.e_tag.is_some());
         let source_version_id_text = source_version_id.to_string();
-        assert_eq!(response.output.copy_source_version_id.as_deref(), Some(source_version_id_text.as_str()));
+        assert_eq!(response.copy_source_version_id.as_deref(), Some(source_version_id_text.as_str()));
         let destination_version_id = response
-            .output
             .version_id
             .clone()
             .expect("versioned self-copy should return its destination version");
@@ -1437,13 +1461,12 @@ mod tests {
             .key(destination.to_string())
             .build()
             .expect("directory copy input should build");
-        let response = DefaultObjectUsecase::with_context(Some(context))
-            .execute_copy_object(build_request(input, Method::PUT))
+        let response = copy_owned(&DefaultObjectUsecase::with_context(Some(context)), build_request(input, Method::PUT))
             .await
             .expect("copying to a directory marker should succeed");
 
         assert_eq!(
-            response.output.version_id.as_deref(),
+            response.version_id.as_deref(),
             Some(NULL_VERSION_ID),
             "CopyObject must expose the null destination version without leaking the internal nil UUID"
         );
@@ -1477,7 +1500,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1498,7 +1521,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -1520,7 +1543,7 @@ mod tests {
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
         );
 
-        let err = Box::pin(DefaultObjectUsecase::without_context().execute_copy_object(req))
+        let err = Box::pin(copy_owned(&DefaultObjectUsecase::without_context(), req))
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -1529,9 +1552,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn metadata_only_copy_escapes_legacy_etags_in_xml() {
-        use crate::app::storage_api::test::ReqInfo;
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-        use s3s::xml::{SerializeContent, Serializer};
+        use http_body_util::BodyExt as _;
         let (store, context) = real_store_test_context().await;
         let bucket = format!("copy-legacy-etag-{}", Uuid::new_v4());
         let key = "owned.txt";
@@ -1558,30 +1580,25 @@ mod tests {
             .await
             .expect("legacy object");
         assert_eq!(before.etag.as_deref(), Some(etag));
-        let input = CopyObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(key.to_string())
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: key.into(),
-                version_id: None,
-            })
-            .metadata_directive(Some(s3s::dto::MetadataDirective::from_static("REPLACE")))
-            .build()
-            .expect("self-copy request");
-        let mut request = build_request(input, Method::PUT);
-        request.extensions.insert(ReqInfo::default());
-        let result = Box::pin(DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(request))
+        // The use case hands the stored ETag on verbatim; the gateway's encoder escapes it.
+        let slot = crate::app::runtime_sources::ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = crate::server::TestGateway::over(&context, slot);
+        let response = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{bucket}/{key}"),
+                vec![
+                    ("x-amz-copy-source", format!("/{bucket}/{key}")),
+                    ("x-amz-metadata-directive", "REPLACE".to_owned()),
+                ],
+                Bytes::new(),
+            )
             .await
             .expect("metadata-only self-copy");
-        let mut bytes = Vec::new();
-        result
-            .output
-            .copy_object_result
-            .expect("copy result")
-            .serialize_content(&mut Serializer::new(&mut bytes))
-            .expect("serialize copy result");
-        let xml = String::from_utf8(bytes).expect("XML UTF-8");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response.into_body().collect().await.expect("copy result body").to_bytes();
+        let xml = String::from_utf8(body.to_vec()).expect("XML UTF-8");
         assert!(!xml.contains("<Injected>"), "{xml}");
         assert!(xml.contains("&lt;Injected&gt;victim&lt;/Injected&gt;"), "{xml}");
         let stored = store
@@ -1623,7 +1640,7 @@ mod tests {
             .expect("copy input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(usecase.execute_copy_object(build_request(input, Method::PUT)))
+        let err = Box::pin(copy_owned(&usecase, build_request(input, Method::PUT)))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the copy");
 

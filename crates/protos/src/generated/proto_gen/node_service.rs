@@ -505,6 +505,45 @@ pub struct RenameDataResponse {
     #[prost(bytes = "bytes", tag = "4")]
     pub rename_data_resp_bin: ::prost::bytes::Bytes,
 }
+/// Ordinary rename transport batch. Protected rename variants intentionally use
+/// their dedicated fail-closed RPCs and are never admitted here.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RenameDataBatchItem {
+    #[prost(uint32, tag = "1")]
+    pub item_index: u32,
+    #[prost(string, tag = "2")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub file_info_msgpack: ::prost::bytes::Bytes,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenameDataBatchRequest {
+    #[prost(string, tag = "1")]
+    pub src_volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub src_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub dst_volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub dst_path: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub items: ::prost::alloc::vec::Vec<RenameDataBatchItem>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct RenameDataBatchResult {
+    #[prost(uint32, tag = "1")]
+    pub item_index: u32,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    #[prost(message, optional, tag = "3")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub rename_data_resp_msgpack: ::prost::bytes::Bytes,
+}
 /// Fixed-scope native pool.bin recovery. The typed MessagePack payload never
 /// accepts an arbitrary volume or object path.
 #[allow(clippy::all)]
@@ -2898,6 +2937,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "RenameData"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn rename_data_batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RenameDataBatchRequest>,
+        ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<super::RenameDataBatchResult>>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/RenameDataBatch");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RenameDataBatch"));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// The method itself requires source-preserving multipart publication on every peer.
         pub async fn rename_multipart_data(
             &mut self,
@@ -4256,6 +4310,14 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::RenameDataRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
+        /// Server streaming response type for the RenameDataBatch method.
+        type RenameDataBatchStream: tonic::codegen::tokio_stream::Stream<Item = std::result::Result<super::RenameDataBatchResult, tonic::Status>>
+            + std::marker::Send
+            + 'static;
+        async fn rename_data_batch(
+            &self,
+            request: tonic::Request<super::RenameDataBatchRequest>,
+        ) -> std::result::Result<tonic::Response<Self::RenameDataBatchStream>, tonic::Status>;
         /// The method itself requires source-preserving multipart publication on every peer.
         async fn rename_multipart_data(
             &self,
@@ -5573,6 +5635,35 @@ pub mod node_service_server {
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/RenameDataBatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenameDataBatchSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::ServerStreamingService<super::RenameDataBatchRequest> for RenameDataBatchSvc<T> {
+                        type Response = super::RenameDataBatchResult;
+                        type ResponseStream = T::RenameDataBatchStream;
+                        type Future = BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::RenameDataBatchRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::rename_data_batch(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenameDataBatchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

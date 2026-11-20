@@ -22,7 +22,9 @@ use crate::app::storage_api::s3::dto::{
     UserMetadata,
 };
 use crate::app::storage_api::s3::xml::{SerResult, SerializeContent};
-use crate::app::storage_api::s3::{S3ErrorCode, S3Request, S3Response, S3Result, xml};
+#[cfg(test)]
+use crate::app::storage_api::s3::{S3ErrorCode, S3Request, S3Response};
+use crate::app::storage_api::s3::{S3Result, xml};
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 
@@ -320,41 +322,30 @@ fn metadata_count_to_i32(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
-async fn is_list_objects_metadata_action_allowed<T>(
-    req: &S3Request<T>,
+async fn is_list_objects_metadata_action_allowed(
+    envelope: &RequestEnvelope,
     bucket: &str,
     object: &str,
     action: S3Action,
 ) -> S3Result<bool> {
-    let mut auth_req = S3Request {
-        input: (),
-        method: req.method.clone(),
-        uri: req.uri.clone(),
-        headers: req.headers.clone(),
-        extensions: req.extensions.clone(),
-        credentials: req.credentials.clone(),
-        region: req.region.clone(),
-        service: req.service.clone(),
-        trailing_headers: req.trailing_headers.clone(),
-    };
-
-    let mut req_info = req_info_ref(req)?.clone();
+    let mut auth_req = envelope.fork_for_authorization();
+    let mut req_info = req_info_ref(envelope)?.clone();
     req_info.bucket = Some(bucket.to_string());
     req_info.object = Some(object.to_string());
     req_info.version_id = None;
     // Denial here is an expected filter outcome, not an error (issue #5740).
     req_info.suppress_denial_log = true;
-    auth_req.extensions.insert(req_info);
+    auth_req.install_req_info(req_info);
 
     match authorize_request(&mut auth_req, Action::S3Action(action)).await {
         Ok(()) => Ok(true),
-        Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
-        Err(err) => Err(err),
+        Err(err) if err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 
-async fn collect_list_objects_metadata_permissions<T>(
-    req: &S3Request<T>,
+async fn collect_list_objects_metadata_permissions(
+    envelope: &RequestEnvelope,
     bucket: &str,
     objects: &[ObjectInfo],
 ) -> S3Result<HashMap<String, ObjectMetadataPermissions>> {
@@ -366,9 +357,9 @@ async fn collect_list_objects_metadata_permissions<T>(
         }
 
         let metadata_allowed =
-            is_list_objects_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectAction).await?;
+            is_list_objects_metadata_action_allowed(envelope, bucket, &object.name, S3Action::GetObjectAction).await?;
         let tags_allowed =
-            is_list_objects_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectTaggingAction).await?;
+            is_list_objects_metadata_action_allowed(envelope, bucket, &object.name, S3Action::GetObjectTaggingAction).await?;
 
         permissions.insert(
             object.name.clone(),
@@ -605,11 +596,22 @@ fn build_list_objects_v2_metadata_output(
 }
 
 impl DefaultBucketUsecase {
+    #[cfg(test)]
     pub(crate) async fn execute_list_objects_v2m(
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2MetadataOutput>> {
-        let input = req.input.clone();
+        let envelope = RequestEnvelope::from_s3s(&req);
+        self.list_objects_v2_metadata(&envelope, req.input).await.map(S3Response::new)
+    }
+
+    /// One page of `GET /{bucket}?list-type=2&metadata=true`, for the caller the envelope's
+    /// authorization installed: each entry's metadata and tags as far as that caller may read them.
+    pub(crate) async fn list_objects_v2_metadata(
+        &self,
+        envelope: &RequestEnvelope,
+        input: ListObjectsV2Input,
+    ) -> S3Result<ListObjectsV2MetadataOutput> {
         let ListObjectsV2Input {
             bucket,
             continuation_token,
@@ -624,14 +626,14 @@ impl DefaultBucketUsecase {
 
         let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), req.uri.query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_deref(), envelope.uri().query())?;
 
         let store = get_validated_store(&bucket).await?;
-        let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+        let incl_deleted = get_header(envelope.headers(), rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|value| value.as_ref() == "true")
             .unwrap_or_default();
 
-        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+        let object_infos = match envelope.table_list_access() {
             Some(access) => {
                 table_list_isolation::list_objects_v2(
                     store.clone(),
@@ -664,24 +666,34 @@ impl DefaultBucketUsecase {
                 .map_err(ApiError::from)?,
         };
 
-        let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let output = build_list_objects_v2_metadata_output(
+        let permissions = collect_list_objects_metadata_permissions(envelope, &bucket, &object_infos.objects).await?;
+        Ok(build_list_objects_v2_metadata_output(
             object_infos,
             &bucket,
             &params,
             encoding_type.as_ref(),
             fetch_owner.unwrap_or_default(),
             &permissions,
-        );
-
-        Ok(S3Response::new(output))
+        ))
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_list_object_versions_m(
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsMetadataOutput>> {
-        let input = req.input.clone();
+        let envelope = RequestEnvelope::from_s3s(&req);
+        self.list_object_versions_metadata(&envelope, req.input)
+            .await
+            .map(S3Response::new)
+    }
+
+    /// One page of `GET /{bucket}?versions&metadata=true`, as [`Self::list_objects_v2_metadata`].
+    pub(crate) async fn list_object_versions_metadata(
+        &self,
+        envelope: &RequestEnvelope,
+        input: ListObjectVersionsInput,
+    ) -> S3Result<ListObjectVersionsMetadataOutput> {
         let ListObjectVersionsInput {
             bucket,
             delimiter,
@@ -696,7 +708,7 @@ impl DefaultBucketUsecase {
         let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
-        let object_infos = match req.extensions.get::<TableDataPlaneListAccess>() {
+        let object_infos = match envelope.table_list_access() {
             Some(access) => {
                 table_list_isolation::list_object_versions(
                     store.clone(),
@@ -725,11 +737,14 @@ impl DefaultBucketUsecase {
                 .map_err(ApiError::from)?,
         };
 
-        let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let output =
-            build_list_object_versions_metadata_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
-
-        Ok(S3Response::new(output))
+        let permissions = collect_list_objects_metadata_permissions(envelope, &bucket, &object_infos.objects).await?;
+        Ok(build_list_object_versions_metadata_output(
+            object_infos,
+            &bucket,
+            &params,
+            encoding_type.as_ref(),
+            &permissions,
+        ))
     }
 }
 

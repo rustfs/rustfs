@@ -404,6 +404,7 @@ struct GetObjectStrategyContext {
 struct GetObjectOutputContext {
     output: GetObjectOutputFacts,
     event_info: Option<ObjectInfo>,
+    effective_ec_block_size: Option<usize>,
     response_content_length: i64,
     optimal_buffer_size: usize,
     extra_checksum_headers: Vec<(&'static str, String)>,
@@ -2601,8 +2602,9 @@ impl DefaultObjectUsecase {
             };
             return Err(with_delete_marker_read_headers(S3Error::new(code), info, input.version_id.as_deref()));
         }
-        let result =
-            check_preconditions(envelope.headers(), info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
+        let result = check_preconditions(envelope.headers(), info)
+            .map_err(S3Error::from)
+            .and_then(|()| Self::validate_get_object_part_number(part_number, info));
         if result.is_err() {
             let principal = SseKmsPrincipal::from_request(envelope);
             crate::storage::sse::validate_conditional_read(
@@ -4065,6 +4067,7 @@ impl DefaultObjectUsecase {
         method: &hyper::Method,
         headers: &HeaderMap,
         event_info: Option<ObjectInfo>,
+        effective_ec_block_size: Option<usize>,
         version_id_for_event: String,
         output: GetObjectOutputFacts,
         extra_checksum_headers: Vec<(&'static str, String)>,
@@ -4082,6 +4085,11 @@ impl DefaultObjectUsecase {
         // Emit XXHash3/64/128 and SHA-512 checksums that GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT, header_inject_start);
         let result = Ok(response);
         let event_complete_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -4129,6 +4137,7 @@ impl DefaultObjectUsecase {
     where
         F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<DynReader>>,
     {
+        let effective_ec_block_size = info.effective_ec_block_size();
         let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
             manager,
@@ -4299,6 +4308,7 @@ impl DefaultObjectUsecase {
         Ok(GetObjectOutputContext {
             output,
             event_info,
+            effective_ec_block_size,
             response_content_length,
             optimal_buffer_size,
             extra_checksum_headers: {
@@ -4454,7 +4464,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(envelope, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err.into()))),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
@@ -4493,7 +4503,6 @@ impl DefaultObjectUsecase {
         crate::app::test_seams::get_object(self, request).await
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) async fn execute_get_object(
         &self,
         envelope: RequestEnvelope,
@@ -4915,6 +4924,7 @@ impl DefaultObjectUsecase {
         let GetObjectOutputContext {
             output,
             event_info,
+            effective_ec_block_size,
             response_content_length,
             optimal_buffer_size,
             extra_checksum_headers,
@@ -4936,6 +4946,7 @@ impl DefaultObjectUsecase {
             envelope.method(),
             envelope.headers(),
             event_info,
+            effective_ec_block_size,
             version_id_for_event,
             output,
             extra_checksum_headers,
@@ -6527,6 +6538,7 @@ mod tests {
             &req.method,
             &req.headers,
             None,
+            Some(262_144),
             String::new(),
             GetObjectOutputFacts::default(),
             Vec::new(),
@@ -6535,6 +6547,7 @@ mod tests {
         .expect("finalize response");
 
         assert_eq!(response.headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+        assert_eq!(response.headers.get(EC_BLOCK_SIZE_RESPONSE_HEADER).unwrap(), "262144");
     }
 
     #[test]
@@ -12301,7 +12314,7 @@ mod tests {
     fn parse_get_object_part_number_rejects_above_s3_max() {
         let err = parse_part_number_i32_to_usize(Some(10001), "GET").expect_err("partNumber above S3 max must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("GET: partNumber must be between 1 and 10000"));
     }
 

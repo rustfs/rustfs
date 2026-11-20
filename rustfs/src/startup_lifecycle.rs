@@ -227,7 +227,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
         subsystem = LOG_SUBSYSTEM_STARTUP,
         version = %crate::version::get_version(),
         server_address = %server_address,
-        started_at = %jiff::Zoned::now(),
+        started_at = %jiff::ZonedDateTime::now(),
         iam_bootstrap = ?iam_bootstrap,
         "RustFS server ready"
     );

@@ -16,7 +16,9 @@
 
 #[path = "admin/tests.rs"]
 mod admin;
+mod control_plane;
 mod keystone;
+mod legacy_layers;
 mod ssec;
 
 use super::*;
@@ -147,7 +149,8 @@ fn the_assembled_stack_registers_exactly_the_table() {
     let stack = GatewayStack::assemble(assembly()).expect("the stack assembles");
 
     let registered: std::collections::BTreeSet<&str> = stack.service.operations().collect();
-    assert_eq!(registered, rows(OPERATIONS).map(|row| row.name).collect());
+    let table = rows(OPERATIONS).map(|row| row.name);
+    assert_eq!(registered, table.chain(metadata_listing::NAMES).collect());
 }
 
 #[test]
@@ -261,7 +264,7 @@ fn keystone_enabled_requires_an_initialized_provider_and_names_both_settings() {
                 .expect("the provider must be initialized before assembly");
             assert!(matches!(error, GatewayAssemblyError::KeystoneNotInitialized));
             let message = error.to_string();
-            for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE"] {
+            for named in ["gateway stack", "RUSTFS_KEYSTONE_ENABLE"] {
                 assert!(message.contains(named), "{named} is missing from: {message}");
             }
         },
@@ -288,7 +291,7 @@ fn keystone_is_read_from_configuration_and_an_unreadable_one_is_refused() {
 
 #[test]
 fn no_handler_runs_under_a_total_deadline_and_the_body_keeps_the_rustfs_idle_bound() {
-    let config = service_config(Duration::from_secs(300));
+    let config = service_config(Duration::from_secs(300), DEFAULT_MAX_BUFFERED_BODY_BYTES);
 
     assert_eq!(config.handler_deadline(HandlerDeadlineClass::Standard), NO_DEADLINE);
     assert_eq!(config.handler_deadline(HandlerDeadlineClass::Extended), NO_DEADLINE);
@@ -306,40 +309,29 @@ fn a_disabled_body_read_timeout_lifts_the_idle_bound_instead_of_arming_zero() {
     assert_eq!(deadlines.first_byte(), NO_DEADLINE);
 }
 
-#[tokio::test(start_paused = true)]
-async fn rejected_http1_body_uses_the_assembled_drain_timeout() {
+/// The stack hands a body its answer left unread back to the host when it answers: dropping it is
+/// what moves it into `EarlyResponseBodyService`, whose drain the HTTP/1-2 shutdown accounting
+/// owns. A drain of the stack's own would hold it here, in a task nothing accounts for. The
+/// configured idle bound of the host's drain is `server::http`'s
+/// `gateway_rejected_http1_body_uses_the_configured_drain_timeout`.
+#[tokio::test]
+async fn rejected_http1_body_is_released_to_the_host_drain() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    for timeout in [Duration::from_secs(1), Duration::ZERO] {
-        let stack = GatewayStack::assemble_with(
-            GatewayAssembly {
-                body_read_timeout: timeout,
-                ..assembly()
-            },
-            Arc::new(ScriptedIam { ready: true }),
-            root().source(),
-            early_gate(OPERATIONS),
-        )
-        .expect("the stack assembles");
-        let dropped = Arc::new(AtomicBool::new(false));
-        let request = signed_with_a_wrong_signature(request(Method::PUT, "/test-bucket/test-key"), ROOT_ACCESS_KEY)
-            .version(http::Version::HTTP_11)
-            .body(StalledBody(Arc::clone(&dropped)))
-            .expect("request");
-        let response = stack.call(request).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response.headers().get(http::header::CONNECTION).expect("connection header"), "close");
-        tokio::task::yield_now().await;
-        assert!(!dropped.load(Ordering::SeqCst), "the drain should retain the stalled body");
-        let elapsed = if timeout.is_zero() { 301 } else { 2 };
-        tokio::time::advance(Duration::from_secs(elapsed)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            dropped.load(Ordering::SeqCst),
-            !timeout.is_zero(),
-            "the configured timeout must govern the gateway drain"
-        );
-    }
+    let stack =
+        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), early_gate(OPERATIONS))
+            .expect("the stack assembles");
+    let dropped = Arc::new(AtomicBool::new(false));
+    let request = signed_with_a_wrong_signature(request(Method::PUT, "/test-bucket/test-key"), ROOT_ACCESS_KEY)
+        .version(http::Version::HTTP_11)
+        .body(StalledBody(Arc::clone(&dropped)))
+        .expect("request");
+    let response = stack.call(request).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the stack must release the unread body to the host when it answers"
+    );
 }
 
 #[test]

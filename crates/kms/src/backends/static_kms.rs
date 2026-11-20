@@ -34,7 +34,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use async_trait::async_trait;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use rand::RngExt;
 use std::collections::HashMap;
 use tracing::debug;
@@ -65,7 +65,7 @@ pub struct StaticKmsBackend {
     /// across a restart and differs between nodes of one cluster, because there
     /// is no creation event to anchor it to; callers must treat it as "when this
     /// node loaded the key", not as the key's birth date.
-    created_at: Zoned,
+    created_at: ZonedDateTime,
 }
 
 impl StaticKmsBackend {
@@ -89,7 +89,7 @@ impl StaticKmsBackend {
         Ok(Self {
             key_id: static_config.key_id.clone(),
             key: key.into(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
         })
     }
 
@@ -149,7 +149,7 @@ impl StaticKmsBackend {
             encrypted_key: encrypted,
             nonce: nonce_bytes.to_vec(),
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             // The static backend has a single fixed key with no rotation.
             master_key_version: None,
             // The context is already bound as AAD by the Static cipher path
@@ -200,7 +200,7 @@ impl StaticKmsBackend {
             encrypted_key: encrypted,
             nonce: nonce_bytes.to_vec(),
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             // The static backend has a single fixed key with no rotation.
             master_key_version: None,
             // The context is already bound as AAD by the Static cipher path

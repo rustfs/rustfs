@@ -118,6 +118,16 @@ pub(crate) async fn test_two_pool_stores(
     test_pool_stores_with_contexts(rebalance_meta, false, 2, 2).await
 }
 
+/// Two pools whose sets have three drives each: EC:1, quorum 2 of 3.
+#[cfg(test)]
+pub(crate) async fn test_two_pool_stores_with_three_drive_sets() -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(None, false, 2, 3).await
+}
+
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn test_three_pool_stores(
     rebalance_meta: Option<RebalanceMeta>,

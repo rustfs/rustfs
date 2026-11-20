@@ -139,6 +139,30 @@ fn extract_archive_incomplete_body(remaining: u64) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining })
 }
 
+/// Settle the transport checksum and trailers before giving the final frame to the TAR parser.
+/// A parser that rejects that frame may never poll the body again.
+fn archive_transport_chunks(
+    chunks: super::request_body::UploadChunks,
+    expected_length: u64,
+) -> impl Stream<Item = std::io::Result<Bytes>> {
+    futures::stream::try_unfold((chunks.fuse(), expected_length), |(mut chunks, remaining)| async move {
+        let Some(chunk) = chunks.next().await else {
+            return Ok(None);
+        };
+        let chunk = chunk.map_err(s3s_body_error_to_io)?;
+        let overlong = || std::io::Error::new(std::io::ErrorKind::InvalidData, "archive body exceeded expected Content-Length");
+        let remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(overlong)?;
+        if remaining == 0 {
+            while let Some(trailing) = chunks.next().await {
+                if !trailing.map_err(s3s_body_error_to_io)?.is_empty() {
+                    return Err(overlong());
+                }
+            }
+        }
+        Ok(Some((chunk, (chunks, remaining))))
+    })
+}
+
 impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
@@ -1077,7 +1101,7 @@ fn is_legacy_null_directory(header: &tokio_tar::Header, path: &str) -> bool {
     header.as_bytes()[TAR_TYPEFLAG_OFFSET] == b'\0' && path.as_bytes().ends_with(b"/")
 }
 
-fn is_snowball_transport_header(key: &str) -> bool {
+pub(super) fn is_snowball_transport_header(key: &str) -> bool {
     if key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT) || key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT_COMPAT) {
         return true;
     }
@@ -1226,7 +1250,7 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
 
 fn map_extract_archive_error(err: std::io::Error) -> S3Error {
     let api_error = ApiError::from(err);
-    if api_error.code != S3ErrorCode::InternalError {
+    if api_error.code != rustfs_s3_types::S3ErrorCode::InternalError {
         return api_error.into();
     }
 
@@ -1299,7 +1323,7 @@ fn is_empty_extract_entry_path(path: &str) -> bool {
 
 fn validate_extract_member_key(path: &str, limits: ArchiveLimits) -> Result<(), ExtractEntryError> {
     validate_put_object_extract_entry_path(path, limits).map_err(ExtractEntryError::Recoverable)?;
-    validate_new_object_key(path, "PUT").map_err(ExtractEntryError::Recoverable)
+    validate_new_object_key(path, "PUT").map_err(|err| ExtractEntryError::Recoverable(err.into()))
 }
 
 fn record_extract_pax_metadata_bytes(
@@ -1620,8 +1644,8 @@ async fn authorized_extract_member_mod_time<R: AuthorizationRequest + ?Sized>(
     }
     match authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await {
         Ok(()) => Ok(archive_time),
-        Err(err) if !replication_required && err.code() == &S3ErrorCode::AccessDenied => Ok(None),
-        Err(err) => Err(err),
+        Err(err) if !replication_required && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -2018,7 +2042,6 @@ impl DefaultObjectUsecase {
         if envelope.post_object().is_some() && !envelope.is_gateway_post() {
             return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
         }
-        #[cfg(feature = "gateway-stack")]
         let input = if envelope.is_gateway_post() {
             let mut input = input;
             let archive = input
@@ -2045,10 +2068,6 @@ impl DefaultObjectUsecase {
             }
             input
         };
-        #[cfg(not(feature = "gateway-stack"))]
-        if envelope.is_gateway_post() {
-            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
-        }
         Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 
@@ -2209,8 +2228,9 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
-        let body =
-            tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))));
+        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?;
+        let chunks = Box::pin(archive_transport_chunks(body, expected_archive_length));
+        let body = tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(chunks));
 
         let md5hex = if let Some(base64_md5) = content_md5 {
             let md5 = base64_simd::STANDARD
@@ -2231,7 +2251,6 @@ impl DefaultObjectUsecase {
             return Err(ApiError::from(err).into());
         }
 
-        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?;
         let archive_upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
         let extract_limits = put_object_extract_limits();
         let tracked_archive =
@@ -2627,7 +2646,11 @@ impl DefaultObjectUsecase {
             .await;
             if replication.replicate_any() {
                 insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-                insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+                insert_str(
+                    &mut opts.user_defined,
+                    SUFFIX_REPLICATION_TIMESTAMP,
+                    jiff::ZonedDateTime::now().to_string(),
+                );
                 insert_str(
                     &mut opts.user_defined,
                     SUFFIX_REPLICATION_STATUS,
@@ -2827,13 +2850,21 @@ impl DefaultObjectUsecase {
     }
 }
 
-#[cfg(feature = "gateway-stack")]
 #[path = "extract/post_archive_preflight.rs"]
 pub(super) mod post_archive_preflight;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Archive extraction through the owned entry point the gateway handler calls, its error in
+    /// the s3s form these tests compare.
+    async fn extract_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
+        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
+        Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+    }
     use crate::app::storage_api::s3::StdError;
     use crate::app::storage_api::s3::dto::{ObjectLockRetentionMode, StreamingBlob};
     use http::{HeaderMap, HeaderName, HeaderValue};
@@ -3635,7 +3666,7 @@ mod tests {
         ] {
             let error = map_extract_archive_error(error);
             assert_eq!(error.code(), &code);
-            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code).as_str()));
+            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code.into()).as_str()));
             assert!(error.source().is_some());
         }
         let error = map_extract_archive_error(io::Error::new(io::ErrorKind::InvalidData, "invalid TAR header"));
@@ -3714,8 +3745,7 @@ mod tests {
         request
             .headers
             .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
-        let error = DefaultObjectUsecase::with_context(Some(context))
-            .execute_put_object_extract(request)
+        let error = extract_owned(&DefaultObjectUsecase::with_context(Some(context)), request)
             .await
             .expect_err("a bad payload digest must reject the archive request");
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
@@ -3798,7 +3828,7 @@ mod tests {
                 .expect("extract request");
             let mut request = build_request(input, Method::PUT);
             request.extensions.insert(ReqInfo::default());
-            let result = Box::pin(usecase.execute_put_object_extract(request)).await;
+            let result = Box::pin(extract_owned(&usecase, request)).await;
             if explicit_version && !replicate {
                 assert_eq!(
                     result
@@ -3902,7 +3932,7 @@ mod tests {
                     .expect("allowed member exists");
                 assert_eq!(info.size, 1);
             } else {
-                assert_eq!(result.err().expect("IAM must deny the member").code().as_str(), "AccessDenied");
+                assert_eq!(result.expect_err("IAM must deny the member").code().as_str(), "AccessDenied");
                 if member == "denied-existing" {
                     let after = store
                         .get_object_info(&bucket, member, &options)
@@ -4012,7 +4042,7 @@ mod tests {
                 result.expect("unchanged public member is allowed");
                 assert_eq!(after.size, 1);
             } else {
-                assert_eq!(result.err().expect("private member must be denied").code().as_str(), "AccessDenied");
+                assert_eq!(result.expect_err("private member must be denied").code().as_str(), "AccessDenied");
                 assert_eq!(after.etag, before.etag, "denied member must not overwrite");
                 assert_eq!(after.user_tags.as_str(), "classification=private");
             }
@@ -4091,7 +4121,7 @@ mod tests {
                 result.expect("private member is authorized");
                 assert_eq!(stored.expect("private member stored").user_tags.as_str(), "classification=private");
             } else {
-                assert_eq!(result.err().expect("public member must be denied").code().as_str(), "AccessDenied");
+                assert_eq!(result.expect_err("public member must be denied").code().as_str(), "AccessDenied");
                 assert!(is_err_object_not_found(&stored.expect_err("denied member must not be stored")));
             }
         }
@@ -4192,7 +4222,7 @@ mod tests {
                     }
                 } else {
                     assert_eq!(
-                        result.err().expect("member privilege required").code().as_str(),
+                        result.expect_err("member privilege required").code().as_str(),
                         "AccessDenied",
                         "{action}: {permission}"
                     );
@@ -4285,6 +4315,28 @@ mod tests {
             .await
             .expect("fixture should contain a logical member")
             .expect("fixture member should parse")
+    }
+
+    #[tokio::test]
+    async fn archive_transport_checks_eof_before_releasing_the_final_frame() {
+        let data = || Ok(Bytes::from_static(b"ab"));
+        let late_error: StdError = Box::new(std::io::Error::other("trailer verification failed"));
+        for (tail, expected) in [
+            (Ok(Bytes::new()), None),
+            (data(), Some("archive body exceeded expected Content-Length")),
+            (Err(late_error), Some("trailer verification failed")),
+        ] {
+            let body = Box::new(futures::stream::iter([data(), data(), tail]));
+            let mut chunks = Box::pin(archive_transport_chunks(body, 4));
+            assert_eq!(chunks.next().await.unwrap().unwrap(), "ab");
+            let last = chunks.next().await.unwrap();
+            if let Some(message) = expected {
+                assert_eq!(last.unwrap_err().to_string(), message);
+            } else {
+                assert_eq!(last.unwrap(), "ab");
+            }
+            assert!(chunks.next().await.is_none());
+        }
     }
 
     #[tokio::test]

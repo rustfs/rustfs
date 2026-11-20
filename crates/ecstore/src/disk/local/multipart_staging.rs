@@ -320,7 +320,9 @@ impl Drop for MultipartCommitStaging {
 impl LocalDisk {
     pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
         let root = upload_scope_root(upload_or_part_path, part_path);
-        let Ok(source) = self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
+        // Advisory skip-recovery probe: only keys ACTIVE_MULTIPART_SOURCE_HEADS and
+        // checks the cached xl.meta stamp; mutating stages re-validate via multipart_source_admission.
+        let Ok(source) = self.io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
             return false;
         };
         super::multipart_source_state::has_clean_active_multipart_source(&source)
@@ -342,6 +344,38 @@ impl LocalDisk {
             base: self.io_root().to_path_buf(),
             publication_root: self.publication_root.clone(),
             initial,
+        }))
+    }
+
+    /// Constructs `MultipartSourceAdmission` for a part path after the caller has
+    /// already validated `(volume, path)` via `io_get_bucket_and_object_path`.
+    pub(super) fn multipart_source_admission_after_validated_part_path(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Result<Option<MultipartSourceAdmission>> {
+        reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
+        if volume != RUSTFS_META_MULTIPART_BUCKET {
+            return Ok(None);
+        }
+        let scope = upload_scope_root(path, true);
+        let trimmed = path.trim_end_matches('/');
+        let source =
+            if !scope.is_empty() && (trimmed == scope || trimmed.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))) {
+                let open_path = self.io_get_object_open_path(volume, scope)?;
+                #[cfg(debug_assertions)]
+                if let Ok(full_path) = self.io_get_object_path(volume, scope) {
+                    debug_assert_eq!(open_path, full_path);
+                }
+                open_path
+            } else {
+                self.io_get_object_path(volume, scope)?
+            };
+        Ok(Some(MultipartSourceAdmission {
+            source,
+            base: self.io_root().to_path_buf(),
+            publication_root: self.publication_root.clone(),
+            initial: false,
         }))
     }
 
@@ -1447,6 +1481,39 @@ mod tests {
                 .await,
             Err(DiskError::FileNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn multipart_source_admission_after_validated_part_path_matches_full_admission() {
+        let (_root, disk, _, _) = fixture().await;
+        let sha_upload = format!("{}/{}/{}/part.1", "a".repeat(64), Uuid::new_v4(), Uuid::new_v4());
+        let fixture_upload = format!("upload/{}/part.1", Uuid::new_v4());
+        let direct_part = format!("{}/part.1", Uuid::new_v4());
+        for path in [&sha_upload, &fixture_upload, &direct_part] {
+            let (_, _) = disk
+                .io_get_bucket_and_object_path(RUSTFS_META_MULTIPART_BUCKET, path)
+                .expect("validated part path");
+            let fast = disk
+                .multipart_source_admission_after_validated_part_path(RUSTFS_META_MULTIPART_BUCKET, path)
+                .expect("fast admission")
+                .expect("multipart admission present");
+            let full = disk
+                .multipart_source_admission(RUSTFS_META_MULTIPART_BUCKET, path, true, false)
+                .expect("full admission")
+                .expect("multipart admission present");
+            assert_eq!(fast.source(), full.source());
+        }
+        assert!(
+            disk.multipart_source_admission_after_validated_part_path("bucket", "object/part.1")
+                .expect("non-multipart volume")
+                .is_none()
+        );
+        for noncanonical in ["a/../b/part.1", "a//b/part.1", "/a/b/part.1"] {
+            assert!(matches!(
+                disk.multipart_source_admission_after_validated_part_path(RUSTFS_META_MULTIPART_BUCKET, noncanonical),
+                Err(DiskError::ConditionalDeleteConflict)
+            ));
+        }
     }
 
     #[cfg(not(windows))]

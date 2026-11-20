@@ -573,6 +573,15 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    type RenameDataBatchStream = ResponseStream<rustfs_protos::proto_gen::node_service::RenameDataBatchResult>;
+
+    async fn rename_data_batch(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataBatchRequest>,
+    ) -> Result<Response<Self::RenameDataBatchStream>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn rename_multipart_data(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,

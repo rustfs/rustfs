@@ -58,7 +58,7 @@ impl Served for dto::PutObject {
                 retention,
                 post: false,
             };
-            Ok(authorize_put_object(envelope, &server, facts, |_| Ok(())).await?)
+            authorize_put_object(envelope, &server, facts, |_| Ok(())).await
         }
     }
 
@@ -89,14 +89,14 @@ impl Served for dto::UploadPart {
                 .server_context()
                 .cloned()
                 .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
-            Ok(authorize_upload_part(envelope, &server, &bucket, &key).await?)
+            authorize_upload_part(envelope, &server, &bucket, &key).await
         }
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let input = native_part_input(request.into_input(), trailer_checksum_algorithm(&envelope)?);
         let output = DefaultMultipartUsecase::with_context(context)
-            .execute_upload_part_owned(envelope, input)
+            .execute_upload_part_with_audit(envelope, input)
             .await?;
         native_part_output(output)
     }

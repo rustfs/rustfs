@@ -256,6 +256,64 @@ pub(crate) fn remote_sdk_credentials(credentials: &RemoteCredentials, now: Syste
     Ok(builder.build())
 }
 
+/// Bound the bytes Smithy can aggregate for a control document or service error.
+/// Successful GetObject responses are streamed directly to the caller.
+#[derive(Debug)]
+struct ControlResponseLimit(usize);
+
+#[derive(Debug)]
+struct OversizedResponseRetryClassifier;
+
+impl aws_smithy_runtime_api::client::retries::classifiers::ClassifyRetry for OversizedResponseRetryClassifier {
+    fn classify_retry(
+        &self,
+        ctx: &aws_smithy_runtime_api::client::interceptors::context::InterceptorContext,
+    ) -> aws_smithy_runtime_api::client::retries::classifiers::RetryAction {
+        use aws_smithy_runtime_api::client::retries::classifiers::RetryAction;
+        if let Some(Err(error)) = ctx.output_or_error() {
+            let mut cause = std::error::Error::source(error);
+            while let Some(error) = cause {
+                if error.is::<http_body_util::LengthLimitError>() {
+                    return RetryAction::RetryForbidden;
+                }
+                cause = error.source();
+            }
+        }
+        RetryAction::NoActionIndicated
+    }
+
+    fn name(&self) -> &'static str {
+        "RustfsOversizedResponseRetryClassifier"
+    }
+}
+
+impl Intercept for ControlResponseLimit {
+    fn name(&self) -> &'static str {
+        "RustfsControlResponseLimit"
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let operation = cfg
+            .load::<aws_smithy_runtime_api::client::orchestrator::Metadata>()
+            .map(|m| m.name());
+        bound_control_response(context.response_mut(), operation, self.0);
+        Ok(())
+    }
+}
+
+fn bound_control_response(response: &mut HttpResponse, operation: Option<&str>, limit: usize) {
+    if operation == Some("GetObject") && response.status().is_success() {
+        return;
+    }
+    let body = std::mem::replace(response.body_mut(), SdkBody::taken());
+    *response.body_mut() = SdkBody::from_body_1_x(http_body_util::Limited::new(body, limit));
+}
+
 /// Only installed on non-streaming upload operations. The budget begins at
 /// response headers, independently of the potentially long request upload.
 #[derive(Debug)]
@@ -375,6 +433,8 @@ pub async fn build_remote_s3_config(spec: &RemoteS3EndpointSpec) -> Result<aws_s
         .region(SdkRegion::new(spec.region.clone()))
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .request_checksum_calculation(replication_request_checksum_calculation())
+        .interceptor(ControlResponseLimit(16 * 1024 * 1024))
+        .retry_classifier(OversizedResponseRetryClassifier)
         .retry_config(spec.retry.retry_config());
 
     if spec.path_style.force_path_style() {
@@ -786,6 +846,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_control_response_limit_preserves_object_streams() {
+        use http_body_util::BodyExt;
+        for (operation, status, bytes, allowed) in [
+            (Some("ListObjectsV2"), 200, 4, true),
+            (Some("ListObjectsV2"), 200, 5, false),
+            (Some("GetObject"), 206, 5, true),
+            (Some("GetObject"), 404, 5, false),
+            (None, 200, 5, false),
+        ] {
+            let mut response = HttpResponse::try_from(
+                http::Response::builder()
+                    .status(status)
+                    .body(SdkBody::from(vec![1; bytes]))
+                    .expect("fixture response"),
+            )
+            .expect("Smithy response");
+            bound_control_response(&mut response, operation, 4);
+            let result = response.into_body().collect().await;
+            if allowed {
+                assert_eq!(result.expect("body is permitted").to_bytes().len(), bytes);
+            } else {
+                assert!(result.is_err(), "oversized control response must fail");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn build_remote_s3_client_rejects_loopback_and_metadata_endpoints() {
         // Default (no loopback opt-in): loopback in IPv4, IPv6 and hostname
         // forms plus the metadata endpoint all return the typed gate error.
@@ -887,6 +974,59 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn sdk_remote_control_limit_stops_chunked_errors_and_preserves_downloads() {
+        #[derive(Debug)]
+        struct ChunkConnector(u16, Arc<AtomicUsize>);
+        impl SmithyHttpConnector for ChunkConnector {
+            fn call(&self, _: HttpRequest) -> HttpConnectorFuture {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let frames =
+                    [b"abc", b"def"].map(|s| Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from_static(s))));
+                let body = http_body_util::StreamBody::new(futures::stream::iter(frames));
+                HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                    SmithyStatusCode::try_from(self.0).expect("fixture status"),
+                    SdkBody::from_body_1_x(body),
+                )))
+            }
+        }
+        for status in [200, 503] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let connector = SharedHttpConnector::new(ChunkConnector(status, calls.clone()));
+            let mut target = spec("s3.example.com", true);
+            target.retry = REPLICATION_TARGET_RETRY_POLICY;
+            let config = build_remote_s3_config(&target)
+                .await
+                .expect("build remote config")
+                .http_client(http_client_fn(move |_, _| connector.clone()))
+                .interceptor(ControlResponseLimit(4))
+                .build();
+            let result = S3Client::from_conf(config)
+                .get_object()
+                .bucket("bucket")
+                .key("key")
+                .send()
+                .await;
+            if status == 200 {
+                let bytes = result
+                    .expect("successful object stream")
+                    .body
+                    .collect()
+                    .await
+                    .expect("collect fixture object")
+                    .into_bytes();
+                assert_eq!(&bytes[..], b"abcdef");
+            } else {
+                assert!(result.is_err(), "oversized error response must fail");
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "oversized control responses must not trigger SDK retries"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retry_policy_decides_how_many_wire_requests_one_call_costs() {
         assert_eq!(
             wire_requests_for_one_failed_call(RemoteS3RetryPolicy::Disabled).await,
@@ -930,8 +1070,9 @@ mod tests {
             .unwrap_or_else(|| panic!("signed request must contain {name}"))
     }
 
-    fn signing_time(headers: &[(String, String)]) -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str(recorded_header(headers, "x-amz-date"), "%Y%m%dT%H%M%SZ")
+    fn signing_time(headers: &[(String, String)]) -> jiff::Timestamp {
+        let value = recorded_header(headers, "x-amz-date").trim_end_matches('Z');
+        jiff::Timestamp::strptime("%Y%m%dT%H%M%S%z", format!("{value}+0000"))
             .expect("SDK signing timestamp must use the SigV4 format")
     }
 
@@ -946,8 +1087,8 @@ mod tests {
                     .map(|(key, value)| (key.to_string(), value.to_string()))
                     .collect(),
             );
-            let server_time = chrono::DateTime::<chrono::Utc>::from(self.clock.now()).naive_utc()
-                + chrono::Duration::seconds(self.skew_seconds);
+            let server_time = jiff::Timestamp::try_from(self.clock.now()).expect("clock timestamp")
+                + jiff::SignedDuration::from_secs(self.skew_seconds);
             let (status, body) = if headers.len() == 1 {
                 (
                     403,
@@ -958,7 +1099,7 @@ mod tests {
             };
             let response = http::Response::builder()
                 .status(status)
-                .header("date", server_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+                .header("date", server_time.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string())
                 .header("content-type", "application/xml")
                 .header("content-length", body.len())
                 .body(SdkBody::from(body))
@@ -996,7 +1137,7 @@ mod tests {
         for error_code in ["RequestTimeTooSkewed", "SignatureDoesNotMatch"] {
             for skew_seconds in [-600, 600] {
                 let (client, headers, clock) = clock_skew_client(error_code, skew_seconds, REPLICATION_TARGET_RETRY_POLICY).await;
-                let initial = chrono::DateTime::<chrono::Utc>::from(clock.now()).naive_utc();
+                let initial = jiff::Timestamp::try_from(clock.now()).expect("clock timestamp");
                 client
                     .get_object()
                     .bucket("bucket")
@@ -1023,12 +1164,12 @@ mod tests {
                 assert_eq!(signing_time(&headers[0]), initial, "the first attempt must use the injected clock");
                 assert_eq!(
                     signing_time(&headers[1]),
-                    initial + chrono::Duration::seconds(skew_seconds),
+                    initial + jiff::SignedDuration::from_secs(skew_seconds),
                     "{error_code}: retry must apply the measured offset exactly"
                 );
                 assert_eq!(
                     signing_time(&headers[2]),
-                    initial + chrono::Duration::seconds(skew_seconds + 17),
+                    initial + jiff::SignedDuration::from_secs(skew_seconds + 17),
                     "{error_code}: the next operation must apply cached skew to the advanced signing clock"
                 );
                 let signature = |index: usize| {

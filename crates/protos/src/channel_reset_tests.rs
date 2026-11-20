@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{INTERNODE_RPC_CONCURRENCY_LIMIT, dial_channel, proto_gen::node_service};
+use super::{INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT, dial_channel, proto_gen::node_service};
 use prost::Message;
 use std::{
     collections::HashSet,
@@ -104,7 +104,7 @@ async fn accept_peer(listener: TcpListener) -> io::Result<TcpStream> {
 
 async fn delayed_response_peer(listener: TcpListener, ready: mpsc::Sender<()>, error_resets: Arc<AtomicUsize>) -> io::Result<()> {
     let mut socket = accept_peer(listener).await?;
-    let mut cancelled = Vec::with_capacity(INTERNODE_RPC_CONCURRENCY_LIMIT);
+    let mut cancelled = Vec::with_capacity(INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
     let mut resets = HashSet::new();
     let mut probe = None;
     loop {
@@ -118,9 +118,9 @@ async fn delayed_response_peer(listener: TcpListener, ready: mpsc::Sender<()>, e
                 let credit = u32::try_from(frame.payload.len()).expect("bounded DATA frame").to_be_bytes();
                 write_frame(&mut socket, WINDOW_UPDATE, 0, 0, &credit).await?;
             }
-            HEADERS if cancelled.len() < INTERNODE_RPC_CONCURRENCY_LIMIT => {
+            HEADERS if cancelled.len() < INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT => {
                 cancelled.push(frame.stream);
-                if cancelled.len() == INTERNODE_RPC_CONCURRENCY_LIMIT {
+                if cancelled.len() == INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT {
                     ready.send(()).await.map_err(|_| io::Error::other("test driver stopped"))?;
                 }
             }
@@ -140,7 +140,7 @@ async fn delayed_response_peer(listener: TcpListener, ready: mpsc::Sender<()>, e
             _ => {}
         }
         if let Some(stream) = probe
-            && resets.len() == INTERNODE_RPC_CONCURRENCY_LIMIT
+            && resets.len() == INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT
         {
             // A raw peer controls bytes already in flight at cancellation. A normal
             // server would consume RST_STREAM and suppress these delayed responses.
@@ -173,7 +173,7 @@ async fn assert_cancelled_responses_are_ignored(bulk: bool) {
         let mut client = node_service::node_service_client::NodeServiceClient::new(channel);
         for batch in 0..BATCHES {
             let mut requests = JoinSet::new();
-            for _ in 0..INTERNODE_RPC_CONCURRENCY_LIMIT {
+            for _ in 0..INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT {
                 let mut pending_client = client.clone();
                 requests.spawn(async move { pending_client.read_version(node_service::ReadVersionRequest::default()).await });
             }

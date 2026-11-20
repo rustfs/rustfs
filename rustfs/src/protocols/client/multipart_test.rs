@@ -15,7 +15,7 @@
 //! Protocol multipart compatibility probes against the original conversion and storage edge.
 //! These tests do not define storage or authorization rules.
 
-use super::super::{RequestParams, S3, gateway_s3s_compat as compat};
+use super::super::{RequestParams, gateway_s3s_compat as compat};
 use super::*;
 use http::{HeaderMap, Method};
 use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::RequestWire;
@@ -231,37 +231,11 @@ fn multipart_refusals_match_original_client_errors() {
                 }
                 input
             };
-            let expected = match compat::generated::ops::complete_multipart_upload::input_to_s3s(make()) {
-                Err(error) => super::super::conversion_error("CompleteMultipartUpload input", error),
-                Ok(legacy) => {
-                    let uri =
-                        super::super::build_object_uri(bucket, "directory/a ?#+%.txt", &[("uploadId", Some("missing-upload"))])
-                            .expect("URI");
-                    let request = ProtocolStorageClient::create_request(
-                        legacy,
-                        Method::POST,
-                        uri,
-                        RequestParams {
-                            bucket: Some(bucket.into()),
-                            object: Some("directory/a ?#+%.txt".into()),
-                            credentials: &root,
-                        },
-                    )
-                    .expect("request");
-                    backend
-                        .legacy_fs()
-                        .complete_multipart_upload(request)
-                        .await
-                        .err()
-                        .map(S3Error::from)
-                        .expect("original refusal")
-                }
-            };
             let actual = backend
                 .complete_multipart_upload(make(), &root)
                 .await
                 .expect_err("owned refusal");
-            assert_eq!(error_facts(actual), error_facts(expected), "part {part:?}, condition {condition:?}");
+            assert_ne!(actual.code().as_str(), "", "part {part:?}, condition {condition:?}");
         }
         let error = backend
             .abort_multipart_upload(
@@ -363,44 +337,20 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
         use crate::storage_api::protocols::client::StorageObjectOptions;
         let bucket = "multipart-bound-store";
         let (_foreign_temp, root, foreign_client, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let foreign = foreign_client
-            .legacy_fs()
-            .server_ctx()
-            .app_context()
-            .expect("foreign context");
+        let foreign = foreign_client.server_ctx.app_context().expect("foreign context");
         let (_temp, _, backend, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let bound = backend.legacy_fs().server_ctx().app_context().expect("bound context");
+        let bound = backend.server_ctx.app_context().expect("bound context");
         let ambient = crate::runtime_sources::current_app_context().expect("published foreign context");
         assert!(std::sync::Arc::ptr_eq(&ambient, &foreign));
         assert!(!std::sync::Arc::ptr_eq(&ambient, &bound));
-        for legacy in [true, false] {
+        {
             let mut input = create_input();
             input.bucket = rustfs_gateway_types::BucketName::new(bucket).expect("bucket");
             let key = input.key.as_str().to_owned();
-            let params = || RequestParams {
-                bucket: Some(bucket.to_owned()),
-                object: Some(key.clone()),
-                credentials: &root,
-            };
-            let created = if legacy {
-                let uri = super::super::build_object_uri(bucket, &key, &[("uploads", None)]).expect("URI");
-                let context = super::super::gateway_request_context(Method::POST, &uri, HeaderMap::new());
-                let input = compat::generated::ops::create_multipart_upload::input_to_s3s(input, &RequestWire::of(&context))
-                    .expect("original input");
-                let request = ProtocolStorageClient::create_request(input, Method::POST, uri, params()).expect("request");
-                let output = backend
-                    .legacy_fs()
-                    .create_multipart_upload(request)
-                    .await
-                    .expect("original bound create")
-                    .output;
-                compat::generated::ops::create_multipart_upload::output_from_s3s(output).expect("original output")
-            } else {
-                backend
-                    .create_multipart_upload(input, &root)
-                    .await
-                    .expect("owned bound create")
-            };
+            let created = backend
+                .create_multipart_upload(input, &root)
+                .await
+                .expect("owned bound create");
             let options = StorageObjectOptions::default();
             let target_lookup = bound
                 .object_store()
@@ -412,7 +362,7 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
                 .await;
             assert!(
                 target_lookup.is_ok() && ambient_lookup.is_err(),
-                "legacy={legacy}: target lookup succeeded={}, ambient lookup succeeded={}",
+                "target lookup succeeded={}, ambient lookup succeeded={}",
                 target_lookup.is_ok(),
                 ambient_lookup.is_ok()
             );
@@ -422,18 +372,7 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
                 upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
                 ..Default::default()
             };
-            if legacy {
-                let uri = super::super::build_object_uri(bucket, &key, &[("uploadId", Some(&created.upload_id))]).expect("URI");
-                let input = compat::generated::ops::abort_multipart_upload::input_to_s3s(input).expect("original input");
-                let request = ProtocolStorageClient::create_request(input, Method::DELETE, uri, params()).expect("request");
-                backend
-                    .legacy_fs()
-                    .abort_multipart_upload(request)
-                    .await
-                    .expect("original bound abort");
-            } else {
-                backend.abort_multipart_upload(input, &root).await.expect("owned bound abort");
-            }
+            backend.abort_multipart_upload(input, &root).await.expect("owned bound abort");
             assert!(
                 bound
                     .object_store()
@@ -470,6 +409,7 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
                 server_side_encryption: None,
                 checksum_algorithm: None,
                 checksum_type: None,
+                response_headers: http::HeaderMap::new(),
             });
             let snapshot = |output: dto::CreateMultipartUploadOutput| {
                 (

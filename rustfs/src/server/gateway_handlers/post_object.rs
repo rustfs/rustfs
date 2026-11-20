@@ -21,7 +21,8 @@ use crate::app::object::post_body::{
     PostBodyIntegrity, VerifiedPostArchivePolicy, post_archive_admission_closed, stage_post_archive, stage_post_body,
 };
 use crate::app::object::post_headers::{
-    post_archive_checksum_headers, post_archive_content_md5, post_checksum_headers, post_metadata_headers,
+    install_post_archive_form_metadata, post_archive_checksum_headers, post_archive_content_md5, post_checksum_headers,
+    post_metadata_headers,
 };
 use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput};
 use crate::storage_api::server::http::access::access_owned::object_write::{
@@ -91,7 +92,7 @@ impl PostObjectHandler for GatewayBackend {
                 Ok(())
             })
             .await
-            .map_err(|error| handler_error(error.into()))?;
+            .map_err(handler_error)?;
             if let Some(expected) = expected_owner.as_deref().filter(|value| !value.is_empty())
                 && crate::app::dto_values::owner().id.as_deref() != Some(expected)
             {
@@ -119,9 +120,10 @@ impl PostObjectHandler for GatewayBackend {
             // The legacy POST hook checks the same form resource after success-control validation.
             authorize_post_object(&mut envelope, input.bucket.as_str(), input.key.as_str(), None)
                 .await
-                .map_err(|error| handler_error(error.into()))?;
+                .map_err(handler_error)?;
             record_s3_op(S3Operation::PostObject);
 
+            install_post_archive_form_metadata(&mut envelope, &input.metadata).map_err(handler_error)?;
             let extract = crate::app::object::is_put_object_extract_requested(envelope.headers());
             let archive_open = extract && !post_archive_admission_closed();
             let checksum_headers = if archive_open {
@@ -183,7 +185,7 @@ impl PostObjectHandler for GatewayBackend {
                 Ok(())
             })
             .await
-            .map_err(|error| handler_error(error.into()))?;
+            .map_err(handler_error)?;
             // A recreated bucket must not inherit the preflight authorization.
             let generation = envelope
                 .bucket_generation()
@@ -193,7 +195,7 @@ impl PostObjectHandler for GatewayBackend {
             }
             authorize_post_object(&mut envelope, &bucket, &key, None)
                 .await
-                .map_err(|error| handler_error(error.into()))?;
+                .map_err(handler_error)?;
             let output = DefaultObjectUsecase::with_context(self.server_ctx.app_context())
                 .execute_put_object_owned(envelope, input)
                 .await
@@ -223,7 +225,7 @@ fn post_retain_until(request: &Req<dto::PostObject>) -> S3Result<Option<time::Of
 }
 
 fn form_policy(fields: &dto::PostObjectFields, retain_until: Option<time::OffsetDateTime>) -> S3Result<PostObjectFormPolicy> {
-    Ok(PostObjectFormPolicy::new(PostObjectPolicyFields {
+    PostObjectFormPolicy::new(PostObjectPolicyFields {
         lock_mode: fields.object_lock_mode.as_ref().map(|value| value.as_str()),
         legal_hold: fields.object_lock_legal_hold_status.as_ref().map(|value| value.as_str()),
         retain_until,
@@ -239,7 +241,7 @@ fn form_policy(fields: &dto::PostObjectFields, retain_until: Option<time::Offset
         grant_write_acp: fields.grant_write_acp.as_deref(),
         if_match: fields.if_match.as_deref().map(form_condition).transpose()?,
         if_none_match: fields.if_none_match.as_deref().map(form_condition).transpose()?,
-    })?)
+    })
 }
 
 fn form_condition(value: &str) -> S3Result<HeaderValue> {
@@ -249,7 +251,7 @@ fn form_condition(value: &str) -> S3Result<HeaderValue> {
     } else {
         HeaderValue::from_str(&format!("\"{value}\""))
     };
-    header.map_err(|_| invalid_post_form_field().into())
+    header.map_err(|_| invalid_post_form_field())
 }
 
 async fn write_input(

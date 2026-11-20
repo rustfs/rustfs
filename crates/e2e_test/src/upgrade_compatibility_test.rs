@@ -46,9 +46,12 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const SOURCE_BINARY_ENV: &str = "RUSTFS_UPGRADE_SOURCE_BINARY";
 const G09_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR";
+const RC2_COMMIT: &str = "e9f53180273b32a9c2b0aa8b5a384047bc7e875c";
 const RC5_COMMIT: &str = "40a2470feb567201165a5b809b7598bb4b1f68f5";
 const STABLE_1_0_1_COMMIT: &str = "6de965ae3c965a78ff819fbcd7acd4aa44177d92";
 const STABLE_1_0_4_COMMIT: &str = "46337942d55f3a8e6a97b147ca98d9ea8115555d";
+const STABLE_1_0_5_COMMIT: &str = "34e6449ed90e3d3a106f6655342e0b3127f33082";
+const STABLE_1_0_6_COMMIT: &str = "de9009d882644effc2628e777650025c3d8e7c65";
 const SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
@@ -142,6 +145,41 @@ fn current_source_revision() -> Result<String, BoxError> {
     Ok(revision.to_string())
 }
 
+pub(crate) struct UpgradeSourceCapabilities {
+    supports_delete_recovery: bool,
+    supports_multipart_publication: bool,
+    pub(crate) requires_list_parts_read_quorum: bool,
+}
+
+impl UpgradeSourceCapabilities {
+    fn from_revision(revision: &str) -> Result<Self, BoxError> {
+        // 1.0.4 supports the delete decision protocol (#8468). Version 1.0.5 also
+        // shipped native MPU publication (#8919) and strict ListParts evidence (#9037, #9149).
+        match revision {
+            RC2_COMMIT | RC5_COMMIT | STABLE_1_0_1_COMMIT => Ok(Self {
+                supports_delete_recovery: false,
+                supports_multipart_publication: false,
+                requires_list_parts_read_quorum: false,
+            }),
+            STABLE_1_0_4_COMMIT => Ok(Self {
+                supports_delete_recovery: true,
+                supports_multipart_publication: false,
+                requires_list_parts_read_quorum: false,
+            }),
+            STABLE_1_0_5_COMMIT | STABLE_1_0_6_COMMIT => Ok(Self {
+                supports_delete_recovery: true,
+                supports_multipart_publication: true,
+                requires_list_parts_read_quorum: true,
+            }),
+            _ => Err(format!("no pinned upgrade expectations for source revision {revision}").into()),
+        }
+    }
+
+    pub(crate) async fn from_binary(binary: &Path) -> Result<Self, BoxError> {
+        Self::from_revision(&binary_source_revision(binary).await?)
+    }
+}
+
 async fn binary_source_revision(binary: &Path) -> Result<String, BoxError> {
     let output = tokio::process::Command::new(binary).arg("--version").output().await?;
     if !output.status.success() {
@@ -224,6 +262,25 @@ fn write_g09_evidence(
 mod g09_evidence_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn pinned_upgrade_sources_keep_distinct_delete_and_list_parts_contracts() -> TestResult {
+        for (revision, delete_recovery, multipart_publication, list_parts_quorum) in [
+            (RC2_COMMIT, false, false, false),
+            (RC5_COMMIT, false, false, false),
+            (STABLE_1_0_1_COMMIT, false, false, false),
+            (STABLE_1_0_4_COMMIT, true, false, false),
+            (STABLE_1_0_5_COMMIT, true, true, true),
+            (STABLE_1_0_6_COMMIT, true, true, true),
+        ] {
+            let source = UpgradeSourceCapabilities::from_revision(revision)?;
+            assert_eq!(source.supports_delete_recovery, delete_recovery, "{revision}");
+            assert_eq!(source.supports_multipart_publication, multipart_publication, "{revision}");
+            assert_eq!(source.requires_list_parts_read_quorum, list_parts_quorum, "{revision}");
+        }
+        assert!(UpgradeSourceCapabilities::from_revision("ffffffffffffffffffffffffffffffffffffffff").is_err());
+        Ok(())
+    }
 
     #[test]
     fn source_revision_parser_requires_lowercase_forty_byte_sha() -> TestResult {
@@ -365,7 +422,7 @@ async fn complete_pending_multipart(
         .await?)
 }
 
-async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
+pub(crate) async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
     let pending = stage_multipart(client, bucket, key, parts).await?;
     complete_pending_multipart(client, bucket, key, &pending).await?;
     Ok(())
@@ -1011,8 +1068,7 @@ async fn exercise_mixed_cluster(
         vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
     );
 
-    // 1.0.4 already implements the delete decision protocol. Use a separate
-    // old-writer key so the original seed still spans the entire rollout.
+    // Use a separate old-writer key so the original seed still spans the entire rollout.
     if previous_has_delete_recovery {
         let key = format!(".upgrade-delete/{phase}/previous-writer");
         previous_client
@@ -2416,7 +2472,7 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     let previous_binary = source_binary()?;
     // Bind the expected protocol to the verified release source, never to the
     // DELETE result itself. The older CI source pins retain their 503 contract.
-    let previous_has_delete_recovery = binary_source_revision(&previous_binary).await? == STABLE_1_0_4_COMMIT;
+    let source = UpgradeSourceCapabilities::from_binary(&previous_binary).await?;
     let evidence_context = g09_evidence_context(&previous_binary).await?;
     let current_binary = rustfs_binary_path();
     let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
@@ -2438,17 +2494,21 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     cluster.stop_node(0)?;
     cluster.start_node_from_binary(0, &current_binary).await?;
     let mut mixed_deleted_keys = Vec::new();
-    if let Some(key) = exercise_mixed_cluster(&cluster, "one-current-node", 0, 1, previous_has_delete_recovery).await? {
+    if let Some(key) = exercise_mixed_cluster(&cluster, "one-current-node", 0, 1, source.supports_delete_recovery).await? {
         mixed_deleted_keys.push(key);
     }
-    // One controlled out-of-policy attempt proves fail-closed behavior below
-    // native write quorum; positive MPU writers remain paused while mixed.
-    assert_mixed_pending_refusal(&cluster, &pending, &sources).await?;
+    let mixed_completion = if source.supports_multipart_publication {
+        let clients = cluster.create_all_clients()?;
+        Some(finish_pending_multipart(&clients, &pending, pending_parts.concat()).await?)
+    } else {
+        assert_mixed_pending_refusal(&cluster, &pending, &sources).await?;
+        None
+    };
 
     for (node_idx, phase) in [(1, "two-current-nodes"), (2, "one-previous-node")] {
         cluster.stop_node(node_idx)?;
         cluster.start_node_from_binary(node_idx, &current_binary).await?;
-        if let Some(key) = exercise_mixed_cluster(&cluster, phase, 0, 3, previous_has_delete_recovery).await? {
+        if let Some(key) = exercise_mixed_cluster(&cluster, phase, 0, 3, source.supports_delete_recovery).await? {
             mixed_deleted_keys.push(key);
         }
     }
@@ -2458,6 +2518,13 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     let clients = cluster.create_all_clients()?;
     wait_for_drive_readmission(&clients, MIXED_BUCKET, "homogeneous-current", DRIVE_READMISSION_TIMEOUT).await?;
     let completed_pending = finish_pending_multipart(&clients, &pending, pending_parts.concat()).await?;
+    if let Some(mixed) = mixed_completion {
+        assert_eq!(
+            completed_pending.version_id, mixed.version_id,
+            "full upgrade changed the completed version"
+        );
+        assert_eq!(completed_pending.etag, mixed.etag, "full upgrade changed the completed ETag");
+    }
     exercise_homogeneous_multipart(&cluster, "homogeneous-current").await?;
     verify_load_bodies(&clients, "homogeneous-previous", "multipart").await?;
     assert_mixed_deletes_visible(&clients, &mixed_deleted_keys).await?;
@@ -2574,7 +2641,7 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
                 "phases": phases,
                 "objects_per_phase": objects_per_phase,
                 "mixed_load": "plain-put",
-                "mixed_delete_protocol_supported": previous_has_delete_recovery,
+                "mixed_delete_protocol_supported": source.supports_delete_recovery,
                 "mixed_deleted_keys": mixed_deleted_keys,
                 "homogeneous_multipart_phases": ["homogeneous-previous", "homogeneous-current", "homogeneous-rollback"],
                 "multipart_objects_per_homogeneous_phase": MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
@@ -2584,7 +2651,7 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
                     "all nodes list every mixed-version object after homogeneous-current convergence",
                     "the previous-release seed survives the baseline restart and every upgrade phase",
                     "previous readers read every current-native MPU body after quiescent rollback",
-                    "same legacy upload resumes with identical body, ETag and version after full upgrade"
+                    "the same previous-release upload remains readable after full upgrade and rollback"
                 ],
             }),
         )?;
@@ -2606,9 +2673,13 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
                     "previous-release writer publishes objects readable by current node",
                     "mixed phases retain 16x16 plain PUT writers while positive multipart writers are paused",
                     "16x16 multipart load runs in homogeneous previous, current and rollback phases",
-                    "one-current-node Complete returns typed 503 and preserves actual source authority and parts",
-                    "the same legacy upload completes and replays once fully upgraded without adding a version",
-                    if previous_has_delete_recovery {
+                    if source.supports_multipart_publication {
+                        "one-current-node Complete and replay return the same version and ETag, and all readers agree on the body"
+                    } else {
+                        "one-current-node Complete returns typed 503 and preserves actual source authority and parts"
+                    },
+                    "fully upgraded readers see the same body, ETag and sole version after replay",
+                    if source.supports_delete_recovery {
                         "mixed-version DELETE succeeds and stays absent through every reader after upgrade and rollback"
                     } else {
                         "modern DELETE fails closed and preserves every byte while old peers remain"
@@ -2955,7 +3026,7 @@ async fn restart_from_binary(env: &mut RustFSTestEnvironment, binary: &Path, ser
     env.start_rustfs_server_from_binary(binary, vec![], server_env).await
 }
 
-async fn set_bucket_quota(env: &RustFSTestEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
+pub(crate) async fn set_bucket_quota(env: &RustFSTestEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
     let path = format!("/rustfs/admin/v3/quota/{bucket}");
     let body = serde_json::json!({ "quota": quota_bytes, "quota_type": "HARD" }).to_string();
     let deadline = Instant::now() + QUOTA_READINESS_TIMEOUT;
@@ -3509,6 +3580,8 @@ async fn direct_upgrade_from_previous_release_preserves_bucket_configuration() -
 #[tokio::test]
 #[ignore = "requires a pinned previous RustFS release binary"]
 async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestResult {
+    use sha2::Digest;
+
     init_logging();
     let previous_binary = source_binary()?;
     let evidence_context = g09_evidence_context(&previous_binary).await?;
@@ -3547,6 +3620,16 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
     let multipart_bytes = multipart_parts.concat();
     write_multipart(&new_client, ROLLBACK_BUCKET, multipart_key, &multipart_parts).await?;
 
+    // This release can finish an upload staged by the current gateway.
+    let inflight = if binary_source_revision(&previous_binary).await? == STABLE_1_0_5_COMMIT {
+        env.create_test_bucket(PENDING_MULTIPART_BUCKET).await?;
+        let parts = [vec![1; LAYOUT_PART_SIZE], vec![2; LAYOUT_PART_SIZE], vec![3; 4096]];
+        let pending = stage_multipart(&new_client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, &parts).await?;
+        Some((pending, parts.concat()))
+    } else {
+        None
+    };
+
     restart_from_binary(&mut env, &previous_binary, &server_env).await?;
     let old_client = env.create_s3_client();
 
@@ -3561,6 +3644,16 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
     let (encryption, body) = read_object(&old_client, ROLLBACK_BUCKET, multipart_key, None).await?;
     assert_eq!(encryption, Some(ServerSideEncryption::Aes256));
     assert_eq!(body, multipart_bytes, "the multipart object did not survive the rollback");
+
+    let rollback_multipart = if let Some((pending, expected)) = inflight {
+        assert_pending_parts(&old_client, &pending).await?;
+        complete_pending_multipart(&old_client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, &pending).await?;
+        let (_, body) = read_object(&old_client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, None).await?;
+        assert_eq!(body, expected);
+        Some((pending.part_sizes, body))
+    } else {
+        None
+    };
 
     // A PUT on the rolled-back release must still honour the encryption
     // configuration it decoded out of the current build's metadata blob.
@@ -3601,6 +3694,25 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
         read_object(&current_again, ROLLBACK_BUCKET, post_rollback_key, None).await?.1,
         post_rollback_bytes
     );
+
+    if let Some((part_sizes, rollback_read)) = rollback_multipart {
+        let (_, current_read) = read_object(&current_again, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, None).await?;
+        assert_eq!(current_read, rollback_read);
+        if let Some(context) = &evidence_context {
+            let evidence = serde_json::json!({
+                "previous_revision": context.previous_revision,
+                "current_revision": context.current_revision,
+                "part_sizes": part_sizes,
+                "bytes": current_read.len(),
+                "rollback_read_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&rollback_read), hex_simd::AsciiCase::Lower),
+                "roll_forward_read_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&current_read), hex_simd::AsciiCase::Lower),
+            });
+            std::fs::write(
+                context.directory.join("inflight-multipart-rollback.json"),
+                serde_json::to_vec_pretty(&evidence)?,
+            )?;
+        }
+    }
 
     if let Some(context) = evidence_context.as_ref() {
         write_g09_evidence(

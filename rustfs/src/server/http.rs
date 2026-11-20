@@ -15,13 +15,10 @@
 // Import HTTP server components and compression configuration
 use crate::admin;
 use crate::app::object::request_body::{BodyReadControl, ObservedBody};
-use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
-#[cfg(feature = "gateway-stack")]
 use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_provider_in_configuration};
-#[cfg(feature = "gateway-stack")]
-use crate::server::stack::{S3StackService, select_stack};
+use crate::server::stack::S3StackService;
 use crate::server::{
     Http12ShutdownOutcome, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
@@ -31,9 +28,8 @@ use crate::server::{
         RequestLoggingLayer, redact_sensitive_uri_query,
     },
     legacy_compat::{
-        BodylessStatusFixLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer,
-        StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
+        BodylessStatusFixLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer,
+        StsQueryApiCompatLayer,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
@@ -86,12 +82,7 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
-use s3s::{
-    config::{S3Config, StaticConfigProvider},
-    host::MultiDomain,
-    service::S3Service,
-    service::S3ServiceBuilder,
-};
+use s3s::host::MultiDomain;
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -117,7 +108,7 @@ use tower_http::trace::TraceLayer;
 #[cfg(feature = "http3")]
 type Http3CoreService = tower::util::BoxCloneService<
     HttpRequest<http3::RequestBody>,
-    Response<HybridBody<s3s::Body, http_body_util::Empty<Bytes>>>,
+    Response<HybridBody<EdgeBody, http_body_util::Empty<Bytes>>>,
     Box<dyn std::error::Error + Send + Sync>,
 >;
 
@@ -191,15 +182,6 @@ static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6
 static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
 
-fn rustfs_s3_config() -> S3Config {
-    let mut s3_config = S3Config::default();
-    s3_config.normalize_forward_slash_path = true;
-    s3_config.enable_sig_v2 = true;
-    s3_config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
-    s3_config.sig_v4_allowed_services.push("s3tables".to_string());
-    s3_config
-}
-
 fn s3_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
     if config.server_domains.is_empty() || config.console_enable {
         return Ok(None);
@@ -263,8 +245,6 @@ const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
 const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
 const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
 const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
-const EVENT_S3_STACK_ASSEMBLED: &str = "s3_stack_assembled";
-const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
 const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
 const EVENT_CONNECTION_CAP_STATE: &str = "connection_cap_state";
@@ -1202,14 +1182,14 @@ impl<B> EarlyResponseBodyState<B> {
     }
 }
 
-/// Request body passed into s3s while retaining ownership of the raw transport
+/// Request body passed into the S3 stack while retaining ownership of the raw transport
 /// body if an operation returns before consuming it.
 ///
 /// Hyper closes the HTTP/1 read side as soon as an [`Incoming`] receiver is
 /// dropped before EOF. A streaming reverse proxy can still be writing at that
 /// point and turns the resulting `EPIPE` into a 502, hiding RustFS's actual S3
 /// error response. Moving the raw body back to the outer service keeps Hyper's
-/// receiver alive without running s3s payload hashing or signature transforms.
+/// receiver alive without running payload hashing or signature transforms.
 struct EarlyResponseBody<B>
 where
     B: http_body::Body<Data = Bytes> + Unpin,
@@ -1500,9 +1480,65 @@ where
     }
 }
 
-// Validate control-plane digests before s3s discards the serialized body.
+/// The error of the S3 service under the middleware.
+type EdgeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The body of the S3 service under the middleware: whatever the gateway, the native console or a
+/// refusal written in this file answers, behind one type the middleware is written against.
+pub(crate) struct EdgeBody(http_body_util::combinators::UnsyncBoxBody<Bytes, EdgeError>);
+
+impl EdgeBody {
+    fn new<B>(body: B) -> Self
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<EdgeError>,
+    {
+        use http_body_util::BodyExt;
+        Self(body.map_err(Into::into).boxed_unsync())
+    }
+}
+
+impl Default for EdgeBody {
+    fn default() -> Self {
+        Self::new(http_body_util::Empty::new())
+    }
+}
+
+impl From<Bytes> for EdgeBody {
+    fn from(bytes: Bytes) -> Self {
+        Self::new(http_body_util::Full::new(bytes))
+    }
+}
+
+impl From<rustfs_s3_types::Body> for EdgeBody {
+    fn from(body: rustfs_s3_types::Body) -> Self {
+        Self::new(body)
+    }
+}
+
+impl http_body::Body for EdgeBody {
+    type Data = Bytes;
+    type Error = EdgeError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.0).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.0.size_hint()
+    }
+}
+
+// Validate control-plane digests before the body reaches the stack.
 // Object uploads and multipart/form-data must retain their streaming readers.
-struct ControlRequestBody(s3s::Body);
+struct ControlRequestBody(EdgeBody);
 
 impl http_body::Body for ControlRequestBody {
     type Data = Bytes;
@@ -1526,34 +1562,25 @@ impl http_body::Body for ControlRequestBody {
     }
 }
 
-fn control_request_body(body: s3s::Body) -> ControlRequestBody {
+fn control_request_body(body: EdgeBody) -> ControlRequestBody {
     ControlRequestBody(body)
 }
 
-/// The S3 service mounted under the middleware. A build without the `gateway-stack` feature mounts
-/// the legacy service itself.
-#[cfg(not(feature = "gateway-stack"))]
-type S3EdgeService = S3Service;
+/// The S3 service mounted under the middleware: the gateway stack with its claimed-route hosts
+/// (`server/stack.rs`).
+type S3EdgeService = S3StackService<GatewayEdgeService, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
 
-/// The S3 service mounted under the middleware: the legacy stack or the gateway stack, selected at
-/// startup (`server/stack.rs`).
-#[cfg(feature = "gateway-stack")]
-type S3EdgeService = S3StackService<S3Service, GatewayEdgeService, NativeConsoleEdgeService>;
-
-/// The gateway stack where the legacy service is mounted: the same response and error types, so
-/// the layers around it do not change with the stack.
-#[cfg(feature = "gateway-stack")]
+/// The gateway stack under the middleware, answering in the middleware's body and error types.
 #[derive(Clone)]
 struct GatewayEdgeService(GatewayStack);
 
-#[cfg(feature = "gateway-stack")]
 impl<B> Service<HttpRequest<B>> for GatewayEdgeService
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    type Response = Response<s3s::Body>;
-    type Error = s3s::HttpError;
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1562,30 +1589,26 @@ where
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         let answer = self.0.call(request);
-        Box::pin(async move { Ok(answer.await.map(s3s::Body::http_body_unsync)) })
+        Box::pin(async move { Ok(answer.await.map(EdgeBody::new)) })
     }
 }
 
-#[cfg(feature = "gateway-stack")]
 #[derive(Clone)]
 struct NativeConsoleEdgeService(axum::Router);
 
-#[cfg(feature = "gateway-stack")]
 impl NativeConsoleEdgeService {
     fn for_config(config: &config::Config) -> Option<Self> {
-        (matches!(config.s3_stack, config::S3Stack::Gateway) && config.console_enable)
-            .then(|| Self(admin::console::make_console_server()))
+        config.console_enable.then(|| Self(admin::console::make_console_server()))
     }
 }
 
-#[cfg(feature = "gateway-stack")]
 impl<B> Service<HttpRequest<B>> for NativeConsoleEdgeService
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    type Response = Response<s3s::Body>;
-    type Error = s3s::HttpError;
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1599,36 +1622,67 @@ where
                 Ok(response) => response,
                 Err(never) => match never {},
             };
-            Ok(response.map(s3s::Body::http_body_unsync))
+            Ok(response.map(EdgeBody::new))
         })
     }
 }
 
-/// Selects the S3 stack of this server, once. A gateway stack that cannot be assembled fails
-/// startup; the legacy stack is never started in its place.
-#[cfg(feature = "gateway-stack")]
-fn select_s3_stack(
+/// The website host on the gateway stack: the owned host RustFS serves on its website domains.
+#[derive(Clone)]
+struct NativeWebsiteEdgeService(Arc<crate::app::website::WebsiteHost>);
+
+impl NativeWebsiteEdgeService {
+    /// The website service and the requests it claims, when website domains are configured
+    /// (`website_host_domains`, which the console turns off).
+    fn claiming(website: Option<crate::app::website::WebsiteHost>) -> Option<(crate::server::stack::HostClaim, Self)> {
+        let host = Arc::new(website?);
+        let claims = Arc::clone(&host);
+        let claim: crate::server::stack::HostClaim =
+            Arc::new(move |uri: &http::Uri, headers: &http::HeaderMap| claims.claims(uri, headers));
+        Some((claim, Self(host)))
+    }
+}
+
+impl<B> Service<HttpRequest<B>> for NativeWebsiteEdgeService
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let host = Arc::clone(&self.0);
+        // A website read has no body; it is dropped unread.
+        let (parts, _body) = request.into_parts();
+        Box::pin(async move {
+            let answer = host.answer(parts.method, parts.uri, parts.headers, parts.extensions).await;
+            Ok(answer.map(EdgeBody::new))
+        })
+    }
+}
+
+/// Assembles the S3 stack of this server, once. A stack that cannot be assembled fails startup.
+fn assemble_s3_stack(
     config: &config::Config,
-    legacy: S3Service,
-    assembly: impl FnOnce() -> Result<GatewayAssembly>,
+    website: Option<crate::app::website::WebsiteHost>,
+    assembly: GatewayAssembly,
 ) -> Result<S3EdgeService> {
-    let mut native_admin = None;
-    let service = select_stack(config.s3_stack, legacy, || -> Result<GatewayEdgeService> {
-        let assembly = assembly()?;
-        native_admin = Some(GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?));
-        let stack = GatewayStack::assemble(assembly).map_err(Error::other)?;
-        Ok(GatewayEdgeService(stack))
-    })?
-    .with_native_console(NativeConsoleEdgeService::for_config(config))
-    .with_native_admin(native_admin);
-    info!(
-        event = EVENT_S3_STACK_ASSEMBLED,
-        component = LOG_COMPONENT_SERVER,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        s3_stack_assembled = service.assembled(),
-        "S3 stack assembled"
-    );
-    Ok(service)
+    let native_admin = GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?);
+    let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
+    let control_plane =
+        GatewayEdgeService(GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?);
+    let stack = GatewayStack::assemble(assembly).map_err(Error::other)?;
+    Ok(S3StackService::new(GatewayEdgeService(stack))
+        .with_native_console(NativeConsoleEdgeService::for_config(config))
+        .with_native_website(NativeWebsiteEdgeService::claiming(website))
+        .with_native_admin(Some(native_admin))
+        .with_control_plane(Some(control_plane)))
 }
 
 #[derive(Clone)]
@@ -1641,6 +1695,10 @@ struct ControlBodyDigestService<S> {
     virtual_host: Option<Arc<MultiDomain>>,
 }
 
+/// The largest control-plane XML body read for digest validation: 20 MiB, the XML body limit
+/// the legacy s3s edge applied.
+const CONTROL_BODY_MAX_BYTES: usize = 20 * 1024 * 1024;
+
 impl<S> ControlBodyDigestService<S> {
     fn new(inner: S, idle_timeout: Duration) -> Self {
         Self {
@@ -1648,7 +1706,7 @@ impl<S> ControlBodyDigestService<S> {
             console_listener: false,
             idle_timeout,
             total_timeout: Duration::from_secs(30),
-            max_body_size: rustfs_s3_config().xml_max_body_size,
+            max_body_size: CONTROL_BODY_MAX_BYTES,
             virtual_host: None,
         }
     }
@@ -1769,11 +1827,11 @@ fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Optio
     None
 }
 
-fn control_body_digest_error(code: &'static str) -> Response<s3s::Body> {
+fn control_body_digest_error<R: From<Bytes>>(code: &'static str) -> Response<R> {
     // Only static protocol error codes reach this function; never reflect headers or bodies.
     let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>");
     let length = xml.len();
-    let mut response = Response::new(s3s::Body::from(xml));
+    let mut response = Response::new(R::from(Bytes::from(xml)));
     *response.status_mut() = http::StatusCode::BAD_REQUEST;
     response
         .headers_mut()
@@ -1782,18 +1840,11 @@ fn control_body_digest_error(code: &'static str) -> Response<s3s::Body> {
     response
 }
 
-const CONTROL_BODY_CHECKSUM_HEADERS: [&str; 10] = [
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-crc64nvme",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-sha512",
-    "x-amz-checksum-xxhash64",
-    "x-amz-checksum-xxhash3",
-    "x-amz-checksum-xxhash128",
-    "x-amz-checksum-md5",
-];
+fn control_body_checksum_headers() -> impl Iterator<Item = (&'static str, rustfs_rio::ChecksumType)> {
+    rustfs_rio::BASE_CHECKSUM_TYPES
+        .iter()
+        .filter_map(|&kind| kind.key().map(|name| (name, kind)))
+}
 
 fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result::Result<(), &'static str> {
     use md5::Digest;
@@ -1811,53 +1862,33 @@ fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result:
             return Err("BadDigest");
         }
     }
-    let mut checksums = s3s::checksum::ChecksumHasher {
-        crc32: headers.contains_key("x-amz-checksum-crc32").then(Default::default),
-        crc32c: headers.contains_key("x-amz-checksum-crc32c").then(Default::default),
-        crc64nvme: headers.contains_key("x-amz-checksum-crc64nvme").then(Default::default),
-        sha1: headers.contains_key("x-amz-checksum-sha1").then(Default::default),
-        sha256: headers.contains_key("x-amz-checksum-sha256").then(Default::default),
-        sha512: headers.contains_key("x-amz-checksum-sha512").then(Default::default),
-        xxhash64: headers.contains_key("x-amz-checksum-xxhash64").then(Default::default),
-        xxhash3: headers.contains_key("x-amz-checksum-xxhash3").then(Default::default),
-        xxhash128: headers.contains_key("x-amz-checksum-xxhash128").then(Default::default),
-        md5: headers.contains_key("x-amz-checksum-md5").then(Default::default),
-    };
-    checksums.update(bytes);
-    let checksums = checksums.finalize();
-    let computed = [
-        checksums.checksum_crc32,
-        checksums.checksum_crc32c,
-        checksums.checksum_crc64nvme,
-        checksums.checksum_sha1,
-        checksums.checksum_sha256,
-        checksums.checksum_sha512,
-        checksums.checksum_xxhash64,
-        checksums.checksum_xxhash3,
-        checksums.checksum_xxhash128,
-        checksums.checksum_md5,
-    ];
-    for (name, computed) in CONTROL_BODY_CHECKSUM_HEADERS.into_iter().zip(computed) {
-        if let Some(computed) = computed
-            && (headers.get_all(name).iter().count() != 1
-                || headers.get(name).map(HeaderValue::as_bytes) != Some(computed.as_bytes()))
-        {
+    for (name, kind) in control_body_checksum_headers() {
+        let mut values = headers.get_all(name).iter();
+        let Some(expected) = values.next() else {
+            continue;
+        };
+        if values.next().is_some() {
+            return Err("BadDigest");
+        }
+        let computed = rustfs_rio::Checksum::new_from_data(kind, bytes).ok_or("BadDigest")?;
+        if expected.as_bytes() != computed.encoded.as_bytes() {
             return Err("BadDigest");
         }
     }
     Ok(())
 }
 
-impl<S, B> Service<HttpRequest<B>> for ControlBodyDigestService<S>
+impl<S, B, R> Service<HttpRequest<B>> for ControlBodyDigestService<S>
 where
-    S: Service<HttpRequest<ControlRequestBody>, Response = Response<s3s::Body>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ControlRequestBody>, Response = Response<R>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Send + Sync + 'static,
     Box<dyn std::error::Error + Send + Sync>: From<B::Error>,
+    R: From<Bytes> + Default + Send + 'static,
 {
-    type Response = Response<s3s::Body>;
+    type Response = Response<R>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -1868,7 +1899,7 @@ where
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         use http_body_util::BodyExt;
         if self.console_listener && !admin::router::console_listener_route(request.method(), request.uri(), request.headers()) {
-            let mut response = Response::new(s3s::Body::empty());
+            let mut response = Response::new(R::default());
             *response.status_mut() = http::StatusCode::NOT_FOUND;
             return Box::pin(async move { Ok(response) });
         }
@@ -1879,7 +1910,7 @@ where
         let total_timeout = self.total_timeout;
         let limit = self.max_body_size;
         Box::pin(async move {
-            let mut request = request.map(s3s::Body::http_body_unsync);
+            let mut request = request.map(EdgeBody::new);
             let Some(required) = required else {
                 return inner.call(request.map(control_request_body)).await;
             };
@@ -1889,7 +1920,7 @@ where
                 .is_some_and(|value| value.as_bytes().starts_with(b"AWS "))
                 || url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
                     .any(|(key, _)| key == "AWSAccessKeyId");
-            let has_checksum = CONTROL_BODY_CHECKSUM_HEADERS.iter().any(|name| headers.contains_key(*name));
+            let has_checksum = control_body_checksum_headers().any(|(name, _)| headers.contains_key(name));
             let has_md5 = headers.contains_key("content-md5");
             if required && !has_md5 && (sig_v2 || !has_checksum) {
                 return Ok(control_body_digest_error("MissingContentMD5"));
@@ -1953,7 +1984,7 @@ where
             if let Err(code) = verify_control_body_digest(request.headers(), &bytes) {
                 return Ok(control_body_digest_error(code));
             }
-            *request.body_mut() = s3s::Body::from(bytes);
+            *request.body_mut() = EdgeBody::from(bytes);
             inner.call(request.map(control_request_body)).await
         })
     }
@@ -2022,7 +2053,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
 macro_rules! external_service_stack {
     ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
      $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
-     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr, $vh_domain_hosts:expr) => {{
+     $compression_config:expr, $server_ctx:expr, $vh_domain_hosts:expr) => {{
         let remote_addr = $remote_addr;
         let trusted_proxy_layer = $trusted_proxy_layer;
         let is_console = $is_console;
@@ -2032,7 +2063,6 @@ macro_rules! external_service_stack {
         let keystone_auth = $keystone_auth;
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
-        let server_domains_configured = $server_domains_configured;
         let vh_domain_hosts = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -2150,17 +2180,12 @@ macro_rules! external_service_stack {
             .layer(RequestLoggingLayer)
             .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
             .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
-            .layer(S3ErrorMessageCompatLayer)
             .layer(IcebergRestErrorCompatLayer)
-            .layer(ObjectAttributesEtagFixLayer)
             .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
             .layer(HeadRequestBodyFixLayer)
             .layer(PublicHealthEndpointLayer::new(server_ctx, readiness))
-            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-            .layer(DoubleSlashListBucketsCompatLayer)
-            .layer(SigV4HeaderGuardLayer)
             .service($service)
     }};
 }
@@ -2446,7 +2471,7 @@ async fn start_http_server_inner(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip_str}:{local_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{local_port}");
-    let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
+    let now_time = jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if config.console_enable {
         admin::console::init_console_cfg(local_ip, local_port);
         let console_prefix = crate::server::console_prefix();
@@ -2493,64 +2518,7 @@ async fn start_http_server_inner(
     // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
     let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
 
-    // Setup S3 service
-    // This project uses the S3S library to implement S3 services
-    let s3_service = {
-        // Bind the S3 service to this server's context slot (backlog#1052 S2)
-        // so request dispatch resolves the server's own store.
-        let admin_server_ctx = server_ctx.clone();
-        let store = storage::ecfs::FS::with_server_ctx(server_ctx.clone());
-        let mut b = S3ServiceBuilder::new(store.clone());
-
-        let access_key = config.access_key.clone();
-        let secret_key = config.secret_key.clone();
-        let metadata_route_host = host_domain_sets
-            .as_ref()
-            .map(MultiDomain::new)
-            .transpose()
-            .map_err(Error::other)?;
-        let website_host_sets = website_host_domains(config)?;
-        let website_route_domains = website_host_sets.unwrap_or_default();
-
-        b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
-        b.set_access(store);
-        let admin_route = admin::make_admin_route(config.console_enable, admin_server_ctx)?;
-        if config.console_enable {
-            b.set_route(admin_route);
-        } else {
-            b.set_route(storage::metadata_route::with_metadata_route(
-                admin_route,
-                metadata_route_host,
-                website_route_domains,
-                protocol,
-                Arc::clone(&server_ctx),
-            ));
-        }
-
-        // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
-        // AWS S3 accepts keys such as "/foo/bar"; without this, requests like
-        // `PUT /bucket//foo/bar` are rejected downstream with InvalidArgument
-        // (ObjectNamePrefixAsSlash, issue #2427). MinIO collapses these slashes instead of preserving them,
-        // so `//foo/bar` is stored and served as `foo/bar`.
-        let s3_config = rustfs_s3_config();
-        b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
-
-        // Virtual-hosted-style requests are only set up for the S3 API listener when server domains are configured.
-        if let Some(domain_sets) = host_domain_sets {
-            info!(
-                event = EVENT_HTTP_HOST_ROUTING,
-                component = LOG_COMPONENT_SERVER,
-                subsystem = LOG_SUBSYSTEM_HTTP,
-                state = "enabled",
-                domain_count = domain_sets.len(),
-                domains = ?domain_sets,
-                "Virtual-hosted-style routing configured"
-            );
-            b.set_host(MultiDomain::new(&domain_sets).map_err(Error::other)?);
-        }
-
-        b.build()
-    };
+    let website_domains = website_host_domains(config)?.unwrap_or_default();
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -2640,26 +2608,17 @@ async fn start_http_server_inner(
         rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
         rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     ));
-    #[cfg(not(feature = "gateway-stack"))]
-    info!(
-        event = EVENT_S3_STACK_ASSEMBLED,
-        component = LOG_COMPONENT_SERVER,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        s3_stack_assembled = "legacy",
-        "S3 stack assembled"
-    );
-    #[cfg(feature = "gateway-stack")]
-    if matches!(config.s3_stack, config::S3Stack::Gateway) {
-        let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
-        if keystone_config.enable {
-            crate::startup_auth::init_keystone_auth_once(keystone_config)
-                .await
-                .map_err(|error| Error::other(error.to_string()))?;
-        }
+    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+    if keystone_config.enable {
+        crate::startup_auth::init_keystone_auth_once(keystone_config)
+            .await
+            .map_err(|error| Error::other(error.to_string()))?;
     }
-    #[cfg(feature = "gateway-stack")]
-    let s3_service = select_s3_stack(config, s3_service, || {
-        Ok(GatewayAssembly {
+    let website = crate::app::website::WebsiteHost::new(website_domains, protocol, Arc::clone(&server_ctx));
+    let s3_service = assemble_s3_stack(
+        config,
+        website,
+        GatewayAssembly {
             server_ctx: Arc::clone(&server_ctx),
             root_access_key: config.access_key.clone(),
             root_secret_key: config.secret_key.clone(),
@@ -2667,8 +2626,8 @@ async fn start_http_server_inner(
             server_domains: vh_domain_hosts.to_vec(),
             body_read_timeout: http_request_body_read_timeout,
             keystone_auth: keystone_provider_in_configuration().map_err(Error::other)?,
-        })
-    })?;
+        },
+    )?;
     #[cfg(feature = "http3")]
     let http3_server = if let Some(server_config) = http3_server_config {
         let h3_s3_service = s3_service.clone();
@@ -2678,7 +2637,6 @@ async fn start_http_server_inner(
         let h3_rate_limit = api_rate_limit_layer.clone();
         let h3_compression = compression_config.clone();
         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
-        let h3_domains_configured = !config.server_domains.is_empty();
         let h3_vh_domain_hosts = vh_domain_hosts.clone();
 
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
@@ -2690,13 +2648,9 @@ async fn start_http_server_inner(
             let service = SwiftService::new(true, None, service);
             let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
             let service = ServiceBuilder::new()
-                .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
-                    response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                .layer(tower::util::MapResponseLayer::new(|response: Response<EdgeBody>| {
+                    response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body })
                 }))
-                .service(service);
-            #[cfg(not(feature = "swift"))]
-            let service = ServiceBuilder::new()
-                .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
                 .service(service);
             let service = Http3CoreService::new(service);
             Http3ExternalService::new(external_service_stack!(
@@ -2710,7 +2664,6 @@ async fn start_http_server_inner(
                 h3_keystone.clone(),
                 h3_compression.clone(),
                 h3_server_ctx.clone(),
-                h3_domains_configured,
                 h3_vh_domain_hosts.clone()
             ))
         };
@@ -2754,7 +2707,6 @@ async fn start_http_server_inner(
     };
 
     let is_console = config.console_enable;
-    let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -3005,7 +2957,6 @@ async fn start_http_server_inner(
                 s3_service: s3_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
-                server_domains_configured,
                 vh_domain_hosts: vh_domain_hosts.clone(),
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
@@ -3114,8 +3065,6 @@ struct ConnectionContext {
     s3_service: S3EdgeService,
     compression_config: HttpCompressionConfig,
     is_console: bool,
-    /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
-    server_domains_configured: bool,
     /// Port-stripped virtual-hosted-style domains, for bucket-level CORS resolution.
     vh_domain_hosts: Arc<[String]>,
     readiness: Arc<GlobalReadiness>,
@@ -3250,7 +3199,6 @@ fn process_connection(
             s3_service,
             compression_config,
             is_console,
-            server_domains_configured,
             vh_domain_hosts,
             readiness,
             keystone_auth,
@@ -3354,20 +3302,15 @@ fn process_connection(
         // 12. RequestLoggingLayer                    — single completion event per request
         // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
         // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
-        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 18. ConditionalCorsLayer                   — S3 API CORS
-        // 19. RedirectLayer                          — console redirect (conditional)
-        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
-        // 25. SigV4HeaderGuardLayer                  — GHSA-xm99/-g8w9 unsigned x-amz-* rules, ahead of s3s signature dispatch
+        // 15. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        // 16. ConditionalCorsLayer                   — S3 API CORS
+        // 17. RedirectLayer                          — console redirect (conditional)
+        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 20. PublicHealthEndpointLayer              — handles public health before the stack
         // `tests::stack_census` pins this order against the real `external_service_stack!`
-        // expansion. Layers 5, 6, 15, 16, 17, 20, 21, 23, 24 and 25 patch s3s and live in
-        // `server::legacy_compat`; T2.12 (rustfs/backlog#2771) removes them.
+        // expansion. Layers 5, 6, 15, 18 and 19 live in `server::legacy_compat`;
+        // T2.12 (rustfs/backlog#2771) removes them.
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -3383,7 +3326,6 @@ fn process_connection(
                 keystone_auth.clone(),
                 compression_config.clone(),
                 server_ctx.clone(),
-                server_domains_configured,
                 vh_domain_hosts.clone()
             )
         };
@@ -3858,6 +3800,9 @@ mod tests {
 
     use super::*;
     use crate::server::compress::RequestPathCategory;
+    use s3s::config::{S3Config, StaticConfigProvider};
+    use s3s::service::{S3Service, S3ServiceBuilder};
+
     use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
     use bytes::Bytes;
     use http::Request as HttpRequest;
@@ -3880,6 +3825,15 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
     use tracing::Level;
+
+    fn rustfs_s3_config() -> S3Config {
+        let mut s3_config = S3Config::default();
+        s3_config.normalize_forward_slash_path = true;
+        s3_config.enable_sig_v2 = true;
+        s3_config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
+        s3_config.sig_v4_allowed_services.push("s3tables".to_string());
+        s3_config
+    }
 
     const DIGEST_DELETE_XML: &str = "<Delete><Object><Key>safe-object</Key></Object></Delete>";
 
@@ -4230,6 +4184,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_body_checksums_match_wire_values_for_all_algorithms() {
+        let body = b"123456789";
+        let vectors = [
+            ("x-amz-checksum-crc32", "y/Q5Jg=="),
+            ("x-amz-checksum-crc32c", "4waSgw=="),
+            ("x-amz-checksum-crc64nvme", "rosUhgp5mIg="),
+            ("x-amz-checksum-sha1", "98O8HYCOBHMq32eZZczDTKeuNEE="),
+            ("x-amz-checksum-sha256", "FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU="),
+            (
+                "x-amz-checksum-sha512",
+                "2eZ2LdHI6vbWGzxhkvxAjU1tXxF20MKRabwk5xw/J0rSf81YEbMT1oH35V7ALXPUmclUVba1u1A6z1dPuo/+hQ==",
+            ),
+            ("x-amz-checksum-xxhash64", "jLhB20DmroM="),
+            ("x-amz-checksum-xxhash3", "ctyxi2ehff8="),
+            ("x-amz-checksum-xxhash128", "MxGUd+3l3NXpcWQnaB1YYA=="),
+            ("x-amz-checksum-md5", "JfnnlDI7RTiF9RgfG2JNCw=="),
+        ];
+        let mut headers = HeaderMap::new();
+        for (name, value) in vectors {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        assert_eq!(verify_control_body_digest(&headers, body), Ok(()));
+        for (name, value) in vectors {
+            headers.insert(name, HeaderValue::from_static("mismatch"));
+            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "{name}");
+            headers.insert(name, HeaderValue::from_static(value));
+            headers.append(name, HeaderValue::from_static(value));
+            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "duplicate {name}");
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+    }
+
     fn digest_v4_request(checksum: &str) -> HttpRequest<s3s::Body> {
         use s3s_sigv4::{AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign};
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -4379,6 +4366,7 @@ mod tests {
         let data = ControlBodyDigestService::new(inner, Duration::from_secs(1));
         let console = data.clone().with_console_listener(true);
         for (uri, expected) in [
+            ("/", StatusCode::NOT_FOUND),
             ("/bucket/notes.txt", StatusCode::NOT_FOUND),
             ("/bucket/notes.txt?response-content-type=text%2Fplain", StatusCode::NOT_FOUND),
             ("/favicon.ico?events", StatusCode::NOT_FOUND),
@@ -4484,7 +4472,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    #[cfg(feature = "gateway-stack")]
     mod native_admin_tests {
         use super::*;
         use crate::runtime_sources::{AppContext, ServerContextSlot, publish_test_app_context};
@@ -4501,6 +4488,11 @@ mod tests {
         const ROOT: &str = "rustfsgatewayroot";
         const ROOT_SECRET: &str = "rustfs-gateway-root-secret";
         const USER_SECRET: &str = "native-admin-user-secret";
+
+        #[path = "control_plane_tests.rs"]
+        mod control_plane_tests;
+        #[path = "metadata_route_parity_tests.rs"]
+        mod metadata_route_parity_tests;
 
         struct UnusedS3;
         #[async_trait::async_trait]
@@ -4525,9 +4517,12 @@ mod tests {
             signed_request_with_headers(form, Method::GET, path, query, key, secret, headers)
         }
 
-        async fn answer<S, B>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
+        async fn answer<S, B, R>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
         where
-            S: Service<HttpRequest<B>, Response = Response<s3s::Body>, Error = s3s::HttpError>,
+            S: Service<HttpRequest<B>, Response = Response<R>>,
+            S::Error: std::fmt::Debug,
+            R: http_body::Body<Data = Bytes>,
+            R::Error: std::fmt::Debug,
         {
             let service = tower::Layer::layer(&crate::server::layer::ExternalRequestContextLayer::new(false), service);
             let response = service.oneshot(request).await.unwrap();
@@ -4656,7 +4651,7 @@ mod tests {
             assert!(slot.install(context));
             let mut legacy = s3s::service::S3ServiceBuilder::new(UnusedS3);
             legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
-            legacy.set_route(crate::admin::make_admin_route(false, slot.clone()).unwrap());
+            legacy.set_route(crate::admin::make_admin_router(false, slot.clone()).unwrap());
             legacy.set_host(s3s::host::MultiDomain::new(["s3.example.test"]).unwrap());
             let legacy = legacy.build();
             (env, slot, legacy)
@@ -4698,13 +4693,17 @@ mod tests {
             }
         }
 
-        async fn iceberg_answer<S>(service: S, request: HttpRequest<Empty<Bytes>>) -> (StatusCode, HeaderMap, serde_json::Value)
+        async fn iceberg_answer<S, R>(
+            service: S,
+            request: HttpRequest<Empty<Bytes>>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value)
         where
-            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>
-                + Clone
-                + Send
-                + 'static,
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<R>> + Clone + Send + 'static,
+            S::Error: std::fmt::Debug,
             S::Future: Send + 'static,
+            R: http_body::Body<Data = Bytes> + Send + 'static,
+            R::Data: Send,
+            R::Error: std::fmt::Debug,
         {
             use crate::server::hybrid::HybridBody;
             use tower::Layer as _;
@@ -4798,9 +4797,8 @@ mod tests {
             let calls = || crate::server::gateway_stack::CONFIG_HANDLER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
             let (_env, slot, legacy) = admin_fixture().await;
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
-            config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot.clone()))).unwrap();
+            let edge = assemble_s3_stack(&config, None, assembly(slot.clone())).unwrap();
             let native_service = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
             let context = slot.installed_app_context().unwrap();
             let expiration = chrono::Utc::now().timestamp() + 900;
@@ -5076,9 +5074,8 @@ mod tests {
         async fn admin_reads_contract(use_native: bool, suffixes: &[&str]) {
             let (_env, slot, legacy) = admin_fixture().await;
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
-            config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let edge = assemble_s3_stack(&config, None, assembly(slot)).unwrap();
             let mut failures = Vec::new();
             let mut check = |condition: bool, label: String| {
                 if !condition {
@@ -5351,7 +5348,12 @@ mod tests {
                                 new.0,
                                 refusal(&new.2)
                             );
-                            check(old.0 == new.0 && old.2 == new.2, format!("{method} {target} {host}: adjacent route"));
+                            // Adjacent routes now reach the control-plane host, whose error document
+                            // differs from legacy's only by the line break after the declaration.
+                            check(
+                                old.0 == new.0 && snapshot_error_xml(&old.2) == snapshot_error_xml(&new.2),
+                                format!("{method} {target} {host}: adjacent route"),
+                            );
                         }
                     }
                 }
@@ -5541,9 +5543,8 @@ mod tests {
             let (_env, slot, legacy) = admin_fixture().await;
             let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
-            config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let edge = assemble_s3_stack(&config, None, assembly(slot)).unwrap();
             let mut failures = Vec::new();
             let mut check = |condition: bool, label: String| {
                 if !condition {
@@ -5898,9 +5899,8 @@ mod tests {
             );
             check(old.0 == StatusCode::OK && new.0 == StatusCode::FORBIDDEN, "presigned floor".to_owned());
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
-            config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let edge = assemble_s3_stack(&config, None, assembly(slot)).unwrap();
             let selected = answer(
                 edge.clone(),
                 signed(
@@ -5947,41 +5947,16 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "gateway-stack")]
     mod native_console_tests {
         use super::*;
-        use crate::config::S3Stack;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tower::ServiceExt;
-
-        async fn assert_console_response_equivalent(
-            expected: Response<s3s::Body>,
-            actual: Response<s3s::Body>,
-            method: &Method,
-            target: &str,
-        ) {
-            use http_body_util::BodyExt;
-            assert_eq!(actual.status(), expected.status(), "{method} {target}");
-            for header in [http::header::CONTENT_TYPE, http::header::CONTENT_LENGTH, http::header::ALLOW] {
-                assert_eq!(
-                    actual.headers().get(&header),
-                    expected.headers().get(&header),
-                    "{method} {target}: {header}"
-                );
-            }
-            assert_eq!(
-                actual.into_body().collect().await.unwrap().to_bytes(),
-                expected.into_body().collect().await.unwrap().to_bytes(),
-                "{method} {target}"
-            );
-        }
 
         #[tokio::test]
         async fn native_console_route_contract() {
             use http_body_util::BodyExt;
-            legacy_console_characterizes_public_static_and_malformed_authorization().await;
             let target = format!("{}/route-fixture.txt", crate::server::console_prefix());
-            let (service, calls) = edge(S3Stack::Gateway, true);
+            let (service, calls) = edge(true);
             let response = service.oneshot(console_request(Method::GET, &target, false)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers().get(http::header::CONTENT_TYPE).unwrap(), "text/plain");
@@ -5991,21 +5966,9 @@ mod tests {
                 b"console-route-static-content"
             );
             assert_eq!(counts(&calls), [0, 0, 1]);
-            public_static_uses_native_console_without_legacy_or_gateway_s3_calls().await;
+            public_static_uses_native_console_without_gateway_s3_calls().await;
             neighboring_prefixes_admin_sts_s3_and_console_extension_queries_are_excluded().await;
-            disabled_console_and_legacy_mode_keep_the_existing_entrypoint().await;
-        }
-
-        struct ConsoleTestS3;
-
-        #[async_trait::async_trait]
-        impl s3s::S3 for ConsoleTestS3 {}
-
-        fn legacy_console(enabled: bool) -> s3s::service::S3Service {
-            let mut builder = s3s::service::S3ServiceBuilder::new(ConsoleTestS3);
-            builder.set_auth(crate::auth::IAMAuth::new("console-test-access", "console-test-secret"));
-            builder.set_route(crate::admin::router::S3Router::<crate::admin::router::AdminOperation>::new(enabled));
-            builder.build()
+            disabled_console_keeps_static_requests_off_the_native_console().await;
         }
 
         fn console_request(method: Method, target: &str, malformed_auth: bool) -> HttpRequest<Empty<Bytes>> {
@@ -6027,7 +5990,7 @@ mod tests {
             ]
         }
 
-        async fn static_response_body(response: Response<s3s::Body>, method: &Method, target: &str) -> Bytes {
+        async fn static_response_body(response: Response<EdgeBody>, method: &Method, target: &str) -> Bytes {
             use http_body_util::BodyExt;
             let (fixture, content_type): (&[u8], &str) = if target == "/favicon.ico" {
                 (include_bytes!("../../tests/fixtures/native-console/favicon.ico"), "image/x-icon")
@@ -6065,64 +6028,11 @@ mod tests {
             body
         }
 
-        async fn legacy_console_characterizes_public_static_and_malformed_authorization() {
-            use http_body_util::BodyExt;
-            for (method, target) in static_console_cases() {
-                let legacy = legacy_console(true)
-                    .oneshot(console_request(method.clone(), &target, false))
-                    .await
-                    .unwrap();
-                let native = crate::admin::console::make_console_server()
-                    .oneshot(console_request(method.clone(), &target, false))
-                    .await
-                    .unwrap()
-                    .map(s3s::Body::http_body_unsync);
-                let malformed_native = crate::admin::console::make_console_server()
-                    .oneshot(console_request(method.clone(), &target, true))
-                    .await
-                    .unwrap()
-                    .map(s3s::Body::http_body_unsync);
-                assert_eq!(legacy.status(), native.status(), "{method} {target}");
-                assert_eq!(malformed_native.status(), native.status(), "native {method} {target}");
-                for header in [http::header::CONTENT_TYPE, http::header::CONTENT_LENGTH, http::header::ALLOW] {
-                    assert_eq!(
-                        legacy.headers().get(&header),
-                        native.headers().get(&header),
-                        "{method} {target}: {header}"
-                    );
-                    assert_eq!(
-                        malformed_native.headers().get(&header),
-                        native.headers().get(&header),
-                        "native malformed auth {method} {target}: {header}"
-                    );
-                }
-                let legacy_body = static_response_body(legacy, &method, &target).await;
-                let native_body = static_response_body(native, &method, &target).await;
-                let malformed_native_body = static_response_body(malformed_native, &method, &target).await;
-                assert_eq!(legacy_body, native_body, "{method} {target}");
-                assert_eq!(malformed_native_body, native_body, "native malformed auth {method} {target}");
-                let malformed = legacy_console(true)
-                    .oneshot(console_request(method.clone(), &target, true))
-                    .await
-                    .unwrap();
-                assert_eq!(malformed.status(), StatusCode::BAD_REQUEST, "legacy {method} {target}");
-                let malformed_body = malformed.into_body().collect().await.unwrap().to_bytes();
-                if method == Method::HEAD {
-                    assert!(malformed_body.is_empty());
-                } else {
-                    assert!(String::from_utf8_lossy(&malformed_body).contains("<Code>InvalidRequest</Code>"));
-                }
-            }
-        }
-
-        type Probe = tower::util::BoxCloneService<HttpRequest<Empty<Bytes>>, Response<s3s::Body>, s3s::HttpError>;
+        type Probe = tower::util::BoxCloneService<HttpRequest<Empty<Bytes>>, Response<EdgeBody>, EdgeError>;
 
         fn counted<S>(inner: S, calls: Arc<AtomicUsize>) -> Probe
         where
-            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>
-                + Clone
-                + Send
-                + 'static,
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<EdgeBody>, Error = EdgeError> + Clone + Send + 'static,
             S::Future: Send + 'static,
         {
             Probe::new(tower::service_fn(move |request| {
@@ -6131,27 +6041,24 @@ mod tests {
             }))
         }
 
-        fn edge(stack: S3Stack, enabled: bool) -> (S3StackService<Probe, Probe>, [Arc<AtomicUsize>; 3]) {
+        fn answering(status: StatusCode) -> Probe {
+            Probe::new(tower::service_fn(move |_| async move {
+                Ok::<_, EdgeError>(Response::builder().status(status).body(EdgeBody::default()).unwrap())
+            }))
+        }
+
+        /// The stack with probes for the control plane (`ACCEPTED`) and the gateway S3 service
+        /// (`IM_A_TEAPOT`); `calls` counts the control plane, the gateway and the native console.
+        fn edge(enabled: bool) -> (S3StackService<Probe, Probe>, [Arc<AtomicUsize>; 3]) {
             let calls = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
-            config.s3_stack = stack;
             config.console_enable = enabled;
-            let legacy = counted(legacy_console(enabled), calls[0].clone());
-            let gateway = counted(
-                tower::service_fn(|_| async {
-                    Ok::<_, s3s::HttpError>(
-                        Response::builder()
-                            .status(StatusCode::IM_A_TEAPOT)
-                            .body(s3s::Body::empty())
-                            .unwrap(),
-                    )
-                }),
-                calls[1].clone(),
-            );
+            let control_plane = counted(answering(StatusCode::ACCEPTED), calls[0].clone());
+            let gateway = counted(answering(StatusCode::IM_A_TEAPOT), calls[1].clone());
             let console = NativeConsoleEdgeService::for_config(&config).map(|service| counted(service, calls[2].clone()));
-            let edge = select_stack(stack, legacy, || Ok::<_, s3s::HttpError>(gateway))
-                .unwrap()
-                .with_native_console(console);
+            let edge = S3StackService::new(gateway)
+                .with_native_console(console)
+                .with_control_plane(Some(control_plane));
             (edge, calls)
         }
 
@@ -6159,36 +6066,41 @@ mod tests {
             std::array::from_fn(|i| calls[i].load(Ordering::SeqCst))
         }
 
-        async fn public_static_uses_native_console_without_legacy_or_gateway_s3_calls() {
-            let (service, calls) = edge(S3Stack::Gateway, true);
+        async fn public_static_uses_native_console_without_gateway_s3_calls() {
+            let (service, calls) = edge(true);
+            for malformed_auth in [false, true] {
+                for (method, target) in static_console_cases() {
+                    let actual = service
+                        .clone()
+                        .oneshot(console_request(method.clone(), &target, malformed_auth))
+                        .await
+                        .unwrap();
+                    static_response_body(actual, &method, &target).await;
+                }
+            }
             let prefix = crate::server::console_prefix();
-            let cases: Vec<_> = static_console_cases()
-                .into_iter()
-                .chain([
-                    (Method::GET, "/apple-touch-icon.png".to_owned()),
-                    (Method::GET, format!("{prefix}/index.html?events")),
-                    (Method::HEAD, format!("{prefix}/index.html?lambdaArn=bad")),
-                    (Method::GET, "/favicon.ico?lambdaArn=bad".to_owned()),
-                ])
-                .collect();
-            for (method, target) in &cases {
+            let extra = [
+                (Method::GET, "/apple-touch-icon.png".to_owned()),
+                (Method::GET, format!("{prefix}/index.html?events")),
+                (Method::HEAD, format!("{prefix}/index.html?lambdaArn=bad")),
+                (Method::GET, "/favicon.ico?lambdaArn=bad".to_owned()),
+            ];
+            for (method, target) in &extra {
                 let actual = service
                     .clone()
                     .oneshot(console_request(method.clone(), target, false))
                     .await
                     .unwrap();
-                let expected = legacy_console(true)
-                    .oneshot(console_request(method.clone(), target, false))
-                    .await
-                    .unwrap();
-                assert_console_response_equivalent(expected, actual, method, target).await;
+                assert_ne!(actual.status(), StatusCode::IM_A_TEAPOT, "{method} {target}");
+                assert_ne!(actual.status(), StatusCode::ACCEPTED, "{method} {target}");
             }
-            assert_eq!(counts(&calls), [0, 0, cases.len()]);
+            assert_eq!(counts(&calls), [0, 0, static_console_cases().len() * 2 + extra.len()]);
         }
 
         async fn neighboring_prefixes_admin_sts_s3_and_console_extension_queries_are_excluded() {
-            let (service, calls) = edge(S3Stack::Gateway, true);
+            let (service, calls) = edge(true);
             let prefix = crate::server::console_prefix();
+            // (method, target, claimed by the control plane, STS form)
             let cases = [
                 (Method::GET, format!("{prefix}x/index.html"), false, false),
                 (Method::GET, "/favicon.icox".to_owned(), false, false),
@@ -6207,62 +6119,43 @@ mod tests {
                 (Method::GET, format!("{prefix}/index.html?lambdaArn=bad"), true, false),
                 (Method::GET, format!("{prefix}/index.html?lambdaArn=bad&lambdaArn=bad"), true, false),
             ];
-            for (method, target, legacy, sts) in &cases {
+            for (method, target, claimed, sts) in &cases {
                 for malformed_auth in [false, true] {
-                    let make_request = || {
-                        let mut request = console_request(method.clone(), target, malformed_auth);
-                        if *sts {
-                            request.headers_mut().insert(
-                                http::header::CONTENT_TYPE,
-                                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
-                            );
-                        }
-                        request
-                    };
-                    let actual = service.clone().oneshot(make_request()).await.unwrap();
-                    if *legacy {
-                        let expected = legacy_console(true).oneshot(make_request()).await.unwrap();
-                        if target == "/rustfs/admin/v3/info" || target == "/minio/admin/v3/info" {
-                            assert_eq!(
-                                actual.status(),
-                                if malformed_auth {
-                                    StatusCode::BAD_REQUEST
-                                } else {
-                                    StatusCode::FORBIDDEN
-                                },
-                                "admin on console listener"
-                            );
-                        }
-                        assert_console_response_equivalent(expected, actual, method, target).await;
-                    } else {
-                        assert_eq!(actual.status(), StatusCode::IM_A_TEAPOT, "{method} {target}");
+                    let mut request = console_request(method.clone(), target, malformed_auth);
+                    if *sts {
+                        request.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+                        );
                     }
+                    let actual = service.clone().oneshot(request).await.unwrap();
+                    let expected = if *claimed {
+                        StatusCode::ACCEPTED
+                    } else {
+                        StatusCode::IM_A_TEAPOT
+                    };
+                    assert_eq!(actual.status(), expected, "{method} {target} malformed={malformed_auth}");
                 }
             }
-            let legacy_cases = cases.iter().filter(|case| case.2).count();
-            assert_eq!(counts(&calls), [legacy_cases * 2, (cases.len() - legacy_cases) * 2, 0]);
+            let claimed = cases.iter().filter(|case| case.2).count();
+            assert_eq!(counts(&calls), [claimed * 2, (cases.len() - claimed) * 2, 0]);
         }
 
-        async fn disabled_console_and_legacy_mode_keep_the_existing_entrypoint() {
-            for (stack, enabled) in [(S3Stack::Gateway, false), (S3Stack::Legacy, true)] {
-                let (service, calls) = edge(stack, enabled);
-                let cases = static_console_cases();
-                for (method, target) in &cases {
-                    for malformed_auth in [false, true] {
-                        let actual = service
-                            .clone()
-                            .oneshot(console_request(method.clone(), target, malformed_auth))
-                            .await
-                            .unwrap();
-                        let expected = legacy_console(enabled)
-                            .oneshot(console_request(method.clone(), target, malformed_auth))
-                            .await
-                            .unwrap();
-                        assert_console_response_equivalent(expected, actual, method, target).await;
-                    }
+        async fn disabled_console_keeps_static_requests_off_the_native_console() {
+            let (service, calls) = edge(false);
+            let cases = static_console_cases();
+            for (method, target) in &cases {
+                for malformed_auth in [false, true] {
+                    service
+                        .clone()
+                        .oneshot(console_request(method.clone(), target, malformed_auth))
+                        .await
+                        .unwrap();
                 }
-                assert_eq!(counts(&calls), [cases.len() * 2, 0, 0]);
             }
+            let [control_plane, gateway, console] = counts(&calls);
+            assert_eq!(console, 0);
+            assert_eq!(control_plane + gateway, cases.len() * 2);
         }
     }
 
@@ -6308,7 +6201,6 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false,
             Arc::default()
         ))
     }
@@ -7737,45 +7629,64 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct UploadPartTimeoutS3 {
-        timeout: Duration,
-    }
+    /// UploadPart reading its whole body, as RustFS's handler reads one; HeadBucket answers at once.
+    struct UploadPartReader;
 
-    #[async_trait::async_trait]
-    impl s3s::S3 for UploadPartTimeoutS3 {
-        async fn upload_part(
+    impl rustfs_gateway::Handler<rustfs_gateway::dto::UploadPart> for UploadPartReader {
+        async fn call(
             &self,
-            req: s3s::S3Request<s3s::dto::UploadPartInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
+            request: rustfs_gateway::Req<rustfs_gateway::dto::UploadPart>,
+        ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::UploadPart> {
             use futures::StreamExt;
             use tokio_util::io::StreamReader;
 
-            let control = req
-                .extensions
-                .get::<BodyReadControl>()
-                .expect("HTTP route must install the control")
-                .clone();
-            control.activate(self.timeout, "bucket", "object", "request", 1024);
-            let body = req.input.body.expect("upload body");
-            let inner = rustfs_rio::wrap_reader(StreamReader::new(body.map(|item| item.map_err(std::io::Error::other))));
-            let mut reader = crate::app::object::request_body::DemandReader::new(inner, control);
+            let body = request.into_input().body.expect("upload body").into_body();
+            let (chunks, _) = crate::app::object::BodyChunks::with_trailers(body, None);
+            let mut reader = StreamReader::new(chunks.map(|item| item.map_err(std::io::Error::other)));
             reader
                 .read_to_end(&mut Vec::new())
                 .await
-                .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))?;
-            Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput::default()))
-        }
-
-        async fn head_bucket(
-            &self,
-            _req: s3s::S3Request<s3s::dto::HeadBucketInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadBucketOutput>> {
-            Ok(s3s::S3Response::new(s3s::dto::HeadBucketOutput::default()))
+                .map_err(|error| crate::server::gateway_handlers::handler_error(crate::error::ApiError::from(error).into()))?;
+            Ok(rustfs_gateway::Resp::new(Default::default()))
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    impl rustfs_gateway::Handler<rustfs_gateway::dto::HeadBucket> for UploadPartReader {
+        async fn call(
+            &self,
+            _request: rustfs_gateway::Req<rustfs_gateway::dto::HeadBucket>,
+        ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::HeadBucket> {
+            Ok(rustfs_gateway::Resp::new(Default::default()))
+        }
+    }
+
+    /// The gateway stack as production configures it, with `timeout` as its request-body idle
+    /// bound, serving [`UploadPartReader`] to every caller behind the host's early-response drain.
+    fn upload_part_timeout_edge(timeout: Duration, drain_timeout: Duration) -> EarlyResponseBodyService<GatewayEdgeService> {
+        let handler = Arc::new(UploadPartReader);
+        let stack = GatewayStack::assemble_serving(
+            GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsgatewayroot".to_owned(),
+                root_secret_key: "rustfs-gateway-root-secret".to_owned(),
+                region: None,
+                server_domains: Vec::new(),
+                body_read_timeout: timeout,
+                keystone_auth: None,
+            },
+            |builder| {
+                builder
+                    .register::<rustfs_gateway::dto::UploadPart, _>(Arc::clone(&handler))
+                    .register::<rustfs_gateway::dto::HeadBucket, _>(handler)
+            },
+        )
+        .expect("the gateway stack assembles");
+        EarlyResponseBodyService::new(GatewayEdgeService(stack), drain_timeout)
+    }
+
+    // Real time: the gateway times a request body out on its own clock, which a paused tokio
+    // clock does not drive.
+    #[tokio::test]
     async fn upload_part_timeout_preserves_http1_drain_and_http2_stream_drop() {
         for version in [Version::HTTP_11, Version::HTTP_2] {
             let (sender, body, bytes_polled, dropped) = tracked_request_body();
@@ -7783,22 +7694,22 @@ mod tests {
                 .version(version)
                 .method(Method::PUT)
                 .uri("/bucket/object?partNumber=1&uploadId=upload")
+                .header(http::header::HOST, "localhost")
                 .header(CONTENT_LENGTH, "1024")
                 .body(body)
                 .expect("upload request");
-            let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
-                timeout: Duration::from_secs(300),
-            })
-            .build();
-            let mut service = EarlyResponseBodyService::new(inner, Duration::from_secs(30));
+            let mut service = upload_part_timeout_edge(Duration::from_millis(200), Duration::from_secs(30));
             let mut call = Box::pin(service.call(request));
             assert!(futures::poll!(call.as_mut()).is_pending());
-            tokio::time::advance(Duration::from_secs(300)).await;
-            let response = call.await.expect("timeout response");
+            let response = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("the stalled body times out")
+                .expect("timeout response");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(response.headers().get(CONNECTION).is_some(), version == Version::HTTP_11);
             let xml = response.into_body().collect().await.expect("timeout XML").to_bytes();
-            assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+            let xml = String::from_utf8_lossy(&xml);
+            assert!(xml.contains("<Code>RequestTimeout</Code>"), "{xml}");
             if version == Version::HTTP_11 {
                 assert!(
                     !dropped.load(Ordering::Acquire),
@@ -7821,11 +7732,7 @@ mod tests {
     #[tokio::test]
     async fn upload_part_timeout_leaves_other_http2_streams_usable() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
-            timeout: Duration::from_millis(500),
-        })
-        .build();
-        let service = EarlyResponseBodyService::new(inner, Duration::from_secs(1));
+        let service = upload_part_timeout_edge(Duration::from_millis(500), Duration::from_secs(1));
         let server = tokio::spawn(async move {
             hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection(TokioIo::new(server_io), TowerToHyperService::new(service))
@@ -7870,7 +7777,8 @@ mod tests {
             .expect("S3 response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let xml = response.into_body().collect().await.expect("timeout body").to_bytes();
-        assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+        let xml = String::from_utf8_lossy(&xml);
+        assert!(xml.contains("<Code>RequestTimeout</Code>"), "{xml}");
         client.ready().await.expect("connection after failed stream");
         let (sender, body, _, _) = tracked_request_body();
         drop(sender);
@@ -7903,6 +7811,48 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    /// A body the gateway stack refuses unread is drained by `EarlyResponseBodyService` under the
+    /// configured idle bound, and zero leaves that drain unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn gateway_rejected_http1_body_uses_the_configured_drain_timeout() {
+        for timeout in [Duration::from_secs(1), Duration::ZERO] {
+            let stack = GatewayStack::assemble(GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsgatewayroot".to_owned(),
+                root_secret_key: "rustfs-gateway-root-secret".to_owned(),
+                region: None,
+                server_domains: Vec::new(),
+                body_read_timeout: timeout,
+                keystone_auth: None,
+            })
+            .expect("the gateway stack assembles");
+            let mut service = EarlyResponseBodyService::new(GatewayEdgeService(stack), timeout);
+            let (_sender, body, _bytes_polled, dropped) = tracked_request_body();
+            let request = HttpRequest::builder()
+                .method(Method::PUT)
+                .uri("/bucket/object")
+                .version(Version::HTTP_11)
+                .header(http::header::HOST, "localhost")
+                .header(http::header::AUTHORIZATION, "invalid")
+                .body(body)
+                .expect("request");
+
+            let response = service.call(request).await.expect("response");
+            assert!(response.status().is_client_error(), "{}", response.status());
+            assert_eq!(response.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+            tokio::task::yield_now().await;
+            assert!(!dropped.load(Ordering::Acquire), "the host drain must retain the stalled body");
+            let elapsed = if timeout.is_zero() { 301 } else { 2 };
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                dropped.load(Ordering::Acquire),
+                !timeout.is_zero(),
+                "the configured timeout must govern the host drain"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9908,12 +9858,12 @@ mod tests {
                     assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
                     let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
                     if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body: s3s::Body::from(identity) }))
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body: EdgeBody::from(Bytes::from(identity)) }))
                 });
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
                     Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
-                    HttpCompressionConfig::default(), ServerContextSlot::new(), false, Arc::default()))
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), Arc::default()))
             }, 0, Duration::from_secs(1), receiver)?;
             let client_endpoint = client_endpoint(vec![cert])?;
             let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
@@ -9944,21 +9894,17 @@ mod tests {
         let (config, cert) = configs()?;
         let readiness = Arc::new(GlobalReadiness::new());
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-        let s3 = S3ServiceBuilder::new(UploadPartTimeoutS3 {
-            timeout: Duration::from_secs(1),
-        })
-        .build();
+        let edge = upload_part_timeout_edge(Duration::from_secs(1), Duration::from_secs(1));
         let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
         let (endpoint, task) = http3::spawn(
             config,
             "127.0.0.1:0".parse()?,
             move |peer| {
                 let inner = ServiceBuilder::new()
-                    .map_response(|response: Response<s3s::Body>| {
-                        response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                    .map_response(|response: Response<EdgeBody>| {
+                        response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body })
                     })
-                    .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
-                    .service(EarlyResponseBodyService::new(s3.clone(), Duration::from_secs(1)));
+                    .service(edge.clone());
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(
                     inner,
@@ -9971,7 +9917,6 @@ mod tests {
                     None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
                     HttpCompressionConfig::default(),
                     ServerContextSlot::new(),
-                    false,
                     Arc::default()
                 ))
             },
@@ -10108,10 +10053,8 @@ mod tests {
     /// Optional layers (`option_layer`, `Either`) are listed because their type
     /// is part of the chain whether or not the layer is installed at runtime.
     /// The fixture's own inner service is not part of it. `legacy_compat` marks
-    /// the s3s patch layers that `server::legacy_compat` groups; T2.12
-    /// (rustfs/backlog#2771) reuses this test to prove which layers the gateway
-    /// stack keeps.
-    const EXTERNAL_STACK_CENSUS: [&str; 28] = [
+    /// the patch layers that `server::legacy_compat` still groups.
+    const EXTERNAL_STACK_CENSUS: [&str; 23] = [
         "AddExtension",                        // Option<RemoteAddr>
         "AddExtension",                        // SocketAddr (optional)
         "TrustedProxyMiddleware",              // TrustedProxyLayer (optional)
@@ -10129,17 +10072,12 @@ mod tests {
         "RequestLoggingService",               //
         "Compression",                         //
         "PathCategoryInjectionService",        // optional
-        "S3ErrorMessageCompatService",         // legacy_compat
         "IcebergRestErrorCompatService",       // legacy_compat
-        "ObjectAttributesEtagFixService",      // legacy_compat
         "ConditionalCorsService",              //
         "RedirectService",                     // optional
         "BodylessStatusFixService",            // legacy_compat
         "HeadRequestBodyFixService",           // legacy_compat
         "PublicHealthEndpointService",         //
-        "VirtualHostStyleHintService",         // legacy_compat, optional
-        "DoubleSlashListBucketsCompatService", // legacy_compat
-        "SigV4HeaderGuardService",             // legacy_compat
     ];
 
     /// Walks a `type_name` string along its service chain: at every node the
@@ -10237,7 +10175,6 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false,
             Arc::default()
         );
         fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}

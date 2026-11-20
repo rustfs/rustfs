@@ -72,6 +72,7 @@ pub(in crate::set_disk) use super::metadata_read::{
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::cluster::rpc::remote_disk::{RenameBatchClientItem, RenameBatchStartError};
 #[cfg(test)]
 use crate::diagnostics::get::GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD;
 #[cfg(test)]
@@ -101,6 +102,7 @@ use crate::diagnostics::get::{
 };
 #[cfg(test)]
 use crate::disk::CHECK_PART_FILE_NOT_FOUND;
+use crate::disk::Disk;
 use crate::disk::DiskAPI;
 #[cfg(test)]
 use crate::disk::DiskOption;
@@ -121,12 +123,14 @@ use crate::disk::{
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
+#[cfg(test)]
+use crate::io_support::bitrot::create_deferred_bitrot_reader_with_stripe_handle;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_from_bytes_with_stage_metrics,
-    create_deferred_bitrot_reader_with_stripe_handle,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle_and_frame_size,
 };
 #[cfg(unix)]
-use crate::io_support::bitrot::{adjust_shard_read_params, object_mmap_read_max_length};
+use crate::io_support::bitrot::{bitrot_encoded_range_with_frame_size, object_mmap_read_max_length};
 use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::ShardReadCost;
 use crate::storage_api_contracts::object::ObjectOperations;
@@ -145,7 +149,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
@@ -958,7 +962,7 @@ impl BitrotReaderSetup {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
+pub(in crate::set_disk) fn schedule_bitrot_reader_task_with_frame_size<'a>(
     reader_tasks: &mut FuturesUnordered<BitrotReaderTask<'a>>,
     setup: &mut BitrotReaderSetup,
     idx: usize,
@@ -970,6 +974,7 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -985,7 +990,7 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
     let path = format!("{object}/{data_dir}/part.{part_number}");
 
     reader_tasks.push(Box::pin(async move {
-        let result = create_bitrot_reader_from_bytes_with_stage_metrics(
+        let result = create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
             inline_data,
             disk,
             bucket,
@@ -993,6 +998,7 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1016,6 +1022,7 @@ pub(in crate::set_disk) fn next_unscheduled_reader_index(
 /// Build a cloneable opener for an unopened deferred shard. The returned
 /// reader is aligned to the requested stripe before its first poll, while the
 /// source reader created during setup remains untouched as a reserve.
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 fn deferred_reader_reopener(
     inline_data: Option<Bytes>,
@@ -1029,10 +1036,39 @@ fn deferred_reader_reopener(
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
 ) -> DeferredReaderReopener {
+    deferred_reader_reopener_with_frame_size(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deferred_reader_reopener_with_frame_size(
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: &str,
+    path: &str,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+) -> DeferredReaderReopener {
     let bucket = bucket.to_owned();
     let path = path.to_owned();
     Arc::new(move |stripe_index| {
-        let (reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, handle) = create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
             inline_data.clone(),
             disk.clone(),
             &bucket,
@@ -1040,6 +1076,7 @@ fn deferred_reader_reopener(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1048,6 +1085,7 @@ fn deferred_reader_reopener(
     })
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     setup: &mut BitrotReaderSetup,
@@ -1059,6 +1097,45 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+) {
+    fill_deferred_bitrot_readers_with_frame_size(
+        setup,
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) fn fill_deferred_bitrot_readers_with_frame_size(
+    setup: &mut BitrotReaderSetup,
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1090,7 +1167,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
         let reopener = (demand_bound_lockstep || preserve_hedged_readers).then(|| {
-            deferred_reader_reopener(
+            deferred_reader_reopener_with_frame_size(
                 inline_data.clone(),
                 disk.clone(),
                 bucket,
@@ -1098,6 +1175,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
@@ -1107,7 +1185,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         if setup.attempted[idx] {
             continue;
         }
-        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
             inline_data,
             disk,
             bucket,
@@ -1115,6 +1193,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1146,7 +1225,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
         let reopener = demand_bound_lockstep.then(|| {
-            deferred_reader_reopener(
+            deferred_reader_reopener_with_frame_size(
                 inline_data.clone(),
                 disk.clone(),
                 bucket,
@@ -1154,12 +1233,13 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
             )
         });
-        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
             inline_data,
             disk,
             bucket,
@@ -1167,6 +1247,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1227,8 +1308,8 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
 }
 
 /// When all online shards are local and mmap-read is enabled, materialize
-/// shard bytes in batches instead of per-shard `spawn_blocking` via
-/// `open_disk_reader`. Demand-bound reads add parity batches only as needed.
+/// shard bytes through `batch_shard_pread` instead of the per-shard
+/// `open_disk_reader` path. Demand-bound reads add parity batches only as needed.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn try_create_bitrot_readers_via_batch_pread(
@@ -1240,6 +1321,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     data_shards: usize,
@@ -1251,11 +1333,18 @@ async fn try_create_bitrot_readers_via_batch_pread(
     use rustfs_io_metrics::{LocalBatchReadDecision, record_local_batch_read_decision};
     use std::io::Cursor;
 
+    // Scoped q reads retain the normal source's disk admission and memory
+    // receipts; the foreground batch worker does not carry resource units.
+    if frame_size != shard_size && crate::disk::has_resource_io_scope() {
+        return None;
+    }
+
     let prepare_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
     let record_decision = |decision| {
         record_local_batch_read_decision(decision, prepare_started.map(|started| started.elapsed()));
     };
-    let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
+    let (adj_off, adj_len) =
+        bitrot_encoded_range_with_frame_size(read_offset, read_length, shard_size, frame_size, checksum_algo.clone());
     if adj_len > object_mmap_read_max_length() {
         record_decision(LocalBatchReadDecision::ReadCapExceeded);
         return None;
@@ -1289,12 +1378,13 @@ async fn try_create_bitrot_readers_via_batch_pread(
         return None;
     }
 
-    // Legacy lockstep consumes every shard, so keep its coalesced batch even
-    // when setup prefers data blocks. Only demand-bound decode can leave the
-    // parity readers unopened; preading them here would discard their bytes
-    // when fill_deferred_bitrot_readers installs stripe-aligned reserves.
+    // Legacy lockstep consumes every shard, so retain its coalesced batch for
+    // longer spans. A bounded q window always decodes on demand, independently
+    // of the full-object policy, and must leave healthy parity unopened.
+    let bounded_quantized_read = frame_size != shard_size && read_length <= shard_size;
     let data_first = strategy != BitrotReaderSetupStrategy::AllShards
-        && crate::erasure::coding::decode::get_lockstep_data_shards_only_with_deferred_parity_enabled();
+        && (bounded_quantized_read
+            || crate::erasure::coding::decode::get_lockstep_data_shards_only_with_deferred_parity_enabled());
     let mut setup = BitrotReaderSetup::new(disks.len());
     for (idx, disk) in disks.iter().enumerate() {
         if disk.is_none() {
@@ -1325,9 +1415,10 @@ async fn try_create_bitrot_readers_via_batch_pread(
         if !requests.is_empty() {
             for (idx, result) in indices.into_iter().zip(batch_shard_pread(requests).await) {
                 let result = result.map(|bytes| {
-                    Some(BitrotReader::new(
+                    Some(BitrotReader::new_with_frame_size(
                         ShardReader::InMemory(Cursor::new(bytes)),
                         shard_size,
+                        frame_size,
                         checksum_algo.clone(),
                         skip_verify_bitrot,
                     ))
@@ -1360,6 +1451,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _read_offset: usize,
     _read_length: usize,
     _shard_size: usize,
+    _frame_size: usize,
     _checksum_algo: HashAlgorithm,
     _skip_verify_bitrot: bool,
     _data_shards: usize,
@@ -1371,6 +1463,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     None
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     files: &[FileInfo],
@@ -1381,6 +1474,48 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
+) -> BitrotReaderSetup {
+    create_bitrot_readers_until_quorum_all_shards_with_frame_size(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+        stage_metrics,
+        attribution,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards_with_frame_size(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1407,7 +1542,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         let checksum_algo = checksum_algo.clone();
 
         reader_tasks.push(async move {
-            let result = create_bitrot_reader_from_bytes_with_stage_metrics(
+            let result = create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
                 inline_data,
                 disk,
                 bucket,
@@ -1415,6 +1550,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo,
                 skip_verify_bitrot,
                 use_mmap_read,
@@ -1440,7 +1576,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
     }
 
-    fill_deferred_bitrot_readers(
+    fill_deferred_bitrot_readers_with_frame_size(
         &mut setup,
         files,
         disks,
@@ -1450,6 +1586,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         read_offset,
         read_length,
         shard_size,
+        frame_size,
         checksum_algo,
         skip_verify_bitrot,
         use_mmap_read,
@@ -1487,7 +1624,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     stage_metrics: Option<BitrotReaderStageMetrics>,
     attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
-    create_bitrot_readers_until_quorum_with_preference(
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size(
         files,
         disks,
         bucket,
@@ -1495,6 +1632,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
         part_number,
         read_offset,
         read_length,
+        shard_size,
         shard_size,
         checksum_algo,
         skip_verify_bitrot,
@@ -1509,6 +1647,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     .await
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_preference(
     files: &[FileInfo],
@@ -1519,6 +1658,50 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    prefer_data_blocks_first: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
+) -> BitrotReaderSetup {
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+        prefer_data_blocks_first,
+        stage_metrics,
+        attribution,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1553,6 +1736,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             data_shards,
@@ -1563,7 +1747,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
         .await
     {
         record_bitrot_reader_setup_strategy(strategy, mode, attribution);
-        fill_deferred_bitrot_readers(
+        fill_deferred_bitrot_readers_with_frame_size(
             &mut setup,
             files,
             disks,
@@ -1573,6 +1757,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1585,7 +1770,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     }
 
     if strategy == BitrotReaderSetupStrategy::AllShards {
-        return create_bitrot_readers_until_quorum_all_shards(
+        return create_bitrot_readers_until_quorum_all_shards_with_frame_size(
             files,
             disks,
             bucket,
@@ -1594,6 +1779,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1616,7 +1802,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     let initial_target = setup.setup_target(data_shards, parity_shards, mode);
     for idx in 0..initial_target.min(data_shards).min(total_shards) {
-        schedule_bitrot_reader_task(
+        schedule_bitrot_reader_task_with_frame_size(
             &mut reader_tasks,
             &mut setup,
             idx,
@@ -1628,6 +1814,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1651,7 +1838,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             let Some(next_idx) = next_unscheduled_reader_index(&setup, total_shards, data_shards) else {
                 break;
             };
-            schedule_bitrot_reader_task(
+            schedule_bitrot_reader_task_with_frame_size(
                 &mut reader_tasks,
                 &mut setup,
                 next_idx,
@@ -1663,6 +1850,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
@@ -1674,7 +1862,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
     }
 
-    fill_deferred_bitrot_readers(
+    fill_deferred_bitrot_readers_with_frame_size(
         &mut setup,
         files,
         disks,
@@ -1684,6 +1872,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
         read_offset,
         read_length,
         shard_size,
+        frame_size,
         checksum_algo,
         skip_verify_bitrot,
         use_mmap_read,
@@ -1701,6 +1890,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     setup
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     files: &[FileInfo],
@@ -1711,6 +1901,40 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+) -> BitrotReaderSetup {
+    create_data_block_bitrot_readers_with_frame_size(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) async fn create_data_block_bitrot_readers_with_frame_size(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1727,7 +1951,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
 
     let schedule_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     for idx in 0..data_shards.min(total_shards) {
-        schedule_bitrot_reader_task(
+        schedule_bitrot_reader_task_with_frame_size(
             &mut reader_tasks,
             &mut setup,
             idx,
@@ -1739,6 +1963,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -3062,6 +3287,134 @@ enum RenameDispatchState {
     MayHavePublished,
 }
 
+struct SlotRenameOutcome {
+    slot: usize,
+    dispatch_state: RenameDispatchState,
+    completion: std::thread::Result<disk::error::Result<disk::RenameDataResp>>,
+}
+
+#[derive(Default)]
+struct RenameFanoutPlan {
+    batch_slot_mask: u16,
+    batch_groups: Vec<RenameBatchGroup>,
+}
+
+struct RenameBatchGroup {
+    addr: String,
+    representative: DiskStore,
+    slots: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct RenameSlotPaths {
+    src_bucket: Arc<String>,
+    src_object: Arc<String>,
+    dst_bucket: Arc<String>,
+    dst_object: Arc<String>,
+}
+
+struct RenameSlotContext {
+    slot: usize,
+    disk: Option<DiskStore>,
+    file_infos: Arc<Vec<FileInfo>>,
+    scanner_token: Option<Uuid>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    paths: RenameSlotPaths,
+    successful_completion_rank: Option<Arc<AtomicUsize>>,
+    write_quorum: usize,
+}
+
+struct RenameOutcomeProducerArgs {
+    disks: Arc<Vec<Option<DiskStore>>>,
+    file_infos: Arc<Vec<FileInfo>>,
+    fence_tokens: Arc<Vec<Option<Uuid>>>,
+    paths: RenameSlotPaths,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    write_quorum: usize,
+    allow_batch: bool,
+}
+
+struct RenameOutcomeProducers {
+    outcomes: mpsc::Receiver<SlotRenameOutcome>,
+    tasks: JoinSet<()>,
+}
+
+struct PreparedRenameSlot {
+    context: RenameSlotContext,
+    indexed_file_info: Option<FileInfo>,
+}
+
+#[cfg(test)]
+type RenameSlotTaskGuard = rename_fanout_barrier::TaskGuard;
+#[cfg(not(test))]
+type RenameSlotTaskGuard = ();
+
+struct AdmittedRenameSlot {
+    prepared: PreparedRenameSlot,
+    _task_guard: RenameSlotTaskGuard,
+}
+
+struct RenameSlotObservation {
+    started_at: Option<Instant>,
+    _foreground_guard: RenameForegroundActiveGuard,
+    disk_wait_stage: &'static str,
+    successful_completion_rank: Option<Arc<AtomicUsize>>,
+    write_quorum: usize,
+}
+
+impl PreparedRenameSlot {
+    fn file_info(&self) -> &FileInfo {
+        self.indexed_file_info
+            .as_ref()
+            .unwrap_or(&self.context.file_infos[self.context.slot])
+    }
+}
+
+impl RenameSlotObservation {
+    fn start(prepared: &PreparedRenameSlot) -> disk::error::Result<Self> {
+        let disk = prepared.context.disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        Ok(Self {
+            started_at: rustfs_io_metrics::put_stage_timer(),
+            _foreground_guard: rename_foreground_active_guard(prepared.context.slot),
+            disk_wait_stage: if disk.is_local() {
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
+            } else {
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
+            },
+            successful_completion_rank: prepared.context.successful_completion_rank.clone(),
+            write_quorum: prepared.context.write_quorum,
+        })
+    }
+
+    fn finish(self, result: &disk::error::Result<disk::RenameDataResp>) {
+        if let Some(started_at) = self.started_at {
+            let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+            rustfs_io_metrics::record_put_object_stage_duration(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+                duration_ms,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration(self.disk_wait_stage, duration_ms);
+            let position = if result.is_ok() {
+                let rank = self
+                    .successful_completion_rank
+                    .as_ref()
+                    .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
+                    .unwrap_or(1);
+                if rank <= self.write_quorum {
+                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
+                } else {
+                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
+                }
+            } else {
+                rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
+            };
+            rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RenameRollbackOutcome {
     NotAttempted(DiskError),
@@ -3980,6 +4333,499 @@ impl SetDisks {
             .collect()
     }
 
+    fn ordinary_rename_batch_eligible(
+        file_info: &FileInfo,
+        scanner_lease: Option<Uuid>,
+        multipart: bool,
+        incarnation_bound: bool,
+    ) -> bool {
+        !multipart
+            && !incarnation_bound
+            && scanner_lease.is_none()
+            && !rustfs_utils::http::metadata_compat::contains_key_str(
+                &file_info.metadata,
+                crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+            )
+            && !rustfs_utils::http::metadata_compat::contains_key_str(
+                &file_info.metadata,
+                crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            )
+    }
+
+    fn prepare_rename_slot(context: RenameSlotContext) -> disk::error::Result<PreparedRenameSlot> {
+        if context.disk.is_none() {
+            return Err(DiskError::DiskNotFound);
+        }
+        let file_info = &context.file_infos[context.slot];
+        let is_delete_marker = file_info.is_canonical_delete_marker();
+        let indexed_file_info = if file_info.erasure.index == 0 {
+            let mut indexed = file_info.clone();
+            indexed.erasure.index = context.slot + 1;
+            Some(indexed)
+        } else {
+            None
+        };
+        let prepared = PreparedRenameSlot {
+            context,
+            indexed_file_info,
+        };
+        let file_info = prepared.file_info();
+        if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(prepared)
+    }
+
+    async fn admit_rename_slot(prepared: PreparedRenameSlot) -> disk::error::Result<PreparedRenameSlot> {
+        let slot = prepared.context.slot;
+        let dst_object = &prepared.context.paths.dst_object;
+        Self::rename_fanout_barrier(dst_object, slot, rename_fanout_barrier_phase::RENAME).await;
+        if let Some(error) = Self::rename_injected_error(dst_object, slot) {
+            return Err(error);
+        }
+        Ok(prepared)
+    }
+
+    async fn prepare_and_admit_rename_slot(context: RenameSlotContext) -> disk::error::Result<AdmittedRenameSlot> {
+        #[allow(clippy::let_unit_value)]
+        let task_guard = Self::rename_fanout_task_guard(&context.paths.dst_object);
+        let prepared = Self::prepare_rename_slot(context)?;
+        let prepared = Self::admit_rename_slot(prepared).await?;
+        Ok(AdmittedRenameSlot {
+            prepared,
+            _task_guard: task_guard,
+        })
+    }
+
+    async fn execute_prepared_unary_slot(
+        admitted: AdmittedRenameSlot,
+        dispatch_state: &mut RenameDispatchState,
+        observation: Option<RenameSlotObservation>,
+    ) -> disk::error::Result<disk::RenameDataResp> {
+        let prepared = &admitted.prepared;
+        let context = &prepared.context;
+        if let Some(scope) = context.publication_scope.as_ref()
+            && !scope.can_commit()
+        {
+            let _ = scope.mark_indeterminate();
+            return Err(DiskError::other("scanner publication commit scope deadline or cancellation reached"));
+        }
+        let disk = context.disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        let observation = match observation {
+            Some(observation) => observation,
+            None => RenameSlotObservation::start(prepared)?,
+        };
+        *dispatch_state = RenameDispatchState::MayHavePublished;
+        let observed = disk
+            .rename_data_borrowed_with_fence_observed(
+                &context.paths.src_bucket,
+                &context.paths.src_object,
+                prepared.file_info(),
+                &context.paths.dst_bucket,
+                &context.paths.dst_object,
+                disk::RenameDataGuards {
+                    scanner_publication_lease_token: context.scanner_token,
+                    namespace_owner: context.namespace_owner.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let rejected_before_publication = observed.rejected_before_publication();
+        let result = observed.result;
+        #[cfg(test)]
+        if result.is_ok() {
+            rollback_fault_injection::after_rename(&context.paths.dst_object, context.slot)?;
+        }
+        observation.finish(&result);
+        if rejected_before_publication {
+            *dispatch_state = RenameDispatchState::RejectedBeforePublication;
+        }
+        result
+    }
+
+    async fn run_unary_rename_slot(context: RenameSlotContext) -> SlotRenameOutcome {
+        let slot = context.slot;
+        let mut dispatch_state = RenameDispatchState::NotDispatched;
+        let completion = std::panic::AssertUnwindSafe(async {
+            let admitted = Self::prepare_and_admit_rename_slot(context).await?;
+            Self::execute_prepared_unary_slot(admitted, &mut dispatch_state, None).await
+        })
+        .catch_unwind()
+        .await;
+        SlotRenameOutcome {
+            slot,
+            dispatch_state,
+            completion,
+        }
+    }
+
+    async fn run_admitted_unary_slot(admitted: AdmittedRenameSlot, observation: RenameSlotObservation) -> SlotRenameOutcome {
+        let slot = admitted.prepared.context.slot;
+        let mut dispatch_state = RenameDispatchState::NotDispatched;
+        let completion =
+            std::panic::AssertUnwindSafe(Self::execute_prepared_unary_slot(admitted, &mut dispatch_state, Some(observation)))
+                .catch_unwind()
+                .await;
+        SlotRenameOutcome {
+            slot,
+            dispatch_state,
+            completion,
+        }
+    }
+
+    fn finish_batch_slot(
+        admitted: AdmittedRenameSlot,
+        observation: RenameSlotObservation,
+        result: disk::error::Result<disk::RenameDataResp>,
+    ) -> SlotRenameOutcome {
+        let slot = admitted.prepared.context.slot;
+        #[cfg(test)]
+        if result.is_ok()
+            && let Err(error) = rollback_fault_injection::after_rename(&admitted.prepared.context.paths.dst_object, slot)
+        {
+            return SlotRenameOutcome {
+                slot,
+                dispatch_state: RenameDispatchState::MayHavePublished,
+                completion: Ok(Err(error)),
+            };
+        }
+        observation.finish(&result);
+        SlotRenameOutcome {
+            slot,
+            dispatch_state: RenameDispatchState::MayHavePublished,
+            completion: Ok(result),
+        }
+    }
+
+    fn plan_rename_fanout(
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        scanner_publication_lease_tokens: &[Option<Uuid>],
+        src_bucket: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+    ) -> RenameFanoutPlan {
+        let batch_enabled = disks
+            .iter()
+            .flatten()
+            .any(|disk| matches!(disk.as_ref(), Disk::Remote(remote) if remote.rename_stream_batch_enabled()));
+        if !batch_enabled {
+            return RenameFanoutPlan::default();
+        }
+        let multipart = src_bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        let incarnation_bound = crate::store::bucket_heal_scope_for_object(dst_bucket, dst_object).is_some();
+        let mut groups: Vec<RenameBatchGroup> = Vec::new();
+        for (slot, ((disk, file_info), scanner_lease)) in disks
+            .iter()
+            .zip(file_infos.iter())
+            .zip(scanner_publication_lease_tokens.iter())
+            .enumerate()
+        {
+            let Some(disk) = disk.as_ref() else {
+                continue;
+            };
+            let Disk::Remote(remote) = disk.as_ref() else {
+                continue;
+            };
+            if !remote.rename_stream_batch_enabled()
+                || !Self::ordinary_rename_batch_eligible(file_info, *scanner_lease, multipart, incarnation_bound)
+            {
+                continue;
+            }
+            if let Some(group) = groups.iter_mut().find(|group| group.addr == remote.addr) {
+                group.slots.push(slot);
+            } else {
+                groups.push(RenameBatchGroup {
+                    addr: remote.addr.clone(),
+                    representative: disk.clone(),
+                    slots: vec![slot],
+                });
+            }
+        }
+        groups.retain(|group| group.slots.len() >= 2);
+        debug_assert!(groups.iter().all(|group| !group.representative.is_local()));
+        let batch_slot_mask = groups
+            .iter()
+            .flat_map(|group| group.slots.iter())
+            .fold(0_u16, |mask, slot| mask | (1_u16 << slot));
+        RenameFanoutPlan {
+            batch_slot_mask,
+            batch_groups: groups,
+        }
+    }
+
+    fn record_rename_batch_candidates(
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        scanner_publication_lease_tokens: &[Option<Uuid>],
+        src_bucket: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+    ) {
+        if !rustfs_io_metrics::put_stage_metrics_enabled() {
+            return;
+        }
+        let multipart = src_bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        let incarnation_bound = crate::store::bucket_heal_scope_for_object(dst_bucket, dst_object).is_some();
+        let mut peers: Vec<(&str, usize, usize)> = Vec::new();
+        for ((disk, file_info), scanner_lease) in disks
+            .iter()
+            .zip(file_infos.iter())
+            .zip(scanner_publication_lease_tokens.iter())
+        {
+            let Some(disk) = disk.as_deref() else {
+                continue;
+            };
+            let Disk::Remote(remote) = disk else {
+                continue;
+            };
+            let batchable = Self::ordinary_rename_batch_eligible(file_info, *scanner_lease, multipart, incarnation_bound);
+            if let Some((_, remote_disks, batchable_disks)) = peers.iter_mut().find(|(addr, _, _)| *addr == remote.addr) {
+                *remote_disks += 1;
+                *batchable_disks += usize::from(batchable);
+            } else {
+                peers.push((&remote.addr, 1, usize::from(batchable)));
+            }
+        }
+        for (_, remote_disks, batchable_disks) in peers {
+            rustfs_io_metrics::record_ecstore_rename_batch_candidate_peer(remote_disks, batchable_disks);
+        }
+    }
+
+    fn spawn_rename_outcome_producers(args: RenameOutcomeProducerArgs) -> RenameOutcomeProducers {
+        let RenameOutcomeProducerArgs {
+            disks,
+            file_infos,
+            fence_tokens,
+            paths,
+            namespace_owner,
+            publication_scope,
+            write_quorum,
+            allow_batch,
+        } = args;
+        debug_assert!(!allow_batch || publication_scope.is_none());
+        let disk_count = disks.len();
+        let fanout_plan = if allow_batch {
+            Self::plan_rename_fanout(
+                disks.as_slice(),
+                file_infos.as_slice(),
+                fence_tokens.as_slice(),
+                &paths.src_bucket,
+                &paths.dst_bucket,
+                &paths.dst_object,
+            )
+        } else {
+            RenameFanoutPlan::default()
+        };
+        let successful_completion_rank = rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
+        let resource_unit = crate::disk::current_resource_unit();
+        let mut tasks = JoinSet::new();
+        let (outcome_tx, outcome_rx) = mpsc::channel(disk_count.max(1));
+        for (slot, (disk, scanner_token)) in disks.iter().cloned().zip(fence_tokens.iter().copied()).enumerate() {
+            if fanout_plan.batch_slot_mask & (1_u16 << slot) != 0 {
+                continue;
+            }
+            let outcome_tx = outcome_tx.clone();
+            let context = RenameSlotContext {
+                slot,
+                disk,
+                file_infos: file_infos.clone(),
+                scanner_token,
+                namespace_owner: namespace_owner.clone(),
+                publication_scope: publication_scope.clone(),
+                paths: paths.clone(),
+                successful_completion_rank: successful_completion_rank.clone(),
+                write_quorum,
+            };
+            let resource_unit = resource_unit.clone();
+            let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
+                let outcome = Self::run_unary_rename_slot(context).await;
+                let _ = outcome_tx.send(outcome).await;
+            });
+            tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
+        }
+        for group in fanout_plan.batch_groups {
+            let outcome_tx = outcome_tx.clone();
+            let paths = paths.clone();
+            let file_infos = file_infos.clone();
+            let successful_completion_rank = successful_completion_rank.clone();
+            let namespace_owner = namespace_owner.clone();
+            let group_disks = disks.clone();
+            let group_tokens = fence_tokens.clone();
+            let resource_unit = resource_unit.clone();
+            let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
+                let prepared = join_all(group.slots.into_iter().map(|slot| {
+                    let context = RenameSlotContext {
+                        slot,
+                        disk: group_disks[slot].clone(),
+                        file_infos: file_infos.clone(),
+                        scanner_token: group_tokens[slot],
+                        namespace_owner: namespace_owner.clone(),
+                        publication_scope: None,
+                        paths: paths.clone(),
+                        successful_completion_rank: successful_completion_rank.clone(),
+                        write_quorum,
+                    };
+                    async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
+                }))
+                .await;
+                let mut admitted = Vec::with_capacity(prepared.len());
+                for (slot, result) in prepared {
+                    match result {
+                        Ok(slot) => admitted.push(slot),
+                        Err(error) => {
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(Err(error)),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                let mut entries = Vec::with_capacity(admitted.len());
+                for slot in admitted {
+                    match RenameSlotObservation::start(&slot.prepared) {
+                        Ok(observation) => entries.push((slot, observation)),
+                        Err(error) => {
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(Err(error)),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                if entries.len() < 2 {
+                    for outcome in join_all(
+                        entries
+                            .into_iter()
+                            .map(|(slot, observation)| Self::run_admitted_unary_slot(slot, observation)),
+                    )
+                    .await
+                    {
+                        let _ = outcome_tx.send(outcome).await;
+                    }
+                    return;
+                }
+                rustfs_io_metrics::record_ecstore_rename_batch_planned(entries.len());
+                let start = {
+                    let items = entries
+                        .iter()
+                        .map(|(slot, _)| RenameBatchClientItem {
+                            slot: slot.prepared.context.slot,
+                            disk: slot
+                                .prepared
+                                .context
+                                .disk
+                                .as_ref()
+                                .map(|disk| disk.endpoint().to_string())
+                                .unwrap_or_default(),
+                            file_info: slot.prepared.file_info(),
+                        })
+                        .collect();
+                    match group.representative.as_ref() {
+                        Disk::Remote(remote) => {
+                            remote
+                                .start_rename_data_batch(
+                                    &paths.src_bucket,
+                                    &paths.src_object,
+                                    &paths.dst_bucket,
+                                    &paths.dst_object,
+                                    items,
+                                )
+                                .await
+                        }
+                        Disk::Local(_) => Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected)),
+                    }
+                };
+                match start {
+                    Ok(mut stream) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_stream_started(entries.len());
+                        let mut remaining = entries.into_iter().map(Some).collect::<Vec<_>>();
+                        loop {
+                            match stream.next_outcome().await {
+                                Ok(Some(batch_outcome)) => {
+                                    if let Some(entry) = remaining.iter_mut().find(|entry| {
+                                        entry
+                                            .as_ref()
+                                            .is_some_and(|(slot, _)| slot.prepared.context.slot == batch_outcome.slot)
+                                    }) && let Some((slot, observation)) = entry.take()
+                                    {
+                                        let outcome = Self::finish_batch_slot(slot, observation, batch_outcome.result);
+                                        let _ = outcome_tx.send(outcome).await;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => break,
+                            }
+                        }
+                        let remaining_items = remaining.iter().flatten().count();
+                        rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(remaining_items);
+                        for (slot, observation) in remaining.into_iter().flatten() {
+                            let result = Err(DiskError::Unexpected);
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::MayHavePublished,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(RenameBatchStartError::UnsupportedBeforeStream) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_fallback(entries.len());
+                        let mut fallbacks = FuturesUnordered::new();
+                        for (slot, observation) in entries {
+                            fallbacks.push(Self::run_admitted_unary_slot(slot, observation));
+                        }
+                        while let Some(outcome) = fallbacks.next().await {
+                            let _ = outcome_tx.send(outcome).await;
+                        }
+                    }
+                    Err(RenameBatchStartError::NotDispatched(error)) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_not_dispatched(entries.len());
+                        for (slot, observation) in entries {
+                            let result = Err(error.clone());
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::NotDispatched,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(RenameBatchStartError::MayHavePublished(error)) => {
+                        rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(entries.len());
+                        for (slot, observation) in entries {
+                            let result = Err(error.clone());
+                            observation.finish(&result);
+                            let _ = outcome_tx
+                                .send(SlotRenameOutcome {
+                                    slot: slot.prepared.context.slot,
+                                    dispatch_state: RenameDispatchState::MayHavePublished,
+                                    completion: Ok(result),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            });
+            tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
+        }
+        drop(outcome_tx);
+        RenameOutcomeProducers {
+            outcomes: outcome_rx,
+            tasks,
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
     async fn rename_data_owned_early_ack_with_fence(
         disks: &[Option<DiskStore>],
@@ -3993,7 +4839,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
-            scanner_publication_commit_scope: _scanner_publication_commit_scope,
+            scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
             multipart_proof_authority: _,
@@ -4013,8 +4859,10 @@ impl SetDisks {
         let file_infos = Arc::new(file_infos);
 
         let disk_count = disks.len();
-        let fanout_disks = disks.to_vec();
-        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
+        let fanout_disks = Arc::new(disks.to_vec());
+        let fanout_fence_tokens =
+            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
+        Self::record_rename_batch_candidates(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
         let coordinator_disks = fanout_disks.clone();
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -4030,119 +4878,33 @@ impl SetDisks {
             let fanout_dst_bucket = dst_bucket.clone();
             let fanout_dst_object = dst_object.clone();
             async move {
-                let successful_rename_completion_rank =
-                    rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-                let mut tasks = JoinSet::new();
-                for (i, (disk, scanner_publication_lease_token)) in
-                    fanout_disks.into_iter().zip(fanout_fence_tokens.into_iter()).enumerate()
-                {
-                    let src_bucket = fanout_src_bucket.clone();
-                    let src_object = fanout_src_object.clone();
-                    let dst_bucket = fanout_dst_bucket.clone();
-                    let dst_object = fanout_dst_object.clone();
-                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
-                    let namespace_commit_guard = namespace_commit_guard.clone();
-                    let file_infos = file_infos.clone();
-                    tasks.spawn(crate::disk::with_detached_disk_io_context(async move {
-                        let _namespace_commit_guard = namespace_commit_guard.clone();
-                        let mut dispatch_state = RenameDispatchState::NotDispatched;
-                        let result = std::panic::AssertUnwindSafe(async {
-                            #[allow(clippy::let_unit_value)]
-                            let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
-
-                            let Some(disk) = disk else {
-                                return Err(DiskError::DiskNotFound);
-                            };
-                            let disk_wait_location_stage = if disk.is_local() {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
-                            } else {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
-                            };
-
-                            let file_info = &file_infos[i];
-                            let is_delete_marker = file_info.is_canonical_delete_marker();
-                            let mut indexed_file_info;
-                            let file_info = if file_info.erasure.index == 0 {
-                                indexed_file_info = file_info.clone();
-                                indexed_file_info.erasure.index = i + 1;
-                                &indexed_file_info
-                            } else {
-                                file_info
-                            };
-                            if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
-                                return Err(DiskError::FileCorrupt);
-                            }
-
-                            Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
-
-                            if let Some(err) = Self::rename_injected_error(&dst_object, i) {
-                                return Err(err);
-                            }
-
-                            let disk_wait_started = rustfs_io_metrics::put_stage_timer();
-                            dispatch_state = RenameDispatchState::MayHavePublished;
-                            let _foreground_active_guard = rename_foreground_active_guard(i);
-                            let observed = disk
-                                .rename_data_borrowed_with_fence_observed(
-                                    &src_bucket,
-                                    &src_object,
-                                    file_info,
-                                    &dst_bucket,
-                                    &dst_object,
-                                    disk::RenameDataGuards {
-                                        scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-                            let rejected_before_publication = observed.rejected_before_publication();
-                            let result = observed.result;
-                            #[cfg(test)]
-                            if result.is_ok() {
-                                rollback_fault_injection::after_rename(&dst_object, i)?;
-                            }
-                            if let Some(disk_wait_started) = disk_wait_started {
-                                let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
-                                rustfs_io_metrics::record_put_object_stage_duration(
-                                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
-                                    duration_ms,
-                                );
-                                rustfs_io_metrics::record_put_object_stage_duration(disk_wait_location_stage, duration_ms);
-                                let position = if result.is_ok() {
-                                    let rank = successful_rename_completion_rank
-                                        .as_ref()
-                                        .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
-                                        .unwrap_or(1);
-                                    if rank <= write_quorum {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
-                                    } else {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
-                                    }
-                                } else {
-                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
-                                };
-                                rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
-                            }
-                            if rejected_before_publication {
-                                dispatch_state = RenameDispatchState::RejectedBeforePublication;
-                            }
-                            result
-                        })
-                        .catch_unwind()
-                        .await;
-                        (i, dispatch_state, result)
-                    }));
-                }
+                let allow_batch = scanner_publication_commit_scope.is_none();
+                let RenameOutcomeProducers {
+                    outcomes: mut outcome_rx,
+                    mut tasks,
+                } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                    disks: fanout_disks.clone(),
+                    file_infos: file_infos.clone(),
+                    fence_tokens: fanout_fence_tokens.clone(),
+                    paths: RenameSlotPaths {
+                        src_bucket: fanout_src_bucket.clone(),
+                        src_object: fanout_src_object.clone(),
+                        dst_bucket: fanout_dst_bucket.clone(),
+                        dst_object: fanout_dst_object.clone(),
+                    },
+                    namespace_owner: namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>),
+                    publication_scope: scanner_publication_commit_scope,
+                    write_quorum,
+                    allow_batch,
+                });
 
                 let mut commit_tx = Some(commit_tx);
                 let mut sent_commit = false;
                 let mut success_count = 0usize;
                 let mut fanout_panic = 0usize;
                 let mut results_seen = 0usize;
-                let mut errs = vec![Some(DiskError::DiskNotFound); disk_count];
+                let mut seen_slots = vec![false; disk_count];
+                let mut errs = vec![Some(DiskError::Unexpected); disk_count];
                 // Missing task results cannot prove that a disk mutation never ran.
                 let mut dispatch_states = vec![RenameDispatchState::MayHavePublished; disk_count];
                 let mut disk_versions = vec![None; disk_count];
@@ -4155,40 +4917,48 @@ impl SetDisks {
                 let mut cleanup_at_snapshot = vec![false; disk_count];
 
                 let mut tail_after_quorum_started = None;
-                while let Some(joined) = tasks.join_next().await {
-                    results_seen += 1;
-                    match joined {
-                        Ok((idx, dispatch_state, Ok(Ok(res)))) => {
-                            dispatch_states[idx] = dispatch_state;
-                            data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
-                            cleanup_data_dirs[idx] = res.cleanup_data_dir;
-                            disk_versions[idx] = res.sign;
-                            old_current_sizes[idx] = res.old_current_size;
-                            old_current_source_checked[idx] = res.old_current_source_checked;
-                            old_current_sources[idx] = res.old_current_source;
-                            errs[idx] = None;
-                            success_count += 1;
+                while let Some(outcome) = outcome_rx.recv().await {
+                    match outcome {
+                        outcome if outcome.slot < disk_count && !seen_slots[outcome.slot] => {
+                            let idx = outcome.slot;
+                            seen_slots[idx] = true;
+                            results_seen += 1;
+                            let dispatch_state = outcome.dispatch_state;
+                            match outcome.completion {
+                                Ok(Ok(res)) => {
+                                    dispatch_states[idx] = dispatch_state;
+                                    data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
+                                    cleanup_data_dirs[idx] = res.cleanup_data_dir;
+                                    disk_versions[idx] = res.sign;
+                                    old_current_sizes[idx] = res.old_current_size;
+                                    old_current_source_checked[idx] = res.old_current_source_checked;
+                                    old_current_sources[idx] = res.old_current_source;
+                                    errs[idx] = None;
+                                    success_count += 1;
+                                }
+                                Ok(Err(err)) => {
+                                    dispatch_states[idx] = dispatch_state;
+                                    errs[idx] = Some(err);
+                                }
+                                Err(_) => {
+                                    dispatch_states[idx] = dispatch_state;
+                                    errs[idx] = Some(DiskError::Unexpected);
+                                    fanout_panic += 1;
+                                }
+                            }
                         }
-                        Ok((idx, dispatch_state, Ok(Err(err)))) => {
-                            dispatch_states[idx] = dispatch_state;
-                            errs[idx] = Some(err);
-                        }
-                        Ok((idx, dispatch_state, Err(_))) => {
-                            dispatch_states[idx] = dispatch_state;
-                            errs[idx] = Some(DiskError::Unexpected);
-                            fanout_panic += 1;
-                        }
-                        Err(_) => {
-                            fanout_panic += 1;
-                        }
+                        _ => fanout_panic += 1,
                     }
 
-                    let pending_tasks = tasks.len();
+                    // Transport tasks may represent multiple disk slots once
+                    // ordinary peer batches are enabled. Quorum stability is
+                    // defined by unseen disk results, never scheduler tasks.
+                    let pending_slots = disk_count.saturating_sub(results_seen);
                     let checked_count = old_current_source_checked.iter().filter(|checked| **checked).count();
                     let max_source_votes = Self::max_common_old_current_source_votes(&old_current_sources);
                     let can_change_old_current_source = (checked_count < write_quorum
-                        && checked_count + pending_tasks >= write_quorum)
-                        || (max_source_votes < write_quorum && max_source_votes + pending_tasks >= write_quorum);
+                        && checked_count + pending_slots >= write_quorum)
+                        || (max_source_votes < write_quorum && max_source_votes + pending_slots >= write_quorum);
 
                     if !sent_commit && success_count >= write_quorum && !can_change_old_current_source {
                         let snapshot_commit = Self::rename_data_commit_from_observations(
@@ -4217,6 +4987,11 @@ impl SetDisks {
                         tail_after_quorum_started = rustfs_io_metrics::put_stage_timer();
                     }
                 }
+                while let Some(joined) = tasks.join_next().await {
+                    if joined.is_err() {
+                        fanout_panic += 1;
+                    }
+                }
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_AFTER_QUORUM_WAIT,
                     tail_after_quorum_started,
@@ -4228,7 +5003,7 @@ impl SetDisks {
                     let fanout_success = errs.iter().filter(|err| err.is_none()).count();
                     let fanout_error = errs.len().saturating_sub(fanout_success + fanout_panic);
                     rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
-                        results_seen,
+                        disk_count,
                         write_quorum,
                         fanout_success,
                         fanout_error,
@@ -4462,7 +5237,7 @@ impl SetDisks {
         } else {
             None
         };
-        let mut errs = Vec::with_capacity(disks.len());
+        let mut errs = vec![Some(DiskError::Unexpected); disks.len()];
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -4470,9 +5245,18 @@ impl SetDisks {
         let dst_object = Arc::new(dst_object.to_string());
 
         let disk_count = disks.len();
-        let fanout_disks = disks.to_vec();
-        let fanout_file_infos = file_infos;
-        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
+        let fanout_disks = Arc::new(disks.to_vec());
+        let fanout_file_infos = Arc::new(file_infos);
+        let fanout_fence_tokens =
+            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
+        Self::record_rename_batch_candidates(
+            disks,
+            &fanout_file_infos,
+            &fanout_fence_tokens,
+            src_bucket.as_str(),
+            dst_bucket.as_str(),
+            dst_object.as_str(),
+        );
         let fanout_src_bucket = src_bucket.clone();
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
@@ -4487,133 +5271,38 @@ impl SetDisks {
             .or_else(|| namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>));
         let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
-        // completed disk mutations. Per-disk futures stay ordered in `join_all`,
-        // preserving slot-indexed quorum and convergence accounting without a
-        // scheduler task for every disk.
+        // completed disk mutations. Producers may complete out of order, while
+        // their stable slot indexes preserve quorum and convergence accounting.
         let fanout_future = async move {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
             let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
-            let successful_rename_completion_rank =
-                rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-            let futures = fanout_disks
-                .into_iter()
-                .zip(fanout_file_infos.iter())
-                .zip(fanout_fence_tokens.into_iter())
-                .enumerate()
-                .map(|(i, ((disk, file_info), scanner_publication_lease_token))| {
-                    let src_bucket = fanout_src_bucket.clone();
-                    let src_object = fanout_src_object.clone();
-                    let dst_object = fanout_dst_object.clone();
-                    let dst_bucket = fanout_dst_bucket.clone();
-                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
-                    let publication_scope = scanner_publication_commit_scope.clone();
-                    let namespace_owner = fanout_namespace_owner.clone();
-
-                    async move {
-                        let mut dispatch_state = RenameDispatchState::NotDispatched;
-                        let result = std::panic::AssertUnwindSafe(async {
-                            // Test-only introspection guard: counts this operation as
-                            // in-flight for the whole body. Compiles to `()` in production.
-                            #[allow(clippy::let_unit_value)]
-                            let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
-
-                            let Some(disk) = disk else {
-                                return Err(DiskError::DiskNotFound);
-                            };
-                            let disk_wait_location_stage = if disk.is_local() {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
-                            } else {
-                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE
-                            };
-
-                            let is_delete_marker = file_info.is_canonical_delete_marker();
-                            let mut local_file_info;
-                            let file_info = if file_info.erasure.index == 0 {
-                                local_file_info = file_info.clone();
-                                local_file_info.erasure.index = i + 1;
-                                &local_file_info
-                            } else {
-                                file_info
-                            };
-                            if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
-                                return Err(DiskError::FileCorrupt);
-                            }
-
-                            // Test-only awaitable pause point right before the disk rename.
-                            // A no-op immediately-ready future in production.
-                            Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
-
-                            if let Some(err) = Self::rename_injected_error(&dst_object, i) {
-                                return Err(err);
-                            }
-
-                            if let Some(scope) = publication_scope.as_ref()
-                                && !scope.can_commit()
-                            {
-                                let _ = scope.mark_indeterminate();
-                                return Err(DiskError::other(
-                                    "scanner publication commit scope deadline or cancellation reached",
-                                ));
-                            }
-
-                            let disk_wait_started = rustfs_io_metrics::put_stage_timer();
-                            dispatch_state = RenameDispatchState::MayHavePublished;
-                            let _foreground_active_guard = rename_foreground_active_guard(i);
-                            let observed = disk
-                                .rename_data_borrowed_with_fence_observed(
-                                    &src_bucket,
-                                    &src_object,
-                                    file_info,
-                                    &dst_bucket,
-                                    &dst_object,
-                                    disk::RenameDataGuards {
-                                        scanner_publication_lease_token,
-                                        namespace_owner: namespace_owner.clone(),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-                            let rejected_before_publication = observed.rejected_before_publication();
-                            let result = observed.result;
-                            #[cfg(test)]
-                            if result.is_ok() {
-                                rollback_fault_injection::after_rename(&dst_object, i)?;
-                            }
-                            if let Some(disk_wait_started) = disk_wait_started {
-                                let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
-                                rustfs_io_metrics::record_put_object_stage_duration(
-                                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
-                                    duration_ms,
-                                );
-                                rustfs_io_metrics::record_put_object_stage_duration(disk_wait_location_stage, duration_ms);
-                                let position = if result.is_ok() {
-                                    let rank = successful_rename_completion_rank
-                                        .as_ref()
-                                        .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
-                                        .unwrap_or(1);
-                                    if rank <= write_quorum {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
-                                    } else {
-                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
-                                    }
-                                } else {
-                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
-                                };
-                                rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
-                            }
-                            if rejected_before_publication {
-                                dispatch_state = RenameDispatchState::RejectedBeforePublication;
-                            }
-                            result
-                        })
-                        .catch_unwind()
-                        .await;
-                        (dispatch_state, result)
-                    }
-                });
-            let results = join_all(futures).await;
+            let paths = RenameSlotPaths {
+                src_bucket: fanout_src_bucket,
+                src_object: fanout_src_object,
+                dst_bucket: fanout_dst_bucket,
+                dst_object: fanout_dst_object.clone(),
+            };
+            let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
+            let RenameOutcomeProducers {
+                outcomes: mut outcome_rx,
+                mut tasks,
+            } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                disks: fanout_disks,
+                file_infos: fanout_file_infos.clone(),
+                fence_tokens: fanout_fence_tokens,
+                paths,
+                namespace_owner: fanout_namespace_owner,
+                publication_scope: scanner_publication_commit_scope,
+                write_quorum,
+                allow_batch,
+            });
+            let mut results = Vec::with_capacity(disk_count);
+            while let Some(outcome) = outcome_rx.recv().await {
+                results.push(outcome);
+            }
+            while tasks.join_next().await.is_some() {}
             #[cfg(test)]
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
@@ -4646,26 +5335,27 @@ impl SetDisks {
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
             quorum_wait_started,
         );
-        let (results, mut file_infos) = match fanout_result {
+        let (results, file_infos) = match fanout_result {
             Ok(result) => result,
             Err(_) => {
                 record_indeterminate_rename(disks, (&dst_bucket, &dst_object), rollback_receipt).await;
                 return Err(DiskError::Unexpected);
             }
         };
+        let mut file_infos = Arc::try_unwrap(file_infos).unwrap_or_else(|file_infos| file_infos.as_ref().clone());
         if rustfs_io_metrics::put_stage_metrics_enabled() {
             let mut fanout_success = 0;
             let mut fanout_error = 0;
             let mut fanout_panic = 0;
-            for (_, result) in &results {
-                match result {
+            for outcome in &results {
+                match &outcome.completion {
                     Ok(Ok(_)) => fanout_success += 1,
                     Ok(Err(_)) => fanout_error += 1,
                     Err(_) => fanout_panic += 1,
                 }
             }
             rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
-                results.len(),
+                disk_count,
                 write_quorum,
                 fanout_success,
                 fanout_error,
@@ -4673,13 +5363,18 @@ impl SetDisks {
             );
         }
 
-        let mut multipart_capabilities = multipart_proof_authority.map(|authority| {
-            PublishingMultipartCapabilities::new(results.len(), authority, multipart_commit_owner, logical_guards)
-        });
-        let mut dispatch_states = Vec::with_capacity(results.len());
-        for (idx, (dispatch_state, result)) in results.into_iter().enumerate() {
-            dispatch_states.push(dispatch_state);
-            match result {
+        let mut multipart_capabilities = multipart_proof_authority
+            .map(|authority| PublishingMultipartCapabilities::new(disk_count, authority, multipart_commit_owner, logical_guards));
+        let mut dispatch_states = vec![RenameDispatchState::MayHavePublished; disk_count];
+        let mut seen_slots = vec![false; disk_count];
+        for outcome in results {
+            let idx = outcome.slot;
+            if idx >= disk_count || seen_slots[idx] {
+                continue;
+            }
+            seen_slots[idx] = true;
+            dispatch_states[idx] = outcome.dispatch_state;
+            match outcome.completion {
                 Ok(Ok(mut res)) => {
                     if let Some(owner) = multipart_capabilities.as_mut() {
                         let publication = res.multipart_source.take().map(|result| *result);
@@ -4706,7 +5401,7 @@ impl SetDisks {
                                     == Some(&(idx + 1))
                         });
                         if !valid {
-                            errs.push(Some(DiskError::FileCorrupt));
+                            errs[idx] = Some(DiskError::FileCorrupt);
                             continue;
                         }
                         owner.publications[idx] = publication;
@@ -4717,13 +5412,13 @@ impl SetDisks {
                     old_current_sizes[idx] = res.old_current_size;
                     old_current_source_checked[idx] = res.old_current_source_checked;
                     old_current_sources[idx] = res.old_current_source;
-                    errs.push(None);
+                    errs[idx] = None;
                 }
                 Ok(Err(e)) => {
-                    errs.push(Some(e));
+                    errs[idx] = Some(e);
                 }
                 Err(_) => {
-                    errs.push(Some(DiskError::Unexpected));
+                    errs[idx] = Some(DiskError::Unexpected);
                 }
             }
         }
@@ -7645,6 +8340,51 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_fanout_plan_batches_only_multi_slot_ordinary_peers() {
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            let mut disks = Vec::new();
+            for endpoint in [
+                "http://127.0.0.1:19000/disk1",
+                "http://127.0.0.1:19000/disk2",
+                "http://127.0.0.1:19000/disk3",
+                "http://127.0.0.1:19001/disk4",
+            ] {
+                let mut endpoint = Endpoint::try_from(endpoint).expect("remote planner endpoint");
+                endpoint.is_local = false;
+                disks.push(Some(
+                    new_disk(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("remote planner disk"),
+                ));
+            }
+            let file_infos = vec![FileInfo::default(); disks.len()];
+            let tokens = vec![None; disks.len()];
+            let plan = SetDisks::plan_rename_fanout(&disks, &file_infos, &tokens, "src", "dst", "object");
+            assert_eq!(plan.batch_slot_mask, 0b0111);
+            assert_eq!(plan.batch_groups.len(), 1);
+            assert_eq!(plan.batch_groups[0].slots, vec![0, 1, 2]);
+
+            let mut protected = file_infos;
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut protected[1].metadata,
+                crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                Uuid::new_v4().to_string(),
+            );
+            let plan = SetDisks::plan_rename_fanout(&disks, &protected, &tokens, "src", "dst", "object");
+            assert_eq!(plan.batch_slot_mask, 0b0101);
+            assert_eq!(plan.batch_groups[0].slots, vec![0, 2]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn commit_fault_schedule_keeps_multiple_disk_phases_independent() {
         use rename_fanout_barrier::{PHASE_CLEANUP, PHASE_RENAME, arm, checkpoint};
 
@@ -8074,6 +8814,540 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod local_q_batch_tests {
+        use super::*;
+        use crate::erasure::coding::BitrotWriter;
+        use crate::io_support::bitrot::ShardReader;
+        use crate::test_metrics::CapturingRecorder;
+
+        const BLOCK: usize = 64 * 1024;
+        const SHARD: usize = BLOCK / 2;
+        const FRAME: usize = 16 * 1024;
+        const HASH: usize = 32;
+        const DECISIONS: &str = "rustfs_io_get_object_local_batch_decisions_total";
+
+        struct Fixture {
+            dirs: Vec<TempDir>,
+            disks: Vec<Option<DiskStore>>,
+            files: Vec<FileInfo>,
+            bucket: String,
+            object: String,
+            payload: Vec<u8>,
+            plain_shards: Vec<Vec<u8>>,
+        }
+
+        impl Fixture {
+            async fn new(bucket: &str, object: &str) -> Self {
+                let payload: Vec<u8> = (0..2 * BLOCK + 17_409)
+                    .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+                    .collect();
+                let erasure = coding::Erasure::new_with_options(2, 2, BLOCK, false);
+                let mut wire = vec![Vec::new(); 4];
+                let mut plain_shards = vec![Vec::new(); 4];
+                assert_eq!(HashAlgorithm::HighwayHash256S.size(), HASH);
+                for block in payload.chunks(BLOCK) {
+                    for (index, shard) in erasure.encode_data(block).expect("encode q fixture").into_iter().enumerate() {
+                        plain_shards[index].extend_from_slice(&shard);
+                        let mut writer = BitrotWriter::new(Vec::new(), FRAME, HashAlgorithm::HighwayHash256S);
+                        for frame in shard.chunks(FRAME) {
+                            writer.write(frame).await.expect("write authenticated fixture frame");
+                        }
+                        wire[index].extend(writer.into_inner());
+                    }
+                }
+                let (dirs, disks) = call_counter_local_disks(bucket, 4).await;
+                let data_dir = Uuid::new_v4();
+                let mut fi = FileInfo::new(object, 2, 2);
+                fi.volume = bucket.to_string();
+                fi.size = i64::try_from(payload.len()).expect("fixture size fits i64");
+                fi.data_dir = Some(data_dir);
+                fi.erasure.block_size = BLOCK;
+                fi.erasure.distribution = (1..=4).collect();
+                crate::object_api::insert_ec_read_quantum(&mut fi.metadata, FRAME);
+                assert_eq!(
+                    crate::object_api::persisted_ec_read_quantum(&fi.metadata, BLOCK, 2, SHARD)
+                        .expect("fixture marker matches supported EC geometry"),
+                    Some(FRAME),
+                    "the persisted quantum is the physical per-shard frame size"
+                );
+                fi.add_object_part(1, "fixture-etag".to_string(), payload.len(), None, fi.size, None, None);
+                let mut files = vec![fi; 4];
+                for (index, ((file, disk), bytes)) in files.iter_mut().zip(&disks).zip(wire).enumerate() {
+                    file.erasure.index = index + 1;
+                    disk.as_ref()
+                        .expect("fixture disk")
+                        .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from(bytes))
+                        .await
+                        .expect("persist external q shard");
+                }
+                Self {
+                    dirs,
+                    disks,
+                    files,
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    payload,
+                    plain_shards,
+                }
+            }
+
+            fn path(&self, index: usize) -> std::path::PathBuf {
+                self.dirs[index]
+                    .path()
+                    .join(&self.bucket)
+                    .join(&self.object)
+                    .join(self.files[index].data_dir.expect("fixture data directory").to_string())
+                    .join("part.1")
+            }
+
+            async fn setup(&self, offset: usize, length: usize, mode: BitrotReaderSetupMode, mmap: bool) -> BitrotReaderSetup {
+                create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+                    &self.files,
+                    &self.disks,
+                    &self.bucket,
+                    &self.object,
+                    1,
+                    offset,
+                    length,
+                    SHARD,
+                    FRAME,
+                    HashAlgorithm::HighwayHash256S,
+                    false,
+                    mmap,
+                    2,
+                    2,
+                    mode,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }
+
+            async fn batch(&self, offset: usize, length: usize) -> Option<BitrotReaderSetup> {
+                try_create_bitrot_readers_via_batch_pread(
+                    &self.files,
+                    &self.disks,
+                    &self.bucket,
+                    &self.object,
+                    1,
+                    offset,
+                    length,
+                    SHARD,
+                    FRAME,
+                    HashAlgorithm::HighwayHash256S,
+                    false,
+                    2,
+                    2,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    BitrotReaderSetupStrategy::DataBlocksFirst,
+                )
+                .await
+            }
+
+            async fn normal_frame(&self) -> crate::disk::error::Result<Option<ObjectBitrotReader>> {
+                let path = format!("{}/{}/part.1", self.object, self.files[0].data_dir.expect("fixture data directory"));
+                create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+                    None,
+                    self.disks[0].as_ref(),
+                    &self.bucket,
+                    &path,
+                    0,
+                    FRAME,
+                    SHARD,
+                    FRAME,
+                    HashAlgorithm::HighwayHash256S,
+                    false,
+                    true,
+                    None,
+                )
+                .await
+            }
+
+            async fn assert_decode(&self, setup: BitrotReaderSetup, offset: usize, length: usize) {
+                let erasure = coding::Erasure::new_with_options(2, 2, BLOCK, false);
+                let mut output = Vec::new();
+                let (written, error) = erasure
+                    .decode_with_stripe_handles_and_reopeners(
+                        &mut output,
+                        setup.readers,
+                        offset,
+                        length,
+                        self.payload.len(),
+                        None,
+                        setup.deferred_stripe_handles,
+                        setup.deferred_reopeners,
+                    )
+                    .await;
+                assert!(error.is_none(), "q decode must succeed: {error:?}");
+                assert_eq!(written, length);
+                assert_eq!(output, self.payload[offset..offset + length]);
+            }
+        }
+
+        fn run(future: impl std::future::Future<Output = ()>) -> CapturingRecorder {
+            struct RestoreMetrics(bool);
+            impl Drop for RestoreMetrics {
+                fn drop(&mut self) {
+                    rustfs_io_metrics::set_get_stage_metrics_enabled(self.0);
+                }
+            }
+            let _restore = RestoreMetrics(rustfs_io_metrics::get_stage_metrics_enabled());
+            rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+            let recorder = CapturingRecorder::default();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("q test runtime");
+            metrics::with_local_recorder(&recorder, || {
+                runtime.block_on(temp_env::async_with_vars(
+                    [
+                        (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                        (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                        ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("false")),
+                        (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("1048576")),
+                        (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+                        ("RUSTFS_IO_URING_READ_ENABLE", Some("false")),
+                        ("RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE", Some("false")),
+                    ],
+                    crate::erasure::coding::decode::with_decode_read_policy(
+                        crate::erasure::coding::decode::DecodeReadPolicy::DemandBound,
+                        future,
+                    ),
+                ))
+            });
+            recorder
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_selects_data_only_without_eager_parity() {
+            let recorder = run(async {
+                for (data_first, expected) in [("true", 2usize), ("false", 4)] {
+                    temp_env::async_with_vars([(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some(data_first))], async {
+                        let fixture = Fixture::new("q-batch-selection", &format!("data-first-{data_first}")).await;
+                        let calls = disk_call_counters::observe(&fixture.object);
+                        let setup = fixture
+                            .setup(0, fixture.plain_shards[0].len(), BitrotReaderSetupMode::ReadQuorum, true)
+                            .await;
+                        assert_eq!(
+                            calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                            u64::try_from(expected).expect("fixture open count fits u64")
+                        );
+                        assert_eq!(setup.available_shards(), expected);
+                        if expected == 2 {
+                            assert_eq!(setup.deferred_shards(), 2);
+                            for (offset, &attempted) in setup.attempted[2..4].iter().enumerate() {
+                                let index = 2 + offset;
+                                assert!(!attempted);
+                                assert_eq!(calls.for_disk(disk_call_counters::KIND_DISK_SHARD_OPEN, index), 0);
+                            }
+                        }
+                        fixture.assert_decode(setup, 0, fixture.payload.len()).await;
+                        assert_eq!(
+                            calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                            u64::try_from(expected).expect("fixture open count fits u64")
+                        );
+                    })
+                    .await;
+                }
+            });
+            assert_eq!(
+                recorder.counter_value(DECISIONS, &[("decision", "selected")]),
+                2,
+                "normal q fallback can decode correctly but must not satisfy batch selection"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_default_policy_keeps_bounded_reads_demand_bound() {
+            let recorder = run(crate::erasure::coding::decode::with_decode_read_policy(
+                crate::erasure::coding::decode::DecodeReadPolicy::Default,
+                async {
+                    for bounded in [true, false] {
+                        let fixture = Fixture::new("q-batch-default", if bounded { "bounded" } else { "long" }).await;
+                        let calls = disk_call_counters::observe(&fixture.object);
+                        let window = if bounded { FRAME } else { fixture.plain_shards[0].len() };
+                        let setup = fixture.setup(0, window, BitrotReaderSetupMode::ReadQuorum, true).await;
+                        let expected = if bounded { 2usize } else { 4 };
+                        assert_eq!(setup.available_shards(), expected);
+                        assert_eq!(
+                            calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                            u64::try_from(expected).expect("fixture open count fits u64")
+                        );
+                        if bounded {
+                            assert_eq!(setup.deferred_shards(), 2);
+                            let erasure = coding::Erasure::new_with_options(2, 2, BLOCK, false);
+                            let mut output = Vec::new();
+                            let outcome = erasure
+                                .decode_quantized_range_with_stripe_handles_and_reopeners(
+                                    &mut output,
+                                    setup.readers,
+                                    0,
+                                    4096,
+                                    FRAME,
+                                    None,
+                                    setup.deferred_stripe_handles,
+                                    setup.deferred_reopeners,
+                                    true,
+                                )
+                                .await;
+                            assert!(outcome.error.is_none(), "bounded default decode failed: {:?}", outcome.error);
+                            assert_eq!(outcome.written, 4096);
+                            assert_eq!(output, fixture.payload[..4096]);
+                        } else {
+                            fixture.assert_decode(setup, 0, fixture.payload.len()).await;
+                        }
+                        assert_eq!(
+                            calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                            u64::try_from(expected).expect("healthy decode must not open more shards")
+                        );
+                    }
+                },
+            ));
+            assert_eq!(recorder.counter_value(DECISIONS, &[("decision", "selected")]), 2);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_maps_second_block_second_frame_exactly() {
+            run(async {
+                let fixture = Fixture::new("q-batch-mapping", "second-block").await;
+                for (offset, length, wire_offset, wire_length) in
+                    [(SHARD, SHARD, 32832, 32832), (SHARD + FRAME, FRAME, 49248, 16416)]
+                {
+                    let mut setup = fixture
+                        .batch(offset, length)
+                        .await
+                        .expect("frame-aware q batch must be selected");
+                    assert_eq!(setup.available_shards(), 2);
+                    assert!(!setup.attempted[2] && !setup.attempted[3]);
+                    for index in 0..2 {
+                        let reader = setup.readers[index].as_mut().expect("selected data reader");
+                        let wire = tokio::fs::read(fixture.path(index))
+                            .await
+                            .expect("read persisted wire oracle");
+                        match reader.inner_ref() {
+                            ShardReader::InMemory(cursor) => {
+                                assert_eq!(cursor.get_ref().as_ref(), &wire[wire_offset..wire_offset + wire_length])
+                            }
+                            _ => panic!("batch must retain its owned encoded bytes"),
+                        }
+                        let mut output = vec![0; length];
+                        assert_eq!(reader.read(&mut output).await.expect("authenticate selected q frames"), length);
+                        assert_eq!(output, fixture.plain_shards[index][offset..offset + length]);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_rejects_second_frame_corruption_and_short_wire() {
+            run(async {
+                for fault in ["hash", "payload", "truncated"] {
+                    let mut fixture = Fixture::new("q-batch-wire-errors", fault).await;
+                    let path = fixture.path(0);
+                    let mut bytes = tokio::fs::read(&path).await.expect("read wire fault fixture");
+                    if fault == "truncated" {
+                        bytes.truncate(65663);
+                        fixture.disks[2] = None;
+                        fixture.disks[3] = None;
+                    } else {
+                        bytes[49248 + if fault == "payload" { HASH } else { 0 }] ^= 0x80;
+                    }
+                    tokio::fs::write(&path, bytes).await.expect("persist q wire fault");
+                    let mut setup = fixture
+                        .batch(SHARD, SHARD)
+                        .await
+                        .expect("q batch must classify real file outcomes");
+                    if fault == "truncated" {
+                        assert!(setup.readers[0].is_none());
+                        assert!(matches!(setup.errors[0].as_ref(), Some(DiskError::FileCorrupt)));
+                        assert!(!setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+                    } else {
+                        assert_eq!(setup.available_shards(), 2, "bitrot is detected during consumption");
+                        let mut output = b"pre".to_vec();
+                        let error = setup.readers[0]
+                            .as_mut()
+                            .expect("corrupt but openable source")
+                            .read_appending(&mut output, SHARD)
+                            .await
+                            .expect_err("the second q frame must fail authentication");
+                        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                        assert_eq!(&output[..3], b"pre");
+                        assert!(
+                            output[3..].is_empty() || output[3..] == fixture.plain_shards[0][SHARD..SHARD + FRAME],
+                            "only the previously verified first frame may be appended"
+                        );
+                    }
+                }
+            });
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_recovers_missing_primary_and_late_bitrot() {
+            run(async {
+                for fault in ["missing", "truncated", "late-bitrot"] {
+                    let fixture = Fixture::new("q-batch-recovery", fault).await;
+                    let path = fixture.path(0);
+                    if fault == "missing" {
+                        tokio::fs::remove_file(&path).await.expect("remove primary shard");
+                    } else {
+                        let mut bytes = tokio::fs::read(&path).await.expect("read recovery wire fixture");
+                        if fault == "truncated" {
+                            bytes.truncate(bytes.len() - 1);
+                        } else {
+                            bytes[2 * (SHARD + 2 * HASH) + HASH] ^= 0x80;
+                        }
+                        tokio::fs::write(&path, bytes).await.expect("persist recovery fault");
+                    }
+                    let calls = disk_call_counters::observe(&fixture.object);
+                    let logical_offset = if fault == "late-bitrot" { BLOCK } else { 0 };
+                    let shard_offset = if fault == "late-bitrot" { SHARD } else { 0 };
+                    let setup = fixture
+                        .setup(
+                            shard_offset,
+                            fixture.plain_shards[0].len() - shard_offset,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            true,
+                        )
+                        .await;
+                    assert_eq!(setup.available_shards(), 2);
+                    let attempts = if fault == "late-bitrot" { 2 } else { 3 };
+                    assert_eq!(setup.attempted_shards(), attempts);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN),
+                        u64::try_from(attempts).expect("fixture attempts fit u64")
+                    );
+                    assert!(!setup.attempted[3], "the last parity source stays unopened at setup");
+                    fixture
+                        .assert_decode(setup, logical_offset, fixture.payload.len() - logical_offset)
+                        .await;
+                }
+            });
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_verify_reconstruction_keeps_surplus() {
+            run(async {
+                let mut fixture = Fixture::new("q-batch-verify", "missing-data").await;
+                fixture.disks[0] = None;
+                let calls = disk_call_counters::observe(&fixture.object);
+                let setup = fixture
+                    .setup(0, fixture.plain_shards[0].len(), BitrotReaderSetupMode::VerifyReconstruction, true)
+                    .await;
+                assert_eq!(setup.available_shards(), 3, "verification retains one source beyond read quorum");
+                assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 3);
+                assert!(setup.ready[2] && setup.ready[3]);
+                fixture.assert_decode(setup, 0, fixture.payload.len()).await;
+            });
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn local_q_batch_preserves_fallbacks_wire_cap_and_resource_receipts() {
+            let recorder = run(async {
+                let mut fixture = Fixture::new("q-batch-fallbacks", "external").await;
+                let cap = FRAME.to_string();
+                temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some(cap.as_str()))], async {
+                    assert!(fixture.batch(0, FRAME).await.is_none(), "the cap includes the frame hash");
+                })
+                .await;
+                let cap = (FRAME + HASH).to_string();
+                temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some(cap.as_str()))], async {
+                    let setup = fixture.batch(0, FRAME).await.expect("an exact encoded cap admits q batch");
+                    assert_eq!(setup.available_shards(), 2);
+                })
+                .await;
+                fixture.files[0].data = Some(Bytes::from(tokio::fs::read(fixture.path(0)).await.expect("inline wire fixture")));
+                assert!(fixture.batch(0, FRAME).await.is_none(), "inline data keeps the normal reader path");
+                fixture.files[0].data = None;
+                let mut endpoint = Endpoint::try_from("http://127.0.0.1:1/disk").expect("remote placeholder endpoint");
+                endpoint.is_local = false;
+                let remote = new_disk(
+                    &endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("construct remote placeholder without connecting");
+                let local = fixture.disks[0].replace(remote);
+                assert!(fixture.batch(0, FRAME).await.is_none(), "remote slots are ineligible for local batch");
+                fixture.disks[0] = local;
+                crate::set_disk::with_get_object_read_policy(crate::set_disk::GetObjectReadPolicy::CopySource, async {
+                    let setup = fixture
+                        .setup(0, fixture.plain_shards[0].len(), BitrotReaderSetupMode::ReadQuorum, true)
+                        .await;
+                    fixture.assert_decode(setup, 0, fixture.payload.len()).await;
+                })
+                .await;
+                let setup = fixture
+                    .setup(0, fixture.plain_shards[0].len(), BitrotReaderSetupMode::ReadQuorum, false)
+                    .await;
+                fixture.assert_decode(setup, 0, fixture.payload.len()).await;
+
+                let memory = crate::disk::BackgroundMemoryBudget::new();
+                memory.set_sampled_limit(0, std::time::Duration::from_secs(30));
+                let (resources, _gates) = crate::disk::test_resource_units(1);
+                crate::disk::with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
+                    assert!(crate::disk::has_resource_io_scope());
+                    assert!(fixture.batch(0, FRAME).await.is_none(), "q batch cannot bypass a resource scope");
+                    match fixture.normal_frame().await {
+                        Err(DiskError::Io(error)) => assert!(crate::disk::background_memory::is_memory_pressure(&error)),
+                        Err(error) => panic!("unexpected normal-source failure: {error:?}"),
+                        Ok(Some(mut reader)) => {
+                            assert!(
+                                !matches!(reader.inner_ref(), ShardReader::InMemory(_)),
+                                "a denied allocation may fall back to a bounded resource reader"
+                            );
+                            let mut output = b"pre".to_vec();
+                            let error = reader
+                                .read_appending(&mut output, FRAME)
+                                .await
+                                .expect_err("the bounded q read must obey the closed scratch budget");
+                            assert!(crate::disk::background_memory::is_memory_pressure(&error));
+                            assert_eq!(output, b"pre");
+                        }
+                        Ok(None) => panic!("the real fixture source must remain present"),
+                    }
+                    assert_eq!(memory.snapshot().used, 0);
+                    let encoded_window = u64::try_from(FRAME + HASH).expect("window fits u64");
+                    memory.set_sampled_limit(encoded_window, std::time::Duration::from_secs(30));
+                    let reader = fixture
+                        .normal_frame()
+                        .await
+                        .expect("exact window budget admits the normal source")
+                        .expect("external q source exists");
+                    assert_eq!(memory.snapshot().used, encoded_window, "the source owns its memory receipt");
+                    drop(reader);
+                    assert_eq!(memory.snapshot().used, 0, "dropping the owned source releases its receipt");
+                })
+                .await;
+            });
+            for decision in [
+                "read_cap_exceeded",
+                "inline_data",
+                "non_local_shard",
+                "copy_source",
+                "mmap_disabled",
+            ] {
+                assert_eq!(recorder.counter_value(DECISIONS, &[("decision", decision)]), 1, "{decision}");
+            }
+            assert_eq!(
+                recorder.counter_value(DECISIONS, &[("decision", "selected")]),
+                1,
+                "only the exact-cap foreground probe may select the batch path"
+            );
+        }
+    }
+
+    #[cfg(unix)]
     async fn local_batch_quorum_fixture(
         bucket: &str,
         object: &str,
@@ -8463,6 +9737,7 @@ mod tests {
                             0,
                             5,
                             4,
+                            4,
                             HashAlgorithm::None,
                             false,
                             1,
@@ -8482,6 +9757,7 @@ mod tests {
                             object,
                             1,
                             0,
+                            4,
                             4,
                             4,
                             HashAlgorithm::HighwayHash256S,
@@ -8505,6 +9781,7 @@ mod tests {
                             object,
                             1,
                             0,
+                            4,
                             4,
                             4,
                             HashAlgorithm::None,
@@ -8538,6 +9815,7 @@ mod tests {
                             0,
                             4,
                             4,
+                            4,
                             HashAlgorithm::None,
                             false,
                             1,
@@ -8559,6 +9837,7 @@ mod tests {
                             0,
                             4,
                             4,
+                            4,
                             HashAlgorithm::None,
                             false,
                             1,
@@ -8578,6 +9857,7 @@ mod tests {
                             object,
                             1,
                             0,
+                            4,
                             4,
                             4,
                             HashAlgorithm::None,

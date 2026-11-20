@@ -16,13 +16,10 @@
 
 use super::*;
 use crate::app::RequestEnvelope;
-#[cfg(any(feature = "gateway-stack", test))]
 use crate::app::storage_api::multipart_usecase::contract::multipart::{MultipartAbortAuthorization, MultipartOwner};
 use http::StatusCode;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::{BucketName, ObjectKey, RecordedUpload, UploadIdClaim, resolve_upload, resolve_upload_async};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
-#[cfg(any(feature = "gateway-stack", test))]
 use std::sync::OnceLock;
 
 pub(crate) enum AbortMultipartUploadTarget {
@@ -31,7 +28,6 @@ pub(crate) enum AbortMultipartUploadTarget {
         key: String,
         upload_id: String,
     },
-    #[cfg(any(feature = "gateway-stack", test))]
     Gateway {
         bucket: BucketName,
         key: ObjectKey,
@@ -43,7 +39,6 @@ impl AbortMultipartUploadTarget {
     fn resource(&self) -> (&str, &str) {
         match self {
             Self::Legacy { bucket, key, .. } => (bucket, key),
-            #[cfg(any(feature = "gateway-stack", test))]
             Self::Gateway { bucket, key, .. } => (bucket.as_str(), key.as_str()),
         }
     }
@@ -79,7 +74,6 @@ impl DefaultMultipartUsecase {
                 let (bucket, key) = target.resource();
                 let mut opts = ObjectOptions::default();
                 apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
-                #[cfg(any(feature = "gateway-stack", test))]
                 if matches!(&target, AbortMultipartUploadTarget::Gateway { .. }) && opts.expected_bucket_incarnation_id.is_none()
                 {
                     return Err(S3Error::with_message(S3ErrorCode::InternalError, "bucket generation guard is missing"));
@@ -95,7 +89,6 @@ impl DefaultMultipartUsecase {
                         .abort_multipart_upload(bucket, key, upload_id, &opts)
                         .await
                         .map_err(multipart_upload_api_error)?,
-                    #[cfg(any(feature = "gateway-stack", test))]
                     AbortMultipartUploadTarget::Gateway { bucket, key, upload_id } => {
                         abort_gateway(&store, bucket, key, upload_id, opts).await?
                     }
@@ -112,10 +105,8 @@ impl DefaultMultipartUsecase {
     }
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 struct AbortOwner(MultipartOwner);
 
-#[cfg(any(feature = "gateway-stack", test))]
 impl RecordedUpload for AbortOwner {
     fn bucket(&self) -> &str {
         &self.0.bucket
@@ -126,7 +117,6 @@ impl RecordedUpload for AbortOwner {
     }
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 struct AbortAuthorization {
     bucket: BucketName,
     key: ObjectKey,
@@ -134,7 +124,6 @@ struct AbortAuthorization {
     observed: OnceLock<MultipartOwner>,
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 impl MultipartAbortAuthorization for AbortAuthorization {
     type Error = StorageError;
 
@@ -148,7 +137,6 @@ impl MultipartAbortAuthorization for AbortAuthorization {
     }
 }
 
-#[cfg(any(feature = "gateway-stack", test))]
 async fn abort_gateway(
     store: &ECStore,
     bucket: &BucketName,
