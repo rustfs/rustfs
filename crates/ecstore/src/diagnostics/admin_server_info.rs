@@ -316,16 +316,15 @@ pub async fn get_server_info_with_inventory(
             no_metadata: true,
             ..Default::default()
         };
-        let deadline = tokio::time::Instant::now() + crate::data_usage::ADMIN_USAGE_INCARNATION_TIMEOUT;
-        let namespace = if include_inventory {
-            Some(inventory::bounded_namespace(deadline, store.list_bucket_for_scanner(&namespace_options)).await)
+        let load_snapshot = load_server_info_usage_snapshot(store.clone());
+        let (snapshot, namespace) = if include_inventory {
+            let (snapshot, namespace, measured) =
+                inventory::collect(&store, load_snapshot, store.list_bucket_for_scanner(&namespace_options)).await;
+            inventory = Some(measured);
+            (snapshot, Some(namespace))
         } else {
-            None
+            (load_snapshot.await, None)
         };
-        let snapshot = load_server_info_usage_snapshot(store.clone()).await;
-        if let Some(namespace) = &namespace {
-            inventory = Some(inventory::collect(&store, namespace.as_ref().ok(), snapshot.as_ref().ok(), deadline).await);
-        }
         apply_data_usage_result(snapshot, &mut buckets, &mut objects, &mut versions, &mut delete_markers, &mut usage);
         if buckets.error.is_some() {
             let listing = inventory::namespace_or_fallback(namespace, store.list_bucket_for_scanner(&namespace_options)).await;

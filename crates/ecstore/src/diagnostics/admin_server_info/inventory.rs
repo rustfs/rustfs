@@ -6,19 +6,24 @@ use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::ClusterInventory;
 use std::collections::HashSet;
 
-use crate::data_usage::current_admin_bucket_incarnations;
+use crate::data_usage::{ADMIN_USAGE_INCARNATION_TIMEOUT, current_admin_bucket_incarnations};
+use crate::error::Result;
 use crate::store::ECStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(super) async fn collect(
     store: &Arc<ECStore>,
-    namespace: Option<&ScannerBucketListing>,
-    snapshot: Option<&DataUsageInfo>,
-    deadline: tokio::time::Instant,
-) -> ClusterInventory {
+    load_snapshot: impl Future<Output = Result<DataUsageInfo>>,
+    list_namespace: impl Future<Output = Result<ScannerBucketListing>>,
+) -> (Result<DataUsageInfo>, Result<ScannerBucketListing>, ClusterInventory) {
+    let snapshot = load_snapshot.await;
+    let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
+    let namespace = bounded_namespace(deadline, list_namespace).await;
     let mut current_ids = HashMap::new();
-    if let (Some(namespace), Some(snapshot)) = (namespace.filter(|listing| listing.topology_complete), snapshot) {
+    if let (Ok(namespace), Ok(snapshot)) = (&namespace, &snapshot)
+        && namespace.topology_complete
+    {
         let names = namespace
             .buckets
             .iter()
@@ -33,7 +38,8 @@ pub(super) async fn collect(
             .collect();
         current_ids = current_admin_bucket_incarnations(store.clone(), names, deadline).await;
     }
-    summarize(namespace, snapshot, &current_ids)
+    let measured = summarize(namespace.as_ref().ok(), snapshot.as_ref().ok(), &current_ids);
+    (snapshot, namespace, measured)
 }
 
 pub(super) async fn bounded_namespace(
@@ -191,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn inventory_excludes_stale_bucket_incarnations_from_a_stored_snapshot() {
+    async fn inventory_excludes_stale_bucket_incarnations_after_a_slow_cold_snapshot_refresh() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::config::com::save_config;
         use crate::data_usage::{DATA_USAGE_OBJ_NAME_PATH, invalidate_data_usage_snapshot_cache};
@@ -210,22 +216,21 @@ mod tests {
             .await
             .unwrap();
         invalidate_data_usage_snapshot_cache().await;
-        let listing = store
-            .list_bucket_for_scanner(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let loaded = super::super::load_server_info_usage_snapshot(store.clone()).await.unwrap();
-        assert_eq!(loaded.usage_snapshot_converged, Some(true));
-        let result = collect(
-            &store,
-            Some(&listing),
-            Some(&loaded),
-            tokio::time::Instant::now() + Duration::from_secs(2),
-        )
-        .await;
+        let options = BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        };
+        let cold_refresh = async {
+            // Model a refresh that outlasts the inventory budget; keep disk I/O
+            // on the real clock so its independent timeouts behave normally.
+            tokio::time::pause();
+            tokio::time::advance(ADMIN_USAGE_INCARNATION_TIMEOUT + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            super::super::load_server_info_usage_snapshot(store.clone()).await
+        };
+        let (loaded, listing, result) = collect(&store, cold_refresh, store.list_bucket_for_scanner(&options)).await;
+        assert_eq!(loaded.unwrap().usage_snapshot_converged, Some(true));
+        assert!(listing.unwrap().topology_complete);
         assert_eq!(result.current_buckets, Some(3));
         assert_eq!(result.measured_buckets, Some(1));
         assert_eq!(result.measured_objects, Some(4));
@@ -242,12 +247,10 @@ mod tests {
             .await
             .unwrap();
         invalidate_data_usage_snapshot_cache().await;
-        let loaded = super::super::load_server_info_usage_snapshot(store.clone()).await.unwrap();
-        let result = collect(
+        let (_, _, result) = collect(
             &store,
-            Some(&listing),
-            Some(&loaded),
-            tokio::time::Instant::now() + Duration::from_secs(2),
+            super::super::load_server_info_usage_snapshot(store.clone()),
+            store.list_bucket_for_scanner(&options),
         )
         .await;
         assert_eq!(result.measured_objects, Some(4));

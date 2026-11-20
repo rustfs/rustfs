@@ -983,7 +983,7 @@ pub struct Metrics {
     actions_latency: Vec<LockedLastMinuteLatency>,
     current_paths: Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
-    cluster_history: Mutex<ScannerAttemptHistory>,
+    last_cluster_attempt: Mutex<Option<ScannerAttemptRecord>>,
     // Lock order: cycle_info, usage_publication, then the observation's status. No awaits under either mutex.
     usage_publication: Mutex<Arc<ScannerUsagePublicationObservation>>,
     current_scan_mode: AtomicU8,
@@ -1225,12 +1225,6 @@ pub struct ScannerAttemptRecord {
     pub duration: Duration,
 }
 
-#[derive(Default)]
-struct ScannerAttemptHistory {
-    latest: Option<ScannerAttemptRecord>,
-    last_success_at: Option<Timestamp>,
-}
-
 /// Compact process-local state for a cluster status probe.
 pub struct ScannerNodeObservation {
     pub active: bool,
@@ -1240,7 +1234,6 @@ pub struct ScannerNodeObservation {
     pub started_at: Option<Timestamp>,
     pub objects_scanned: u64,
     pub last_attempt: Option<ScannerAttemptRecord>,
-    pub last_success_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2174,7 +2167,7 @@ impl Metrics {
                 .collect(),
             current_paths: Arc::new(RwLock::new(HashMap::new())),
             cycle_info: Arc::new(RwLock::new(None)),
-            cluster_history: Mutex::new(ScannerAttemptHistory::default()),
+            last_cluster_attempt: Mutex::new(None),
             usage_publication: Mutex::new(Arc::new(ScannerUsagePublicationObservation::default())),
             current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
             current_scan_cycle_work_active: AtomicBool::new(false),
@@ -3142,14 +3135,10 @@ impl Metrics {
     }
 
     /// Keep delayed results from an older coordinator from replacing a newer attempt.
-    pub fn record_cluster_attempt(&self, attempt: ScannerAttemptRecord, last_success_at: Option<Timestamp>) {
-        let mut history = self.cluster_history.lock().unwrap_or_else(|err| err.into_inner());
-        if history
-            .latest
-            .is_none_or(|old| (old.epoch, old.cycle) <= (attempt.epoch, attempt.cycle))
-        {
-            history.latest = Some(attempt);
-            history.last_success_at = history.last_success_at.max(last_success_at);
+    pub fn record_cluster_attempt(&self, attempt: ScannerAttemptRecord) {
+        let mut latest = self.last_cluster_attempt.lock().unwrap_or_else(|err| err.into_inner());
+        if latest.is_none_or(|old| (old.epoch, old.cycle) <= (attempt.epoch, attempt.cycle)) {
+            *latest = Some(attempt);
         }
     }
 
@@ -3167,8 +3156,7 @@ impl Metrics {
         let epoch = generation
             .scanner_epoch
             .filter(|_| !active || generation.cycle == Some(cycle_id));
-        let last_success_at = cycle.as_ref().and_then(CurrentCycle::last_success_at);
-        let history = self.cluster_history.lock().unwrap_or_else(|err| err.into_inner());
+        let last_attempt = *self.last_cluster_attempt.lock().unwrap_or_else(|err| err.into_inner());
         ScannerNodeObservation {
             active,
             leader: self.scanner_leader_lock_held.load(Ordering::Acquire),
@@ -3181,8 +3169,7 @@ impl Metrics {
             } else {
                 0
             },
-            last_attempt: history.latest,
-            last_success_at: last_success_at.max(history.last_success_at),
+            last_attempt,
         }
     }
 
@@ -5774,9 +5761,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_scanner_keeps_confirmed_history_when_leadership_moves() {
+    async fn cluster_scanner_keeps_last_attempt_when_leadership_moves() {
         let metrics = Metrics::new();
-        let when = Timestamp::constant(1_700_000_000, 1234);
         let previous = ScannerAttemptRecord {
             epoch: 7,
             cycle: 40,
@@ -5784,19 +5770,15 @@ mod tests {
             partial_reason: Some("runtime"),
             duration: Duration::from_secs(1801),
         };
-        metrics.record_cluster_attempt(previous, Some(when));
-        metrics.record_cluster_attempt(
-            ScannerAttemptRecord {
-                epoch: 6,
-                cycle: 100,
-                ..previous
-            },
-            None,
-        );
+        metrics.record_cluster_attempt(previous);
+        metrics.record_cluster_attempt(ScannerAttemptRecord {
+            epoch: 6,
+            cycle: 100,
+            ..previous
+        });
         metrics.set_cycle(None).await;
         let follower = metrics.scanner_node_observation().await;
         assert!(!follower.active);
-        assert_eq!(follower.last_success_at, Some(when));
         let history = follower.last_attempt.expect("previous leader's terminal record");
         assert_eq!(
             (history.epoch, history.cycle, history.result, history.partial_reason),

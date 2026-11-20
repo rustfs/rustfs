@@ -1516,7 +1516,6 @@ pub struct ScannerNodeSample {
     pub started_at: Option<Timestamp>,
     pub objects_scanned: u64,
     pub last_attempt: Option<ScannerAttemptSample>,
-    pub last_success_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -418,7 +418,6 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
             epoch: sample.epoch,
             started_at: sample.started_at,
             objects_scanned: sample.objects_scanned,
-            last_success_at: sample.last_success_at,
             last_attempt: sample
                 .last_attempt
                 .map(|attempt| rustfs_madmin::metrics::ScannerAttemptSample {
