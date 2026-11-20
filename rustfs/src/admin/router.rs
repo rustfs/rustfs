@@ -23,6 +23,7 @@ use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOpe
 use crate::admin::runtime_sources::{ServerContextSlot, current_object_store_handle, current_region, current_server_config};
 use crate::admin::storage_api::access::ReqInfo;
 use crate::admin::utils::{parse_query_pairs, query_value_exact, query_values_exact};
+use crate::app::RequestEnvelope;
 use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::license::license_check;
 #[cfg(test)]
@@ -34,6 +35,7 @@ use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
 use hyper::Uri;
+#[cfg(test)]
 use hyper::http::Extensions;
 use matchit::Params;
 use reqwest::Url;
@@ -54,12 +56,13 @@ use rustfs_utils::http::headers::{
 use s3s::Body;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
+#[cfg(test)]
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 #[cfg(test)]
 use s3s::auth::SigV4PathEncoding;
-use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, StreamingBlob, Timestamp, TimestampFormat};
+use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, Timestamp, TimestampFormat};
 use s3s::header;
 #[cfg(test)]
 use s3s::route::S3Route;
@@ -195,8 +198,8 @@ where
         .transpose()
 }
 
-fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: &str) -> S3Result<S3Request<GetObjectInput>> {
-    let filtered_uri = uri_without_query_key(&req.uri, "lambdaArn")?;
+fn build_object_lambda_get_request(req: &RequestEnvelope, bucket: &str, object: &str) -> S3Result<(Uri, GetObjectInput)> {
+    let filtered_uri = uri_without_query_key(req.uri(), "lambdaArn")?;
     let part_number = query_value_exact(&filtered_uri, "partNumber")
         .filter(|value| !value.is_empty())
         .map(|value| {
@@ -206,7 +209,7 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         })
         .transpose()?;
     let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
-    let range = parse_optional_header(&req.headers, header::RANGE)?
+    let range = parse_optional_header(req.headers(), header::RANGE)?
         .map(|value| {
             Range::parse(&value).map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Range header is invalid"))
         })
@@ -218,21 +221,21 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         .part_number(part_number)
         .version_id(version_id)
         .range(range)
-        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, header::IF_MATCH)?)
-        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(&req.headers, header::IF_NONE_MATCH)?)
-        .if_modified_since(parse_optional_timestamp_header(&req.headers, header::IF_MODIFIED_SINCE)?)
-        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, header::IF_UNMODIFIED_SINCE)?);
+        .if_match(parse_optional_etag_condition_header::<IfMatch>(req.headers(), header::IF_MATCH)?)
+        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(req.headers(), header::IF_NONE_MATCH)?)
+        .if_modified_since(parse_optional_timestamp_header(req.headers(), header::IF_MODIFIED_SINCE)?)
+        .if_unmodified_since(parse_optional_timestamp_header(req.headers(), header::IF_UNMODIFIED_SINCE)?);
 
     builder = builder.sse_customer_algorithm(parse_optional_header(
-        &req.headers,
+        req.headers(),
         HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm"),
     )?);
     builder = builder.sse_customer_key(parse_optional_header(
-        &req.headers,
+        req.headers(),
         HeaderName::from_static("x-amz-server-side-encryption-customer-key"),
     )?);
     builder = builder.sse_customer_key_md5(parse_optional_header(
-        &req.headers,
+        req.headers(),
         HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
     )?);
 
@@ -240,17 +243,7 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to build object lambda get request: {err}"))
     })?;
 
-    Ok(S3Request {
-        input,
-        method: req.method.clone(),
-        uri: filtered_uri,
-        headers: req.headers.clone(),
-        extensions: req.extensions.clone(),
-        credentials: req.credentials.clone(),
-        region: req.region.clone(),
-        service: req.service.clone(),
-        trailing_headers: req.trailing_headers.clone(),
-    })
+    Ok((filtered_uri, input))
 }
 
 fn parse_object_lambda_arn(uri: &Uri) -> S3Result<rustfs_targets::arn::ARN> {
@@ -462,15 +455,15 @@ fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
 }
 
-fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
-    let credentials = req.credentials.as_ref().ok_or_else(|| {
+fn build_object_lambda_source_url(req: &RequestEnvelope) -> S3Result<String> {
+    let credentials = req.credentials().ok_or_else(|| {
         S3Error::with_message(S3ErrorCode::AccessDenied, "object lambda source URL requires authenticated credentials")
     })?;
-    let host = extract_request_host(&req.headers, &req.uri).ok_or_else(|| {
+    let host = extract_request_host(req.headers(), req.uri()).ok_or_else(|| {
         S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda source URL requires a valid host header")
     })?;
-    let scheme = extract_request_scheme(&req.headers, &req.uri);
-    let filtered_uri = uri_without_query_key(&req.uri, "lambdaArn")?;
+    let scheme = extract_request_scheme(req.headers(), req.uri());
+    let filtered_uri = uri_without_query_key(req.uri(), "lambdaArn")?;
     let path_and_query = filtered_uri
         .path_and_query()
         .map(|value| value.as_str().to_string())
@@ -479,24 +472,25 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
         S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to construct object lambda source URL: {e}"))
     })?;
     let region = req
-        .region
-        .clone()
-        .or_else(|| current_region().map(Into::into))
-        .map(|value| value.as_str().to_string())
+        .region()
+        .map(str::to_owned)
+        .or_else(|| current_region().map(|region| region.as_str().to_owned()))
         .unwrap_or_else(|| "us-east-1".to_string());
-    let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
+    let session_token = get_session_token(req.uri(), req.headers()).unwrap_or_default().to_string();
 
     let presigned = pre_sign_v4(
         http::Request::builder()
             .method(Method::GET)
             .uri(source_uri)
             .header(http::header::HOST, host)
-            .body(Body::default())
+            .body(())
             .map_err(|e| {
                 S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to build object lambda source request: {e}"))
             })?,
-        &credentials.access_key,
-        credentials.secret_key.expose(),
+        credentials.access_key(),
+        credentials.secret_key().ok_or_else(|| {
+            S3Error::with_message(S3ErrorCode::AccessDenied, "object lambda source URL requires signing credentials")
+        })?,
         &session_token,
         &region,
         OBJECT_LAMBDA_PRESIGN_EXPIRES_SECS,
@@ -507,14 +501,14 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
 }
 
 fn build_object_lambda_event_payload(
-    req: &S3Request<Body>,
+    req: &RequestEnvelope,
     lambda_arn: &str,
     input_s3_url: &str,
     output_route: &str,
     output_token: &str,
 ) -> S3Result<Vec<u8>> {
     let request_headers = req
-        .headers
+        .headers()
         .iter()
         .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.to_string(), value.to_string())))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -529,7 +523,7 @@ fn build_object_lambda_event_payload(
             "accessPointArn": lambda_arn,
         },
         "userRequest": {
-            "url": req.uri.to_string(),
+            "url": req.uri().to_string(),
             "headers": request_headers,
         },
         "protocolVersion": "rustfs-object-lambda-1.0",
@@ -766,8 +760,8 @@ fn build_object_lambda_passthrough_response(
     mut response_headers: HeaderMap,
     lambda_headers: &HeaderMap,
     status: StatusCode,
-    body: Body,
-) -> S3Response<Body> {
+    body: rustfs_s3_types::Body,
+) -> AdminResponse {
     clear_object_lambda_variant_headers(&mut response_headers);
     for (name, value) in lambda_headers {
         if !is_disallowed_object_lambda_response_header(name) && name != "x-amz-request-route" && name != "x-amz-request-token" {
@@ -775,23 +769,18 @@ fn build_object_lambda_passthrough_response(
         }
     }
 
-    S3Response {
-        output: body,
-        status: Some(status),
-        headers: response_headers,
-        extensions: Extensions::new(),
-    }
+    AdminResponse::with_headers(status, body, response_headers)
 }
 
 async fn invoke_object_lambda_target(
-    req: &S3Request<Body>,
+    req: &RequestEnvelope,
     bucket: &str,
     object: &str,
     get_resp: S3Response<GetObjectOutput>,
-) -> S3Result<S3Response<Body>> {
-    let lambda_config = resolve_object_lambda_webhook_config(&req.uri).await?;
+) -> S3Result<AdminResponse> {
+    let lambda_config = resolve_object_lambda_webhook_config(req.uri()).await?;
     let client = build_object_lambda_http_client(&lambda_config)?;
-    let lambda_arn = query_value_exact(&req.uri, "lambdaArn")
+    let lambda_arn = query_value_exact(req.uri(), "lambdaArn")
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::InvalidRequest, "lambdaArn query parameter must be provided exactly once")
@@ -813,7 +802,7 @@ async fn invoke_object_lambda_target(
         .post(lambda_config.endpoint)
         .header("x-rustfs-object-lambda-bucket", bucket)
         .header("x-rustfs-object-lambda-key", object)
-        .header("x-rustfs-object-lambda-request-uri", req.uri.to_string())
+        .header("x-rustfs-object-lambda-request-uri", req.uri().to_string())
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(event_payload);
 
@@ -839,19 +828,19 @@ async fn invoke_object_lambda_target(
     if status.is_success() {
         validate_object_lambda_response_auth_headers(&lambda_headers, &output_route, &output_token)?;
     }
-    let body = Body::from(StreamingBlob::wrap(lambda_response.bytes_stream()));
+    let body = rustfs_s3_types::Body::from_stream(lambda_response.bytes_stream());
     Ok(build_object_lambda_passthrough_response(response_headers, &lambda_headers, status, body))
 }
 
-async fn authorize_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, object: &str) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+async fn authorize_object_lambda_request(req: &mut RequestEnvelope, bucket: &str, object: &str) -> S3Result<()> {
+    let Some(input_cred) = req.credentials() else {
         return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required"));
     };
 
     let (cred, is_owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-    req.extensions.insert(ReqInfo {
+    req.install_req_info(ReqInfo {
         cred: Some(cred),
         is_owner,
         bucket: Some(bucket.to_owned()),
@@ -881,31 +870,24 @@ async fn authorize_object_lambda_request(req: &mut S3Request<Body>, bucket: &str
 }
 
 async fn authorized_object_lambda_get_request(
-    req: &S3Request<Body>,
+    req: &RequestEnvelope,
     bucket: &str,
     object: &str,
-) -> S3Result<(crate::app::RequestEnvelope, GetObjectInput)> {
-    let get_req = build_object_lambda_get_request(req, bucket, object)?;
-    let slot = req
-        .extensions
-        .get::<Arc<ServerContextSlot>>()
-        .cloned()
-        .ok_or_else(server_context_not_ready_error)?;
-    let (bucket, key, version) = (get_req.input.bucket.clone(), get_req.input.key.clone(), get_req.input.version_id.clone());
-    let mut envelope = crate::app::RequestEnvelope::from_s3s(&get_req);
-    crate::admin::storage_api::access::authorize_get_object(&slot, &mut envelope, &bucket, &key, version.as_deref()).await?;
-    Ok((envelope, get_req.input))
+) -> S3Result<(RequestEnvelope, GetObjectInput)> {
+    let (uri, input) = build_object_lambda_get_request(req, bucket, object)?;
+    let slot = req.server_context().ok_or_else(server_context_not_ready_error)?;
+    let mut envelope = req.fork_for_authorization();
+    *envelope.uri_mut() = uri;
+    crate::admin::storage_api::access::authorize_get_object(slot, &mut envelope, bucket, object, input.version_id.as_deref())
+        .await?;
+    Ok((envelope, input))
 }
 
-async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, object: &str) -> S3Result<S3Response<Body>> {
-    authorize_object_lambda_request(req, bucket, object).await?;
-    validate_object_lambda_query(&req.uri)?;
-    let (envelope, get_input) = authorized_object_lambda_get_request(req, bucket, object).await?;
-    let slot = req
-        .extensions
-        .get::<Arc<ServerContextSlot>>()
-        .cloned()
-        .ok_or_else(server_context_not_ready_error)?;
+async fn handle_object_lambda_request(mut req: RequestEnvelope, bucket: &str, object: &str) -> S3Result<AdminResponse> {
+    authorize_object_lambda_request(&mut req, bucket, object).await?;
+    validate_object_lambda_query(req.uri())?;
+    let (envelope, get_input) = authorized_object_lambda_get_request(&req, bucket, object).await?;
+    let slot = req.server_context().ok_or_else(server_context_not_ready_error)?;
     let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(slot.app_context());
     rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
     let crate::app::Answered { output, status, headers } = usecase
@@ -918,7 +900,7 @@ async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, o
     );
     get_resp.status = status;
     get_resp.headers = headers;
-    invoke_object_lambda_target(req, bucket, object, get_resp).await
+    invoke_object_lambda_target(&req, bucket, object, get_resp).await
 }
 
 /// The bucket and key of an Object Lambda request, which takes precedence over every other route
@@ -934,26 +916,7 @@ pub(crate) async fn serve_object_lambda(
     bucket: &str,
     object: &str,
 ) -> rustfs_s3_types::S3Result<AdminResponse> {
-    let mut req = S3Request {
-        input: Body::empty(),
-        method: envelope.method().clone(),
-        uri: envelope.uri().clone(),
-        headers: envelope.headers().clone(),
-        extensions: envelope.transport_extensions(),
-        credentials: envelope.credentials().map(|credentials| s3s::auth::Credentials {
-            access_key: credentials.access_key().to_owned(),
-            secret_key: credentials.secret_key().unwrap_or_default().to_owned().into(),
-        }),
-        region: envelope.region().and_then(|region| region.parse().ok()),
-        service: envelope.service().map(str::to_owned),
-        trailing_headers: None,
-    };
-    let response = Box::pin(handle_object_lambda_request(&mut req, bucket, object)).await?;
-    Ok(AdminResponse::with_headers(
-        response.status.unwrap_or_default(),
-        response.output.into(),
-        response.headers,
-    ))
+    Ok(Box::pin(handle_object_lambda_request(envelope, bucket, object)).await?)
 }
 
 pub struct S3Router<T> {
@@ -1158,7 +1121,8 @@ where
             }
         }
         if let Some((bucket, object)) = parse_object_lambda_request(&req.method, &req.uri) {
-            return Box::pin(handle_object_lambda_request(&mut req, &bucket, &object)).await;
+            let response = Box::pin(handle_object_lambda_request(RequestEnvelope::from_s3s(&req), &bucket, &object)).await?;
+            return Ok(legacy_admin_response(response));
         }
         // Extension routes are claimed ahead of the console.
         // Console requests should be handled by console router first (including OPTIONS)
@@ -1177,10 +1141,7 @@ where
         }
 
         let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        let (status, headers, body) = dispatch(self, envelope, req.input.into()).await?.into_parts();
-        let mut response = S3Response::with_headers(body.into(), headers);
-        response.status = Some(status);
-        Ok(response)
+        Ok(legacy_admin_response(dispatch(self, envelope, req.input.into()).await?))
     }
 }
 
@@ -1335,7 +1296,7 @@ mod tests {
                     req.extensions.insert(slot.clone());
                     req.extensions.insert(ReqInfo::default());
                     req.headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
-                    let result = authorized_object_lambda_get_request(&req, &bucket, "object").await;
+                    let result = authorized_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), &bucket, "object").await;
                     // Version-only Allow covers current reads; Version Deny overrides
                     // the explicit current-read Allow as well as version grants.
                     if deny_versions || (version.is_some() && !grant_versions) {
@@ -2105,56 +2066,41 @@ mod tests {
         lambda_headers.insert("x-amz-request-route", HeaderValue::from_static("route-token"));
         lambda_headers.insert("x-amz-request-token", HeaderValue::from_static("request-token"));
 
-        let response = build_object_lambda_passthrough_response(
+        let (status, headers, _) = build_object_lambda_passthrough_response(
             upstream_headers,
             &lambda_headers,
             StatusCode::BAD_GATEWAY,
-            Body::from("lambda failed".to_string()),
-        );
+            OwnedBody::from("lambda failed"),
+        )
+        .into_parts();
 
-        assert_eq!(response.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(
-            response
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
+            headers.get(http::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
         assert_eq!(
-            response
-                .headers
-                .get("x-rustfs-lambda-error")
-                .and_then(|value| value.to_str().ok()),
+            headers.get("x-rustfs-lambda-error").and_then(|value| value.to_str().ok()),
             Some("upstream")
         );
-        assert!(response.headers.get(http::header::CONTENT_LENGTH).is_none());
-        assert!(response.headers.get("x-amz-meta-demo").is_none());
-        assert!(response.headers.get(http::header::CONNECTION).is_none());
-        assert!(response.headers.get("x-amz-request-route").is_none());
-        assert!(response.headers.get("x-amz-request-token").is_none());
-        assert_eq!(response.headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()), Some("v1"));
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(headers.get("x-amz-meta-demo").is_none());
+        assert!(headers.get(http::header::CONNECTION).is_none());
+        assert!(headers.get("x-amz-request-route").is_none());
+        assert!(headers.get("x-amz-request-token").is_none());
+        assert_eq!(headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()), Some("v1"));
     }
 
     #[test]
     fn build_object_lambda_source_url_presigns_request_without_lambda_arn() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::GET,
-            uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook&versionId=v1"
-                .parse()
-                .expect("uri should parse"),
-            headers: HeaderMap::from_iter([(http::header::HOST, HeaderValue::from_static("localhost:9000"))]),
-            extensions: http::Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: "rustfsadmin".to_string(),
-                secret_key: s3s::auth::SecretKey::from("rustfssecret"),
-            }),
-            region: current_region().map(Into::into),
-            service: None,
-            trailing_headers: None,
-        };
-
-        let source_url = build_object_lambda_source_url(&req).expect("source url should build");
+        let request = crate::admin::operation::test_support::TestRequest::new(
+            Method::GET,
+            "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook&versionId=v1",
+        )
+        .header("host", "localhost:9000")
+        .credentials("rustfsadmin", "rustfssecret", None)
+        .build();
+        let source_url = build_object_lambda_source_url(request.envelope()).expect("source url should build");
         let source_url = Url::parse(&source_url).expect("source url should parse");
         let query_pairs = source_url.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
 
@@ -2168,6 +2114,16 @@ mod tests {
         assert_eq!(expires, Some(3600));
         assert_eq!(query_pairs.get("X-Amz-Algorithm").map(|value| value.as_ref()), Some("AWS4-HMAC-SHA256"));
         assert!(query_pairs.contains_key("X-Amz-Signature"));
+    }
+
+    #[test]
+    fn object_lambda_requires_a_signing_secret_for_its_source_url() {
+        let request = crate::admin::operation::test_support::TestRequest::new(Method::GET, "/bucket/object?lambdaArn=test")
+            .header("host", "localhost:9000")
+            .credentials_without_secret("verified-user", None)
+            .build();
+        let error = build_object_lambda_source_url(request.envelope()).expect_err("identity alone cannot sign a GET");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
     }
 
     #[test]
@@ -2187,7 +2143,7 @@ mod tests {
         };
 
         let payload = build_object_lambda_event_payload(
-            &req,
+            &RequestEnvelope::from_s3s(&req),
             "arn:acme:s3-object-lambda::transformer:webhook",
             "https://example.com/source",
             "route-123",
@@ -2495,22 +2451,23 @@ mod tests {
         req.headers
             .insert(http::header::IF_MATCH, HeaderValue::from_static("\"abc\""));
 
-        let bridged = build_object_lambda_get_request(&req, "demo-bucket", "object.txt").expect("bridge request should build");
+        let (uri, input) = build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt")
+            .expect("bridge request should build");
 
-        assert_eq!(bridged.uri.path(), "/demo-bucket/object.txt");
-        assert_eq!(bridged.uri.query(), Some("versionId=v1&partNumber=7"));
-        assert_eq!(bridged.input.bucket, "demo-bucket");
-        assert_eq!(bridged.input.key, "object.txt");
-        assert_eq!(bridged.input.version_id.as_deref(), Some("v1"));
-        assert_eq!(bridged.input.part_number, Some(7));
+        assert_eq!(uri.path(), "/demo-bucket/object.txt");
+        assert_eq!(uri.query(), Some("versionId=v1&partNumber=7"));
+        assert_eq!(input.bucket, "demo-bucket");
+        assert_eq!(input.key, "object.txt");
+        assert_eq!(input.version_id.as_deref(), Some("v1"));
+        assert_eq!(input.part_number, Some(7));
         assert_eq!(
-            bridged.input.range,
+            input.range,
             Some(Range::Int {
                 first: 5,
                 last: Some(10)
             })
         );
-        assert!(bridged.input.if_match.is_some());
+        assert!(input.if_match.is_some());
     }
 
     #[test]
@@ -2531,7 +2488,8 @@ mod tests {
         req.headers
             .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-5"));
 
-        let err = build_object_lambda_get_request(&req, "demo-bucket", "object.txt").expect_err("invalid range must fail");
+        let err = build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt")
+            .expect_err("invalid range must fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2985,6 +2943,14 @@ pub struct Extra {
     pub credentials: Option<s3s::auth::Credentials>,
     pub region: Option<s3s::region::Region>,
     pub service: Option<String>,
+}
+
+#[cfg(test)]
+fn legacy_admin_response(response: AdminResponse) -> S3Response<Body> {
+    let (status, headers, body) = response.into_parts();
+    let mut answer = S3Response::with_headers(body.into(), headers);
+    answer.status = Some(status);
+    answer
 }
 
 #[cfg(test)]
