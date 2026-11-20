@@ -155,6 +155,8 @@ mod legacy_edge;
 #[cfg(test)]
 pub(crate) use legacy_edge::complete_multipart_upload_input;
 #[cfg(test)]
+pub(crate) use legacy_edge::copy_input_from_legacy;
+#[cfg(test)]
 pub(crate) use legacy_edge::list_objects_v2_through_legacy_edge;
 
 #[async_trait::async_trait]

@@ -22,7 +22,6 @@ use super::*;
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_object_if_none_match_existing_object_returns_precondition_failed() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-put-if-none-match-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -39,7 +38,7 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
         .content_length(Some(initial_payload.len() as i64))
         .build()
         .unwrap();
-    Box::pin(usecase.execute_put_object(&fs, build_request(initial_input, Method::PUT)))
+    Box::pin(put_owned(&usecase, build_request(initial_input, Method::PUT)))
         .await
         .expect("Failed to upload initial object through usecase");
 
@@ -73,7 +72,7 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
             let mut req = build_request(replacement_input, Method::PUT);
             req.headers.insert(IF_NONE_MATCH, header.clone());
 
-            let err = Box::pin(usecase.execute_put_object(&fs, req))
+            let err = Box::pin(put_owned(&usecase, req))
                 .await
                 .expect_err("conditional PUT must reject the replacement");
             assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
@@ -108,7 +107,6 @@ async fn put_object_computes_replication_decision_exactly_once() {
     use std::sync::atomic::Ordering;
 
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-repl-decision-once-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -129,7 +127,7 @@ async fn put_object_computes_replication_decision_exactly_once() {
         .content_length(Some(payload.len() as i64))
         .build()
         .unwrap();
-    Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT)))
+    Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
         .await
         .expect("Failed to upload object through usecase");
 
@@ -207,7 +205,7 @@ async fn put_object_extract_computes_replication_decision_per_entry() {
         .unwrap();
     let mut req = build_request(input, Method::PUT);
     req.extensions.insert(ReqInfo::default());
-    Box::pin(usecase.execute_put_object_extract(req))
+    Box::pin(put_extract_owned(&usecase, req))
         .await
         .expect("Failed to extract archive through usecase");
 
@@ -218,4 +216,27 @@ async fn put_object_extract_computes_replication_decision_per_entry() {
          object; 0 means extracted objects bypass bucket replication (P0-6 companion, MinIO \
          PutObjectExtract parity)"
     );
+}
+
+/// PutObject through the owned entry point the gateway handler calls, its error in the s3s form
+/// these tests compare.
+async fn put_owned(
+    usecase: &DefaultObjectUsecase,
+    req: S3Request<PutObjectInput>,
+) -> s3s::S3Result<crate::app::object_usecase::PutObjectWriteOutput> {
+    let (envelope, input) = crate::app::object_usecase::PutObjectWriteInput::from_test_request(req);
+    Box::pin(usecase.execute_put_object_owned(envelope, input))
+        .await
+        .map_err(Into::into)
+}
+
+/// As [`put_owned`], through the archive-extraction entry point.
+async fn put_extract_owned(
+    usecase: &DefaultObjectUsecase,
+    req: S3Request<PutObjectInput>,
+) -> s3s::S3Result<crate::app::object_usecase::PutObjectWriteOutput> {
+    let (envelope, input) = crate::app::object_usecase::PutObjectWriteInput::from_test_request(req);
+    Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
+        .await
+        .map_err(Into::into)
 }

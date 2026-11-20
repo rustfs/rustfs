@@ -2111,23 +2111,26 @@ mod tests {
             );
             if let Some(action) = secondary_action {
                 assert_eq!(
-                    block.matches("authorize_admin_envelope(").count(),
-                    1,
-                    "{handler} must perform exactly one secondary capability check"
+                    block.matches("validate_admin_request(").count(),
+                    2,
+                    "{handler} must perform primary and secondary capability checks"
                 );
                 assert!(block.contains(&format!("AdminAction::{action}")), "{handler} must probe {action}");
-                let primary = block.find("validate_admin_request(").expect("explicit primary gate");
-                let secondary = block.find("authorize_admin_envelope(").expect("secondary capability gate");
+                let primary = block
+                    .find("AdminAction::CreateUserAdminAction")
+                    .expect("explicit primary gate");
+                let secondary = block
+                    .find(&format!("AdminAction::{action}"))
+                    .expect("secondary capability gate");
                 assert!(
                     primary < secondary,
                     "{handler} must complete primary authorization before the secondary capability check"
                 );
-            } else {
-                assert!(
-                    !block.contains("authorize_admin_envelope("),
-                    "{handler} must not use a secondary shared gate"
-                );
             }
+            assert!(
+                !block.contains("authorize_admin_envelope("),
+                "{handler} must not use a secondary shared gate"
+            );
         }
     }
 }

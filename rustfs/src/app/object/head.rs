@@ -1246,15 +1246,13 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("head-metadata-permissions", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
             use crate::app::storage_api::test::ReqInfo;
-            use crate::app::storage_api::test::S3Access as _;
+            use crate::app::storage_api::test::authorize_head_object;
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-            use crate::app::storage_api::test::ecfs::FS;
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let fs = FS::with_server_ctx(slot.clone());
             let usecase = DefaultObjectUsecase::with_context(Some(context));
             let bucket = format!("head-metadata-{}", Uuid::new_v4().simple());
             store
@@ -1310,7 +1308,7 @@ mod tests {
                     .unwrap();
                 let version_id = object.version_id.map(|version| version.to_string());
                 for (version, tagging_directive) in [(None, false), (None, true), (version_id, true)] {
-                    let mut req = head_input(&bucket, "protected", version);
+                    let mut req = head_input(&bucket, "protected", version.clone());
                     if tagging_directive {
                         req.headers
                             .insert(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER, HeaderValue::from_static("ACCESS"));
@@ -1321,11 +1319,14 @@ mod tests {
                         req.headers
                             .insert("x-rustfs-source-replication-check", HeaderValue::from_static("true"));
                     }
-                    fs.head_object(&mut req).await.expect("ordinary HEAD read is permitted");
-                    let response = Box::pin(crate::app::test_seams::head_object(&usecase, req))
+                    let mut envelope = RequestEnvelope::from_s3s(&req);
+                    authorize_head_object(&slot, &mut envelope, &bucket, "protected", version.as_deref())
+                        .await
+                        .expect("ordinary HEAD read is permitted");
+                    let response = Box::pin(usecase.execute_head_object_fields(envelope, HeadObjectFields::from_s3s(req.input)))
                         .await
                         .expect("HEAD succeeds");
-                    assert_eq!(response.output.content_length, Some(4));
+                    assert_eq!(response.output.dto.content_length, Some(4));
                     for header in [
                         AMZ_TAG_COUNT,
                         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
