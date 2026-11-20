@@ -879,32 +879,32 @@ async fn authorized_object_lambda_get_request(
     req: &S3Request<Body>,
     bucket: &str,
     object: &str,
-) -> S3Result<S3Request<GetObjectInput>> {
-    let mut get_req = build_object_lambda_get_request(req, bucket, object)?;
+) -> S3Result<(crate::app::RequestEnvelope, GetObjectInput)> {
+    let get_req = build_object_lambda_get_request(req, bucket, object)?;
     let slot = req
         .extensions
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
     let (bucket, key, version) = (get_req.input.bucket.clone(), get_req.input.key.clone(), get_req.input.version_id.clone());
-    crate::admin::storage_api::access::authorize_get_object(&slot, &mut get_req, &bucket, &key, version.as_deref()).await?;
-    Ok(get_req)
+    let mut envelope = crate::app::RequestEnvelope::from_s3s(&get_req);
+    crate::admin::storage_api::access::authorize_get_object(&slot, &mut envelope, &bucket, &key, version.as_deref()).await?;
+    Ok((envelope, get_req.input))
 }
 
 async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, object: &str) -> S3Result<S3Response<Body>> {
     authorize_object_lambda_request(req, bucket, object).await?;
     validate_object_lambda_query(&req.uri)?;
-    let get_req = authorized_object_lambda_get_request(req, bucket, object).await?;
-    let slot = get_req
+    let (envelope, get_input) = authorized_object_lambda_get_request(req, bucket, object).await?;
+    let slot = req
         .extensions
         .get::<Arc<ServerContextSlot>>()
         .cloned()
         .ok_or_else(server_context_not_ready_error)?;
     let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(slot.app_context());
     rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
-    let envelope = crate::app::RequestEnvelope::from_s3s(&get_req);
     let crate::app::Answered { output, status, headers } = usecase
-        .execute_get_object_fields(envelope, crate::app::object_usecase::GetObjectFields::from_s3s(get_req.input))
+        .execute_get_object_fields(envelope, crate::app::object_usecase::GetObjectFields::from_s3s(get_input))
         .await?;
     let mut get_resp = S3Response::new(
         output
@@ -1330,16 +1330,16 @@ mod tests {
                     // Version-only Allow covers current reads; Version Deny overrides
                     // the explicit current-read Allow as well as version grants.
                     if deny_versions || (version.is_some() && !grant_versions) {
-                        assert_eq!(
-                            result
-                                .expect_err("version read must be denied before usecase or webhook")
-                                .code(),
-                            &s3s::S3ErrorCode::AccessDenied
-                        );
+                        let Err(err) = result else {
+                            panic!("version read must be denied before usecase or webhook");
+                        };
+                        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
                     } else {
-                        let request = result.expect("authorized read remains available");
-                        assert_eq!(request.input.version_id.as_deref(), version);
-                        assert_eq!(request.extensions.get::<ReqInfo>().unwrap().version_id.as_deref(), version);
+                        let Ok((envelope, input)) = result else {
+                            panic!("authorized read remains available");
+                        };
+                        assert_eq!(input.version_id.as_deref(), version);
+                        assert_eq!(envelope.req_info().unwrap().version_id.as_deref(), version);
                     }
                 }
             }

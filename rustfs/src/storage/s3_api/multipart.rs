@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+#[cfg(test)]
 use crate::storage::storage_api::effective_storage_class;
-use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
+#[cfg(test)]
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::ListPartsInfo;
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
+#[cfg(test)]
 use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
+#[cfg(test)]
 use s3s::dto::{ListPartsOutput, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
@@ -34,6 +40,7 @@ pub(crate) struct ListMultipartUploadsParams {
     pub max_uploads: usize,
 }
 
+#[cfg(test)]
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();

@@ -29,7 +29,7 @@ use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::storage_api::s3::dto::{EncodingType, ListObjectVersionsInput, ListObjectsV2Input};
 use crate::app::storage_api::s3::xml;
-use crate::storage::access::access_owned::listing_multipart::authorize_bucket_listing;
+use crate::storage::access_owned::listing_multipart::authorize_bucket_listing;
 use crate::storage::authorization::AuthorizationRequest;
 use http::{HeaderMap, Uri};
 use rustfs_policy::policy::action::S3Action;

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contract tests for how api_coverage.py finds `impl S3 for FS` across the ECFS source set."""
+"""Contract tests for the registered gateway operation inventory."""
 
 from __future__ import annotations
 
@@ -26,66 +26,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import api_coverage  # noqa: E402
 
-IMPL = "impl S3 for FS {\n    async fn get_object(&self) {}\n    async fn put_object(&self) {}\n}\n"
-
-
 class ImplementedOperationsTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.handlers = self.root / api_coverage.HANDLERS
+        self.handlers.mkdir(parents=True)
+        self.write("mod", "static OPERATIONS: OperationTable = &[write::ROWS];")
 
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+    def write(self, module: str, source: str) -> None:
+        (self.handlers / f"{module}.rs").write_text(source, encoding="utf-8")
 
-    def write(self, relative: str, text: str) -> None:
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+    def rows(self, items: str) -> None:
+        self.write("write", f"const ROWS: &[OpRow] = &[{items}];")
 
-    def test_reads_the_impl_from_ecfs_when_the_split_directory_is_absent(self) -> None:
-        self.write(api_coverage.ECFS_PATH, "struct FS;\n" + IMPL)
+    def test_only_installed_rows_count(self) -> None:
+        self.rows("row::<dto::ListObjectsV2>(), super::post::ROW,")
+        self.write("post", "const ROW: OpRow = OpRow { name: dto::PostObject::NAME, register: bind };")
+        self.write("unused", "const ROWS: &[OpRow] = &[row::<dto::DeleteObject>()];")
+        self.assertEqual(api_coverage.implemented_operations(self.root), {"list_objects_v2", "post_object"})
 
-        self.assertEqual(api_coverage.implemented_operations(self.root), {"get_object", "put_object"})
-
-    def test_finds_the_impl_after_it_moves_into_the_split_directory(self) -> None:
-        self.write(api_coverage.ECFS_PATH, "struct FS;\n")
-        self.write(f"{api_coverage.ECFS_SPLIT_DIR}/s3_impl.rs", IMPL)
-        self.write(f"{api_coverage.ECFS_SPLIT_DIR}/bucket_core.rs", "impl FS {\n    async fn helper(&self) {}\n}\n")
-
-        self.assertEqual(api_coverage.implemented_operations(self.root), {"get_object", "put_object"})
-
-    def test_missing_ecfs_fails_even_when_the_split_directory_holds_the_impl(self) -> None:
-        self.write(f"{api_coverage.ECFS_SPLIT_DIR}/s3_impl.rs", IMPL)
-
-        with self.assertRaisesRegex(RuntimeError, "ecfs.rs is missing"):
+    def test_missing_family_fails(self) -> None:
+        with self.assertRaises(FileNotFoundError):
             api_coverage.implemented_operations(self.root)
 
-    def test_an_impl_in_both_ecfs_and_the_split_directory_fails(self) -> None:
-        self.write(api_coverage.ECFS_PATH, IMPL)
-        self.write(f"{api_coverage.ECFS_SPLIT_DIR}/s3_impl.rs", IMPL)
-
-        with self.assertRaisesRegex(RuntimeError, "exactly once.*found 2"):
+    def test_duplicate_registration_fails(self) -> None:
+        self.rows("row::<dto::GetObject>(), row::<dto::GetObject>()")
+        with self.assertRaisesRegex(ValueError, "duplicate"):
             api_coverage.implemented_operations(self.root)
 
-    def test_no_impl_anywhere_fails(self) -> None:
-        self.write(api_coverage.ECFS_PATH, "struct FS;\n")
-        self.write(f"{api_coverage.ECFS_SPLIT_DIR}/bucket_core.rs", "impl FS {}\n")
-
-        with self.assertRaisesRegex(RuntimeError, "found 0"):
+    def test_unknown_registration_fails(self) -> None:
+        self.rows("other_registration()")
+        with self.assertRaisesRegex(ValueError, "unknown registration"):
             api_coverage.implemented_operations(self.root)
 
-    def test_an_impl_in_a_non_rust_file_of_the_split_directory_is_not_source(self) -> None:
-        self.write(api_coverage.ECFS_PATH, "struct FS;\n")
-        self.write(f"{api_coverage.ECFS_SPLIT_DIR}/notes.md", IMPL)
-
-        with self.assertRaisesRegex(RuntimeError, "found 0"):
-            api_coverage.implemented_operations(self.root)
-
-    def test_a_split_path_that_is_a_file_fails(self) -> None:
-        self.write(api_coverage.ECFS_PATH, IMPL)
-        self.write(api_coverage.ECFS_SPLIT_DIR, "stray\n")
-
-        with self.assertRaisesRegex(RuntimeError, "not a directory"):
+    def test_missing_custom_row_fails(self) -> None:
+        self.rows("super::post::ROW")
+        self.write("post", "const DIFFERENT: OpRow = OpRow { name: dto::PostObject::NAME, register: bind };")
+        with self.assertRaisesRegex(ValueError, "missing or ambiguous"):
             api_coverage.implemented_operations(self.root)
 
 

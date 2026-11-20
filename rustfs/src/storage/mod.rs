@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
 pub(crate) mod access_owned;
 pub(crate) mod authorization;
 pub(crate) mod authorization_actions;
 pub mod concurrency;
 pub mod deadlock_detector;
 pub(crate) mod denial_audit;
-pub mod ecfs;
 pub(crate) mod helper;
 pub mod options;
 pub(crate) mod req_info;
@@ -36,13 +34,15 @@ pub mod tonic_service;
 mod concurrent_fix_test;
 #[cfg(test)]
 mod concurrent_get_object_test;
-#[cfg(test)]
-mod ecfs_test;
 pub(crate) mod head_prefix;
+#[cfg(test)]
+mod helpers_test;
 #[cfg(test)]
 mod minio_generated_read_test;
 #[cfg(test)]
 mod multi_factor_scheduler_integration_test;
+#[cfg(test)]
+mod object_metadata_commit_test;
 pub(crate) mod runtime_sources;
 mod s3_support;
 pub(crate) mod scanner_dirty_journal;
@@ -51,6 +51,8 @@ mod sse_test;
 pub(crate) mod storage_api;
 
 pub(crate) use s3_support::*;
+#[cfg(test)]
+pub(crate) use storage_api::persisted_from_s3s;
 #[allow(unused_imports)]
 pub(crate) use storage_api::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
@@ -80,7 +82,6 @@ pub(crate) use storage_api::{
     try_migrate_server_config, update_bucket_metadata_config, update_bucket_metadata_config_if_incarnation,
     validate_website_configuration, verify_rpc_signature, wrap_reader,
 };
-pub(crate) use storage_api::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
 
 #[cfg(test)]
 #[allow(unused_imports)]

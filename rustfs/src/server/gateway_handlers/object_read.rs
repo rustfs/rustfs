@@ -78,11 +78,13 @@ impl Served for dto::GetObject {
         .await
     }
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
-        get_result(
+        let log_error = super::error::object_error_logger("GetObject", request.context().transport_extensions().clone());
+        let result = get_result(
             DefaultObjectUsecase::with_context(context)
                 .execute_get_object(envelope, request.into_input())
                 .await,
-        )
+        );
+        result.inspect_err(log_error)
     }
 }
 

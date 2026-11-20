@@ -464,7 +464,10 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
 
 #[cfg(test)]
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
-    parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
+    parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
+        mode: r.mode.map(|m| m.as_str().to_owned()),
+        retain_until: r.retain_until_date.map(OffsetDateTime::from),
+    }))
 }
 
 pub(crate) fn parse_object_lock_retention_native(
@@ -527,7 +530,7 @@ pub(crate) fn parse_object_lock_retention_native(
 
 #[cfg(test)]
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
-    parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
+    parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
 }
 
 pub(crate) fn parse_object_lock_legal_hold_native(

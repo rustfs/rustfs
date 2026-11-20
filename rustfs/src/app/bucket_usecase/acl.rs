@@ -68,6 +68,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn execute_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let usecase = DefaultBucketUsecase::without_context();
+        let envelope = crate::app::bucket_usecase::test_support::owned_envelope(http::Method::PUT);
+        let error = usecase
+            .execute_put_bucket_acl(envelope, "test-bucket", false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
         let input = gateway_dto::GetBucketAclInput {
             bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),

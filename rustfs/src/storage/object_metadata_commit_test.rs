@@ -12,230 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tests of the `object_meta` legacy-edge handlers (batch B1), moved unchanged from `ecfs.rs` and
-//! `ecfs_test.rs`.
-
-use super::{build_request, store_uninitialized_premise_holds};
-use crate::storage::ecfs::*;
+use super::authorization::tests::fixture::request;
 use http::Method;
-
-#[tokio::test]
-async fn test_get_object_acl_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = GetObjectAclInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.get_object_acl(build_request(input, Method::GET)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_get_object_legal_hold_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = GetObjectLegalHoldInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.get_object_legal_hold(build_request(input, Method::GET)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_get_object_retention_returns_internal_error_when_store_uninitialized() {
-    let input = GetObjectRetentionInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.get_object_retention(build_request(input, Method::GET)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_put_object_legal_hold_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = PutObjectLegalHoldInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.put_object_legal_hold(build_request(input, Method::PUT)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_put_object_acl_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = PutObjectAclInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.put_object_acl(build_request(input, Method::PUT)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_put_object_retention_returns_internal_error_when_store_uninitialized() {
-    let input = PutObjectRetentionInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.put_object_retention(build_request(input, Method::PUT)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_get_object_tagging_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = GetObjectTaggingInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.get_object_tagging(build_request(input, Method::GET)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_put_object_tagging_rejects_too_many_tags() {
-    let tag_set = (0..11)
-        .map(|index| Tag {
-            key: Some(format!("k{index}")),
-            value: Some(format!("v{index}")),
-        })
-        .collect();
-    let input = PutObjectTaggingInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .tagging(Tagging { tag_set })
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
-    assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
-}
-
-#[tokio::test]
-async fn test_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
-    let input = PutObjectTaggingInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .tagging(Tagging {
-            tag_set: vec![Tag {
-                key: Some(String::new()),
-                value: Some("v1".to_string()),
-            }],
-        })
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
-    assert!(err.to_string().contains("Tag key cannot be empty"));
-}
-
-#[tokio::test]
-async fn test_put_object_tagging_preserves_missing_tag_fields_before_version_validation() {
-    let fs = FS::new();
-    for (key, value, message) in [
-        (None, Some("value"), "Tag key cannot be empty"),
-        (Some("key"), None, "Tag value cannot be null"),
-    ] {
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_owned())
-            .key("test-key".to_owned())
-            .version_id(Some("invalid".to_owned()))
-            .tagging(Tagging {
-                tag_set: vec![Tag {
-                    key: key.map(str::to_owned),
-                    value: value.map(str::to_owned),
-                }],
-            })
-            .build()
-            .unwrap();
-        let error = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-        assert_eq!(error.code(), &S3ErrorCode::InvalidTag);
-        assert!(error.to_string().contains(message), "{error}");
-    }
-}
-
-#[tokio::test]
-async fn test_put_object_tagging_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = PutObjectTaggingInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .tagging(Tagging {
-            tag_set: vec![Tag {
-                key: Some("k".to_string()),
-                value: Some("v".to_string()),
-            }],
-        })
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
-
-#[tokio::test]
-async fn test_delete_object_tagging_returns_internal_error_when_store_uninitialized() {
-    if !store_uninitialized_premise_holds() {
-        return;
-    }
-    let input = DeleteObjectTaggingInput::builder()
-        .bucket("test-bucket".to_string())
-        .key("test-key".to_string())
-        .build()
-        .unwrap();
-
-    let fs = FS::new();
-    let err = fs
-        .delete_object_tagging(build_request(input, Method::DELETE))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
-}
 
 #[test]
 #[serial_test::serial]
 fn put_object_tagging_completes_once_for_committed_metadata() {
-    use crate::app::{RequestEnvelope, gating_test_env, object_meta::ObjectMetaUsecase};
+    use crate::app::{gating_test_env, object_meta::ObjectMetaUsecase};
     use crate::storage::helper::MutationCompletionProbe;
     use crate::storage::storage_api::StoragePutObjReader;
     use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
@@ -275,10 +58,9 @@ fn put_object_tagging_completes_once_for_committed_metadata() {
         let _observer = RestoreObserver(set_scanner_dirty_usage_mutation_observer(Some(observe)));
 
         let put = |key: &'static str| {
-            let mut req = build_request((), Method::PUT);
-            req.uri = format!("/{bucket}/{key}?tagging").parse().unwrap();
+            let envelope = request(Method::PUT).uri(&format!("/{bucket}/{key}?tagging")).build();
             usecase.put_object_tagging_fields(
-                RequestEnvelope::from_s3s(&req),
+                envelope,
                 &bucket,
                 key,
                 None,
@@ -322,14 +104,20 @@ impl LockWrite {
         }
     }
 
-    async fn authorize(self, envelope: &mut crate::app::RequestEnvelope, fs: &FS, bucket: &str, version: Option<&str>) {
+    async fn authorize(
+        self,
+        envelope: &mut crate::app::RequestEnvelope,
+        slot: &crate::runtime_sources::ServerContextSlot,
+        bucket: &str,
+        version: Option<&str>,
+    ) {
         use crate::storage::access_owned::object_meta::{
             RequestedObjectLegalHold, authorize_put_object_legal_hold, authorize_put_object_retention,
         };
         match self {
             Self::LegalHold => authorize_put_object_legal_hold(
                 envelope,
-                fs.server_ctx(),
+                slot,
                 bucket,
                 "object",
                 version,
@@ -338,15 +126,15 @@ impl LockWrite {
             .await
             .unwrap(),
             Self::Retention => {
-                authorize_put_object_retention(envelope, fs.server_ctx(), bucket, "object", version, Self::requested_retention())
+                authorize_put_object_retention(envelope, slot, bucket, "object", version, Self::requested_retention())
                     .await
                     .unwrap()
             }
         }
     }
 
-    fn requested_retention() -> crate::storage::access::RequestedObjectLockRetention {
-        crate::storage::access::RequestedObjectLockRetention {
+    fn requested_retention() -> crate::storage::request_markers::RequestedObjectLockRetention {
+        crate::storage::request_markers::RequestedObjectLockRetention {
             mode: Some("GOVERNANCE".into()),
             retain_until: Some(time::macros::datetime!(2099-01-02 00:00:00 UTC)),
         }
@@ -359,7 +147,7 @@ impl LockWrite {
         bucket: &str,
         version: Option<String>,
     ) -> rustfs_s3_types::S3Result<()> {
-        use crate::storage::access::RequestedObjectLegalHold;
+        use crate::storage::request_markers::RequestedObjectLegalHold;
         match self {
             Self::LegalHold => usecase
                 .put_object_legal_hold_fields(
@@ -380,9 +168,9 @@ impl LockWrite {
 }
 
 fn lock_write_rejects_bucket_replacement(write: LockWrite) {
-    use crate::app::{RequestEnvelope, gating_test_env, object_meta::ObjectMetaUsecase};
-    use crate::storage::access::ReqInfo;
+    use crate::app::{gating_test_env, object_meta::ObjectMetaUsecase};
     use crate::storage::helper::MutationCompletionProbe;
+    use crate::storage::req_info::ReqInfo;
     use crate::storage::storage_api::contract::{
         bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions},
         object::{ObjectIO, ObjectOperations},
@@ -430,21 +218,20 @@ fn lock_write_rejects_bucket_replacement(write: LockWrite) {
         let original = make_object(b"original object").await;
         let slot = crate::runtime_sources::ServerContextSlot::new();
         assert!(slot.install(context));
-        let fs = FS::with_server_ctx(slot);
         let envelope = |version: Option<&str>| {
-            let mut request = build_request((), Method::PUT);
-            request.extensions.insert(ReqInfo {
-                cred: Some(rustfs_credentials::Credentials::default()),
-                is_owner: true,
-                ..Default::default()
-            });
-            request.extensions.insert(fs.server_ctx().clone());
             let query = version.map_or_else(String::new, |value| format!("&versionId={value}"));
-            request.uri = format!("/{bucket}/object?{}{query}", write.subresource()).parse().unwrap();
-            RequestEnvelope::from_s3s(&request)
+            request(Method::PUT)
+                .uri(&format!("/{bucket}/object?{}{query}", write.subresource()))
+                .extension(ReqInfo {
+                    cred: Some(rustfs_credentials::Credentials::default()),
+                    is_owner: true,
+                    ..Default::default()
+                })
+                .server_context(&slot)
+                .build()
         };
         let mut stale = envelope(None);
-        write.authorize(&mut stale, &fs, &bucket, None).await;
+        write.authorize(&mut stale, &slot, &bucket, None).await;
         store
             .delete_object(
                 &bucket,
@@ -493,7 +280,7 @@ fn lock_write_rejects_bucket_replacement(write: LockWrite) {
         assert!(probe.events.lock().unwrap().is_empty(), "refusal emitted an event");
 
         let mut fresh = envelope(Some(&replacement));
-        write.authorize(&mut fresh, &fs, &bucket, Some(&replacement)).await;
+        write.authorize(&mut fresh, &slot, &bucket, Some(&replacement)).await;
         write
             .execute(&usecase, fresh, &bucket, Some(replacement.clone()))
             .await
@@ -531,7 +318,7 @@ fn put_object_retention_fences_replacement_and_completes_once() {
 #[serial_test::serial]
 fn put_object_retention_rechecks_a_competing_extension_at_commit() {
     use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
-    use crate::app::{RequestEnvelope, gating_test_env, object_meta::ObjectMetaUsecase};
+    use crate::app::{gating_test_env, object_meta::ObjectMetaUsecase};
     use crate::storage::storage_api::contract::{
         bucket::{BucketOperations, MakeBucketOptions},
         object::{ObjectIO, ObjectOperations},
@@ -575,9 +362,9 @@ fn put_object_retention_rechecks_a_competing_extension_at_commit() {
         .await;
         let version = first.version_id.unwrap().to_string();
         let barrier = PutObjectCommitBarrier::install(&bucket, "object", PutObjectCommitPause::BeforeMetadata);
-        let mut request = build_request((), Method::PUT);
-        request.uri = format!("/{bucket}/object?retention&versionId={version}").parse().unwrap();
-        let envelope = RequestEnvelope::from_s3s(&request);
+        let envelope = request(Method::PUT)
+            .uri(&format!("/{bucket}/object?retention&versionId={version}"))
+            .build();
         let attempted_bucket = bucket.clone();
         let attempted_version = version.clone();
         let short = tokio::spawn(async move {

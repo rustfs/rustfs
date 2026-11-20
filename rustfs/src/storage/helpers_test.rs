@@ -37,7 +37,6 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
-    use crate::storage::ecfs::FS;
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::s3_support::parse_object_version_id;
     use crate::storage::s3_support::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
@@ -67,35 +66,6 @@ mod tests {
     use s3s::{S3Error, S3ErrorCode, s3_error};
     use std::collections::HashMap;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
-    #[test]
-    fn test_fs_creation() {
-        let _fs = FS::new();
-
-        // Verify that FS struct can be created successfully
-        // Since it's currently empty, we just verify it doesn't panic
-        // The test passes if we reach this point without panicking
-    }
-
-    #[test]
-    fn test_fs_debug_implementation() {
-        let fs = FS::new();
-
-        // Test that Debug trait is properly implemented
-        let debug_str = format!("{fs:?}");
-        assert!(debug_str.contains("FS"));
-    }
-
-    #[test]
-    fn test_fs_clone_implementation() {
-        let fs = FS::new();
-
-        // Test that Clone trait is properly implemented
-        let cloned_fs = fs.clone();
-
-        // Both should be equivalent (since FS is currently empty)
-        assert_eq!(format!("{fs:?}"), format!("{cloned_fs:?}"));
-    }
 
     #[test]
     fn test_rustfs_owner_helpers_are_stable() {
@@ -1762,24 +1732,6 @@ mod tests {
 
     /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
     /// returns Ok(empty map) so authorization can proceed without tag conditions.
-    #[tokio::test]
-    async fn test_get_object_tag_conditions_for_policy_returns_empty_without_store() {
-        let fs = FS::new();
-        let out = fs.get_object_tag_conditions_for_policy("bucket", "key", None).await.unwrap();
-        assert!(out.is_empty(), "without store should return empty tag conditions");
-    }
-
-    /// With version_id specified, the same no-store path returns Ok(empty) (versioned object path).
-    #[tokio::test]
-    async fn test_get_object_tag_conditions_for_policy_version_id_returns_empty_without_store() {
-        let fs = FS::new();
-        let out = fs
-            .get_object_tag_conditions_for_policy("bucket", "key", Some("v1"))
-            .await
-            .unwrap();
-        assert!(out.is_empty());
-    }
-
     // --- CORS origin pattern matching tests ---
 
     #[test]
@@ -1815,5 +1767,42 @@ mod tests {
     fn test_matches_origin_pattern_single_star_wildcard() {
         assert!(matches_origin_pattern("*", "anything.com"));
         assert!(matches_origin_pattern("*", ""));
+    }
+
+    #[test]
+    fn website_config_rejects_missing_index_and_invalid_redirect_rules() {
+        use crate::storage::validate_website_configuration;
+        use rustfs_gateway_types::persistence::{
+            PersistedIndexDocument as IndexDocument, PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule,
+            PersistedRoutingRuleCondition as Condition, PersistedWebsiteConfiguration as WebsiteConfiguration,
+        };
+        assert!(validate_website_configuration(&WebsiteConfiguration::default()).is_err());
+        let config = WebsiteConfiguration {
+            index_document: Some(IndexDocument {
+                suffix: "index.html".to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_website_configuration(&config).is_ok());
+        let mut bad = config;
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition::default()),
+            redirect: Redirect {
+                host_name: Some("other.test".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition {
+                key_prefix_equals: Some("old/".to_owned()),
+                ..Default::default()
+            }),
+            redirect: Redirect {
+                protocol: Some("ftp".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
     }
 }

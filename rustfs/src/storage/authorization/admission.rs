@@ -22,10 +22,11 @@
 //! Upstream: the legacy `S3Access::check` hook and the gateway edge's `access::admit`.
 //! Downstream: `ReqInfo` readers and the use cases that read the installed markers.
 
+#[cfg(test)]
+use crate::auth::AuthType;
 use crate::auth::{
-    AuthType, RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest,
-    VerifiedSigV4Request, check_key_valid_with_context, parse_presigned_multipart_max_total_object_size,
-    parse_presigned_put_max_content_length,
+    RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
+    check_key_valid_with_context, parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
 };
 use crate::license::license_check;
 use crate::storage::req_info::ReqInfo;
@@ -48,6 +49,7 @@ pub(crate) struct VerifiedSignature {
     pub(crate) presigned: bool,
 }
 
+#[cfg(test)]
 impl VerifiedSignature {
     /// The legacy edge's reading: s3s verified the signature form these headers name.
     pub(crate) fn from_auth_type(auth_type: AuthType) -> Self {
