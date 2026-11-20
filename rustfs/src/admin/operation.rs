@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::app::{RequestCredentials, RequestEnvelope};
-use crate::storage::access::ReqInfo;
+use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use matchit::Params;
@@ -280,7 +280,7 @@ mod tests {
     use super::AdminRequest;
     use super::test_support::TestRequest;
     use crate::shared_types::RemoteAddr;
-    use crate::storage::access::ReqInfo;
+    use crate::storage::req_info::ReqInfo;
     use http::{HeaderValue, Method};
     use http_body_util::BodyExt;
     use rustfs_s3_types::Body;

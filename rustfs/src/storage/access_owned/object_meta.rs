@@ -21,12 +21,15 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_meta.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-use super::super::{
-    AuthorizationRequest, S3Result, ServerContextSlot, authorize_object_request, authorize_request, has_bypass_governance_header,
-    load_bucket_generation, req_info_mut, set_requested_object_lock_retain_until, versioned_tagging_action,
+use crate::storage::authorization::{
+    AuthorizationRequest, authorize_object_request, authorize_request, has_bypass_governance_header, load_bucket_generation,
+    req_info_mut, set_requested_object_lock_retain_until,
 };
-pub(crate) use super::super::{RequestedObjectLegalHold, RequestedObjectLockRetention, RequestedObjectTags};
+use crate::storage::authorization_actions::versioned_tagging_action;
+pub(crate) use crate::storage::request_markers::{RequestedObjectLegalHold, RequestedObjectLockRetention, RequestedObjectTags};
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::S3Result;
 
 /// GetObjectTagging and DeleteObjectTagging: the plain object shape, with the tagging action
 /// swapped for its version action when the request names a version.

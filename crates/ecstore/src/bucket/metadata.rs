@@ -1136,6 +1136,14 @@ impl BucketMetadata {
     /// delivered late (backlog#2292). Only replication receivers should pass
     /// a foreign time; local edits keep [`Self::update_config`].
     pub fn update_config_at(&mut self, config_file: &str, data: Vec<u8>, updated: OffsetDateTime) -> Result<OffsetDateTime> {
+        const MAX_BUCKET_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+        if data.len() > MAX_BUCKET_CONFIG_BYTES {
+            return Err(Error::InvalidArgument(
+                self.name.clone(),
+                String::new(),
+                "bucket configuration exceeds 2 MiB".to_owned(),
+            ));
+        }
         match config_file {
             BUCKET_POLICY_CONFIG => {
                 self.policy_config_json = data;
@@ -1343,6 +1351,39 @@ impl BucketMetadata {
         Ok(())
     }
 
+    /// Parse only the configuration used for foreground write/delete admission.
+    pub(super) fn parse_admission_configs(&mut self) {
+        self.object_lock_config = None;
+        if !self.object_lock_config_xml.is_empty()
+            && let Err(e) =
+                deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
+        {
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "object_lock",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
+        }
+        self.quota_config = None;
+        if !self.quota_config_json.is_empty()
+            && let Err(e) = serde_json::from_slice(&self.quota_config_json).map(|c| self.quota_config = Some(c))
+        {
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "quota",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
+        }
+    }
+
     /// Decode every stored sub-configuration into its typed field.
     ///
     /// A decode failure never fails the whole load: this runs on every bucket
@@ -1364,7 +1405,7 @@ impl BucketMetadata {
     /// | public access block | Fails closed in `get_public_access_block_config`: degrading grants the anonymous access the operator asked to block. |
     /// | quota | Fails closed in `get_quota_config`; the enforcement path in `quota::checker` already re-parses the raw JSON and refuses on error. |
     /// | lifecycle | `get_lifecycle_config` fails closed, so GetBucketLifecycle reports the fault instead of NoSuchLifecycleConfiguration. ILM, scanner and expiry-header consumers still degrade to "no rules": nothing is deleted or moved on the strength of an unreadable rule set, and the bucket keeps serving reads and writes. |
-    /// | notification | `get_notification_config` fails closed, so GetBucketNotificationConfiguration reports the fault and startup leaves that one bucket's rules unchanged instead of clearing them; other buckets are unaffected. |
+    /// | notification | `get_notification_config` fails closed, so GetBucketNotificationConfiguration reports the fault and startup skips that bucket's rule registration; metadata-bound server dispatch suppresses external delivery for the unreadable snapshot. Other buckets are unaffected. |
     /// | tagging, CORS, logging, website, accelerate, request payment | The getter fails closed so the matching GET API reports the fault instead of "not configured". Per-request consumers (CORS response headers) still degrade to "not configured", which is the restrictive direction. |
     /// | bucket ACL | Safe to degrade: it only shapes an optional response. |
     ///
@@ -1418,21 +1459,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
-        self.object_lock_config = None;
-        if !self.object_lock_config_xml.is_empty()
-            && let Err(e) =
-                deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
-        {
-            tracing::warn!(
-                event = "bucket_metadata_parse_failed",
-                component = "ecstore",
-                subsystem = "bucket_metadata",
-                bucket = %self.name,
-                config = "object_lock",
-                error = %e,
-                "Failed to parse bucket metadata config"
-            );
-        }
+        self.parse_admission_configs();
         self.versioning_config = None;
         if !self.versioning_config_xml.is_empty()
             && let Err(e) =
@@ -1473,19 +1500,6 @@ impl BucketMetadata {
                 subsystem = "bucket_metadata",
                 bucket = %self.name,
                 config = "tagging",
-                error = %e,
-                "Failed to parse bucket metadata config"
-            );
-        }
-        if !self.quota_config_json.is_empty()
-            && let Err(e) = serde_json::from_slice(&self.quota_config_json).map(|c| self.quota_config = Some(c))
-        {
-            tracing::warn!(
-                event = "bucket_metadata_parse_failed",
-                component = "ecstore",
-                subsystem = "bucket_metadata",
-                bucket = %self.name,
-                config = "quota",
                 error = %e,
                 "Failed to parse bucket metadata config"
             );
@@ -2073,6 +2087,33 @@ mod test {
             ..Default::default()
         });
         assert!(bm.object_locking());
+    }
+
+    #[test]
+    fn bucket_config_size_limit_preserves_last_accepted_policy() {
+        let mut metadata = BucketMetadata::new("policy-size-limit");
+        let stamp = OffsetDateTime::now_utc();
+        let mut policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        policy.resize(2 * 1024 * 1024, b' ');
+        metadata
+            .update_config_at(BUCKET_POLICY_CONFIG, policy.clone(), stamp)
+            .expect("accept a policy exactly at the size limit");
+        let mut oversized = policy.clone();
+        oversized.push(b' ');
+        let result = metadata.update_config_at(BUCKET_POLICY_CONFIG, oversized, stamp + time::Duration::seconds(1));
+        assert!(matches!(result, Err(Error::InvalidArgument(..))));
+        assert!(metadata.policy_config_json == policy, "rejection must preserve the accepted policy");
+        assert_eq!(metadata.policy_config_updated_at, stamp);
+    }
+
+    #[test]
+    fn admission_configs_leave_logging_unparsed() {
+        let mut bm = BucketMetadata::new("bucket");
+        bm.logging_config_xml = b"<BucketLoggingStatus/>".to_vec();
+        bm.parse_admission_configs();
+        assert!(bm.logging_config.is_none());
+        bm.parse_all_configs().expect("parse logging config");
+        assert!(bm.logging_config.is_some());
     }
 
     #[test]

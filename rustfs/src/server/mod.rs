@@ -16,9 +16,10 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
-#[cfg(feature = "gateway-stack")]
 mod gateway_handlers;
-#[cfg(feature = "gateway-stack")]
+#[cfg(test)]
+pub(crate) mod gateway_stack;
+#[cfg(not(test))]
 mod gateway_stack;
 mod health;
 mod http;
@@ -33,7 +34,6 @@ mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
 mod ssec_transport;
-#[cfg(feature = "gateway-stack")]
 mod stack;
 pub mod tls_material;
 pub(crate) mod tls_publish;
@@ -69,6 +69,8 @@ pub(crate) use event::{
     reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
 };
 #[cfg(test)]
+pub(crate) use gateway_stack::TestGateway;
+#[cfg(test)]
 pub(crate) use health::{
     HealthPayloadContext, HealthReadinessSource, build_component_details, build_health_payload, health_check_state,
     readiness_source_for_probe,
@@ -83,7 +85,6 @@ pub use layer::s3_http_request_guard;
 pub(crate) use layer::{RequestContextLayer, is_control_plane_route, is_sts_query_request};
 
 /// The S3 operations the gateway stack serves.
-#[cfg(feature = "gateway-stack")]
 pub(crate) fn gateway_operations() -> Vec<&'static str> {
     gateway_handlers::rows(gateway_handlers::OPERATIONS)
         .map(|row| row.name)

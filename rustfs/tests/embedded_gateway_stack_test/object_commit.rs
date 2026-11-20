@@ -16,7 +16,7 @@
 //! answers CompleteMultipartUpload for every request shape whose conversion onto the gateway's
 //! types needs care. CompleteMultipartUpload is served on both stacks.
 
-use super::{LEGACY, create_bucket_in_the_store, s3_client, with_stack};
+use super::{create_bucket_in_the_store, s3_client, with_stack};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -189,289 +189,221 @@ fn part(number: Option<i32>, etag: &str) -> CompletedPart {
     CompletedPart::builder().set_part_number(number).e_tag(etag).build()
 }
 
-/// CompleteMultipartUpload on the legacy stack answers every request shape as before its use case
-/// moved onto the gateway's types. Every answer was measured on `main` before the move.
-#[test]
-fn the_legacy_stack_completes_every_upload_as_before() {
-    with_stack(LEGACY, |server| async move {
-        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
-        client
-            .create_bucket()
-            .bucket(ORDINARY_BUCKET)
-            .send()
-            .await
-            .expect("CreateBucket");
-        for bucket in RESERVED_SHAPED_BUCKETS {
-            create_bucket_in_the_store(bucket).await;
-        }
-        let mut answered = Vec::new();
+/// CompleteMultipartUpload answers every request shape as before its use case moved onto the
+/// gateway's types. Every answer was measured on the legacy stack on `main` before the move, and
+/// both stacks are held to the same table.
+async fn completes_every_upload(server: rustfs::embedded::RustFSServer, divergences: &[(&str, &str)]) {
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    client
+        .create_bucket()
+        .bucket(ORDINARY_BUCKET)
+        .send()
+        .await
+        .expect("CreateBucket");
+    for bucket in RESERVED_SHAPED_BUCKETS {
+        create_bucket_in_the_store(bucket).await;
+    }
+    let mut answered = Vec::new();
 
-        for bucket in [ORDINARY_BUCKET].into_iter().chain(RESERVED_SHAPED_BUCKETS) {
-            let (upload_id, etag) = one_part_upload(&client, bucket, "object").await;
-            let answer = complete(&client, bucket, "object", &upload_id, part(Some(1), &etag), &[]).await;
-            answered.push((format!("bucket {bucket}"), answer));
-        }
+    for bucket in [ORDINARY_BUCKET].into_iter().chain(RESERVED_SHAPED_BUCKETS) {
+        let (upload_id, etag) = one_part_upload(&client, bucket, "object").await;
+        let answer = complete(&client, bucket, "object", &upload_id, part(Some(1), &etag), &[]).await;
+        answered.push((format!("bucket {bucket}"), answer));
+    }
 
-        let too_long = "k".repeat(1025);
-        for (label, key) in [("NUL key", "nul\0key"), ("1025-byte key", too_long.as_str())] {
-            let answer = complete(&client, ORDINARY_BUCKET, key, "no-such-upload", part(Some(1), "\"0\""), &[]).await;
-            answered.push((label.to_owned(), answer));
-        }
+    let too_long = "k".repeat(1025);
+    for (label, key) in [("NUL key", "nul\0key"), ("1025-byte key", too_long.as_str())] {
+        let answer = complete(&client, ORDINARY_BUCKET, key, "no-such-upload", part(Some(1), "\"0\""), &[]).await;
+        answered.push((label.to_owned(), answer));
+    }
 
-        type ShapeCase<'a> = (&'a str, Option<i32>, fn(&str) -> String, &'a [(&'a str, &'a str)]);
-        let shapes: [ShapeCase<'_>; 10] = [
-            ("empty part ETag", Some(1), |_| String::new(), &[]),
-            ("weak spelling of the stored part ETag", Some(1), |etag| format!("W/{etag}"), &[]),
-            ("unquoted stored part ETag", Some(1), |etag| etag.trim_matches('"').to_owned(), &[]),
-            (
-                "quoted other part ETag",
-                Some(1),
-                |_| "\"00000000000000000000000000000000\"".to_owned(),
-                &[],
-            ),
-            (
-                "unquoted other part ETag",
-                Some(1),
-                |_| "00000000000000000000000000000000".to_owned(),
-                &[],
-            ),
-            (
-                "weak other part ETag",
-                Some(1),
-                |_| "W/\"00000000000000000000000000000000\"".to_owned(),
-                &[],
-            ),
-            ("part without a number", None, str::to_owned, &[]),
-            (
-                "two checksum headers",
-                Some(1),
-                str::to_owned,
-                &[
-                    ("crc32", "AAAAAA=="),
-                    ("sha256", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
-                ],
-            ),
-            ("checksum of the wrong width", Some(1), str::to_owned, &[("crc32", "AAAA")]),
-            ("ordinary", Some(1), str::to_owned, &[("crc32", "AAAAAA==")]),
-        ];
-        for (index, (label, number, etag_for, checksums)) in shapes.into_iter().enumerate() {
-            let key = format!("shape-{index}");
-            let (upload_id, etag) = one_part_upload(&client, ORDINARY_BUCKET, &key).await;
-            let answer = complete(&client, ORDINARY_BUCKET, &key, &upload_id, part(number, &etag_for(&etag)), checksums).await;
-            answered.push((label.to_owned(), answer));
-        }
+    type ShapeCase<'a> = (&'a str, Option<i32>, fn(&str) -> String, &'a [(&'a str, &'a str)]);
+    let shapes: [ShapeCase<'_>; 10] = [
+        ("empty part ETag", Some(1), |_| String::new(), &[]),
+        ("weak spelling of the stored part ETag", Some(1), |etag| format!("W/{etag}"), &[]),
+        ("unquoted stored part ETag", Some(1), |etag| etag.trim_matches('"').to_owned(), &[]),
+        (
+            "quoted other part ETag",
+            Some(1),
+            |_| "\"00000000000000000000000000000000\"".to_owned(),
+            &[],
+        ),
+        (
+            "unquoted other part ETag",
+            Some(1),
+            |_| "00000000000000000000000000000000".to_owned(),
+            &[],
+        ),
+        (
+            "weak other part ETag",
+            Some(1),
+            |_| "W/\"00000000000000000000000000000000\"".to_owned(),
+            &[],
+        ),
+        ("part without a number", None, str::to_owned, &[]),
+        (
+            "two checksum headers",
+            Some(1),
+            str::to_owned,
+            &[
+                ("crc32", "AAAAAA=="),
+                ("sha256", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
+            ],
+        ),
+        ("checksum of the wrong width", Some(1), str::to_owned, &[("crc32", "AAAA")]),
+        ("ordinary", Some(1), str::to_owned, &[("crc32", "AAAAAA==")]),
+    ];
+    for (index, (label, number, etag_for, checksums)) in shapes.into_iter().enumerate() {
+        let key = format!("shape-{index}");
+        let (upload_id, etag) = one_part_upload(&client, ORDINARY_BUCKET, &key).await;
+        let answer = complete(&client, ORDINARY_BUCKET, &key, &upload_id, part(number, &etag_for(&etag)), checksums).await;
+        answered.push((label.to_owned(), answer));
+    }
 
-        for (label, upload_id) in [
-            ("upload id with a dot-dot segment", "a/../b"),
-            ("upload id never minted", "bm90LWFuLXVwbG9hZA"),
-        ] {
-            let answer = complete(&client, ORDINARY_BUCKET, "object", upload_id, part(Some(1), "\"0\""), &[]).await;
-            answered.push((label.to_owned(), answer));
-        }
+    for (label, upload_id) in [
+        ("upload id with a dot-dot segment", "a/../b"),
+        ("upload id never minted", "bm90LWFuLXVwbG9hZA"),
+    ] {
+        let answer = complete(&client, ORDINARY_BUCKET, "object", upload_id, part(Some(1), "\"0\""), &[]).await;
+        answered.push((label.to_owned(), answer));
+    }
 
-        // No body at all: the legacy decoder refuses it before the operation.
-        let (upload_id, _) = one_part_upload(&client, ORDINARY_BUCKET, "no-body").await;
-        let answer = match client
-            .complete_multipart_upload()
-            .bucket(ORDINARY_BUCKET)
-            .key("no-body")
-            .upload_id(&upload_id)
-            .send()
-            .await
-        {
-            Ok(_) => "200".to_owned(),
-            Err(error) => format!(
-                "{:?} {:?} {:?}",
-                error.raw_response().map(|response| response.status().as_u16()),
-                error.code(),
-                error.message()
-            ),
-        };
-        answered.push(("no body".to_owned(), answer));
+    // No body at all: the legacy decoder refuses it before the operation.
+    let (upload_id, _) = one_part_upload(&client, ORDINARY_BUCKET, "no-body").await;
+    let answer = match client
+        .complete_multipart_upload()
+        .bucket(ORDINARY_BUCKET)
+        .key("no-body")
+        .upload_id(&upload_id)
+        .send()
+        .await
+    {
+        Ok(_) => "200".to_owned(),
+        Err(error) => format!(
+            "{:?} {:?} {:?}",
+            error.raw_response().map(|response| response.status().as_u16()),
+            error.code(),
+            error.message()
+        ),
+    };
+    answered.push(("no body".to_owned(), answer));
 
-        let expected = [
-            (
-                "bucket e1-complete",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "bucket sthree-e1",
-                "200 bucket=Some(\"sthree-e1\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "bucket e1-s3alias",
-                "200 bucket=Some(\"e1-s3alias\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "NUL key",
-                "Some(400) Some(\"InvalidArgument\") Some(\"Object key contains invalid control characters: \\\"nul\\\\0key\\\"\")",
-            ),
-            ("1025-byte key", "Some(400) Some(\"KeyTooLongError\") Some(\"Your key is too long.\")"),
-            (
-                "empty part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "weak spelling of the stored part ETag",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "unquoted stored part ETag",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
-            ),
-            (
-                "quoted other part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "unquoted other part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "weak other part ETag",
-                "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
-            ),
-            (
-                "part without a number",
-                "Some(400) Some(\"InvalidPart\") Some(\"Part number 0 must be between 1 and 10000\")",
-            ),
-            (
-                "two checksum headers",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=Some(\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\") type=None",
-            ),
-            (
-                "checksum of the wrong width",
-                "Some(400) Some(\"BadDigest\") Some(\"The Content-Md5 you specified did not match what we received.\")",
-            ),
-            (
-                "ordinary",
-                "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=None type=None",
-            ),
-            (
-                "upload id with a dot-dot segment",
-                "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.\")",
-            ),
-            (
-                "upload id never minted",
-                "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.\")",
-            ),
-            (
-                "no body",
-                "Some(400) Some(\"MalformedXML\") Some(\"This happens when the user sends malformed XML (XML that doesn't conform to the published XSD) for the configuration. The error message is, \\\"The XML you provided was not well-formed or did not validate against our published schema.\\\"\")",
-            ),
-        ];
-        let expected: Vec<(String, String)> = expected
-            .into_iter()
-            .map(|(label, answer)| (label.to_owned(), answer.to_owned()))
-            .collect();
-        assert_eq!(answered, expected);
-        server.shutdown().await;
-    });
+    let expected = [
+        (
+            "bucket e1-complete",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "bucket sthree-e1",
+            "200 bucket=Some(\"sthree-e1\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "bucket e1-s3alias",
+            "200 bucket=Some(\"e1-s3alias\") key_len=Some(6) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "NUL key",
+            "Some(400) Some(\"InvalidArgument\") Some(\"Object key contains invalid control characters: \\\"nul\\\\0key\\\"\")",
+        ),
+        ("1025-byte key", "Some(400) Some(\"KeyTooLongError\") Some(\"Your key is too long.\")"),
+        (
+            "empty part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "weak spelling of the stored part ETag",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "unquoted stored part ETag",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=None sha256=None type=None",
+        ),
+        (
+            "quoted other part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "unquoted other part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "weak other part ETag",
+            "Some(400) Some(\"InvalidPart\") Some(\"One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.\")",
+        ),
+        (
+            "part without a number",
+            "Some(400) Some(\"InvalidPart\") Some(\"Part number 0 must be between 1 and 10000\")",
+        ),
+        (
+            "two checksum headers",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=Some(\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\") type=None",
+        ),
+        (
+            "checksum of the wrong width",
+            "Some(400) Some(\"BadDigest\") Some(\"The Content-Md5 you specified did not match what we received.\")",
+        ),
+        (
+            "ordinary",
+            "200 bucket=Some(\"e1-complete\") key_len=Some(7) etag=Some(true) crc32=Some(\"AAAAAA==\") sha256=None type=None",
+        ),
+        (
+            "upload id with a dot-dot segment",
+            "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.\")",
+        ),
+        (
+            "upload id never minted",
+            "Some(404) Some(\"NoSuchUpload\") Some(\"The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.\")",
+        ),
+        (
+            "no body",
+            "Some(400) Some(\"MalformedXML\") Some(\"This happens when the user sends malformed XML (XML that doesn't conform to the published XSD) for the configuration. The error message is, \\\"The XML you provided was not well-formed or did not validate against our published schema.\\\"\")",
+        ),
+    ];
+    let mut expected: Vec<(String, String)> = expected
+        .into_iter()
+        .map(|(label, answer)| (label.to_owned(), answer.to_owned()))
+        .collect();
+    for (label, answer) in divergences {
+        let row = expected
+            .iter_mut()
+            .find(|(row_label, _)| row_label == label)
+            .unwrap_or_else(|| panic!("no row named {label}"));
+        assert_ne!(row.1, *answer, "{label}: a divergence that equals the table is no divergence");
+        row.1 = (*answer).to_owned();
+    }
+    assert_eq!(answered, expected);
+    server.shutdown().await;
 }
 
+/// The rows on which the gateway stack answers differently from the legacy stack, with the
+/// gateway's answer. Every other row is held to the legacy table above.
+const GATEWAY_COMPLETION_DIVERGENCES: &[(&str, &str)] = &[
+    ("NUL key", "Some(400) Some(\"InvalidArgument\") Some(\"the name contains a NUL byte\")"),
+    (
+        "1025-byte key",
+        "Some(400) Some(\"KeyTooLongError\") Some(\"the name is longer than the maximum length in bytes\")",
+    ),
+    (
+        "empty part ETag",
+        "Some(400) Some(\"InvalidArgument\") Some(\"the request body carries a value this gateway cannot carry exactly\")",
+    ),
+    (
+        "part without a number",
+        "Some(400) Some(\"MalformedXML\") Some(\"the body omits a member the schema requires\")",
+    ),
+    (
+        "two checksum headers",
+        "Some(400) Some(\"InvalidRequest\") Some(\"Expecting a single x-amz-checksum- header\")",
+    ),
+    (
+        "no body",
+        "Some(400) Some(\"MalformedXML\") Some(\"the request body is not the XML this operation accepts\")",
+    ),
+];
+
 #[test]
-fn legacy_absent_upload_refusal_order() {
-    with_stack(LEGACY, |server| async move {
-        use rustfs_ecstore::api::bucket::{
-            metadata_sys,
-            quota::{BucketQuota, checker::QuotaChecker},
-        };
-        use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
-        use rustfs_storage_api::{MultipartOperations, ObjectIO};
-        let context = rustfs::app::context::get_global_app_context().expect("embedded context");
-        let store = context.object_store();
-        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
-        for (shape, raw_id) in [("absent", None), ("dot", Some("a/../b")), ("absolute", Some("/upload"))] {
-            for (label, full_quota, locked) in [
-                ("wire-absent-quota", true, false),
-                ("wire-absent", false, false),
-                ("wire-absent-lock", false, true),
-                ("wire-absent-both", true, true),
-            ] {
-                let bucket = format!("{shape}-{label}");
-                let label = bucket.as_str();
-                create_bucket_in_the_store(label).await;
-                let upload = store
-                    .new_multipart_upload(label, "object", &ObjectOptions::default())
-                    .await
-                    .expect("mint");
-                store
-                    .abort_multipart_upload(label, "object", &upload.upload_id, &ObjectOptions::default())
-                    .await
-                    .expect("abort");
-                assert!(
-                    store
-                        .lookup_multipart_completion_binding(label, "object", &upload.upload_id, &ObjectOptions::default())
-                        .await
-                        .expect("binding")
-                        .is_none()
-                );
-                if locked {
-                    metadata_sys::update(
-                        label,
-                        rustfs_ecstore::api::bucket::metadata::OBJECT_LOCK_CONFIG,
-                        b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"
-                            .to_vec(),
-                    )
-                    .await
-                    .expect("lock config");
-                    let mut opts = ObjectOptions::default();
-                    opts.user_defined
-                        .insert("x-amz-object-lock-legal-hold".to_owned(), "ON".to_owned());
-                    let mut reader = PutObjReader::from_vec(b"existing".to_vec());
-                    store
-                        .clone()
-                        .put_object(label, "object", &mut reader, &opts)
-                        .await
-                        .expect("held object");
-                }
-                rustfs_ecstore::api::data_usage::seed_bucket_usage_memory_for_test(label, 2).await;
-                if full_quota {
-                    QuotaChecker::new(store.bucket_metadata_sys().expect("metadata context"))
-                        .set_quota_config(
-                            label,
-                            BucketQuota {
-                                quota: Some(1),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .expect("quota");
-                }
-                let before = super::s3_request_counts();
-                let answer =
-                    complete(&client, label, "object", raw_id.unwrap_or(&upload.upload_id), part(Some(1), "part"), &[]).await;
-                assert_eq!(
-                    super::counted_since(&before),
-                    std::collections::BTreeMap::from([(("POST", "s3:CompleteMultipartUpload", "4xx"), 1)]),
-                    "{shape}/{label}"
-                );
-                let (status, code, message) = if raw_id.is_some() {
-                    (
-                        404,
-                        "NoSuchUpload",
-                        "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
-                    )
-                } else if full_quota {
-                    (400, "InvalidRequest", "Bucket quota exceeded. Current usage: 2 bytes, limit: 1 bytes")
-                } else if locked {
-                    (
-                        403,
-                        "AccessDenied",
-                        "Object has a legal hold and cannot be overwritten. Remove the legal hold first.",
-                    )
-                } else {
-                    (
-                        404,
-                        "NoSuchUpload",
-                        "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
-                    )
-                };
-                assert_eq!(answer, format!("{:?} {:?} {:?}", Some(status), Some(code), Some(message)), "{label}");
-            }
-        }
-        server.shutdown().await;
-    });
+fn the_gateway_stack_completes_every_upload() {
+    with_stack(super::GATEWAY, |server| completes_every_upload(server, GATEWAY_COMPLETION_DIVERGENCES));
 }
 
 #[test]
@@ -807,12 +739,6 @@ async fn copy_authorization_contract(root: &Client, endpoint: &str) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_copy_object_fixed_main_contract() {
-    with_stack(LEGACY, copy_contract);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_copy_object_wire_contract() {
     with_stack(super::GATEWAY, copy_contract);
 }
@@ -938,12 +864,6 @@ async fn upload_part_copy_contract(server: super::RustFSServer) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_upload_part_copy_wire_contract() {
-    with_stack(LEGACY, upload_part_copy_contract);
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_upload_part_copy_wire_contract() {
     with_stack(super::GATEWAY, upload_part_copy_contract);
 }
@@ -1025,4 +945,103 @@ fn gateway_upload_part_copy_checks_source_owner() {
         assert_eq!(parts.parts()[0].size(), Some(9));
         server.shutdown().await;
     });
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_copy_object_checks_source_owner_before_overwriting() {
+    with_stack(super::GATEWAY, copy_object_checks_source_owner_before_overwriting);
+}
+
+async fn copy_object_checks_source_owner_before_overwriting(server: rustfs::embedded::RustFSServer) {
+    const SOURCE: &str = "copy-object-source-owner";
+    const DESTINATION: &str = "copy-object-owner-target";
+    create_bucket_in_the_store(SOURCE).await;
+    create_bucket_in_the_store(DESTINATION).await;
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let owner = root
+        .get_bucket_acl()
+        .bucket(SOURCE)
+        .send()
+        .await
+        .expect("read source bucket owner")
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("source owner ID")
+        .to_owned();
+    for (bucket, key, bytes) in [
+        (SOURCE, "source", b"source-data".as_slice()),
+        (DESTINATION, "existing", b"original".as_slice()),
+    ] {
+        root.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .expect("write copy fixture");
+    }
+    let denied = root
+        .copy_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner("different-owner")
+        .send()
+        .await
+        .expect_err("wrong source owner must be denied");
+    assert_eq!(super::refusal(&denied), (Some("AccessDenied".to_owned()), Some(403)));
+    let original = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .send()
+        .await
+        .expect("read destination after denial")
+        .body
+        .collect()
+        .await
+        .expect("read original bytes")
+        .into_bytes();
+    assert_eq!(original.as_ref(), b"original");
+    let denied_new = root
+        .copy_object()
+        .bucket(DESTINATION)
+        .key("not-created")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner("different-owner")
+        .send()
+        .await
+        .expect_err("wrong source owner must not create a destination");
+    assert_eq!(super::refusal(&denied_new), (Some("AccessDenied".to_owned()), Some(403)));
+    let missing = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("not-created")
+        .send()
+        .await
+        .expect_err("the denied copy must leave no object");
+    assert_eq!(super::refusal(&missing).1, Some(404));
+    root.copy_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner(owner)
+        .send()
+        .await
+        .expect("matching source owner permits copy");
+    let copied = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .send()
+        .await
+        .expect("read matching-owner copy")
+        .body
+        .collect()
+        .await
+        .expect("read copied bytes")
+        .into_bytes();
+    assert_eq!(copied.as_ref(), b"source-data");
+    server.shutdown().await;
 }

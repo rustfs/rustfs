@@ -17,7 +17,7 @@
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -608,7 +608,7 @@ pub trait KmsBackend: Send + Sync {
     ///
     /// The default rejects the operation for backends without deletion
     /// support.
-    async fn remove_expired_key(&self, _key_id: &str, _now: &Zoned) -> Result<ExpiredKeyRemoval> {
+    async fn remove_expired_key(&self, _key_id: &str, _now: &ZonedDateTime) -> Result<ExpiredKeyRemoval> {
         Err(KmsError::unsupported_capability("backend without deletion support", "remove_expired_key"))
     }
 
@@ -934,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn default_remove_expired_key_is_unsupported() {
         let error = MinimalBackend
-            .remove_expired_key("any-key", &jiff::Zoned::now())
+            .remove_expired_key("any-key", &jiff::ZonedDateTime::now())
             .await
             .expect_err("backends without deletion support must reject expired-key removal");
         assert!(

@@ -702,6 +702,13 @@ async fn validate_config_admin_request(req: &AdminRequest) -> S3Result<Credentia
     authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
 }
 
+async fn authorize_federation_change(req: &AdminRequest, before: &ServerConfig, after: &ServerConfig) -> S3Result<()> {
+    if before.0.get(IDENTITY_OPENID_SUB_SYS) != after.0.get(IDENTITY_OPENID_SUB_SYS) {
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ManageOpenIDConfigAdminAction)]).await?;
+    }
+    Ok(())
+}
+
 fn header_value(content_type: &str) -> S3Result<HeaderValue> {
     HeaderValue::from_str(content_type)
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))
@@ -1597,6 +1604,10 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
     Ok(lines.join("\n").into_bytes())
 }
 
+fn render_config_export(config: &ServerConfig) -> Vec<u8> {
+    render_full_config(config, true)
+}
+
 fn render_full_config(config: &ServerConfig, redact_secrets: bool) -> Vec<u8> {
     let mut subsystems = config.0.iter().collect::<Vec<_>>();
     subsystems.sort_by_key(|(lhs, _)| *lhs);
@@ -2054,6 +2065,7 @@ impl Operation for SetConfigKVHandler {
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = snapshot.config.clone();
             apply_set_directives(&mut config, &directives)?;
+            authorize_federation_change(&req, &snapshot.config, &config).await?;
             prepare_server_config(&config, sub_system.as_deref()).await?;
             commit_server_config_transaction(config, snapshot, sub_system).await
         })
@@ -2083,6 +2095,7 @@ impl Operation for DelConfigKVHandler {
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = snapshot.config.clone();
             apply_delete_directives(&mut config, &directives);
+            authorize_federation_change(&req, &snapshot.config, &config).await?;
             prepare_server_config(&config, sub_system.as_deref()).await?;
             commit_server_config_transaction(config, snapshot, sub_system).await
         })
@@ -2167,6 +2180,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         supervise_admin_mutation("config mutation", async move {
             preflight_config_intent(None).await?;
             let snapshot = load_server_config_snapshot_from_store().await?;
+            authorize_federation_change(&req, &snapshot.config, &config).await?;
             prepare_server_config(&config, None).await?;
             let transaction = persist_server_config_transaction(config, snapshot).await?;
             let Err(restore_error) = reconcile_committed_config(None, transaction.persisted).await else {
@@ -2268,7 +2282,7 @@ impl Operation for GetConfigHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_config_admin_request(&req).await?;
         let config = load_active_server_config().await?;
-        let payload = render_full_config(&config, false);
+        let payload = render_config_export(&config);
         let (body, content_type) = encode_config_payload(req.uri().path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
     }
@@ -2293,6 +2307,7 @@ impl Operation for SetConfigHandler {
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = ServerConfig::new();
             apply_set_directives(&mut config, &directives)?;
+            authorize_federation_change(&req, &snapshot.config, &config).await?;
             prepare_server_config(&config, None).await?;
             commit_server_config_transaction(config, snapshot, None).await?;
             Ok(())
@@ -2340,6 +2355,22 @@ mod tests {
                 SCANNER_SUB_SYS
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_config_add_and_implicit_removal_require_extra_authorization() {
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::PUT, "/rustfs/admin/v3/config")
+            .body(Body::from(String::new()))
+            .build();
+        let before = ServerConfig::new();
+        let mut after = before.clone();
+        let directives = parse_config_directives("identity_openid:team role_policy=readOnly", false).expect("parse OIDC change");
+        apply_set_directives(&mut after, &directives).expect("apply OIDC change");
+        authorize_federation_change(&req, &after, &after)
+            .await
+            .expect("unchanged provider does not need extra authorization");
+        assert!(authorize_federation_change(&req, &before, &after).await.is_err());
+        assert!(authorize_federation_change(&req, &after, &before).await.is_err());
     }
 
     #[test]
@@ -2455,6 +2486,10 @@ mod tests {
         .expect("utf8");
         assert!(rendered.contains(r#"client_id="console""#));
         assert!(rendered.contains(r#"client_secret="*redacted*""#));
+
+        let export = String::from_utf8(render_config_export(&config)).expect("utf8 config export");
+        assert!(!export.contains("secret-value"));
+        assert!(export.contains(r#"client_secret="*redacted*""#));
 
         let delete_directives = parse_config_directives("identity_openid client_secret", true).expect("parse delete directives");
         apply_delete_directives(&mut config, &delete_directives);

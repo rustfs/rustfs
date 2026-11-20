@@ -29,7 +29,7 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::PutObject>(), row::<dto::UploadPart>()];
+pub(super) const ROWS: &[OpRow] = &[row::<dto::PutObject>(), row::<dto::UploadPart>(), super::post_object::ROW];
 
 impl Served for dto::PutObject {
     const METRIC: S3Operation = S3Operation::PutObject;
@@ -58,7 +58,7 @@ impl Served for dto::PutObject {
                 retention,
                 post: false,
             };
-            Ok(authorize_put_object(envelope, &server, facts, |_| Ok(())).await?)
+            authorize_put_object(envelope, &server, facts, |_| Ok(())).await
         }
     }
 
@@ -89,14 +89,14 @@ impl Served for dto::UploadPart {
                 .server_context()
                 .cloned()
                 .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
-            Ok(authorize_upload_part(envelope, &server, &bucket, &key).await?)
+            authorize_upload_part(envelope, &server, &bucket, &key).await
         }
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let input = native_part_input(request.into_input(), trailer_checksum_algorithm(&envelope)?);
         let output = DefaultMultipartUsecase::with_context(context)
-            .execute_upload_part_owned(envelope, input)
+            .execute_upload_part_with_audit(envelope, input)
             .await?;
         native_part_output(output)
     }
@@ -236,10 +236,13 @@ fn native_input(input: dto::PutObjectInput, retain_until: Option<time::OffsetDat
         bucket: input.bucket.as_str().to_owned(),
         key: input.key.as_str().to_owned(),
         body: input.body.map(|body| body.into_body()),
+        post_archive: None,
         trailing_headers: None,
         frame_trailers: None,
         content_length: Some(input.content_length),
         metadata: Some(input.metadata.into_iter().collect()),
+        metadata_headers: None,
+        checksum_headers: None,
         specific_if_none_match: input.if_none_match.as_deref().is_some_and(|value| value.trim() != "*"),
         object_lock_retain_until_date: retain_until,
         cache_control: input.cache_control,

@@ -106,7 +106,7 @@ impl fmt::Display for RemoteErrorCode {
     }
 }
 
-/// The codes the legacy client (s3s at the pinned revision) recognized, sorted.
+/// The sorted wire codes recognized by the legacy client at revision 5761ddfe.
 const RECOGNIZED_CODES: &[&str] = &[
     "AccessControlListNotSupported",
     "AccessDenied",
@@ -352,15 +352,19 @@ const RECOGNIZED_CODES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn recognizes_exactly_the_codes_the_legacy_client_named() {
         assert_eq!(RECOGNIZED_CODES.len(), 239);
         assert!(RECOGNIZED_CODES.windows(2).all(|pair| pair[0] < pair[1]), "the table must stay sorted");
+        // SHA-256 of the sorted, newline-separated wire names in S3_ERROR_CODE_MAP at 5761ddfe.
+        let digest = Sha256::digest(RECOGNIZED_CODES.join("\n"));
+        assert_eq!(
+            hex_simd::encode_to_string(digest.as_slice(), hex_simd::AsciiCase::Lower),
+            "6fa6be09aa53ae2e05c5c98c10c43dae79713b07a2bdde492dbb6a776888978d"
+        );
         for code in RECOGNIZED_CODES {
-            let legacy = s3s::S3ErrorCode::from_bytes(code.as_bytes()).expect("utf-8");
-            assert!(!matches!(legacy, s3s::S3ErrorCode::Custom(_)), "{code} is not named by the legacy client");
-            assert_eq!(legacy.as_str(), *code);
             let parsed = RemoteErrorCode::from_wire(code);
             assert!(!parsed.is_custom(), "{code}");
             assert_eq!(parsed.as_str(), *code);
@@ -369,19 +373,18 @@ mod tests {
 
     #[test]
     fn parses_like_the_legacy_client() {
-        for text in [
-            "NoSuchKey",
-            "nosuchkey",
-            "NOSUCHKEY",
-            "PermanentRedirect",
-            "SomethingNew",
-            "",
-            "No Such Key",
+        for (text, expected, custom) in [
+            ("NoSuchKey", "NoSuchKey", false),
+            ("nosuchkey", "NoSuchKey", false),
+            ("NOSUCHKEY", "NoSuchKey", false),
+            ("PermanentRedirect", "PermanentRedirect", false),
+            ("SomethingNew", "SomethingNew", true),
+            ("", "", true),
+            ("No Such Key", "No Such Key", true),
         ] {
-            let legacy = s3s::S3ErrorCode::from_bytes(text.as_bytes()).expect("utf-8");
             let parsed = RemoteErrorCode::from_wire(text);
-            assert_eq!(parsed.is_custom(), matches!(legacy, s3s::S3ErrorCode::Custom(_)), "{text:?}");
-            assert_eq!(parsed.as_str(), legacy.as_str(), "{text:?}");
+            assert_eq!(parsed.is_custom(), custom, "{text:?}");
+            assert_eq!(parsed.as_str(), expected, "{text:?}");
         }
         assert_eq!(RemoteErrorCode::from_wire("nosuchkey"), RemoteErrorCode::NO_SUCH_KEY);
     }

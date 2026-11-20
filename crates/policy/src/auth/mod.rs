@@ -25,10 +25,24 @@ use time::OffsetDateTime;
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct UserIdentity {
     pub version: i64,
+    /// Regular-user secret generation, or the issuing generation on a derived STS record.
+    /// Older records predate generation tracking.
+    #[serde(
+        rename = "stsGeneration",
+        default,
+        deserialize_with = "read_sts_generation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sts_generation: Option<[u8; 16]>,
     pub credentials: Credentials,
     /// updatedAt (RFC3339), legacy RustFS: update_at. Serialize as updatedAt
     #[serde(rename = "updatedAt", alias = "update_at", default, with = "crate::serde_datetime::option")]
     pub update_at: Option<OffsetDateTime>,
+}
+
+// Only an absent field is a legacy generation. Reject an explicitly null or malformed value.
+fn read_sts_generation<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<[u8; 16]>, D::Error> {
+    <[u8; 16]>::deserialize(de).map(Some)
 }
 
 impl UserIdentity {
@@ -42,6 +56,7 @@ impl UserIdentity {
     pub fn new(credentials: Credentials) -> Self {
         UserIdentity {
             version: 1,
+            sts_generation: None,
             credentials,
             update_at: Some(OffsetDateTime::now_utc()),
         }
@@ -69,17 +84,36 @@ impl UserIdentity {
 
 impl From<Credentials> for UserIdentity {
     fn from(value: Credentials) -> Self {
-        UserIdentity {
-            version: 1,
-            credentials: value,
-            update_at: Some(OffsetDateTime::now_utc()),
-        }
+        Self::new(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::UserIdentity;
+
+    #[test]
+    fn sts_generation_distinguishes_legacy_and_malformed_records() {
+        let mut record = serde_json::to_value(UserIdentity::default()).expect("encode legacy record");
+        assert!(record.get("stsGeneration").is_none());
+        assert!(
+            serde_json::from_value::<UserIdentity>(record.clone())
+                .expect("legacy record")
+                .sts_generation
+                .is_none()
+        );
+        for bad in [serde_json::Value::Null, serde_json::json!([1, 2])] {
+            record["stsGeneration"] = bad;
+            assert!(serde_json::from_value::<UserIdentity>(record.clone()).is_err());
+        }
+        record["stsGeneration"] = serde_json::to_value([9u8; 16]).expect("encode generation");
+        assert_eq!(
+            serde_json::from_value::<UserIdentity>(record)
+                .expect("versioned record")
+                .sts_generation,
+            Some([9; 16])
+        );
+    }
 
     /// Deserialize UserIdentity from MinIO-style JSON (RFC3339 updatedAt).
     #[test]

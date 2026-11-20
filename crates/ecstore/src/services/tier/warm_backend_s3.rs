@@ -24,7 +24,7 @@ use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{
         TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
-        build_transition_put_options, endpoint_authority, transition_client_timeouts_from_env,
+        build_transition_put_options, endpoint_authority, transition_client_timeouts_from_env, validate_tier_bucket,
     },
 };
 use http::HeaderMap;
@@ -119,9 +119,8 @@ impl WarmBackendS3 {
             return Err(std::io::Error::other(
                 "AWS Role cannot be activated with static credentials or the web identity token file",
             ));
-        } else if conf.bucket.is_empty() {
-            return Err(std::io::Error::other("no bucket name was provided"));
         }
+        validate_tier_bucket(&conf.bucket)?;
 
         let creds = if has_access_key && has_secret_key {
             //creds = Credentials::new_static_v4(conf.access_key, conf.secret_key, "");

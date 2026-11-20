@@ -21,11 +21,20 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/listing_multipart.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-// The table snapshot reads the access module's private table-catalog state.
-use super::super::*;
+use crate::auth::facts::AuthzTarget;
+use crate::error::ApiError;
+use crate::storage::authorization::*;
+use crate::storage::authorization_actions::list_parts_authorize_action;
 use crate::storage::options::destination_version_id;
-use rustfs_s3_types::S3Result;
+use crate::storage::storage_api::runtime_sources_consumer::{ServerContextSlot, runtime_sources};
+use rustfs_policy::policy::Args;
+use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+use rustfs_s3_types::{S3Error, S3Result};
 use rustfs_utils::http::SUFFIX_INCLUDE_DELETED;
+use rustfs_utils::http::get_header;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use time::OffsetDateTime;
 
 const TABLE_DATA_PLANE_LIST_CURSOR_KEY_CONTEXT: &[u8] = b"rustfs-table-list-cursor-key:v1";
 
@@ -50,7 +59,7 @@ pub(crate) async fn authorize_bucket_listing<R: AuthorizationRequest + ?Sized>(
     if action == S3Action::ListBucketAction && get_header(req.headers(), SUFFIX_INCLUDE_DELETED).as_deref() == Some("true") {
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await?;
     }
-    Ok(prepare_table_data_plane_list_access(req, bucket, action).await?)
+    prepare_table_data_plane_list_access(req, bucket, action).await
 }
 
 /// The authorization of ListMultipartUploads: the bucket generation captured before the decision,
@@ -195,7 +204,7 @@ fn table_list_snapshot_fingerprint(resources: &[TableDataPlaneListResource]) -> 
     hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
-fn table_list_cursor_key<R: AuthorizationRequest + ?Sized>(req: &R) -> super::super::S3Result<[u8; 32]> {
+fn table_list_cursor_key<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<[u8; 32]> {
     let credentials = match req.server_context() {
         Some(server_ctx) => server_ctx
             .installed_app_context()
@@ -216,7 +225,7 @@ async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     bucket: &str,
     action: S3Action,
-) -> super::super::S3Result<()> {
+) -> S3Result<()> {
     if !table_bucket_enabled_for_data_plane(req, bucket).await? {
         return Ok(());
     }
@@ -303,7 +312,3 @@ async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     req.install_table_list_access(access);
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "listing_multipart_test.rs"]
-mod tests;

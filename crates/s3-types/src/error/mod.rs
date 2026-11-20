@@ -51,7 +51,8 @@ pub struct S3Error(Box<S3ErrorParts>);
 pub struct S3ErrorParts {
     /// The wire error code.
     pub code: S3ErrorCode,
-    /// The message, when one was given; there is no per-code default here.
+    /// The message, when one was given; the per-code default is not filled in
+    /// here (see [`S3ErrorCode::default_message`]).
     pub message: Option<Cow<'static, str>>,
     /// The request id, when one was attached.
     pub request_id: Option<String>,
@@ -156,7 +157,12 @@ impl S3Error {
 
     /// The cause, if one was attached.
     pub fn source(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
-        self.0.source.as_deref()
+        let source = self.0.source.as_deref()?;
+        #[cfg(any(test, feature = "compat-s3s"))]
+        if let Some(legacy) = source.downcast_ref::<crate::compat_s3s::LegacyCause>() {
+            return legacy.cause();
+        }
+        Some(source)
     }
 
     /// The explicit status if one was set, otherwise the code's own status;
@@ -201,7 +207,7 @@ impl fmt::Display for S3Error {
 
 impl std::error::Error for S3Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source.as_deref().map(|source| source as _)
+        S3Error::source(self).map(|source| source as _)
     }
 }
 

@@ -83,6 +83,7 @@ rustfs-common = { workspace = true }
 rustfs-heal-contracts = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-utils = { workspace = true }
+jiff = { workspace = true }
 tokio = { workspace = true, features = ["sync", "io-util", "time", "macros", "fs", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["io", "compat", "rt"] }
 tonic = { workspace = true }
@@ -110,7 +111,7 @@ walkdir = { workspace = true }
 http = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
-chrono = { workspace = true }
+jiff = { workspace = true }
 
 [lib]
 doctest = false

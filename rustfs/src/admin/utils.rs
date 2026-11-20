@@ -215,9 +215,10 @@ mod tests {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
 
-        let decoded = read_compatible_admin_body(s3s::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
-            .await
-            .expect("decode payload");
+        let decoded =
+            read_compatible_admin_body(rustfs_s3_types::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
+                .await
+                .expect("decode payload");
 
         assert_eq!(decoded, payload);
     }

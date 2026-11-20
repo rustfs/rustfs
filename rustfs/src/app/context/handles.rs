@@ -409,12 +409,12 @@ impl ActionCredentialInterface for ActionCredentialHandle {
 }
 
 impl RegionInterface for ECStore {
-    fn get(&self) -> Option<s3s::region::Region> {
-        self.region().map(Into::into)
+    fn get(&self) -> Option<rustfs_s3_types::Region> {
+        self.region()
     }
 
-    fn additional(&self) -> Vec<s3s::region::Region> {
-        self.additional_regions().into_iter().map(Into::into).collect()
+    fn additional(&self) -> Vec<rustfs_s3_types::Region> {
+        self.additional_regions()
     }
 }
 
@@ -423,7 +423,7 @@ impl RegionInterface for ECStore {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<s3s::region::Region> {
+    fn get(&self) -> Option<rustfs_s3_types::Region> {
         runtime_sources::region()
     }
 }

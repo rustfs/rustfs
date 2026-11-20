@@ -69,7 +69,7 @@ impl Served for dto::HeadBucket {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::ListBucketAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -118,7 +118,7 @@ impl Served for dto::GetBucketLocation {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketLocationAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -134,7 +134,7 @@ impl Served for dto::GetBucketAccelerateConfiguration {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -153,7 +153,7 @@ impl Served for dto::GetBucketRequestPayment {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -171,7 +171,7 @@ impl Served for dto::GetBucketWebsite {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -193,7 +193,7 @@ impl Served for dto::GetBucketLogging {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketLoggingAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {

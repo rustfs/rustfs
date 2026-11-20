@@ -27,7 +27,7 @@ use crate::backends::{ExpiredKeyRemoval, KmsBackend};
 use crate::error::Result;
 use crate::types::{KeyInfo, KeyStatus, ListKeysRequest, OperationContext};
 use async_trait::async_trait;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -117,7 +117,7 @@ struct KeyCensus {
 }
 
 impl KeyCensus {
-    fn observe(&mut self, key: &KeyInfo, now: &Zoned) {
+    fn observe(&mut self, key: &KeyInfo, now: &ZonedDateTime) {
         match key.status {
             KeyStatus::PendingDeletion => self.pending_deletion += 1,
             KeyStatus::Deleted => self.tombstones += 1,
@@ -145,7 +145,7 @@ impl KeyCensus {
 
 /// Seconds from `earlier` to `now`, clamped at zero so clock skew (or a
 /// timestamp persisted by a node running ahead) cannot produce a negative age.
-fn seconds_between(earlier: &Zoned, now: &Zoned) -> f64 {
+fn seconds_between(earlier: &ZonedDateTime, now: &ZonedDateTime) -> f64 {
     (now.timestamp().as_second() - earlier.timestamp().as_second()).max(0) as f64
 }
 
@@ -273,7 +273,7 @@ impl DeletionWorker {
                 }
                 _ = ticker.tick() => {}
             }
-            let report = self.sweep(&Zoned::now()).await;
+            let report = self.sweep(&ZonedDateTime::now()).await;
             if !report.removed.is_empty() || !report.blocked.is_empty() || report.failed > 0 || report.unreadable > 0 {
                 info!(
                     removed = ?report.removed,
@@ -293,7 +293,7 @@ impl DeletionWorker {
     /// Also feeds the lifecycle gauges: every key it lists is counted into a
     /// [`KeyCensus`] on the way past, so the observability comes out of the
     /// pages the sweep already had to fetch.
-    pub(crate) async fn sweep(&self, now: &Zoned) -> SweepReport {
+    pub(crate) async fn sweep(&self, now: &ZonedDateTime) -> SweepReport {
         let mut report = SweepReport::default();
         let mut census = KeyCensus::default();
         let mut marker: Option<String> = None;
@@ -359,7 +359,7 @@ impl DeletionWorker {
     }
 
     /// Handle one key that is on its way out; reports whether it was removed.
-    async fn process_key(&self, key_id: &str, now: &Zoned, report: &mut SweepReport) -> bool {
+    async fn process_key(&self, key_id: &str, now: &ZonedDateTime, report: &mut SweepReport) -> bool {
         // Never remove a key that live configuration still points at. The
         // default key check is built in; broader references (bucket
         // encryption settings, ...) come from the injected checker.
@@ -464,8 +464,8 @@ mod tests {
         DeletionWorker::new(backend, None, None, "local")
     }
 
-    fn after_window() -> Zoned {
-        Zoned::now() + Duration::from_secs(8 * 86400)
+    fn after_window() -> ZonedDateTime {
+        ZonedDateTime::now() + Duration::from_secs(8 * 86400)
     }
 
     async fn assert_key_gone(backend: &LocalKmsBackend, key_id: &str) {
@@ -488,7 +488,7 @@ mod tests {
         let worker = worker(backend.clone());
 
         // Not yet due: nothing happens.
-        let report = worker.sweep(&Zoned::now()).await;
+        let report = worker.sweep(&ZonedDateTime::now()).await;
         assert!(report.removed.is_empty());
         assert_eq!(report.skipped, 1);
         assert_eq!(report.failed, 0);
@@ -635,7 +635,7 @@ mod tests {
         let worker = DeletionWorker::new(backend.clone(), None, None, "local").with_audit_sink(Some(sink.clone()));
 
         // A key that is not yet due was never at risk, so it produces no record.
-        worker.sweep(&Zoned::now()).await;
+        worker.sweep(&ZonedDateTime::now()).await;
         assert!(
             sink.records.lock().expect("sink lock").is_empty(),
             "a key the sweep declined to touch must not be audited as a deletion"
@@ -780,7 +780,7 @@ mod tests {
             .sum()
     }
 
-    fn key_info(key_id: &str, status: KeyStatus, created_at: Zoned, rotated_at: Option<Zoned>) -> KeyInfo {
+    fn key_info(key_id: &str, status: KeyStatus, created_at: ZonedDateTime, rotated_at: Option<ZonedDateTime>) -> KeyInfo {
         KeyInfo {
             key_id: key_id.to_string(),
             description: None,
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn census_ages_from_rotation_and_ignores_departing_keys() {
-        let now = Zoned::now();
+        let now = ZonedDateTime::now();
         let day = Duration::from_secs(86400);
         let mut census = KeyCensus::default();
 
@@ -833,7 +833,7 @@ mod tests {
     /// material never wraps again, so its consumed nonce budget is moot.
     #[test]
     fn census_takes_the_max_wrap_reservation_of_usable_keys_only() {
-        let now = Zoned::now();
+        let now = ZonedDateTime::now();
         let mut census = KeyCensus::default();
 
         census.observe(&key_info("uncounted", KeyStatus::Active, now.clone(), None), &now);
@@ -859,7 +859,7 @@ mod tests {
     fn wrap_budget_gauge_is_aggregate_and_carries_no_key_label() {
         let (snapshot, ()) = record_metrics(|| {
             Box::pin(async {
-                let now = Zoned::now();
+                let now = ZonedDateTime::now();
                 let mut census = KeyCensus::default();
                 let mut wrapped = key_info("wrapped-key-id", KeyStatus::Active, now.clone(), None);
                 wrapped.wrap_budget_reserved = Some(2_000_000);
@@ -897,7 +897,7 @@ mod tests {
                 // Three days in, still inside the seven-day window: the sweep
                 // observes the scheduled key instead of removing it.
                 let report = worker(backend.clone())
-                    .sweep(&(Zoned::now() + Duration::from_secs(3 * 86400)))
+                    .sweep(&(ZonedDateTime::now() + Duration::from_secs(3 * 86400)))
                     .await;
                 assert_eq!(report.skipped, 1);
                 assert!(report.removed.is_empty());
@@ -950,7 +950,7 @@ mod tests {
 
                 // Well inside the seven-day window: every key is observed as
                 // pending rather than removed.
-                let report = worker(backend.clone()).sweep(&Zoned::now()).await;
+                let report = worker(backend.clone()).sweep(&ZonedDateTime::now()).await;
                 assert_eq!(report.skipped, total, "every scheduled key must be inspected");
                 assert!(report.removed.is_empty());
             })

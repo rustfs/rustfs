@@ -164,10 +164,10 @@ impl From<legacy_s3s::S3Error> for S3Error {
 /// reference only, so the whole error travels inside and this wrapper presents
 /// the cause's own text and chain, as if the cause itself had been moved.
 #[derive(Debug)]
-struct LegacyCause(legacy_s3s::S3Error);
+pub(super) struct LegacyCause(legacy_s3s::S3Error);
 
 impl LegacyCause {
-    fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+    pub(super) fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
         self.0.source()
     }
 }
@@ -236,6 +236,25 @@ mod tests {
         assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
         assert_eq!(oracle("TierNotFound").status_code(), None);
         assert_eq!(S3ErrorCode::Custom("TierNotFound".into()).status_code(), None);
+    }
+
+    #[test]
+    fn every_code_matches_the_s3s_default_message() {
+        let mut mismatches = Vec::new();
+        for code in S3ErrorCode::NAMED {
+            let legacy = oracle(code.as_str()).default_message();
+            if legacy.is_none() {
+                mismatches.push(format!("{code}: s3s has no default message"));
+            }
+            if code.default_message() != legacy {
+                mismatches.push(format!("{code}: s3s {legacy:?}, ours {:?}", code.default_message()));
+            }
+        }
+        assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+        for custom in ["TierNotFound", "NoSuchKey", ""] {
+            assert_eq!(legacy_s3s::S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+            assert_eq!(S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+        }
     }
 
     #[test]
@@ -359,6 +378,8 @@ mod tests {
         legacy.set_source(Box::new(io::Error::other("read quorum")));
 
         let mut ours: S3Error = legacy.into();
+        assert!(ours.source().is_some_and(|cause| cause.is::<io::Error>()));
+        assert!(std::error::Error::source(&ours).is_some_and(|cause| cause.is::<io::Error>()));
         ours.set_message("retry later".to_owned());
         let back: legacy_s3s::S3Error = ours.into();
         assert_eq!(back.code(), &legacy_s3s::S3ErrorCode::ServiceUnavailable);

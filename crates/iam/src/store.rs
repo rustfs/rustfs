@@ -21,6 +21,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 
+/// A backend-owned transaction for one named group. Persistence must fail if its lock is lost.
+#[async_trait::async_trait]
+pub trait GroupEdit: Send + Sync {
+    async fn save(&self, group: &GroupInfo) -> Result<()>;
+    /// Remove the policy mapping, then the group record, after the caller verified emptiness.
+    async fn delete_empty(&self) -> Result<()>;
+}
+
 #[async_trait::async_trait]
 pub trait Store: Clone + Send + Sync + 'static {
     fn has_watcher(&self) -> bool;
@@ -34,13 +42,66 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
 
     async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;
+    /// Read the authoritative identity and its opaque storage revision. Only confirmed absence yields None.
+    async fn regular_user_revision(&self, _name: &str) -> Result<Option<(UserIdentity, String)>> {
+        Err(crate::error::Error::IAMActionNotAllowed)
+    }
+    /// Commit only against the revision just read, or create only if absent. Never retry a stale edit.
+    /// Delegation-capable backends also replace the separate plugin owner epoch atomically,
+    /// without changing the caller-selected STS generation.
+    async fn save_regular_user_revision(&self, _name: &str, _item: &UserIdentity, _revision: Option<&str>) -> Result<()> {
+        Err(crate::error::Error::IAMActionNotAllowed)
+    }
+    /// Persist the secret and its generation in a single conditional write. A same-secret
+    /// upsert preserves sessions, including those predating generation tracking.
+    async fn upsert_regular_user(&self, name: &str, item: &mut UserIdentity, allow_status_change: bool) -> Result<bool> {
+        let current = self.regular_user_revision(name).await?;
+        let previous = current.as_ref().map(|(user, _)| user);
+        if previous.is_some_and(|user| !allow_status_change && user.credentials.status != item.credentials.status) {
+            return Err(crate::error::Error::IAMActionNotAllowed);
+        }
+        let changed = previous.is_some_and(|user| user.credentials.secret_key != item.credentials.secret_key);
+        item.sts_generation = match previous {
+            Some(user) if !changed => user.sts_generation,
+            _ => Some(rand::random()),
+        };
+        self.save_regular_user_revision(name, item, current.as_ref().map(|(_, revision)| revision.as_str()))
+            .await?;
+        Ok(changed)
+    }
+
+    /// Create a regular identity or replace one without changing its durable status.
+    async fn save_regular_user_preserving_status(&self, name: &str, item: &UserIdentity) -> Result<bool> {
+        self.upsert_regular_user(name, &mut item.clone(), false).await
+    }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
+
+    /// Read an enabled regular owner's (plugin epoch, identity revision) from authoritative storage.
+    /// Never initialize or rebind missing state here. Every regular identity write replaces the epoch,
+    /// independently of STS generation. Backends without this contract reject delegation.
+    async fn plugin_delegation_owner_revision(&self, _name: &str) -> Result<(String, String)> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
+
+    /// Authenticate the actual request signing secret against the authoritative regular owner,
+    /// then return its (plugin epoch, identity revision) from the same atomic record.
+    /// May initialize a missing legacy epoch using exact-revision CAS, preserving STS generation.
+    /// Never adopt a different epoch after that CAS or retry against a concurrent identity edit.
+    async fn authenticate_plugin_delegation_owner(&self, _name: &str, _signing_secret: &str) -> Result<(String, String)> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
 
     async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_secret_key(&self, name: &str, user_type: UserType) -> Result<String>;
 
+    /// Serialize edits to this group across all writers sharing the backend, then read its
+    /// durable state. Only confirmed absence yields `None`. Keep the returned guard through
+    /// save/delete and local cache publication; dropping it releases the transaction lock.
+    async fn begin_group_edit(&self, _name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+        Err(crate::error::Error::other("backend does not support serialized group edits"))
+    }
     async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()>;
     async fn delete_group_info(&self, name: &str) -> Result<()>;
     async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()>;
