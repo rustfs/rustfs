@@ -3399,6 +3399,10 @@ pub enum ChannelClass {
 // Keep multiplexed unary RPCs below h2's per-connection small-frame budget.
 const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
 
+// Quorum reads cancel surplus metadata RPCs in bursts. Retain their stream IDs
+// until late replies arrive, with a finite per-connection memory bound.
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
+
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
     rustfs_utils::get_env_bool(
@@ -3603,6 +3607,7 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
         .concurrency_limit(INTERNODE_RPC_CONCURRENCY_LIMIT)
+        .http2_max_concurrent_reset_streams(INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS)
         // TCP-level keepalive - OS will probe connection
         .tcp_keepalive(Some(tcp_keepalive))
         // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
@@ -3731,6 +3736,9 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
         }
     }
 }
+
+#[cfg(test)]
+mod reset_retention_tests;
 
 #[cfg(test)]
 mod tests {
