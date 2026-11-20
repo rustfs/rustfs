@@ -98,14 +98,13 @@ use rustfs_policy::policy::{
     {BucketPolicy, BucketPolicyArgs, Effect},
 };
 use rustfs_s3_ops::S3Operation;
-use rustfs_s3_types::Region;
+use rustfs_s3_types::{Region, S3Error, S3ErrorCode, S3Result};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::http::get_header;
 use rustfs_utils::obj::extract_user_defined_metadata;
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -907,7 +906,9 @@ mod tests {
             .expect_err("full queue rejects immediately");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
-        let response = error.to_http_response().expect("serialize admission error");
+        let response = s3s::S3Error::from(error)
+            .to_http_response()
+            .expect("serialize admission error");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
         use http_body_util::BodyExt as _;
@@ -1000,7 +1001,8 @@ mod tests {
             },
         );
 
-        assert!(req_info_ref(&req).expect("req info should be present").is_owner);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 
     #[tokio::test]

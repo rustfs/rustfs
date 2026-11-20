@@ -37,6 +37,9 @@ pub mod fake_s3_target;
 #[cfg(test)]
 mod dual_stack_differential;
 
+#[cfg(test)]
+mod persistence_parity;
+
 // On-demand migration (backlog#2147): shared two-server environment, admin
 // wrappers, and the harness self-test (backlog#2151). Behavior scenarios are
 // added by later ODM tasks.

@@ -15,12 +15,8 @@
 
 """Quantify RustFS S3 API surface coverage.
 
-Compares the operations defined by the s3s `S3` trait (at the revision pinned
-in the workspace Cargo.toml) against the methods RustFS overrides in
-`impl S3 for FS` (rustfs/src/storage/ecfs.rs, or the rustfs/src/storage/legacy_edge/
-directory a mechanical split of that file moves code into). Trait methods that are not
-overridden fall back to the s3s default implementation, which returns
-NotImplemented — so "overridden" is a faithful proxy for "implemented".
+Compares the reference S3 trait with the operation rows installed by the RustFS gateway.
+Only registered operations count toward coverage.
 
 The s3s trait source is located automatically from the local cargo git
 checkout cache; if absent (e.g. a fresh CI runner), it is fetched from the
@@ -36,9 +32,7 @@ import subprocess
 import sys
 import tempfile
 
-ECFS_PATH = "rustfs/src/storage/ecfs.rs"
-ECFS_SPLIT_DIR = "rustfs/src/storage/legacy_edge"
-IMPL_MARKER = "impl S3 for FS {"
+HANDLERS = pathlib.Path("rustfs/src/server/gateway_handlers")
 TRAIT_RELPATH = "crates/s3s/src/s3_trait.rs"
 
 
@@ -71,57 +65,46 @@ def locate_trait_source(git_url: str, rev: str) -> pathlib.Path:
     return workdir / TRAIT_RELPATH
 
 
-def extract_block(src: str, start: int) -> str:
-    """Return the brace-balanced block starting at the first '{' at/after start."""
-    depth = 0
-    begin = src.index("{", start)
-    for i in range(begin, len(src)):
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[begin : i + 1]
-    raise RuntimeError("unbalanced braces")
+def trait_operations(trait_source: pathlib.Path) -> set[str]:
+    source = trait_source.read_text(encoding="utf-8")
+    names = set(re.findall(r"async fn (\w+)", source))
+    if not names:
+        raise ValueError(f"no S3 operations found in {trait_source}")
+    return names
 
 
-def trait_operations(trait_source: pathlib.Path) -> dict[str, str]:
-    """Return {operation: default kind} for every trait method.
-
-    Kind is "not_implemented" when the default body errors with NotImplemented,
-    or "delegated" when it forwards to another operation (e.g. post_object
-    delegates to put_object), in which case overriding is optional.
-    """
-    src = trait_source.read_text(encoding="utf-8")
-    ops: dict[str, str] = {}
-    for match in re.finditer(r"async fn (\w+)", src):
-        body = extract_block(src, match.end())
-        ops[match.group(1)] = "not_implemented" if "NotImplemented" in body else "delegated"
-    return ops
-
-
-def ecfs_sources(root: pathlib.Path) -> list[pathlib.Path]:
-    """Return ecfs.rs (required) followed by every .rs file under the split directory, in path order."""
-    required = root / ECFS_PATH
-    if not required.is_file():
-        raise RuntimeError(f"{required} is missing")
-    split_dir = root / ECFS_SPLIT_DIR
-    if not split_dir.exists():
-        return [required]
-    if not split_dir.is_dir():
-        raise RuntimeError(f"{split_dir} is not a directory")
-    return [required, *sorted(split_dir.rglob("*.rs"), key=lambda path: path.relative_to(root).as_posix())]
+def registered_items(source: pathlib.Path, name: str) -> list[str]:
+    text = source.read_text(encoding="utf-8")
+    matches = re.findall(rf"\b{name}: [^=;]+?=\s*&\[([^;]*?)\];", text)
+    if len(matches) != 1:
+        raise ValueError(f"expected one {name} registration table in {source}")
+    entries = re.sub(r"//[^\n]*", "", matches[0]).strip().rstrip(",")
+    return [item.strip() for item in entries.split(",")] if entries else []
 
 
 def implemented_operations(root: pathlib.Path) -> set[str]:
-    """Return the methods of the one `impl S3 for FS` block across the ECFS source set."""
-    blocks = []
-    for source in ecfs_sources(root):
-        src = source.read_text(encoding="utf-8")
-        blocks += [extract_block(src, match.start()) for match in re.finditer(re.escape(IMPL_MARKER), src)]
-    if len(blocks) != 1:
-        raise RuntimeError(f"`{IMPL_MARKER}` must occur exactly once under {ECFS_PATH} and {ECFS_SPLIT_DIR}, found {len(blocks)}")
-    return set(re.findall(r"async fn (\w+)", blocks[0]))
+    directory = root / HANDLERS
+    operations = set()
+    for family in registered_items(directory / "mod.rs", "OPERATIONS"):
+        module = re.fullmatch(r"(\w+)::ROWS", family)
+        if not module:
+            raise ValueError(f"unknown operation family: {family}")
+        for item in registered_items(directory / f"{module[1]}.rs", "ROWS"):
+            if direct := re.fullmatch(r"row::<dto::(\w+)>\(\)", item):
+                operation = direct[1]
+            elif external := re.fullmatch(r"super::(\w+)::(\w+)", item):
+                source = (directory / f"{external[1]}.rs").read_text(encoding="utf-8")
+                names = re.findall(rf"\bconst {external[2]}: OpRow = OpRow \{{\s*name: dto::(\w+)::NAME,", source)
+                if len(names) != 1:
+                    raise ValueError(f"missing or ambiguous operation name for {item}")
+                operation = names[0]
+            else:
+                raise ValueError(f"unknown registration in {family}: {item}")
+            name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", operation).lower()
+            if name in operations:
+                raise ValueError(f"duplicate registered operation: {name}")
+            operations.add(name)
+    return operations
 
 
 def main() -> int:
@@ -141,11 +124,10 @@ def main() -> int:
     all_ops = trait_operations(trait_source)
     impl_ops = implemented_operations(root)
 
-    stale = sorted(impl_ops - all_ops.keys())
+    stale = sorted(impl_ops - all_ops)
     implemented = sorted(op for op in all_ops if op in impl_ops)
-    delegated = sorted(op for op, kind in all_ops.items() if op not in impl_ops and kind == "delegated")
-    missing = sorted(op for op, kind in all_ops.items() if op not in impl_ops and kind == "not_implemented")
-    covered = len(implemented) + len(delegated)
+    missing = sorted(all_ops - impl_ops)
+    covered = len(implemented)
     pct = 100.0 * covered / len(all_ops) if all_ops else 0.0
 
     lines = [
@@ -153,27 +135,20 @@ def main() -> int:
         "",
         f"s3s trait revision: `{rev}` — {len(all_ops)} operations.",
         "",
-        f"**{covered}/{len(all_ops)} operations covered ({pct:.0f}%)** — "
-        f"{len(implemented)} overridden by RustFS, {len(delegated)} served by s3s default delegation.",
-        "",
-        "Operations below fall back to s3s defaults that return NotImplemented.",
+        f"**{covered}/{len(all_ops)} reference operations registered ({pct:.0f}%)**",
         "",
         f"## Missing operations ({len(missing)})",
         "",
     ]
     lines += [f"- `{op}`" for op in missing] or ["_none_"]
     lines.append("")
-    if delegated:
-        lines += [f"## Covered via s3s default delegation ({len(delegated)})", ""]
-        lines += [f"- `{op}`" for op in delegated]
-        lines.append("")
     lines += [f"## Implemented operations ({len(implemented)})", ""]
     lines += [f"- `{op}`" for op in implemented]
     lines.append("")
     if stale:
-        lines += [f"## Overridden but absent from the trait ({len(stale)})", ""]
+        lines += [f"## Registered operations outside the reference trait ({len(stale)})", ""]
         lines += [f"- `{op}`" for op in stale]
-        lines += ["", "_These suggest the s3s pin moved; re-run after `cargo update`._", ""]
+        lines.append("")
 
     report = "\n".join(lines)
     if args.output:
@@ -183,7 +158,7 @@ def main() -> int:
 
     print(
         f"[INFO] {covered}/{len(all_ops)} S3 operations covered ({pct:.0f}%): "
-        f"{len(implemented)} overridden, {len(delegated)} delegated, {len(missing)} missing"
+        f"{len(implemented)} registered, {len(missing)} missing"
     )
     for op in missing:
         print(f"[MISSING] {op}")

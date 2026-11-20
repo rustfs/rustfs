@@ -53,10 +53,12 @@ impl Served for dto::DeleteObject {
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let log_error = super::error::object_error_logger("DeleteObject", request.context().transport_extensions().clone());
         let output = DefaultObjectUsecase::with_context(context)
             .execute_delete_object(envelope, request.into_input())
-            .await?;
-        Ok(Resp::new(output))
+            .await;
+        let result = output.map(Resp::new);
+        result.inspect_err(log_error)
     }
 }
 

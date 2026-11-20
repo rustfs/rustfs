@@ -17,9 +17,8 @@
 use super::*;
 use crate::runtime_sources::ServerContextSlot;
 use crate::storage_api::server::http::access::test_support::{
-    AuthorizationRequest, BucketOperations as _, CompletePart, DeleteBucketOptions, ETag, ETagCondition, FS, MakeBucketOptions,
-    MultipartOperations as _, ObjectIO as _, ObjectOperations as _, ObjectOptions, PutObjectInput as LegacyPutObjectInput,
-    ReqInfo, S3Access as _, S3Request, get_bucket_metadata, set_bucket_metadata,
+    AuthorizationRequest, BucketOperations as _, CompletePart, DeleteBucketOptions, MakeBucketOptions, MultipartOperations as _,
+    ObjectIO as _, ObjectOperations as _, ObjectOptions, ReqInfo, S3Request, get_bucket_metadata, set_bucket_metadata,
 };
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
@@ -142,35 +141,11 @@ async fn put_authorization_checks_action_resource_and_write_privileges_on_both_e
         };
         let mut native = envelope(&server, headers.clone());
         let native_result = <dto::PutObject as Served>::authorize(&mut native, &request(input)).await;
-        let mut legacy = build_request(
-            LegacyPutObjectInput {
-                object_lock_retain_until_date: retain.map(Into::into),
-                bucket: bucket.clone(),
-                key: key.to_owned(),
-                if_match: headers
-                    .get("if-match")
-                    .or_else(|| headers.get("dto-if-match"))
-                    .map(|_| ETagCondition::ETag(ETag::Strong("tag".to_owned()))),
-                object_lock_legal_hold_status: headers.get("x-amz-object-lock-legal-hold").map(|_| "ON".to_owned().into()),
-                object_lock_mode: headers.get("x-amz-object-lock-mode").map(|_| "GOVERNANCE".to_owned().into()),
-                ..Default::default()
-            },
-            Method::PUT,
-        );
-        legacy.headers = headers;
-        legacy.extensions.insert(Arc::clone(&server));
-        legacy.extensions.insert(ReqInfo::default());
-        let legacy_result = FS::with_server_ctx(Arc::clone(&server)).put_object(&mut legacy).await;
-        for result in [
+        assert_eq!(
             native_result.map_err(|error| error.code().as_str().to_owned()),
-            legacy_result.map_err(|error| error.code().as_str().to_owned()),
-        ] {
-            assert_eq!(
-                result,
-                if allowed { Ok(()) } else { Err("AccessDenied".to_owned()) },
-                "{actions:?} {key} {extra:?}"
-            );
-        }
+            if allowed { Ok(()) } else { Err("AccessDenied".to_owned()) },
+            "{actions:?} {key} {extra:?}"
+        );
         assert_eq!(AuthorizationRequest::requested_retain_until(&native).map(|value| value.0), retain);
         let info = native.req_info().unwrap();
         assert_eq!(info.bucket.as_deref(), Some(bucket.as_str()));
@@ -216,25 +191,7 @@ async fn put_authorization_honors_request_object_tag_policy_on_both_edges() {
             .await
             .err()
             .map(|error| error.code().as_str().to_owned());
-        let mut legacy = build_request(
-            LegacyPutObjectInput {
-                bucket: bucket.clone(),
-                key: "allowed".to_owned(),
-                tagging: tagging.map(str::to_owned),
-                ..Default::default()
-            },
-            Method::PUT,
-        );
-        legacy.headers = headers;
-        legacy.extensions.insert(Arc::clone(&server));
-        legacy.extensions.insert(ReqInfo::default());
-        let legacy = FS::with_server_ctx(Arc::clone(&server))
-            .put_object(&mut legacy)
-            .await
-            .err()
-            .map(|error| error.code().as_str().to_owned());
         let expected = (!allowed).then_some("AccessDenied");
-        assert_eq!(legacy.as_deref(), expected, "legacy edge with {tagging:?}");
         assert_eq!(native.as_deref(), expected, "gateway edge with {tagging:?}");
     }
 }
@@ -488,35 +445,6 @@ fn native_put_projection_preserves_unvalidated_write_fields() {
     assert_eq!(input.tagging.as_deref(), Some("classification=public"));
     assert_eq!(input.metadata.unwrap().get("purpose").map(String::as_str), Some("projection"));
     assert_eq!(input.checksum_crc32.as_deref(), Some("NSRBwg=="));
-}
-
-#[tokio::test]
-#[serial]
-async fn legacy_post_projection_keeps_early_refusal_order() {
-    for (offset, invalid, actions, expected) in [
-        (true, true, vec![], Some("NotImplemented")),
-        (false, true, vec![], Some("InvalidArgument")),
-        (false, false, vec![], Some("AccessDenied")),
-        (false, false, vec!["s3:PutObject"], None),
-    ] {
-        let (server, bucket) = fixture(&actions).await;
-        let mut req = build_request(
-            LegacyPutObjectInput {
-                bucket,
-                key: "allowed".to_owned(),
-                storage_class: Some(if invalid { "BAD\nFIELD" } else { "STANDARD" }.to_owned().into()),
-                ..Default::default()
-            },
-            Method::POST,
-        );
-        req.extensions.insert(Arc::clone(&server));
-        req.extensions.insert(ReqInfo::default());
-        if offset {
-            req.headers.insert("x-amz-write-offset-bytes", HeaderValue::from_static("0"));
-        }
-        let result = FS::with_server_ctx(server).put_object(&mut req).await;
-        assert_eq!(result.err().map(|error| error.code().as_str().to_owned()), expected.map(str::to_owned));
-    }
 }
 
 #[test]

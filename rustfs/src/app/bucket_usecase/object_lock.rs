@@ -634,6 +634,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_put_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
+        let usecase = DefaultBucketUsecase::without_context();
+        let envelope = crate::app::bucket_usecase::test_support::owned_envelope(http::Method::PUT);
+        let error = usecase
+            .execute_put_object_lock_configuration(
+                envelope,
+                "test-bucket",
+                Some(ObjectLockConfiguration {
+                    object_lock_enabled: Some("Enabled".into()),
+                    rule: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_get_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
         let input = gateway_dto::GetObjectLockConfigurationInput {
             bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),

@@ -26,7 +26,7 @@ mod tests {
         ] {
             let error = crate::storage::s3_support::validate_object_key(key, "PUT")
                 .expect_err("client keys must not alias internal directory markers");
-            assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument, "{key}");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument, "{key}");
         }
         for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
             crate::storage::s3_support::validate_object_key(key, "PUT")
@@ -37,22 +37,28 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
-    use crate::storage::ecfs::FS;
+    use crate::storage::request_markers::{RequestedObjectLegalHold, RequestedObjectLockRetention};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::s3_support::parse_object_version_id;
     use crate::storage::s3_support::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
+    use crate::storage::s3_support::{
+        parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_object_version_id,
+    };
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
         apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
-        parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations,
-        process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy,
-        remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
-        validate_list_object_unordered_with_delimiter,
+        parse_etag, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
+    use rustfs_gateway_types::persistence::{
+        PersistedFilterRule, PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter,
+        PersistedQueueConfiguration, PersistedS3KeyFilter, PersistedTopicConfiguration,
+    };
+    use rustfs_s3_types::{S3ErrorCode, S3Result};
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -60,41 +66,21 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        DefaultRetention, Delimiter, FilterRule, FilterRuleName, LambdaFunctionConfiguration, NotificationConfigurationFilter,
-        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, ObjectLockRule, QueueConfiguration, S3KeyFilter, TopicConfiguration,
+        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
     };
-    use s3s::{S3Error, S3ErrorCode, s3_error};
     use std::collections::HashMap;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-    #[test]
-    fn test_fs_creation() {
-        let _fs = FS::new();
-
-        // Verify that FS struct can be created successfully
-        // Since it's currently empty, we just verify it doesn't panic
-        // The test passes if we reach this point without panicking
+    fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
+            mode: r.mode.map(|m| m.as_str().to_owned()),
+            retain_until: r.retain_until_date.map(OffsetDateTime::from),
+        }))
     }
 
-    #[test]
-    fn test_fs_debug_implementation() {
-        let fs = FS::new();
-
-        // Test that Debug trait is properly implemented
-        let debug_str = format!("{fs:?}");
-        assert!(debug_str.contains("FS"));
-    }
-
-    #[test]
-    fn test_fs_clone_implementation() {
-        let fs = FS::new();
-
-        // Test that Clone trait is properly implemented
-        let cloned_fs = fs.clone();
-
-        // Both should be equivalent (since FS is currently empty)
-        assert_eq!(format!("{fs:?}"), format!("{cloned_fs:?}"));
+    fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
     }
 
     #[test]
@@ -169,6 +155,8 @@ mod tests {
 
     #[test]
     fn test_s3_error_scenarios() {
+        use s3s::{S3Error, S3ErrorCode, s3_error};
+
         // Test that we can create expected S3 errors for common validation cases
 
         // Test incomplete body error
@@ -643,8 +631,7 @@ mod tests {
         // [1] Normal case: No delimiter specified.
         assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
 
-        let delim_str = "/".to_string();
-        let delimiter_some: Option<&Delimiter> = Some(&delim_str);
+        let delimiter_some = Some("/");
         // [2] Normal case: Delimiter is present, but 'allow-unordered' is explicitly set to false.
         assert!(validate_list_object_unordered_with_delimiter(delimiter_some, Some("allow-unordered=false")).is_ok());
 
@@ -1088,6 +1075,31 @@ mod tests {
             ..Default::default()
         };
         assert!(check_preconditions(&headers18, &info18).is_ok());
+    }
+
+    #[test]
+    fn conditional_read_preserves_invalid_cache_header_cause_at_the_wire() {
+        let info = ObjectInfo {
+            user_defined: HashMap::from([("cache-control".to_owned(), "invalid\nvalue".to_owned())]).into(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_static("*"));
+        let error = check_preconditions(&headers, &info).expect_err("invalid cached metadata cannot form a 304 response");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(error.headers().is_none());
+        assert!(
+            error
+                .source()
+                .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
+        );
+        let wire = s3s::S3Error::from(error);
+        assert_eq!(wire.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(
+            wire.source()
+                .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
+        );
     }
 
     #[test]
@@ -1603,8 +1615,8 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 queue_arn: invalid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1629,8 +1641,8 @@ mod tests {
 
         let result = process_topic_configurations(
             &mut event_rules,
-            Some(vec![TopicConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedTopicConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 topic_arn: invalid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1655,8 +1667,8 @@ mod tests {
 
         let result = process_lambda_configurations(
             &mut event_rules,
-            Some(vec![LambdaFunctionConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedLambdaFunctionConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 lambda_function_arn: invalid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1681,8 +1693,8 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 queue_arn: valid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1707,18 +1719,18 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 queue_arn: valid_arn.to_string(),
-                filter: Some(NotificationConfigurationFilter {
-                    key: Some(S3KeyFilter {
+                filter: Some(PersistedNotificationConfigurationFilter {
+                    key: Some(PersistedS3KeyFilter {
                         filter_rules: Some(vec![
-                            FilterRule {
-                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                            PersistedFilterRule {
+                                name: Some("Prefix".to_string()),
                                 value: Some("uploads/".to_string()),
                             },
-                            FilterRule {
-                                name: Some(FilterRuleName::from("Suffix".to_string())),
+                            PersistedFilterRule {
+                                name: Some("Suffix".to_string()),
                                 value: Some(".csv".to_string()),
                             },
                         ]),
@@ -1762,24 +1774,6 @@ mod tests {
 
     /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
     /// returns Ok(empty map) so authorization can proceed without tag conditions.
-    #[tokio::test]
-    async fn test_get_object_tag_conditions_for_policy_returns_empty_without_store() {
-        let fs = FS::new();
-        let out = fs.get_object_tag_conditions_for_policy("bucket", "key", None).await.unwrap();
-        assert!(out.is_empty(), "without store should return empty tag conditions");
-    }
-
-    /// With version_id specified, the same no-store path returns Ok(empty) (versioned object path).
-    #[tokio::test]
-    async fn test_get_object_tag_conditions_for_policy_version_id_returns_empty_without_store() {
-        let fs = FS::new();
-        let out = fs
-            .get_object_tag_conditions_for_policy("bucket", "key", Some("v1"))
-            .await
-            .unwrap();
-        assert!(out.is_empty());
-    }
-
     // --- CORS origin pattern matching tests ---
 
     #[test]
@@ -1815,5 +1809,48 @@ mod tests {
     fn test_matches_origin_pattern_single_star_wildcard() {
         assert!(matches_origin_pattern("*", "anything.com"));
         assert!(matches_origin_pattern("*", ""));
+    }
+
+    #[test]
+    fn website_config_rejects_missing_index_and_invalid_redirect_rules() {
+        use crate::storage::validate_website_configuration;
+        use rustfs_gateway_types::persistence::{
+            PersistedIndexDocument as IndexDocument, PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule,
+            PersistedRoutingRuleCondition as Condition, PersistedWebsiteConfiguration as WebsiteConfiguration,
+        };
+        let missing_index = validate_website_configuration(&WebsiteConfiguration::default()).expect_err("index is required");
+        assert_eq!(missing_index.code(), &rustfs_s3_types::S3ErrorCode::MalformedXML);
+        assert_eq!(missing_index.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            missing_index.message(),
+            Some("IndexDocument is required unless RedirectAllRequestsTo is configured")
+        );
+        let config = WebsiteConfiguration {
+            index_document: Some(IndexDocument {
+                suffix: "index.html".to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_website_configuration(&config).is_ok());
+        let mut bad = config;
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition::default()),
+            redirect: Redirect {
+                host_name: Some("other.test".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
+        bad.routing_rules = Some(vec![RoutingRule {
+            condition: Some(Condition {
+                key_prefix_equals: Some("old/".to_owned()),
+                ..Default::default()
+            }),
+            redirect: Redirect {
+                protocol: Some("ftp".to_owned()),
+                ..Default::default()
+            },
+        }]);
+        assert!(validate_website_configuration(&bad).is_err());
     }
 }

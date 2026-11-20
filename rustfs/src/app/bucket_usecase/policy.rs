@@ -243,27 +243,19 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, s3_op_total};
-    use crate::app::storage_api::s3::S3ErrorCode;
-    use crate::app::storage_api::s3::dto::{DeleteBucketPolicyInput, PutBucketPolicyInput};
+    use crate::app::bucket_usecase::test_support::build_request;
     use http::Method;
 
     #[tokio::test]
-    async fn execute_delete_bucket_policy_records_s3_operation_before_store_lookup() {
-        let input = DeleteBucketPolicyInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
+    async fn execute_delete_bucket_policy_returns_internal_error_when_store_uninitialized() {
+        let req = build_request((), Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
 
-        let req = build_request(input, Method::DELETE);
-        let fs = crate::storage::ecfs::FS::new();
-        let before = s3_op_total(S3Operation::DeleteBucketPolicy);
-
-        let err = crate::app::storage_api::s3::S3::delete_bucket_policy(&fs, req)
+        let err = usecase
+            .execute_delete_bucket_policy(RequestEnvelope::from_s3s(&req), "test-bucket")
             .await
             .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert_eq!(s3_op_total(S3Operation::DeleteBucketPolicy), before + 1);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     fn bucket(name: &str) -> rustfs_gateway_types::BucketName {
@@ -300,20 +292,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_policy_returns_internal_error_when_store_uninitialized() {
-        let input = PutBucketPolicyInput::builder()
-            .bucket("test-bucket".to_string())
-            .policy("{}".to_string())
-            .build()
-            .unwrap();
+        let req = build_request((), Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
 
-        let req = build_request(input, Method::PUT);
-        let fs = crate::storage::ecfs::FS::new();
-        let before = s3_op_total(S3Operation::PutBucketPolicy);
-
-        let err = crate::app::storage_api::s3::S3::put_bucket_policy(&fs, req)
+        let err = usecase
+            .execute_put_bucket_policy(RequestEnvelope::from_s3s(&req), "test-bucket", "{}")
             .await
             .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert_eq!(s3_op_total(S3Operation::PutBucketPolicy), before + 1);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 }
