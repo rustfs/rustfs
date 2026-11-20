@@ -1,15 +1,34 @@
-// Copyright 2026 RustFS Team
-// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use super::{
-    AccessMarkers, Action, AuthorizationRequest, AuthzPrincipal, AuthzTarget, HeaderMap, ReqInfo, S3Action, VerifiedSignature,
-    build_args, build_conditions, get_request_auth_type_with_query, request_authz_facts,
-};
+//! The signing facts a permission probe forked from an account-permissions request carries into
+//! its authorization conditions: the caller's verified query-signing family survives, its URL
+//! capability does not, and an unauthenticated query never becomes a signing fact.
+//!
+//! Not covered here: the probe's endpoint handling, or decisions for ordinary requests.
+//! Upstream: `RequestEnvelope::fork_for_permission_probe`, `request_authz_facts`, and
+//! `build_conditions`; downstream: none.
+
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
-use crate::auth::facts::AuthTypeCondition;
-use http::{Extensions, Method};
+use crate::auth::facts::{AuthTypeCondition, AuthzPrincipal, AuthzTarget, build_args, build_conditions};
+use crate::auth::get_request_auth_type_with_query;
+use crate::storage::authorization::{AccessMarkers, AuthorizationRequest, VerifiedSignature, request_authz_facts};
+use crate::storage::req_info::ReqInfo;
+use http::{Extensions, HeaderMap, Method};
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::Policy;
+use rustfs_policy::policy::action::{Action, S3Action};
 
 fn accepted_query_caller(query: &str) -> (RequestEnvelope, Credentials) {
     let credentials = Credentials {

@@ -13,14 +13,14 @@
 // limitations under the License.
 
 //! UploadPartCopy through one owned storage implementation and its legacy adapter.
-//! Protocol clients and the legacy FS edge supply request facts; multipart ownership stays in storage.
+//! Gateway and protocol clients supply request facts. Storage owns the multipart upload.
 
 use super::*;
 #[cfg(test)]
-use crate::app::storage_api::s3::dto::CopySource;
 use crate::app::storage_api::s3::dto::{
-    CopyPartResult, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
+    CopyPartResult, CopySource, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
 };
+#[cfg(test)]
 use crate::app::storage_api::s3::{S3Request, S3Response};
 use crate::app::{RequestEnvelope, object_usecase::CopySourceCondition};
 use rustfs_gateway_types::CopySourceValue;
@@ -100,6 +100,7 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
 }
 
 impl DefaultMultipartUsecase {
+    #[cfg(test)]
     pub async fn execute_upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,
@@ -129,7 +130,7 @@ impl DefaultMultipartUsecase {
             copy_source_sse_customer_key: input.copy_source_sse_customer_key,
             copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
         };
-        let output = self.execute_upload_part_copy_owned(envelope, input).await?;
+        let output = self.execute_upload_part_copy_with_audit(envelope, input).await?;
         Ok(S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
                 e_tag: output.e_tag.as_deref().map(to_s3s_xml_etag),
@@ -151,6 +152,18 @@ impl DefaultMultipartUsecase {
     }
 
     /// Copies plaintext into an existing upload without changing its recorded owner.
+    /// Records the gateway audit. The protocol client records its own projected response.
+    pub(crate) async fn execute_upload_part_copy_with_audit(
+        &self,
+        envelope: RequestEnvelope,
+        input: UploadPartCopyWriteInput,
+    ) -> S3Result<UploadPartCopyWriteOutput> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPartCopy, http::StatusCode::OK, |envelope| {
+            Box::pin(self.execute_upload_part_copy_owned(envelope, input))
+        })
+        .await
+    }
+
     #[instrument(level = "debug", skip(self, envelope, input))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub(crate) async fn execute_upload_part_copy_owned(
@@ -437,7 +450,7 @@ impl DefaultMultipartUsecase {
             .user_defined
             .contains_key("x-amz-server-side-encryption-customer-algorithm");
         let ssekms_key_id = match server_side_encryption.as_ref() {
-            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => mp_info
+            Some(sse) if sse.as_str() == rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS => mp_info
                 .user_defined
                 .get("x-amz-server-side-encryption-aws-kms-key-id")
                 .map(|s| s.to_string()),

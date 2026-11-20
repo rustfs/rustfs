@@ -20,6 +20,73 @@ use crate::app::storage_api::s3::dto::Range;
 use crate::app::storage_api::test::ReqInfo;
 use http::Method;
 
+#[test]
+fn website_and_object_lambda_ranges_match_the_legacy_wire_reader() {
+    for value in [
+        "bytes=0-9",
+        "bytes=0-",
+        "bytes=-7",
+        "bytes=-0",
+        "bytes=-",
+        "bytes=-18446744073709551615",
+        "bytes=9223372036854775807-",
+        "bytes=9223372036854775808-",
+        "bytes=0-9223372036854775808",
+        "bytes=-18446744073709551616",
+        "bytes=10-5",
+        "bytes=1-2 ",
+        "bytes=1 -2",
+        "bytes=1-2,3-4",
+        "bytes=-+1",
+        "Bytes=1-2",
+        "bytes=",
+    ] {
+        let expected = Range::parse(value).ok().map(|range| match range {
+            Range::Int { first, last: Some(last) } => rustfs_gateway_types::ByteRange::FromTo { first, last },
+            Range::Int { first, last: None } => rustfs_gateway_types::ByteRange::From { first },
+            Range::Suffix { length } => rustfs_gateway_types::ByteRange::Suffix { length },
+        });
+        assert_eq!(GetObjectFields::parse_range(value), expected, "{value}");
+    }
+}
+
+#[test]
+fn website_and_object_lambda_conditions_match_the_legacy_wire_reader() {
+    use s3s::dto::{ETagCondition, Timestamp, TimestampFormat};
+    for value in [
+        b"*".as_slice(),
+        b"abc-2",
+        b"\"\"",
+        b"W/\"x\"",
+        b"\"a \tb\"",
+        b"\"a\"b\"",
+        b"",
+        b"bad etag",
+        b"w/\"x\"",
+        b"\"\xff\"",
+        b"\"\x7f\"",
+        b"\"x",
+    ] {
+        assert_eq!(
+            GetObjectFields::valid_etag_condition(value),
+            ETagCondition::parse_http_header(value).is_ok(),
+            "{value:?}"
+        );
+    }
+    for value in [
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "2025-01-01",
+        "Sun, 32 Nov 1994 08:49:37 GMT",
+    ] {
+        assert_eq!(
+            GetObjectFields::valid_date_condition(value),
+            Timestamp::parse(TimestampFormat::HttpDate, value).is_ok(),
+            "{value}"
+        );
+    }
+}
+
 fn get_request(input: GetObjectInput) -> S3Request<GetObjectInput> {
     let info = ReqInfo {
         bucket: Some(input.bucket.clone()),
@@ -482,9 +549,13 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
         .sse_customer_key_md5(Some(digest.clone()))
         .build()
         .unwrap();
-    crate::app::test_seams::put_object(usecase, &FS::new(), build_request(input, Method::PUT))
-        .await
-        .unwrap();
+    {
+        let (envelope, input) =
+            crate::app::object_usecase::PutObjectWriteInput::from_test_request(build_request(input, Method::PUT));
+        crate::app::test_seams::put_object(usecase, envelope, input)
+    }
+    .await
+    .unwrap();
     for (case, valid, wrong_key, condition, range) in [
         ("ordinary", true, false, false, false),
         ("missing", false, false, false, false),

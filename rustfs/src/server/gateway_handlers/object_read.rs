@@ -78,11 +78,13 @@ impl Served for dto::GetObject {
         .await
     }
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
-        get_result(
+        let log_error = super::error::object_error_logger("GetObject", request.context().transport_extensions().clone());
+        let result = get_result(
             DefaultObjectUsecase::with_context(context)
                 .execute_get_object(envelope, request.into_input())
                 .await,
-        )
+        );
+        result.inspect_err(log_error)
     }
 }
 
@@ -222,15 +224,11 @@ pub(super) fn get_response(answered: Answered<GetObjectOutputFacts>) -> S3Result
 }
 
 fn insert_etag(headers: &mut http::HeaderMap, etag: Option<ResponseEtag>) -> S3Result<()> {
-    if let Some(ResponseEtag { opaque, weak }) = etag {
-        let value = if weak {
-            format!("W/\"{}\"", opaque)
-        } else {
-            format!("\"{}\"", opaque)
-        };
+    if let Some(etag) = etag {
         headers.insert(
             http::header::ETAG,
-            http::HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
+            etag.to_http_header()
+                .map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
         );
     }
     Ok(())

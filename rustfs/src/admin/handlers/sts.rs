@@ -48,7 +48,6 @@ use rustfs_policy::{
 };
 use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::MaskedAccessKey;
-use s3s::dto::{AssumeRoleOutput, Credentials, Timestamp};
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
@@ -337,33 +336,35 @@ async fn handle_assume_role(
         warn!("site replication STS hook failed, err: {err}");
     }
 
-    let resp = AssumeRoleOutput {
-        credentials: Some(Credentials {
-            access_key_id: new_cred.access_key,
-            expiration: Timestamp::from(
-                new_cred
-                    .expiration
-                    .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
-            ),
-            secret_access_key: new_cred.secret_key,
-            session_token: new_cred.session_token,
-        }),
-        ..Default::default()
-    };
-
-    // getAssumeRoleCredentials
-    let output = serialize_assume_role_output(&resp)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize assume role output failed: {e}")))?;
-
+    let expiration = new_cred
+        .expiration
+        .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600)));
+    let output = assume_role_response_xml(&new_cred, expiration)?;
     Ok(AdminResponse::new(StatusCode::OK, Body::from(output)))
 }
 
-/// The STS answer is an s3s response body, so the s3s encoder writes it; it
-/// is not a bucket configuration and never goes through the bucket-config codec.
-fn serialize_assume_role_output(output: &AssumeRoleOutput) -> s3s::xml::SerResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    s3s::xml::Serialize::serialize(output, &mut s3s::xml::Serializer::new(&mut buf))?;
-    Ok(buf)
+fn assume_role_response_xml(credentials: &rustfs_credentials::Credentials, expiration: OffsetDateTime) -> S3Result<String> {
+    // The STS codec writes local clock fields with millisecond precision and a four-digit year.
+    if !(0..=9999).contains(&expiration.year()) {
+        return Err(s3_error!(InternalError, "cannot serialize STS expiration year"));
+    }
+    let expiration = expiration
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .map_err(|_| s3_error!(InternalError, "cannot serialize STS expiration"))?;
+    Ok(format!(
+        concat!(
+            "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleResult><Credentials>",
+            "<AccessKeyId>{}</AccessKeyId><Expiration>{}</Expiration>",
+            "<SecretAccessKey>{}</SecretAccessKey><SessionToken>{}</SessionToken>",
+            "</Credentials></AssumeRoleResult></AssumeRoleResponse>"
+        ),
+        xml_escape(&credentials.access_key),
+        expiration,
+        xml_escape(&credentials.secret_key),
+        xml_escape(&credentials.session_token),
+    ))
 }
 
 /// Session claim marking a session that presented a second factor.
@@ -577,6 +578,29 @@ mod tests {
         ] {
             assert!(!logs.contains(secret), "AssumeRole claims log leaked {secret}: {logs}");
         }
+    }
+
+    #[test]
+    fn assume_role_xml_matches_the_pinned_sts_response() {
+        let credentials = rustfs_credentials::Credentials {
+            access_key: "access<&".to_owned(),
+            secret_key: "synthetic>'".to_owned(),
+            session_token: "quoted\"token".to_owned(),
+            ..Default::default()
+        };
+        let expiration = time::macros::datetime!(2024-02-29 11:22:33.123456789 +05:30);
+        let answer = assume_role_response_xml(&credentials, expiration).expect("valid timestamp");
+        // Captured from the pinned 5761ddfe STS writer, including field order and escaping.
+        assert_eq!(
+            answer,
+            concat!(
+                "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleResult><Credentials>",
+                "<AccessKeyId>access&lt;&amp;</AccessKeyId><Expiration>2024-02-29T11:22:33.123Z</Expiration>",
+                "<SecretAccessKey>synthetic&gt;&apos;</SecretAccessKey><SessionToken>quoted&quot;token</SessionToken>",
+                "</Credentials></AssumeRoleResult></AssumeRoleResponse>"
+            )
+        );
+        assert!(assume_role_response_xml(&credentials, time::macros::datetime!(-1-01-01 00:00 UTC)).is_err());
     }
 
     #[test]

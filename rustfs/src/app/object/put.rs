@@ -150,7 +150,7 @@ pub(crate) fn reject_oversize_single_upload(size: i64) -> S3Result<()> {
     if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
         return Err(S3Error::with_message(
             S3ErrorCode::EntityTooLarge,
-            ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+            ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge),
         ));
     }
     Ok(())
@@ -1174,8 +1174,10 @@ impl PutObjectCompletion {
         match self {
             Self::S3(helper) => Self::S3(helper.complete_owned(result, status, headers)),
             Self::Internal(event) => {
-                if let Some(event) = event {
-                    event.complete_owned(result, headers);
+                if result.is_ok()
+                    && let Some(event) = event
+                {
+                    event.publish(headers);
                 }
                 Self::Internal(None)
             }
@@ -1322,7 +1324,7 @@ impl DefaultObjectUsecase {
         {
             return Err(rustfs_s3_types::s3_error!(InvalidStorageClass));
         }
-        reject_non_wildcard_write_if_none_match_native(input.specific_if_none_match, envelope.headers())?;
+        reject_non_wildcard_write_if_none_match(input.specific_if_none_match, envelope.headers())?;
         // An authorized inbound replication PUT must store the replica verbatim.
         // Legacy snowball-extracted members may still carry the auto-extract
         // metadata, which replication replays as a header. Do not interpret that
@@ -2605,6 +2607,23 @@ mod tests {
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
     use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
 
+    /// PutObject through the owned entry point the gateway handler calls, its error in the s3s
+    /// form these tests compare.
+    async fn put_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
+        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
+        Box::pin(usecase.execute_put_object_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+    }
+
+    /// As [`put_owned`], through the archive-extraction entry point.
+    async fn put_extract_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
+        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
+        Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn s3_put_uses_tail_drained_completion_before_acknowledgement() {
@@ -2626,10 +2645,9 @@ mod tests {
             .build()
             .expect("PUT completion request");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let fs = FS::new();
         let (response, observed) = PUT_STORAGE_TEST_COMPLETION
             .scope(std::cell::Cell::new(None), async {
-                let response = Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT))).await;
+                let response = Box::pin(put_owned(&usecase, build_request(input, Method::PUT))).await;
                 (response, PUT_STORAGE_TEST_COMPLETION.with(std::cell::Cell::get))
             })
             .await;
@@ -2644,7 +2662,9 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn put_edge_counts_polled_requests_once_before_usecase_refusal() {
+    /// The PutObject use cases count nothing: the gateway's dispatch counts each request once before
+    /// the use case runs (`GatewayBackend::serve`), so a count here would count it twice.
+    fn owned_put_entry_points_never_count_the_operation() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
         use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
@@ -2690,7 +2710,6 @@ mod tests {
             .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
             .expect("count test bucket");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let fs = FS::new();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let request = |invalid_class: bool| {
@@ -2707,39 +2726,35 @@ mod tests {
         let baseline = official_count();
         let mut observed = 0;
         metrics::with_local_recorder(&recorder, || {
-            drop(usecase.execute_put_object(&fs, request(false)));
+            drop(put_owned(&usecase, request(false)));
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "constructing a future does not count a PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
             let error = runtime
-                .block_on(Box::pin(usecase.execute_put_object(&fs, request(true))))
+                .block_on(Box::pin(put_owned(&usecase, request(true))))
                 .expect_err("invalid class");
             assert_eq!(error.code(), &S3ErrorCode::InvalidStorageClass);
-            assert_eq!(put_count(&snapshotter, &mut observed), 1, "the owned edge counts before usecase refusal");
-            assert_eq!(official_count() - baseline, 1, "official operation total");
+            assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count a refused PUT");
+            assert_eq!(official_count() - baseline, 0, "official operation total");
             runtime
-                .block_on(Box::pin(usecase.execute_put_object(&fs, request(false))))
+                .block_on(Box::pin(put_owned(&usecase, request(false))))
                 .expect("successful PUT");
-            assert_eq!(
-                put_count(&snapshotter, &mut observed),
-                2,
-                "the usecase must not count the accepted PUT again"
-            );
-            assert_eq!(official_count() - baseline, 2, "official operation total");
+            assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count an accepted PUT");
+            assert_eq!(official_count() - baseline, 0, "official operation total");
             let input = PutObjectInput {
                 bucket: bucket.clone(),
                 key: "archive.tar".to_owned(),
                 ..Default::default()
             };
             let error = runtime
-                .block_on(Box::pin(usecase.execute_put_object_extract(build_request(input, Method::PUT))))
+                .block_on(Box::pin(put_extract_owned(&usecase, build_request(input, Method::PUT))))
                 .expect_err("missing archive body");
             assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
             assert_eq!(
                 put_count(&snapshotter, &mut observed),
-                3,
-                "the direct archive edge counts once before validation"
+                0,
+                "the archive use case does not count a refused PUT"
             );
-            assert_eq!(official_count() - baseline, 3, "official operation total");
+            assert_eq!(official_count() - baseline, 0, "official operation total");
         });
     }
 
@@ -2772,13 +2787,16 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let mut request = S3HttpRequestGuard::new("PUT");
         let error = metrics::with_local_recorder(&recorder, || {
-            let fs = FS::new();
             let mut future = Box::pin(PUT_STORAGE_TEST_FAILURE.scope(
                 (
                     PutStorageTestStage::Commit,
                     StorageError::Lock(LockError::timeout("private-bucket/private-key", Duration::from_secs(5))),
                 ),
-                Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT))),
+                // The gateway's dispatch names the operation before the use case runs.
+                Box::pin(async {
+                    rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                    put_owned(&usecase, build_request(input, Method::PUT)).await
+                }),
             ));
             runtime.block_on(std::future::poll_fn(|cx| {
                 request.in_scope(|| std::future::Future::poll(future.as_mut(), cx))
@@ -2859,7 +2877,7 @@ mod tests {
                 let err = PUT_STORAGE_TEST_FAILURE
                     .scope(
                         (stage, StorageError::InsufficientReadQuorum("bucket".into(), "object".into())),
-                        usecase.execute_put_object(&FS::new(), req),
+                        put_owned(&usecase, req),
                     )
                     .await
                     .expect_err("read quorum failure must refuse the upload");
@@ -2919,7 +2937,7 @@ mod tests {
                 .expect("capacity PUT input must build");
             let request = build_request(input, Method::PUT);
             let error = PUT_STORAGE_TEST_FAILURE
-                .scope((PutStorageTestStage::Commit, failure), usecase.execute_put_object(&FS::new(), request))
+                .scope((PutStorageTestStage::Commit, failure), put_owned(&usecase, request))
                 .await
                 .expect_err("capacity refusal must fail PUT");
             assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
@@ -3273,11 +3291,7 @@ mod tests {
             .build()
             .expect("PUT input must build");
         let put_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let put = tokio::spawn(async move {
-            put_usecase
-                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
-                .await
-        });
+        let put = tokio::spawn(async move { put_owned(&put_usecase, build_request(put_input, Method::PUT)).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.snapshot().write_stalled {
                 tokio::task::yield_now().await;
@@ -3337,7 +3351,7 @@ mod tests {
         let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let mut request = build_request(put_input, Method::PUT);
         request.uri = format!("/{bucket}/{object}").parse().expect("PUT URI");
-        let put = tokio::spawn(async move { put_usecase.execute_put_object(&FS::new(), request).await });
+        let put = tokio::spawn(async move { put_owned(&put_usecase, request).await });
 
         tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
             .await
@@ -3380,8 +3394,7 @@ mod tests {
             .expect("normal PUT");
         let mut normal_request = build_request(normal_input, Method::PUT);
         normal_request.uri = format!("/{bucket}/normal.bin").parse().expect("URI");
-        DefaultObjectUsecase::with_context(Some(context))
-            .execute_put_object(&FS::new(), normal_request)
+        put_owned(&DefaultObjectUsecase::with_context(Some(context)), normal_request)
             .await
             .expect("normal response completion");
         let audits = probe.audits.lock().expect("audits");
@@ -3418,8 +3431,7 @@ mod tests {
         let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let mut extra_body_request = build_request(extra_body_input, Method::PUT);
         extra_body_request.headers = streaming_headers(Some("0"));
-        let extra_body_err = extra_body_usecase
-            .execute_put_object(&FS::new(), extra_body_request)
+        let extra_body_err = put_owned(&extra_body_usecase, extra_body_request)
             .await
             .expect_err("decoded zero-byte PUT with body data must fail");
         assert_eq!(extra_body_err.code(), &S3ErrorCode::UnexpectedContent);
@@ -3455,7 +3467,7 @@ mod tests {
         let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let mut zero_request = build_request(zero_input, Method::PUT);
         zero_request.headers = streaming_headers(Some("0"));
-        let zero_put = tokio::spawn(async move { zero_usecase.execute_put_object(&FS::new(), zero_request).await });
+        let zero_put = tokio::spawn(async move { put_owned(&zero_usecase, zero_request).await });
 
         tokio::time::timeout(Duration::from_secs(30), body_polled_rx)
             .await
@@ -3507,11 +3519,8 @@ mod tests {
             .build()
             .expect("zero-copy PUT input must build");
         let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let zero_copy_put = tokio::spawn(async move {
-            zero_copy_usecase
-                .execute_put_object(&FS::new(), build_request(zero_copy_input, Method::PUT))
-                .await
-        });
+        let zero_copy_put =
+            tokio::spawn(async move { put_owned(&zero_copy_usecase, build_request(zero_copy_input, Method::PUT)).await });
 
         tokio::time::timeout(Duration::from_secs(30), async {
             while !object_traffic_health.snapshot().write_stalled {
@@ -3973,7 +3982,7 @@ mod tests {
             let mut request = build_request(input, Method::PUT);
             request.extensions.insert(control.clone());
             let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-            let owner = tokio::spawn(async move { usecase.execute_put_object(&FS::new(), request).await });
+            let owner = tokio::spawn(async move { put_owned(&usecase, request).await });
             control.wait_until_pending_for_test().await;
             control.advance_wait_for_test(Duration::from_secs(60));
             sender.send(Ok(Frame::data(Bytes::new()))).unwrap();
@@ -4358,7 +4367,7 @@ mod tests {
     async fn post_object_metadata_cannot_dispatch_legacy_archive_extraction() {
         let mut req = build_request(PutObjectInput::default(), Method::POST);
         req.extensions.insert(PostObjectRequestMarker);
-        let err = Box::pin(DefaultObjectUsecase::without_context().execute_put_object_extract(req))
+        let err = Box::pin(put_extract_owned(&DefaultObjectUsecase::without_context(), req))
             .await
             .expect_err("a legacy form cannot authorize archive replay");
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
@@ -4377,7 +4386,7 @@ mod tests {
             .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"different-etag\""));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+        let err = Box::pin(put_owned(&usecase, req))
             .await
             .expect_err("POST header-only ETag precondition must fail before storage access");
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
@@ -4407,7 +4416,7 @@ mod tests {
             } else {
                 Box::pin(usecase.execute_put_object_owned(envelope, input)).await
             };
-            let error = result.err().expect("unbound gateway archive must be refused");
+            let error = result.expect_err("unbound gateway archive must be refused");
             assert_eq!(error.code().as_str(), "NotImplemented", "direct={direct_extract}");
             assert_eq!(
                 polls.load(std::sync::atomic::Ordering::SeqCst),
@@ -4430,9 +4439,8 @@ mod tests {
         req.extensions.insert(PostObjectRequestMarker);
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4449,9 +4457,8 @@ mod tests {
         req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4468,9 +4475,8 @@ mod tests {
         req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4491,9 +4497,8 @@ mod tests {
 
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
         assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
     }
@@ -4529,9 +4534,8 @@ mod tests {
                 HeaderValue::from_str(&decoded.to_string()).unwrap(),
             );
             let usecase = DefaultObjectUsecase::without_context();
-            let fs = FS::new();
 
-            let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+            let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
             if expect_too_large {
                 assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "decoded {decoded}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
@@ -4559,9 +4563,8 @@ mod tests {
             .insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("aws:kms"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4579,9 +4582,8 @@ mod tests {
             .insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4596,9 +4598,8 @@ mod tests {
 
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4820,13 +4821,12 @@ mod tests {
                 .expect("SSE-C PUT input must build");
 
             let usecase = DefaultObjectUsecase::from_global();
-            let response = usecase
-                .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+            let response = put_owned(&usecase, build_request(input, Method::PUT))
                 .await
                 .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
-            assert_eq!(response.output.server_side_encryption, None);
-            assert_eq!(response.output.sse_customer_algorithm.as_deref(), Some("AES256"));
-            assert_eq!(response.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            assert_eq!(response.server_side_encryption, None);
+            assert_eq!(response.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(response.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
 
             let encoded_key = base64_simd::STANDARD.encode_to_string(customer_key);
             let mut read_headers = HeaderMap::new();
@@ -4940,8 +4940,7 @@ mod tests {
             ..Default::default()
         });
 
-        let err = DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), request)
+        let err = put_owned(&DefaultObjectUsecase::from_global(), request)
             .await
             .expect_err("quota-enabled ciphertext replication should fail at ingress");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -4991,8 +4990,7 @@ mod tests {
             .build()
             .expect("legacy quota PUT input should build");
 
-        let err = DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+        let err = put_owned(&DefaultObjectUsecase::from_global(), build_request(input, Method::PUT))
             .await
             .expect_err("4 GiB used plus a 2 GiB PUT must exceed a 5 GiB legacy quota");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -5038,8 +5036,7 @@ mod tests {
             .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
             .build()
             .expect("PUT input should build");
-        DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+        put_owned(&DefaultObjectUsecase::from_global(), build_request(input, Method::PUT))
             .await
             .expect("a ledger-admitted bucket must accept a write without scanner usage");
 
@@ -5051,8 +5048,7 @@ mod tests {
             .content_length(Some(i64::try_from(too_large.len()).expect("test payload length must fit i64")))
             .build()
             .expect("PUT input should build");
-        let err = DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+        let err = put_owned(&DefaultObjectUsecase::from_global(), build_request(input, Method::PUT))
             .await
             .expect_err("the ledger must still reject a write above the quota limit");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -5455,7 +5451,7 @@ mod tests {
             .expect("PUT input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+        let err = Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the write");
 
@@ -5500,7 +5496,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             request.in_scope(|| {
                 runtime.block_on(async {
-                    Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+                    Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
                         .await
                         .expect("S3 PUT must commit");
                     assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
@@ -5567,7 +5563,7 @@ mod tests {
             .expect("PUT input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+        Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
             .await
             .expect("a bucket without default encryption must still accept a plaintext write");
 
@@ -5613,7 +5609,7 @@ mod tests {
         req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+        let err = Box::pin(put_owned(&usecase, req))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
 
@@ -5673,7 +5669,7 @@ mod oversize_single_upload_tests {
         assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
         assert_eq!(
             err.message(),
-            Some(ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge).as_str())
+            Some(ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge).as_str())
         );
     }
 }

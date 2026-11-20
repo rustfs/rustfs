@@ -26,11 +26,8 @@ use rustfs_s3_types::S3Result;
 use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 pub(crate) enum ListPartsTarget {
-    Legacy {
-        bucket: String,
-        key: String,
-        upload_id: String,
-    },
+    #[allow(dead_code)]
+    Legacy { bucket: String, key: String, upload_id: String },
     Gateway {
         bucket: BucketName,
         key: ObjectKey,
@@ -82,7 +79,7 @@ where
         Ok::<_, StorageError>(page.recorded_owner.take().map(|owner| RecordedListParts { owner, page }))
     })
     .await
-    .map_err(|error| S3Error::from(multipart_upload_api_error(error)))?
+    .map_err(multipart_upload_api_error)?
     .map_err(|refusal| S3Error::with_message(S3ErrorCode::NoSuchUpload, refusal.reason()))?;
     Ok(record.page)
 }
@@ -201,7 +198,7 @@ impl DefaultMultipartUsecase {
             ListPartsTarget::Legacy { upload_id, .. } => store
                 .list_object_parts(bucket, key, upload_id, params.part_number_marker, params.max_parts, &opts)
                 .await
-                .map_err(|error| multipart_upload_api_error(error).into()),
+                .map_err(multipart_upload_api_error),
             ListPartsTarget::Gateway {
                 bucket: bucket_name,
                 key: object_key,

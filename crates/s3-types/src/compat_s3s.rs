@@ -164,10 +164,10 @@ impl From<legacy_s3s::S3Error> for S3Error {
 /// reference only, so the whole error travels inside and this wrapper presents
 /// the cause's own text and chain, as if the cause itself had been moved.
 #[derive(Debug)]
-struct LegacyCause(legacy_s3s::S3Error);
+pub(super) struct LegacyCause(legacy_s3s::S3Error);
 
 impl LegacyCause {
-    fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+    pub(super) fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
         self.0.source()
     }
 }
@@ -378,6 +378,8 @@ mod tests {
         legacy.set_source(Box::new(io::Error::other("read quorum")));
 
         let mut ours: S3Error = legacy.into();
+        assert!(ours.source().is_some_and(|cause| cause.is::<io::Error>()));
+        assert!(std::error::Error::source(&ours).is_some_and(|cause| cause.is::<io::Error>()));
         ours.set_message("retry later".to_owned());
         let back: legacy_s3s::S3Error = ours.into();
         assert_eq!(back.code(), &legacy_s3s::S3ErrorCode::ServiceUnavailable);
