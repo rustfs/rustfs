@@ -1091,9 +1091,12 @@ jobs:
       - name: Verify E2E archive identity
         run: python3 scripts/ci_test_artifact.py verify --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
 
-      - name: Install network fault-injection tools
+      - name: Install network fault-injection tools and the persistence test clock
         run: |
-          sudo apt-get install -y iptables
+          sudo apt-get install -y iptables libfaketime
+          clock_library="$(dpkg-query -L libfaketime | grep -E '/libfaketime[.]so[.]1$')"
+          test -f "$clock_library"
+          echo "RUSTFS_PERSISTENCE_CLOCK_LIBRARY=$clock_library" >> "$GITHUB_ENV"
           sudo -n iptables --version
           # The endpoint-blackhole heal scenario needs CAP_NET_ADMIN. Containerised
           # runners can run iptables but not touch the rule set; the test then logs
@@ -1200,8 +1203,14 @@ jobs:
       # default-filter in .config/nextest.toml is the single wiring mechanism —
       # extend that filter, never add ad-hoc e2e jobs here. Reuses the downloaded
       # debug binary; each test spawns its own rustfs server on a random port.
+      - name: Download pinned release for persistence byte parity
+        id: persistence-reference
+        uses: ./.github/actions/reference-binary
+
       - name: Run e2e full suite
         env:
+          RUSTFS_PERSISTENCE_REFERENCE_BINARY: ${{ steps.persistence-reference.outputs.path }}
+          RUSTFS_PERSISTENCE_XML_DIR: ${{ runner.temp }}/rustfs-persistence-xml
           CARGO_BIN_EXE_rustfs: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
@@ -1220,6 +1229,7 @@ jobs:
           path: |
             target/nextest/e2e-full/junit.xml
             ${{ runner.temp }}/rustfs-e2e-full-list.json
+            ${{ runner.temp }}/rustfs-persistence-xml
           retention-days: 7
 
       - name: Upload startup CAS evidence
