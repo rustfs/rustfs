@@ -30,6 +30,8 @@ mod object_misc;
 
 #[cfg(test)]
 pub(crate) use object_misc::complete_multipart_upload_input;
+#[cfg(test)]
+pub(crate) use object_misc::copy_input_from_legacy;
 mod object_read;
 mod object_write;
 

@@ -73,7 +73,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput, PutObjectOutput};
+    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     pub(crate) use s3s::header;
@@ -1951,7 +1951,6 @@ pub(crate) mod context {
 #[cfg(test)]
 pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
-    pub(crate) use s3s::access::S3Access;
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{
@@ -1982,6 +1981,7 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
+    pub(crate) use crate::storage::storage_api::test_consumer::authorize_head_object;
     pub(crate) mod sse {
         pub(crate) use crate::storage::storage_api::test_consumer::sse::{
             RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,

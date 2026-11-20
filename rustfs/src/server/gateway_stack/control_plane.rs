@@ -46,16 +46,18 @@ use rustfs_gateway_core::dialect::{
 };
 use rustfs_gateway_core::op::{AuthRequirement, ResourceShape};
 use rustfs_gateway_core::registry::{HandlerDeadlineClass, OperationSpec};
-use rustfs_gateway_core::route::FormClaim;
+use rustfs_gateway_core::route::{FormClaim, ShadowingDecl};
 use rustfs_gateway_core::{DerivedResourceError, NoDerived};
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     check_replication::CheckReplication, get_replication_metrics::GetReplicationMetrics,
     get_replication_metrics_v2::GetReplicationMetricsV2, get_replication_reset_status::GetReplicationResetStatus,
     invoke_object_lambda::InvokeObjectLambda, listen_bucket_notification::ListenBucketNotification,
-    listen_notification::ListenNotification, reset_bucket_replication::ResetBucketReplication,
+    listen_notification::ListenNotification, post_v3_speedtest_client_devnull::PostV3SpeedtestClientDevnull,
+    reset_bucket_replication::ResetBucketReplication,
 };
 use rustfs_gateway_dialect_rustfs_admin::{
-    AdminResponse as WireResponse, CLAIMS, ExtensionOperation, OVERLAY, TABLE_CATALOG_PREFIXES, admin,
+    AdminOperation as DialectAdminOperation, AdminResponse as WireResponse, CLAIMS, ExtensionOperation, OVERLAY,
+    TABLE_CATALOG_PREFIXES, admin,
 };
 use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
 use rustfs_s3_types::{Body, s3_error};
@@ -206,9 +208,10 @@ impl OperationCodec for StsForm {
     }
 }
 
-/// The gateway's query-discriminated extension rows this host serves, recorded in the gateway's
-/// own overlay.
-const BORROWED: [&str; 8] = [
+/// The gateway's query-discriminated extension rows and streamed speedtest row this host serves,
+/// recorded in the gateway's own overlay.
+const BORROWED: [&str; 9] = [
+    PostV3SpeedtestClientDevnull::NAME,
     ResetBucketReplication::NAME,
     GetReplicationResetStatus::NAME,
     GetReplicationMetricsV2::NAME,
@@ -218,6 +221,13 @@ const BORROWED: [&str; 8] = [
     ListenNotification::NAME,
     ListenBucketNotification::NAME,
 ];
+
+const SPEEDTEST_SHADOWS: &[ShadowingDecl] = &[ShadowingDecl {
+    winner: PostV3SpeedtestClientDevnull::NAME,
+    shadowed: NAME,
+    reason: "The streamed client devnull speedtest precedes the buffered control-plane catch-all.",
+    evidence: &[ROUTER],
+}];
 
 fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     static ROWS: OnceLock<Vec<OverlayRow>> = OnceLock::new();
@@ -257,6 +267,12 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     });
     Dialect::assemble(record)
         .declare_claimed::<ControlPlane>(ROUTE)
+        .declare_claimed::<PostV3SpeedtestClientDevnull>(ClaimedRoute {
+            precedence: PostV3SpeedtestClientDevnull::PRECEDENCE,
+            rows: PostV3SpeedtestClientDevnull::rows(),
+            shadows: SPEEDTEST_SHADOWS,
+            bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
+        })
         .declare_form::<StsForm>(STS_ROUTE)
         .declare::<ResetBucketReplication>(ResetBucketReplication::ROUTE)
         .declare::<GetReplicationResetStatus>(GetReplicationResetStatus::ROUTE)
@@ -297,6 +313,7 @@ pub(super) fn assemble(
         .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
         .dialect(&dialect()?)
         .register::<ControlPlane, _>(Arc::clone(&host))
+        .register::<PostV3SpeedtestClientDevnull, _>(Arc::clone(&host))
         .register::<StsForm, _>(Arc::clone(&host))
         .register::<ResetBucketReplication, _>(Arc::clone(&host))
         .register::<GetReplicationResetStatus, _>(Arc::clone(&host))
@@ -438,6 +455,12 @@ impl AdminBody for () {
 impl AdminBody for Bytes {
     fn into_admin_body(self) -> Body {
         Body::from(self)
+    }
+}
+
+impl AdminBody for ByteStream {
+    fn into_admin_body(self) -> Body {
+        Body::from_stream(crate::app::object::BodyChunks::with_trailers(self.into_body(), None).0)
     }
 }
 

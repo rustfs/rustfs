@@ -33,8 +33,14 @@ impl FS {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         crate::hp_guard!("S3::put_object");
-        let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_put_object(self, req).await
+        record_s3_op(S3Operation::PutObject);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = PutObjectWriteInput::from_legacy(req.input, req.trailing_headers);
+        s3_api::object_usecase_for(self)
+            .execute_put_object_owned(envelope, input)
+            .await
+            .map(put_output_to_legacy)
+            .map_err(Into::into)
     }
 
     #[instrument(name = "upload_part", level = "debug", skip(self, req))]
@@ -51,8 +57,8 @@ impl FS {
 
 use crate::app::RequestEnvelope;
 use crate::storage::s3_api::{
-    DefaultMultipartUsecase, DefaultObjectUsecase, PutObjectWriteInput, PutObjectWriteOutput, UploadPartTarget,
-    UploadPartWriteInput, UploadPartWriteOutput,
+    DefaultMultipartUsecase, PutObjectWriteInput, PutObjectWriteOutput, UploadPartTarget, UploadPartWriteInput,
+    UploadPartWriteOutput,
 };
 
 impl PutObjectWriteInput {
@@ -117,30 +123,6 @@ fn put_output_to_legacy(output: PutObjectWriteOutput) -> S3Response<PutObjectOut
     response.headers = output.headers;
     response.status = output.status;
     response
-}
-
-impl DefaultObjectUsecase {
-    #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
-    pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        record_s3_op(S3Operation::PutObject);
-        let envelope = RequestEnvelope::from_s3s(&req);
-        let input = PutObjectWriteInput::from_legacy(req.input, req.trailing_headers);
-        self.execute_put_object_owned(envelope, input)
-            .await
-            .map(put_output_to_legacy)
-            .map_err(Into::into)
-    }
-
-    pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        record_s3_op(S3Operation::PutObject);
-        let envelope = RequestEnvelope::from_s3s(&req);
-        let input = PutObjectWriteInput::from_legacy(req.input, req.trailing_headers);
-        self.execute_put_object_extract_owned(envelope, input)
-            .await
-            .map(put_output_to_legacy)
-            .map_err(Into::into)
-    }
 }
 
 impl UploadPartWriteInput {

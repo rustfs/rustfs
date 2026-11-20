@@ -147,7 +147,7 @@ async fn install_identities() -> (Callers, String) {
         .await
         .expect("IAM format");
     let iam = ambient.iam().handle();
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = format!("test{}", uuid::Uuid::new_v4().simple());
     let bucket = format!("ext-routes-{suffix}");
     let all = [
         Action::ResetReplication,
