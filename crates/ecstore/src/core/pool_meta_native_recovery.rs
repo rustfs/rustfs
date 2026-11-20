@@ -19,6 +19,7 @@ use crate::disk::{
     PoolMetaNativeRecoveryResponse as Response,
 };
 use bytes::Bytes;
+use futures::TryStreamExt as _;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -90,7 +91,8 @@ fn current(pool: &InspectedPool) -> Result<Vec<Bytes>> {
 
 async fn inspect(pools: &[Arc<Sets>], fence: &PoolMetaPersistenceFence<'_>) -> Result<Vec<InspectedPool>> {
     let mut inspected = Vec::with_capacity(pools.len());
-    // Pool -> disk order is stable; all capability probes precede every mutation.
+    // Check every slot before starting I/O. The authenticated, read-only
+    // Inspect RPC proves both protocol support and the disk's evidence.
     for pool in pools {
         fence.ensure_held()?;
         let set = pool.get_disks_by_key(POOL_META_NAME);
@@ -102,18 +104,6 @@ async fn inspect(pools: &[Arc<Sets>], fence: &PoolMetaPersistenceFence<'_>) -> R
             .cloned()
             .map(|disk| disk.ok_or_else(|| missing_evidence("missing_pool_metadata_slot")))
             .collect::<Result<Vec<_>>>()?;
-        let probes = futures::stream::iter(disks.iter().cloned().map(|disk| async move {
-            match disk.pool_meta_native_recovery(Request::Probe {}).await? {
-                Response::Probed => Ok(()),
-                _ => Err(missing_evidence("unexpected_probe_response")),
-            }
-        }))
-        .buffered(4)
-        .collect::<Vec<Result<()>>>()
-        .await;
-        for result in probes {
-            result?;
-        }
         inspected.push(InspectedPool {
             disks,
             snapshots: Vec::new(),
@@ -121,7 +111,7 @@ async fn inspect(pools: &[Arc<Sets>], fence: &PoolMetaPersistenceFence<'_>) -> R
     }
     for pool in &mut inspected {
         fence.ensure_held()?;
-        let results = futures::stream::iter(pool.disks.iter().cloned().map(|disk| async move {
+        pool.snapshots = futures::stream::iter(pool.disks.iter().cloned().map(|disk| async move {
             match disk
                 .pool_meta_native_recovery(Request::Inspect {
                     object: PoolMetaNativeObject::PoolBin,
@@ -133,11 +123,8 @@ async fn inspect(pools: &[Arc<Sets>], fence: &PoolMetaPersistenceFence<'_>) -> R
             }
         }))
         .buffered(4)
-        .collect::<Vec<Result<PoolMetaNativeInspection>>>()
-        .await;
-        for result in results {
-            pool.snapshots.push(result?);
-        }
+        .try_collect()
+        .await?;
     }
     fence.ensure_held()?;
     Ok(inspected)

@@ -222,6 +222,24 @@ async fn pool_meta_native_physical_split_without_ordinary_commit_performs_no_mut
         .expect("missing ordinary authority alone must not install a permanent corruption latch");
 }
 
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_inspection_rejects_an_absent_slot_without_changing_evidence() {
+    let fixture = fixture(1).await;
+    let before = snapshots(&fixture.store).await;
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    let last_pool = fixture.store.pools.last().expect("fixture has a last pool");
+    let set = last_pool.get_disks_by_key(POOL_META_NAME);
+    let missing = set.disks.write().await[0].take().expect("fixture has a disk in slot zero");
+
+    let result = inspect(&fixture.store.pools, &fence).await;
+
+    set.disks.write().await[0] = Some(missing);
+    let error = result.err().expect("an absent slot cannot provide native evidence");
+    assert!(error.to_string().contains("(missing_pool_metadata_slot)"), "{error}");
+    assert_eq!(snapshots(&fixture.store).await, before);
+}
+
 async fn interrupted_first_commit_fixture() -> (PhysicalFixture, PoolMetaCommittedCandidate) {
     let fixture = fixture(3).await;
     let PoolMetaReplica::Valid {
