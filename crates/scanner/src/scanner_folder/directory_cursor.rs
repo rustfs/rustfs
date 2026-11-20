@@ -688,13 +688,18 @@ impl Drop for ScannerDirectory {
     fn drop(&mut self) {
         let Some((scope, stamp)) = self.scope.take() else { return };
         let Some(listing) = self.listing.take() else { return };
-        if listing.failed || self.budget.reason().is_none() {
+        if listing.failed {
             if let Some(recorder) = &listing.work.recorder {
                 *recorder.slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
             }
             return;
         }
+        // An owner cancellation can still persist a partial cache. Keep its
+        // last accepted native position while releasing the live reader.
         listing.work.checkpoint();
+        if self.budget.reason().is_none() {
+            return;
+        }
         let mut slots = PARKED.lock().unwrap_or_else(|p| p.into_inner());
         let expired = expired_slots(&mut slots);
         let key = self.path.to_path_buf();
