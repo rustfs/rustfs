@@ -43,7 +43,7 @@ impl RecordedUpload for PartUpload {
 
 async fn lookup_part_upload(store: &ECStore, bucket: &str, key: &str, id: &str, opts: &ObjectOptions) -> S3Result<MultipartInfo> {
     let result = store.get_multipart_info(bucket, key, id, opts).await;
-    result.map_err(|error| multipart_upload_api_error(error).into())
+    result.map_err(multipart_upload_api_error)
 }
 
 pub(super) async fn lookup_recorded_part_upload(
@@ -56,7 +56,7 @@ pub(super) async fn lookup_recorded_part_upload(
     let result = store.lookup_multipart_part_binding(bucket, key, id, opts).await;
     #[cfg(test)]
     let result = tests::observe_lookup(result);
-    match result.map_err(|error| S3Error::from(multipart_upload_api_error(error))) {
+    match result.map_err(multipart_upload_api_error) {
         Ok((info, owner)) => Ok(owner.map(|owner| PartUpload { owner, info })),
         Err(error) if error.code() == &S3ErrorCode::NoSuchUpload => Ok(None),
         Err(error) => Err(error),

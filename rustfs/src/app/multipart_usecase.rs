@@ -103,6 +103,7 @@ use futures::StreamExt;
 use http::{HeaderMap, Uri};
 use metrics::counter;
 use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
@@ -114,7 +115,6 @@ use rustfs_utils::http::{
     headers::{AMZ_CHECKSUM_TYPE, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
-use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -192,12 +192,13 @@ fn multipart_max_total_object_size(metadata: &HashMap<String, String>) -> S3Resu
     let value = get_consistent_str(metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE).ok_or_else(|| {
         S3Error::with_message(
             S3ErrorCode::InvalidRequest,
-            "multipart size capability metadata is missing or inconsistent".to_string(),
+            "multipart size capability metadata is missing or inconsistent",
         )
     })?;
-    value.parse::<u64>().map(Some).map_err(|_| {
-        S3Error::with_message(S3ErrorCode::InvalidRequest, "multipart size capability metadata is invalid".to_string())
-    })
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "multipart size capability metadata is invalid"))
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -290,7 +291,11 @@ impl DefaultMultipartUsecase {
 /// or completed".
 fn multipart_upload_api_error(err: StorageError) -> S3Error {
     if matches!(err, StorageError::MalformedUploadID(_)) {
-        return S3Error::new(S3ErrorCode::NoSuchUpload);
+        let mut error = S3Error::new(S3ErrorCode::NoSuchUpload);
+        if let Some(message) = error.code().default_message() {
+            error.set_message(message);
+        }
+        return error;
     }
     ApiError::from(err).into()
 }
@@ -544,7 +549,7 @@ mod tests {
                 .execute_create_multipart_upload_from_s3s(build_request(create, Method::POST))
                 .await
                 .expect_err("reserved key must be rejected before accessing storage");
-            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
 
             let complete = CompleteMultipartUploadInput::builder()
                 .bucket("bucket".to_owned())
@@ -592,6 +597,9 @@ mod tests {
     fn multipart_upload_api_error_reports_malformed_upload_id_as_no_such_upload() {
         let malformed = multipart_upload_api_error(StorageError::MalformedUploadID("bucket/object-not-an-id".to_string()));
         assert_eq!(malformed.code(), &S3ErrorCode::NoSuchUpload);
+        let legacy = crate::app::storage_api::s3::S3Error::new(crate::app::storage_api::s3::S3ErrorCode::NoSuchUpload);
+        assert_eq!(malformed.message(), legacy.message());
+        assert_eq!(malformed.status_code(), legacy.status_code());
 
         let unknown = multipart_upload_api_error(StorageError::InvalidUploadID(
             "bucket".to_string(),

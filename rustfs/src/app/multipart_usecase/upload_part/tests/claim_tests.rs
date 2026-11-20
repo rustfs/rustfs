@@ -233,7 +233,8 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                     } else if matches!(mode, LookupResult::Outage) {
                         let Err(error) = result else { panic!("expected read quorum failure") };
                         let actual: crate::app::storage_api::s3::S3Error = error.into();
-                        let expected = multipart_upload_api_error(StorageError::ErasureReadQuorum);
+                        let expected: crate::app::storage_api::s3::S3Error =
+                            ApiError::from(StorageError::ErasureReadQuorum).into();
                         assert_eq!(actual.code(), expected.code());
                         assert_eq!(actual.status_code(), expected.status_code());
                         assert_eq!(actual.message(), expected.message());
