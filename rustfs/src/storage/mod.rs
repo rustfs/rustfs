@@ -25,6 +25,7 @@ pub mod request_context;
 pub(crate) mod request_markers;
 pub mod rpc;
 pub(crate) mod s3_api;
+#[cfg(test)]
 pub(crate) mod s3_compat;
 pub(crate) mod sse;
 pub mod timeout_wrapper;
