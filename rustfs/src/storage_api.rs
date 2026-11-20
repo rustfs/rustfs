@@ -141,11 +141,9 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
+        pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
-        #[cfg(test)]
-        pub(crate) type FS = crate::storage::storage_api::FS;
-        pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::dto::ListObjectsV2Input;
         #[cfg(all(test, any(feature = "webdav", feature = "sftp")))]
@@ -232,14 +230,10 @@ pub(crate) mod server {
                 pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
                 pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
-                    FS, StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
+                    StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
                     set_bucket_metadata,
                 };
-                pub(crate) use s3s::{
-                    S3Request,
-                    access::S3Access,
-                    dto::{ETag, ETagCondition, PutObjectInput},
-                };
+                pub(crate) use s3s::S3Request;
             }
         }
 
@@ -278,14 +272,6 @@ pub(crate) mod server {
                 RequestContext, extract_request_id_from_headers, spawn_traced,
             };
         }
-    }
-
-    /// The s3s error types the s3s-compat tower layers in
-    /// `server::legacy_compat` render and match on, funneled here so those
-    /// files stay off the direct s3s surface (s3s footprint ratchet). T2.12
-    /// (rustfs/backlog#2771) removes the layers and with them this module.
-    pub(crate) mod legacy_compat {
-        pub(crate) use s3s::S3ErrorCode;
     }
 
     pub(crate) mod module_switch {
@@ -437,14 +423,6 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod init {
-        /// Renders a persisted notification configuration as the DTO the notify
-        /// runtime still consumes (rustfs/backlog#2745).
-        pub(crate) fn notification_config_to_s3s(
-            config: &rustfs_gateway_types::persistence::PersistedNotificationConfiguration,
-        ) -> s3s::S3Result<s3s::dto::NotificationConfiguration> {
-            crate::storage::storage_api::persisted_to_s3s(config)
-        }
-
         pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
         pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,

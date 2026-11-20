@@ -36,6 +36,42 @@ pub(crate) struct GetObjectFields {
     pub(crate) sse_customer_key_md5: Option<String>,
 }
 
+impl GetObjectFields {
+    /// The conditional-read wire format permits a wildcard, a quoted tag, or a bare S3 tag.
+    pub(crate) fn valid_etag_condition(value: &[u8]) -> bool {
+        match value {
+            b"*" => true,
+            [b'"', tag @ .., b'"'] | [b'W', b'/', b'"', tag @ .., b'"'] => tag.iter().all(|b| matches!(*b, b'\t' | b' '..=b'~')),
+            bare => !bare.is_empty() && bare.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-'),
+        }
+    }
+
+    pub(crate) fn valid_date_condition(value: &str) -> bool {
+        time::PrimitiveDateTime::parse(value, super::RFC1123).is_ok()
+    }
+
+    /// Object Lambda and website reads accept the historical single-range wire grammar.
+    pub(crate) fn parse_range(value: &str) -> Option<ByteRange> {
+        use rustfs_gateway_types::RangeParse;
+        let spec = value.strip_prefix("bytes=")?;
+        if !spec.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            return None;
+        }
+        if spec == "-" {
+            // An omitted suffix length historically selects a zero-length suffix.
+            return Some(ByteRange::Suffix { length: 0 });
+        }
+        let RangeParse::One(range) = RangeParse::parse(value) else {
+            return None;
+        };
+        match range {
+            ByteRange::From { first } if first > i64::MAX as u64 => None,
+            ByteRange::FromTo { last, .. } if last > i64::MAX as u64 => None,
+            _ => Some(range),
+        }
+    }
+}
+
 /// Body and ETag retain their native representation until the final edge.
 #[derive(Debug, Default)]
 pub(crate) struct GetObjectOutputFacts {

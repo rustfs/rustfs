@@ -15,14 +15,19 @@
 //! The single bridge from the HTTP framework's trailer handle to the
 //! framework-neutral `rustfs_rio::TrailerSource`.
 
+#[cfg(test)]
 use crate::app::storage_api::s3::TrailingHeaders;
+#[cfg(test)]
 use rustfs_rio::{SharedTrailerSource, TrailerSource, TrailerValue};
+#[cfg(test)]
 use std::sync::Arc;
 
 // RUSTFS_COMPAT_TODO(s3gate-trailer-adapter): s3s still decodes aws-chunked bodies and publishes their trailers through its own handle, so the object write path adapts that handle to rio's TrailerSource here. Remove after the gateway stack replaces s3s as the request body decoder.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct S3sTrailerSource(TrailingHeaders);
 
+#[cfg(test)]
 impl TrailerSource for S3sTrailerSource {
     fn lookup(&self, name: &str) -> TrailerValue {
         // s3s fills the handle after the final chunk has been decoded and
@@ -39,6 +44,7 @@ impl TrailerSource for S3sTrailerSource {
 }
 
 /// Adapts the request's trailer handle, if the request declared one.
+#[cfg(test)]
 pub(crate) fn trailer_source(trailing_headers: Option<TrailingHeaders>) -> Option<SharedTrailerSource> {
     trailing_headers.map(|headers| Arc::new(S3sTrailerSource(headers)) as SharedTrailerSource)
 }

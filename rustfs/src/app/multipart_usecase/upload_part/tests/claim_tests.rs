@@ -104,7 +104,7 @@ async fn native_claim_checks_order_ownership_and_one_active_lookup() {
         let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
         LOOKUP
             .scope((Cell::new(0), mode), async {
-                let result = usecase.execute_upload_part_owned(envelope, input).await;
+                let result = usecase.execute_upload_part_with_audit(envelope, input).await;
                 assert_eq!(
                     result.as_ref().err().map(|err| err.code().as_str()),
                     expected,
@@ -214,7 +214,7 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
             let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
             LOOKUP
                 .scope((Cell::new(0), mode), async {
-                    let result = Box::pin(usecase.execute_upload_part_copy_owned(envelope, input)).await;
+                    let result = Box::pin(usecase.execute_upload_part_copy_with_audit(envelope, input)).await;
                     assert_eq!(result.as_ref().err().map(|error| error.code().as_str()), expected, "{mode:?}");
                     assert_eq!(LOOKUP.with(|(calls, _)| calls.get()), 1, "{mode:?}");
                     if expected == Some("NoSuchUpload") {
@@ -233,7 +233,8 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                     } else if matches!(mode, LookupResult::Outage) {
                         let Err(error) = result else { panic!("expected read quorum failure") };
                         let actual: crate::app::storage_api::s3::S3Error = error.into();
-                        let expected = multipart_upload_api_error(StorageError::ErasureReadQuorum);
+                        let expected: crate::app::storage_api::s3::S3Error =
+                            ApiError::from(StorageError::ErasureReadQuorum).into();
                         assert_eq!(actual.code(), expected.code());
                         assert_eq!(actual.status_code(), expected.status_code());
                         assert_eq!(actual.message(), expected.message());

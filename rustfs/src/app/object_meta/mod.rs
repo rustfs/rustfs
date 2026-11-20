@@ -101,7 +101,7 @@ mod tests {
     use http::{Extensions, HeaderMap, Method, Uri};
     use rustfs_gateway_types::dto::{
         DeleteObjectTaggingInput, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput,
-        PutObjectAclInput,
+        PutObjectAclInput, Tag,
     };
     use rustfs_gateway_types::{BucketName, ObjectKey};
 
@@ -186,6 +186,27 @@ mod tests {
                 .await
                 .map(drop),
             usecase
+                .put_object_retention_fields(envelope(), bucket.as_str(), key.as_str(), None, None)
+                .await
+                .map(drop),
+            usecase
+                .put_object_legal_hold_fields(envelope(), bucket.as_str(), key.as_str(), None, None)
+                .await
+                .map(drop),
+            usecase
+                .put_object_tagging_fields(
+                    envelope(),
+                    bucket.as_str(),
+                    key.as_str(),
+                    None,
+                    vec![Tag {
+                        key: Some("project".into()),
+                        value: Some("test".into()),
+                    }],
+                )
+                .await
+                .map(drop),
+            usecase
                 .execute_delete_object_tagging(
                     envelope(),
                     DeleteObjectTaggingInput {
@@ -201,6 +222,28 @@ mod tests {
         for (index, result) in errors.into_iter().enumerate() {
             let error = result.expect_err("no store");
             assert_eq!(error.code(), &S3ErrorCode::InternalError, "use case {index}");
+        }
+    }
+    #[tokio::test]
+    async fn invalid_put_tags_are_rejected_before_version_and_store_lookup() {
+        let usecase = ObjectMetaUsecase::with_context(None);
+        let tag = |key: Option<&str>, value: Option<&str>| Tag {
+            key: key.map(str::to_owned),
+            value: value.map(str::to_owned),
+        };
+        let too_many = (0..11).map(|index| tag(Some(&format!("k{index}")), Some("value"))).collect();
+        for (tags, expected) in [
+            (too_many, "Cannot have more than 10 tags per object"),
+            (vec![tag(Some(""), Some("v1"))], "Tag key cannot be empty"),
+            (vec![tag(None, Some("value"))], "Tag key cannot be empty"),
+            (vec![tag(Some("key"), None)], "Tag value cannot be null"),
+        ] {
+            let error = usecase
+                .put_object_tagging_fields(envelope(), "test-bucket", "test-key", Some("invalid".into()), tags)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidTag);
+            assert_eq!(error.message(), Some(expected));
         }
     }
 }

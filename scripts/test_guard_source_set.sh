@@ -162,13 +162,12 @@ done < <(awk '
   pending { sub(/^[[:space:]]*'"'"'/, ""); sub(/'"'"'[[:space:]]*\\$/, ""); print; pending = 0; next }
   /module_relative_rg rustfs\/src\/(app|storage) \\$/ { pending = 1 }
 ' "$ARCH_RULES")
-[[ ${#TEMPLATES[@]} == 6 ]] || fail "expected 6 depth-aware rules in $ARCH_RULES, found ${#TEMPLATES[@]}"
+[[ ${#TEMPLATES[@]} == 5 ]] || fail "expected 5 depth-aware rules in $ARCH_RULES, found ${#TEMPLATES[@]}"
 STORAGE_HELPER_RULE="${TEMPLATES[0]}"
 STORAGE_OWNER_RULE="${TEMPLATES[1]}"
 RUNTIME_IMPORT_RULE="${TEMPLATES[2]}"
 RUNTIME_PATH_RULE="${TEMPLATES[3]}"
-ECFS_TEST_RULE="${TEMPLATES[4]}"
-ECFS_TEST_SPLIT_RULE="${TEMPLATES[5]}"
+STORAGE_HELPER_TEST_RULE="${TEMPLATES[4]}"
 
 # relative_hits <module-dir> <template> <relative-file> <line>: rg output for one file.
 relative_hits() {
@@ -208,9 +207,8 @@ flagged rustfs/src/app "$STORAGE_OWNER_RULE" rustfs/src/app/bucket_usecase.rs 's
 flagged rustfs/src/app "$STORAGE_OWNER_RULE" rustfs/src/app/bucket_usecase/cors.rs 'super::super::super::metadata_sys::get();'
 flagged rustfs/src/app "$RUNTIME_IMPORT_RULE" rustfs/src/app/bucket_usecase/cors.rs 'use super::super::ECStore;'
 flagged rustfs/src/app "$RUNTIME_PATH_RULE" rustfs/src/app/lifecycle_transition_api_test/put.rs 'super::super::get_server_info();'
-flagged rustfs/src/storage "$ECFS_TEST_RULE" rustfs/src/storage/ecfs_test.rs '    use super::super::{BucketMetadata};'
-flagged rustfs/src/storage "$ECFS_TEST_SPLIT_RULE" rustfs/src/storage/legacy_edge/tests/object_meta.rs 'use super::super::super::{BucketMetadata};'
-flagged rustfs/src/storage "$ECFS_TEST_SPLIT_RULE" rustfs/src/storage/legacy_edge/tests/object_meta.rs '    use super::super::super::super::{check_preconditions};'
+flagged rustfs/src/storage "$STORAGE_HELPER_TEST_RULE" rustfs/src/storage/helpers_test.rs '    use super::super::{BucketMetadata};'
+flagged rustfs/src/storage "$STORAGE_HELPER_TEST_RULE" rustfs/src/storage/helpers_test.rs 'use crate::storage::{check_preconditions};'
 
 # Ordinary forms: a split file importing from its own parent module is not flagged.
 new_case
@@ -219,12 +217,12 @@ not_flagged rustfs/src/app "$STORAGE_OWNER_RULE" rustfs/src/app/bucket_usecase/c
 not_flagged rustfs/src/app "$STORAGE_OWNER_RULE" rustfs/src/app/bucket_usecase/cors.rs 'super::tagging::helper();'
 not_flagged rustfs/src/app "$RUNTIME_IMPORT_RULE" rustfs/src/app/bucket_usecase/cors.rs 'use super::{ECStore, DefaultBucketUsecase};'
 not_flagged rustfs/src/app "$RUNTIME_PATH_RULE" rustfs/src/app/bucket_usecase/cors.rs 'super::get_server_info();'
-not_flagged rustfs/src/storage "$ECFS_TEST_SPLIT_RULE" rustfs/src/storage/legacy_edge/tests/object_meta.rs '    use super::{BucketMetadata};'
+not_flagged rustfs/src/storage "$STORAGE_HELPER_TEST_RULE" rustfs/src/storage/helpers_test.rs '    use super::{BucketMetadata};'
 
 # A file outside the module directory, or a missing -- separator, is an error, not a silent pass.
 new_case
 status=0
-module_relative_rg rustfs/src/app 'x' -n -- rustfs/src/storage/ecfs.rs 2>/dev/null || status=$?
+module_relative_rg rustfs/src/app 'x' -n -- rustfs/src/storage/helpers_test.rs 2>/dev/null || status=$?
 [[ "$status" == 2 ]] || fail "file outside the module dir: status $status"
 status=0
 module_relative_rg rustfs/src/app 'x' -n rustfs/src/app/a.rs 2>/dev/null || status=$?

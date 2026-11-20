@@ -211,6 +211,8 @@ the wiring source of truth. Committed test-ID digests under
 
 **Endpoint blackhole scenario skipped** — `heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_after_target_endpoint_blackhole` installs a loopback `iptables` DROP rule and therefore needs `CAP_NET_ADMIN` (root or passwordless `sudo -n iptables`). A host where `iptables` is missing or cannot read the OUTPUT chain (typical inside an unprivileged container, where the nf_tables backend reports "Permission denied" even under `sudo`) logs a `heal_interruption_skipped` warning and returns without exercising heal. Set `RUSTFS_E2E_REQUIRE_NET_FAULT_INJECTION=1` on lanes that do provision the capability so a broken runner fails instead of skipping.
 
+The full suite compares persisted bucket configurations and object records against the release pinned in `.config/reference-binary.toml`. Set `RUSTFS_PERSISTENCE_REFERENCE_BINARY` to the verified executable and `RUSTFS_PERSISTENCE_CLOCK_LIBRARY` to the absolute path of libfaketime (`libfaketime.so.1` on Linux or `libfaketime.1.dylib` on macOS). To retain the two sets of 13 XML documents for the gateway golden corpus, set `RUSTFS_PERSISTENCE_XML_DIR` to an output directory. CI includes them in the full suite's JUnit artifact.
+
 **Reproduce a CI failure locally** — run the exact profile/lane:
 
 ```bash

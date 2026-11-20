@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::EncodingType;
-use s3s::{S3Error, S3ErrorCode};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 use tracing::debug;
-use urlencoding::encode;
 
 const S3_MAX_KEYS: i32 = 1000;
 
@@ -46,25 +44,6 @@ fn decode_list_objects_v2_continuation_token(token: &str) -> Result<String, S3Er
 
 fn normalize_max_keys(max_keys: i32) -> i32 {
     max_keys.min(S3_MAX_KEYS)
-}
-
-fn should_encode_url(encoding_type: Option<&EncodingType>) -> bool {
-    encoding_type.is_some_and(|e| e.as_str() == EncodingType::URL)
-}
-
-fn encode_s3_name(name: &str) -> String {
-    name.split('/')
-        .map(|part| encode(part).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-pub(crate) fn encode_list_output_value(value: String, encoding_type: Option<&EncodingType>) -> String {
-    if should_encode_url(encoding_type) {
-        encode_s3_name(&value)
-    } else {
-        value
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -170,7 +149,7 @@ pub(crate) fn parse_list_objects_v2_params(
 #[cfg(test)]
 mod tests {
     use super::{encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params};
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     // A key that literally ends in the retired metacache tag survives the V2
     // round trip unchanged: the API layer no longer strips anything.
