@@ -52,6 +52,10 @@ mod tests {
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
+    use rustfs_gateway_types::persistence::{
+        PersistedFilterRule, PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter,
+        PersistedQueueConfiguration, PersistedS3KeyFilter, PersistedTopicConfiguration,
+    };
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -59,9 +63,8 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        DefaultRetention, Delimiter, FilterRule, FilterRuleName, LambdaFunctionConfiguration, NotificationConfigurationFilter,
-        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, ObjectLockRule, QueueConfiguration, S3KeyFilter, TopicConfiguration,
+        DefaultRetention, Delimiter, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
     };
     use s3s::{S3Error, S3ErrorCode, s3_error};
     use std::collections::HashMap;
@@ -1573,8 +1576,8 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 queue_arn: invalid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1599,8 +1602,8 @@ mod tests {
 
         let result = process_topic_configurations(
             &mut event_rules,
-            Some(vec![TopicConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedTopicConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 topic_arn: invalid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1625,8 +1628,8 @@ mod tests {
 
         let result = process_lambda_configurations(
             &mut event_rules,
-            Some(vec![LambdaFunctionConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedLambdaFunctionConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 lambda_function_arn: invalid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1651,8 +1654,8 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 queue_arn: valid_arn.to_string(),
                 filter: None,
                 id: None,
@@ -1677,18 +1680,18 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:*".to_string().into()],
+            Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_owned()],
                 queue_arn: valid_arn.to_string(),
-                filter: Some(NotificationConfigurationFilter {
-                    key: Some(S3KeyFilter {
+                filter: Some(PersistedNotificationConfigurationFilter {
+                    key: Some(PersistedS3KeyFilter {
                         filter_rules: Some(vec![
-                            FilterRule {
-                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                            PersistedFilterRule {
+                                name: Some("Prefix".to_string()),
                                 value: Some("uploads/".to_string()),
                             },
-                            FilterRule {
-                                name: Some(FilterRuleName::from("Suffix".to_string())),
+                            PersistedFilterRule {
+                                name: Some("Suffix".to_string()),
                                 value: Some(".csv".to_string()),
                             },
                         ]),

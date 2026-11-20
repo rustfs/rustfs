@@ -243,6 +243,7 @@ pub(crate) use native_body::{BodyChunks, FrameTrailers};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
+#[cfg(test)]
 mod s3s_compat;
 pub(crate) mod shared;
 #[cfg(test)]

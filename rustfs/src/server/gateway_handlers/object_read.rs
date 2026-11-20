@@ -224,15 +224,11 @@ pub(super) fn get_response(answered: Answered<GetObjectOutputFacts>) -> S3Result
 }
 
 fn insert_etag(headers: &mut http::HeaderMap, etag: Option<ResponseEtag>) -> S3Result<()> {
-    if let Some(ResponseEtag { opaque, weak }) = etag {
-        let value = if weak {
-            format!("W/\"{}\"", opaque)
-        } else {
-            format!("\"{}\"", opaque)
-        };
+    if let Some(etag) = etag {
         headers.insert(
             http::header::ETAG,
-            http::HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
+            etag.to_http_header()
+                .map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
         );
     }
     Ok(())

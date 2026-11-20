@@ -2731,6 +2731,7 @@ where
 }
 
 /// Renders a persisted configuration as the DTO the legacy edge answers with.
+#[cfg(test)]
 pub(crate) fn persisted_to_s3s<T, S>(value: &T) -> s3s::S3Result<S>
 where
     T: ecstore_bucket::utils::BucketConfigXml,

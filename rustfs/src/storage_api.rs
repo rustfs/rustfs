@@ -431,14 +431,6 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod init {
-        /// Renders a persisted notification configuration as the DTO the notify
-        /// runtime still consumes (rustfs/backlog#2745).
-        pub(crate) fn notification_config_to_s3s(
-            config: &rustfs_gateway_types::persistence::PersistedNotificationConfiguration,
-        ) -> s3s::S3Result<s3s::dto::NotificationConfiguration> {
-            crate::storage::storage_api::persisted_to_s3s(config)
-        }
-
         pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
         pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,

@@ -27,9 +27,6 @@
 
 use crate::app::object_usecase::{DefaultObjectUsecase, GetObjectBody, GetObjectFields, GetObjectOutputFacts, HeadObjectFields};
 use crate::app::runtime_sources::ServerContextSlot;
-use crate::app::storage_api::s3::dto::{
-    ETagCondition, GetObjectInput, Range, Timestamp as WireTimestamp, TimestampFormat as WireFormat,
-};
 use crate::app::{Answered, RequestEnvelope, RequestHead};
 use crate::storage::access_owned::object_read::{authorize_get_object, authorize_head_object};
 use crate::storage::req_info::ReqInfo;
@@ -189,12 +186,15 @@ impl WebsiteRequest {
         let mut envelope = self.envelope(Method::GET, headers, bucket, key, true);
         authorize_get_object(&self.server_ctx, &mut envelope, bucket, key, None).await?;
         record_s3_op(S3Operation::GetObject);
-        let fields = GetObjectFields::from_s3s(GetObjectInput {
+        let fields = GetObjectFields {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             range,
-            ..Default::default()
-        });
+            version_id: None,
+            part_number: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        };
         Box::pin(self.usecase().execute_get_object_fields(envelope, fields)).await
     }
 
@@ -231,18 +231,21 @@ fn header_text(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<String>
 
 /// The range a conditional read asks for, after refusing a malformed range or condition the
 /// way the S3 GetObject decoder refuses it.
-fn validated_conditions(headers: &HeaderMap) -> S3Result<Option<Range>> {
+fn validated_conditions(headers: &HeaderMap) -> S3Result<Option<rustfs_gateway_types::ByteRange>> {
     let range = header_text(headers, http::header::RANGE)?
-        .map(|value| Range::parse(&value).map_err(|_| S3Error::new(S3ErrorCode::InvalidRange)))
+        .map(|value| GetObjectFields::parse_range(&value).ok_or_else(|| S3Error::new(S3ErrorCode::InvalidRange)))
         .transpose()?;
     for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
-        if let Some(value) = headers.get(name) {
-            ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+        if headers
+            .get(name)
+            .is_some_and(|value| !GetObjectFields::valid_etag_condition(value.as_bytes()))
+        {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument));
         }
     }
     for name in [http::header::IF_MODIFIED_SINCE, http::header::IF_UNMODIFIED_SINCE] {
-        if let Some(value) = header_text(headers, name)? {
-            WireTimestamp::parse(WireFormat::HttpDate, &value).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+        if header_text(headers, name)?.is_some_and(|value| !GetObjectFields::valid_date_condition(&value)) {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument));
         }
     }
     Ok(range)

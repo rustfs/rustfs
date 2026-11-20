@@ -45,6 +45,11 @@ pub(crate) struct ResponseEtag {
 }
 
 impl ResponseEtag {
+    pub(crate) fn to_http_header(&self) -> Result<http::HeaderValue, http::header::InvalidHeaderValue> {
+        let prefix = if self.weak { "W/" } else { "" };
+        http::HeaderValue::from_str(&format!("{prefix}\"{}\"", self.opaque))
+    }
+
     pub(super) fn from_stored(value: &str) -> Self {
         let weak = value.starts_with("W/\"");
         let etag = stored_etag(value);
