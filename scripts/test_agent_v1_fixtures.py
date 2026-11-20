@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -12,6 +13,9 @@ SCRIPT = ROOT / "scripts" / "verify_agent_v1_fixtures.py"
 SCHEMAS = ROOT / "protocol" / "agent" / "v1"
 FIXTURES = ROOT / "protocol" / "agent" / "v1" / "fixtures"
 ALLOWLIST = ROOT / "protocol" / "agent" / "v1" / "schema-gap-allowlist.json"
+
+sys.path.insert(0, str(ROOT / "scripts"))
+import verify_agent_v1_fixtures as verifier  # noqa: E402
 
 
 class FixtureVerifierRegressionTests(unittest.TestCase):
@@ -119,3 +123,66 @@ class FixtureVerifierRegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class FixtureManifestCoverageTests(unittest.TestCase):
+    """The root manifest must list every fixture set exactly once."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def add_set(self, name: str, payload: str = "x") -> str:
+        directory = self.root / name
+        directory.mkdir(parents=True)
+        (directory / "data.txt").write_text(payload, encoding="utf-8")
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        (directory / "MANIFEST.sha256").write_text(f"{digest}  data.txt\n", encoding="utf-8")
+        return hashlib.sha256((directory / "MANIFEST.sha256").read_bytes()).hexdigest()
+
+    def write_root(self, lines: list[str]) -> None:
+        (self.root / "manifest.sha256").write_text("".join(lines), encoding="utf-8")
+
+    def test_valid_chain_passes(self) -> None:
+        digest = self.add_set("alpha")
+        self.write_root([f"{digest}  alpha\n"])
+        self.assertTrue(verifier.verify_manifests(self.root))
+
+    def test_empty_root_manifest_fails(self) -> None:
+        self.add_set("alpha")
+        self.write_root([])
+        self.assertFalse(verifier.verify_manifests(self.root))
+
+    def test_unlisted_fixture_set_fails(self) -> None:
+        digest = self.add_set("alpha")
+        self.add_set("beta")
+        self.write_root([f"{digest}  alpha\n"])
+        self.assertFalse(verifier.verify_manifests(self.root))
+
+    def test_duplicate_entry_fails(self) -> None:
+        digest = self.add_set("alpha")
+        self.write_root([f"{digest}  alpha\n", f"{digest}  alpha\n"])
+        self.assertFalse(verifier.verify_manifests(self.root))
+
+
+class JsonPointerArrayIndexTests(unittest.TestCase):
+    """Array tokens that Python's int() would accept but RFC 6901 forbids."""
+
+    def test_negative_index_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            verifier.apply_mutation({"items": [1, 2, 3]}, {"path": "/items/-1", "replacement": 9})
+
+    def test_leading_zero_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            verifier.apply_mutation({"items": [1, 2, 3]}, {"path": "/items/01", "replacement": 9})
+
+    def test_removal_rejects_negative_index(self) -> None:
+        with self.assertRaises(ValueError):
+            verifier.apply_mutation({"items": [1, 2, 3]}, {"path": "/items/-1", "remove": True})
+
+    def test_valid_index_still_works(self) -> None:
+        mutated = verifier.apply_mutation({"items": [1, 2, 3]}, {"path": "/items/1", "replacement": 9})
+        self.assertEqual([1, 9, 3], mutated["items"])

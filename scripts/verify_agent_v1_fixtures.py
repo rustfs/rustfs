@@ -12,6 +12,7 @@ import argparse
 import copy
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -82,6 +83,7 @@ def verify_manifests(root: Path) -> bool:
                 bad += 1
 
     top = root / "manifest.sha256"
+    declared: list[str] = []
     if not top.is_file():
         print(f"FAIL {top}: required top-level manifest is missing")
         bad += 1
@@ -94,6 +96,9 @@ def verify_manifests(root: Path) -> bool:
                 expected, set_name = parsed
                 if "/" in set_name or "\\" in set_name or set_name in {".", ".."}:
                     raise ValueError(f"{top}:{line_no}: unsafe fixture-set name {set_name!r}")
+                if set_name in declared:
+                    raise ValueError(f"{top}:{line_no}: duplicate fixture-set entry {set_name!r}")
+                declared.append(set_name)
                 nested_manifest = root / set_name / "MANIFEST.sha256"
                 if not nested_manifest.is_file():
                     raise ValueError(f"{nested_manifest}: missing fixture-set manifest")
@@ -104,6 +109,21 @@ def verify_manifests(root: Path) -> bool:
             except (OSError, ValueError) as exc:
                 print(f"FAIL {exc}")
                 bad += 1
+
+        # Every fixture set on disk must be listed exactly once at the root,
+        # and every root entry must resolve to a fixture set. An empty root
+        # manifest used to pass as long as the nested manifests were valid.
+        discovered = {manifest.parent.name for manifest in nested}
+        declared_set = set(declared)
+        if not declared_set:
+            print(f"FAIL {top}: top-level manifest declares no fixture sets")
+            bad += 1
+        for name in sorted(discovered - declared_set):
+            print(f"FAIL {root / name}: fixture set on disk is not listed in {top.name}")
+            bad += 1
+        for name in sorted(declared_set - discovered):
+            print(f"FAIL {root / name}: fixture set listed in {top.name} has no nested manifest")
+            bad += 1
 
     print(f"manifest entries ok={ok} bad={bad}")
     return bad == 0
@@ -131,6 +151,21 @@ def pointer_tokens(pointer: str) -> list[str]:
     return tokens
 
 
+_ARRAY_INDEX = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+def array_index(token: str) -> int:
+    """Return a JSON Pointer array index for an existing element.
+
+    RFC 6901 array tokens are unsigned decimal integers without leading zeros.
+    Python's int() also accepts "-1" and "01", which would silently address a
+    different element than the vector names.
+    """
+    if not _ARRAY_INDEX.fullmatch(token):
+        raise ValueError(f"invalid JSON Pointer array index {token!r}")
+    return int(token)
+
+
 def apply_mutation(value: Any, vector: dict[str, Any]) -> Any:
     if not isinstance(vector, dict):
         raise ValueError("reject vector must be an object")
@@ -141,7 +176,7 @@ def apply_mutation(value: Any, vector: dict[str, Any]) -> Any:
     cursor = document
     for token in tokens[:-1]:
         if isinstance(cursor, list):
-            cursor = cursor[int(token)]
+            cursor = cursor[array_index(token)]
         elif isinstance(cursor, dict):
             cursor = cursor[token]
         else:
@@ -149,7 +184,7 @@ def apply_mutation(value: Any, vector: dict[str, Any]) -> Any:
     last = tokens[-1]
     if vector.get("remove") is True:
         if isinstance(cursor, list):
-            del cursor[int(last)]
+            del cursor[array_index(last)]
         elif isinstance(cursor, dict):
             if last not in cursor:
                 raise KeyError(f"cannot remove missing property {last!r}")
@@ -160,7 +195,7 @@ def apply_mutation(value: Any, vector: dict[str, Any]) -> Any:
         if "replacement" not in vector:
             raise KeyError(f"reject vector {vector.get('id')!r} lacks replacement")
         if isinstance(cursor, list):
-            cursor[int(last)] = vector["replacement"]
+            cursor[array_index(last)] = vector["replacement"]
         elif isinstance(cursor, dict):
             cursor[last] = vector["replacement"]
         else:
