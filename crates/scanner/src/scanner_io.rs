@@ -62,17 +62,14 @@ use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::NamespaceLocking as _;
 use crate::storage_api::scanner_io::{BucketInfo, BucketOptions, NsScannerCapabilities};
 use crate::{
-    BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
-    RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
+    BucketTargetSys, BucketVersioningSys, Disk, ECStore, EcstoreError as Error, EcstoreResult as Result, RUSTFS_META_BUCKET,
+    ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, begin_tier_registry_cycle,
     complete_tier_registry_cycle, enqueue_runtime_free_version, get_lifecycle_config, get_object_lock_config,
     get_replication_config, runtime_tier_names, runtime_tier_registry_for_cycle, scanner_publication_admission_for_epoch,
     scanner_publication_epoch, storageclass,
 };
 
-pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
-pub(crate) const SCANNER_METADATA_CORRUPT_ERROR: &str = "scanner metadata corrupt";
-pub(crate) const SCANNER_METADATA_TRANSIENT_ERROR: &str = "scanner metadata transient";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_IO: &str = "io";
 // Mirrors `scanner_folder.rs` so the versioning-lookup fallback warn keeps its
@@ -963,24 +960,36 @@ fn scanner_segment_reuse_activated() -> bool {
     scanner_segment_reuse_activation_preflight().scanner_segment_reuse_activated
 }
 
-pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
-    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_CORRUPT_ERROR))
+pub(crate) fn is_scanner_source_unavailable(err: &StorageError) -> bool {
+    matches!(
+        err,
+        StorageError::DiskNotFound
+            | StorageError::FaultyDisk
+            | StorageError::FaultyRemoteDisk
+            | StorageError::UnformattedDisk
+            | StorageError::InconsistentDisk
+            | StorageError::CorruptedFormat
+            | StorageError::CorruptedBackend
+            | StorageError::RemoteClientUnavailable(_)
+    )
 }
 
-pub(crate) fn is_scanner_metadata_transient_error(err: &StorageError) -> bool {
-    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_TRANSIENT_ERROR))
+pub(crate) fn check_local_scanner_handle(disk: &Disk) -> Result<()> {
+    if let Disk::Local(local) = disk {
+        local.check_scanner_handle()?;
+    }
+    Ok(())
 }
 
-fn scanner_metadata_corrupt_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
-    StorageError::other(format!(
-        "{SCANNER_METADATA_CORRUPT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
-    ))
-}
-
-fn scanner_metadata_transient_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
-    StorageError::other(format!(
-        "{SCANNER_METADATA_TRANSIENT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
-    ))
+pub(crate) fn scanner_slot_disk_id(set: &SetDisks, disk: &Disk) -> Option<uuid::Uuid> {
+    let index = crate::storage_api::owner::EcstoreDiskAPI::get_disk_location(disk).disk_idx?;
+    set.format
+        .erasure
+        .sets
+        .get(set.set_index)?
+        .get(index)
+        .copied()
+        .filter(|id| !id.is_nil())
 }
 
 async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Option<Arc<ObjectLockConfiguration>> {
@@ -1484,7 +1493,7 @@ fn record_bucket_pending_maintenance_work(cache: &DataUsageCache, pending: &Atom
     }
 }
 
-fn is_xl_meta_path(path: &str) -> bool {
+pub(crate) fn is_xl_meta_path(path: &str) -> bool {
     Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())

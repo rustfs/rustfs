@@ -240,6 +240,16 @@ fn clear_tier_error_response(err: &AdminError) -> S3Error {
     S3Error::with_message(S3ErrorCode::Custom("TierClearFailed".into()), format!("tier clear failed. {err}"))
 }
 
+fn decode_mutation_tier_name(params: &Params<'_, '_>) -> S3Result<String> {
+    let name = params
+        .get("tiername")
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing tier path parameter"))?;
+    percent_decode_str(name)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))
+}
+
 fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
     if let Some(tier) = params.get("tier") {
         let decoded = percent_decode_str(tier)
@@ -492,7 +502,7 @@ impl Operation for EditTier {
         let creds: TierCreds = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
-        let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
+        let tier_name = decode_mutation_tier_name(&params)?;
 
         debug!(
             event = EVENT_ADMIN_TIER_STATE,
@@ -620,7 +630,7 @@ impl Operation for RemoveTier {
             })?;
         }
 
-        let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
+        let tier_name = decode_mutation_tier_name(&params)?;
 
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
@@ -1270,6 +1280,19 @@ mod tests {
 
             assert_eq!(config.name, expected, "{provider} top-level Name must not be cleared");
         }
+    }
+
+    #[test]
+    fn mutation_tier_path_preserves_legacy_names_exactly() {
+        let mut router = Router::new();
+        router.insert("/tier/{tiername}", ()).expect("tier mutation route");
+        for (path, expected) in [("/tier/WARM%0A", "WARM\n"), ("/tier/COLD%252F+X", "COLD%2F+X")] {
+            let matched = router.at(path).expect("legacy mutation route matches");
+            assert_eq!(decode_mutation_tier_name(&matched.params).expect("valid UTF-8 tier"), expected);
+        }
+        let matched = router.at("/tier/%FF").expect("mutation route matches");
+        let err = decode_mutation_tier_name(&matched.params).expect_err("invalid UTF-8 has no corresponding tier name");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 
     #[test]

@@ -1986,6 +1986,26 @@ impl LocalDiskWrapper {
         self.cancel_token.cancel();
     }
 
+    /// Retire a superseded wrapper and stop any monitoring tied to that attachment.
+    pub(crate) fn retire_handle(&self) {
+        self.retired.cancel();
+        self.cancel_token.cancel();
+    }
+
+    /// Check whether the scanner can still use this handle without issuing disk I/O.
+    ///
+    /// # Errors
+    /// Returns `DiskNotFound` after retirement or `FaultyDisk` for an offline disk.
+    pub fn check_scanner_handle(&self) -> Result<()> {
+        if self.retired.is_cancelled() {
+            return Err(DiskError::DiskNotFound);
+        }
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        Ok(())
+    }
+
     /// Observe retirement without granting callers authority to retire this wrapper.
     pub fn retirement_token(&self) -> CancellationToken {
         self.retired.child_token()
@@ -2988,8 +3008,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn close(&self) -> Result<()> {
-        self.retired.cancel();
-        self.stop_monitoring().await;
+        self.retire_handle();
         self.disk.close().await
     }
 

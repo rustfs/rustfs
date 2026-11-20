@@ -3661,6 +3661,9 @@ impl TierConfigMgr {
                 }
             }
         }
+        if !rustfs_data_usage::is_scannable_tier_name(&tier_config.name) {
+            return Err(tier_invalid_config("Remote tier name cannot be represented in lifecycle accounting"));
+        }
         self.ensure_generation_is_idle(&tier_config.name)?;
         let tier_name = tier_config.name.clone();
         if tier_name != tier_name.to_uppercase() {
@@ -8433,6 +8436,20 @@ mod tests {
         normalize_s3_gcs_add_tier_name(&mut legacy_gcs).expect("legacy nested GCS name should normalize");
         assert_eq!(legacy_gcs.name, "COLD-LEGACY");
         assert_eq!(legacy_gcs.gcs.as_ref().expect("GCS payload should remain").name, "COLD-LEGACY");
+    }
+
+    #[tokio::test]
+    async fn add_rejects_names_that_scanner_cannot_account_for() {
+        let mut mgr = empty_mgr();
+        let long_name = "X".repeat(257);
+        for name in ["COLD\n", rustfs_data_usage::UNKNOWN_TIER, long_name.as_str()] {
+            let err = mgr
+                .add(build_s3_tier(name), true)
+                .await
+                .expect_err("tier name must fail admission");
+            assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+            assert!(mgr.tiers.is_empty());
+        }
     }
 
     #[tokio::test]

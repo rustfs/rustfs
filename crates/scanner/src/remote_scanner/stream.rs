@@ -334,6 +334,18 @@ struct RemoteScannerServerError {
 }
 
 impl RemoteScannerServerError {
+    fn source_unavailable(error: StorageError) -> Self {
+        Self {
+            scope: RemoteScannerErrorScope::Bucket,
+            error: ScannerError::source_unavailable(error),
+            retry_bucket: true,
+        }
+    }
+
+    fn check_source(disk: &Disk) -> Result<(), Self> {
+        crate::scanner_io::check_local_scanner_handle(disk).map_err(Self::source_unavailable)
+    }
+
     fn worker(message: impl Into<String>) -> Self {
         Self {
             scope: RemoteScannerErrorScope::Worker,
@@ -866,6 +878,26 @@ async fn remote_disk_belongs_to_set(disk: &Disk, set: &crate::SetDisks) -> bool 
     }
 }
 
+// Validate the physical slot before reusing any cached value for the requested set.
+// Only the configured one-drive topology can admit a healing source for usage alone.
+fn remote_source_heal_suppression(
+    disk: &Disk,
+    set: &crate::SetDisks,
+    info: &crate::DiskInfo,
+    skip_healing: bool,
+) -> Result<bool, RemoteScannerServerError> {
+    if !info.error.is_empty()
+        || info.id.is_none()
+        || info.id != crate::scanner_io::scanner_slot_disk_id(set, disk)
+        || (info.healing && set.set_drive_count != 1)
+    {
+        return Err(RemoteScannerServerError::retry_bucket(
+            "scanner source format or healing state does not permit this walk",
+        ));
+    }
+    Ok(skip_healing || info.healing)
+}
+
 async fn scan_and_persist_local_bucket(
     disk: Arc<Disk>,
     ctx: CancellationToken,
@@ -932,6 +964,17 @@ async fn scan_and_persist_local_bucket_with_store(
             "remote namespace scanner disk does not belong to its storage instance",
         ));
     }
+    RemoteScannerServerError::check_source(&disk)?;
+    let options = crate::DiskInfoOptions::default();
+    let info = tokio::select! {
+        _ = ctx.cancelled() => return Err(RemoteScannerServerError::retry_bucket("scanner source admission was cancelled")),
+        _ = budget.wait_for_stop() => return Ok(RemoteScannerFrameResult::Partial),
+        probe = tokio::time::timeout(NS_SCANNER_DISK_HEALTH_TIMEOUT, disk.disk_info(&options)) =>
+            probe.map_err(|_| RemoteScannerServerError::retry_bucket("scanner source probe timed out"))?
+                .map_err(|err| RemoteScannerServerError::source_unavailable(err.into()))?,
+    };
+    let skip_healing = remote_source_heal_suppression(&disk, &set, &info, skip_healing)?;
+
     if let Some(proof) = usage_watch.as_deref()
         && !proof.verify_with_store(&store).await
     {
@@ -1041,6 +1084,7 @@ async fn scan_and_persist_local_bucket_with_store(
                     "remote namespace scanner usage watch changed before cache reuse",
                 ));
             }
+            RemoteScannerServerError::check_source(&disk)?;
             return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
                 source,
                 scan_plan_digest,
@@ -1075,6 +1119,7 @@ async fn scan_and_persist_local_bucket_with_store(
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
     let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
     let scan_ctx = ctx.child_token();
+    let local_stop = Arc::new(crate::scanner_io::ScannerLocalStop::default());
     #[cfg(feature = "e2e-test-hooks")]
     let _ = crate::e2e_barrier::checkpoint(
         "bucket_walk",
@@ -1098,7 +1143,7 @@ async fn scan_and_persist_local_bucket_with_store(
                 scan_mode,
                 prefix_scan_scope: None,
                 checkpoint_tx: Some(checkpoint_tx),
-                local_stop: None,
+                local_stop: Some(local_stop.clone()),
             },
         ),
     );
@@ -1133,7 +1178,11 @@ async fn scan_and_persist_local_bucket_with_store(
             }
             result = &mut scan => {
                 match result {
+                    _ if local_stop.reason().is_some() =>
+                        return Err(RemoteScannerServerError::retry_bucket("scanner source was interrupted during the walk")),
                     Ok(outcome) => break outcome,
+                    Err(err) if crate::scanner_io::is_scanner_source_unavailable(&err) =>
+                        return Err(RemoteScannerServerError::source_unavailable(err)),
                     Err(err) => {
                         let disk_online =
                             tokio::time::timeout(NS_SCANNER_DISK_HEALTH_TIMEOUT, crate::scanner_disk_is_online(disk.as_ref()))
@@ -1160,6 +1209,11 @@ async fn scan_and_persist_local_bucket_with_store(
                     checkpoint_channel_closed = true;
                     continue;
                 };
+                if let Err(error) = RemoteScannerServerError::check_source(&disk) {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(error);
+                }
                 if guard.is_lock_lost() {
                     scan_ctx.cancel();
                     let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -1265,6 +1319,7 @@ async fn scan_and_persist_local_bucket_with_store(
         .map_err(|err| {
             RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
         })?;
+    RemoteScannerServerError::check_source(&disk)?;
     let done_save = Metrics::time(Metric::SaveUsage);
     // Each physical main/backup PUT must still prove the epoch captured before
     // the scan. A movement transition that starts and ends during the scan
@@ -1310,6 +1365,7 @@ async fn scan_and_persist_local_bucket_with_store(
         ));
     }
 
+    RemoteScannerServerError::check_source(&disk)?;
     if let Some(partial_result) = partial_result {
         if matches!(partial_result, RemoteScannerFrameResult::Partial) {
             log_saved_partial_bucket_cache(&cache, &cache_name);

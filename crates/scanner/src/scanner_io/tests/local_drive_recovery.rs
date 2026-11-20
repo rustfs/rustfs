@@ -89,6 +89,37 @@ impl Drop for RegisteredProbe {
     }
 }
 
+fn register_probe(
+    bucket: &str,
+    set: Arc<SetDisks>,
+    before: bool,
+    replace: bool,
+    faulty: bool,
+    eof: bool,
+) -> (Arc<Probe>, RegisteredProbe) {
+    let probe = Arc::new(Probe {
+        set,
+        before,
+        replace,
+        faulty,
+        eof,
+        attempts: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+    });
+    assert!(
+        PROBES
+            .lock()
+            .expect("probe registry")
+            .insert(bucket.to_owned(), probe.clone())
+            .is_none()
+    );
+    (probe, RegisteredProbe(bucket.to_owned()))
+}
+
+pub(crate) fn retire_source_at_eof(bucket: &str, set: Arc<SetDisks>) -> impl Drop {
+    register_probe(bucket, set, false, false, false, true).1
+}
+
 async fn recovery_fixture(bucket: &str, before: bool, replace: bool, faulty: bool, eof: bool) {
     let (_dir, store) = setup_local_scanner_store(1, 1).await;
     clear_dirty_usage_buckets_for_tests();
@@ -107,20 +138,7 @@ async fn recovery_fixture(bucket: &str, before: bool, replace: bool, faulty: boo
     }
     wait_for_namespace_commit_tails(store.as_ref()).await;
     let set = store.pools[0].disk_set[0].clone();
-    let probe = Arc::new(Probe {
-        set: set.clone(),
-        before,
-        replace,
-        faulty,
-        eof,
-        attempts: AtomicUsize::new(0),
-        reads: AtomicUsize::new(0),
-    });
-    PROBES
-        .lock()
-        .expect("probe registry")
-        .insert(bucket.to_string(), probe.clone());
-    let _registered = RegisteredProbe(bucket.to_string());
+    let (probe, _registered) = register_probe(bucket, set.clone(), before, replace, faulty, eof);
     let status = run_full_cycle(&store, 1).await;
     if replace || faulty {
         assert_eq!(status, ScannerCycleStatus::Complete);

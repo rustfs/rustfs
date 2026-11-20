@@ -52,9 +52,9 @@ use super::replication_resync_boundary::{
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX};
 use super::replication_storage_boundary::{
-    AdvancedGetOptions, EcstoreObjectOperations, GetObjectReader, HTTPPreconditions, HTTPRangeSpec, ObjectInfo, ObjectOptions,
-    ObjectToDelete, ReplicationObjectIO, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode, ReplicationStorage,
-    StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
+    EcstoreObjectOperations, GetObjectReader, HTTPPreconditions, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
+    ReplicationObjectIO, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode, ReplicationStorage,
+    StorageObjectInfoOrErr, WalkOptions,
 };
 #[cfg(test)]
 use super::replication_storage_boundary::{NamespaceLockFence, NamespaceLockSignalTestFence, ReplicationDeletedObject};
@@ -67,8 +67,8 @@ use super::replication_target_boundary::{
     replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
     replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
     replication_put_object_options, replication_source_etag_is_comparable, replication_target_head_is_newer_null_version,
-    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_capability_from_put,
-    version_identity_drifted,
+    replication_target_tags_match, resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate,
+    version_identity_capability_from_put, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -87,9 +87,9 @@ use metrics::counter;
 use rmp_serde;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_TAGGING_DIRECTIVE,
-    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX, has_internal_suffix,
-    insert_str, replication_target_versions,
+    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, SUFFIX_REPLICATION_RESET,
+    SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX,
+    has_internal_suffix, insert_str, replication_target_versions,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
@@ -850,7 +850,8 @@ fn user_defined_value<'a>(user_defined: &'a HashMap<String, String>, name: &str)
 /// difference (retention is only ever extended here — shortening or clearing
 /// it needs a governance bypass the replication client does not hold, so the
 /// replica keeps its longer window and the difference is logged). Heal and
-/// resync attempts only touch what the HEAD proves diverged.
+/// resync attempts apply known differences. An existing-object reset also
+/// reconciles a nonempty tag set whose values the target HEAD omits.
 async fn sync_drifted_replica_metadata(
     tgt_client: &TargetClient,
     object: &str,
@@ -863,10 +864,15 @@ async fn sync_drifted_replica_metadata(
     let mut applied = false;
 
     let source_tags = ReplicationTagFilter::decode_tags_to_map(&source.user_tags);
-    let source_tag_count = i32::try_from(source_tags.len()).unwrap_or(i32::MAX);
-    if op_type == ReplicationType::Metadata || replica.tag_count.unwrap_or_default() != source_tag_count {
+    let replica_tag_count = replica.tag_count.unwrap_or_default();
+    let update_tags = match op_type {
+        ReplicationType::Metadata => true,
+        ReplicationType::ExistingObject => !replication_target_tags_match(&source_tags, replica_tag_count, replica.metadata()),
+        _ => usize::try_from(replica_tag_count) != Ok(source_tags.len()),
+    };
+    if update_tags {
         if source_tags.is_empty() {
-            if replica.tag_count.unwrap_or_default() > 0 {
+            if replica_tag_count > 0 || op_type == ReplicationType::ExistingObject {
                 tgt_client
                     .delete_object_tagging(&tgt_client.bucket, object, version_id.clone())
                     .await
@@ -4116,6 +4122,17 @@ fn replication_status_writeback_mode(state_update_needed: bool) -> ReplicationSt
     }
 }
 
+/// Source-object metadata a replication worker publishes with its terminal
+/// status.
+#[derive(Clone, Copy, Default)]
+struct ReplicationStatusWriteback<'a> {
+    replication_internal: Option<&'a String>,
+    /// `(arn, version id the target assigned)` for targets minting their own ids.
+    target_version_ledger: &'a [(String, String)],
+    /// `(arn, resync stamp)` for targets this attempt resynced.
+    resync_stamps: &'a [(String, String)],
+}
+
 /// Publish a worker's status with a storage-enforced compare-and-set token.
 /// `put_object_metadata` checks the token while it owns the object write lock,
 /// avoiding both a read/write race and any need to hold a hot object lock
@@ -4123,12 +4140,16 @@ fn replication_status_writeback_mode(state_update_needed: bool) -> ReplicationSt
 fn replication_status_writeback_options(
     roi: &ReplicateObjectInfo,
     replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
-    new_replication_internal: Option<&String>,
-    target_version_ledger: &[(String, String)],
+    writeback: ReplicationStatusWriteback<'_>,
     mode: ReplicationStatusWritebackMode,
 ) -> ObjectOptions {
+    let ReplicationStatusWriteback {
+        replication_internal,
+        target_version_ledger,
+        resync_stamps,
+    } = writeback;
     let mut eval_metadata = HashMap::new();
-    if let Some(status) = new_replication_internal {
+    if let Some(status) = replication_internal {
         insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, status.clone());
     }
     // One durable key per drifting target: the version id it assigned to this
@@ -4140,6 +4161,12 @@ fn replication_status_writeback_options(
             &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
             assigned_version_id.clone(),
         );
+    }
+    // The per-target existing-object resync stamp. Without it the object keeps
+    // answering "not yet resynced" for the target's reset id, and the scanner
+    // re-queues it on every cycle.
+    for (arn, stamp) in resync_stamps {
+        insert_str(&mut eval_metadata, &format!("{SUFFIX_REPLICATION_RESET_ARN_PREFIX}{arn}"), stamp.clone());
     }
     let mut write_opts = ObjectOptions {
         version_id: roi.version_id.map(|version_id| version_id.to_string()),
@@ -4162,13 +4189,11 @@ async fn persist_replication_state_if_current<S: ReplicationStorage>(
     roi: &ReplicateObjectInfo,
     storage: &Arc<S>,
     replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
-    new_replication_internal: Option<&String>,
-    target_version_ledger: &[(String, String)],
+    writeback: ReplicationStatusWriteback<'_>,
     mode: ReplicationStatusWritebackMode,
     object_info: &mut ObjectInfo,
 ) -> Result<ReplicationStatePersistOutcome> {
-    let write_opts =
-        replication_status_writeback_options(roi, replication_lock_guard, new_replication_internal, target_version_ledger, mode);
+    let write_opts = replication_status_writeback_options(roi, replication_lock_guard, writeback, mode);
     match storage.put_object_metadata(&roi.bucket, &roi.name, &write_opts).await {
         Ok(updated) => {
             *object_info = updated;
@@ -4334,6 +4359,12 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         .filter(|target| !target.is_empty())
         .filter_map(|target| Some((target.arn.clone(), target.target_version_id.clone()?)))
         .collect();
+    let resync_stamps: Vec<(String, String)> = rinfos
+        .targets
+        .iter()
+        .filter(|target| !target.is_empty() && !target.resync_timestamp.is_empty())
+        .map(|target| (target.arn.clone(), target.resync_timestamp.clone()))
+        .collect();
     let state_update_needed = roi.replication_status_internal != new_replication_internal
         || rinfos.replication_resynced()
         || !target_version_ledger.is_empty();
@@ -4343,8 +4374,11 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         &roi,
         &storage,
         &obj_lock_guard,
-        new_replication_internal.as_ref(),
-        &target_version_ledger,
+        ReplicationStatusWriteback {
+            replication_internal: new_replication_internal.as_ref(),
+            target_version_ledger: &target_version_ledger,
+            resync_stamps: &resync_stamps,
+        },
         writeback_mode,
         &mut object_info,
     )
@@ -5005,8 +5039,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let _sopts = replicate_all_stat_options(&object_info, &bucket, &tgt_client);
-
         let Some((replication_action, object_info)) = resolve_replicate_all_action(
             ReplicateAllActionContext {
                 siblings: &storage,
@@ -5088,6 +5120,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         {
             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
             return rinfo;
+        }
+
+        // The transfer is this target's resync of the object. Stamp it like the
+        // already-converged outcome above, or the next scanner cycle admits the
+        // object for the same reset id again.
+        if self.op_type == ReplicationType::ExistingObject && !tgt_client.reset_id.is_empty() {
+            apply_replication_resync_timestamp(&mut rinfo, &tgt_client.reset_id);
         }
 
         rinfo
@@ -5236,34 +5275,6 @@ fn note_replicate_all_target_bucket_empty(bucket: &str, tgt_client: &TargetClien
         user_agent: "Internal: [Replication]".to_string(),
         ..Default::default()
     });
-}
-
-/// Build the stat options for the target metadata comparison, logging (without
-/// failing) when the tagging directive header cannot be set.
-fn replicate_all_stat_options(object_info: &ObjectInfo, bucket: &str, tgt_client: &TargetClient) -> StatObjectOptions {
-    let mut sopts = StatObjectOptions {
-        version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
-        internal: AdvancedGetOptions {
-            replication_proxy_request: "false".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    if let Err(err) = sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS") {
-        debug!(
-            event = EVENT_RESYNC_RUNTIME_SKIPPED,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-            bucket = %bucket,
-            arn = %tgt_client.arn,
-            error = %err,
-            reason = "tagging_directive_header_invalid",
-            "Skipped replication tagging directive header detail"
-        );
-    }
-
-    sopts
 }
 
 /// Record a failed payload transfer: mark the outcome FAILED, log the target
@@ -5465,7 +5476,15 @@ async fn resolve_replicate_all_action(
                             // records the sync without running the PUT.
                             replication_action = ReplicationAction::None;
                         } else {
-                            replication_action = if replica_matches {
+                            // A current-version fallback may omit its version ID. Avoid
+                            // mutating an unpinned version's tags or certifying stale tags.
+                            replication_action = if replica_matches
+                                && (roi.op_type != ReplicationType::ExistingObject
+                                    || replication_target_tags_match(
+                                        &ReplicationTagFilter::decode_tags_to_map(&object_info.user_tags),
+                                        oi.tag_count.unwrap_or_default(),
+                                        oi.metadata(),
+                                    )) {
                                 ReplicationAction::None
                             } else {
                                 ReplicationAction::All
@@ -6395,8 +6414,7 @@ mod tests {
         let opts = replication_status_writeback_options(
             &ReplicateObjectInfo::default(),
             &guard,
-            None,
-            &[],
+            ReplicationStatusWriteback::default(),
             ReplicationStatusWritebackMode::ValidateOnly,
         );
         forced_lost.store(true, std::sync::atomic::Ordering::Release);
@@ -6413,6 +6431,76 @@ mod tests {
             ReplicationTerminalPublication::default(),
             "a fenced writeback retry must not publish terminal events or statistics"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_writeback_persists_resync_stamp_that_ends_existing_object_resync() {
+        let lock = rustfs_lock::NamespaceLock::new(
+            "replication-status-writeback-resync-stamp".to_string(),
+            Arc::new(rustfs_lock::LocalClient::new()),
+        );
+        let guard = lock
+            .get_write_lock(
+                rustfs_lock::ObjectKey::new("bucket", "/[replicate]/object"),
+                "worker-a",
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replication lock should be acquired");
+        let arn = "arn:rustfs:replication::target:bucket";
+        let reset_before = OffsetDateTime::now_utc();
+        let mut rinfo = ReplicatedTargetInfo {
+            arn: arn.to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        apply_replication_resync_timestamp(&mut rinfo, "reset-1");
+        let resync_decision = |user_defined: &HashMap<String, String>, reset_id: &str| {
+            super::super::replication_object_decision_boundary::resync_target_for_object(
+                &super::super::replication_object_decision_boundary::ReplicationResyncTargetObject {
+                    mod_time: Some(reset_before - time::Duration::hours(1)),
+                    user_defined,
+                },
+                arn,
+                reset_id,
+                Some(reset_before),
+                ReplicationStatusType::Completed,
+            )
+            .replicate
+        };
+        let persisted = |resync_stamps: &[(String, String)]| {
+            replication_status_writeback_options(
+                &ReplicateObjectInfo::default(),
+                &guard,
+                ReplicationStatusWriteback {
+                    resync_stamps,
+                    ..Default::default()
+                },
+                ReplicationStatusWritebackMode::Update,
+            )
+            .eval_metadata
+            .expect("writeback always carries evaluated metadata")
+        };
+
+        let unstamped = persisted(&[]);
+        assert!(
+            resync_decision(&unstamped, "reset-1"),
+            "an object older than the reset date stays admitted until it carries the stamp"
+        );
+
+        let stamped = persisted(&[(rinfo.arn.clone(), rinfo.resync_timestamp.clone())]);
+        let suffix = format!("{SUFFIX_REPLICATION_RESET_ARN_PREFIX}{arn}");
+        for prefix in [
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+        ] {
+            assert_eq!(stamped.get(&format!("{prefix}{suffix}")), Some(&rinfo.resync_timestamp));
+        }
+        assert!(
+            !resync_decision(&stamped, "reset-1"),
+            "the persisted stamp must end the resync for the same reset id"
+        );
+        assert!(resync_decision(&stamped, "reset-2"), "a new reset id must admit the object again");
     }
 
     #[test]
@@ -8058,43 +8146,28 @@ mod tests {
         assert!(purge_backoff_active(&dobj));
     }
 
-    #[tokio::test]
-    async fn metadata_update_on_a_drifted_target_uses_the_tagging_api_instead_of_a_put() {
-        let (endpoint, server) = spawn_scripted_target_server(3, |line| {
-            if line.starts_with("HEAD ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
-                format!(
-                    "HTTP/1.1 200 OK\r\nETag: \"{DRIFTED_ETAG}\"\r\nContent-Length: 4\r\nx-amz-version-id: {DRIFTED_ASSIGNED_VERSION_ID}\r\nx-amz-tagging-count: 1\r\nLast-Modified: Sun, 06 Sep 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n"
-                )
-            } else if line.starts_with("HEAD ") {
-                empty_response("404 Not Found")
-            } else if line.starts_with("PUT ")
-                && line.contains("tagging")
-                && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}"))
-            {
-                empty_response("200 OK")
-            } else {
-                empty_response("500 Unexpected")
-            }
-        });
-        let target = test_target_client(endpoint);
+    async fn resolve_tagged_test_replica(
+        target: &Arc<TargetClient>,
+        op_type: ReplicationType,
+        has_ledger: bool,
+    ) -> (Option<ReplicationAction>, ReplicatedTargetInfo) {
         let (mut roi, mut object_info) = drifted_roi_and_object();
-        roi.op_type = ReplicationType::Metadata;
+        roi.op_type = op_type;
         roi.user_tags = "phase=after".to_string();
-        object_info.user_tags = Arc::new("phase=after".to_string());
-        let mut user_defined = HashMap::new();
-        insert_str(
-            &mut user_defined,
-            &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{}", target.arn),
-            DRIFTED_ASSIGNED_VERSION_ID.to_string(),
-        );
-        object_info.user_defined = Arc::new(user_defined);
-        let mut rinfo = replicate_all_target_info(&roi, &target);
-
+        object_info.user_tags = Arc::new(roi.user_tags.clone());
+        if has_ledger {
+            insert_str(
+                Arc::make_mut(&mut object_info.user_defined),
+                &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{}", target.arn),
+                DRIFTED_ASSIGNED_VERSION_ID.to_string(),
+            );
+        }
+        let mut rinfo = replicate_all_target_info(&roi, target);
         let action = resolve_replicate_all_action(
             ReplicateAllActionContext {
                 siblings: &NoSiblingLedger,
                 roi: &roi,
-                tgt_client: &target,
+                tgt_client: target,
                 bucket: &roi.bucket,
                 object: &roi.name,
                 start_time: OffsetDateTime::now_utc(),
@@ -8104,24 +8177,93 @@ mod tests {
             &mut rinfo,
         )
         .await;
+        (action.map(|(action, _)| action), rinfo)
+    }
 
-        assert!(
-            matches!(action, Some((ReplicationAction::None, _))),
-            "metadata is applied in place; the PUT transport must not run: {action:?}"
-        );
-        assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
-        assert!(
-            rinfo.target_version_id.is_none(),
-            "an id the ledger already records must not trigger another metadata writeback"
-        );
+    async fn assert_versioned_tagging_sync(
+        op_type: ReplicationType,
+        tag_header: Option<&'static str>,
+        expect_write: bool,
+        put_status: &'static str,
+    ) {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let server_wrote = Arc::clone(&wrote);
+        let (endpoint, server) = spawn_scripted_target_server(2 + usize::from(expect_write), move |line| {
+            let assigned = line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}"));
+            if line.starts_with("HEAD ") && assigned {
+                let tags = tag_header
+                    .map(|value| format!("x-amz-tagging: {value}\r\n"))
+                    .unwrap_or_default();
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{DRIFTED_ETAG}\"\r\nContent-Length: 4\r\nx-amz-version-id: {DRIFTED_ASSIGNED_VERSION_ID}\r\nx-amz-tagging-count: 1\r\n{tags}Last-Modified: Sun, 06 Sep 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n"
+                )
+            } else if line.starts_with("HEAD ") {
+                empty_response("404 Not Found")
+            } else if line.starts_with("PUT ") && line.contains("tagging") && assigned {
+                server_wrote.store(true, Ordering::Release);
+                empty_response(put_status)
+            } else {
+                empty_response("400 Unexpected")
+            }
+        });
+
+        let mut target = test_target_client(endpoint);
+        Arc::get_mut(&mut target).expect("unshared test target").reset_id = "reset-1".to_string();
+        let (action, rinfo) = resolve_tagged_test_replica(&target, op_type, true).await;
+        assert_eq!(wrote.load(Ordering::Acquire), expect_write, "{tag_header:?}");
+        if put_status == "200 OK" {
+            assert_eq!(action, Some(ReplicationAction::None), "the payload PUT must not run");
+            assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
+            assert!(rinfo.target_version_id.is_none(), "the ledger already records the replica version");
+        } else {
+            assert_eq!(action, None, "a failed tag write must stop before the caller can mark the reset complete");
+            assert_eq!(rinfo.replication_status, ReplicationStatusType::Failed);
+            assert!(rinfo.error.is_some() && rinfo.resync_timestamp.is_empty());
+        }
         let seen = server.join().expect("test HTTP server should finish");
-        assert_eq!(seen.len(), 3, "HEAD by source id, HEAD by ledger id, PutObjectTagging: {seen:?}");
         assert!(
             seen[1].starts_with("HEAD ") && seen[1].contains(DRIFTED_ASSIGNED_VERSION_ID),
             "{}",
             seen[1]
         );
-        assert!(seen[2].starts_with("PUT ") && seen[2].contains("tagging"), "{}", seen[2]);
+        assert_eq!(seen.len(), 2 + usize::from(expect_write));
+    }
+
+    #[tokio::test]
+    async fn metadata_update_on_a_drifted_target_uses_the_tagging_api_instead_of_a_put() {
+        assert_versioned_tagging_sync(ReplicationType::Metadata, None, true, "200 OK").await;
+    }
+
+    #[tokio::test]
+    async fn existing_object_resync_verifies_drifted_replica_tags_before_stamping() {
+        for (tag_header, write, status) in [
+            (Some("phase=after"), false, "200 OK"),
+            (Some("phase=before"), true, "200 OK"),
+            (None, true, "200 OK"),
+            (Some("phase=before"), true, "403 Forbidden"),
+        ] {
+            assert_versioned_tagging_sync(ReplicationType::ExistingObject, tag_header, write, status).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_object_resync_does_not_stamp_unaddressed_replica_with_stale_tags() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("HEAD ") && line.contains("versionId") {
+                empty_response("400 Bad Request")
+            } else if line.starts_with("HEAD ") {
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{DRIFTED_ETAG}\"\r\nContent-Length: 4\r\nx-amz-tagging-count: 1\r\nx-amz-tagging: phase=before\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                empty_response("400 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        let (action, rinfo) = resolve_tagged_test_replica(&target, ReplicationType::ExistingObject, false).await;
+        assert_eq!(action, Some(ReplicationAction::All));
+        assert!(rinfo.resync_timestamp.is_empty());
+        assert_eq!(server.join().expect("test HTTP server should finish").len(), 2);
     }
 
     #[test]

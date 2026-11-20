@@ -1602,6 +1602,7 @@ fn shard_object(ledger_object: &str, shard_index: u16, bucket_incarnation: Uuid,
 }
 
 fn shard_index(object: &str) -> u16 {
+    let object = rustfs_utils::path::encode_dir_object_ref(object);
     let digest = Sha256::digest(object.as_bytes());
     u16::from_be_bytes([digest[0], digest[1]]) % SHARDED_LEDGER_COUNT
 }
@@ -3304,6 +3305,35 @@ mod tests {
                 .size,
             1
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_shard_reconciliation_matches_the_directory_object_write() {
+        use crate::object_api::PutObjReader;
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let (_directories, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "quota-directory-marker";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create test bucket");
+        let listed_name = "photos/";
+        let stored_name = rustfs_utils::path::encode_dir_object(listed_name);
+        let mut body = PutObjReader::from_vec(vec![1, 2, 3]);
+        store
+            .put_object(bucket, listed_name, &mut body, &ObjectOptions::default())
+            .await
+            .expect("write a directory object with billable bytes");
+
+        let usages = exact_shard_usages(&store, bucket)
+            .await
+            .expect("reconcile the version listing");
+        assert_eq!(usages.iter().sum::<u64>(), 3);
+        assert_eq!(usages[usize::from(shard_index(&stored_name))], 3);
+        assert_eq!(shard_index(listed_name), shard_index(&stored_name));
     }
 
     #[tokio::test]

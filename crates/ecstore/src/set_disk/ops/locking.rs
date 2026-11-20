@@ -31,7 +31,6 @@ use futures::{StreamExt, stream, stream::FuturesUnordered};
 use rand::prelude::SliceRandom;
 use rustfs_heal_contracts::heal_channel::{create_auto_replacement_disks_request, send_heal_request};
 use rustfs_utils::path::object_name_disk_identity;
-#[cfg(test)]
 use uuid::Uuid;
 
 // Bound batching when another reconnect is still pending.
@@ -446,7 +445,7 @@ impl SetDisks {
         // Reconnect drives concurrently without holding the inventory lock.
         let mut reconnects = stream::iter(disks.into_iter().enumerate())
             .map(|(i, opdisk)| async move {
-                if let Some(disk) = opdisk {
+                if let Some(disk) = &opdisk {
                     if !active_monitoring
                         && disk.get_disk_location().set_idx.is_some()
                         && let disk::Disk::Local(local) = disk.as_ref()
@@ -465,7 +464,9 @@ impl SetDisks {
                 }
 
                 let endpoint = self.set_endpoints.get(i)?;
-                self.reconnect_disk(endpoint).await.then(|| endpoint.to_string())
+                self.reconnect_disk(endpoint, opdisk.as_ref())
+                    .await
+                    .then(|| endpoint.to_string())
             })
             .buffer_unordered(MAX_ERASURE_SET_DRIVE_COUNT);
         let mut submissions = FuturesUnordered::new();
@@ -515,26 +516,22 @@ impl SetDisks {
     }
 
     pub async fn renew_disk(&self, ep: &Endpoint) {
-        if self.reconnect_disk(ep).await {
+        let Some(disk_idx) = self.set_endpoints.iter().position(|endpoint| endpoint == ep) else {
+            return;
+        };
+        let previous = self.disks.read().await[disk_idx].clone();
+        if self.reconnect_disk(ep, previous.as_ref()).await {
             self.submit_replacement_heal(vec![ep.to_string()]).await;
         }
     }
 
     /// Return whether this reconnect attached a verified unformatted target.
-    async fn reconnect_disk(&self, ep: &Endpoint) -> bool {
+    async fn reconnect_disk(&self, ep: &Endpoint, previous: Option<&DiskStore>) -> bool {
         debug!("renew_disk: start {:?}", ep);
-
-        let previous_disk = {
-            let disks = self.disks.read().await;
-            disks
-                .iter()
-                .filter_map(|disk| disk.as_ref())
-                .find(|disk| disk.endpoint() == *ep)
-                .cloned()
-        };
-        let previous_health = previous_disk
-            .as_ref()
-            .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
+        if previous.is_some_and(|disk| disk.endpoint() != *ep) {
+            return false;
+        }
+        let previous_health = previous.and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
 
         let (new_disk, fm) = match Self::connect_endpoint(ep, previous_health).await {
             Ok(res) => res,
@@ -544,7 +541,7 @@ impl SetDisks {
                     return false;
                 }
 
-                let attached = match self.attach_unformatted_replacement_disk(ep).await {
+                let attached = match self.attach_unformatted_replacement_disk(ep, previous).await {
                     Ok(attached) => attached,
                     Err(err) => {
                         warn!(endpoint = %ep, error = ?err, "renew_disk: unformatted replacement probe failed");
@@ -580,21 +577,18 @@ impl SetDisks {
             return false;
         }
 
-        let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
-
-        if !new_disk.is_local() {
+        if let disk::Disk::Local(local) = new_disk.as_ref() {
+            local.set_disk_id_state(Some(fm.erasure.this)).await;
+            self.publish_local_reconnect(disk_idx, previous, new_disk, Some(fm.erasure.this))
+                .await;
+        } else {
+            let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
             let displaced = {
                 let mut disks = self.disks.write().await;
                 let slot = &mut disks[disk_idx];
-                let unchanged = match (slot.as_ref(), previous_disk.as_ref()) {
-                    (None, None) => true,
-                    (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
-                    _ => false,
-                };
                 // A GET probe or another reconnect may have filled this slot while
-                // format I/O was pending. Only the successful publisher owns the
-                // displaced monitor; a failed or superseded probe must retain it.
-                if unchanged {
+                // format I/O was pending. Only the winner owns the displaced monitor.
+                if Self::same_disk_handle(slot.as_ref(), previous) {
                     new_disk.enable_health_check();
                     slot.replace(new_disk)
                 } else {
@@ -604,39 +598,79 @@ impl SetDisks {
             if let Some(disk) = displaced {
                 let _ = disk.close().await;
             }
+        }
+        false
+    }
+
+    fn same_disk_handle(current: Option<&DiskStore>, expected: Option<&DiskStore>) -> bool {
+        match (current, expected) {
+            (None, None) => true,
+            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+            _ => false,
+        }
+    }
+
+    /// Commit a freshly probed attachment to its set and all local RPC routes together.
+    async fn publish_local_reconnect(
+        &self,
+        disk_idx: usize,
+        previous: Option<&DiskStore>,
+        candidate: DiskStore,
+        format_id: Option<Uuid>,
+    ) -> bool {
+        let disk::Disk::Local(local) = candidate.as_ref() else { return false };
+        let path = candidate.endpoint().to_string();
+        let dist = self.ctx.is_dist_erasure().await;
+        // A busy set must not block RPC lookups across the instance. Lock the set
+        // first, then follow the registry order used by startup and RPC registration:
+        // distributed drive table -> path map -> ID map.
+        let mut disks = self.disks.write().await;
+        let slot = &mut disks[disk_idx];
+        if !Self::same_disk_handle(slot.as_ref(), previous) {
             return false;
         }
-
-        new_disk.enable_health_check();
-
-        if new_disk.is_local() {
-            if let crate::disk::Disk::Local(wrapper) = new_disk.as_ref() {
-                wrapper.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
-            }
-            let local_disk_map = runtime_sources::local_disk_map_handle();
-            let mut global_local_disk_map = local_disk_map.write().await;
-            let path = new_disk.endpoint().to_string();
-            global_local_disk_map.insert(path, Some(new_disk.clone()));
-
-            if runtime_sources::setup_is_dist_erasure().await {
-                let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-                let mut local_set_drives = local_disk_set_drives.write().await;
-                local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
-            }
+        let table = self.ctx.local_disk_set_drives();
+        let mut table = if dist { Some(table.write().await) } else { None };
+        let route_slot = if let Some(table) = table.as_mut() {
+            let Some(slot) = table
+                .get_mut(self.pool_index)
+                .and_then(|pool| pool.get_mut(self.set_index))
+                .and_then(|set| set.get_mut(disk_idx))
+            else {
+                return false;
+            };
+            Some(slot)
+        } else {
+            None
+        };
+        let routes = self.ctx.local_disk_map();
+        let mut routes = routes.write().await;
+        if let Some(id) = format_id {
+            self.ctx.local_disk_id_map().write().await.insert(id, path.clone());
         }
-
-        debug!("renew_disk: update {:?}", fm.erasure.this);
-
-        let mut disk_lock = self.disks.write().await;
-        disk_lock[disk_idx] = Some(new_disk);
-        false
+        // No await after publication begins: cancellation cannot expose half an attachment.
+        local.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
+        candidate.enable_health_check();
+        if let Some(disk::Disk::Local(displaced)) = slot.as_deref() {
+            displaced.retire_handle();
+        }
+        routes.insert(path, Some(candidate.clone()));
+        if let Some(route_slot) = route_slot {
+            *route_slot = Some(candidate.clone());
+        }
+        *slot = Some(candidate);
+        true
     }
 
     /// Attach a replacement target only after proving that the exact local slot
     /// is present and unformatted. A health-checked reconnect may reject a
     /// blank target before it reaches the format-heal path; that target still
     /// has to be visible in this set for the formatter to claim it safely.
-    async fn attach_unformatted_replacement_disk(&self, ep: &Endpoint) -> disk::error::Result<bool> {
+    async fn attach_unformatted_replacement_disk(
+        &self,
+        ep: &Endpoint,
+        previous: Option<&DiskStore>,
+    ) -> disk::error::Result<bool> {
         if !ep.is_local
             || usize::try_from(ep.pool_idx).ok() != Some(self.pool_index)
             || usize::try_from(ep.set_idx).ok() != Some(self.set_index)
@@ -662,28 +696,7 @@ impl SetDisks {
             Err(err) => return Err(err),
         }
 
-        {
-            let mut disks = self.disks.write().await;
-            if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
-                warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
-                return Ok(false);
-            }
-            disks[disk_idx] = Some(replacement.clone());
-        }
-
-        let local_disk_map = runtime_sources::local_disk_map_handle();
-        local_disk_map
-            .write()
-            .await
-            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
-
-        if runtime_sources::setup_is_dist_erasure().await {
-            let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-            let mut local_set_drives = local_disk_set_drives.write().await;
-            local_set_drives[self.pool_index][self.set_index][disk_idx] = Some(replacement);
-        }
-
-        Ok(true)
+        Ok(self.publish_local_reconnect(disk_idx, previous, replacement, None).await)
     }
 
     pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
@@ -1251,6 +1264,9 @@ mod tests {
             .await
             .expect("renewed disk_info should record a drive API metric");
         renewed_disk.force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Offline);
+        assert!(
+            matches!(renewed_disk.as_ref(), disk::Disk::Local(local) if matches!(local.check_scanner_handle(), Err(DiskError::FaultyDisk)))
+        );
 
         set_disks.renew_disk(&endpoints[0]).await;
 
@@ -1258,6 +1274,13 @@ mod tests {
         let renewed_again = disks[0]
             .as_ref()
             .expect("second renew_disk should keep the recovered disk attached");
+        let (disk::Disk::Local(retired), disk::Disk::Local(current)) = (renewed_disk.as_ref(), renewed_again.as_ref()) else {
+            panic!("local reconnect fixture must retain a local slot");
+        };
+        assert!(matches!(retired.check_scanner_handle(), Err(DiskError::DiskNotFound)));
+        current
+            .check_scanner_handle()
+            .expect("reconnected scanner handle must be usable");
         assert_eq!(
             renewed_again
                 .metrics_snapshot()
@@ -1267,6 +1290,70 @@ mod tests {
         );
 
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn stale_local_reconnect_cannot_retire_the_published_rpc_source() {
+        use crate::layout::endpoints::SetupType;
+        use crate::runtime::instance::InstanceContext;
+
+        let format = FormatV3::new(1, 1);
+        let id = format.erasure.sets[0][0];
+        let (directory, endpoint, original) = make_formatted_local_disk(0, &format).await;
+        let path = endpoint.to_string();
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        *ctx.local_disk_set_drives().write().await = vec![vec![vec![Some(original.clone())]]];
+        ctx.local_disk_map()
+            .write()
+            .await
+            .insert(path.clone(), Some(original.clone()));
+        let set = SetDisks::new_with_instance_ctx(
+            "local-reconnect-race".to_owned(),
+            Arc::new(RwLock::new(vec![Some(original.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint.clone()],
+            format,
+            Vec::new(),
+            ctx.clone(),
+        )
+        .await;
+
+        // Two reconnects saw the same set slot. Finish one before allowing the
+        // other probe to publish, first with its format and then as a blank target.
+        let delayed = set.get_disks_internal().await[0].clone();
+        set.renew_disk(&endpoint).await;
+        let winner = set.get_disks_internal().await[0].clone().expect("published handle");
+        assert!(
+            original
+                .local_retirement_token()
+                .expect("original local handle")
+                .is_cancelled()
+        );
+        assert!(!Arc::ptr_eq(&original, &winner));
+        for blank in [false, true] {
+            if blank {
+                tokio::fs::remove_file(directory.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE))
+                    .await
+                    .expect("turn delayed source into a verified blank replacement");
+            }
+            assert!(
+                !set.reconnect_disk(&endpoint, delayed.as_ref()).await,
+                "superseded blank cannot schedule a heal"
+            );
+            let active = set.get_disks_internal().await[0].clone().expect("set slot");
+            let route = ctx.local_disk_map().read().await[&path].clone().expect("RPC route");
+            let topology = ctx.local_disk_set_drives().read().await[0][0][0]
+                .clone()
+                .expect("distributed drive slot");
+            assert!(Arc::ptr_eq(&active, &winner) && Arc::ptr_eq(&route, &winner) && Arc::ptr_eq(&topology, &winner));
+            assert_eq!(ctx.local_disk_id_map().read().await.get(&id), Some(&path));
+            assert!(!winner.local_retirement_token().expect("current local handle").is_cancelled());
+        }
+        winner.close().await.expect("stop the winning monitor");
     }
 
     #[tokio::test]
@@ -1466,7 +1553,7 @@ mod tests {
 
         assert!(
             set_disks
-                .attach_unformatted_replacement_disk(&replacement_endpoint)
+                .attach_unformatted_replacement_disk(&replacement_endpoint, None)
                 .await
                 .expect("a blank local replacement should be admitted")
         );

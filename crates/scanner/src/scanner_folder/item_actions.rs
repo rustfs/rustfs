@@ -31,6 +31,7 @@ pub type GetSizeFn = Box<dyn Fn(ScannerItem) -> Result<SizeSummary, StorageError
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum GetSizeFailureAction {
     Skip,
+    AbandonSource,
     RecordFailed,
     HealMetadata { object: String },
 }
@@ -1347,21 +1348,17 @@ impl ScannerItem {
 }
 
 pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) -> GetSizeFailureAction {
-    if matches!(err, StorageError::Io(io) if io.to_string() == SCANNER_SKIP_FILE_ERROR) {
-        return GetSizeFailureAction::Skip;
-    }
-
-    if is_scanner_metadata_corrupt_error(err) {
-        return GetSizeFailureAction::HealMetadata {
+    match err {
+        err if is_scanner_source_unavailable(err) => GetSizeFailureAction::AbandonSource,
+        StorageError::FileNotFound | StorageError::FileVersionNotFound | StorageError::VolumeNotFound => {
+            GetSizeFailureAction::Skip
+        }
+        StorageError::IsNotRegular if !is_xl_meta_path(&item.path) => GetSizeFailureAction::Skip,
+        StorageError::FileCorrupt => GetSizeFailureAction::HealMetadata {
             object: item.metadata_object_path(),
-        };
+        },
+        _ => GetSizeFailureAction::RecordFailed,
     }
-
-    if is_scanner_metadata_transient_error(err) {
-        return GetSizeFailureAction::RecordFailed;
-    }
-
-    GetSizeFailureAction::RecordFailed
 }
 
 pub(super) fn is_erasure_part_name(name: &str) -> bool {

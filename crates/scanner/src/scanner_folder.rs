@@ -33,9 +33,7 @@ use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
-use crate::scanner_io::{
-    SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
-};
+use crate::scanner_io::{ScannerIODisk as _, check_local_scanner_handle, is_scanner_source_unavailable, is_xl_meta_path};
 use crate::sleeper::{DynamicSleeper, PacingDebt};
 use crate::storage_api::owner::{
     EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
@@ -1806,25 +1804,33 @@ impl FolderScanner {
     }
 
     pub async fn should_heal(&self) -> bool {
+        self.try_should_heal().await.unwrap_or(false)
+    }
+
+    async fn try_should_heal(&self) -> Result<bool, ScannerError> {
         if self.skip_heal.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
+            return Ok(false);
         }
         if self.heal_object_select == 0 {
-            return false;
+            return Ok(false);
         }
 
-        if self
-            .local_disk
-            .disk_info(&DiskInfoOptions::default())
-            .await
-            .unwrap_or_default()
-            .healing
-        {
+        let healing = match self.local_disk.disk_info(&DiskInfoOptions::default()).await {
+            Ok(info) => info.healing,
+            Err(error) => {
+                let error = StorageError::from(error);
+                if is_scanner_source_unavailable(&error) {
+                    return Err(ScannerError::source_unavailable(error));
+                }
+                false
+            }
+        };
+        if healing {
             self.skip_heal.store(true, std::sync::atomic::Ordering::Relaxed);
-            return false;
+            return Ok(false);
         }
 
-        true
+        Ok(true)
     }
 
     async fn send_required_scanner_heal_request(
@@ -2079,6 +2085,8 @@ impl FolderScanner {
         let done_folder = Metrics::time(Metric::ScanFolder);
         let trace_started_at = trace_start_instant();
 
+        check_local_scanner_handle(&self.local_disk).map_err(ScannerError::source_unavailable)?;
+
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
         }
@@ -2280,6 +2288,9 @@ impl FolderScanner {
                 // Hold at most one metadata entry until a candidate reaches
                 // EOF: a later part must not leave object accounting or ILM work.
                 let (entry, replayed_metadata) = if let Some(reader) = dir_reader.as_mut().filter(|_| !raw_enumeration_complete) {
+                    if reader.batch_entries == SCANNER_DIRECTORY_BATCH_ENTRIES {
+                        check_local_scanner_handle(&self.local_disk).map_err(ScannerError::source_unavailable)?;
+                    }
                     let entry = match next_scanner_dir_entry(&ctx, &self.sleeper, reader, self.node_admission.as_ref()).await {
                         Ok(Some(entry)) => entry,
                         Ok(None) => {
@@ -2614,7 +2625,7 @@ impl FolderScanner {
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
                     self.heal_object_select / folder.object_heal_prob_div,
-                ) && self.should_heal().await;
+                ) && self.try_should_heal().await?;
 
                 let mut item = ScannerItem {
                     path: file_path,
@@ -2694,13 +2705,19 @@ impl FolderScanner {
                 })
                 .await?;
                 let work_started = tokio::time::Instant::now();
-                if self.node_admission.is_some() && ctx.is_cancelled() {
+                if self.node_admission.is_some()
+                    && ctx.is_cancelled()
+                    && !matches!(&size_result, Err(error) if is_scanner_source_unavailable(error))
+                {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
                 }
                 let sz = match size_result {
                     Ok(sz) => sz,
                     Err(e) => {
                         let failure_action = classify_get_size_failure(&item, &e);
+                        if failure_action == GetSizeFailureAction::AbandonSource {
+                            return Err(ScannerError::source_unavailable(e));
+                        }
                         let retry_suppressed = self.failed_retry_suppressed(&item.path);
 
                         if failure_action != GetSizeFailureAction::Skip {
@@ -2708,17 +2725,6 @@ impl FolderScanner {
                             into.failed_objects = into.failed_objects.saturating_add(1);
                             if !retry_suppressed {
                                 self.record_failed(&item.path);
-                            }
-
-                            if self.local_disk.is_local() && matches!(e, StorageError::FaultyDisk | StorageError::DiskNotFound) {
-                                if let Some(stop) = &self.local_stop {
-                                    stop.stop(crate::scanner_io::ScannerLocalStopReason::Unavailable, &ctx);
-                                } else {
-                                    ctx.cancel();
-                                }
-                                // Cancellation preserves this unresolved object and
-                                // completed siblings through every recursive path.
-                                return Err(ScannerError::Other("Local scanner drive unavailable".to_string()));
                             }
 
                             if !retry_suppressed && should_log_failed_object(into.failed_objects) {
@@ -3190,6 +3196,9 @@ impl FolderScanner {
                             outcome
                         }
                         Err(e) => {
+                            if matches!(&e, ScannerError::SourceUnavailable(_)) {
+                                return Err(e);
+                            }
                             if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
                                 if child_summary {
                                     // Cancellation and resource deferral keep completed
@@ -3285,7 +3294,7 @@ impl FolderScanner {
             }
 
             // Scan for healing
-            if abandoned_children.is_empty() || !self.should_heal().await {
+            if abandoned_children.is_empty() || !self.try_should_heal().await? {
                 debug!(
                     target: "rustfs::scanner::folder",
                     event = EVENT_SCANNER_FOLDER_STATE,
@@ -3316,7 +3325,7 @@ impl FolderScanner {
 
             let mut previous_bucket = String::new();
             for name in abandoned_children {
-                if !self.should_heal().await {
+                if !self.try_should_heal().await? {
                     break;
                 }
 
@@ -3335,6 +3344,7 @@ impl FolderScanner {
                 }
 
                 let child_ctx = ctx.child_token();
+                let _cancel_child_on_exit = child_ctx.clone().drop_guard();
 
                 let (agreed_tx, mut agreed_rx) = mpsc::channel::<String>(1);
                 let (partial_tx, mut partial_rx) = mpsc::channel::<MetaCacheEntries>(1);
@@ -3481,7 +3491,7 @@ impl FolderScanner {
                                 partial_closed = true;
                                 continue;
                             };
-                            if !self.should_heal().await {
+                            if !self.try_should_heal().await? {
                                 child_ctx.cancel();
                                 break;
                             }
@@ -3620,6 +3630,16 @@ impl FolderScanner {
                                 continue;
                             };
                             finished_closed = true;
+                            // The callback preserves the input disk order. A failing sibling does
+                            // not invalidate this walk, but the selected source's rejection does.
+                            if let Some(error) = self.disks.iter().position(|disk| Arc::ptr_eq(disk, &self.local_disk))
+                                .and_then(|idx| errs.get(idx)).and_then(Option::as_ref)
+                            {
+                                let error = StorageError::from(error.clone());
+                                if is_scanner_source_unavailable(&error) {
+                                    return Err(ScannerError::source_unavailable(error));
+                                }
+                            }
                             if disk_errors_are_only_missing_paths(&errs) {
                                 debug!(
                                     target: "rustfs::scanner::folder",
@@ -3661,10 +3681,7 @@ impl FolderScanner {
                     if into.compacted {
                         // In compacted mode child totals are accumulated directly into the parent entry.
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
-                        fut.await.map_err(|error| match error {
-                            ScannerError::ResourceDeferred => ScannerError::ResourceDeferred,
-                            other => ScannerError::Other(other.to_string()),
-                        })?;
+                        fut.await?;
                         self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                         tokio::task::yield_now().await;
                     } else {
@@ -3683,6 +3700,9 @@ impl FolderScanner {
                             )
                             .await
                         {
+                            if matches!(e, ScannerError::SourceUnavailable(_)) {
+                                return Err(e);
+                            }
                             if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
                                 self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
                                     .await;
@@ -3832,6 +3852,11 @@ pub(crate) async fn scan_data_folder_scoped(
         let source = match wait_for_scanner_io(&ctx, directory_cursor::physical_source(&local_disk)).await {
             Ok(Ok(source)) => source,
             Err(error) | Ok(Err(error)) => {
+                if matches!(&error, ScannerError::SourceUnavailable(_))
+                    && let Some(stop) = &local_stop
+                {
+                    stop.stop(crate::scanner_io::ScannerLocalStopReason::Unavailable, &ctx);
+                }
                 // A retired handle cannot bind a source. Preserve the input for the coordinator's
                 // fenced local-drive retry. Ordinary cancellation keeps its original error.
                 if local_stop.as_ref().is_some_and(|stop| stop.reason().is_some())
@@ -3981,10 +4006,6 @@ pub(crate) async fn scan_data_folder_scoped(
         return Err(ScannerError::Other("Operation cancelled".to_string()));
     }
 
-    if !ctx.is_cancelled() {
-        scanner.retry_pending_scanner_heals().await?;
-    }
-
     // Read top level in bucket
     let mut root = DataUsageEntry::default();
     let folder = CachedFolder {
@@ -3995,9 +4016,21 @@ pub(crate) async fn scan_data_folder_scoped(
 
     // Scan the folder
     let physical = scanner.local_disk.physical_admission();
-    match crate::workload_admission::with_scanner_physical_disk(physical, scanner.scan_folder(ctx.clone(), folder, &mut root))
-        .await
+    let outcome = async {
+        if !ctx.is_cancelled() {
+            scanner.retry_pending_scanner_heals().await?;
+        }
+        crate::workload_admission::with_scanner_physical_disk(physical, scanner.scan_folder(ctx.clone(), folder, &mut root)).await
+    }
+    .await;
+    // A source failure is a retry of the physical walk, never a failed object.
+    // Reuse the interrupted-drive checkpoint path, including its EOF and identity fences.
+    if matches!(&outcome, Err(ScannerError::SourceUnavailable(_)))
+        && let Some(stop) = &scanner.local_stop
     {
+        stop.stop(crate::scanner_io::ScannerLocalStopReason::Unavailable, &ctx);
+    }
+    match outcome {
         Ok(()) => {
             directory_cursor::forget_bucket(&scanner.local_disk, &scanner.old_cache.info);
             // Get the new cache and finalize it

@@ -471,7 +471,6 @@ pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
 /// How long the scanner caches the runtime tier-name list before re-reading
 /// the tier configuration manager.
 const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
-const MAX_TIER_REGISTRY_NAME_BYTES: usize = 256;
 
 /// Process-wide TTL cache of runtime tier names.
 ///
@@ -560,16 +559,10 @@ fn next_tier_registry_generation() -> u64 {
 }
 
 fn validate_tier_registry_names(mut names: Vec<String>) -> Result<Arc<[String]>, ()> {
-    if names.iter().any(|name| {
-        name.is_empty()
-            || name.len() > MAX_TIER_REGISTRY_NAME_BYTES
-            || name.bytes().any(|byte| byte.is_ascii_control())
-            || name == UNKNOWN_TIER
-            || name == storageclass::STANDARD
-            || name == storageclass::RRS
-    }) {
-        return Err(());
-    }
+    // Quarantine individual invalid names from older persisted configurations.
+    names.retain(|name| {
+        rustfs_data_usage::is_scannable_tier_name(name) && name != storageclass::STANDARD && name != storageclass::RRS
+    });
     names.sort_unstable();
     if names.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(());
@@ -1240,9 +1233,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tier_registry_names_fail_closed_for_refresh() {
-        assert!(validate_tier_registry_names(vec!["COLD\n".to_string()]).is_err());
-        assert!(validate_tier_registry_names(vec![UNKNOWN_TIER.to_string()]).is_err());
+    fn tier_registry_keeps_usable_names_on_refresh() {
+        assert_eq!(
+            validate_tier_registry_names(vec!["COLD\n".into(), UNKNOWN_TIER.into(), "WARM".into()])
+                .expect("valid subset")
+                .as_ref(),
+            &["WARM"]
+        );
         assert!(validate_tier_registry_names(vec!["COLD".to_string(), "COLD".to_string()]).is_err());
         assert_eq!(
             validate_tier_registry_names(vec!["WARM".to_string(), "COLD".to_string()])
