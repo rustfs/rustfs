@@ -16,7 +16,6 @@
 
 use super::common::*;
 use super::*;
-use crate::app::storage_api::s3::S3 as _;
 
 fn expiration_lifecycle_configuration(prefix: &str) -> BucketLifecycleConfiguration {
     BucketLifecycleConfiguration {
@@ -162,8 +161,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
             .unwrap(),
         Method::PUT,
     );
-    FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    put_lifecycle(req)
         .await
         .expect("Failed to update lifecycle configuration for delete marker cleanup");
 
@@ -199,10 +197,7 @@ async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
         Method::PUT,
     );
 
-    FS::new()
-        .put_bucket_lifecycle_configuration(req)
-        .await
-        .expect("Failed to update lifecycle configuration");
+    put_lifecycle(req).await.expect("Failed to update lifecycle configuration");
 
     assert!(
         wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
@@ -231,8 +226,7 @@ async fn put_bucket_lifecycle_configuration_allows_expired_delete_marker_on_obje
         Method::PUT,
     );
 
-    FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    put_lifecycle(req)
         .await
         .expect("ExpiredObjectDeleteMarker should be accepted on object-lock bucket");
 }
@@ -258,11 +252,9 @@ async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_obj
         Method::PUT,
     );
 
-    let err: rustfs_s3_types::S3Error = FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    let err = put_lifecycle(req)
         .await
-        .expect_err("DelMarkerExpiration must be rejected on object-lock bucket")
-        .into();
+        .expect_err("DelMarkerExpiration must be rejected on object-lock bucket");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
@@ -294,11 +286,9 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
         Method::PUT,
     );
 
-    let err: rustfs_s3_types::S3Error = FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    let err = put_lifecycle(req)
         .await
-        .expect_err("DelMarkerExpiration with zero days must be rejected on object-lock bucket")
-        .into();
+        .expect_err("DelMarkerExpiration with zero days must be rejected on object-lock bucket");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
@@ -351,11 +341,9 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
         Method::PUT,
     );
 
-    let err: rustfs_s3_types::S3Error = FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    let err = put_lifecycle(req)
         .await
-        .expect_err("zero-day expiration must be rejected with InvalidArgument")
-        .into();
+        .expect_err("zero-day expiration must be rejected with InvalidArgument");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
@@ -471,7 +459,6 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
         ),
     ];
 
-    let fs = FS::new();
     let handled_count = || {
         rustfs_io_metrics::s3_op_metrics_snapshot()
             .into_iter()
@@ -511,8 +498,8 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
                 .extensions
                 .insert(parity_test_support::bucket_config_mutation(&readable));
         }
-        let error = fs.put_bucket_lifecycle_configuration(request).await.unwrap_err();
-        assert_eq!(error.code(), &code, "{name}: {error}");
+        let error = put_lifecycle(request).await.unwrap_err();
+        assert_eq!(error.code().as_str(), code.as_str(), "{name}: {error}");
         if let Some(message) = message {
             assert_eq!(error.message(), Some(message), "{name}");
         }
@@ -533,9 +520,7 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
 
     let before = handled_count();
     let probe = MutationCompletionProbe::install(&readable);
-    fs.put_bucket_lifecycle_configuration(request(&readable, Some(("Disabled", false))))
-        .await
-        .unwrap();
+    put_lifecycle(request(&readable, Some(("Disabled", false)))).await.unwrap();
     assert_audit(&probe);
     assert_eq!(handled_count() - before, 1, "success counts once");
 
@@ -546,4 +531,27 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
     assert_eq!((rules[1].id.as_deref(), rules[1].status.as_str()), (Some("rule-0"), "Disabled"));
     assert_eq!(rules[0].expiration.as_ref().unwrap().date.as_deref(), Some("2099-01-01T00:00:00.000Z"));
     assert_eq!(rules[1].expiration.as_ref().unwrap().days, Some(30));
+}
+
+async fn put_lifecycle(req: S3Request<PutBucketLifecycleConfigurationInput>) -> rustfs_s3_types::S3Result<()> {
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutBucketLifecycleConfiguration);
+    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    let prepared = match req.input.lifecycle_configuration {
+        None => crate::app::bucket_usecase::PreparedLifecycleConfiguration::Missing,
+        Some(cfg) => {
+            if crate::app::bucket_usecase::validate_lifecycle_rule_status(cfg.rules.iter().map(|rule| rule.status.as_str()))
+                .is_err()
+            {
+                crate::app::bucket_usecase::PreparedLifecycleConfiguration::InvalidStatus
+            } else {
+                crate::app::bucket_usecase::PreparedLifecycleConfiguration::Prepared(
+                    crate::storage::persisted_from_s3s(&cfg).map_err(|e| std::io::Error::other(e.to_string())),
+                )
+            }
+        }
+    };
+    crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
+        .execute_put_bucket_lifecycle_configuration(envelope, &req.input.bucket, prepared)
+        .await
+        .map(|_| ())
 }

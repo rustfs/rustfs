@@ -23,10 +23,19 @@ pub(crate) async fn list_objects_v2(
     usecase: &DefaultBucketUsecase,
     req: S3Request<ListObjectsV2Input>,
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
-    crate::storage::ecfs::list_objects_v2_through_legacy_edge(req, |envelope, input| {
-        list_objects_v2_owned(usecase, envelope, input)
-    })
-    .await
+    use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2 as ops;
+    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    let input = ops::input_from_s3s(req.input).map_err(crate::app::dto_values::seam_error)?;
+    let mut output = list_objects_v2_owned(usecase, envelope, input).await?;
+    let source_left_out = output.rustfs_on_demand_migration_list.take().is_some();
+    let s3s_output = ops::output_to_s3s(output).map_err(crate::app::dto_values::seam_error)?;
+    let mut response = S3Response::new(s3s_output);
+    if source_left_out {
+        response
+            .headers
+            .insert("x-rustfs-on-demand-migration-list", http::HeaderValue::from_static("local-only"));
+    }
+    Ok(response)
 }
 
 /// Calls `DefaultBucketUsecase::execute_list_objects_v2` with owned inputs.

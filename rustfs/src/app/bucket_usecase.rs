@@ -1000,7 +1000,8 @@ mod tests {
             },
         );
 
-        assert!(req_info_ref(&req).expect("req info should be present").is_owner);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 
     #[tokio::test]

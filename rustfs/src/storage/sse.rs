@@ -4707,7 +4707,8 @@ pub(crate) mod tests {
         };
         request.extensions.insert(crate::storage::req_info::ReqInfo::default());
 
-        let principal = SseKmsPrincipal::from_request(&request).expect("S3-boundary request should build a principal");
+        let envelope = crate::app::RequestEnvelope::from_s3s(&request);
+        let principal = SseKmsPrincipal::from_request(&envelope).expect("S3-boundary request should build a principal");
 
         assert!(principal.account.is_empty());
         assert!(principal.groups.is_none());

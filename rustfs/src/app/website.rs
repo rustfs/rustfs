@@ -31,7 +31,7 @@ use crate::app::storage_api::s3::dto::{
     ETagCondition, GetObjectInput, Range, Timestamp as WireTimestamp, TimestampFormat as WireFormat,
 };
 use crate::app::{Answered, RequestEnvelope, RequestHead};
-use crate::storage::access::access_owned::object_read::{authorize_get_object, authorize_head_object};
+use crate::storage::access_owned::object_read::{authorize_get_object, authorize_head_object};
 use crate::storage::req_info::ReqInfo;
 use crate::storage::request_markers::WebsiteRead;
 use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};

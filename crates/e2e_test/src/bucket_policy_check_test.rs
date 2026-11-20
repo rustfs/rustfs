@@ -137,6 +137,40 @@ async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::erro
         .await
         .map_err(|e| format!("DeleteObject failed: {}", e))?;
 
+    for (allowed, may_read) in [("s3:GetBucketPolicy", true), ("s3:PutBucketPolicy", false)] {
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "AWS": [user_access] },
+                "Action": allowed,
+                "Resource": format!("arn:aws:s3:::{bucket_name}")
+            }]
+        })
+        .to_string();
+        admin_client
+            .put_bucket_policy()
+            .bucket(bucket_name)
+            .policy(&policy)
+            .send()
+            .await?;
+        let read = user_client.get_bucket_policy().bucket(bucket_name).send().await;
+        let write = user_client
+            .put_bucket_policy()
+            .bucket(bucket_name)
+            .policy(&policy)
+            .send()
+            .await;
+        if may_read {
+            read?;
+            let denied = write.expect_err("GetBucketPolicy must not grant PutBucketPolicy");
+            assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+        } else {
+            let denied = read.expect_err("PutBucketPolicy must not grant GetBucketPolicy");
+            assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+            write?;
+        }
+    }
     info!("Test Passed!");
     Ok(())
 }

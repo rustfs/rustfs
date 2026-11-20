@@ -26,8 +26,6 @@ use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
 use crate::shared_types::RemoteAddr;
-#[cfg(test)]
-use crate::storage_api::protocols::client::FS;
 #[cfg(feature = "webdav")]
 use crate::storage_api::protocols::client::capacity;
 use crate::storage_api::protocols::client::{MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
@@ -46,8 +44,6 @@ use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
 use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
-#[cfg(test)]
-use s3s::S3;
 #[cfg(test)]
 use s3s::S3Request;
 #[cfg(test)]
@@ -384,12 +380,6 @@ impl ProtocolStorageClient {
         rustfs_io_metrics::init_s3_metrics();
         rustfs_io_metrics::init_list_objects_metrics();
         Self { server_ctx }
-    }
-
-    /// The legacy storage service over the same context slot, the oracle of differential tests.
-    #[cfg(test)]
-    fn legacy_fs(&self) -> FS {
-        FS::with_server_ctx(self.server_ctx.clone())
     }
 
     async fn authorize_protocol_request(
@@ -1539,8 +1529,7 @@ mod tests {
             let store = context.object_store();
             let slot = ServerContextSlot::new();
             assert!(slot.install(context));
-            let fs = FS::with_server_ctx(slot);
-            let backend = ProtocolStorageClient::new(fs.server_ctx().clone());
+            let backend = ProtocolStorageClient::new(slot);
             for (bucket, key, data, versioned) in [
                 ("protocol-version-oracle", "versioned-key", b"versioned data".as_slice(), true),
                 ("protocol-marker-oracle", "folder/", b"".as_slice(), false),
@@ -1574,103 +1563,40 @@ mod tests {
                     )
                     .await
                     .expect("seed object");
-                let params = || RequestParams {
-                    bucket: Some(bucket.to_owned()),
-                    object: Some(key.to_owned()),
-                    credentials: &root,
-                };
-                let uri = build_object_uri(bucket, key, &[]).expect("object URI");
-                let old = fs
-                    .get_object(
-                        ProtocolStorageClient::create_request(
-                            GetObjectInput::builder()
-                                .bucket(bucket.to_owned())
-                                .key(key.to_owned())
-                                .build()
-                                .expect("old GET input"),
-                            Method::GET,
-                            uri.clone(),
-                            params(),
-                        )
-                        .expect("old GET request"),
-                    )
-                    .await
-                    .expect("old GET");
-                let old = gateway_s3s_compat::generated::ops::get_object::output_from_s3s(old.output).expect("old GET output");
-                if versioned {
-                    assert_eq!(old.last_modified.expect("old LastModified").subsec_nanos(), 123_000_000);
-                }
                 let current = backend.get_object(bucket, key, &root, None).await.expect("protocol GET");
-                assert_eq!(current.last_modified, old.last_modified);
-                assert_eq!(current.version_id, old.version_id);
-                assert_eq!(current.version_id.is_some(), versioned);
-                assert_eq!(current.e_tag, old.e_tag);
-                assert_eq!(current.content_length, old.content_length);
-                let collect = |output: gateway_dto::GetObjectOutput| async move {
-                    output
-                        .body
-                        .expect("GET body")
-                        .into_body()
-                        .collect()
-                        .await
-                        .expect("read body")
-                        .to_bytes()
-                };
-                assert_eq!(collect(current).await, collect(old).await);
-                let old = fs
-                    .head_object(
-                        ProtocolStorageClient::create_request(
-                            HeadObjectInput::builder()
-                                .bucket(bucket.to_owned())
-                                .key(key.to_owned())
-                                .build()
-                                .expect("old HEAD input"),
-                            Method::HEAD,
-                            uri,
-                            params(),
-                        )
-                        .expect("old HEAD request"),
-                    )
-                    .await
-                    .expect("old HEAD");
-                let old = gateway_s3s_compat::generated::ops::head_object::output_from_s3s(old.output).expect("old HEAD output");
                 if versioned {
-                    assert_eq!(old.last_modified.expect("old LastModified").subsec_nanos(), 123_000_000);
+                    assert_eq!(current.last_modified.expect("LastModified").subsec_nanos(), 123_000_000);
                 }
+                assert_eq!(current.version_id.is_some(), versioned);
+                assert_eq!(current.content_length, Some(data.len() as i64));
+                let expected_version = current.version_id.clone();
+                let expected_etag = current.e_tag.clone();
+                let expected_last_modified = current.last_modified;
+                let body = current
+                    .body
+                    .expect("GET body")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("read body")
+                    .to_bytes();
+                assert_eq!(body.as_ref(), data);
                 let current = backend.head_object(bucket, key, &root).await.expect("protocol HEAD");
-                assert_eq!(current.last_modified, old.last_modified);
-                assert_eq!(current.version_id, old.version_id);
-                assert_eq!(current.e_tag, old.e_tag);
-                assert_eq!(current.content_length, old.content_length);
+                assert_eq!(current.last_modified, expected_last_modified);
+                assert_eq!(current.version_id, expected_version);
+                assert_eq!(current.e_tag, expected_etag);
+                assert_eq!(current.content_length, Some(data.len() as i64));
                 let deleted = backend.delete_object(bucket, key, &root).await.expect("protocol DELETE");
                 if versioned {
                     assert_eq!(deleted.delete_marker, Some(true));
                 }
                 assert_eq!(deleted.version_id.is_some(), versioned);
-                let old_error: rustfs_s3_types::S3Error = fs
-                    .get_object(
-                        ProtocolStorageClient::create_request(
-                            GetObjectInput::builder()
-                                .bucket(bucket.to_owned())
-                                .key(key.to_owned())
-                                .build()
-                                .expect("old GET input"),
-                            Method::GET,
-                            build_object_uri(bucket, key, &[]).expect("object URI"),
-                            params(),
-                        )
-                        .expect("old GET request"),
-                    )
-                    .await
-                    .expect_err("old GET deleted object")
-                    .into();
                 let current = backend
                     .get_object(bucket, key, &root, None)
                     .await
                     .expect_err("protocol GET deleted object");
-                assert_eq!(current.code(), old_error.code());
-                assert_eq!(current.status_code(), old_error.status_code());
-                assert_eq!(current.headers(), old_error.headers());
+                assert_eq!(current.code(), &rustfs_s3_types::S3ErrorCode::NoSuchKey);
+                assert_eq!(current.status_code(), Some(http::StatusCode::NOT_FOUND));
                 if versioned {
                     let headers = current.headers().expect("delete marker error headers");
                     assert_eq!(
@@ -2020,39 +1946,6 @@ mod put_tests {
         assert!(mismatches.is_empty(), "PutObject output mismatches: {mismatches:#?}");
     }
 
-    async fn legacy_put(
-        fs: &FS,
-        input: gateway_dto::PutObjectInput,
-        credentials: &rustfs_credentials::Credentials,
-    ) -> rustfs_s3_types::S3Result<gateway_dto::PutObjectOutput> {
-        let bucket = input.bucket.as_str().to_owned();
-        let key = input.key.as_str().to_owned();
-        let uri = build_object_uri(&bucket, &key, &[])?;
-        let length = input.content_length;
-        let mut headers = HeaderMap::new();
-        if length >= 0 {
-            headers.insert("content-length", length.to_string().parse().expect("length header"));
-        }
-        let mut input =
-            gateway_s3s_compat::put_object::input_to_s3s(input).map_err(|error| conversion_error("PutObject input", error))?;
-        if length < 0 {
-            input.content_length = None;
-        }
-        let request = ProtocolStorageClient::create_request(
-            input,
-            Method::PUT,
-            uri,
-            RequestParams {
-                bucket: Some(bucket),
-                object: Some(key),
-                credentials,
-            },
-        )?;
-        let response = fs.put_object(S3Request { headers, ..request }).await?;
-        gateway_s3s_compat::put_object::output_from_s3s(response.output)
-            .map_err(|error| conversion_error("PutObject output", error))
-    }
-
     fn case_input(case: &str, key: &str) -> gateway_dto::PutObjectInput {
         let mut request = input();
         request.key = rustfs_gateway_types::ObjectKey::new(key.to_owned()).expect("case key");
@@ -2237,12 +2130,7 @@ mod put_tests {
         let backend = ProtocolStorageClient::new(slot);
         let mut observations = Vec::new();
         for (case, expected) in cases.iter().cloned() {
-            let old_key = format!("old/{case}");
             let current_key = format!("current/{case}");
-            let before = put_count();
-            let old = legacy_put(&backend.legacy_fs(), case_input(case, &old_key), &root).await;
-            let old_count = put_count() - before;
-            let old_state = object_state(&backend, &old_key, &root).await;
             let before = put_count();
             let current = backend.put_object(case_input(case, &current_key), &root).await;
             let current_count = put_count() - before;
@@ -2250,14 +2138,11 @@ mod put_tests {
             let expected_count = u64::from(expected != Some(S3ErrorCode::InternalError));
             observations.push((
                 case,
-                outcome(&old),
                 outcome(&current),
-                old.as_ref().err().map(|error| error.code().clone()),
+                current.as_ref().err().map(|error| error.code().clone()),
                 expected.clone(),
                 state,
                 expected.is_none().then(|| b"data".to_vec()),
-                old_state,
-                old_count,
                 current_count,
                 expected_count,
             ));
@@ -2265,25 +2150,8 @@ mod put_tests {
         let mismatches: Vec<_> = observations
             .into_iter()
             .filter(
-                |(
-                    _,
-                    old,
-                    current,
-                    old_code,
-                    expected,
-                    state,
-                    expected_state,
-                    old_state,
-                    old_count,
-                    current_count,
-                    expected_count,
-                )| {
-                    old != current
-                        || old_code != expected
-                        || state != expected_state
-                        || old_state != expected_state
-                        || old_count != expected_count
-                        || current_count != expected_count
+                |(_, _current, current_code, expected, state, expected_state, current_count, expected_count)| {
+                    current_code != expected || state != expected_state || current_count != expected_count
                 },
             )
             .collect();
