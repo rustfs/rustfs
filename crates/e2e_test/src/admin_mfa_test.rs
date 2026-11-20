@@ -34,7 +34,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+    use crate::common::{
+        AdminTransport, RustFSTestEnvironment, admin_attach_user_policy_via, admin_create_user, admin_request_with_session_token,
+        init_logging, local_http_client, parse_assume_role_credentials,
+    };
     use hmac::{Hmac, KeyInit as _, Mac};
     use http::header::HOST;
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -395,6 +398,54 @@ mod tests {
 
         let (status, _) = signed_request(&env.url, http::Method::GET, ACCOUNT_INFO_PATH, None, user_ak, old_sk).await?;
         assert!(status.is_client_error(), "the old secret must stop working, status: {status}");
+
+        env.stop_server();
+        drop(env);
+        console_session_rotates_the_iam_password_and_revokes_the_old_session().await
+    }
+
+    async fn console_session_rotates_the_iam_password_and_revokes_the_old_session() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let user = "console-password-user";
+        let old_password = uuid::Uuid::new_v4().to_string();
+        let new_password = uuid::Uuid::new_v4().to_string();
+        admin_create_user(&env, user, &old_password).await?;
+        admin_attach_user_policy_via(AdminTransport::Signed, &env.url, &env.access_key, &env.secret_key, "readonly", user)
+            .await?;
+
+        let (status, response) = assume_role(&env.url, user, &old_password, None).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "the current password must sign in");
+        let (session_key, session_secret, token) = parse_assume_role_credentials(&response)?;
+        let session_request = |method, path, body| {
+            admin_request_with_session_token(&env.url, method, path, body, &session_key, &session_secret, Some(&token))
+        };
+        let password_request = |current: &str| {
+            Some(serde_json::json!({ "current_secret_key": current, "new_secret_key": new_password }).to_string())
+        };
+
+        let (status, body) =
+            session_request(http::Method::POST, ACCOUNT_PASSWORD_PATH, password_request(&session_secret)).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "the session secret must not be accepted as the IAM password"
+        );
+        assert!(body.contains("InvalidRequest") && body.contains("the current secret key is incorrect"));
+
+        let (status, body) = session_request(http::Method::POST, ACCOUNT_PASSWORD_PATH, password_request(&old_password)).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "the same session must accept the current IAM password");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["sessions_revoked"], 1);
+
+        let (status, _) = session_request(http::Method::GET, ACCOUNT_INFO_PATH, None).await?;
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "the pre-rotation session must be revoked");
+        let (status, _) = assume_role(&env.url, user, &old_password, None).await?;
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "the old password must no longer sign in");
+        let (status, response) = assume_role(&env.url, user, &new_password, None).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "the new password must sign in");
+        parse_assume_role_credentials(&response)?;
 
         env.stop_server();
         Ok(())
