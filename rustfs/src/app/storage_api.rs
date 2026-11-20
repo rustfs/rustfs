@@ -1568,9 +1568,7 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod tagging {
-        pub(crate) fn decode_tags(tags: &str) -> Vec<s3s::dto::Tag> {
-            crate::storage::storage_api::decode_tags(tags)
-        }
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::decode_tags;
     }
 
     pub(crate) mod target {

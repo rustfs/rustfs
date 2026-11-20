@@ -1779,7 +1779,13 @@ mod tests {
             PersistedIndexDocument as IndexDocument, PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule,
             PersistedRoutingRuleCondition as Condition, PersistedWebsiteConfiguration as WebsiteConfiguration,
         };
-        assert!(validate_website_configuration(&WebsiteConfiguration::default()).is_err());
+        let missing_index = validate_website_configuration(&WebsiteConfiguration::default()).expect_err("index is required");
+        assert_eq!(missing_index.code(), &rustfs_s3_types::S3ErrorCode::MalformedXML);
+        assert_eq!(missing_index.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            missing_index.message(),
+            Some("IndexDocument is required unless RedirectAllRequestsTo is configured")
+        );
         let config = WebsiteConfiguration {
             index_document: Some(IndexDocument {
                 suffix: "index.html".to_owned(),
