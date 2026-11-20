@@ -983,6 +983,7 @@ pub struct Metrics {
     actions_latency: Vec<LockedLastMinuteLatency>,
     current_paths: Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
+    cluster_history: Mutex<ScannerAttemptHistory>,
     // Lock order: cycle_info, usage_publication, then the observation's status. No awaits under either mutex.
     usage_publication: Mutex<Arc<ScannerUsagePublicationObservation>>,
     current_scan_mode: AtomicU8,
@@ -1212,6 +1213,34 @@ impl ScannerUsageSaveResult {
             _ => Self::Unknown,
         }
     }
+}
+
+/// Completed coordinator attempt, retained with the generation of its originating worker.
+#[derive(Clone, Copy, Debug)]
+pub struct ScannerAttemptRecord {
+    pub epoch: u64,
+    pub cycle: u64,
+    pub result: &'static str,
+    pub partial_reason: Option<&'static str>,
+    pub duration: Duration,
+}
+
+#[derive(Default)]
+struct ScannerAttemptHistory {
+    latest: Option<ScannerAttemptRecord>,
+    last_success_at: Option<Timestamp>,
+}
+
+/// Compact process-local state for a cluster status probe.
+pub struct ScannerNodeObservation {
+    pub active: bool,
+    pub leader: bool,
+    pub epoch: Option<u64>,
+    pub cycle: u64,
+    pub started_at: Option<Timestamp>,
+    pub objects_scanned: u64,
+    pub last_attempt: Option<ScannerAttemptRecord>,
+    pub last_success_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1713,6 +1742,11 @@ pub struct ScannerRuntimeDetailsReport {
 }
 
 impl CurrentCycle {
+    /// Last successful completion recorded in the persisted cycle history.
+    pub fn last_success_at(&self) -> Option<Timestamp> {
+        self.cycle_completed.last().copied()
+    }
+
     pub fn unmarshal(&mut self, buf: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         *self = rmp_serde::from_slice(buf)?;
         Ok(())
@@ -2140,6 +2174,7 @@ impl Metrics {
                 .collect(),
             current_paths: Arc::new(RwLock::new(HashMap::new())),
             cycle_info: Arc::new(RwLock::new(None)),
+            cluster_history: Mutex::new(ScannerAttemptHistory::default()),
             usage_publication: Mutex::new(Arc::new(ScannerUsagePublicationObservation::default())),
             current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
             current_scan_cycle_work_active: AtomicBool::new(false),
@@ -3104,6 +3139,51 @@ impl Metrics {
         let mut current_cycle = self.cycle_info.write().await;
         self.finish_scan_cycle_work(start);
         *current_cycle = Some(cycle);
+    }
+
+    /// Keep delayed results from an older coordinator from replacing a newer attempt.
+    pub fn record_cluster_attempt(&self, attempt: ScannerAttemptRecord, last_success_at: Option<Timestamp>) {
+        let mut history = self.cluster_history.lock().unwrap_or_else(|err| err.into_inner());
+        if history
+            .latest
+            .is_none_or(|old| (old.epoch, old.cycle) <= (attempt.epoch, attempt.cycle))
+        {
+            history.latest = Some(attempt);
+            history.last_success_at = history.last_success_at.max(last_success_at);
+        }
+    }
+
+    /// Sample only the fields required by the admin cluster status API. The cycle read
+    /// lock also protects installation of the publication and per-cycle work baseline.
+    pub async fn scanner_node_observation(&self) -> ScannerNodeObservation {
+        let cycle = self.cycle_info.read().await;
+        let active = self.current_scan_cycle_work_active.load(Ordering::Acquire);
+        let generation = self
+            .usage_publication
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .snapshot();
+        let cycle_id = cycle.as_ref().map_or(0, |c| c.current);
+        let epoch = generation
+            .scanner_epoch
+            .filter(|_| !active || generation.cycle == Some(cycle_id));
+        let last_success_at = cycle.as_ref().and_then(CurrentCycle::last_success_at);
+        let history = self.cluster_history.lock().unwrap_or_else(|err| err.into_inner());
+        ScannerNodeObservation {
+            active,
+            leader: self.scanner_leader_lock_held.load(Ordering::Acquire),
+            cycle: cycle_id,
+            epoch,
+            started_at: cycle.as_ref().filter(|_| active).map(|c| c.started),
+            objects_scanned: if active {
+                self.scan_cycle_work_since(self.current_scan_cycle_work_start())
+                    .objects_scanned
+            } else {
+                0
+            },
+            last_attempt: history.latest,
+            last_success_at: last_success_at.max(history.last_success_at),
+        }
     }
 
     /// Read the current cycle record.
@@ -5691,6 +5771,55 @@ mod tests {
         assert_eq!(report.last_cycle_heal_objects, 3);
         assert_eq!(report.last_cycle_replication_checks, 6);
         assert_eq!(report.last_cycle_usage_saves, 2);
+    }
+
+    #[tokio::test]
+    async fn cluster_scanner_keeps_confirmed_history_when_leadership_moves() {
+        let metrics = Metrics::new();
+        let when = Timestamp::constant(1_700_000_000, 1234);
+        let previous = ScannerAttemptRecord {
+            epoch: 7,
+            cycle: 40,
+            result: "partial",
+            partial_reason: Some("runtime"),
+            duration: Duration::from_secs(1801),
+        };
+        metrics.record_cluster_attempt(previous, Some(when));
+        metrics.record_cluster_attempt(
+            ScannerAttemptRecord {
+                epoch: 6,
+                cycle: 100,
+                ..previous
+            },
+            None,
+        );
+        metrics.set_cycle(None).await;
+        let follower = metrics.scanner_node_observation().await;
+        assert!(!follower.active);
+        assert_eq!(follower.last_success_at, Some(when));
+        let history = follower.last_attempt.expect("previous leader's terminal record");
+        assert_eq!(
+            (history.epoch, history.cycle, history.result, history.partial_reason),
+            (7, 40, "partial", Some("runtime"))
+        );
+        let cycle = CurrentCycle {
+            current: 41,
+            ..Default::default()
+        };
+        let remote = Arc::new(RemoteScanProgress::default());
+        metrics
+            .start_scan_cycle_work_with_publication(
+                cycle,
+                remote.clone(),
+                Arc::new(ScannerUsagePublicationObservation::new(8, 41)),
+            )
+            .await;
+        metrics.record_scanner_leader_liveness("acquired", true, "").await;
+        remote.record(814, 1);
+        let active = metrics.scanner_node_observation().await;
+        assert!(active.active && active.leader);
+        assert_eq!((active.epoch, active.cycle, active.objects_scanned), (Some(8), 41, 814));
+        assert_eq!(active.last_attempt.expect("prior cycle").cycle, 40);
     }
 
     #[tokio::test]

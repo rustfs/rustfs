@@ -14,6 +14,9 @@
 
 // #730: scanner/data-usage state is partially migrated and still owns staged cache helpers.
 
+mod admin_bucket_identity;
+pub(crate) use admin_bucket_identity::current_admin_bucket_incarnations;
+pub use admin_bucket_identity::verified_account_bucket_usage;
 pub mod local_snapshot;
 
 use crate::storage_api_contracts::{
@@ -57,7 +60,7 @@ const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 const ADMIN_USAGE_INCARNATION_CONCURRENCY: usize = 4;
-const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
 // A scanner save invalidates only the saving process's snapshot cache; every
 // other node sees it only after reloading. A fail-closed usage lookup for a
 // bucket the cached snapshot does not mention at all may reload a copy this
@@ -1464,42 +1467,9 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
     let (selected, selected_is_current_format) =
         select_admin_data_usage_snapshot(authoritative, source.is_authoritative(), observed);
     let mut response = normalize_loaded_data_usage(selected, selected_is_current_format).await.0;
-    use futures::StreamExt as _;
+    let buckets = response.usage_snapshot_bucket_observations.keys().cloned().collect();
     let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
-    let mut incarnations = HashMap::new();
-    {
-        // Display-only identity reads must not serialize every bucket behind a
-        // slow metadata lock while holding the shared admin refresh permit.
-        // The common deadline bounds their total added latency; dropping this
-        // stream cancels all unfinished reads without spawning detached work.
-        // Own the names and store across awaits so this future remains Send
-        // when composed into spawned metrics collectors.
-        let buckets = response
-            .usage_snapshot_bucket_observations
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut identities = futures::stream::iter(buckets)
-            .map(move |bucket| {
-                let store = store.clone();
-                async move {
-                    let identity = store.bucket_incarnation_id_from_disk(&bucket).await;
-                    (bucket, identity)
-                }
-            })
-            .buffer_unordered(ADMIN_USAGE_INCARNATION_CONCURRENCY);
-        while tokio::time::Instant::now() < deadline {
-            let Ok(Some((bucket, identity))) = tokio::time::timeout_at(deadline, identities.next()).await else {
-                break;
-            };
-            // Unavailable, timed-out or recreated buckets retain canonical values.
-            if let Ok(incarnation) = identity
-                && !incarnation.is_nil()
-            {
-                incarnations.insert(bucket, incarnation.to_string());
-            }
-        }
-    }
+    let incarnations = current_admin_bucket_incarnations(store, buckets, deadline).await;
     response.project_bucket_observations_for_admin(&incarnations);
     Ok(response)
 }

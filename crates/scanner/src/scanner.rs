@@ -1897,6 +1897,48 @@ async fn run_data_scanner_cycle_with_budget<S>(
 where
     S: ScannerStorage,
 {
+    let cycle = cycle_info.next;
+    let started = Instant::now();
+    let outcome =
+        run_data_scanner_cycle_inner(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget.clone(), scheduling)
+            .await;
+    let (result, partial_reason) = match outcome {
+        ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => ("success", None),
+        ScannerCycleOutcome::Partial => (
+            "partial",
+            cycle_budget
+                .reason()
+                .map(|reason| scan_cycle_partial_reason(Some(reason)).as_str()),
+        ),
+        ScannerCycleOutcome::Superseded => ("superseded", None),
+        ScannerCycleOutcome::Deferred(_) => ("deferred", None),
+        ScannerCycleOutcome::Failed | ScannerCycleOutcome::StatePersistenceFailed => ("error", None),
+    };
+    global_metrics().record_cluster_attempt(
+        rustfs_scanner_metrics::metrics::ScannerAttemptRecord {
+            epoch: leader_epoch,
+            cycle,
+            result,
+            partial_reason,
+            duration: started.elapsed(),
+        },
+        cycle_info.last_success_at(),
+    );
+    outcome
+}
+
+async fn run_data_scanner_cycle_inner<S>(
+    ctx: &CancellationToken,
+    storeapi: &Arc<S>,
+    cycle_info: &mut CurrentCycle,
+    cycle_revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+    cycle_budget: Arc<ScannerCycleBudget>,
+    scheduling: ScannerCycleScheduling,
+) -> ScannerCycleOutcome
+where
+    S: ScannerStorage,
+{
     let _activity_guard = ScannerActivityGuard::new();
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
         warn!(
@@ -4462,6 +4504,7 @@ pub use backlog::{
 };
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
+pub use cycle_state::read_scanner_status_fence;
 pub use cycle_state::{
     SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
     ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord, ScannerRecoveryIntentRequest,
