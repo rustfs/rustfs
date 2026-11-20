@@ -58,7 +58,7 @@ impl From<Region> for legacy_s3s::region::Region {
     fn from(region: Region) -> Self {
         match Self::new(region.into_boxed_str()) {
             Ok(region) => region,
-            Err(invalid) => unreachable!("rustfs_s3_types::Region and s3s::region::Region share one grammar: {invalid}"),
+            Err(invalid) => unreachable!("rustfs_s3_types::Region and the legacy region type share one grammar: {invalid}"),
         }
     }
 }
@@ -67,7 +67,7 @@ impl From<legacy_s3s::region::Region> for Region {
     fn from(region: legacy_s3s::region::Region) -> Self {
         match Self::new(region.into_boxed_str()) {
             Ok(region) => region,
-            Err(invalid) => unreachable!("s3s::region::Region and rustfs_s3_types::Region share one grammar: {invalid}"),
+            Err(invalid) => unreachable!("the legacy region type and rustfs_s3_types::Region share one grammar: {invalid}"),
         }
     }
 }
