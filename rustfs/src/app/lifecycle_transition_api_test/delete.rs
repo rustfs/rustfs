@@ -43,7 +43,6 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
 #[ignore = "global-state object-version integration test: runs serialized in the CI ILM Integration (serial) lane"]
 async fn undo_delete_only_removes_the_current_matching_delete_marker() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
     let bucket = format!("test-undo-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let object = "test/object.txt";
@@ -56,7 +55,7 @@ async fn undo_delete_only_removes_the_current_matching_delete_marker() {
         .content_length(Some(13))
         .build()
         .unwrap();
-    Box::pin(test_seams::put_object(&usecase, &fs, build_request(put, Method::PUT)))
+    Box::pin(put_through_seam(&usecase, build_request(put, Method::PUT)))
         .await
         .expect("object version should be written");
     let marker = Box::pin(

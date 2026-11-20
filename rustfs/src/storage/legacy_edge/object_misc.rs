@@ -280,7 +280,7 @@ impl DefaultObjectUsecase {
     }
 }
 
-fn copy_input_from_legacy(input: CopyObjectInput) -> CopyObjectWriteInput {
+pub(crate) fn copy_input_from_legacy(input: CopyObjectInput) -> CopyObjectWriteInput {
     let condition = |value: ETagCondition| match value {
         ETagCondition::Any => CopySourceCondition::Any,
         ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),

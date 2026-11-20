@@ -257,12 +257,6 @@ fn gateway_post_filename_substitution_supports_streamed_uploads() {
 
 #[test]
 #[serial_test::serial]
-fn legacy_post_wire_preserves_success_controls_and_storage() {
-    stack::with_stack(stack::LEGACY, |server| post_wire_observes_success_controls_and_storage(server, false));
-}
-
-#[test]
-#[serial_test::serial]
 fn gateway_post_final_stream_failure_does_not_publish() {
     stack::with_stack(stack::GATEWAY, |server| async move {
         const BUCKET: &str = "browser-post-incomplete";
@@ -581,14 +575,6 @@ async fn post_wire_authorizes_form_values_before_success_status(server: rustfs::
 fn gateway_post_wire_authorizes_form_values_before_success_status() {
     stack::with_stack(stack::GATEWAY, |server| {
         post_wire_authorizes_form_values_before_success_status(server, true)
-    });
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_post_wire_authorizes_form_values_before_success_status() {
-    stack::with_stack(stack::LEGACY, |server| {
-        post_wire_authorizes_form_values_before_success_status(server, false)
     });
 }
 

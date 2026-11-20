@@ -916,14 +916,12 @@ async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, o
     invoke_object_lambda_target(req, bucket, object, get_resp).await
 }
 
-#[cfg(feature = "gateway-stack")]
 /// The bucket and key of an Object Lambda request, which takes precedence over every other route
 /// this router claims; `None` for any other request.
 pub(crate) fn object_lambda_target(method: &Method, uri: &Uri) -> Option<(String, String)> {
     parse_object_lambda_request(method, uri)
 }
 
-#[cfg(feature = "gateway-stack")]
 /// Serves an admitted Object Lambda request that another edge verified, through the same handler
 /// the legacy `call` runs.
 pub(crate) async fn serve_object_lambda(
@@ -973,7 +971,6 @@ pub(crate) fn console_listener_route(method: &Method, uri: &Uri, headers: &Heade
 
 /// Whether this router answers the request itself rather than an S3 operation: the RustFS extension
 /// routes and every control-plane route.
-#[cfg(feature = "gateway-stack")]
 pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
     s3_extension::route_key(method, uri).is_some()
         || parse_object_lambda_request(method, uri).is_some()
@@ -981,7 +978,6 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
 }
 
 /// Signed system-status and catalog-configuration reads, after object-lambda routing.
-#[cfg(feature = "gateway-stack")]
 pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
     method == Method::GET
         && matches!(
@@ -1011,7 +1007,6 @@ pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
 }
 
 /// Console paths whose requests do not belong to an earlier extension route.
-#[cfg(feature = "gateway-stack")]
 pub(crate) fn claims_native_console_route(method: &Method, uri: &Uri) -> bool {
     is_console_path(uri.path())
         && parse_object_lambda_request(method, uri).is_none()

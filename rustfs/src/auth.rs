@@ -162,6 +162,7 @@ impl IAMAuth {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_server_context(
         ak: impl Into<String>,
         sk: impl Into<SecretKey>,
@@ -3052,7 +3053,9 @@ mod tests {
     #[test]
     fn session_token_comparison_uses_constant_time_helper() {
         let source = include_str!("auth.rs");
-        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(source, |(production, _)| production);
         let ordinary_comparison = ["token ", "!=", " cred.session_token"].concat();
         assert!(
             !production.contains(&ordinary_comparison),
