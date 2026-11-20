@@ -2152,7 +2152,10 @@ mod tests {
     #[test]
     fn object_lambda_auth_headers_use_constant_time_helper() {
         let source = include_str!("router.rs");
-        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        let (_, validation) = source
+            .split_once("fn validate_object_lambda_response_auth_headers(")
+            .expect("Object Lambda response validation function");
+        let (production, _) = validation.split_once("\n}").expect("end of validation function");
         assert!(!production.contains("route == Some(output_route)"));
         assert!(!production.contains("token == Some(output_token)"));
         assert!(production.contains("constant_time_eq(route, output_route)"));
