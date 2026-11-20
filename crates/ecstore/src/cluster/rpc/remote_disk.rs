@@ -693,6 +693,7 @@ struct RetryingRemoteReader {
     request: ReadStreamRequest,
     background: bool,
     emitted: usize,
+    minimum_length: usize,
     retried: bool,
     initial_read_timeout: Option<Duration>,
     retry_cutoff: Option<Pin<Box<time::Sleep>>>,
@@ -711,6 +712,7 @@ impl RetryingRemoteReader {
         Self {
             reader: Some(reader),
             transport,
+            minimum_length: request.length,
             request,
             background: current_rpc_background_request(),
             emitted: 0,
@@ -800,7 +802,7 @@ impl AsyncRead for RetryingRemoteReader {
                         None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
                     };
                     if resume_pending {
-                        if produced == 0 && (self.request.length == 0 || self.emitted >= self.request.length) {
+                        if produced == 0 && self.emitted >= self.minimum_length {
                             self.resume = None;
                         } else if produced == 0 {
                             self.reader = None;
@@ -808,7 +810,7 @@ impl AsyncRead for RetryingRemoteReader {
                         } else {
                             self.resume = None;
                         }
-                    } else if produced == 0 && self.request.length != 0 && self.emitted < self.request.length {
+                    } else if produced == 0 && self.emitted < self.minimum_length {
                         self.reader = None;
                         return Poll::Ready(Err(remote_terminal_eof_to_io()));
                     }
@@ -1916,6 +1918,57 @@ impl RemoteDisk {
     /// window can drop the readable-shard count below `data_shards` and surface as a spurious
     /// `InsufficientReadQuorum`. Opening the stream is idempotent, so re-dialing once absorbs the
     /// transient failure instead of eroding quorum. See issue #2761.
+    /// Read the encoded data plus an optional trailing byte used by bitrot_verify.
+    pub(crate) async fn read_file_for_bitrot_verify(
+        &self,
+        volume: &str,
+        path: &str,
+        encoded_length: usize,
+    ) -> Result<FileReader> {
+        let limit = encoded_length
+            .checked_add(1)
+            .ok_or_else(|| DiskError::other("bitrot verification range overflow"))?;
+        self.open_file_range(volume, path, 0, limit, encoded_length).await
+    }
+
+    async fn open_file_range(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        minimum_length: usize,
+    ) -> Result<FileReader> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
+        let request = ReadStreamRequest {
+            endpoint: self.endpoint.grid_host(),
+            disk,
+            volume: volume.to_string(),
+            path: path.to_string(),
+            offset,
+            length,
+            stall_timeout: timeouts.body_stall,
+        };
+        #[cfg(feature = "internode-transport")]
+        if self.external_streams {
+            return self.data_transport.open_read(request).await;
+        }
+        let reader = self.open_read_with_retry(request.clone()).await?;
+        let mut reader = RetryingRemoteReader::new_with_timeouts(
+            reader,
+            Arc::clone(&self.data_transport),
+            request,
+            timeouts.initial_read,
+            timeouts.recovery,
+        );
+        reader.minimum_length = minimum_length;
+        Ok(Box::new(reader))
+    }
+
     async fn open_read_with_retry(&self, request: ReadStreamRequest) -> Result<FileReader> {
         let mut attempt = 1;
         let mut last_retry_classification = None;
@@ -4929,41 +4982,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        // warn!(
-        //     "disk remote read_file_stream {}/{}/{} offset={} length={}",
-        //     self.endpoint.to_string(),
-        //     volume,
-        //     path,
-        //     offset,
-        //     length
-        // );
-
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
-        let disk = self.disk_ref().await;
-        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
-        let request = ReadStreamRequest {
-            endpoint: self.endpoint.grid_host(),
-            disk,
-            volume: volume.to_string(),
-            path: path.to_string(),
-            offset,
-            length,
-            stall_timeout: timeouts.body_stall,
-        };
-        #[cfg(feature = "internode-transport")]
-        if self.external_streams {
-            return self.data_transport.open_read(request).await;
-        }
-        let reader = self.open_read_with_retry(request.clone()).await?;
-        Ok(Box::new(RetryingRemoteReader::new_with_timeouts(
-            reader,
-            Arc::clone(&self.data_transport),
-            request,
-            timeouts.initial_read,
-            timeouts.recovery,
-        )))
+        self.open_file_range(volume, path, offset, length, length).await
     }
 
     async fn read_file_stream_chunks(
@@ -8948,6 +8967,26 @@ mod tests {
         assert_eq!(error.kind(), std_io::ErrorKind::ConnectionReset);
         assert!(crate::disk::error::is_terminal_read_error(&error));
         assert!(matches!(DiskError::from(error), DiskError::Io(inner) if inner.kind() == std_io::ErrorKind::ConnectionReset));
+    }
+
+    #[tokio::test]
+    async fn remote_bitrot_eof_probe_reads_one_optional_byte() {
+        for data in [b"ab".as_slice(), b"abc", b"abcd"] {
+            let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::Data(data.to_vec())]));
+            let disk = new_remote_disk_with_transport(transport.clone()).await;
+            let mut reader = disk.read_file_for_bitrot_verify("volume", "part.1", 3).await.unwrap();
+            let mut received = Vec::new();
+            let result = reader.read_to_end(&mut received).await;
+            assert_eq!(received, data);
+            if data.len() < 3 {
+                assert_eq!(result.unwrap_err().kind(), std_io::ErrorKind::UnexpectedEof);
+            } else {
+                assert_eq!(result.unwrap(), data.len());
+            }
+            let requests = transport.read_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!((requests[0].offset, requests[0].length), (0, 4));
+        }
     }
 
     #[test]

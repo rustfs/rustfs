@@ -24,8 +24,8 @@
 //! run per stream so request latency overlaps the transfers.
 //!
 //! UCX addresses ports by LID or GID, so this works on InfiniBand rails that
-//! have no IP addresses. Writes, walks and any stream whose first chunk cannot
-//! be served this way use the TCP/HTTP transport.
+//! have no IP addresses. Shard reads and writes require NIXL. Directory walks
+//! and scanner requests use the control transport.
 //!
 //! Buffer safety: the serving node may still write into a buffer whose request
 //! was abandoned (a dropped reader, chunks past the end of the file). Such
@@ -83,7 +83,6 @@ pub const NIXL_BYTES_HEADER: &str = "x-rustfs-nixl-bytes";
 pub const ABANDONED_BUFFER_HOLD: Duration = Duration::from_secs(120);
 /// Request timeout when the caller sets no stall timeout.
 const DEFAULT_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
-const EVENT_NIXL_INTERNODE_FALLBACK: &str = "nixl_internode_fallback";
 const LOG_COMPONENT_INTERNODE: &str = "internode";
 const LOG_SUBSYSTEM_NIXL: &str = "nixl";
 
@@ -125,8 +124,7 @@ fn recv_pool() -> Option<Arc<dyn NixlRecvPool>> {
     RECV_POOL.get().cloned()
 }
 
-/// Internode transport that reads shard streams over NIXL and delegates
-/// everything else to TCP/HTTP.
+/// Internode transport for NIXL shard data and TCP/HTTP control requests.
 #[derive(Debug)]
 pub struct NixlInternodeDataTransport {
     tcp: TcpHttpInternodeDataTransport,
@@ -141,72 +139,32 @@ impl NixlInternodeDataTransport {
         }
     }
 
-    /// A NIXL chunk reader for `request` with its first chunk already landed,
-    /// or `None` when this read should use TCP/HTTP.
-    async fn open_nixl(&self, request: &ReadStreamRequest) -> Option<NixlChunkReader> {
-        let pool = recv_pool()?;
+    async fn open_nixl(&self, request: ReadStreamRequest) -> Result<NixlChunkReader> {
         if request.length == 0 {
-            // Unbounded reads need the file size; TCP/HTTP streams them.
-            return None;
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "NIXL shard reads require a bounded range").into());
         }
-        let mut reader = NixlChunkReader::new(pool, request.clone(), self.depth);
-        match futures::future::poll_fn(|cx| reader.state_mut().poll_chunk(cx, usize::MAX)).await {
-            Ok(Some(first)) => {
-                reader.state_mut().current = first;
-                Some(reader)
-            }
-            Ok(None) => Some(reader),
-            Err(error) => {
-                debug!(
-                    event = EVENT_NIXL_INTERNODE_FALLBACK,
-                    component = LOG_COMPONENT_INTERNODE,
-                    subsystem = LOG_SUBSYSTEM_NIXL,
-                    result = "fallback",
-                    endpoint = %request.endpoint,
-                    error = %error,
-                    "nixl internode read fell back to tcp"
-                );
-                None
-            }
+        let pool = recv_pool().ok_or_else(|| io::Error::other("NIXL receive pool unavailable"))?;
+        let mut reader = NixlChunkReader::new(pool, request, self.depth);
+        if let Some(first) = futures::future::poll_fn(|cx| reader.state_mut().poll_chunk(cx, usize::MAX)).await? {
+            reader.state_mut().current = first;
         }
+        Ok(reader)
     }
 }
 
 #[async_trait]
 impl InternodeDataTransport for NixlInternodeDataTransport {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
-        match self.open_nixl(&request).await {
-            Some(reader) => Ok(Box::new(reader)),
-            None => self.tcp.open_read(request).await,
-        }
-    }
-
-    async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
-        match self.open_nixl(&request).await {
-            Some(reader) => Ok(Box::new(reader)),
-            None => self.tcp.open_read_fresh(request).await,
-        }
+        Ok(Box::new(self.open_nixl(request).await?))
     }
 
     async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
-        match self.open_nixl(&request).await {
-            Some(reader) => Ok(Some(Box::new(reader))),
-            None => self.tcp.open_read_chunks(request).await,
-        }
-    }
-
-    async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
-        match self.open_nixl(&request).await {
-            Some(reader) => Ok(Some(Box::new(reader))),
-            None => self.tcp.open_read_chunks_fresh(request).await,
-        }
+        Ok(Some(Box::new(self.open_nixl(request).await?)))
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
-        match recv_pool() {
-            Some(pool) => Ok(Box::new(NixlFileWriter::new(pool, request))),
-            None => self.tcp.open_write(request).await,
-        }
+        let pool = recv_pool().ok_or_else(|| io::Error::other("NIXL receive pool unavailable"))?;
+        Ok(Box::new(NixlFileWriter::new(pool, request)))
     }
 
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
@@ -230,7 +188,10 @@ impl InternodeDataTransport for NixlInternodeDataTransport {
     }
 
     fn capabilities(&self) -> InternodeDataTransportCapabilities {
-        InternodeDataTransportCapabilities::tcp_http()
+        InternodeDataTransportCapabilities {
+            fallback_supported: false,
+            ..InternodeDataTransportCapabilities::tcp_http()
+        }
     }
 }
 
@@ -666,6 +627,27 @@ impl tokio::io::AsyncWrite for NixlFileWriter {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn strict_nixl_rejects_unbounded_reads() {
+        let request = ReadStreamRequest {
+            endpoint: String::new(),
+            disk: String::new(),
+            volume: String::new(),
+            path: String::new(),
+            offset: 0,
+            length: 0,
+            stall_timeout: None,
+        };
+        let transport = NixlInternodeDataTransport::from_env();
+        let error = transport
+            .open_read_chunks_fresh(request)
+            .await
+            .err()
+            .expect("unbounded shard read must fail");
+        assert!(error.to_string().contains("NIXL shard reads require a bounded range"));
+        assert!(!transport.capabilities().fallback_supported);
+    }
 
     struct CountingBuffer {
         released: Arc<AtomicUsize>,

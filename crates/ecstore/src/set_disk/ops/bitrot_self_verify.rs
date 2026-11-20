@@ -86,7 +86,15 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
             let disk = disk.as_ref()?.clone();
             let algo = algo.clone();
             Some(async move {
-                let result = match disk.read_file(target.volume, target.path).await {
+                let reader = match disk.as_ref() {
+                    crate::disk::Disk::Local(local) => local.read_file(target.volume, target.path).await,
+                    crate::disk::Disk::Remote(remote) => {
+                        remote
+                            .read_file_for_bitrot_verify(target.volume, target.path, encoded_shard_size)
+                            .await
+                    }
+                };
+                let result = match reader {
                     Ok(reader) => {
                         coding::bitrot_verify(reader, encoded_shard_size, target.logical_shard_size, algo, target.shard_size)
                             .await
