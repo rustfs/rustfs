@@ -62,7 +62,7 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) checksum_crc64nvme: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct PutObjectWriteOutput {
     pub(crate) e_tag: Option<String>,
     pub(crate) version_id: Option<String>,
@@ -86,5 +86,16 @@ impl PutObjectWriteInput {
         let trailers = std::sync::Arc::new(super::native_body::FrameTrailers::default());
         self.frame_trailers = Some(trailers.clone());
         self.trailing_headers = Some(trailers);
+    }
+}
+
+#[cfg(test)]
+impl PutObjectWriteInput {
+    /// A test's s3s fixture request as the envelope and input a gateway handler hands the use case.
+    pub(crate) fn from_test_request(
+        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::PutObjectInput>,
+    ) -> (crate::app::RequestEnvelope, Self) {
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        (envelope, Self::from_legacy(req.input, req.trailing_headers))
     }
 }

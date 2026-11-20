@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::object_usecase::DefaultObjectUsecase;
-use crate::app::storage_api::s3::{PutObjectInput, PutObjectOutput, S3Request, S3Response, S3Result};
-use crate::app::storage_api::test::ecfs::FS;
+use crate::app::RequestEnvelope;
+use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput, PutObjectWriteOutput};
 use std::future::Future;
 
-/// Calls `DefaultObjectUsecase::execute_put_object` with today's arguments.
+/// Calls `DefaultObjectUsecase::execute_put_object_owned`, the entry point the gateway handler calls.
 ///
 /// Owned by the PutObject batch (D). Tests outside that batch's files call this seam instead of the use-case method;
 /// when batch D changes the use-case signature it changes only this body.
-pub(crate) fn put_object<'a>(
-    usecase: &'a DefaultObjectUsecase,
-    fs: &'a FS,
-    req: S3Request<PutObjectInput>,
-) -> impl Future<Output = S3Result<S3Response<PutObjectOutput>>> + 'a {
-    usecase.execute_put_object(fs, req)
+pub(crate) fn put_object(
+    usecase: &DefaultObjectUsecase,
+    envelope: RequestEnvelope,
+    input: PutObjectWriteInput,
+) -> impl Future<Output = rustfs_s3_types::S3Result<PutObjectWriteOutput>> + '_ {
+    Box::pin(usecase.execute_put_object_owned(envelope, input))
 }
