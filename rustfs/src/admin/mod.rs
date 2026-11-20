@@ -45,24 +45,8 @@ use handlers::{
     user,
 };
 use router::{AdminOperation, S3Router};
-use s3s::route::S3Route;
 
-/// Create admin router
-///
-/// # Arguments
-/// * `console_enabled` - Whether the console is enabled
-///
-/// # Returns
-/// An instance of S3Route for admin operations
-pub fn make_admin_route(
-    console_enabled: bool,
-    server_ctx: std::sync::Arc<crate::admin::runtime_sources::ServerContextSlot>,
-) -> std::io::Result<impl S3Route> {
-    make_admin_router(console_enabled, server_ctx)
-}
-
-/// The admin router with every route registered, bound to `server_ctx`: what the legacy stack
-/// mounts as its custom route and the gateway stack's control-plane host dispatches through.
+/// Builds the control-plane router and binds it to this server.
 pub(crate) fn make_admin_router(
     console_enabled: bool,
     server_ctx: std::sync::Arc<crate::admin::runtime_sources::ServerContextSlot>,

@@ -465,7 +465,7 @@ pub(crate) async fn set_replication_target_with_options(
     Ok(arn)
 }
 
-async fn send_set_replication_target_request(
+pub(crate) async fn send_set_replication_target_request(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
     update: bool,

@@ -16,7 +16,7 @@
 //! These probes observe storage, body demand and responses; they do not define ownership rules.
 
 use super::super::super::{
-    ETag as LegacyETag, LegacyS3Error, LegacyS3ErrorCode, S3Request as LegacyRequest, ServerSideEncryption as LegacyEncryption,
+    ETag as LegacyETag, LegacyS3Error, LegacyS3ErrorCode, ServerSideEncryption as LegacyEncryption,
     UploadPartOutput as LegacyOutput,
 };
 use super::*;
@@ -80,41 +80,6 @@ fn input(bucket: &str, upload: &str, number: i32, length: i64) -> (dto::UploadPa
     )
 }
 
-async fn original(
-    backend: &ProtocolStorageClient,
-    input: dto::UploadPartInput,
-    credentials: &rustfs_credentials::Credentials,
-) -> S3Result<dto::UploadPartOutput> {
-    let bucket = input.bucket.as_str().to_owned();
-    let key = input.key.as_str().to_owned();
-    let length = input.content_length;
-    let input = compat::generated::ops::upload_part::input_to_s3s(input)
-        .map_err(|error| super::super::super::conversion_error("UploadPart input", error))?;
-    let number = input.part_number.to_string();
-    let uri = super::super::super::build_object_uri(
-        &bucket,
-        &key,
-        &[("partNumber", Some(&number)), ("uploadId", Some(&input.upload_id))],
-    )?;
-    let mut headers = HeaderMap::new();
-    if let Ok(value) = length.to_string().parse() {
-        headers.insert("content-length", value);
-    }
-    let request = ProtocolStorageClient::create_request(
-        input,
-        Method::PUT,
-        uri,
-        RequestParams {
-            bucket: Some(bucket),
-            object: Some(key),
-            credentials,
-        },
-    )?;
-    let response = backend.legacy_fs().upload_part(LegacyRequest { headers, ..request }).await?;
-    compat::generated::ops::upload_part::output_from_s3s(response.output)
-        .map_err(|error| super::super::super::conversion_error("UploadPart output", error))
-}
-
 fn count() -> u64 {
     rustfs_io_metrics::s3_op_metrics_snapshot()
         .into_iter()
@@ -139,15 +104,8 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
             )
             .await
             .expect("create upload");
-        let store = backend
-            .legacy_fs()
-            .server_ctx()
-            .app_context()
-            .expect("context")
-            .object_store();
+        let store = backend.server_ctx.app_context().expect("context").object_store();
         let probe = crate::app::storage_api::helper::MutationCompletionProbe::install(bucket);
-        let mut observations = Vec::new();
-        let mut controls = Vec::new();
         for case in [
             "zero",
             "negative",
@@ -195,11 +153,6 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                 }
                 (request, polls)
             };
-            let (request, old_polls) = make();
-            let before = count();
-            let expected = original(&backend, request, &root).await.expect_err("original refusal");
-            let old_count = count() - before;
-            let expected_audit = audit_facts(&probe);
             let (request, new_polls) = make();
             let before = count();
             let actual = backend.upload_part(request, &root).await;
@@ -217,27 +170,17 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                 .expect("parts")
                 .parts;
             let actual_audit = audit_facts(&probe);
-            let old_polls = old_polls.load(Ordering::Relaxed);
             let new_polls = new_polls.load(Ordering::Relaxed);
-            controls.push((case, old_count, expected_audit.len(), old_polls > 0));
-            observations.push((
-                case,
-                (parts.len(), actual.err().map(error_facts), actual_count, new_polls, actual_audit),
-                (0, Some(error_facts(expected)), old_count, old_polls, expected_audit),
-            ));
+            assert!(actual.is_err(), "{case}: expected refusal");
+            assert_eq!(parts.len(), 0, "{case}: no parts persisted");
+            assert_eq!(actual_count, 1, "{case}: count");
+            assert_eq!(actual_audit.len(), 1, "{case}: audit");
+            assert_eq!(
+                new_polls > 0,
+                matches!(case, "wrong-md5" | "short-body" | "source-error"),
+                "{case}: polls={new_polls}"
+            );
         }
-        let bad_controls: Vec<_> = controls
-            .into_iter()
-            .filter(|(case, count, audits, polled)| {
-                *count != 1 || *audits != 1 || *polled != matches!(*case, "wrong-md5" | "short-body" | "source-error")
-            })
-            .collect();
-        let differences: Vec<_> = observations
-            .into_iter()
-            .filter(|(_, actual, expected)| actual != expected)
-            .collect();
-        assert!(bad_controls.is_empty(), "original request controls: {bad_controls:#?}");
-        assert!(differences.is_empty(), "UploadPart refusal differences: {differences:#?}");
     });
 }
 
@@ -248,13 +191,9 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
         use http_body_util::BodyExt;
         let bucket = "protocol-upload-part-bound";
         let (_foreign_temp, root, foreign_client, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let foreign = foreign_client
-            .legacy_fs()
-            .server_ctx()
-            .app_context()
-            .expect("foreign context");
+        let foreign = foreign_client.server_ctx.app_context().expect("foreign context");
         let (_temp, _, backend, _) = crate::protocols::mainflow_test::object_client(bucket).await;
-        let bound = backend.legacy_fs().server_ctx().app_context().expect("bound context");
+        let bound = backend.server_ctx.app_context().expect("bound context");
         assert!(Arc::ptr_eq(&crate::runtime_sources::current_app_context().expect("ambient"), &foreign));
         let created = backend
             .create_multipart_upload(
@@ -267,23 +206,16 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
             )
             .await
             .expect("create upload");
-        let mut outputs = Vec::new();
-        for legacy in [true, false] {
-            let (mut request, polls) = input(bucket, &created.upload_id, if legacy { 1 } else { 2 }, 3);
+        for part_num in [1, 2] {
+            let (mut request, polls) = input(bucket, &created.upload_id, part_num, 3);
             request.checksum_spec =
                 Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "NSRBwg==").expect("checksum"));
             let before = count();
-            let result = if legacy {
-                original(&backend, request, &root).await
-            } else {
-                backend.upload_part(request, &root).await
-            };
-            let output = result.expect("upload part");
+            let output = backend.upload_part(request, &root).await.expect("upload part");
             assert_eq!(count() - before, 1);
             assert!(polls.load(Ordering::Relaxed) > 0, "successful upload must poll its producer");
-            outputs.push(format!("{output:?}"));
+            let _ = &output.e_tag;
         }
-        assert_eq!(outputs[1], outputs[0]);
         let options = StorageObjectOptions::default();
         let parts = bound
             .object_store()
@@ -357,20 +289,11 @@ fn upload_part_checksum_observations_match_original() {
             )
             .await
             .expect("create upload");
-        let mut outcomes = Vec::new();
-        for legacy in [true, false] {
-            let (mut request, _) = input(bucket, &created.upload_id, if legacy { 1 } else { 2 }, 3);
-            request.checksum_spec =
-                Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "AAAAAA==").expect("checksum"));
-            let result = if legacy {
-                original(&backend, request, &root).await
-            } else {
-                backend.upload_part(request, &root).await
-            };
-            outcomes.push(result.map(|output| format!("{output:?}")).map_err(error_facts));
-        }
-        assert_eq!(outcomes[1], outcomes[0]);
-        assert!(outcomes[0].is_ok(), "original checksum projection remains representable");
+        let (mut request, _) = input(bucket, &created.upload_id, 1, 3);
+        request.checksum_spec =
+            Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "AAAAAA==").expect("checksum"));
+        let result = backend.upload_part(request, &root).await;
+        assert!(result.is_ok(), "checksum projection remains representable");
     });
 }
 
