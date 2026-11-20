@@ -1300,6 +1300,26 @@ fn resolve_notification_region(global_region: Option<Region>, request_region: Op
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 
+static TRANSITION_SCAN_ADMISSION: Semaphore = Semaphore::const_new(1);
+static EXPIRY_SCAN_ADMISSION: Semaphore = Semaphore::const_new(1);
+static ABORT_SCAN_ADMISSION: Semaphore = Semaphore::const_new(1);
+
+fn spawn_bounded_lifecycle_scan(
+    admission: &'static Semaphore,
+    context: Option<request_context::RequestContext>,
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    // These are best-effort accelerators; the regular scanner observes persisted
+    // lifecycle configuration. Acquire before spawning so neither tasks nor waiters
+    // can accumulate when configuration is updated faster than a bucket is scanned.
+    let Ok(permit) = admission.try_acquire() else { return false };
+    spawn_background_with_context(context, async move {
+        let _permit = permit;
+        future.await;
+    });
+    true
+}
+
 fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
     let mut rule_ids: HashSet<String> = HashSet::new();
 
@@ -2596,7 +2616,7 @@ impl DefaultBucketUsecase {
         {
             let bucket_name = bucket.clone();
             let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
+            spawn_bounded_lifecycle_scan(&TRANSITION_SCAN_ADMISSION, request_context, async move {
                 if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
                 }
@@ -2608,7 +2628,7 @@ impl DefaultBucketUsecase {
         {
             let bucket_name = bucket.clone();
             let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
+            spawn_bounded_lifecycle_scan(&EXPIRY_SCAN_ADMISSION, request_context, async move {
                 if let Err(err) = enqueue_expiry_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue expiry for existing objects");
                 }
@@ -2620,7 +2640,7 @@ impl DefaultBucketUsecase {
         {
             let bucket_name = bucket.clone();
             let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
+            spawn_bounded_lifecycle_scan(&ABORT_SCAN_ADMISSION, request_context, async move {
                 let deleted = run_stale_multipart_upload_cleanup_once(store).await;
                 debug!(bucket = %bucket_name, deleted, "completed lifecycle abort multipart cleanup trigger");
             });
@@ -4972,6 +4992,23 @@ mod tests {
         }];
 
         assert_eq!(validate_lifecycle_rule_status(&rules).unwrap_err(), ERR_LIFECYCLE_RULE_STATUS);
+    }
+
+    #[tokio::test]
+    async fn immediate_lifecycle_scans_have_no_unbounded_waiters() {
+        static ADMISSION: Semaphore = Semaphore::const_new(1);
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        assert!(spawn_bounded_lifecycle_scan(&ADMISSION, None, async move {
+            wait.await.expect("test releases the active scan");
+        }));
+        assert!(!spawn_bounded_lifecycle_scan(&ADMISSION, None, async {
+            panic!("overlapping scan must not run")
+        }));
+        finish.send(()).expect("active scan retains its permit");
+        let _permit = tokio::time::timeout(Duration::from_secs(5), ADMISSION.acquire())
+            .await
+            .expect("permit is released after the active scan")
+            .expect("admission stays open");
     }
 
     #[test]
