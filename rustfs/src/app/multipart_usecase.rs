@@ -50,8 +50,7 @@ use super::storage_api::multipart_usecase::io::{
     EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
 };
 #[cfg(test)]
-use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
-use super::storage_api::multipart_usecase::object_utils::to_s3s_xml_etag;
+use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
     get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,

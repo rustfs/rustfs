@@ -13,14 +13,14 @@
 // limitations under the License.
 
 //! UploadPartCopy through one owned storage implementation and its legacy adapter.
-//! Protocol clients and the legacy FS edge supply request facts; multipart ownership stays in storage.
+//! Gateway and protocol clients supply request facts. Storage owns the multipart upload.
 
 use super::*;
 #[cfg(test)]
-use crate::app::storage_api::s3::dto::CopySource;
 use crate::app::storage_api::s3::dto::{
-    CopyPartResult, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
+    CopyPartResult, CopySource, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
 };
+#[cfg(test)]
 use crate::app::storage_api::s3::{S3Request, S3Response};
 use crate::app::{RequestEnvelope, object_usecase::CopySourceCondition};
 use rustfs_gateway_types::CopySourceValue;
@@ -100,6 +100,7 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
 }
 
 impl DefaultMultipartUsecase {
+    #[cfg(test)]
     pub async fn execute_upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,
@@ -448,7 +449,7 @@ impl DefaultMultipartUsecase {
             .user_defined
             .contains_key("x-amz-server-side-encryption-customer-algorithm");
         let ssekms_key_id = match server_side_encryption.as_ref() {
-            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => mp_info
+            Some(sse) if sse.as_str() == rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS => mp_info
                 .user_defined
                 .get("x-amz-server-side-encryption-aws-kms-key-id")
                 .map(|s| s.to_string()),

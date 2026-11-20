@@ -57,6 +57,8 @@ pub(crate) mod s3 {
     pub(crate) use rustfs_s3_types::StdError;
     #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
     pub(crate) use s3s::Body;
+    #[cfg(test)]
+    pub(crate) use s3s::S3Request;
     pub(crate) use s3s::S3Response;
     #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
@@ -86,7 +88,7 @@ pub(crate) mod s3 {
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
     pub(crate) use s3s::{BodySizeLimitExceeded, S3, TrailingHeaders};
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result};
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
 }
 
 pub(crate) mod admin {
@@ -1881,8 +1883,10 @@ pub(crate) mod multipart_usecase {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) use super::object_utils;
     pub(crate) use super::{
-        access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
+        access, bucket, compression, data_usage, error, helper, io, options, request_context, s3_api, set_disk, sse,
     };
     pub(crate) use crate::storage::storage_api::{
         DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY,
