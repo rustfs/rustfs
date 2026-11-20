@@ -144,7 +144,7 @@ impl Served for dto::UploadPartCopy {
             copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
         };
         let output = DefaultMultipartUsecase::with_context(context)
-            .execute_upload_part_copy_owned(envelope, input)
+            .execute_upload_part_copy_with_audit(envelope, input)
             .await?;
         let tag = output
             .e_tag

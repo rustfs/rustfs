@@ -148,20 +148,21 @@ fn normalize_presigned_part_checksums(req: &mut RequestEnvelope, input: &mut Upl
 }
 
 impl DefaultMultipartUsecase {
-    #[instrument(name = "execute_upload_part", level = "debug", skip(self, envelope, input))]
-    #[hotpath::measure(impl_type = "MultipartUsecase")]
-    pub(crate) async fn execute_upload_part_owned(
+    /// Records the gateway audit. The protocol client records its own projected response.
+    pub(crate) async fn execute_upload_part_with_audit(
         &self,
         envelope: RequestEnvelope,
         input: UploadPartWriteInput,
     ) -> S3Result<UploadPartWriteOutput> {
         RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPart, http::StatusCode::OK, |envelope| {
-            self.execute_upload_part_body(envelope, input)
+            self.execute_upload_part_owned(envelope, input)
         })
         .await
     }
 
-    async fn execute_upload_part_body(
+    #[instrument(name = "execute_upload_part", level = "debug", skip(self, req, input))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
+    pub(crate) async fn execute_upload_part_owned(
         &self,
         mut req: RequestEnvelope,
         mut input: UploadPartWriteInput,
@@ -557,7 +558,7 @@ impl DefaultMultipartUsecase {
         };
         let envelope = RequestEnvelope::from_s3s(&req);
         let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
-        let output = self.execute_upload_part_owned(envelope, input).await?;
+        let output = self.execute_upload_part_with_audit(envelope, input).await?;
         let mut response = S3Response::new(UploadPartOutput {
             e_tag: output
                 .e_tag

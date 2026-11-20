@@ -130,7 +130,7 @@ impl DefaultMultipartUsecase {
             copy_source_sse_customer_key: input.copy_source_sse_customer_key,
             copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
         };
-        let output = self.execute_upload_part_copy_owned(envelope, input).await?;
+        let output = self.execute_upload_part_copy_with_audit(envelope, input).await?;
         Ok(S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
                 e_tag: output.e_tag.as_deref().map(to_s3s_xml_etag),
@@ -152,20 +152,21 @@ impl DefaultMultipartUsecase {
     }
 
     /// Copies plaintext into an existing upload without changing its recorded owner.
-    #[instrument(level = "debug", skip(self, envelope, input))]
-    #[hotpath::measure(impl_type = "MultipartUsecase")]
-    pub(crate) async fn execute_upload_part_copy_owned(
+    /// Records the gateway audit. The protocol client records its own projected response.
+    pub(crate) async fn execute_upload_part_copy_with_audit(
         &self,
         envelope: RequestEnvelope,
         input: UploadPartCopyWriteInput,
     ) -> S3Result<UploadPartCopyWriteOutput> {
         RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPartCopy, http::StatusCode::OK, |envelope| {
-            Box::pin(self.execute_upload_part_copy_body(envelope, input))
+            Box::pin(self.execute_upload_part_copy_owned(envelope, input))
         })
         .await
     }
 
-    async fn execute_upload_part_copy_body(
+    #[instrument(level = "debug", skip(self, envelope, input))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
+    pub(crate) async fn execute_upload_part_copy_owned(
         &self,
         envelope: RequestEnvelope,
         input: UploadPartCopyWriteInput,
