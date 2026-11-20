@@ -14,7 +14,9 @@
 
 use super::route_table::{RouteTable, canonicalize_admin_path, is_admin_v4_fallback_path, route_key_canonical};
 use super::storage_api::config::read_admin_config_without_migrate;
-use crate::admin::console::{is_console_path, make_console_server};
+use crate::admin::console::is_console_path;
+#[cfg(test)]
+use crate::admin::console::make_console_server;
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::handlers::s3_extension;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
@@ -23,9 +25,9 @@ use crate::admin::storage_api::access::ReqInfo;
 use crate::admin::utils::{parse_query_pairs, query_value_exact, query_values_exact};
 use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::license::license_check;
-use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, is_control_plane_route, is_sts_query_request, is_table_catalog_path,
-};
+#[cfg(test)]
+use crate::server::is_table_catalog_path;
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, is_control_plane_route, is_sts_query_request};
 use http::HeaderValue;
 use http::header::HeaderName;
 use hyper::HeaderMap;
@@ -55,14 +57,17 @@ use s3s::S3ErrorCode;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
+#[cfg(test)]
 use s3s::auth::SigV4PathEncoding;
 use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, StreamingBlob, Timestamp, TimestampFormat};
 use s3s::header;
+#[cfg(test)]
 use s3s::route::S3Route;
 use s3s::s3_error;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::Duration;
+#[cfg(test)]
 use tower::Service;
 use tracing::{error, warn};
 use url::form_urlencoded;
@@ -954,6 +959,7 @@ pub(crate) async fn serve_object_lambda(
 pub struct S3Router<T> {
     table: RouteTable<T>,
     console_enabled: bool,
+    #[cfg(test)]
     console_router: Option<axum::routing::RouterIntoService<Body>>,
     /// This server's request-path context slot (backlog#1052 S2). Injected
     /// into every request's extensions at dispatch so the static admin
@@ -1069,6 +1075,7 @@ fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
 
 impl<T> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
+        #[cfg(test)]
         let console_router = if console_enabled {
             Some(make_console_server().into_service::<Body>())
         } else {
@@ -1078,6 +1085,7 @@ impl<T> S3Router<T> {
         Self {
             table: RouteTable::new(),
             console_enabled,
+            #[cfg(test)]
             console_router,
             server_ctx: None,
         }
@@ -1115,6 +1123,7 @@ impl<T> Default for S3Router<T> {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl<T> S3Route for S3Router<T>
 where
@@ -2970,6 +2979,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct Extra {
     pub credentials: Option<s3s::auth::Credentials>,
@@ -2977,6 +2987,7 @@ pub struct Extra {
     pub service: Option<String>,
 }
 
+#[cfg(test)]
 fn convert_request(req: S3Request<Body>) -> http::Request<Body> {
     let (mut parts, _) = http::Request::new(Body::empty()).into_parts();
     parts.method = req.method;
@@ -2991,6 +3002,7 @@ fn convert_request(req: S3Request<Body>) -> http::Request<Body> {
     http::Request::from_parts(parts, req.input)
 }
 
+#[cfg(test)]
 fn convert_response(resp: http::Response<axum::body::Body>) -> S3Response<Body> {
     let (parts, body) = resp.into_parts();
     let mut s3_resp = S3Response::new(Body::http_body_unsync(body));

@@ -1,7 +1,7 @@
 # MinIO ↔ RustFS Router Compatibility (Exceptions Only)
 
 **Use this when:** a client or `mc` call that works against MinIO fails against RustFS and you need to know whether the endpoint is missing, stubbed, or deliberately different.
-**Source of truth:** S3 plane: the registered operation families in `rustfs/src/server/gateway_handlers/mod.rs`. Admin plane: `make_admin_route` in `rustfs/src/admin/mod.rs`, the registration inventory `rustfs/src/admin/route_registration_test.rs`, and the route/action guardrail [admin-route-action-snapshot.md](admin-route-action-snapshot.md).
+**Source of truth:** S3 plane: the registered operation families in `rustfs/src/server/gateway_handlers/mod.rs`. Admin plane: `make_admin_router` in `rustfs/src/admin/mod.rs`, the registration inventory `rustfs/src/admin/route_registration_test.rs`, and the route/action guardrail [admin-route-action-snapshot.md](admin-route-action-snapshot.md).
 
 This document lists only exceptions. Anything not listed here is implemented with MinIO-equivalent behavior. For the s3tests-level claim see [s3-compatibility-matrix.md](s3-compatibility-matrix.md).
 
