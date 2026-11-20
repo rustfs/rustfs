@@ -355,6 +355,34 @@ pub(super) fn validate_rebalance_disk_stats_coverage(disk_stats: &[DiskStat]) ->
     Ok(())
 }
 
+fn select_rebalance_sources(meta: &mut RebalanceMeta, pool_meta: &PoolMeta, now: OffsetDateTime) {
+    // Placement excludes suspended pools. Counting their free space can make
+    // every writable pool a source and leave the run without a destination.
+    let mut total_free = 0;
+    let mut total_capacity = 0;
+    for (idx, stat) in meta.pool_stats.iter().enumerate() {
+        if !pool_meta.is_suspended(idx) {
+            total_free += stat.init_free_space;
+            total_capacity += stat.init_capacity;
+        }
+    }
+    meta.percent_free_goal = percent_free_ratio(total_free, total_capacity);
+
+    for (idx, stat) in meta.pool_stats.iter_mut().enumerate() {
+        if !pool_meta.is_suspended(idx)
+            && should_pool_participate(stat.init_free_space, stat.init_capacity, meta.percent_free_goal)
+        {
+            stat.participating = true;
+            stat.info = RebalanceInfo {
+                start_time: Some(now),
+                status: RebalStatus::Started,
+                ..Default::default()
+            };
+        }
+    }
+    meta.stopped_at = (!meta.pool_stats.iter().any(|stat| stat.participating)).then_some(now);
+}
+
 fn pool_rebalance_status_from_meta(meta: Option<&RebalanceMeta>, pool_index: usize) -> (RebalStatus, bool) {
     meta.and_then(|meta| meta.pool_stats.get(pool_index))
         .filter(|pool_stat| pool_stat.participating)
@@ -584,7 +612,8 @@ impl ECStore {
     async fn save_rebalance_activation_meta_with_merge<S>(
         &self,
         pool: Arc<S>,
-        local_snapshot: &RebalanceMeta,
+        local_snapshot: &mut RebalanceMeta,
+        now: OffsetDateTime,
         stage: &str,
     ) -> Result<()>
     where
@@ -600,6 +629,7 @@ impl ECStore {
             .load_runtime_pool_meta_under_activation_fence(&mut pool_meta_guard, &activation_fence, stage)
             .await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
+        select_rebalance_sources(local_snapshot, &pool_meta, now);
 
         merge_and_save_rebalance_meta_no_lock(
             pool,
@@ -963,15 +993,10 @@ impl ECStore {
 
         let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
 
-        let mut total_cap = 0;
-        let mut total_free = 0;
         for disk in si.disks.iter() {
             if disk.pool_index < 0 || disk_stats.len() <= disk.pool_index as usize {
                 continue;
             }
-
-            total_cap += disk.total_space;
-            total_free += disk.available_space;
 
             disk_stats[disk.pool_index as usize].total_space += disk.total_space;
             disk_stats[disk.pool_index as usize].available_space += disk.available_space;
@@ -980,50 +1005,29 @@ impl ECStore {
         #[cfg(test)]
         if let Some(overridden) = take_rebalance_disk_stats_override_for_test(self.id) {
             disk_stats = overridden;
-            total_cap = disk_stats.iter().map(|stat| stat.total_space).sum();
-            total_free = disk_stats.iter().map(|stat| stat.available_space).sum();
         }
 
-        let percent_free_goal = percent_free_ratio(total_free, total_cap);
         validate_rebalance_disk_stats_coverage(&disk_stats)?;
 
-        let mut pool_stats = Vec::with_capacity(self.pools.len());
-
         let now = self.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await;
-
-        for disk_stat in disk_stats.iter() {
-            let mut pool_stat = RebalanceStats {
-                init_free_space: disk_stat.available_space,
-                init_capacity: disk_stat.total_space,
-                buckets: bucktes.clone(),
-                rebalanced_buckets: Vec::with_capacity(bucktes.len()),
-                ..Default::default()
-            };
-
-            if should_pool_participate(disk_stat.available_space, disk_stat.total_space, percent_free_goal) {
-                pool_stat.participating = true;
-                pool_stat.info = RebalanceInfo {
-                    start_time: Some(now),
-                    status: RebalStatus::Started,
-                    ..Default::default()
-                };
-            }
-
-            pool_stats.push(pool_stat);
-        }
-
-        let has_participating_pool = pool_stats.iter().any(|pool_stat| pool_stat.participating);
-        let meta = RebalanceMeta {
+        let mut meta = RebalanceMeta {
             id: Uuid::new_v4().to_string(),
-            stopped_at: (!has_participating_pool).then_some(now),
-            percent_free_goal,
-            pool_stats,
+            pool_stats: disk_stats
+                .iter()
+                .map(|stat| RebalanceStats {
+                    init_free_space: stat.available_space,
+                    init_capacity: stat.total_space,
+                    buckets: bucktes.clone(),
+                    rebalanced_buckets: Vec::with_capacity(bucktes.len()),
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         };
 
         let pool = clone_first_arc(&self.pools, "init_rebalance_meta: no pools available")?;
         resolve_rebalance_meta_save_result(
-            self.save_rebalance_activation_meta_with_merge(pool, &meta, "init_rebalance_meta")
+            self.save_rebalance_activation_meta_with_merge(pool, &mut meta, now, "init_rebalance_meta")
                 .await,
             "init_rebalance_meta",
         )?;
@@ -2667,6 +2671,46 @@ mod tests {
             assert_real_activation_start_race(PoolActivationStartKind::Decommission).await;
         })
         .await;
+    }
+
+    #[test]
+    fn rebalance_selects_sources_only_among_writable_pools_after_decommission() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pool_meta = PoolMeta {
+            pools: (0..4)
+                .map(|id| crate::core::pools::PoolStatus {
+                    id,
+                    cmd_line: format!("pool-{id}"),
+                    last_update: now,
+                    decommission: (id == 0).then(|| crate::core::pools::PoolDecommissionInfo {
+                        start_time: Some(now),
+                        complete: true,
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        // A retired pool can be either emptier or fuller than the live pools.
+        for retired_free in [100, 40] {
+            let mut meta = RebalanceMeta {
+                pool_stats: [retired_free, 94, 95, 96]
+                    .map(|free| RebalanceStats {
+                        init_capacity: 100,
+                        init_free_space: free,
+                        ..Default::default()
+                    })
+                    .to_vec(),
+                ..Default::default()
+            };
+            select_rebalance_sources(&mut meta, &pool_meta, now);
+            assert_eq!(meta.percent_free_goal, 0.95);
+            assert_eq!(
+                meta.pool_stats.iter().map(|p| p.info.status).collect::<Vec<_>>(),
+                [RebalStatus::None, RebalStatus::Started, RebalStatus::None, RebalStatus::None]
+            );
+            assert!(meta.stopped_at.is_none());
+        }
     }
 
     #[test]
