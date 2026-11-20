@@ -162,7 +162,7 @@ impl DefaultObjectUsecase {
             envelope.uri().query(),
             envelope.verified_presigned().is_some(),
         )?;
-        reject_non_wildcard_write_if_none_match_native(input.specific_if_none_match, envelope.headers())?;
+        reject_non_wildcard_write_if_none_match(input.specific_if_none_match, envelope.headers())?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }

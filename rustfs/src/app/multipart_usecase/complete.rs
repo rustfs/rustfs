@@ -294,10 +294,8 @@ impl DefaultMultipartUsecase {
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         // The input member and the header are one value on the wire; both are checked, as the
         // legacy guard checks both.
-        if if_none_match.as_deref().is_some_and(|condition| condition.trim() != "*") {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented));
-        }
-        reject_non_wildcard_write_if_none_match(None, headers)?;
+        let specific_if_none_match = if_none_match.as_deref().is_some_and(|condition| condition.trim() != "*");
+        reject_non_wildcard_write_if_none_match(specific_if_none_match, headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {

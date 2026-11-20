@@ -21,9 +21,9 @@ use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart
 use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 #[cfg(test)]
 use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 #[cfg(test)]
 use s3s::dto::{ListPartsOutput, Part, Timestamp};
-use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
 
@@ -176,7 +176,7 @@ mod tests {
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListPartsInfo, PartInfo};
     use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     #[test]
     fn test_list_parts_output_maps_parts_and_owner() {

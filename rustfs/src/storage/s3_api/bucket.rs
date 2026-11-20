@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::{S3Error, S3ErrorCode};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 use tracing::debug;
 
 const S3_MAX_KEYS: i32 = 1000;
@@ -149,7 +149,7 @@ pub(crate) fn parse_list_objects_v2_params(
 #[cfg(test)]
 mod tests {
     use super::{encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params};
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     // A key that literally ends in the retired metacache tag survives the V2
     // round trip unchanged: the API layer no longer strips anything.
