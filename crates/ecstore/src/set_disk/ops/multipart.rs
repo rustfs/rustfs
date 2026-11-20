@@ -4346,8 +4346,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         if let Some(wtcs) = opts.want_checksum.as_ref() {
             if checksum_type.full_object_requested() {
-                if (!wtcs.encoded.is_empty() && wtcs.encoded != checksum.encoded) || wtcs.want_parts != 0 {
-                    let want = if wtcs.want_parts != 0 {
+                let has_part_suffix = wtcs.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) || wtcs.want_parts != 0;
+                if (!wtcs.encoded.is_empty() && wtcs.encoded != checksum.encoded) || has_part_suffix {
+                    let want = if has_part_suffix {
                         format!("{}-{}", wtcs.encoded, wtcs.want_parts)
                     } else {
                         wtcs.encoded.clone()
@@ -18173,12 +18174,15 @@ mod tests {
         let right_crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, payload).expect("right crc32");
         let wrong_crc32 =
             rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"different-payload").expect("wrong crc32");
-        let suffixed_crc32 =
-            rustfs_rio::Checksum::new_with_type(full_object_type, &format!("{}-1", right_crc32.encoded)).expect("suffixed crc32");
+        let suffixed_crc32 = |parts| {
+            rustfs_rio::Checksum::new_with_type(full_object_type, &format!("{}-{parts}", right_crc32.encoded))
+                .expect("suffixed crc32")
+        };
 
         for (label, bad_checksum) in [
             ("wrong value", wrong_crc32),
-            ("composite suffix on FULL_OBJECT", suffixed_crc32),
+            ("composite suffix on FULL_OBJECT", suffixed_crc32(1)),
+            ("zero-part suffix on FULL_OBJECT", suffixed_crc32(0)),
         ] {
             let err = set
                 .clone()
