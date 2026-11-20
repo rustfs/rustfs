@@ -160,6 +160,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
         last_cycle_lifecycle_transition_actions: metrics.last_cycle_lifecycle_transition_actions,
         last_cycle_partial_source: metrics.last_cycle_partial_source,
         last_cycle_partial_source_code: metrics.last_cycle_partial_source_code,
+        last_cycle_partial_stage: metrics.last_cycle_partial_stage,
         last_cycle_duration_seconds: metrics.last_cycle_duration_seconds,
         last_cycle_objects_scanned: metrics.last_cycle_objects_scanned,
         last_cycle_directories_scanned: metrics.last_cycle_directories_scanned,
@@ -691,6 +692,7 @@ mod test {
             current_started: chrono_to_jiff_timestamp(current_started),
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
+            last_cycle_partial_stage: Some("object_budget".into()),
             cycle_timeout_total: 3,
             cycle_recovery_required_total: 2,
             cycle_last_progress_age: 17,
@@ -706,6 +708,7 @@ mod test {
         assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(current_started));
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
+        assert_eq!(scanner.last_cycle_partial_stage.as_deref(), Some("object_budget"));
         assert_eq!(scanner.cycle_timeout_total, 3);
         assert_eq!(scanner.cycle_recovery_required_total, 2);
         assert_eq!(scanner.cycle_last_progress_age, 17);

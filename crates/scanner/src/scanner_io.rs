@@ -1164,10 +1164,18 @@ impl ScannerBucketPlanDigests {
         reuse: DataUsageScanPlanDigest,
         coverage: DataUsageScanPlanDigest,
         dirty_generation: Option<u64>,
+        usage_watch: Option<&ScannerUsageWatchProof>,
     ) -> Self {
         Self {
             reuse: scanner_bucket_cache_digest(reuse, dirty_generation),
-            coverage: scanner_bucket_cache_digest(coverage, dirty_generation),
+            // A complete producer watch binds every node's bucket revision.
+            // Coordinator-local dirty history must still fence cache reuse,
+            // but cannot change coverage when that same watch is continued.
+            coverage: if usage_watch.is_some() {
+                coverage
+            } else {
+                scanner_bucket_cache_digest(coverage, dirty_generation)
+            },
         }
     }
 }
@@ -1930,6 +1938,7 @@ pub(crate) struct ScannerCycleResult {
     usage_watch_proofs: Vec<ScannerUsageWatchProof>,
     usage_watch_retirements: Vec<ScannerUsageWatchProof>,
     pub(crate) status: ScannerCycleStatus,
+    pub(crate) partial_stage: Option<&'static str>,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
     activity_baseline: Option<Arc<crate::scanner::ScannerActivitySnapshot>>,
@@ -1956,6 +1965,7 @@ impl ScannerCycleResult {
             usage_watch_proofs: Vec::new(),
             usage_watch_retirements: Vec::new(),
             status,
+            partial_stage: None,
             publication_epoch: None,
             activity_digest: None,
             activity_baseline: None,
@@ -1975,6 +1985,11 @@ impl ScannerCycleResult {
             scope_fallback: None,
             publication_expectation: None,
         }
+    }
+
+    fn with_partial_stage(mut self, stage: Option<&'static str>) -> Self {
+        self.partial_stage = stage;
+        self
     }
 
     pub(crate) fn with_publication_epoch(mut self, publication_epoch: Option<u64>) -> Self {

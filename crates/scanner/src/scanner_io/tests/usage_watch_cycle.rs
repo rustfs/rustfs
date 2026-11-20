@@ -146,6 +146,103 @@ async fn durable_watch_start_survives_three_cycles_and_unrelated_bucket_writes()
 
 #[tokio::test]
 #[serial]
+async fn durable_watch_coverage_ignores_coordinator_local_dirty_history() {
+    let (dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    store
+        .make_bucket(BUCKET, &MakeBucketOptions::default())
+        .await
+        .expect("long bucket");
+    for index in 0..9 {
+        put(&store, BUCKET, &format!("prefix-{index:02}/object"), 16).await;
+    }
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    record_dirty_usage_bucket(BUCKET);
+    let (_, _, first) = run(&store, cohort.clone(), 1, Some(2)).await;
+    assert!(first.has_scan_position());
+    let watch = first.info.scan_usage_watch.clone().expect("full producer watch");
+    let plan = first.info.scan_progress.expect("starting plan").started_plan;
+    for cycle in 2..=3 {
+        // Different coordinators can have different dirty queue histories for
+        // the same quiet bucket. Only the full producer watch proves coverage.
+        record_dirty_usage_bucket(BUCKET);
+        assert!(watch.verify_with_store(&store).await);
+        let (_, _, continued) = run(&store, cohort.clone(), cycle, Some(2)).await;
+        let progress = continued.info.scan_progress.expect("continued checkpoint");
+        assert_eq!(progress.started_plan, plan);
+        assert_eq!(progress.requested_plan, plan, "local dirty history cannot change watched coverage");
+    }
+    let (result, usage, completed) = run(&store, cohort, 4, None).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert!(completed.info.snapshot_complete);
+    let root = completed
+        .checked_flatten_complete_scope(BUCKET)
+        .expect("certified full bucket");
+    assert_eq!((root.objects, root.size), (9, 9 * 16));
+    assert!(
+        usage.expect("certified usage").buckets_usage[BUCKET]
+            .usage_certification
+            .is_some()
+    );
+    drop(store);
+    dir.close().expect("remove dirty history fixture");
+}
+
+#[tokio::test]
+#[serial]
+async fn bucket_configuration_between_watched_cycles_requires_a_fresh_sweep() {
+    let (dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    store
+        .make_bucket(BUCKET, &MakeBucketOptions::default())
+        .await
+        .expect("long bucket");
+    for index in 0..9 {
+        put(&store, BUCKET, &format!("prefix-{index:02}/object"), 16).await;
+    }
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let (_, _, first) = run(&store, cohort.clone(), 1, Some(2)).await;
+    assert!(first.has_scan_position());
+    let watch = first.info.scan_usage_watch.clone().expect("original watch");
+    assert!(watch.verify_with_store(&store).await);
+    let previous_generation = scanner_maintenance_generation();
+    store.update_bucket_metadata_config(
+        BUCKET,
+        "versioning.xml",
+        br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#.to_vec(),
+    ).await.expect("actual bucket versioning update without a maintenance notification");
+    wait_for_namespace_commit_tails(&store).await;
+    record_dirty_usage_bucket(BUCKET);
+    assert_eq!(
+        scanner_maintenance_generation(),
+        previous_generation,
+        "no maintenance hint masks the producer check"
+    );
+    assert!(
+        !watch.verify_with_store(&store).await,
+        "configuration changes invalidate original coverage"
+    );
+    let (result, _, mixed) = run(&store, cohort.clone(), 2, None).await;
+    assert!(!mixed.info.snapshot_complete);
+    assert!(mixed.completed_bucket_observation().is_some());
+    assert!(result.usage_watch_proofs().iter().all(|proof| proof.bucket != BUCKET));
+    assert!(!result.has_dirty_usage_to_acknowledge());
+    assert!(dirty_usage_buckets_for_tests().contains_key(BUCKET));
+    let (result, usage, fresh) = run(&store, cohort, 3, None).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    let root = fresh.checked_flatten_complete_scope(BUCKET).expect("fresh certified sweep");
+    assert_eq!((root.objects, root.size), (9, 9 * 16));
+    assert!(
+        usage.expect("certified usage").buckets_usage[BUCKET]
+            .usage_certification
+            .is_some()
+    );
+    drop(store);
+    dir.close().expect("remove maintenance fixture");
+}
+
+#[tokio::test]
+#[serial]
 async fn changed_watch_during_resume_preserves_an_observation_then_requires_a_fresh_sweep() {
     let (dir, store) = setup_local_scanner_store(1, 1).await;
     clear_dirty_usage_buckets_for_tests();

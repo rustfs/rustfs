@@ -653,6 +653,7 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
     cache.replace("bucket", "", DataUsageEntry::default());
     let revisions = DataUsageCacheRevisions {
         main: DataUsageCacheRevision::Missing,
+        damaged_pages: DamagedPages::default(),
         backup: None,
     };
 
@@ -779,6 +780,7 @@ fn baseline_revisions_allow_only_a_decoded_unchanged_primary_backup_catchup() {
         revisions: DataUsageCacheRevisions {
             main: etag("primary"),
             backup: Some(etag("old-backup")),
+            damaged_pages: DamagedPages::default(),
         },
         loaded_from_main: true,
     };
@@ -835,11 +837,11 @@ async fn baseline_revisions_record_the_actual_decoded_cache_source() {
     let mut expected = DataUsageCache::default();
     expected.info.name = "decoded".to_owned();
     let valid = expected.marshal_msg().expect("encode valid cache");
-    for (main, backup, from_main, name) in [
-        (valid.clone(), Some(valid.clone()), true, "decoded"),
-        (b"corrupt".to_vec(), Some(valid.clone()), false, "decoded"),
-        (b"corrupt".to_vec(), None, false, ""),
-        (Vec::new(), None, false, ""),
+    for (main, backup, from_main, damaged_main, name) in [
+        (valid.clone(), Some(valid.clone()), true, false, "decoded"),
+        (b"corrupt".to_vec(), Some(valid.clone()), false, true, "decoded"),
+        (b"corrupt".to_vec(), None, false, true, ""),
+        (Vec::new(), None, false, true, ""),
     ] {
         let store = Arc::new(CacheReadStore::new(CacheReadBody::Bytes(main), backup));
         let mut loaded = DataUsageCache::default();
@@ -848,6 +850,7 @@ async fn baseline_revisions_record_the_actual_decoded_cache_source() {
             .await
             .expect("load actual cache source");
         assert_eq!(baseline.loaded_from_main, from_main);
+        assert_eq!(baseline.revisions.damaged_pages.main, damaged_main);
         assert_eq!(loaded.info.name, name);
         let mut raw_loaded = DataUsageCache::default();
         let raw = raw_loaded
@@ -866,6 +869,7 @@ async fn baseline_revisions_record_the_actual_decoded_cache_source() {
     assert_eq!(legacy_cache.info.name, "decoded");
     assert!(!legacy.loaded_from_main);
     assert_eq!(legacy.revisions.main, DataUsageCacheRevision::Missing);
+    assert_eq!(legacy.revisions.damaged_pages, DamagedPages::default());
 }
 
 #[tokio::test]
@@ -2976,6 +2980,7 @@ async fn test_save_backup_budget_tracks_primary_cost() {
         let store = Arc::new(store);
         let revisions = DataUsageCacheRevisions {
             main: DataUsageCacheRevision::Missing,
+            damaged_pages: DamagedPages::default(),
             backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
         };
         DataUsageCache::default()
@@ -3028,6 +3033,7 @@ async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
             let store = Arc::new(store);
             let revisions = DataUsageCacheRevisions {
                 main: DataUsageCacheRevision::Missing,
+                damaged_pages: DamagedPages::default(),
                 backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
             };
             let started = Instant::now();

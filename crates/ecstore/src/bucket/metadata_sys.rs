@@ -27,6 +27,7 @@ use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
 use crate::object_api::ObjectOptions;
 use crate::runtime::sources as runtime_sources;
+use crate::runtime::usage_watch::UsageWatchMutationGuard;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::store::{ECStore, await_bucket_namespace_operation};
@@ -270,7 +271,12 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
 
     let sys = Arc::new(RwLock::new(sys));
 
-    instance_ctx.init_bucket_metadata_sys(sys.clone());
+    {
+        // Installing a whole cache can also withdraw buckets absent from its
+        // initial listing. Fence replacement of the instance's previous cache.
+        let _watch = instance_ctx.usage_watches.begin(None);
+        instance_ctx.init_bucket_metadata_sys(sys.clone());
+    }
 
     if is_dist_erasure {
         start_refresh_buckets_metadata_loop(sys);
@@ -2063,6 +2069,37 @@ pub(crate) fn current_local_meta_mutation_gen() -> u64 {
     LOCAL_META_MUTATION_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
+// These are the cached inputs used by the scanner's lifecycle, retention and
+// replication decisions. Raw bytes distinguish absent/unreadable records;
+// typed values also cover publications of already-parsed metadata. A periodic
+// reload of the same content or an unrelated config edit preserves the watch.
+fn same_scanner_configuration(previous: &BucketMetadata, next: &BucketMetadata) -> bool {
+    fn target_resets(metadata: &BucketMetadata) -> impl Iterator<Item = (&str, &str, Option<OffsetDateTime>)> {
+        metadata.bucket_target_config.iter().flat_map(|targets| {
+            targets
+                .targets
+                .iter()
+                .map(|target| (target.arn.as_str(), target.reset_id.as_str(), target.reset_before_date))
+        })
+    }
+
+    previous.bucket_incarnation_id == next.bucket_incarnation_id
+        && previous.bucket_incarnation_sidecar == next.bucket_incarnation_sidecar
+        && previous.bucket_creation_committed == next.bucket_creation_committed
+        && previous.lock_enabled == next.lock_enabled
+        && previous.lifecycle_config_xml == next.lifecycle_config_xml
+        && previous.lifecycle_config == next.lifecycle_config
+        && previous.object_lock_config_xml == next.object_lock_config_xml
+        && previous.object_lock_config == next.object_lock_config
+        && previous.versioning_config_xml == next.versioning_config_xml
+        && previous.versioning_config == next.versioning_config
+        && previous.replication_config_xml == next.replication_config_xml
+        && previous.replication_config == next.replication_config
+        && previous.bucket_targets_config_json == next.bucket_targets_config_json
+        && previous.bucket_targets_unreadable() == next.bucket_targets_unreadable()
+        && target_resets(previous).eq(target_resets(next))
+}
+
 type LocalAuthorityCache = Arc<StdMutex<HashMap<String, (u64, Arc<BucketMetadata>)>>>;
 
 #[derive(Debug, Clone)]
@@ -2145,6 +2182,33 @@ impl BucketMetadataSys {
 
     fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
         self.api.upgrade()
+    }
+
+    /// The bucket publish lock precedes the metadata map write lock, then the
+    /// instance's watch registry. A caller keeps the returned guard until
+    /// dependent caches (including replication targets) have also been updated.
+    fn replace_cached_metadata(
+        &self,
+        map: &mut HashMap<String, Arc<BucketMetadata>>,
+        bucket: &str,
+        next: Option<Arc<BucketMetadata>>,
+    ) -> (bool, Option<UsageWatchMutationGuard>) {
+        let changed = match (map.get(bucket), next.as_deref()) {
+            (Some(previous), Some(next)) => !same_scanner_configuration(previous, next),
+            (None, None) => false,
+            _ => true,
+        };
+        let watch = if changed {
+            self.object_store_if_live()
+                .map(|store| store.ctx.usage_watches.begin(Some(bucket)))
+        } else {
+            None
+        };
+        let previous = match next {
+            Some(next) => map.insert(bucket.to_owned(), next),
+            None => map.remove(bucket),
+        };
+        (previous.is_some(), watch)
     }
 
     /// Whether the backing `ECStore` has been dropped.
@@ -2354,7 +2418,7 @@ impl BucketMetadataSys {
                 let _publish_guard = self
                     .lock_metadata_publish(bucket, namespace_guard, "stale bucket metadata removal")
                     .await?;
-                let removed = self.metadata_map.write().await.remove(bucket).is_some();
+                let (removed, _watch) = self.replace_cached_metadata(&mut *self.metadata_map.write().await, bucket, None);
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.insert(bucket.to_string(), ()).await;
                 if removed {
@@ -2393,7 +2457,8 @@ impl BucketMetadataSys {
                 let _publish_guard = self
                     .lock_metadata_publish(bucket, namespace_guard, "initial bucket metadata publish")
                     .await?;
-                self.metadata_map.write().await.insert(bucket.to_string(), Arc::clone(&bm));
+                let (_, _watch) =
+                    self.replace_cached_metadata(&mut *self.metadata_map.write().await, bucket, Some(Arc::clone(&bm)));
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
@@ -2438,7 +2503,7 @@ impl BucketMetadataSys {
             if !unchanged {
                 return Ok(());
             }
-            let removed = map.remove(bucket).is_some();
+            let (removed, _watch) = self.replace_cached_metadata(&mut map, bucket, None);
             drop(map);
             self.fabricated_metadata.write().await.insert(bucket.to_string());
             self.missing_buckets.invalidate(bucket).await;
@@ -2462,7 +2527,7 @@ impl BucketMetadataSys {
         if !unchanged {
             return Ok(());
         }
-        map.insert(bucket.to_string(), Arc::clone(&metadata));
+        let (_, _watch) = self.replace_cached_metadata(&mut map, bucket, Some(Arc::clone(&metadata)));
         drop(map);
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
@@ -2491,7 +2556,7 @@ impl BucketMetadataSys {
             let publish_lock = self.metadata_publish_lock(&bucket);
             let _publish_guard = publish_lock.lock().await;
             let mut map = self.metadata_map.write().await;
-            map.insert(bucket.clone(), bm.clone());
+            let (_, _watch) = self.replace_cached_metadata(&mut map, &bucket, Some(Arc::clone(&bm)));
             drop(map);
             self.fabricated_metadata.write().await.remove(&bucket);
             self.missing_buckets.invalidate(&bucket).await;
@@ -2512,7 +2577,7 @@ impl BucketMetadataSys {
         let publish_lock = self.metadata_publish_lock(bucket);
         let _publish_guard = publish_lock.lock().await;
         let mut map = self.metadata_map.write().await;
-        let removed = map.remove(bucket).is_some();
+        let (removed, _watch) = self.replace_cached_metadata(&mut map, bucket, None);
         drop(map);
         let removed_fabricated = self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.insert(bucket.to_string(), ()).await;
@@ -2528,6 +2593,7 @@ impl BucketMetadataSys {
     async fn _reset(&mut self) {
         bump_local_meta_mutation_gen();
         let mut map = self.metadata_map.write().await;
+        let _watch = self.object_store_if_live().map(|store| store.ctx.usage_watches.begin(None));
         map.clear();
         drop(map);
         self.fabricated_metadata.write().await.clear();
@@ -2849,7 +2915,7 @@ impl BucketMetadataSys {
                 if let Some(current) = map.get(bucket) {
                     return Ok((Arc::clone(current), true));
                 }
-                map.insert(bucket.to_string(), bm.clone());
+                let (_, _watch) = self.replace_cached_metadata(&mut map, bucket, Some(Arc::clone(&bm)));
                 drop(map);
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.invalidate(bucket).await;
@@ -3167,10 +3233,8 @@ impl BucketMetadataSys {
         let _publish_guard = self
             .lock_metadata_publish(bucket, &namespace_guard, "bucket creation commitment publish")
             .await?;
-        self.metadata_map
-            .write()
-            .await
-            .insert(bucket.to_string(), Arc::clone(&metadata));
+        let (_, _watch) =
+            self.replace_cached_metadata(&mut *self.metadata_map.write().await, bucket, Some(Arc::clone(&metadata)));
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
         Ok(BucketMetadataAuthority::Authoritative(metadata))
@@ -3225,7 +3289,7 @@ impl BucketMetadataSys {
                 let _publish_guard = self
                     .lock_metadata_publish(bucket, &namespace_guard, "missing legacy bucket metadata publish")
                     .await?;
-                self.metadata_map.write().await.remove(bucket);
+                let (_, _watch) = self.replace_cached_metadata(&mut *self.metadata_map.write().await, bucket, None);
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.insert(bucket.to_string(), ()).await;
                 return Ok(BucketMetadataAuthority::MissingBucket);
@@ -3296,10 +3360,8 @@ impl BucketMetadataSys {
         let _publish_guard = self
             .lock_metadata_publish(bucket, &namespace_guard, "legacy bucket metadata publish")
             .await?;
-        self.metadata_map
-            .write()
-            .await
-            .insert(bucket.to_string(), Arc::clone(&metadata));
+        let (_, _watch) =
+            self.replace_cached_metadata(&mut *self.metadata_map.write().await, bucket, Some(Arc::clone(&metadata)));
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
@@ -5543,6 +5605,185 @@ mod tests {
         let node_a = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore.clone())));
         let node_b = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
         (dirs, node_a, node_b)
+    }
+
+    #[test]
+    fn usage_watch_metadata_comparison_covers_scanner_inputs_and_skips_unrelated_config() {
+        let original = BucketMetadata::new("scanner-config");
+        for config in [
+            BUCKET_LIFECYCLE_CONFIG,
+            BUCKET_VERSIONING_CONFIG,
+            OBJECT_LOCK_CONFIG,
+            BUCKET_REPLICATION_CONFIG,
+        ] {
+            let (_, bytes) = NEW_WRITER_CONFIGS
+                .iter()
+                .find(|(file, _)| *file == config)
+                .expect("scanner config fixture");
+            let mut parsed = original.clone();
+            parsed.update_config(config, bytes.to_vec()).expect("valid scanner config");
+            parsed.parse_all_configs().expect("parse scanner config");
+            assert!(!same_scanner_configuration(&original, &parsed), "{config} must fence the watch");
+            let mut unreadable = parsed.clone();
+            match config {
+                BUCKET_LIFECYCLE_CONFIG => unreadable.lifecycle_config = None,
+                BUCKET_VERSIONING_CONFIG => unreadable.versioning_config = None,
+                OBJECT_LOCK_CONFIG => unreadable.object_lock_config = None,
+                BUCKET_REPLICATION_CONFIG => unreadable.replication_config = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                !same_scanner_configuration(&parsed, &unreadable),
+                "{config} parser state must fence the watch"
+            );
+        }
+
+        let mut changed = original.clone();
+        changed.lock_enabled = !original.lock_enabled;
+        assert!(!same_scanner_configuration(&original, &changed));
+        let mut changed = original.clone();
+        changed.bucket_target_config = Some(BucketTargets {
+            targets: vec![BucketTarget {
+                arn: "arn:replica".into(),
+                reset_id: "resync".into(),
+                ..Default::default()
+            }],
+        });
+        assert!(
+            !same_scanner_configuration(&original, &changed),
+            "in-memory replication resync targets changed"
+        );
+        let mut unrelated = original.clone();
+        unrelated.tagging_config_xml = b"<Tagging/>".to_vec();
+        unrelated.lifecycle_config_updated_at = OffsetDateTime::UNIX_EPOCH;
+        assert!(same_scanner_configuration(&original, &unrelated));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn periodic_metadata_refresh_fences_usage_watch_after_missed_peer_notification() {
+        use crate::bucket::versioning::VersioningApi as _;
+        use crate::layout::endpoints::EndpointServerPools;
+        use crate::runtime::instance::InstanceContext;
+        use crate::runtime::usage_watch::{ScannerUsageWatchKnown, ScannerUsageWatchRequest};
+        use crate::store::init_local_disks_with_instance_ctx;
+
+        async fn observe(store: &ECStore, request: &ScannerUsageWatchRequest) -> ScannerUsageWatchKnown {
+            store.scanner_usage_watch(std::slice::from_ref(request)).await[0]
+                .known
+                .clone()
+                .expect("a healthy peer must return a bucket watch")
+        }
+
+        let (_dirs, writer) = isolated_store_over_temp_disks().await;
+        let endpoints = EndpointServerPools::from(vec![writer.pools[0].endpoints.clone()]);
+        let peer_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&peer_ctx, endpoints.clone())
+            .await
+            .expect("initialize the second instance's disks");
+        let peer = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            endpoints,
+            CancellationToken::new(),
+            peer_ctx,
+        )
+        .await
+        .expect("open the same deployment with an independent instance");
+        assert_eq!(writer.id, peer.id);
+        assert_ne!(writer.scanner_usage_watch_session_id(), peer.scanner_usage_watch_session_id());
+        init_bucket_metadata_sys(writer.clone(), Vec::new()).await;
+        let bucket = "missed-config-notification";
+        writer
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let other = "unchanged-watch-bucket";
+        writer
+            .make_bucket(other, &MakeBucketOptions::default())
+            .await
+            .expect("create control bucket");
+        init_bucket_metadata_sys(peer.clone(), vec![bucket.to_owned(), other.to_owned()]).await;
+        let peer_sys = peer.ctx.bucket_metadata_sys().expect("peer metadata cache");
+        let writer_sys = writer.ctx.bucket_metadata_sys().expect("writer metadata cache");
+        assert!(!Arc::ptr_eq(&peer_sys, &writer_sys));
+        let (initial, _) = peer_sys
+            .read()
+            .await
+            .get_config(bucket)
+            .await
+            .expect("cache original metadata on peer");
+        assert!(initial.versioning_config_xml.is_empty());
+        let request = ScannerUsageWatchRequest {
+            bucket: bucket.into(),
+            bucket_incarnation: peer
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("bucket incarnation"),
+            watch_id: None,
+            session_id: None,
+            release: false,
+        };
+        let control = ScannerUsageWatchRequest {
+            bucket: other.into(),
+            bucket_incarnation: peer
+                .bucket_incarnation_id_from_disk(other)
+                .await
+                .expect("control incarnation"),
+            ..request.clone()
+        };
+        let first = observe(&peer, &request).await;
+        let unaffected = observe(&peer, &control).await;
+        let enabled = br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+        writer_sys
+            .read()
+            .await
+            .update(bucket, BUCKET_VERSIONING_CONFIG, enabled.to_vec())
+            .await
+            .expect("persist versioning");
+        assert!(
+            writer_sys
+                .read()
+                .await
+                .get_versioning_config(bucket)
+                .await
+                .expect("writer versioning")
+                .0
+                .enabled()
+        );
+        assert!(Arc::ptr_eq(
+            &initial,
+            &peer_sys.read().await.get(bucket).await.expect("stale cached snapshot")
+        ));
+        assert!(observe(&peer, &request).await.unchanged_since(&first), "the peer missed the notification");
+
+        refresh_buckets_metadata_once(peer_sys.clone()).await;
+        let installed = peer_sys.read().await.get(bucket).await.expect("refreshed cached snapshot");
+        assert!(installed.versioning_config.as_ref().is_some_and(|config| config.enabled()));
+        let refreshed = observe(&peer, &request).await;
+        assert!(
+            !refreshed.unchanged_since(&first),
+            "installing changed scanner configuration must fence that peer's old watch"
+        );
+        assert!(observe(&peer, &control).await.unchanged_since(&unaffected));
+        refresh_buckets_metadata_once(peer_sys.clone()).await;
+        assert!(
+            observe(&peer, &request).await.unchanged_since(&refreshed),
+            "an unchanged periodic reload must preserve progress"
+        );
+
+        assert!(peer_sys.read().await.remove(bucket).await);
+        assert!(!observe(&peer, &request).await.unchanged_since(&refreshed));
+        assert!(observe(&peer, &control).await.unchanged_since(&unaffected));
+        peer_sys.write().await._reset().await;
+        let old_control = ScannerUsageWatchRequest {
+            watch_id: Some(unaffected.watch_id),
+            session_id: Some(unaffected.session_id),
+            ..control
+        };
+        assert!(
+            peer.scanner_usage_watch(&[old_control]).await[0].known.is_none(),
+            "reset retires all cached policy proofs"
+        );
     }
 
     #[tokio::test]

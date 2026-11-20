@@ -175,6 +175,51 @@ fn watch_structure_ignores_unrelated_dirty_generations_but_requires_every_owner(
     assert!(watch_structure_digest(&unrelated, &routes).is_none());
 }
 
+#[test]
+fn local_dirty_history_still_fences_reuse_and_unwatched_coverage() {
+    let (proof, _) = fixture();
+    let work = DataUsageScanPlanDigest([9; 32]);
+    let first = ScannerBucketPlanDigests::from_work_plans(work, work, Some(1), Some(&proof));
+    let later = ScannerBucketPlanDigests::from_work_plans(work, work, Some(2), Some(&proof));
+    assert_ne!(first.reuse, later.reuse);
+    assert_eq!(first.coverage, later.coverage);
+    let fallback = ScannerBucketPlanDigests::from_work_plans(work, work, Some(1), None);
+    let changed_fallback = ScannerBucketPlanDigests::from_work_plans(work, work, Some(2), None);
+    assert_ne!(fallback.coverage, changed_fallback.coverage);
+    assert_eq!(fallback.reuse, first.reuse);
+}
+
+#[test]
+fn watch_structure_and_renewal_survive_a_change_of_local_node() {
+    let (proof, first_routes) = fixture();
+    let first_node = crate::scanner::scanner_node_activity_for_tests("first-instance", 1, 2, true);
+    let second_node = crate::scanner::scanner_node_activity_for_tests("second-instance", 103, 104, false);
+    let first_view = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.into(), first_node.clone()),
+        ("peer".into(), second_node.clone()),
+    ]);
+    let second_routes = BTreeMap::from([(Uuid::from_u128(1), Some("first-node".into())), (Uuid::from_u128(2), None)]);
+    let second_view = BTreeMap::from([
+        ("first-node".into(), first_node),
+        (LOCAL_SCANNER_ACTIVITY_NODE.into(), second_node),
+    ]);
+    let structure = watch_structure_digest(&first_view, &first_routes).expect("first node view");
+    assert_eq!(watch_structure_digest(&second_view, &second_routes), Some(structure));
+    let proof = ScannerUsageWatchProof { structure, ..proof };
+    let second = &proof.peers[&Uuid::from_u128(2)];
+    let request = ScannerUsageWatchRequest {
+        bucket: proof.bucket.clone(),
+        bucket_incarnation: proof.bucket_incarnation,
+        watch_id: Some(second.watch_id),
+        session_id: Some(second.session_id),
+        release: false,
+    };
+    let now = Instant::now();
+    let renewed = accept_watch_observations(&request, &second_routes, responses(&proof), Some(&proof), structure, now, now)
+        .expect("new local node renews every original producer token");
+    assert_eq!(renewed.start.digest(), proof.digest());
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn instance_layouts_stay_distinct_even_when_legacy_global_topology_is_equal() {

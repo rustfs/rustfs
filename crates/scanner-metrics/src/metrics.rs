@@ -286,19 +286,6 @@ impl ScannerWorkSource {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::Usage),
-            2 => Some(Self::Lifecycle),
-            3 => Some(Self::BucketReplication),
-            4 => Some(Self::SiteReplication),
-            5 => Some(Self::Heal),
-            6 => Some(Self::Bitrot),
-            7 => Some(Self::Alerts),
-            _ => None,
-        }
-    }
-
     fn all() -> &'static [Self] {
         &Self::ALL
     }
@@ -1000,6 +987,34 @@ impl ScannerUsagePublicationObservation {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct LastScanCycle {
+    sequence: u64,
+    result: u8,
+    partial_reason: ScanCyclePartialReason,
+    partial_source: Option<ScannerWorkSource>,
+    partial_stage: Option<&'static str>,
+    duration_millis: u64,
+}
+
+/// Updates only this observation if a later state write fails. A supervisor
+/// cancellation leaves the already recorded partial result and budget visible.
+pub struct PartialCycleObservation<'a> {
+    latest: &'a Mutex<LastScanCycle>,
+    sequence: u64,
+}
+
+impl PartialCycleObservation<'_> {
+    pub fn observe_state_write(self, persisted: bool) {
+        if !persisted {
+            let mut last = self.latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.sequence == self.sequence {
+                last.partial_stage = Some("cycle_state_not_durable");
+            }
+        }
+    }
+}
+
 pub struct Metrics {
     startup: crate::startup::ScannerStartupObservation,
     scan_observation: ScannerScanObservation,
@@ -1046,11 +1061,8 @@ pub struct Metrics {
     scanner_leader_lock_held: AtomicBool,
     scanner_leader_lock_last_error: RwLock<String>,
     scanner_leader_lock_last_update_unix_secs: AtomicU64,
-    last_scan_cycle_result: AtomicU8,
-    last_scan_cycle_partial_reason: AtomicU8,
-    last_scan_cycle_partial_source: AtomicU8,
+    last_scan_cycle: Mutex<LastScanCycle>,
     last_scan_cycle_end_unix_secs: AtomicU64,
-    last_scan_cycle_duration_millis: AtomicU64,
     last_scan_cycle_objects_scanned: AtomicU64,
     last_scan_cycle_directories_scanned: AtomicU64,
     /// Lifetime count of object versions walked by the data scanner, counted
@@ -1166,7 +1178,6 @@ pub struct Metrics {
     partial_scan_cycles: AtomicU64,
 }
 
-const SCAN_CYCLE_RESULT_UNKNOWN: u8 = 0;
 const SCAN_CYCLE_RESULT_SUCCESS: u8 = 1;
 const SCAN_CYCLE_RESULT_ERROR: u8 = 2;
 const SCAN_CYCLE_RESULT_PARTIAL: u8 = 3;
@@ -1198,12 +1209,12 @@ impl ScanCyclePartialReason {
         }
     }
 
-    fn from_code(code: u8) -> Self {
-        match code {
-            1 => Self::Runtime,
-            2 => Self::Objects,
-            3 => Self::Directories,
-            _ => Self::Unknown,
+    fn budget_stage(self) -> Option<&'static str> {
+        match self {
+            Self::Runtime => Some("runtime_budget"),
+            Self::Objects => Some("object_budget"),
+            Self::Directories => Some("directory_budget"),
+            Self::Unknown => None,
         }
     }
 }
@@ -1603,6 +1614,9 @@ pub struct ScannerMetricsReport {
     pub last_cycle_partial_source: String,
     #[serde(default)]
     pub last_cycle_partial_source_code: u64,
+    /// First observed blocker for this partial cycle, including the exact budget when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle_partial_stage: Option<String>,
     pub last_cycle_duration_seconds: f64,
     #[serde(default)]
     pub last_cycle_objects_scanned: u64,
@@ -2100,8 +2114,18 @@ pub fn emit_scan_cycle_partial_with_source(
     reason: ScanCyclePartialReason,
     source: Option<ScannerWorkSource>,
 ) {
-    global_metrics().record_scan_cycle_partial_with_source(duration, reason, source);
+    emit_scan_cycle_partial_with_stage(duration, reason, source, reason.budget_stage());
+}
+
+pub fn emit_scan_cycle_partial_with_stage(
+    duration: Duration,
+    reason: ScanCyclePartialReason,
+    source: Option<ScannerWorkSource>,
+    stage: Option<&'static str>,
+) -> PartialCycleObservation<'static> {
+    let observation = global_metrics().record_scan_cycle_partial_with_stage(duration, reason, source, stage);
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_PARTIAL_LABEL).increment(1);
+    observation
 }
 
 pub fn emit_scan_cycle_superseded(duration: Duration) {
@@ -2231,11 +2255,8 @@ impl Metrics {
             scanner_leader_lock_held: AtomicBool::new(false),
             scanner_leader_lock_last_error: RwLock::new(String::new()),
             scanner_leader_lock_last_update_unix_secs: AtomicU64::new(0),
-            last_scan_cycle_result: AtomicU8::new(SCAN_CYCLE_RESULT_UNKNOWN),
-            last_scan_cycle_partial_reason: AtomicU8::new(ScanCyclePartialReason::Unknown as u8),
-            last_scan_cycle_partial_source: AtomicU8::new(0),
+            last_scan_cycle: Mutex::new(LastScanCycle::default()),
             last_scan_cycle_end_unix_secs: AtomicU64::new(0),
-            last_scan_cycle_duration_millis: AtomicU64::new(0),
             last_scan_cycle_objects_scanned: AtomicU64::new(0),
             last_scan_cycle_directories_scanned: AtomicU64::new(0),
             lifetime_versions_scanned: AtomicU64::new(0),
@@ -3203,36 +3224,43 @@ impl Metrics {
             self.failed_scan_cycles.fetch_add(1, Ordering::Relaxed);
             SCAN_CYCLE_RESULT_ERROR
         };
-        self.record_scanner_cycle_end_time();
-        self.last_scan_cycle_result.store(result, Ordering::Relaxed);
-        self.last_scan_cycle_partial_reason
-            .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
-        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
-        self.last_scan_cycle_duration_millis
-            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+        self.record_last_cycle(
+            duration,
+            LastScanCycle {
+                result,
+                ..Default::default()
+            },
+        );
     }
 
     pub fn record_scan_cycle_superseded(&self, duration: Duration) {
-        self.record_scanner_cycle_end_time();
         self.superseded_scan_cycles.fetch_add(1, Ordering::Relaxed);
-        self.last_scan_cycle_result
-            .store(SCAN_CYCLE_RESULT_SUPERSEDED, Ordering::Relaxed);
-        self.last_scan_cycle_partial_reason
-            .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
-        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
-        self.last_scan_cycle_duration_millis
-            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+        self.record_last_cycle(
+            duration,
+            LastScanCycle {
+                result: SCAN_CYCLE_RESULT_SUPERSEDED,
+                ..Default::default()
+            },
+        );
     }
 
     pub fn record_scan_cycle_deferred(&self, duration: Duration) {
+        self.record_last_cycle(
+            duration,
+            LastScanCycle {
+                result: SCAN_CYCLE_RESULT_DEFERRED,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn record_last_cycle(&self, duration: Duration, mut cycle: LastScanCycle) -> u64 {
         self.record_scanner_cycle_end_time();
-        self.last_scan_cycle_result
-            .store(SCAN_CYCLE_RESULT_DEFERRED, Ordering::Relaxed);
-        self.last_scan_cycle_partial_reason
-            .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
-        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
-        self.last_scan_cycle_duration_millis
-            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+        cycle.duration_millis = duration_millis_saturated(duration);
+        let mut latest = self.last_scan_cycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cycle.sequence = latest.sequence.wrapping_add(1);
+        *latest = cycle;
+        cycle.sequence
     }
 
     pub fn record_scan_cycle_partial(&self, duration: Duration, reason: ScanCyclePartialReason) {
@@ -3245,7 +3273,16 @@ impl Metrics {
         reason: ScanCyclePartialReason,
         source: Option<ScannerWorkSource>,
     ) {
-        self.record_scanner_cycle_end_time();
+        self.record_scan_cycle_partial_with_stage(duration, reason, source, reason.budget_stage());
+    }
+
+    fn record_scan_cycle_partial_with_stage(
+        &self,
+        duration: Duration,
+        reason: ScanCyclePartialReason,
+        source: Option<ScannerWorkSource>,
+        stage: Option<&'static str>,
+    ) -> PartialCycleObservation<'_> {
         self.partial_scan_cycles.fetch_add(1, Ordering::Relaxed);
         match reason {
             ScanCyclePartialReason::Unknown => &self.partial_scan_cycles_unknown,
@@ -3254,18 +3291,25 @@ impl Metrics {
             ScanCyclePartialReason::Directories => &self.partial_scan_cycles_directories,
         }
         .fetch_add(1, Ordering::Relaxed);
-        self.last_scan_cycle_result
-            .store(SCAN_CYCLE_RESULT_PARTIAL, Ordering::Relaxed);
-        self.last_scan_cycle_partial_reason.store(reason as u8, Ordering::Relaxed);
-        self.last_scan_cycle_partial_source
-            .store(source.map(ScannerWorkSource::code).unwrap_or_default(), Ordering::Relaxed);
         if let Some(source) = source
             && let Some(cycles) = self.partial_scan_cycles_by_source.get(source.index())
         {
             cycles.fetch_add(1, Ordering::Relaxed);
         }
-        self.last_scan_cycle_duration_millis
-            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+        let sequence = self.record_last_cycle(
+            duration,
+            LastScanCycle {
+                result: SCAN_CYCLE_RESULT_PARTIAL,
+                partial_reason: reason,
+                partial_source: source,
+                partial_stage: stage,
+                ..Default::default()
+            },
+        );
+        PartialCycleObservation {
+            latest: &self.last_scan_cycle,
+            sequence,
+        }
     }
 
     pub fn start_scan_cycle_work(&self) -> ScanCycleWorkSnapshot {
@@ -3854,19 +3898,19 @@ impl Metrics {
         m.current_disk_scan_concurrency_limit = disk_scan_concurrency_limit;
         m.current_disk_bucket_scans_queued = disk_bucket_scans_queued;
         m.current_disk_bucket_scans_active = disk_bucket_scans_active;
-        let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
-        m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
-        m.last_cycle_result_code = last_cycle_result as u64;
-        let partial_reason = ScanCyclePartialReason::from_code(self.last_scan_cycle_partial_reason.load(Ordering::Relaxed));
-        m.last_cycle_partial_reason = partial_reason.as_str().to_string();
-        m.last_cycle_partial_reason_code = partial_reason as u8 as u64;
-        let partial_source = ScannerWorkSource::from_code(self.last_scan_cycle_partial_source.load(Ordering::Relaxed));
-        m.last_cycle_partial_source = partial_source
+        let last = *self.last_scan_cycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        m.last_cycle_result = scan_cycle_result_label(last.result).to_string();
+        m.last_cycle_result_code = last.result.into();
+        m.last_cycle_partial_reason = last.partial_reason.as_str().to_string();
+        m.last_cycle_partial_reason_code = last.partial_reason as u64;
+        m.last_cycle_partial_source = last
+            .partial_source
             .map(ScannerWorkSource::as_str)
             .unwrap_or(SCAN_CYCLE_RESULT_UNKNOWN_LABEL)
             .to_string();
-        m.last_cycle_partial_source_code = partial_source.map(|source| source.code().into()).unwrap_or_default();
-        m.last_cycle_duration_seconds = self.last_scan_cycle_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.last_cycle_partial_source_code = last.partial_source.map(|source| source.code().into()).unwrap_or_default();
+        m.last_cycle_partial_stage = last.partial_stage.map(str::to_owned);
+        m.last_cycle_duration_seconds = last.duration_millis as f64 / 1000.0;
         m.last_cycle_objects_scanned = self.last_scan_cycle_objects_scanned.load(Ordering::Relaxed);
         m.last_cycle_directories_scanned = self.last_scan_cycle_directories_scanned.load(Ordering::Relaxed);
         m.last_cycle_bucket_drive_scans = self.last_scan_cycle_bucket_drive_scans.load(Ordering::Relaxed);
@@ -5282,6 +5326,56 @@ mod tests {
         assert_eq!(report.last_cycle_duration_seconds, 2.0);
         assert_eq!(report.failed_cycles, 0);
         assert_eq!(report.partial_cycles, 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_partial_state_write_can_only_update_its_own_observation() {
+        let metrics = Metrics::new();
+        let record = || {
+            metrics.record_scan_cycle_partial_with_stage(
+                Duration::from_secs(1),
+                ScanCyclePartialReason::Runtime,
+                None,
+                Some("runtime_budget"),
+            )
+        };
+        let old = record();
+        let current = record();
+        assert_eq!(
+            metrics.report().await.partial_cycles,
+            2,
+            "both stops are visible before either state write finishes"
+        );
+        old.observe_state_write(false);
+        assert_eq!(metrics.report().await.last_cycle_partial_stage.as_deref(), Some("runtime_budget"));
+        current.observe_state_write(false);
+        let failed = metrics.report().await;
+        assert_eq!(failed.last_cycle_partial_stage.as_deref(), Some("cycle_state_not_durable"));
+        assert_eq!(failed.partial_cycles, 2);
+        assert_eq!(failed.last_cycle_partial_reason, "runtime");
+        let superseded = record();
+        metrics.record_scan_cycle_complete(true, Duration::ZERO);
+        superseded.observe_state_write(false);
+        assert!(metrics.report().await.last_cycle_partial_stage.is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_stage_is_reported_with_the_last_result_and_cleared_on_completion() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_partial(Duration::from_secs(1), ScanCyclePartialReason::Directories);
+        let partial = serde_json::to_value(metrics.report().await).unwrap();
+        assert_eq!(partial["last_cycle_partial_reason"], "directories");
+        assert_eq!(partial["last_cycle_partial_stage"], "directory_budget");
+        metrics.record_scan_cycle_complete(true, Duration::from_secs(1));
+        let finished = serde_json::to_value(metrics.report().await).unwrap();
+        assert!(
+            !finished
+                .as_object()
+                .expect("serialized report")
+                .contains_key("last_cycle_partial_stage")
+        );
+        let legacy: ScannerMetricsReport = serde_json::from_value(finished).expect("older reports omit the stage");
+        assert_eq!(legacy.last_cycle_partial_stage, None);
     }
 
     #[tokio::test]

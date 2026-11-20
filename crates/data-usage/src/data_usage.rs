@@ -1229,23 +1229,66 @@ impl Serialize for DataUsageEntry {
     where
         S: serde::Serializer,
     {
+        self.serialize_fields(serializer, &self.children, &self.replication_stats, &self.all_tier_stats)
+    }
+}
+
+struct OrderedUsageEntry<'a>(&'a DataUsageEntry);
+
+impl Serialize for OrderedUsageEntry<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut children: Vec<_> = self.0.children.iter().collect();
+        children.sort_unstable();
+        // MessagePack decoders accept struct fields as positional sequences.
+        // Include the nested target and tier maps in stable order as well.
+        let replication = self.0.replication_stats.as_ref().map(|stats| {
+            let ReplicationAllStats {
+                targets,
+                replica_size,
+                replica_count,
+            } = stats;
+            let targets: std::collections::BTreeMap<_, _> = targets.iter().collect();
+            (targets, replica_size, replica_count)
+        });
+        let tiers = self.0.all_tier_stats.as_ref().map(|stats| {
+            let AllTierStats { tiers } = stats;
+            let tiers: std::collections::BTreeMap<_, _> = tiers.iter().collect();
+            (tiers,)
+        });
+        self.0.serialize_fields(serializer, &children, &replication, &tiers)
+    }
+}
+
+impl DataUsageEntry {
+    /// Stable MessagePack encoding for independently reusable scanner checkpoint pages.
+    pub fn ordered_encoding(&self) -> impl Serialize + '_ {
+        OrderedUsageEntry(self)
+    }
+
+    fn serialize_fields<S: serde::Serializer, C: Serialize, R: Serialize, T: Serialize>(
+        &self,
+        serializer: S,
+        children: &C,
+        replication: &R,
+        tiers: &T,
+    ) -> Result<S::Ok, S::Error> {
         // Keep entries map-encoded so older readers can ignore fields appended
         // by newer scanner versions during rolling upgrades. The derived
         // (array) encoding made any appended field a decode error for them.
         let mut state = serializer.serialize_map(Some(
             11 + usize::from(self.unknown_tier_stats.is_some()) + usize::from(self.tier_accounting_proof.is_some()),
         ))?;
-        state.serialize_entry("children", &self.children)?;
+        state.serialize_entry("children", children)?;
         state.serialize_entry("size", &self.size)?;
         state.serialize_entry("objects", &self.objects)?;
         state.serialize_entry("versions", &self.versions)?;
         state.serialize_entry("delete_markers", &self.delete_markers)?;
         state.serialize_entry("obj_sizes", &self.obj_sizes)?;
         state.serialize_entry("obj_versions", &self.obj_versions)?;
-        state.serialize_entry("replication_stats", &self.replication_stats)?;
+        state.serialize_entry("replication_stats", replication)?;
         state.serialize_entry("compacted", &self.compacted)?;
         state.serialize_entry("failed_objects", &self.failed_objects)?;
-        state.serialize_entry("all_tier_stats", &self.all_tier_stats)?;
+        state.serialize_entry("all_tier_stats", tiers)?;
         // Keep the legacy no-unknown shape byte-for-byte stable. Once unknown
         // accounting exists, append its map field before the optional proof.
         if let Some(unknown_tier_stats) = self.unknown_tier_stats.as_ref() {
@@ -2526,6 +2569,32 @@ mod tests {
         let mut entry = DataUsageEntry::default();
         entry.add_tier_sizes(&HashMap::from([(tier.to_string(), stats)]));
         entry
+    }
+
+    #[test]
+    fn ordered_checkpoint_entry_round_trips_and_stays_identical_after_reload() {
+        let mut entry = DataUsageEntry::default();
+        let mut replication = ReplicationAllStats {
+            replica_size: 998,
+            replica_count: 3,
+            ..Default::default()
+        };
+        let mut tiers = AllTierStats::default();
+        for index in 1..=32 {
+            let key = format!("source-{index}");
+            entry.children.insert(key.clone());
+            replication.targets.insert(key.clone(), ReplicationTargetUsage::default());
+            tiers.tiers.insert(key, TierStats::default());
+        }
+        entry.replication_stats = Some(replication);
+        entry.all_tier_stats = Some(tiers);
+        let bytes = rmp_serde::to_vec(&entry.ordered_encoding()).expect("encode ordered checkpoint");
+        let reloaded: DataUsageEntry = rmp_serde::from_slice(&bytes).expect("read with the existing codec");
+        assert_eq!(reloaded.children, entry.children);
+        let replicas = reloaded.replication_stats.as_ref().expect("replication stats");
+        assert_eq!((replicas.targets.len(), replicas.replica_size, replicas.replica_count), (32, 998, 3));
+        assert_eq!(reloaded.all_tier_stats.as_ref().expect("tier stats").tiers.len(), 32);
+        assert_eq!(rmp_serde::to_vec(&reloaded.ordered_encoding()).expect("encode reloaded entry"), bytes);
     }
 
     #[test]

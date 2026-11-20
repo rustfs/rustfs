@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -88,6 +88,86 @@ pub struct ScannerUsageWatchObservation {
     pub known: Option<ScannerUsageWatchKnown>,
 }
 
+pub(crate) struct UsageWatchOwners {
+    pub(crate) deployment: Uuid,
+    pub(crate) local: Uuid,
+    pub(crate) peers: HashMap<String, Uuid>,
+}
+
+impl UsageWatchOwners {
+    pub(crate) fn from_topology(deployment: Uuid, topology: &crate::layout::endpoints::EndpointServerPools) -> Option<Self> {
+        use crate::layout::endpoint::EndpointType;
+        use sha2::{Digest, Sha256};
+        use std::collections::hash_map::Entry;
+
+        if deployment.is_nil() || topology.as_ref().is_empty() {
+            return None;
+        }
+        let mut has_paths = false;
+        let mut nodes = HashMap::new();
+        for pool in topology.as_ref() {
+            if pool.endpoints.as_ref().is_empty()
+                || pool.set_count.checked_mul(pool.drives_per_set) != Some(pool.endpoints.as_ref().len())
+            {
+                return None;
+            }
+            for endpoint in pool.endpoints.as_ref() {
+                if endpoint.get_type() == EndpointType::Path {
+                    if !endpoint.is_local {
+                        return None;
+                    }
+                    has_paths = true;
+                    continue;
+                }
+                let host = endpoint.host_port();
+                let grid = endpoint.grid_host();
+                if host.is_empty() || grid.is_empty() {
+                    return None;
+                }
+                let route = (grid, endpoint.is_local);
+                match nodes.entry(host) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(route);
+                    }
+                    Entry::Occupied(entry) if entry.get() == &route => {}
+                    Entry::Occupied(_) => return None,
+                }
+            }
+        }
+        if has_paths {
+            return nodes.is_empty().then_some(Self {
+                deployment,
+                local: deployment,
+                peers: HashMap::new(),
+            });
+        }
+        let mut local = None;
+        let mut peers = HashMap::new();
+        for (host, (grid, is_local)) in nodes {
+            let mut hash = Sha256::new();
+            hash.update(b"rustfs-scanner-usage-watch-owner-v1");
+            hash.update(deployment.as_bytes());
+            hash.update(host.as_bytes());
+            let digest = hash.finalize();
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            let owner = uuid::Builder::from_custom_bytes(bytes).into_uuid();
+            if is_local {
+                if local.replace(owner).is_some() {
+                    return None;
+                }
+            } else if peers.insert(grid, owner).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            deployment,
+            local: local?,
+            peers,
+        })
+    }
+}
+
 struct Watch {
     owner: Uuid,
     token: Uuid,
@@ -108,6 +188,7 @@ struct State {
 }
 
 pub(crate) struct UsageWatchRegistry {
+    pub(crate) owners: OnceLock<UsageWatchOwners>,
     session: Uuid,
     state: Mutex<State>,
 }
@@ -126,6 +207,7 @@ pub(crate) struct UsageWatchMutationGuard {
 impl Default for UsageWatchRegistry {
     fn default() -> Self {
         Self {
+            owners: OnceLock::new(),
             session: Uuid::new_v4(),
             state: Mutex::new(State {
                 coverage_epoch: 1,

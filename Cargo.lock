@@ -10852,7 +10852,9 @@ dependencies = [
  "rustfs-storage-api",
  "rustfs-test-utils",
  "rustfs-utils",
+ "rustix",
  "s3s",
+ "same-file",
  "serde",
  "serde_json",
  "serial_test",
@@ -10866,6 +10868,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "winapi-util",
 ]
 
 [[package]]

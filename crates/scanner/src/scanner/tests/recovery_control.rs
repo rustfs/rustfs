@@ -160,6 +160,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
                     ScannerMaintenanceFeatures::default(),
                     None,
                     runtime.startup_token(),
+                    &mut None,
                 ),
             )
             .await
