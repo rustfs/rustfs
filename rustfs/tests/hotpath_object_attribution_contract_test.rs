@@ -13,7 +13,6 @@
 // limitations under the License.
 
 const GET_OBJECT: &str = include_str!("../src/app/object/get.rs");
-const PUT_OBJECT: &str = include_str!("../src/storage/legacy_edge/object_write.rs");
 const PUT_OBJECT_OWNED: &str = include_str!("../src/app/object/put.rs");
 const SELECT_OBJECT: &str = include_str!("../src/app/object/mod.rs");
 
@@ -47,16 +46,16 @@ fn object_request_profiling_is_attached_to_the_matching_operation() {
         GET_OBJECT.contains("label = \"rustfs::app::object::get::DefaultObjectUsecase::execute_get_object\""),
         "the native entry must retain the established profiling label"
     );
-    let put_edge = PUT_OBJECT
-        .split_once("async fn put_object_edge(")
-        .unwrap()
+    let put_handler = include_str!("../src/server/gateway_handlers/object_write.rs")
+        .split_once("impl Served for dto::PutObject {")
+        .expect("registered PUT handler")
         .1
-        .split_once("\n    }")
-        .unwrap()
-        .0;
+        .split("\nimpl ")
+        .next()
+        .unwrap();
     assert!(
-        put_edge.contains(".execute_put_object_owned(envelope, input)"),
-        "the storage edge must call the measured PUT"
+        put_handler.contains(".execute_put_object_owned(envelope, input)"),
+        "the gateway must call the measured PUT"
     );
     assert_async_method_is_measured(PUT_OBJECT_OWNED, "execute_put_object_owned");
     assert!(

@@ -461,35 +461,6 @@ impl RequestEnvelope {
     pub fn residual_extensions(&self) -> &Extensions {
         &self.residual_extensions
     }
-
-    /// The payloads the connection, request and signature layers attached, back in the extensions
-    /// they arrive in, for an edge that hands this request to a handler still taking those.
-    pub(crate) fn transport_extensions(&self) -> Extensions {
-        let mut extensions = self.residual_extensions.clone();
-        extensions.insert(self.remote_addr.map(RemoteAddr));
-        if let Some(client_info) = &self.client_info {
-            extensions.insert(client_info.clone());
-        }
-        if let Some(native_tls) = self.native_tls_transport {
-            extensions.insert(NativeTlsTransport(native_tls));
-        }
-        if let Some(request_context) = &self.request_context {
-            extensions.insert(request_context.clone());
-        }
-        if let Some(server_context) = &self.server_context {
-            extensions.insert(Arc::clone(server_context));
-        }
-        if let Some(body_read_control) = &self.body_read_control {
-            extensions.insert(body_read_control.clone());
-        }
-        if let Some(verified) = self.verified_sigv4 {
-            extensions.insert(verified);
-        }
-        if let Some(verified) = self.verified_presigned {
-            extensions.insert(verified);
-        }
-        extensions
-    }
 }
 
 #[cfg_attr(

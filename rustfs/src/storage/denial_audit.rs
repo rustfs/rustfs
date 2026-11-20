@@ -21,10 +21,9 @@
 
 use crate::module_switches::is_audit_module_enabled;
 use crate::storage::authorization::{AuthorizationRequest, req_info_mut};
-use crate::storage::helper::{
-    AuditRequestView, DenialRequest, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
-    spawn_background_with_context,
-};
+use crate::storage::helper::{AuditRequestView, DenialScope, authorization_denial_entry_for_view, spawn_background_with_context};
+#[cfg(test)]
+use crate::storage::helper::{DenialRequest, authorization_denial_entry};
 use crate::storage::request_context::RequestContext;
 use rustfs_audit::{AuditEntry, global::AuditLogger};
 use rustfs_policy::policy::action::Action;
@@ -176,10 +175,12 @@ impl DenialAuditor {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn audit<T>(&self, req: &DenialRequest<T>, action: &Action, reason: &'static str, scope: DenialScope) {
         self.audit_at(req, action, reason, scope, (self.clock)());
     }
 
+    #[cfg(test)]
     pub(crate) fn audit_at<T>(
         &self,
         req: &DenialRequest<T>,

@@ -258,7 +258,6 @@ windows-sys = { workspace = true, features = [
 windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
-s3s = { workspace = true, features = ["minio"] }
 aws-smithy-async.workspace = true
 rustfs-s3-ops.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }

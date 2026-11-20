@@ -358,6 +358,10 @@ impl TestGateway {
     pub(crate) const ACCESS_KEY: &str = "gatewaytestroot";
     pub(crate) const SECRET_KEY: &str = "gateway-test-root-secret";
 
+    pub(crate) async fn call(&self, request: Request<rustfs_gateway::Body>) -> Response<rustfs_gateway::Body> {
+        self.0.call(request).await
+    }
+
     /// Publishes the root on `context` and assembles the stack over `slot`, which holds `context`.
     pub(crate) fn over(context: &crate::runtime_sources::AppContext, slot: Arc<ServerContextSlot>) -> Self {
         assert!(

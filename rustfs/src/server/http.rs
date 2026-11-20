@@ -4646,7 +4646,7 @@ mod tests {
             assert!(slot.install(context));
             let mut legacy = s3s::service::S3ServiceBuilder::new(UnusedS3);
             legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
-            legacy.set_route(crate::admin::make_admin_route(false, slot.clone()).unwrap());
+            legacy.set_route(crate::admin::make_admin_router(false, slot.clone()).unwrap());
             legacy.set_host(s3s::host::MultiDomain::new(["s3.example.test"]).unwrap());
             let legacy = legacy.build();
             (env, slot, legacy)

@@ -17,6 +17,9 @@ mod compress;
 pub mod cors;
 mod event;
 mod gateway_handlers;
+#[cfg(test)]
+pub(crate) mod gateway_stack;
+#[cfg(not(test))]
 mod gateway_stack;
 mod health;
 mod http;

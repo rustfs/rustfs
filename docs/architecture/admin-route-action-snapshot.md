@@ -9,7 +9,7 @@ This page is a pointer, not a route table. The machine-checked matrix in `route_
 
 | Prefix | Behavior | Rule |
 |---|---|---|
-| `/rustfs/admin` | Canonical admin prefix used by `make_admin_route` (`rustfs/src/admin/mod.rs`) | The only registered admin prefix |
+| `/rustfs/admin` | Canonical admin prefix used by `make_admin_router` (`rustfs/src/admin/mod.rs`) | The only registered admin prefix |
 | `/minio/admin` | Compatibility alias accepted by `S3Router::is_match`; `canonicalize_admin_path` rewrites it to `/rustfs/admin` immediately before route lookup (`rustfs/src/admin/router.rs`) | Never register routes twice; preserve canonicalization |
 | `/iceberg/v1` | Table catalog prefix registered by `register_table_catalog_route` (`rustfs/src/admin/handlers/table_catalog/routes.rs`) and accepted by `is_admin_path` | Stays outside `/rustfs/admin`; table actions are authorized per handler |
 | `/health`, `/health/ready` | Public health endpoints, registered only when `ENV_HEALTH_ENDPOINT_ENABLE` allows | Preserve the unauthenticated bypass |

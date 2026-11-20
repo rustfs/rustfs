@@ -158,6 +158,17 @@ impl DefaultMultipartUsecase {
         envelope: RequestEnvelope,
         input: UploadPartCopyWriteInput,
     ) -> S3Result<UploadPartCopyWriteOutput> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPartCopy, http::StatusCode::OK, |envelope| {
+            Box::pin(self.execute_upload_part_copy_body(envelope, input))
+        })
+        .await
+    }
+
+    async fn execute_upload_part_copy_body(
+        &self,
+        envelope: RequestEnvelope,
+        input: UploadPartCopyWriteInput,
+    ) -> S3Result<UploadPartCopyWriteOutput> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             envelope.headers(),
             envelope.uri().query(),
