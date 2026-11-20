@@ -40,14 +40,13 @@ use crate::storage_api_contracts::list::{
     AuthoritativeListOperations, ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo,
     StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
 };
-use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
+use crate::store::{ECStore, VersioningConfiguration};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
     FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetadataResolutionParams,
 };
-use rustfs_gateway_types::persistence::PersistedVersioningConfiguration;
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
     ListObjectsGatherCaller, ListObjectsGatherObservation,
@@ -91,7 +90,7 @@ enum ListingMergeOutput {
     TierRecovery {
         sender: Sender<Result<TierRecoveryEntry>>,
         bucket: String,
-        versioning: Option<PersistedVersioningConfiguration>,
+        versioning: Option<VersioningConfiguration>,
         marker: Option<String>,
     },
 }
