@@ -23,7 +23,7 @@ mod head_object;
 mod list_objects_v2;
 mod put_object;
 
-pub(crate) use get_object::get_object;
-pub(crate) use head_object::head_object;
-pub(crate) use list_objects_v2::list_objects_v2;
+pub(crate) use get_object::{get_object, get_object_fields};
+pub(crate) use head_object::{head_object, head_object_fields};
+pub(crate) use list_objects_v2::{list_objects_v2, list_objects_v2_owned};
 pub(crate) use put_object::put_object;

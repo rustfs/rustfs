@@ -347,6 +347,90 @@ impl GatewayStack {
     }
 }
 
+/// The gateway stack over a server context, with requests signed by a root it publishes on that
+/// context: for tests that drive an operation through the wire codec, authentication and
+/// authorization instead of calling its use case.
+#[cfg(test)]
+pub(crate) struct TestGateway(GatewayStack);
+
+#[cfg(test)]
+impl TestGateway {
+    pub(crate) const ACCESS_KEY: &str = "gatewaytestroot";
+    pub(crate) const SECRET_KEY: &str = "gateway-test-root-secret";
+
+    pub(crate) async fn call(&self, request: Request<rustfs_gateway::Body>) -> Response<rustfs_gateway::Body> {
+        self.0.call(request).await
+    }
+
+    /// Publishes the root on `context` and assembles the stack over `slot`, which holds `context`.
+    pub(crate) fn over(context: &crate::runtime_sources::AppContext, slot: Arc<ServerContextSlot>) -> Self {
+        assert!(
+            context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: Self::ACCESS_KEY.to_owned(),
+                secret_key: Self::SECRET_KEY.to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }),
+            "the test context has no root yet"
+        );
+        let stack = GatewayStack::assemble(GatewayAssembly {
+            server_ctx: slot,
+            root_access_key: Self::ACCESS_KEY.to_owned(),
+            root_secret_key: Self::SECRET_KEY.to_owned(),
+            region: None,
+            server_domains: Vec::new(),
+            body_read_timeout: Duration::from_secs(300),
+            keystone_auth: None,
+        })
+        .expect("the gateway stack assembles");
+        Self(stack)
+    }
+
+    /// `method target` with `headers` and `body`, header-signed by the root over an unsigned
+    /// payload. A `Result`, so a call site reads as a service call does.
+    pub(crate) async fn signed(
+        &self,
+        method: http::Method,
+        target: &str,
+        headers: Vec<(&str, String)>,
+        body: bytes::Bytes,
+    ) -> Result<Response<rustfs_gateway::Body>, std::convert::Infallible> {
+        use crate::server::gateway_handlers::test_support::{Signed, signed_request_with_headers};
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        // The signer takes the canonical spelling of a subresource, `uploads=` for `uploads`.
+        let query = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                if pair.contains('=') {
+                    pair.to_owned()
+                } else {
+                    format!("{pair}=")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut signed_headers = http::HeaderMap::new();
+        // The length is the body's own, set below; the signer does not sign it.
+        for (name, value) in headers
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("content-length"))
+        {
+            signed_headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                value.parse().expect("a header value"),
+            );
+        }
+        let request =
+            signed_request_with_headers(Signed::Header, method, path, &query, Self::ACCESS_KEY, Self::SECRET_KEY, signed_headers);
+        let mut request = request.map(|_| http_body_util::Full::new(body.clone()));
+        request
+            .headers_mut()
+            .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(body.len()));
+        Ok(self.0.call(request).await)
+    }
+}
+
 /// The early gate over `table` and the two metadata listings: an operation it serves is allowed on
 /// to its handler, which decides; every other operation is denied.
 fn early_gate(table: OperationTable) -> impl Authorizer {

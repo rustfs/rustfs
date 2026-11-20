@@ -99,6 +99,7 @@ pub(crate) mod contract {
     pub(crate) mod multipart {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
+        #[cfg(test)]
         pub(crate) use super::super::storage_contracts::ListPartsInfo;
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
@@ -192,18 +193,15 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::parity_test_support;
     pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
-    pub(crate) use super::super::authorization::ObjectTagConditions;
-    pub(crate) use super::super::authorization::TableDataPlanePublicationGuards;
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
+    pub(crate) use super::super::authorization::parity_test_support;
     pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
     pub(crate) use super::super::authorization::{
-        authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
+        authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers,
         authorize_staged_multipart_part, authorize_write_etag_condition,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
-    pub(crate) use super::super::ecfs::FS;
     pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_context::RequestContext;
@@ -231,10 +229,6 @@ pub(crate) mod deadlock_detector_consumer {
 
 pub(crate) mod ecfs_consumer {
     pub(crate) mod contract {
-        pub(crate) mod bucket {
-            pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
-        }
-
         pub(crate) mod object {
             pub(crate) use super::super::super::contract::object::ObjectOperations;
         }
@@ -437,13 +431,14 @@ pub(crate) mod s3_api_consumer {
 
         pub(crate) mod contract {
             pub(crate) mod multipart {
-                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
+                pub(crate) use super::super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 
                 #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::PartInfo;
+                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, PartInfo};
             }
         }
 
+        #[cfg(test)]
         pub(crate) use super::super::to_s3s_xml_etag;
     }
 
@@ -483,6 +478,7 @@ pub(crate) mod tonic_service_consumer {
 
 #[cfg(test)]
 pub(crate) mod test_consumer {
+    pub(crate) use super::super::access_owned::object_read::authorize_head_object;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::TestAuthorizationHooks;
         pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
@@ -859,8 +855,6 @@ pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersio
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
-#[cfg(test)]
-pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
@@ -2660,6 +2654,7 @@ pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
     ecstore_set_disk::is_valid_storage_class(storage_class)
 }
 
+#[cfg(test)]
 pub(crate) fn effective_storage_class<'a>(stored_class: Option<&'a str>, completed_transition_tier: Option<&'a str>) -> &'a str {
     ecstore_config::storageclass::effective_class(stored_class, completed_transition_tier)
 }
@@ -2718,6 +2713,7 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 ///
 /// A document the legacy edge accepted but the persisted reader refuses is
 /// answered as `MalformedXML`, the code the old codec used for its own refusals.
+#[cfg(test)]
 pub(crate) fn persisted_from_s3s<S, T>(value: &S) -> s3s::S3Result<T>
 where
     S: s3s::xml::Serialize,
@@ -2735,6 +2731,7 @@ where
 }
 
 /// Renders a persisted configuration as the DTO the legacy edge answers with.
+#[cfg(test)]
 pub(crate) fn persisted_to_s3s<T, S>(value: &T) -> s3s::S3Result<S>
 where
     T: ecstore_bucket::utils::BucketConfigXml,
@@ -2766,12 +2763,14 @@ pub(crate) fn tags_to_s3s(tags: Vec<rustfs_gateway_types::cors_tagging::Persiste
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn tagging_from_s3s(value: &s3s::dto::Tagging) -> rustfs_gateway_types::cors_tagging::PersistedTagging {
     rustfs_gateway_types::cors_tagging::PersistedTagging {
         tag_set: tags_from_s3s(value.tag_set.clone()),
     }
 }
 
+#[cfg(test)]
 pub(crate) fn tagging_to_s3s(value: &rustfs_gateway_types::cors_tagging::PersistedTagging) -> s3s::dto::Tagging {
     s3s::dto::Tagging {
         tag_set: tags_to_s3s(value.tag_set.clone()),

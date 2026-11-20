@@ -1030,12 +1030,6 @@ pub(in crate::app) fn object_lock_checks_required_for_state(state: &metadata_sys
 pub(crate) const ON_DEMAND_MIGRATION_HEADER: http::HeaderName = http::HeaderName::from_static("x-rustfs-on-demand-migration");
 pub(crate) const ON_DEMAND_MIGRATION_SOURCE: HeaderValue = HeaderValue::from_static("source");
 
-/// Response header marking a `ListObjectsV2` that could not consult the source
-/// and was answered from local state alone (rustfs/backlog#2164).
-pub(crate) const ON_DEMAND_MIGRATION_LIST_HEADER: http::HeaderName =
-    http::HeaderName::from_static("x-rustfs-on-demand-migration-list");
-pub(crate) const ON_DEMAND_MIGRATION_LIST_LOCAL_ONLY: HeaderValue = HeaderValue::from_static("local_only");
-
 /// Custom S3 error code for a source failure surfaced under
 /// `policy.source_error = propagate`; carried on HTTP 424.
 pub(crate) const ODM_SOURCE_UNAVAILABLE_CODE: &str = "SourceUnavailable";
@@ -1109,12 +1103,6 @@ pub(crate) fn mark_on_demand_migration_response(headers: &mut HeaderMap) {
     headers.insert(ON_DEMAND_MIGRATION_HEADER, ON_DEMAND_MIGRATION_SOURCE);
 }
 
-/// Marks a merged listing that fell back to local state because the source
-/// could not be consulted (rustfs/backlog#2164).
-pub(crate) fn mark_on_demand_migration_list_local_only(headers: &mut HeaderMap) {
-    headers.insert(ON_DEMAND_MIGRATION_LIST_HEADER, ON_DEMAND_MIGRATION_LIST_LOCAL_ONLY);
-}
-
 /// Evaluates the request's conditional headers (`If-Match`, `If-None-Match`,
 /// `If-Modified-Since`, `If-Unmodified-Since`) against the source's view of
 /// the object, with the same S3 semantics the local path applies to
@@ -1155,14 +1143,7 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
 /// Reject unsupported ETag comparisons with 501 NotImplemented.
 /// Treating it as an ETag comparison would let a write overwrite an existing key
 /// while still satisfying a policy that requires `s3:if-none-match`.
-pub(crate) fn reject_non_wildcard_write_if_none_match(
-    if_none_match: Option<&s3s::dto::ETagCondition>,
-    headers: &HeaderMap,
-) -> S3Result<()> {
-    reject_non_wildcard_write_if_none_match_native(matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_))), headers)
-}
-
-pub(crate) fn reject_non_wildcard_write_if_none_match_native(specific_if_none_match: bool, headers: &HeaderMap) -> S3Result<()> {
+pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bool, headers: &HeaderMap) -> S3Result<()> {
     // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
     if specific_if_none_match
         || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
@@ -1180,7 +1161,6 @@ pub(crate) fn reject_non_wildcard_write_if_none_match_native(specific_if_none_ma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::ETag;
     use http::{HeaderMap, HeaderValue};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
@@ -1190,12 +1170,8 @@ mod tests {
     #[test]
     fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
         let headers = HeaderMap::new();
-        assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok());
-        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers).is_ok());
-
-        let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
-        let err =
-            reject_non_wildcard_write_if_none_match(Some(&etag), &headers).expect_err("an ETag If-None-Match must be rejected");
+        assert!(reject_non_wildcard_write_if_none_match(false, &headers).is_ok());
+        let err = reject_non_wildcard_write_if_none_match(true, &headers).expect_err("an ETag If-None-Match must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
         assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
         assert_eq!(
@@ -1209,12 +1185,12 @@ mod tests {
         for value in ["*", " * ", "", " "] {
             let mut headers = HeaderMap::new();
             headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
-            assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok(), "{value:?}");
+            assert!(reject_non_wildcard_write_if_none_match(false, &headers).is_ok(), "{value:?}");
         }
         for value in ["\"different-etag\"", "W/\"weak-etag\"", "unquoted-etag"] {
             let mut headers = HeaderMap::new();
             headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
-            let err = reject_non_wildcard_write_if_none_match(None, &headers)
+            let err = reject_non_wildcard_write_if_none_match(false, &headers)
                 .expect_err("header-only ETag precondition must be rejected");
             assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
         }
@@ -1229,7 +1205,7 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.append(http::header::IF_NONE_MATCH, http::HeaderValue::from_static("*"));
             headers.append(http::header::IF_NONE_MATCH, value);
-            let err = reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers)
+            let err = reject_non_wildcard_write_if_none_match(false, &headers)
                 .expect_err("a form wildcard must not hide an unsupported raw HTTP precondition");
             assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
         }

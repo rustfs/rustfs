@@ -211,11 +211,17 @@ mod tests {
                 let mut req = build_request(input, Method::PUT);
                 req.extensions.insert(ReqInfo::default());
                 req.extensions.insert(slot.clone());
-                authorize_bucket_config_mutation(&slot, &mut req, &bucket, Action::S3Action(S3Action::PutBucketTaggingAction))
-                    .await
-                    .expect("permission allows tag updates");
+                let mut envelope = RequestEnvelope::from_s3s(&req);
+                authorize_bucket_config_mutation(
+                    &slot,
+                    &mut envelope,
+                    &bucket,
+                    Action::S3Action(S3Action::PutBucketTaggingAction),
+                )
+                .await
+                .expect("permission allows tag updates");
                 let result = usecase
-                    .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, persisted)
+                    .execute_put_bucket_tagging(envelope, &req.input.bucket, persisted)
                     .await;
                 if valid {
                     result.expect("valid tags are persisted");

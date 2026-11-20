@@ -19,5 +19,7 @@
 //! lossless. Everything here goes away with the s3s edge itself (task T4.1).
 
 mod envelope;
+#[cfg(test)]
 pub(crate) mod lifecycle;
+#[cfg(test)]
 pub(crate) mod replication;
