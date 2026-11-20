@@ -22,6 +22,8 @@
 
 pub mod admin_usecase;
 mod answered;
+#[cfg(test)]
+mod audit_coverage_test;
 pub(crate) mod bucket_list_through;
 pub mod bucket_usecase;
 pub mod context;

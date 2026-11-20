@@ -27,7 +27,7 @@
 //! is process-global, so two stacks in one process would read each other's buckets.
 
 mod compare;
-mod reference;
+pub(crate) mod reference;
 mod scenarios;
 
 use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path, workspace_root};

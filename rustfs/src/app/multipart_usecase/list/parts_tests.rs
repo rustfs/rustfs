@@ -165,7 +165,7 @@ fn list_parts_resolves_real_owners_and_retains_storage_errors() {
             storage_error,
             StorageError::InvalidUploadID(..) | StorageError::MalformedUploadID(..)
         ));
-        let expected = multipart_upload_api_error(storage_error);
+        let expected: LegacyS3Error = ApiError::from(storage_error).into();
         for target in [
             gateway_fields(&bucket, key, id, None, None),
             ListPartsFields {
@@ -217,10 +217,11 @@ fn list_parts_applies_the_authorized_generation_before_lookup() {
         let req = || {
             let mut req = build_request((), Method::GET);
             req.extensions.insert(slot.clone());
-            req
+            RequestEnvelope::from_s3s(&req)
         };
         let capability = |query: &str| {
-            let mut request = req();
+            let mut request = build_request((), Method::GET);
+            request.extensions.insert(slot.clone());
             request.uri = format!("/fixture?{query}").parse().expect("fixture URI");
             RequestEnvelope::from_s3s(&request)
         };
@@ -269,7 +270,7 @@ fn list_parts_applies_the_authorized_generation_before_lookup() {
         temp_env::async_with_vars([(rustfs_config::ENV_VEEAM_SOSAPI_ENABLE, Some("true"))], async {
             let err = execute_counted(
                 &usecase,
-                RequestEnvelope::from_s3s(&veeam_request),
+                veeam_request,
                 gateway_fields(
                     &bucket,
                     ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/system.xml",
@@ -294,13 +295,8 @@ fn list_parts_applies_the_authorized_generation_before_lookup() {
             if let Some(guard) = guard {
                 request.install_bucket_generation(guard);
             }
-            let result = execute_counted(
-                &usecase,
-                RequestEnvelope::from_s3s(&request),
-                gateway_fields(&bucket, key, &upload.upload_id, marker, None),
-                lookups,
-            )
-            .await;
+            let result =
+                execute_counted(&usecase, request, gateway_fields(&bucket, key, &upload.upload_id, marker, None), lookups).await;
             assert_eq!(result.as_ref().err().map(|err| err.code().as_str()), code);
             if let Ok(page) = result {
                 assert!(page.upload_id == upload.upload_id);

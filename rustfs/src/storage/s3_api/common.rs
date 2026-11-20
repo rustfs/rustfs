@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{Initiator, Owner};
+#[cfg(test)]
+use s3s::dto::Initiator;
+use s3s::dto::Owner;
 
 // Stable owner identity used in S3 response payloads (for example ACL, ListBuckets, and multipart listings).
 // RustFS currently does not maintain a persistent per-tenant canonical owner ID, so we keep a deterministic
@@ -28,6 +30,7 @@ pub(crate) fn rustfs_owner() -> Owner {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn rustfs_initiator() -> Initiator {
     Initiator {
         id: Some(RUSTFS_OWNER_ID.to_owned()),

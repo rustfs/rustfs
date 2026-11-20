@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Builds a [`RequestEnvelope`] from an s3s request at the legacy edge.
-//!
-//! The request is only borrowed: until its call site moves to the envelope
-//! (T1.8), the legacy handler keeps reading the same request.
+//! Builds a [`RequestEnvelope`] from a legacy S3 request for compatibility tests.
 
 use crate::app::storage_api::s3::S3Request;
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
