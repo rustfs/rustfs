@@ -400,10 +400,10 @@ mod tests {
         assert!(status.is_client_error(), "the old secret must stop working, status: {status}");
 
         env.stop_server();
-        Ok(())
+        drop(env);
+        console_session_rotates_the_iam_password_and_revokes_the_old_session().await
     }
 
-    #[tokio::test]
     async fn console_session_rotates_the_iam_password_and_revokes_the_old_session() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
