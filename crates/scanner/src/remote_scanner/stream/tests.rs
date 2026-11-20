@@ -216,7 +216,7 @@ async fn remote_checkpoint_survives_replica_detach_and_same_uuid_reconnect() {
             );
             scan_and_persist_local_bucket_with_store(
                 disk,
-                ctx,
+                budget.token(),
                 budget,
                 Arc::new(AtomicU8::new(RemoteScannerPhase::Scanning as u8)),
                 Arc::new(Notify::new()),
@@ -232,12 +232,21 @@ async fn remote_checkpoint_survives_replica_detach_and_same_uuid_reconnect() {
     let disk_b = &disks[1];
     let endpoint_b = disk_b.endpoint();
     let uuid_b = disk_b.get_disk_id().await.expect("read disk ID").expect("formatted disk");
-    assert!(
-        matches!(scan(disk_b.clone(), Some(8)).await, RemoteScannerFrameResult::DurableProgress(receipt) if receipt.advanced)
-    );
+    let first = scan(disk_b.clone(), Some(8)).await;
     let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
     let mut cache = DataUsageCache::default();
     cache.load(set.clone(), &cache_name).await.expect("load B's checkpoint");
+    assert!(
+        matches!(&first, RemoteScannerFrameResult::DurableProgress(receipt) if receipt.advanced),
+        "B returned {first:?}, persisted identity={:?} progress={:?} source={:?} frontier={:?} work={} trees={} complete={}",
+        cache.info.scan_identity,
+        cache.info.scan_progress,
+        cache.info.scan_directory_source,
+        cache.validated_scan_frontier(),
+        cache.info.scan_directory_work.len(),
+        cache.info.scan_source_trees.len(),
+        cache.info.snapshot_complete
+    );
     let source_b = cache.info.scan_directory_source.expect("source for the partial traversal");
 
     let detached = set.disks.write().await[1].take().expect("detach B");
