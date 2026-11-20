@@ -3580,8 +3580,8 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
                 "current_revision": context.current_revision,
                 "part_sizes": part_sizes,
                 "bytes": current_read.len(),
-                "rollback_read_sha256": format!("{:x}", sha2::Sha256::digest(&rollback_read)),
-                "roll_forward_read_sha256": format!("{:x}", sha2::Sha256::digest(&current_read)),
+                "rollback_read_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&rollback_read), hex_simd::AsciiCase::Lower),
+                "roll_forward_read_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&current_read), hex_simd::AsciiCase::Lower),
             });
             std::fs::write(
                 context.directory.join("inflight-multipart-rollback.json"),
