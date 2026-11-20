@@ -28,7 +28,7 @@ pub mod diagnostic {
 }
 
 pub mod admin {
-    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
+    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info, get_server_info_with_inventory};
 }
 
 pub mod bitrot {

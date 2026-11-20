@@ -568,6 +568,72 @@ async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_a_budget_deadline_before_the_first_worker_poll() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    budget.wait_for_stop().await;
+    advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+    let worker = std::future::poll_fn(|_| panic!("expired drain must win before polling the worker"));
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, worker, std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("dropped attempt");
+    assert_eq!(
+        (attempt.epoch, attempt.cycle, attempt.result, attempt.partial_reason),
+        (9, 40, "partial", Some("runtime"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_lock_loss_cancellation_and_cooperative_completion() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, std::future::pending(), std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics.scanner_node_observation().await.last_attempt.expect("lost lock");
+    assert_eq!(attempt.result, "lock_lost");
+    assert!(attempt.duration >= SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    ctx.cancel();
+    let wait = await_observed_scanner_cycle(&metrics, 9, 41, &ctx, &budget, std::future::pending(), std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Cancelled);
+    assert_eq!(
+        metrics
+            .scanner_node_observation()
+            .await
+            .last_attempt
+            .expect("cancelled attempt")
+            .result,
+        "cancelled"
+    );
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let worker = std::future::ready(ScannerCycleOutcome::Completed);
+    let wait = await_observed_scanner_cycle(&metrics, 9, 42, &ctx, &budget, worker, std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("cooperative result");
+    assert_eq!((attempt.cycle, attempt.result), (42, "success"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn cycle_budget_fences_late_writer_after_timeout() {
     let cycle_ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new(

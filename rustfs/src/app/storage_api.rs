@@ -70,8 +70,11 @@ pub(crate) mod s3 {
 }
 
 pub(crate) mod admin {
-    pub(crate) async fn get_server_info(get_pools: bool) -> rustfs_madmin::InfoMessage {
-        crate::storage::storage_api::ecstore_admin::get_server_info(get_pools).await
+    pub(crate) async fn get_server_info(
+        get_pools: bool,
+        include_inventory: bool,
+    ) -> (rustfs_madmin::InfoMessage, Option<rustfs_madmin::ClusterInventory>) {
+        crate::storage::storage_api::ecstore_admin::get_server_info_with_inventory(get_pools, include_inventory).await
     }
 }
 

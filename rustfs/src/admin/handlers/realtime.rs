@@ -18,6 +18,8 @@
 //! keeping the response format explicitly NDJSON. It is not a Prometheus text
 //! exposition endpoint.
 
+mod cluster_scanner;
+
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::Operation;
 use crate::admin::storage_api::access::spawn_traced;
@@ -66,6 +68,8 @@ struct MetricsParams {
     by_dep_id: String,
     #[serde(skip)]
     n_set: bool,
+    scope: String,
+    valid_cluster_count: bool,
 }
 
 impl Default for MetricsParams {
@@ -81,7 +85,22 @@ impl Default for MetricsParams {
             by_job_id: Default::default(),
             by_dep_id: Default::default(),
             n_set: false,
+            scope: String::new(),
+            valid_cluster_count: true,
         }
+    }
+}
+
+impl MetricsParams {
+    fn is_single_cluster_scanner_sample(&self) -> bool {
+        self.valid_cluster_count
+            && self.types == 1
+            && self.hosts.is_empty()
+            && self.disks.is_empty()
+            && self.by_job_id.is_empty()
+            && self.by_dep_id.is_empty()
+            && self.by_host != "true"
+            && self.by_disk != "true"
     }
 }
 
@@ -92,6 +111,11 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
+                if key == "scope"
+                    && let Some(value) = parts.next()
+                {
+                    mp.scope = value.to_owned();
+                }
                 if key == "disks"
                     && let Some(value) = parts.next()
                 {
@@ -111,7 +135,9 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
                     && let Some(value) = parts.next()
                 {
                     mp.n_set = true;
-                    mp.n = value.parse::<u64>().unwrap_or(DEFAULT_METRICS_SAMPLES);
+                    let count = value.parse::<u64>();
+                    mp.valid_cluster_count = count == Ok(1);
+                    mp.n = count.unwrap_or(DEFAULT_METRICS_SAMPLES);
                 }
                 if key == "types"
                     && let Some(value) = parts.next()
@@ -200,6 +226,31 @@ impl Operation for MetricsHandler {
 
         let mp = extract_metrics_init_params(&req.uri);
         debug!("mp: {:?}", mp);
+
+        if mp.scope == "cluster" {
+            if !mp.is_single_cluster_scanner_sample() {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "cluster scanner summaries require n=1, types=1 and no node filters"
+                ));
+            }
+            let cluster_scanner = cluster_scanner::read(crate::admin::runtime_sources::app_context_from_req(&req)).await;
+            #[derive(Serialize)]
+            struct ClusterFrame {
+                cluster_scanner: cluster_scanner::Summary,
+                #[serde(rename = "final")]
+                finished: bool,
+            }
+            let mut encoded = serde_json::to_vec(&ClusterFrame {
+                cluster_scanner,
+                finished: true,
+            })
+            .map_err(|_| s3_error!(InternalError, "could not encode cluster scanner status"))?;
+            encoded.push(b'\n');
+            let mut header = HeaderMap::new();
+            header.insert(CONTENT_TYPE, HeaderValue::from_static(CONSOLE_METRICS_CONTENT_TYPE));
+            return Ok(S3Response::with_headers((StatusCode::OK, Body::from(encoded)), header));
+        }
 
         let tick = parse_duration(&mp.tick).unwrap_or_else(|_| StdDuration::from_secs(3));
         let mut n = resolve_sample_count(&mp);
@@ -301,6 +352,28 @@ mod tests {
     }
 
     #[test]
+    fn cluster_scanner_scope_only_accepts_one_unfiltered_scanner_sample() {
+        fn params(query: &str) -> super::MetricsParams {
+            let uri = format!("/rustfs/admin/v3/realtime?scope=cluster&{query}")
+                .parse()
+                .expect("test URI");
+            extract_metrics_init_params(&uri)
+        }
+        let valid = params("n=1&types=1");
+        assert_eq!(valid.scope, "cluster");
+        assert!(valid.is_single_cluster_scanner_sample());
+        for query in [
+            "types=1&n=5",
+            "types=1&n=bad",
+            "types=3&n=1",
+            "types=1&n=1&hosts=only-one",
+            "types=1&by-host=true",
+        ] {
+            assert!(!params(query).is_single_cluster_scanner_sample(), "{query}");
+        }
+    }
+
+    #[test]
     fn metrics_params_default_to_single_sample() {
         let uri: Uri = "/rustfs/admin/v3/realtime".parse().unwrap();
         let mp = extract_metrics_init_params(&uri);
@@ -331,15 +404,18 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_handler_rejects_missing_credentials() {
-        let result = MetricsHandler {}
-            .call(build_metrics_request("/rustfs/admin/v3/realtime"), Params::new())
-            .await;
-        let err = match result {
-            Ok(_) => panic!("metrics handler must reject unauthenticated requests"),
-            Err(err) => err,
-        };
+        for uri in [
+            "/rustfs/admin/v3/realtime",
+            "/rustfs/admin/v3/realtime?scope=cluster&types=1&n=1",
+        ] {
+            let result = MetricsHandler {}.call(build_metrics_request(uri), Params::new()).await;
+            let err = match result {
+                Ok(_) => panic!("metrics handler must reject unauthenticated requests"),
+                Err(err) => err,
+            };
 
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
-        assert_eq!(err.message(), Some("Signature is required"));
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(err.message(), Some("Signature is required"));
+        }
     }
 }

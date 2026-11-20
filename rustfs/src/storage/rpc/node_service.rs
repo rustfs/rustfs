@@ -10968,6 +10968,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_scanner_rpc_returns_compact_node_sample() {
+        let service = create_test_node_service();
+        let request = GetMetricsRequest {
+            metric_type: rmp_serde::to_vec(&MetricType::SCANNER_SUMMARY)
+                .expect("encode scanner selector")
+                .into(),
+            opts: rmp_serde::to_vec(&CollectMetricsOpts::default())
+                .expect("encode empty filters")
+                .into(),
+        };
+        let response = service
+            .get_metrics(Request::new(request))
+            .await
+            .expect("GetMetrics")
+            .into_inner();
+        assert!(response.success);
+        let sample: rustfs_madmin::metrics::RealtimeMetrics =
+            rmp_serde::from_slice(&response.realtime_metrics).expect("named reply");
+        assert!(sample.scanner_node.is_some());
+        assert!(
+            sample.aggregated.scanner.is_none(),
+            "peer probe excludes the full scanner report and paths"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_metrics_round_trip() {
         let service = create_test_node_service();
         let metric_type = MetricType::DISK;

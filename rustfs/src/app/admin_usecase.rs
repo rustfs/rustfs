@@ -53,10 +53,12 @@ pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/cap
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
     pub include_pools: bool,
+    pub include_inventory: bool,
 }
 
 pub struct QueryServerInfoResponse {
     pub info: InfoMessage,
+    pub inventory: Option<rustfs_madmin::ClusterInventory>,
 }
 
 impl std::fmt::Debug for QueryServerInfoResponse {
@@ -307,8 +309,8 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
-        let info = get_server_info(req.include_pools).await;
-        Ok(QueryServerInfoResponse { info })
+        let (info, inventory) = get_server_info(req.include_pools, req.include_inventory).await;
+        Ok(QueryServerInfoResponse { info, inventory })
     }
 
     pub async fn execute_query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
