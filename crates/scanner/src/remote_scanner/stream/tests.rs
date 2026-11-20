@@ -109,6 +109,62 @@ fn retry_bucket_terminal_frame_preserves_its_wire_disposition() {
     assert!(!frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX));
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn retired_remote_source_at_eof_retries_without_certifying_its_walk() {
+    use crate::scanner_io::tests::{retire_source_at_eof, setup_local_scanner_store, wait_for_namespace_commit_tails};
+    use crate::storage_api::scan::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
+
+    let (_directory, store) = setup_local_scanner_store(1, 4).await;
+    let bucket = "remote-retired-source";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    let mut reader = crate::ScannerPutObjReader::from_vec(b"payload".to_vec());
+    store
+        .put_object(bucket, "object", &mut reader, &crate::ScannerObjectOptions::default())
+        .await
+        .expect("write object");
+    wait_for_namespace_commit_tails(&store).await;
+    let set = store.pools[0].disk_set[0].clone();
+    let disk = scanner_set_disk_inventory(&set).await[0].clone();
+    let retirement = disk.local_retirement_token().expect("local source");
+    let _probe = retire_source_at_eof(bucket, set.clone());
+    let mut request = test_request(Uuid::new_v4());
+    request.bucket = bucket.to_owned();
+    request.scan_mode = HealScanMode::Normal;
+    crate::save_config(
+        store.clone(),
+        crate::DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        crate::scanner::encode_scanner_cycle_fence_for_test(request.next_cycle, request.leader_epoch),
+    )
+    .await
+    .expect("persist the worker's cycle fence");
+    let ctx = CancellationToken::new();
+    let frame = scan_and_persist_local_bucket_with_store(
+        disk,
+        ctx.clone(),
+        ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+        Arc::new(AtomicU8::new(RemoteScannerPhase::Scanning as u8)),
+        Arc::new(Notify::new()),
+        request,
+        store,
+    )
+    .await
+    .expect_err("retired worker must relinquish this bucket")
+    .into_frame();
+    assert!(retirement.is_cancelled(), "fault must fire after the walk reaches EOF");
+    assert!(matches!(frame.scope, RemoteScannerErrorScope::Bucket));
+    assert!(frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX), "{}", frame.message);
+    let mut cache = DataUsageCache::default();
+    cache
+        .load(set, &path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]))
+        .await
+        .expect("load checkpoint");
+    assert!(!cache.info.snapshot_complete);
+}
+
 #[test]
 fn semantic_deadline_is_capped_by_rpc_lifetime_without_overflow() {
     let now = Instant::now();
@@ -2022,10 +2078,9 @@ async fn retry_bucket_error_terminal_frame_requeues_bucket_work() {
             &mut sequence,
             &RemoteScannerFrame::terminal(
                 RemoteScannerProgress::default(),
-                RemoteScannerFrameResult::Error(RemoteScannerErrorFrame {
-                    scope: RemoteScannerErrorScope::Bucket,
-                    message: format!("{NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX} cache lock contention"),
-                }),
+                RemoteScannerFrameResult::Error(
+                    RemoteScannerServerError::source_unavailable(StorageError::FaultyDisk).into_frame(),
+                ),
             ),
         )
         .await
@@ -2040,7 +2095,7 @@ async fn retry_bucket_error_terminal_frame_requeues_bucket_work() {
 
     assert!(error.retry_bucket_work());
     assert!(!error.retire_worker());
-    assert!(error.to_string().contains("cache lock contention"));
+    assert!(error.to_string().contains("Faulty disk"));
 }
 
 #[tokio::test]
@@ -2917,6 +2972,65 @@ async fn background_envelope_accepts_the_full_wire_limit_and_matches_none() {
 
 #[path = "durable_progress.rs"]
 mod durable_progress;
+
+#[tokio::test]
+#[serial_test::serial]
+async fn remote_source_admission_preserves_slot_identity_and_single_drive_heal_suppression() {
+    use crate::storage_api::scan::HEALING_MARKER_PATH;
+
+    for width in [1, 4] {
+        let (_directory, store) = crate::scanner_io::tests::setup_local_scanner_store(1, width).await;
+        let set = &store.pools[0].disk_set[0];
+        let disk = scanner_set_disk_inventory(set).await.remove(0);
+        let options = crate::DiskInfoOptions::default();
+        let mut info = disk.disk_info(&options).await.expect("probe formatted source");
+        assert!(!remote_source_heal_suppression(&disk, set, &info, false).expect("formatted source may serve"));
+        assert!(remote_source_heal_suppression(&disk, set, &info, true).expect("preserve requested suppression"));
+
+        info.error = "failed admission probe".to_owned();
+        assert!(
+            remote_source_heal_suppression(&disk, set, &info, false)
+                .expect_err("probe returned a disk error")
+                .retry_bucket
+        );
+        info.error.clear();
+        for id in [None, Some(Uuid::nil()), Some(Uuid::new_v4())] {
+            info.id = id;
+            assert!(
+                remote_source_heal_suppression(&disk, set, &info, false)
+                    .expect_err("format mismatch")
+                    .retry_bucket
+            );
+        }
+
+        let marker = disk.path().join(crate::RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH);
+        tokio::fs::write(&marker, b"scanner fixture")
+            .await
+            .expect("mark rebuilding drive");
+        let marked = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let info = disk.disk_info(&options).await.expect("probe marked source");
+                if info.healing {
+                    break info;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("observe healing marker");
+        let admitted = remote_source_heal_suppression(&disk, set, &marked, false);
+        if width == 1 {
+            assert!(admitted.expect("single formatted drive may serve usage with healing suppressed"));
+        } else {
+            assert!(admitted.expect_err("marked multi-drive source must be retried").retry_bucket);
+            assert!(
+                remote_source_heal_suppression(&disk, set, &marked, true)
+                    .expect_err("peer cannot override set width")
+                    .retry_bucket
+            );
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]

@@ -28,6 +28,10 @@ pub enum ScannerError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The selected disk failed or was replaced. Discard uncommitted walk state.
+    #[error("Scanner source unavailable: {0}")]
+    SourceUnavailable(#[source] Box<crate::StorageError>),
+
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -64,4 +68,10 @@ pub enum ScannerError {
     /// Partial cache retained because the bucket or scan root disappeared.
     #[error("Scanner namespace path disappeared during the scan")]
     NamespaceNotFoundCache(Box<DataUsageCache>),
+}
+
+impl ScannerError {
+    pub(crate) fn source_unavailable(error: crate::StorageError) -> Self {
+        Self::SourceUnavailable(Box::new(error))
+    }
 }

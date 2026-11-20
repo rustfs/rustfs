@@ -53,6 +53,7 @@ mod cycle_collector_diagnostics;
 mod expiry_lock;
 mod listing_window_scope;
 pub(super) mod local_drive_recovery;
+pub(crate) use local_drive_recovery::retire_source_at_eof;
 mod node_admission;
 mod partial_bucket_carry;
 mod per_bucket_certification;
@@ -5141,7 +5142,7 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         .get_size(item.clone())
         .await
         .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
-    assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+    assert!(matches!(err, StorageError::FileNotFound | StorageError::VolumeNotFound));
 
     let missing = global_metrics().scan_observation().snapshot().metadata_reads;
     assert_eq!(missing.attempts, before.attempts + 1);
@@ -5158,7 +5159,7 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
             .get_size(item)
             .await
             .expect_err("symlink loop must remain a read failure");
-        assert!(is_scanner_metadata_transient_error(&err), "read error: {err:?}");
+        assert!(matches!(err, StorageError::Io(_) | StorageError::Unexpected), "read error: {err:?}");
         let failed = global_metrics().scan_observation().snapshot().metadata_reads;
         assert_eq!(failed.attempts, missing.attempts + 1);
         assert_eq!(failed.errors, missing.errors + 1);
@@ -5225,7 +5226,7 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
             .get_size(item.clone())
             .await
             .expect_err("corrupt metadata should be surfaced as scanner-heal work");
-        assert!(is_scanner_metadata_corrupt_error(&err));
+        assert!(matches!(err, StorageError::FileCorrupt));
     }
 
     let reads = global_metrics().scan_observation().snapshot().metadata_reads;

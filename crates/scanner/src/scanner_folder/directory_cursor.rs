@@ -50,7 +50,13 @@ pub(super) async fn physical_source(disk: &Arc<Disk>) -> Result<String, super::S
             }
         }
         Ok(Some(_)) => return Err(io::Error::new(io::ErrorKind::InvalidData, "scanner disk format contains a nil ID").into()),
-        Err(error) => return Err(io::Error::other(error).into()),
+        Err(error) => {
+            let error = crate::StorageError::from(error);
+            if crate::scanner_io::is_scanner_source_unavailable(&error) {
+                return Err(super::ScannerError::source_unavailable(error));
+            }
+            return Err(io::Error::other(error).into());
+        }
     };
     Ok(format!("{generation}|{endpoint}"))
 }

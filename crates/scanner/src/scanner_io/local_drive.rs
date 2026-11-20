@@ -74,13 +74,7 @@ pub(super) async fn current_local_scanner_disk(
     // This also bounds the first binding, while the coordinator owns a scan
     // permit. Waiting for a format probe must respect source cancellation and its turn.
     let lookup = async {
-        let location = EcstoreDiskAPI::get_disk_location(assigned.as_ref());
-        let expected_id = location
-            .disk_idx
-            .and_then(|index| set.format.erasure.sets.get(set.set_index)?.get(index))
-            .copied()
-            .filter(|id| !id.is_nil());
-        let expected_id = expected_id?;
+        let expected_id = scanner_slot_disk_id(set, assigned)?;
         let candidate = scanner_set_disk_inventory(set).await.into_iter().find(|candidate| {
             EcstoreDiskAPI::is_local(candidate.as_ref())
                 && EcstoreDiskAPI::endpoint(candidate.as_ref()) == EcstoreDiskAPI::endpoint(assigned.as_ref())

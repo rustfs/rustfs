@@ -628,6 +628,9 @@ impl SetDisks {
         debug!("renew_disk: update {:?}", fm.erasure.this);
 
         let mut disk_lock = self.disks.write().await;
+        if let Some(disk::Disk::Local(displaced)) = disk_lock[disk_idx].as_deref() {
+            displaced.retire_handle();
+        }
         disk_lock[disk_idx] = Some(new_disk);
         false
     }
@@ -667,6 +670,9 @@ impl SetDisks {
             if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
                 warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
                 return Ok(false);
+            }
+            if let Some(disk::Disk::Local(displaced)) = disks[disk_idx].as_deref() {
+                displaced.retire_handle();
             }
             disks[disk_idx] = Some(replacement.clone());
         }
@@ -1251,6 +1257,9 @@ mod tests {
             .await
             .expect("renewed disk_info should record a drive API metric");
         renewed_disk.force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Offline);
+        assert!(
+            matches!(renewed_disk.as_ref(), disk::Disk::Local(local) if matches!(local.check_scanner_handle(), Err(DiskError::FaultyDisk)))
+        );
 
         set_disks.renew_disk(&endpoints[0]).await;
 
@@ -1258,6 +1267,13 @@ mod tests {
         let renewed_again = disks[0]
             .as_ref()
             .expect("second renew_disk should keep the recovered disk attached");
+        let (disk::Disk::Local(retired), disk::Disk::Local(current)) = (renewed_disk.as_ref(), renewed_again.as_ref()) else {
+            panic!("local reconnect fixture must retain a local slot");
+        };
+        assert!(matches!(retired.check_scanner_handle(), Err(DiskError::DiskNotFound)));
+        current
+            .check_scanner_handle()
+            .expect("reconnected scanner handle must be usable");
         assert_eq!(
             renewed_again
                 .metrics_snapshot()
