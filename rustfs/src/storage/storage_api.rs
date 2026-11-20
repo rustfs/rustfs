@@ -2148,7 +2148,7 @@ pub(crate) async fn get_bucket_website_config_for_store(
 
 pub(crate) fn validate_website_configuration(
     config: &rustfs_gateway_types::persistence::PersistedWebsiteConfiguration,
-) -> s3s::S3Result<()> {
+) -> rustfs_s3_types::S3Result<()> {
     if config.redirect_all_requests_to.is_some()
         && (config.index_document.is_some() || config.error_document.is_some() || config.routing_rules.is_some())
     {
@@ -2230,7 +2230,7 @@ pub(crate) fn validate_website_configuration(
     Ok(())
 }
 
-fn validate_website_redirect_host(host: &str) -> s3s::S3Result<()> {
+fn validate_website_redirect_host(host: &str) -> rustfs_s3_types::S3Result<()> {
     let url =
         url::Url::parse(&format!("http://{host}/")).map_err(|_| website_config_error("website redirect host is invalid"))?;
     if url.host_str().is_none()
@@ -2245,8 +2245,8 @@ fn validate_website_redirect_host(host: &str) -> s3s::S3Result<()> {
     Ok(())
 }
 
-fn website_config_error(message: &'static str) -> s3s::S3Error {
-    s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, message)
+fn website_config_error(message: &'static str) -> rustfs_s3_types::S3Error {
+    rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::MalformedXML, message)
 }
 
 #[cfg(test)]
@@ -2357,16 +2357,8 @@ pub(crate) async fn record_replication_proxy(bucket: &str, api: &str, is_err: bo
     }
 }
 
-pub(crate) fn decode_tags(tags: &str) -> Vec<s3s::dto::Tag> {
-    tags_to_s3s(ecstore_bucket::tagging::decode_tags(tags))
-}
-
 pub(crate) fn decode_tags_to_map(tags: &str) -> std::collections::HashMap<String, String> {
     ecstore_bucket::tagging::decode_tags_to_map(tags)
-}
-
-pub(crate) fn encode_tags(tags: Vec<s3s::dto::Tag>) -> String {
-    ecstore_bucket::tagging::encode_tags(tags_from_s3s(tags))
 }
 
 /// Writes an s3s response body for test assertions. Bucket configurations go
@@ -2749,7 +2741,8 @@ where
     Ok(value)
 }
 
-pub(crate) fn tags_from_s3s(tags: Vec<s3s::dto::Tag>) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
+#[cfg(test)]
+fn tags_from_s3s(tags: Vec<s3s::dto::Tag>) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
     tags.into_iter()
         .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
             key: tag.key,
@@ -2758,7 +2751,8 @@ pub(crate) fn tags_from_s3s(tags: Vec<s3s::dto::Tag>) -> Vec<rustfs_gateway_type
         .collect()
 }
 
-pub(crate) fn tags_to_s3s(tags: Vec<rustfs_gateway_types::cors_tagging::PersistedTag>) -> Vec<s3s::dto::Tag> {
+#[cfg(test)]
+fn tags_to_s3s(tags: Vec<rustfs_gateway_types::cors_tagging::PersistedTag>) -> Vec<s3s::dto::Tag> {
     tags.into_iter()
         .map(|tag| s3s::dto::Tag {
             key: tag.key,

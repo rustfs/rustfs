@@ -11375,7 +11375,6 @@ dependencies = [
  "rustfs-storage-api",
  "rustfs-test-utils",
  "rustfs-utils",
- "s3s",
  "serde",
  "serde_json",
  "serial_test",
