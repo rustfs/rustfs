@@ -1136,7 +1136,7 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
         user_defined: metadata.into(),
         ..Default::default()
     };
-    check_preconditions(headers, &info)
+    Ok(check_preconditions(headers, &info)?)
 }
 
 /// S3 documents write-side `If-None-Match` only as `*` (create-only).

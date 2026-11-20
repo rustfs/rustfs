@@ -116,7 +116,7 @@ impl DefaultBucketUsecase {
 
     async fn list_objects_page(&self, envelope: &mut RequestEnvelope, request: &PageRequest) -> S3Result<Page> {
         let PageRequest { bucket, params, .. } = request;
-        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), envelope.uri().query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_deref(), envelope.uri().query())?;
         let store = get_validated_store(bucket).await?;
         let incl_deleted = get_header(envelope.headers(), rustfs_utils::http::SUFFIX_INCLUDE_DELETED).as_deref() == Some("true");
         let table_list_access = envelope.table_list_access().cloned();

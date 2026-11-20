@@ -503,7 +503,7 @@ fn project_delete_objects_pre_stat_error(
     error: ApiError,
 ) -> S3Result<DeleteBatchError> {
     // Bucket loss invalidates the shared request, not just one object.
-    if error.code == S3ErrorCode::NoSuchBucket {
+    if error.code == rustfs_s3_types::S3ErrorCode::NoSuchBucket {
         return Err(error.into());
     }
     Ok(DeleteBatchError {
@@ -676,10 +676,9 @@ impl DefaultObjectUsecase {
             let key = normalize_delete_object_key(&obj_id.key);
             // A rejected wire key has no authorization resource. Its normalized text cannot become a target.
             let key_error = if obj_id.key_too_long {
-                Some((
-                    S3ErrorCode::InvalidArgument,
-                    ApiError::error_code_to_message(&S3ErrorCode::InvalidArgument),
-                ))
+                let code = rustfs_s3_types::S3ErrorCode::InvalidArgument;
+                let message = ApiError::error_code_to_message(&code);
+                Some((code, message))
             } else {
                 validate_object_key(&key, "DeleteObjects")
                     .err()
