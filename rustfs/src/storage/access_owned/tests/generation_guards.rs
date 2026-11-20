@@ -410,7 +410,7 @@ async fn copy_operations_reject_recreated_source_bucket_after_authorization() {
         copy_source_sse_customer_key_md5: None,
     };
     let err = DefaultMultipartUsecase::with_context(Some(app_context))
-        .execute_upload_part_copy_owned(upload_envelope, upload_input)
+        .execute_upload_part_copy_with_audit(upload_envelope, upload_input)
         .await
         .err()
         .expect("stale authorization must not read the recreated source into a part");

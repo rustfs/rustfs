@@ -626,7 +626,7 @@ impl DefaultBucketUsecase {
 
         let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), envelope.uri().query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_deref(), envelope.uri().query())?;
 
         let store = get_validated_store(&bucket).await?;
         let incl_deleted = get_header(envelope.headers(), rustfs_utils::http::SUFFIX_INCLUDE_DELETED)

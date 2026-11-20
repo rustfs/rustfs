@@ -503,7 +503,7 @@ fn project_delete_objects_pre_stat_error(
     error: ApiError,
 ) -> S3Result<DeleteBatchError> {
     // Bucket loss invalidates the shared request, not just one object.
-    if error.code == S3ErrorCode::NoSuchBucket {
+    if error.code == rustfs_s3_types::S3ErrorCode::NoSuchBucket {
         return Err(error.into());
     }
     Ok(DeleteBatchError {
@@ -678,7 +678,7 @@ impl DefaultObjectUsecase {
             let key_error = if obj_id.key_too_long {
                 Some((
                     S3ErrorCode::InvalidArgument,
-                    ApiError::error_code_to_message(&S3ErrorCode::InvalidArgument),
+                    ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::InvalidArgument),
                 ))
             } else {
                 validate_object_key(&key, "DeleteObjects")
