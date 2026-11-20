@@ -2396,17 +2396,20 @@ impl FolderScanner {
                     raw_entries_observed = raw_entries_observed.saturating_add(1);
                     let raw_entry_is_new = (continues_stream || raw_entries_observed > raw_replay_floor)
                         && !raw_enumeration_committed_entries.contains(&file_name);
+                    #[cfg(test)]
                     if raw_entry_is_new {
-                        #[cfg(test)]
                         tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
-                        pending_entry_progress = pending_entry_progress.saturating_add(1);
-                        if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
-                            || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
-                        {
-                            self.budget.record_entries_visited(pending_entry_progress);
-                            pending_entry_progress = 0;
-                            last_entry_progress = Instant::now();
-                        }
+                    }
+                    // Physical discovery is progress even when a changed directory
+                    // must replay names retained by its logical page index. Budget
+                    // admission below still charges only newly durable entries.
+                    pending_entry_progress = pending_entry_progress.saturating_add(1);
+                    if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
+                        || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
+                    {
+                        self.budget.record_entries_visited(pending_entry_progress);
+                        pending_entry_progress = 0;
+                        last_entry_progress = Instant::now();
                     }
                     let raw_entry_is_durable =
                         self.record_raw_enumeration_entry_with_stream(&folder.name, &file_name, continues_stream);
