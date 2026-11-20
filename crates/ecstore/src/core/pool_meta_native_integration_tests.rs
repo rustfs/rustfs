@@ -207,10 +207,10 @@ async fn pool_meta_native_physical_split_without_ordinary_commit_performs_no_mut
     let before = snapshots(&fixture.store).await;
     let mut state = clean_state(&fixture);
     let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
-    assert!(
-        repair(&fixture.store, &mut state, &fence).await.is_err(),
-        "reconstruction alone must never authorize a COMMIT"
-    );
+    let error = repair(&fixture.store, &mut state, &fence)
+        .await
+        .expect_err("reconstruction alone must never authorize a COMMIT");
+    assert!(error.to_string().contains("(no_ordinary_v3_authority)"), "{error}");
     assert_eq!(
         snapshots(&fixture.store).await,
         before,

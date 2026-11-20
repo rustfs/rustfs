@@ -38,8 +38,16 @@ struct InspectedPool {
     snapshots: Vec<PoolMetaNativeInspection>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("native pool metadata recovery requires one proven V3 transaction and complete matching disk evidence ({0})")]
+struct MissingEvidence(&'static str);
+
+fn missing_evidence(reason: &'static str) -> Error {
+    Error::other(MissingEvidence(reason))
+}
+
 fn invalid() -> Error {
-    Error::other("native pool metadata recovery requires one proven V3 transaction and complete matching disk evidence")
+    missing_evidence("inconsistent_evidence")
 }
 
 fn known_validation(source: Error, phase: &'static str) -> Error {
@@ -71,7 +79,12 @@ fn latch_validation(state: &mut PoolMetaWriteState, error: Error) -> Error {
 fn current(pool: &InspectedPool) -> Result<Vec<Bytes>> {
     pool.snapshots
         .iter()
-        .map(|snapshot| snapshot.current.clone().ok_or_else(invalid))
+        .map(|snapshot| {
+            snapshot
+                .current
+                .clone()
+                .ok_or_else(|| missing_evidence("missing_pool_metadata_head"))
+        })
         .collect()
 }
 
@@ -87,12 +100,12 @@ async fn inspect(pools: &[Arc<Sets>], fence: &PoolMetaPersistenceFence<'_>) -> R
             .await
             .iter()
             .cloned()
-            .map(|disk| disk.ok_or_else(invalid))
+            .map(|disk| disk.ok_or_else(|| missing_evidence("missing_pool_metadata_slot")))
             .collect::<Result<Vec<_>>>()?;
         let probes = futures::stream::iter(disks.iter().cloned().map(|disk| async move {
             match disk.pool_meta_native_recovery(Request::Probe {}).await? {
                 Response::Probed => Ok(()),
-                _ => Err(invalid()),
+                _ => Err(missing_evidence("unexpected_probe_response")),
             }
         }))
         .buffered(4)
@@ -116,7 +129,7 @@ async fn inspect(pools: &[Arc<Sets>], fence: &PoolMetaPersistenceFence<'_>) -> R
                 .await?
             {
                 Response::Inspected(snapshot) if !snapshot.disk_id.is_nil() => Ok(snapshot),
-                _ => Err(invalid()),
+                _ => Err(missing_evidence("invalid_disk_identity_evidence")),
             }
         }))
         .buffered(4)
@@ -142,7 +155,7 @@ async fn validate_identities(pools: &[Arc<Sets>], canonical: &[u8], fence: &Pool
             .await
             .iter()
             .cloned()
-            .map(|disk| disk.ok_or_else(invalid))
+            .map(|disk| disk.ok_or_else(|| missing_evidence("missing_pool_identity_slot")))
             .collect::<Result<Vec<_>>>()?;
         let results = futures::stream::iter(disks.into_iter().enumerate().map(|(index, disk)| async move {
             match disk.pool_meta_native_recovery(Request::InspectIdentity {}).await? {
@@ -151,7 +164,7 @@ async fn validate_identities(pools: &[Arc<Sets>], canonical: &[u8], fence: &Pool
                         .await
                         .map_err(|error| codec_validation(error, "native_identity_validation"))
                 }
-                _ => Err(invalid()),
+                _ => Err(missing_evidence("invalid_disk_identity_evidence")),
             }
         }))
         .buffered(4)
@@ -479,7 +492,7 @@ pub(super) async fn repair(
         })
         .collect::<Vec<_>>();
     if ordinary_commits.is_empty() && ordinary_prepares.is_empty() {
-        return Err(invalid());
+        return Err(missing_evidence("no_ordinary_v3_authority"));
     }
     let selection = select_pool_meta_replica_reads(reads)
         .map_err(|error| latch_validation(state, known_validation(error, "native_metadata_validation")))?;
@@ -535,7 +548,7 @@ pub(super) async fn repair(
         .iter()
         .any(|read| !matches!(read.replica, PoolMetaIdentityReplica::Valid(_)))
     {
-        return Err(invalid());
+        return Err(missing_evidence("pool_identity_unavailable"));
     }
     let identity = select_pool_meta_identity(identities, cluster_id)
         .map_err(|error| latch_validation(state, known_validation(error, "native_identity_validation")))?;
@@ -847,7 +860,10 @@ mod tests {
     async fn pool_meta_native_plan_rejects_missing_or_corrupt_evidence() {
         let mut f = fixture().await;
         let before = f.pools[1].snapshots[2].current.take();
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
+        let error = plan(&f.pools, &f.commit, f.revision, &f.identity, None)
+            .await
+            .expect_err("missing current shard must block the repair plan");
+        assert!(error.to_string().contains("(missing_pool_metadata_head)"), "{error}");
         f.pools[1].snapshots[2].current = before;
         f.pools[1].snapshots[2].backups[0].data = Bytes::from_static(b"invalid metadata");
         assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
