@@ -1102,6 +1102,22 @@ struct RenameAdmissionGrant {
     batch: bool,
 }
 
+struct QuarantinedRenamePermit {
+    permit: Option<OwnedSemaphorePermit>,
+    batch: bool,
+    items: usize,
+}
+
+impl Drop for QuarantinedRenamePermit {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        drop(permit);
+        rustfs_io_metrics::record_ecstore_rename_quarantine_released(self.batch, self.items);
+    }
+}
+
 impl RenameAdmissionGrant {
     fn release_one(&mut self) -> bool {
         self.permit.as_mut().is_some_and(|permit| permit.split(1).is_some())
@@ -1125,17 +1141,20 @@ impl RenameAdmissionGrant {
         let hold = get_max_timeout_duration();
         let release_at = tokio::time::Instant::now() + hold;
         rustfs_io_metrics::record_ecstore_rename_quarantine(self.batch, items, hold);
-        let batch = self.batch;
+        let permit = QuarantinedRenamePermit {
+            permit: Some(permit),
+            batch: self.batch,
+            items,
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 tokio::time::sleep_until(release_at).await;
                 drop(permit);
-                rustfs_io_metrics::record_ecstore_rename_quarantine_released(batch, items);
             });
         } else {
             // Without a runtime there is no safe deadline task. Leaking until
             // process exit is safer than admitting work over a still-running mutation.
-            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(batch, items);
+            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(self.batch, items);
             std::mem::forget(permit);
         }
     }
@@ -2820,7 +2839,12 @@ impl RemoteDisk {
         {
             Ok(Ok(permit)) => (Ok(permit), false),
             Ok(Err(_)) => (Err(Error::RemoteClientUnavailable("internode rename admission closed".to_owned())), false),
-            Err(_) => (Err(DiskError::DiskOngoingReq), true),
+            Err(_) => {
+                if started.is_none() {
+                    rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, Duration::ZERO, true);
+                }
+                (Err(DiskError::DiskOngoingReq), true)
+            }
         };
         if let Some(started) = started {
             rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, started.elapsed(), timed_out);
@@ -13514,6 +13538,66 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(rename_admission_metrics)]
+    async fn rename_admission_timeout_is_visible_without_stage_metrics() {
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+            let disk = remote_disk_for_addr("http://127.0.0.1:59989").await;
+            let gate = Arc::clone(disk.rename_admission.as_ref().expect("configured rename admission"));
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+            let admission = disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("available admission succeeds")
+                .expect("rename admission is enabled");
+            drop(admission);
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                0
+            );
+
+            let held = Arc::clone(&gate)
+                .acquire_many_owned(
+                    u32::try_from(rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT)
+                        .expect("rename admission limit fits u32"),
+                )
+                .await
+                .expect("hold every rename admission permit");
+            let error = match disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("exhausted admission must time out"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DiskError::DiskOngoingReq));
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                1
+            );
+
+            drop(held);
+            gate.close();
+            let error = match disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("closed admission must fail without a timeout"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DiskError::RemoteClientUnavailable(_)));
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                1
+            );
+            disk.cancel_token.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rename_admission_quarantine_holds_after_ambiguity() {
         let gate = peer_rename_admission("http://rename-quarantine-peer", true).expect("enabled rename gate");
         let permit = Arc::clone(&gate)
@@ -13535,6 +13619,64 @@ mod tests {
         tokio::time::advance(Duration::from_nanos(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[test]
+    fn rename_admission_quarantine_metrics_release_when_runtime_stops() {
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let gate = peer_rename_admission("http://rename-quarantine-runtime-stop-peer", true).expect("enabled rename gate");
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("quarantine runtime");
+            runtime.block_on(async {
+                let permit = Arc::clone(&gate)
+                    .acquire_many_owned(4)
+                    .await
+                    .expect("weighted batch admission");
+                RenameAdmissionGrant {
+                    permit: Some(permit),
+                    batch: true,
+                }
+                .quarantine_after_ambiguity();
+                assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+            });
+            drop(runtime);
+        });
+
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+        let rows = snapshotter.snapshot().into_vec();
+        let metric_value = |name: &str, kind: MetricKind| {
+            &rows
+                .iter()
+                .find(|(composite, _, _, _)| {
+                    composite.kind() == kind
+                        && composite.key().name() == name
+                        && composite
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "mode" && label.value() == "batch")
+                })
+                .unwrap_or_else(|| panic!("missing batch quarantine metric {name}"))
+                .3
+        };
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_events_total", MetricKind::Counter),
+            DebugValue::Counter(1)
+        ));
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_released_items_total", MetricKind::Counter),
+            DebugValue::Counter(4)
+        ));
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_active_items", MetricKind::Gauge),
+            DebugValue::Gauge(value) if value.into_inner() == 0.0
+        ));
     }
 
     #[tokio::test(start_paused = true)]
