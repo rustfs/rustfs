@@ -16,7 +16,7 @@
 //! tagging, public access block and encryption. Every behaviour test runs on both stacks.
 
 use super::{
-    GATEWAY, LEGACY, MatrixRow, Outcome, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome,
+    GATEWAY, MatrixRow, Outcome, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket, outcome,
     s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -244,41 +244,29 @@ fn gateway_bucket_configuration_deletes_authorize_the_existing_action_and_bucket
 }
 
 #[test]
-fn legacy_bucket_configuration_deletes_authorize_the_existing_action_and_bucket() {
-    with_stack(LEGACY, bucket_configuration_deletes_authorize_the_existing_action_and_bucket);
-}
-
-#[test]
-fn tag_deletion_reaches_opa_with_unreadable_tags_on_both_stacks() {
-    const STACK: &str = "RUSTFS_TEST_TAG_REPAIR_STACK";
-    match std::env::var(STACK).as_deref() {
-        Ok("gateway") => with_stack(GATEWAY, tag_deletion_reaches_opa_with_unreadable_tags),
-        Ok("legacy") => with_stack(LEGACY, tag_deletion_reaches_opa_with_unreadable_tags),
-        _ => {
-            // The IAM plug-in is process-wide, so isolate it from the other embedded tests.
-            for stack in ["gateway", "legacy"] {
-                let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-                    .args([
-                        "--exact",
-                        "bucket_configs::tag_deletion_reaches_opa_with_unreadable_tags_on_both_stacks",
-                    ])
-                    .env(STACK, stack)
-                    .env("NO_PROXY", "127.0.0.1,localhost")
-                    .env("no_proxy", "127.0.0.1,localhost")
-                    .output()
-                    .expect("run isolated OPA test");
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                assert!(
-                    output.status.success() && stdout.contains("test result: ok. 1 passed;"),
-                    "{stack} OPA test failed:\n{stdout}\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
+fn tag_deletion_reaches_opa_with_unreadable_tags() {
+    const ISOLATED: &str = "RUSTFS_TEST_TAG_REPAIR_ISOLATED";
+    if std::env::var_os(ISOLATED).is_some() {
+        with_stack(GATEWAY, tag_deletion_reaches_opa_with_unreadable_tags_on);
+        return;
     }
+    // The IAM plug-in is process-wide, so isolate it from the other embedded tests.
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "bucket_configs::tag_deletion_reaches_opa_with_unreadable_tags"])
+        .env(ISOLATED, "1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("run isolated OPA test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+        "OPA test failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
-async fn tag_deletion_reaches_opa_with_unreadable_tags(server: RustFSServer) {
+async fn tag_deletion_reaches_opa_with_unreadable_tags_on(server: RustFSServer) {
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_policy::policy::opa::{Args, AuthZPlugin};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -669,28 +657,13 @@ fn the_gateway_stack_reads_bucket_cors() {
 }
 
 #[test]
-fn the_legacy_stack_reads_bucket_cors() {
-    with_stack(LEGACY, cors_read);
-}
-
-#[test]
 fn the_gateway_stack_reads_bucket_encryption() {
     with_stack(GATEWAY, encryption_read);
 }
 
 #[test]
-fn the_legacy_stack_reads_bucket_encryption() {
-    with_stack(LEGACY, encryption_read);
-}
-
-#[test]
 fn the_gateway_stack_reads_bucket_tagging() {
     with_stack(GATEWAY, tagging_read);
-}
-
-#[test]
-fn the_legacy_stack_reads_bucket_tagging() {
-    with_stack(LEGACY, tagging_read);
 }
 
 const CORS_BUCKET: &str = "gateway-stack-cors";
@@ -769,11 +742,6 @@ async fn the_cors_document_is_stored_and_removed(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_stores_and_removes_the_cors_document() {
     with_stack(GATEWAY, the_cors_document_is_stored_and_removed);
-}
-
-#[test]
-fn the_legacy_stack_stores_and_removes_the_cors_document() {
-    with_stack(LEGACY, the_cors_document_is_stored_and_removed);
 }
 
 const PUBLIC_ACCESS_BLOCK_XML: &str = concat!(
@@ -940,9 +908,4 @@ async fn public_access_block_configuration(server: RustFSServer, checks_expected
 #[test]
 fn the_gateway_stack_serves_public_access_block_configuration() {
     with_stack(GATEWAY, |server| public_access_block_configuration(server, true));
-}
-
-#[test]
-fn the_legacy_stack_serves_public_access_block_configuration() {
-    with_stack(LEGACY, |server| public_access_block_configuration(server, false));
 }

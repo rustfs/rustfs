@@ -47,11 +47,6 @@
 //! the answer is that id for every bucket, with no lookup: a missing bucket is the handler's own
 //! `NoSuchBucket`.
 
-// The stack is under construction, so a build without debug assertions must not carry it. The
-// message is checked by `scripts/check_connect_release_boundary.py`.
-#[cfg(not(debug_assertions))]
-compile_error!("gateway-stack is restricted to debug builds");
-
 mod admin;
 mod control_plane;
 
@@ -67,10 +62,10 @@ use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
-    AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr,
+    AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr, ConnectionIntent,
     DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces,
     PlaintextCustomerKeyAck, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig,
-    TransportSecurity, UnreadBodyDrain, decide_with,
+    TransportSecurity, connection_intent_of, decide_with,
 };
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, KeystoneEstablished, KeystoneVerifier, RequestIdCarrier, RootCredentials, RootCredentialsError,
@@ -154,7 +149,7 @@ pub(crate) enum GatewayAssemblyError {
     MetadataListingDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
     #[error("RUSTFS_KEYSTONE_ENABLE configuration is invalid: {0}")]
     KeystoneConfig(rustfs_keystone::KeystoneError),
-    #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider on RUSTFS_S3_STACK=gateway")]
+    #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider before the gateway stack is assembled")]
     KeystoneNotInitialized,
     #[error("the Keystone header claim is invalid")]
     KeystoneClaim,
@@ -205,6 +200,26 @@ impl GatewayStack {
         control_plane::assemble(assembly, iam, root, router)
     }
 
+    /// The stack as [`GatewayStack::assemble`] configures it, admitting every caller to the
+    /// handlers `register` adds instead of RustFS's: for tests of the host layers around it.
+    #[cfg(test)]
+    pub(crate) fn assemble_serving(
+        assembly: GatewayAssembly,
+        register: impl FnOnce(ServiceBuilder) -> ServiceBuilder,
+    ) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        let builder = Self::configured_builder(&assembly, iam, root, decide_with(|_| Decision::Allow), std::convert::identity)?;
+        let service = register(builder).build().map_err(GatewayAssemblyError::Service)?;
+        Ok(Self {
+            service,
+            keystone_auth: assembly.keystone_auth,
+            control_plane: false,
+        })
+    }
+
     fn assemble_with(
         assembly: GatewayAssembly,
         iam: Arc<dyn IamKeyLookup>,
@@ -248,8 +263,6 @@ impl GatewayStack {
             // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
             // the refusal once authorization succeeds.
             .defer_encryption_header_refusals_to_handlers()
-            // Keep the profile's inner drain aligned with the host's configured idle bound.
-            .drain_unread_request_bodies(UnreadBodyDrain::with_idle_timeout(assembly.body_read_timeout))
             .authenticator(authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile()))
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
@@ -310,18 +323,107 @@ impl GatewayStack {
             (None, _) => true,
         };
         attach_host_facts(extensions);
-        let mut service = self.service.clone();
+        // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
+        let http1 = request.version() < http::Version::HTTP_2;
+        let service = self.service.clone();
         async move {
             if !valid {
                 let mut response = Response::new(rustfs_gateway::Body::empty());
                 *response.status_mut() = http::StatusCode::FORBIDDEN;
                 return response;
             }
-            match tower::Service::call(&mut service, request).await {
-                Ok(response) => response,
-                Err(never) => match never {},
+            // The service's own entry, not its tower adapter: the adapter reads a body the handler
+            // left unread in a detached task of its own, which takes the body away from
+            // `EarlyResponseBodyService`, the drain the HTTP/1-2 shutdown accounting owns. The
+            // adapter's connection verdict is kept.
+            let mut response = service.call(request).await;
+            if http1 && connection_intent_of(&response).is_some_and(ConnectionIntent::must_close) {
+                response
+                    .headers_mut()
+                    .insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
             }
+            response
         }
+    }
+}
+
+/// The gateway stack over a server context, with requests signed by a root it publishes on that
+/// context: for tests that drive an operation through the wire codec, authentication and
+/// authorization instead of calling its use case.
+#[cfg(test)]
+pub(crate) struct TestGateway(GatewayStack);
+
+#[cfg(test)]
+impl TestGateway {
+    pub(crate) const ACCESS_KEY: &str = "gatewaytestroot";
+    pub(crate) const SECRET_KEY: &str = "gateway-test-root-secret";
+
+    /// Publishes the root on `context` and assembles the stack over `slot`, which holds `context`.
+    pub(crate) fn over(context: &crate::runtime_sources::AppContext, slot: Arc<ServerContextSlot>) -> Self {
+        assert!(
+            context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: Self::ACCESS_KEY.to_owned(),
+                secret_key: Self::SECRET_KEY.to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }),
+            "the test context has no root yet"
+        );
+        let stack = GatewayStack::assemble(GatewayAssembly {
+            server_ctx: slot,
+            root_access_key: Self::ACCESS_KEY.to_owned(),
+            root_secret_key: Self::SECRET_KEY.to_owned(),
+            region: None,
+            server_domains: Vec::new(),
+            body_read_timeout: Duration::from_secs(300),
+            keystone_auth: None,
+        })
+        .expect("the gateway stack assembles");
+        Self(stack)
+    }
+
+    /// `method target` with `headers` and `body`, header-signed by the root over an unsigned
+    /// payload. A `Result`, so a call site reads as a service call does.
+    pub(crate) async fn signed(
+        &self,
+        method: http::Method,
+        target: &str,
+        headers: Vec<(&str, String)>,
+        body: bytes::Bytes,
+    ) -> Result<Response<rustfs_gateway::Body>, std::convert::Infallible> {
+        use crate::server::gateway_handlers::test_support::{Signed, signed_request_with_headers};
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        // The signer takes the canonical spelling of a subresource, `uploads=` for `uploads`.
+        let query = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                if pair.contains('=') {
+                    pair.to_owned()
+                } else {
+                    format!("{pair}=")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut signed_headers = http::HeaderMap::new();
+        // The length is the body's own, set below; the signer does not sign it.
+        for (name, value) in headers
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("content-length"))
+        {
+            signed_headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                value.parse().expect("a header value"),
+            );
+        }
+        let request =
+            signed_request_with_headers(Signed::Header, method, path, &query, Self::ACCESS_KEY, Self::SECRET_KEY, signed_headers);
+        let mut request = request.map(|_| http_body_util::Full::new(body.clone()));
+        request
+            .headers_mut()
+            .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(body.len()));
+        Ok(self.0.call(request).await)
     }
 }
 

@@ -5573,8 +5573,6 @@ dependencies = [
 [[package]]
 name = "hyper"
 version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -9867,6 +9865,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "google-cloud-auth",
+ "h2",
  "h3",
  "h3-quinn",
  "hashbrown 0.17.1",
@@ -10324,7 +10323,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway"
 version = "0.66.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -10371,7 +10370,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-core"
 version = "0.63.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "bytes",
  "futures-core",
@@ -10392,7 +10391,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-dialect-rustfs-admin"
 version = "0.13.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -10406,7 +10405,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10424,7 +10423,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10434,7 +10433,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-sig"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10449,7 +10448,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10460,7 +10459,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-types"
 version = "0.42.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10483,7 +10482,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=d6840d54187382d31526317e61369734c759e2cd#d6840d54187382d31526317e61369734c759e2cd"
+source = "git+https://github.com/rustfs/gateway.git?rev=d32f17219d75989167a05183dd3d04922615cbd5#d32f17219d75989167a05183dd3d04922615cbd5"
 dependencies = [
  "quick-xml 0.41.0",
 ]

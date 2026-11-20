@@ -230,15 +230,12 @@ mod get;
 mod get_response;
 pub(crate) use get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 mod head;
-#[cfg(feature = "gateway-stack")]
 pub(crate) use head::ResponseEtag;
 pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
 mod native_body;
 mod on_demand_migration_put;
-#[cfg(feature = "gateway-stack")]
 pub(crate) mod post_body;
-#[cfg(feature = "gateway-stack")]
 pub(crate) mod post_headers;
 mod put;
 mod put_input;

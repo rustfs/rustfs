@@ -25,3 +25,6 @@ pub(crate) mod object_meta;
 pub(crate) mod object_misc;
 pub(crate) mod object_read;
 pub(crate) mod object_write;
+
+#[cfg(test)]
+mod tests;

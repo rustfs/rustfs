@@ -88,21 +88,14 @@ fn operation_counts() -> std::collections::BTreeMap<&'static str, u64> {
 
 #[test]
 #[serial_test::serial]
-fn get_boundary_legacy() {
-    get_boundary(None);
-}
-
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
 fn get_boundary_gateway() {
-    get_boundary(Some("gateway"));
+    get_boundary(None);
 }
 
 fn get_boundary(stack: Option<&str>) {
     temp_env::with_vars(
         [
-            ("RUSTFS_S3_STACK", stack),
+            (crate::config::RETIRED_S3_STACK_SELECTOR, stack),
             ("RUSTFS_AUDIT_ENABLE", Some("true")),
             ("RUSTFS_SSE_C_REQUIRE_TLS", Some("false")),
         ],
@@ -489,9 +482,13 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
         .sse_customer_key_md5(Some(digest.clone()))
         .build()
         .unwrap();
-    crate::app::test_seams::put_object(usecase, &FS::new(), build_request(input, Method::PUT))
-        .await
-        .unwrap();
+    {
+        let (envelope, input) =
+            crate::app::object_usecase::PutObjectWriteInput::from_test_request(build_request(input, Method::PUT));
+        crate::app::test_seams::put_object(usecase, envelope, input)
+    }
+    .await
+    .unwrap();
     for (case, valid, wrong_key, condition, range) in [
         ("ordinary", true, false, false, false),
         ("missing", false, false, false, false),

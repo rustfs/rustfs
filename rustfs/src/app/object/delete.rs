@@ -1188,7 +1188,6 @@ impl DefaultObjectUsecase {
     /// The access phase has installed `ReqInfo` and the pending bucket-generation guard; this
     /// adds `ReplicateDelete` for a replica delete, repeats `ForceDeleteObject` for a non-owner,
     /// and authorizes every descendant of a recursive force delete.
-    #[cfg(any(feature = "gateway-stack", test))]
     #[instrument(level = "info", skip(self, envelope, input))]
     pub async fn execute_delete_object(
         &self,
@@ -2083,7 +2082,6 @@ mod tests {
     #[serial_test::serial]
     fn repeated_versioned_delete_returns_204_with_legacy_residue() {
         crate::app::gating_test_env::run_large_stack_test("repeated-versioned-delete-http", || async {
-            use crate::app::storage_api::s3::{Body, S3ServiceBuilder};
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
             use http_body_util::BodyExt;
 
@@ -2091,8 +2089,8 @@ mod tests {
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
             let slot = crate::app::runtime_sources::ServerContextSlot::new();
-            assert!(slot.install(context));
-            let service = S3ServiceBuilder::new(FS::with_server_ctx(slot)).build();
+            assert!(slot.install(Arc::clone(&context)));
+            let gateway = crate::server::TestGateway::over(&context, slot);
             let bucket = format!("repeated-delete-http-{}", Uuid::new_v4());
             let key = "history";
             let payload = b"historical version behind repeated delete markers";
@@ -2118,26 +2116,14 @@ mod tests {
                 )
                 .await
                 .expect("write historical version");
-            // Exercise HTTP decoding and serialization with the production FS
-            // dispatcher. Authentication is supplied by the owner fixture.
-            let request = |method: Method, uri: String| {
-                http::Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("host", "localhost")
-                    .extension(crate::storage::req_info::ReqInfo {
-                        cred: Some(rustfs_credentials::Credentials::default()),
-                        is_owner: true,
-                        ..Default::default()
-                    })
-                    .body(Body::empty())
-                    .expect("HTTP request")
-            };
+            // HTTP decoding and serialization through the gateway stack, signed by its root.
+            let gateway = &gateway;
+            let request =
+                |method: Method, uri: String| async move { gateway.signed(method, &uri, Vec::new(), Bytes::new()).await };
             let mut marker_ids = Vec::new();
             let mut backup = None;
             for attempt in 0..2 {
-                let response = service
-                    .call(request(Method::DELETE, format!("/{bucket}/{key}")))
+                let response = request(Method::DELETE, format!("/{bucket}/{key}"))
                     .await
                     .expect("DELETE HTTP response");
                 assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -2173,13 +2159,12 @@ mod tests {
             }
             let (path, bytes) = backup.expect("legacy backup fixture");
             assert_eq!(tokio::fs::read(path).await.expect("legacy backup remains"), bytes);
-            let response = service
-                .call(request(
-                    Method::GET,
-                    format!("/{bucket}/{key}?versionId={}", original.version_id.expect("historical version ID")),
-                ))
-                .await
-                .expect("historical GET HTTP response");
+            let response = request(
+                Method::GET,
+                format!("/{bucket}/{key}?versionId={}", original.version_id.expect("historical version ID")),
+            )
+            .await
+            .expect("historical GET HTTP response");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 BodyExt::collect(response.into_body())
@@ -3622,9 +3607,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_legacy_delete_key_still_records_an_audit() {
+    fn invalid_delete_key_still_records_an_audit() {
         crate::app::gating_test_env::run_large_stack_test("invalid-delete-audit", || async {
-            use s3s::S3 as _;
             let bucket = format!("invalid-delete-audit-{}", Uuid::new_v4());
             let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(&bucket);
             let input = DeleteObjectInput::builder()
@@ -3634,8 +3618,17 @@ mod tests {
                 .expect("delete input");
             let mut request = build_request(input, Method::DELETE);
             request.uri = format!("/{bucket}/key").parse().expect("URI");
-            let error = FS::new().delete_object(request).await.expect_err("invalid key");
-            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            let envelope = RequestEnvelope::from_s3s(&request);
+            let input = request.input;
+            let error = Box::pin(DefaultObjectUsecase::from_global().execute_delete_object_fields(
+                envelope,
+                input.bucket,
+                input.key,
+                input.version_id,
+            ))
+            .await
+            .expect_err("invalid key");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
             let audits = probe.audits.lock().expect("audits");
             assert_eq!(audits.len(), 1);
             assert_eq!(audits[0].api.status.as_deref(), Some("failure"));
