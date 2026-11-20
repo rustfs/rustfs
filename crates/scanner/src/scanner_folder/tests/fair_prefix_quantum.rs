@@ -803,3 +803,211 @@ async fn wide_directory_deleted_bucket_releases_a_slot_under_pressure() {
     assert!(is_parked(next), "an obsolete source must not indefinitely exclude new work");
     super::super::directory_cursor::forget_bucket(&disk, &cache.info);
 }
+
+#[tokio::test]
+#[serial]
+async fn raw_directory_replay_reports_discovery_without_recharging_known_entries() {
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let mut cache = seed_flat_bucket(&disk_root, 0).await;
+    let mut index =
+        RawEnumerationPageWriter::new(RawEnumerationPageIndex::new("bucket", 16).expect("raw index")).expect("raw index writer");
+    for n in 0..64 {
+        tokio::fs::create_dir_all(disk_root.join("bucket").join(format!("object-{n:04}")))
+            .await
+            .expect("existing directory member");
+        index.record_entry(&format!("object-{n:04}")).expect("known directory member");
+    }
+    cache.info.scan_raw_enumeration_page_index = Some(index.checkpoint().expect("persist logical enumeration"));
+    assert_eq!(
+        cache
+            .validated_raw_enumeration_page_index()
+            .expect("valid logical checkpoint")
+            .committed_entries()
+            .expect("known entries")
+            .len(),
+        64
+    );
+    let disk = open_fixture_disk(&disk_root).await;
+    cache.info.scan_directory_source = Some(
+        super::super::directory_cursor::physical_source(&disk)
+            .await
+            .expect("bind the retained logical index to its physical source"),
+    );
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_entries: Some(1),
+            ..Default::default()
+        },
+    );
+    let complete = scan_data_folder(
+        budget.token(),
+        budget.clone(),
+        vec![disk.clone()],
+        disk.clone(),
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await
+    .expect("known entries do not exhaust the one-entry budget");
+    assert_eq!(budget.reason(), None);
+    assert_eq!(complete.checked_flatten("bucket").expect("bucket root").objects, 0);
+    assert_eq!(
+        budget.entries_visited(),
+        64,
+        "real directory discovery must keep the remote stream alive while replaying known names"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[serial]
+async fn ordinary_owner_cancellation_persists_directory_position_for_cold_resume() {
+    use super::super::directory_cursor::is_parked;
+    use super::enumeration_restart::install_raw_entry_owner_cancel;
+
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let mut cache = seed_flat_bucket(&disk_root, 64).await;
+    let tier = runtime_tier_registry_for_cycle(cache.info.next_cycle, cache.info.leader_epoch).await;
+    cache
+        .info
+        .scan_identity
+        .as_mut()
+        .expect("scan identity")
+        .tier_registry_generation = tier.generation;
+    cache.info.tier_registry_generation = Some(tier.generation);
+    let disk = open_fixture_disk(&disk_root).await;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
+    let observer = install_raw_entry_owner_cancel(disk.path(), 16, parent.clone());
+    let result = scan_data_folder(
+        budget.token(),
+        budget.clone(),
+        vec![disk.clone()],
+        disk.clone(),
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await;
+    drop(observer);
+    assert!(parent.is_cancelled());
+    assert_eq!(budget.reason(), None, "the owner stopped independently of the cycle budget");
+    let Err(ScannerError::PartialCache(partial)) = result else {
+        panic!("ordinary cancellation must retain a partial cache");
+    };
+    assert_eq!(partial.info.scan_directory_work.len(), 1, "retain the physical directory receipt");
+    let saved = serde_json::to_value(&partial.info.scan_directory_work[0]).expect("directory receipt");
+    assert_eq!(saved["entries_read"], 16);
+    assert!(!is_parked(disk.path().join("bucket").to_str().expect("fixture path")));
+    let path = temp.path().join("checkpoint.bin");
+    tokio::fs::write(&path, partial.marshal_msg().expect("serialize partial checkpoint"))
+        .await
+        .expect("persist partial checkpoint");
+    let mut cache =
+        DataUsageCache::unmarshal(&tokio::fs::read(&path).await.expect("read cold checkpoint")).expect("reload cold checkpoint");
+    let identity = cache.info.scan_identity.expect("checkpoint identity");
+    let source = cache.info.source.expect("checkpoint source");
+    let plan = crate::DataUsageScanPlanDigest([31; 32]);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 1, source, plan, identity),
+        crate::data_usage_define::DataUsageCachePrepareOutcome::Reused
+    );
+    let cold_disk = open_fixture_disk(&disk_root).await;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_entries: Some(1),
+            ..Default::default()
+        },
+    );
+    let result = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![cold_disk.clone()],
+        cold_disk.clone(),
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await;
+    let Err(ScannerError::PartialCache(partial)) = result else {
+        panic!("one newly charged entry must stop the cold continuation");
+    };
+    let resumed = serde_json::to_value(&partial.info.scan_directory_work[0]).expect("resumed directory receipt");
+    assert_eq!(
+        resumed["entries_read"], 17,
+        "the cold reader must continue after its saved native position"
+    );
+    assert_eq!(resumed["physical"], saved["physical"]);
+    let mut cache = DataUsageCache::unmarshal(&partial.marshal_msg().expect("serialize resumed checkpoint"))
+        .expect("reload resumed checkpoint");
+    cache.prepare_bucket_checkpoint("bucket", 3, 2, source, plan, identity);
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
+    let complete = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![cold_disk.clone()],
+        cold_disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await
+    .expect("cold continuation finishes the bucket");
+    let total = complete.checked_flatten("bucket").expect("complete bucket root");
+    assert_eq!((total.objects, total.size), (64, 64));
+    assert!(complete.info.snapshot_complete);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[serial]
+async fn changed_directory_listing_clears_its_physical_receipt() {
+    use super::super::directory_cursor::{DirectoryScope, ScannerDirectory};
+
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let disk_root = temp.path().join("disk");
+    let cache = seed_flat_bucket(&disk_root, 16).await;
+    let disk = open_fixture_disk(&disk_root).await;
+    let scope = DirectoryScope::new(&disk, &cache, FolderScanMode::Namespace, None).expect("directory scope");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
+    let saved = Arc::new(std::sync::Mutex::new(None));
+    let path = disk_root.join("bucket");
+    let mut directory =
+        ScannerDirectory::open(path.to_str().expect("fixture path"), "bucket", Some(scope), budget, Some(saved.clone()))
+            .await
+            .expect("open physical directory");
+    for _ in 0..8 {
+        directory
+            .peek_entry()
+            .await
+            .expect("read physical entry")
+            .expect("directory member");
+        directory.accept_entry();
+    }
+    directory.work().expect("indexed directory").checkpoint();
+    assert!(saved.lock().expect("receipt").is_some());
+    tokio::fs::rename(&path, disk_root.join("retired"))
+        .await
+        .expect("replace physical directory");
+    tokio::fs::create_dir(&path).await.expect("create successor directory");
+    let error = directory.verify_current().await.expect_err("the old listing is invalid");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    drop(directory);
+    assert!(
+        saved.lock().expect("receipt").is_none(),
+        "an invalid listing cannot retain a resumable receipt"
+    );
+}
