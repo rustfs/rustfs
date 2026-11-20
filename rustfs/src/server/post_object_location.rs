@@ -249,8 +249,8 @@ pub(crate) fn rewrite_post_response_location(
     if !xml.contains("<PostResponse") {
         return None;
     }
-    let bucket = xml_unescape(xml_element(xml, "Bucket")?);
-    let key = xml_unescape(xml_element(xml, "Key")?);
+    let bucket = quick_xml::escape::unescape(xml_element(xml, "Bucket")?).ok()?;
+    let key = quick_xml::escape::unescape(xml_element(xml, "Key")?).ok()?;
     let virtual_hosted = virtual_hosted_bucket.is_some_and(|name| name.eq_ignore_ascii_case(&bucket));
     let location = xml_escape(&post_object_location(scheme, host, &bucket, &key, virtual_hosted));
     let (start, end) = xml_element_span(xml, "Location")?;
@@ -290,15 +290,6 @@ fn xml_escape(value: &str) -> String {
         }
     }
     escaped
-}
-
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
 }
 
 #[cfg(test)]
@@ -374,6 +365,17 @@ mod tests {
             "{rewritten}"
         );
         assert!(rewritten.contains("<Key>uploads/a b&amp;résumé?.txt</Key>"), "{rewritten}");
+    }
+
+    #[test]
+    fn keeps_entity_like_text_in_the_object_key() {
+        let xml = concat!(
+            "<PostResponse><Location>/bucket/&amp;lt;.txt</Location>",
+            "<Bucket>bucket</Bucket><Key>&amp;lt;.txt</Key></PostResponse>"
+        );
+        let rewritten = rewrite_post_response_location(xml, "https", Some("s3.example"), None).unwrap();
+        assert!(rewritten.contains("<Location>https://s3.example/bucket/%26lt%3B.txt</Location>"));
+        assert!(rewritten.contains("<Key>&amp;lt;.txt</Key>"));
     }
 
     #[test]
