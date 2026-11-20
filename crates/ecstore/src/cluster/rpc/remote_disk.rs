@@ -2756,6 +2756,75 @@ impl RemoteDisk {
             .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
+    pub(crate) async fn verify_staged_part(&self, directory: &str, fi: &FileInfo, encoded_size: usize) -> Result<CheckPartsResp> {
+        // The reply arrives after the complete disk scan. A fixed control-RPC
+        // deadline would reject healthy large shards even while reads progress.
+        let scan_seconds = u64::try_from(encoded_size)
+            .map_err(Error::other)?
+            .div_ceil(rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND);
+        let base = get_max_timeout_duration();
+        // gRPC encodes deadlines with at most eight digits and hours as its largest unit.
+        let timeout = if base.is_zero() {
+            Duration::ZERO
+        } else {
+            base.saturating_add(Duration::from_secs(scan_seconds))
+                .min(Duration::from_secs(99_999_999 * 3600))
+        };
+        self.verify_file_rpc(crate::disk::RUSTFS_META_TMP_BUCKET, directory, fi, Some(timeout))
+            .await
+    }
+
+    async fn verify_file_rpc(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: &FileInfo,
+        scan_timeout: Option<Duration>,
+    ) -> Result<CheckPartsResp> {
+        self.execute_with_timeout_for_op(
+            "verify_file",
+            || async {
+                let file_info = serde_json::to_string(fi)?;
+                let mut client = if scan_timeout.is_some() {
+                    if let Some(err) = self.offline_bypass_error() {
+                        return Err(err);
+                    }
+                    super::client::staged_shard_verification_client(
+                        &self.addr,
+                        TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+                    )
+                    .await
+                    .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))?
+                } else {
+                    self.get_client().await?
+                };
+                let mut request = Request::new(VerifyFileRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info,
+                });
+
+                if let Some(timeout) = scan_timeout.filter(|duration| !duration.is_zero()) {
+                    request.set_timeout(timeout);
+                }
+                let response = client.verify_file(request).await?.into_inner();
+                if let Some(error) = response.error {
+                    return Err(error.into());
+                }
+                if !response.success {
+                    return Err(Error::other("peer failed file verification without an error"));
+                }
+
+                let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
+
+                Ok(check_parts_resp)
+            },
+            scan_timeout.unwrap_or_else(get_max_timeout_duration),
+        )
+        .await
+    }
+
     async fn get_client_with_msgpack_policy(&self) -> Result<(NodeRpcClient, MsgpackSendPolicy)> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
@@ -5457,30 +5526,7 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout(
-            || async {
-                let file_info = serde_json::to_string(&fi)?;
-                let mut client = self.get_client().await?;
-                let request = Request::new(VerifyFileRequest {
-                    disk: self.endpoint.to_string(),
-                    volume: volume.to_string(),
-                    path: path.to_string(),
-                    file_info,
-                });
-
-                let response = client.verify_file(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
-
-                Ok(check_parts_resp)
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.verify_file_rpc(volume, path, fi, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -5834,6 +5880,9 @@ impl DiskAPI for RemoteDisk {
         ScanGuard(Arc::clone(&self.scanning))
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::with_staged_part_peer;
 
 #[cfg(test)]
 mod tests {
@@ -7226,6 +7275,7 @@ mod tests {
         fail_format_reads: Arc<AtomicBool>,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
         bounded_discovery: Arc<StdMutex<Option<Arc<TestBoundedDiscovery>>>>,
+        verify_disk: Arc<StdMutex<Option<crate::disk::DiskStore>>>,
         unsupported_methods: Arc<StdMutex<Vec<String>>>,
     }
 
@@ -7253,6 +7303,7 @@ mod tests {
                 fail_format_reads: Arc::default(),
                 next_format_read_gate: Arc::default(),
                 bounded_discovery: Arc::default(),
+                verify_disk: Arc::default(),
                 unsupported_methods: Arc::default(),
             }
         }
@@ -7350,6 +7401,43 @@ mod tests {
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec);
                         Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/VerifyFile" => {
+                    struct VerifySvc(AuthenticatedReadPeer);
+                    impl tonic::server::UnaryService<VerifyFileRequest> for VerifySvc {
+                        type Response = rustfs_protos::proto_gen::node_service::VerifyFileResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+                        fn call(&mut self, request: Request<VerifyFileRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/VerifyFile")?;
+                                let request = request.into_inner();
+                                let disk = peer
+                                    .verify_disk
+                                    .lock()
+                                    .expect("verification fixture")
+                                    .clone()
+                                    .expect("verification disk");
+                                let fi: FileInfo = serde_json::from_str(&request.file_info).expect("verification layout");
+                                assert!(fi.data.is_none());
+                                let result = disk
+                                    .verify_file(&request.volume, &request.path, &fi)
+                                    .await
+                                    .expect("disk verification");
+                                Ok(Response::new(Self::Response {
+                                    success: true,
+                                    check_parts_resp: serde_json::to_string(&result).expect("verification result"),
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+                    let method = VerifySvc(self.peer.clone());
+                    Box::pin(async move {
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(method, request)
+                            .await)
                     })
                 }
                 "/node_service.NodeService/RecoverDeleteTransaction"
@@ -7516,6 +7604,34 @@ mod tests {
             self.shutdown.cancel();
             let _ = self.task.await;
         }
+    }
+
+    pub(crate) async fn with_staged_part_peer<F, Fut>(disk: crate::disk::DiskStore, exercise: F)
+    where
+        F: FnOnce(RemoteDisk, RemoteDisk) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("bind verification peer");
+        *peer.peer.verify_disk.lock().expect("verification fixture") = Some(disk);
+        let tcp = remote_disk_for_addr(&peer.addr).await;
+        let mut nixl = remote_disk_for_addr(&peer.addr).await;
+        nixl.data_transport = Arc::new(crate::cluster::rpc::nixl_internode::NixlInternodeDataTransport::from_env());
+        // Ordinary control RPCs have a fixed deadline. Verification must use
+        // its own channel even when a short-lived control channel is cached.
+        let control = tonic::transport::Endpoint::from_shared(peer.addr.clone())
+            .expect("peer URI")
+            .timeout(Duration::from_nanos(1))
+            .connect()
+            .await
+            .expect("connect control channel");
+        rustfs_common::cache_connection(peer.addr.clone(), control).await;
+        exercise(tcp, nixl).await;
+        assert_eq!(peer.peer.read_all_calls(), 0);
+        assert!(peer.peer.unsupported_methods.lock().expect("unexpected requests").is_empty());
+        peer.stop().await;
     }
 
     impl RecordingInternodeDataTransport {

@@ -145,6 +145,22 @@ pub async fn node_service_time_out_client_for_class(
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
     let channel = get_internode_channel_for_class(addr, class).await?;
+    Ok(node_client_on_channel(channel, interceptor))
+}
+
+pub(crate) async fn staged_shard_verification_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
+    let channel = rustfs_protos::staged_shard_verification_channel(addr).await?;
+    Ok(node_client_on_channel(channel, interceptor))
+}
+
+fn node_client_on_channel(
+    channel: rustfs_protos::InternodeChannel,
+    interceptor: TonicInterceptor,
+) -> NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>> {
     let connection_state = channel.connection_state();
     let interceptor = interceptor.with_connection_state(connection_state.clone());
 
@@ -154,9 +170,9 @@ pub async fn node_service_time_out_client_for_class(
         interceptor.replay_scope_audience(),
         connection_state,
     );
-    Ok(NodeServiceClient::with_interceptor(channel, interceptor)
+    NodeServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
-        .max_encoding_message_size(max_message_size))
+        .max_encoding_message_size(max_message_size)
 }
 
 /// Build an eligible request client and capture its peer capability exactly once for this RPC.
