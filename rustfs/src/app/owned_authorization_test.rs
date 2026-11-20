@@ -397,7 +397,7 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
         .get_write_lock(Duration::from_secs(1))
         .await
         .expect("publication writer should hold the fence");
-    let put_req = build_request(
+    let mut put_req = build_request(
         PutObjectInput::builder()
             .bucket(bucket.clone())
             .key("object".to_string())
@@ -405,7 +405,7 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             .expect("PUT input should build"),
         Method::PUT,
     );
-    let multipart_req = build_request(
+    let mut multipart_req = build_request(
         CreateMultipartUploadInput::builder()
             .bucket(bucket.clone())
             .key("multipart-object".to_string())
@@ -413,7 +413,7 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             .expect("multipart input should build"),
         Method::POST,
     );
-    let delete_req = build_request(
+    let mut delete_req = build_request(
         DeleteObjectInput::builder()
             .bucket(bucket.clone())
             .key("object".to_string())
@@ -421,6 +421,12 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             .expect("DELETE input should build"),
         Method::DELETE,
     );
+    ensure_req_info(&mut put_req);
+    ensure_req_info(&mut delete_req);
+    ensure_req_info(&mut multipart_req);
+    put_req.extensions.insert(server_ctx.clone());
+    delete_req.extensions.insert(server_ctx.clone());
+    multipart_req.extensions.insert(server_ctx);
     let mut owned_put = crate::app::RequestEnvelope::from_s3s(&put_req);
     let owned_info = owned_put.req_info_mut().expect("owned request info");
     owned_info.bucket = Some(bucket.clone());
