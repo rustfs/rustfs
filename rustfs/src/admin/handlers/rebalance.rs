@@ -926,10 +926,11 @@ impl Operation for RebalanceStatus {
                     "admin rebalance state"
                 );
                 // Preserve the idle 404 contract without triggering the custom-route error logger.
-                let (parts, body) = s3s::S3Error::with_message(s3s::S3ErrorCode::NoSuchResource, REBALANCE_NOT_STARTED_MESSAGE)
-                    .to_http_response()?
-                    .into_parts();
-                return Ok(AdminResponse::with_headers(parts.status, body.into(), parts.headers));
+                let body = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchResource</Code><Message>{REBALANCE_NOT_STARTED_MESSAGE}</Message></Error>"#
+                );
+                let headers = HeaderMap::from_iter([(CONTENT_TYPE, HeaderValue::from_static("application/xml"))]);
+                return Ok(AdminResponse::with_headers(StatusCode::NOT_FOUND, Body::from(body), headers));
             }
 
             error!(

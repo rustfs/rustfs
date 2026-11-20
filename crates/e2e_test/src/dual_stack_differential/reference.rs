@@ -78,7 +78,7 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 
 /// What `<binary> --version` printed, trimmed. Fails when the binary does not run, exits
 /// non-zero, or prints nothing, because an empty version would report nothing as observed.
-pub(super) async fn binary_version(binary: &Path) -> Result<String, BoxError> {
+pub(crate) async fn binary_version(binary: &Path) -> Result<String, BoxError> {
     let output = tokio::process::Command::new(binary).arg("--version").output().await?;
     if !output.status.success() {
         return Err(format!("{} --version failed with {}", binary.display(), output.status).into());

@@ -109,7 +109,6 @@ bytes.workspace = true
 hex-simd.workspace = true
 
 [dev-dependencies]
-s3s = { workspace = true, features = ["minio"] }
 opentelemetry-proto.workspace = true
 opentelemetry_sdk.workspace = true
 prost.workspace = true

@@ -293,9 +293,9 @@ pub(super) fn upload_part_error(error: S3Error) -> S3Error {
     error
 }
 
-pub(super) fn upload_part_copy_input(
+pub(super) fn prepare_upload_part_copy(
     input: dto::UploadPartCopyInput,
-) -> S3Result<crate::app::multipart_usecase::UploadPartCopyWriteInput> {
+) -> S3Result<(http::Uri, crate::app::multipart_usecase::UploadPartCopyWriteInput)> {
     super::owned::validate_copy_source(&input.copy_source, "UploadPartCopy copy_source")?;
     let copy_source_if_match =
         super::owned::copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match", "UploadPartCopy input")?;
@@ -314,11 +314,18 @@ pub(super) fn upload_part_copy_input(
         .copy_source_if_unmodified_since
         .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_unmodified_since"))
         .transpose()?;
-    Ok(crate::app::multipart_usecase::UploadPartCopyWriteInput {
+    let upload_id = super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
+    let part_number = input.part_number.to_string();
+    let uri = super::build_object_uri(
+        input.bucket.as_str(),
+        input.key.as_str(),
+        &[("partNumber", Some(&part_number)), ("uploadId", Some(&upload_id))],
+    )?;
+    let write = crate::app::multipart_usecase::UploadPartCopyWriteInput {
         target: crate::app::multipart_usecase::UploadPartTarget::Legacy {
             bucket: input.bucket.as_str().to_owned(),
             key: input.key.as_str().to_owned(),
-            upload_id: super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id),
+            upload_id,
         },
         part_number: input.part_number,
         copy_source: input.copy_source,
@@ -333,7 +340,8 @@ pub(super) fn upload_part_copy_input(
             .copy_source_sse_customer_key
             .map(|value| value.expose_secret().to_owned()),
         copy_source_sse_customer_key_md5: nonempty(input.copy_source_sse_customer_key_md5),
-    })
+    };
+    Ok((uri, write))
 }
 
 pub(super) fn upload_part_copy_output(

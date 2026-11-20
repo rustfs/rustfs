@@ -28,7 +28,6 @@ use super::storage_api::test::contract::{
     namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
-use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
 use super::storage_api::test::runtime::{
     MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,

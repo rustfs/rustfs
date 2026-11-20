@@ -15,9 +15,13 @@
 //! Upload frame/chunk boundary. Protocol edges supply a native body; storage consumes chunks.
 //! This adapter preserves trailers and source errors without applying another length check.
 
-use crate::app::storage_api::request_body::{ByteStream, StdError, StreamingBlob};
+use crate::app::storage_api::request_body::StdError;
+#[cfg(test)]
+use crate::app::storage_api::request_body::{ByteStream, StreamingBlob};
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
+#[cfg(test)]
+use futures::StreamExt;
 use http::HeaderMap;
 use http_body::Body as _;
 use parking_lot::Mutex;
@@ -30,6 +34,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// The legacy edge preserves the producer's length hint without enforcing it a second time.
+#[cfg(test)]
 pub(crate) fn from_legacy(body: StreamingBlob) -> Body {
     let stream = LegacyPayload { body, ended: false };
     Body::from_payload(Payload::Stream(Box::pin(stream)))
@@ -49,11 +54,13 @@ impl std::error::Error for ProducerSource {
     }
 }
 
+#[cfg(test)]
 struct LegacyPayload {
     body: StreamingBlob,
     ended: bool,
 }
 
+#[cfg(test)]
 impl PayloadStream for LegacyPayload {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<PayloadRead, StreamError>> {
         if self.ended {

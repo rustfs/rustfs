@@ -104,6 +104,7 @@ impl SourceSet {
             collect_rust_files(&dir, &mut paths);
             let mut split_files: Vec<SourceFile> = paths
                 .into_iter()
+                .filter(|path| path != &required)
                 .map(|path| {
                     let text = std::fs::read_to_string(&path)
                         .unwrap_or_else(|err| panic!("guard source {} must be readable: {err}", path.display()));
@@ -127,6 +128,7 @@ impl SourceSet {
 
     /// The files of `self` followed by those of `other`, for a guard whose call sites span two
     /// source trees while an operation family moves from one to the other.
+    #[allow(dead_code)]
     pub(crate) fn and(mut self, other: Self) -> Self {
         self.files.extend(other.files);
         self
@@ -145,6 +147,7 @@ impl SourceSet {
 
     /// [`SourceSet::count`] with all whitespace removed from both the text and `needle`, so a
     /// call matches however rustfmt wraps its arguments.
+    #[allow(dead_code)]
     pub(crate) fn count_ignoring_whitespace(&self, needle: &str) -> usize {
         let needle: String = needle.split_whitespace().collect();
         self.files
