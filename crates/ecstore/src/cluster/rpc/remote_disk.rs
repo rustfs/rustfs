@@ -1911,28 +1911,36 @@ impl RemoteDisk {
         }
     }
 
-    /// Open a remote read stream with a bounded retry on transient transport failures, mirroring
-    /// [`Self::open_write_with_retry`]. A freshly-committed object exists on only `write_quorum`
-    /// disks until background heal reconstructs the rest, so a single transient network error
-    /// (BrokenPipe/ConnectionReset/reset-by-peer) on a shard read during that read-after-write
-    /// window can drop the readable-shard count below `data_shards` and surface as a spurious
-    /// `InsufficientReadQuorum`. Opening the stream is idempotent, so re-dialing once absorbs the
-    /// transient failure instead of eroding quorum. See issue #2761.
-    /// Read the encoded data plus an optional trailing byte used by bitrot_verify.
+    pub(crate) async fn read_format_control(&self, volume: &str, path: &str) -> Result<FileReader> {
+        if self.data_transport.requires_bounded_reads() {
+            let control = Arc::new(super::internode_data_transport::TcpHttpInternodeDataTransport);
+            return self.open_file_range(control, volume, path, 0, 0, 0).await;
+        }
+        self.read_file(volume, path).await
+    }
+
+    /// Read through the first byte past the encoded shard so the verifier can check EOF.
     pub(crate) async fn read_file_for_bitrot_verify(
         &self,
         volume: &str,
         path: &str,
         encoded_length: usize,
     ) -> Result<FileReader> {
-        let limit = encoded_length
-            .checked_add(1)
-            .ok_or_else(|| DiskError::other("bitrot verification range overflow"))?;
-        self.open_file_range(volume, path, 0, limit, encoded_length).await
+        let length = if self.data_transport.requires_bounded_reads() {
+            encoded_length
+                .checked_add(1)
+                .ok_or_else(|| DiskError::other("bitrot verification range overflow"))?
+        } else {
+            // HTTP and external streams interpret a positive length as an exact byte count.
+            0
+        };
+        self.open_file_range(self.data_transport.clone(), volume, path, 0, length, encoded_length)
+            .await
     }
 
     async fn open_file_range(
         &self,
+        transport: Arc<dyn InternodeDataTransport>,
         volume: &str,
         path: &str,
         offset: usize,
@@ -1955,30 +1963,32 @@ impl RemoteDisk {
         };
         #[cfg(feature = "internode-transport")]
         if self.external_streams {
-            return self.data_transport.open_read(request).await;
+            return transport.open_read(request).await;
         }
-        let reader = self.open_read_with_retry(request.clone()).await?;
-        let mut reader = RetryingRemoteReader::new_with_timeouts(
-            reader,
-            Arc::clone(&self.data_transport),
-            request,
-            timeouts.initial_read,
-            timeouts.recovery,
-        );
+        let reader = Self::open_read_with_retry(transport.as_ref(), request.clone()).await?;
+        let mut reader =
+            RetryingRemoteReader::new_with_timeouts(reader, transport, request, timeouts.initial_read, timeouts.recovery);
         reader.minimum_length = minimum_length;
         Ok(Box::new(reader))
     }
 
-    async fn open_read_with_retry(&self, request: ReadStreamRequest) -> Result<FileReader> {
+    /// Open a remote read stream with a bounded retry on transient transport failures, mirroring
+    /// [`Self::open_write_with_retry`]. A freshly-committed object exists on only `write_quorum`
+    /// disks until background heal reconstructs the rest, so a single transient network error
+    /// (BrokenPipe/ConnectionReset/reset-by-peer) on a shard read during that read-after-write
+    /// window can drop the readable-shard count below `data_shards` and surface as a spurious
+    /// `InsufficientReadQuorum`. Opening the stream is idempotent, so re-dialing once absorbs the
+    /// transient failure instead of eroding quorum. See issue #2761.
+    async fn open_read_with_retry(transport: &dyn InternodeDataTransport, request: ReadStreamRequest) -> Result<FileReader> {
         let mut attempt = 1;
         let mut last_retry_classification = None;
         loop {
             // The second attempt bypasses the pool. The first failure is often a
             // stale kept-alive connection to a peer that just restarted.
             let opened = if attempt == 1 {
-                self.data_transport.open_read(request.clone()).await
+                transport.open_read(request.clone()).await
             } else {
-                self.data_transport.open_read_fresh(request.clone()).await
+                transport.open_read_fresh(request.clone()).await
             };
             match opened {
                 Ok(reader) => {
@@ -4982,7 +4992,8 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        self.open_file_range(volume, path, offset, length, length).await
+        self.open_file_range(self.data_transport.clone(), volume, path, offset, length, length)
+            .await
     }
 
     async fn read_file_stream_chunks(
@@ -8857,6 +8868,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl InternodeDataTransport for ResumeTransport {
+        fn requires_bounded_reads(&self) -> bool {
+            true
+        }
+
         async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
             self.read_requests
                 .lock()

@@ -154,6 +154,10 @@ impl NixlInternodeDataTransport {
 
 #[async_trait]
 impl InternodeDataTransport for NixlInternodeDataTransport {
+    fn requires_bounded_reads(&self) -> bool {
+        true
+    }
+
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
         Ok(Box::new(self.open_nixl(request).await?))
     }
@@ -251,7 +255,7 @@ async fn fetch_chunk(pool: Arc<dyn NixlRecvPool>, request: ReadStreamRequest, ti
             .map_err(|_| io::Error::other("nixl agent metadata is not a header value"))?,
     );
     build_auth_headers(&url, &Method::GET, &mut headers)?;
-    let (status, response_headers, _) = rustfs_rio::internode_http_request(&url, Method::GET, headers, Some(timeout)).await?;
+    let (status, response_headers, body) = rustfs_rio::internode_http_request(&url, Method::GET, headers, Some(timeout)).await?;
     if !status.is_success() {
         debug!(
             component = LOG_COMPONENT_INTERNODE,
@@ -260,6 +264,17 @@ async fn fetch_chunk(pool: Arc<dyn NixlRecvPool>, request: ReadStreamRequest, ti
             status = status.as_u16(),
             "nixl internode read refused by peer"
         );
+        if status == http::StatusCode::NOT_FOUND {
+            // A missing route also returns 404. Only the disk marker or the legacy file response identifies a missing shard.
+            // RUSTFS_COMPAT_TODO(9526): Older peers report a missing file in the body. Remove after all supported peers send the disk error header.
+            let missing = match response_headers.get(rustfs_rio::INTERNODE_DISK_ERROR_HEADER) {
+                Some(marker) => marker == rustfs_rio::INTERNODE_FILE_NOT_FOUND,
+                None => body.as_ref() == b"file not found",
+            };
+            if missing {
+                return Err(crate::disk::error::DiskError::FileNotFound.into());
+            }
+        }
         return Err(io::Error::other("nixl internode read refused by peer"));
     }
     let landed = response_headers
@@ -624,6 +639,9 @@ impl tokio::io::AsyncWrite for NixlFileWriter {
 }
 
 #[cfg(test)]
+pub(crate) mod read_test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -698,7 +716,7 @@ mod tests {
         }
     }
 
-    struct VecPool;
+    pub(super) struct VecPool;
 
     impl NixlRecvPool for VecPool {
         fn agent_name(&self) -> &str {

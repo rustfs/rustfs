@@ -71,6 +71,52 @@ async fn assert_plan_published(disks: &[Option<DiskStore>], expected: &[Option<F
 }
 
 #[tokio::test]
+async fn strict_nixl_bootstrap_reads_remote_format_evidence_through_control_http() {
+    use crate::cluster::rpc::nixl_internode::{
+        NixlInternodeDataTransport,
+        read_test_support::{read_peer, remote_disk},
+    };
+
+    let (_directory, mut disks) = local_disks(4).await;
+    let transport = Arc::new(NixlInternodeDataTransport::from_env());
+    let missing = format!(
+        "HTTP/1.1 500 Internal Server Error\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        rustfs_rio::INTERNODE_DISK_ERROR_HEADER,
+        rustfs_rio::INTERNODE_FILE_NOT_FOUND
+    );
+    let (endpoint, peer) = read_peer(missing.into_bytes()).await;
+    disks[3] = Some(remote_disk(&endpoint, transport.clone()).await);
+    let result = try_migrate_format(&disks, &[None, None, None, None], 1, 4, LegacyFormatMode::Migration).await;
+    assert!(matches!(result, Ok(LegacyFormatOutcome::None)), "all four disks lack legacy formats");
+    let uri = peer.await.expect("legacy format peer");
+    assert_eq!(uri.path(), "/rustfs/rpc/read_file_stream");
+    assert!(
+        uri.query_pairs()
+            .any(|(key, value)| key == "volume" && value == MIGRATING_META_BUCKET)
+    );
+    assert!(
+        uri.query_pairs()
+            .any(|(key, value)| key == "path" && value == FORMAT_CONFIG_FILE)
+    );
+
+    // An existing remote intent must prevent publication of a different plan on the empty first disk.
+    let (endpoint, peer) = read_peer(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec()).await;
+    disks[3] = Some(remote_disk(&endpoint, transport).await);
+    let result = write_format_bootstrap_intents(&disks, &bootstrap_plan()).await;
+    assert!(matches!(result, Err(Error::CorruptedFormat)), "unexpected intent result: {result:?}");
+    let uri = peer.await.expect("bootstrap intent peer");
+    assert_eq!(uri.path(), "/rustfs/rpc/read_file_stream");
+    assert!(
+        uri.query_pairs()
+            .any(|(key, value)| key == "volume" && value == RUSTFS_META_BUCKET)
+    );
+    assert!(
+        uri.query_pairs()
+            .any(|(key, value)| key == "path" && value == FORMAT_BOOTSTRAP_FILE)
+    );
+}
+
+#[tokio::test]
 async fn bootstrap_intent_survives_formatter_restart() {
     let (_directory, mut disks) = local_disks(4).await;
     let first = connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), true, &mut disks, 1, 4, None)

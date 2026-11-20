@@ -16,9 +16,8 @@ use super::super::{
     Cursor, DiskStore, EVENT_SET_DISK_WRITE, Error, FileInfo, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK,
     Result, join_all, warn,
 };
-use crate::disk::DiskAPI;
 #[cfg(test)]
-use crate::disk::RUSTFS_META_TMP_BUCKET;
+use crate::disk::{DiskAPI, RUSTFS_META_TMP_BUCKET};
 use crate::set_disk::coding;
 #[cfg(test)]
 use bytes::Bytes;
@@ -86,15 +85,10 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
             let disk = disk.as_ref()?.clone();
             let algo = algo.clone();
             Some(async move {
-                let reader = match disk.as_ref() {
-                    crate::disk::Disk::Local(local) => local.read_file(target.volume, target.path).await,
-                    crate::disk::Disk::Remote(remote) => {
-                        remote
-                            .read_file_for_bitrot_verify(target.volume, target.path, encoded_shard_size)
-                            .await
-                    }
-                };
-                let result = match reader {
+                let result = match disk
+                    .read_file_for_bitrot_verify(target.volume, target.path, encoded_shard_size)
+                    .await
+                {
                     Ok(reader) => {
                         coding::bitrot_verify(reader, encoded_shard_size, target.logical_shard_size, algo, target.shard_size)
                             .await
@@ -157,6 +151,54 @@ mod tests {
             writer.write(chunk).await.expect("streaming shard should encode");
         }
         Bytes::from(writer.into_inner().into_inner())
+    }
+
+    #[tokio::test]
+    async fn remote_bitrot_verify_accepts_exact_http_shards_and_rejects_short_or_oversized_data() {
+        use crate::cluster::rpc::internode_data_transport::TcpHttpInternodeDataTransport;
+        use crate::cluster::rpc::nixl_internode::read_test_support::{read_peer, remote_disk};
+        use std::sync::Arc;
+
+        let data = b"abc";
+        let encoded = encode_streaming_shard(data, data.len()).await;
+        let mut oversized = encoded.to_vec();
+        oversized.push(0xff);
+        for (body, valid) in [
+            (&encoded[..], true),
+            (&encoded[..encoded.len() - 1], false),
+            (&oversized[..], false),
+        ] {
+            let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+            response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+            response.extend_from_slice(body);
+            response.extend_from_slice(b"\r\n0\r\n\r\n");
+            let (endpoint, peer) = read_peer(response).await;
+            let disk = remote_disk(&endpoint, Arc::new(TcpHttpInternodeDataTransport)).await;
+            let result = verify_written_bitrot_shards(
+                &[Some(disk)],
+                None,
+                BitrotSelfVerifyTarget {
+                    operation: "put_object",
+                    bucket: "bucket",
+                    object: "object",
+                    part_number: None,
+                    volume: RUSTFS_META_TMP_BUCKET,
+                    path: "tmp/part.1",
+                    logical_shard_size: data.len(),
+                    shard_size: data.len(),
+                    write_quorum: 1,
+                },
+            )
+            .await;
+            if valid {
+                assert_eq!(result.expect("healthy HTTP shard"), 1);
+            } else {
+                result.expect_err("invalid shard must fail verification");
+            }
+            let uri = peer.await.expect("HTTP peer");
+            assert_eq!(uri.path(), "/rustfs/rpc/read_file_stream");
+            assert!(uri.query_pairs().any(|(name, value)| name == "length" && value == "0"));
+        }
     }
 
     #[test]
