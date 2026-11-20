@@ -155,6 +155,7 @@ pub struct TestECStoreEnvBuilder {
     prefix: String,
     base_dir: Option<PathBuf>,
     init_bucket_metadata: bool,
+    shutdown: CancellationToken,
 }
 
 impl Default for TestECStoreEnvBuilder {
@@ -164,6 +165,7 @@ impl Default for TestECStoreEnvBuilder {
             prefix: "rustfs_test_utils".to_string(),
             base_dir: None,
             init_bucket_metadata: true,
+            shutdown: CancellationToken::new(),
         }
     }
 }
@@ -193,6 +195,12 @@ impl TestECStoreEnvBuilder {
     /// (default `true`, as the heal bootstraps did).
     pub fn init_bucket_metadata(mut self, yes: bool) -> Self {
         self.init_bucket_metadata = yes;
+        self
+    }
+
+    /// Supply the shutdown token passed to the store's background workers.
+    pub fn shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown = token;
         self
     }
 
@@ -242,7 +250,7 @@ impl TestECStoreEnvBuilder {
         // Port 0 keeps ECStore-backed integration binaries parallel-safe under
         // nextest: no fixed peer port is ever shared between test processes.
         let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse test addr");
-        let ecstore = ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
+        let ecstore = ECStore::new(server_addr, endpoint_pools.clone(), self.shutdown)
             .await
             .expect("build test ECStore");
 
