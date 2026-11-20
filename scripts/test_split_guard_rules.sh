@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end probe for the guards that must survive the mechanical split of
-# ecfs.rs, bucket_usecase.rs, multipart_usecase.rs and
+# bucket_usecase.rs, multipart_usecase.rs and
 # lifecycle_transition_api_test.rs (rustfs/backlog#2765).
 #
-# It copies the working tree and works out, for each of ecfs.rs,
-# bucket_usecase.rs and multipart_usecase.rs, whether that source is still
+# It copies the working tree and works out, for bucket_usecase.rs and multipart_usecase.rs, whether that source is still
 # unsplit or already split:
 #
 #   unsplit  the split directory holds no production .rs file; the probe
@@ -144,7 +143,6 @@ def imports(rel):
 
 
 LISTING_ANCHOR = "    pub async fn execute_list_objects_v2("
-ecfs_state, ecfs_files = state("ecfs", f"{STORAGE}/ecfs.rs", f"{STORAGE}/legacy_edge", "impl S3 for FS {")
 bu_state, bu_files = state("bucket usecase", f"{APP}/bucket_usecase.rs", f"{APP}/bucket_usecase", LISTING_ANCHOR)
 mu_state, mu_files = state("multipart usecase", f"{APP}/multipart_usecase.rs", f"{APP}/multipart_usecase",
                            "pub async fn execute_complete_multipart_upload(")
@@ -172,19 +170,11 @@ else:
         die(f"bucket usecase: {APP}/bucket_usecase/ is split but {LISTING_ANCHOR.strip()!r} is not in one of its files")
     listing = owners[0]
 
-edge_imports = f"{STORAGE}/legacy_edge/split_probe_edge_imports.rs"
-prepend(edge_imports, imports(f"{STORAGE}/ecfs.rs"))
 lt_imports = f"{APP}/lifecycle_transition_api_test/split_probe_imports.rs"
 prepend(lt_imports, imports(f"{APP}/lifecycle_transition_api_test.rs"))
 
-if ecfs_state == "split":
-    e_file = pick(ecfs_files, set(), f"{STORAGE}/legacy_edge/bucket_configs.rs")
-    test_files = sorted(p.relative_to(fx).as_posix() for p in (fx / STORAGE / "legacy_edge/tests").rglob("*.rs")) \
-        if (fx / STORAGE / "legacy_edge/tests").is_dir() else []
-    t_file = test_files[0] if test_files else f"{STORAGE}/legacy_edge/tests/object_meta.rs"
-else:
-    e_file = f"{STORAGE}/legacy_edge/bucket_configs.rs"
-    t_file = f"{STORAGE}/legacy_edge/tests/object_meta.rs"
+e_file = f"{STORAGE}/legacy_edge/bucket_configs.rs"
+t_file = f"{STORAGE}/helpers_test.rs"
 b_file = pick(bu_files, {listing}, f"{APP}/bucket_usecase/cors.rs") if bu_state == "split" \
     else f"{APP}/bucket_usecase/cors.rs"
 m_file = pick(mu_files, set(), f"{APP}/multipart_usecase/complete.rs") if mu_state == "split" \
@@ -210,9 +200,9 @@ PLANTS = {
              "fn forbidden() {\n"
              "    super::super::tagging::probe();\n"
              "}\n"),
-    t_file: ("use super::super::super::{BucketMetadata};\n"
+    t_file: ("use super::{BucketMetadata};\n"
              "mod tests {\n"
-             "    use super::super::super::super::{check_preconditions};\n"
+             "    use super::super::{check_preconditions};\n"
              "}\n"
              "use crate::storage::core_storage_compat::TestProbe;\n"),
 }
@@ -232,11 +222,6 @@ for rel in ordinary:
     if (fx / rel).exists():
         die(f"{rel} already exists; the probe will not overwrite a real file")
     prepend(rel, ORDINARY)
-edge_ordinary = f"{STORAGE}/legacy_edge/tests/split_probe_ordinary.rs"
-if (fx / edge_ordinary).exists():
-    die(f"{edge_ordinary} already exists; the probe will not overwrite a real file")
-prepend(edge_ordinary, "mod tests {\n    use super::{BucketMetadata, check_preconditions};\n}\n")
-
 for rel, block in PLANTS.items():
     prepend(rel, block)
     if not (fx / rel).read_text().startswith(block):
@@ -244,27 +229,25 @@ for rel, block in PLANTS.items():
 
 # Real split files that carry no planted line hold moved production code only:
 # no rule may report them.
-real = [rel for rel in ecfs_files + bu_files + mu_files if rel not in PLANTS and rel != listing]
+real = [rel for rel in bu_files + mu_files if rel not in PLANTS and rel != listing]
 
-print(f"ECFS_STATE={ecfs_state} BU_STATE={bu_state} MU_STATE={mu_state}")
+print(f"BU_STATE={bu_state} MU_STATE={mu_state}")
 for var, value in [("E", e_file), ("B", b_file), ("M", m_file), ("L", l_file), ("T", t_file),
-                   ("LISTING", listing), ("EDGE_IMPORTS", edge_imports), ("LT_IMPORTS", lt_imports)]:
+                   ("LISTING", listing), ("LT_IMPORTS", lt_imports)]:
     print(f"{var}={shlex.quote(value)}")
-print("SILENT_FILES=(" + " ".join(shlex.quote(p) for p in ordinary + [edge_ordinary, listing, edge_imports, lt_imports]) + ")")
+print("SILENT_FILES=(" + " ".join(shlex.quote(p) for p in ordinary + [listing, lt_imports]) + ")")
 print("REAL_SPLIT_FILES=(" + " ".join(shlex.quote(p) for p in real) + ")")
 PY
 # shellcheck source=/dev/null
 source "$PLAN"
-echo "split probe: ecfs $ECFS_STATE, bucket usecase $BU_STATE, multipart usecase $MU_STATE"
+echo "split probe: bucket usecase $BU_STATE, multipart usecase $MU_STATE"
 
 # --- architecture rules ------------------------------------------------------
 ARCH_OUT="$FX/.arch.out"
 if (cd "$FX" && ./scripts/check_architecture_migration_rules.sh) >"$ARCH_OUT" 2>&1; then
   fail "architecture rules passed over planted violations"
 fi
-expect_reported "$ARCH_OUT" "$E:1:" "storage runtime source reads must stay behind" "runtime-source bypass (ECFS set)"
-expect_reported "$ARCH_OUT" "$E:2:" "ECFS S3 routes must construct app usecases" "ECFS usecase bypass"
-expect_reported "$ARCH_OUT" "$E:3:" "must use relative core_storage_compat paths" "core_storage_compat (ECFS set)"
+expect_reported "$ARCH_OUT" "rustfs/src/storage/legacy_edge" "Retired S3 storage edge reintroduced" "retired edge"
 expect_reported "$ARCH_OUT" "$B:1:" "instead of crate::storage::*" "storage wildcard (bucket split)"
 expect_reported "$ARCH_OUT" "$B:2:" "consume storage helper APIs through" "storage helper import (bucket split)"
 expect_reported "$ARCH_OUT" "$B:3:" "consume storage helper APIs through" "depth-aware super::super storage helper"
@@ -275,9 +258,8 @@ expect_reported "$ARCH_OUT" "$M:2:" "consume storage helper APIs through" "depth
 expect_reported "$ARCH_OUT" "$M:3:" "local compatibility consumers must use relative" "usecase_storage_compat (multipart split)"
 expect_reported "$ARCH_OUT" "$L:1:" "completed storage helper consumers" "test storage helper (lifecycle split)"
 expect_reported "$ARCH_OUT" "$L:3:" "consume storage helper APIs through" "depth-aware super::super owner path"
-expect_reported "$ARCH_OUT" "$T:1:" "storage-owner tests must use storage_api test consumer" "ecfs_test import at file depth"
-expect_reported "$ARCH_OUT" "$T:3:" "storage-owner tests must use storage_api test consumer" "ecfs_test import in an inline tests module"
-expect_reported "$ARCH_OUT" "$T:5:" "local compatibility consumers must use relative" "ecfs_test core_storage_compat"
+expect_reported "$ARCH_OUT" "$T:3:" "storage-owner tests must use storage_api test consumer" "helper import in an inline tests module"
+expect_reported "$ARCH_OUT" "$T:5:" "local compatibility consumers must use relative" "helper test core_storage_compat"
 for silent in "${SILENT_FILES[@]}"; do
   expect_silent "$ARCH_OUT" "$silent:" "architecture rules over moved or ordinary code"
 done
@@ -303,7 +285,6 @@ if (cd "$FX" && ./scripts/check_layer_dependencies.sh) >"$LAYER_OUT" 2>&1; then
   fail "layer guard passed over a planted reverse dependency"
 fi
 expect_reported "$LAYER_OUT" "dep|$E|interface->composition|" "crate::startup_server::LayerProbe" "legacy_edge keeps the interface layer"
-expect_silent "$LAYER_OUT" "dep|$EDGE_IMPORTS|" "moved ecfs imports stay legal"
 expect_silent "$LAYER_OUT" "dep|rustfs/src/app/lifecycle_transition_api_test/" "moved lifecycle transition tests stay excluded"
 expect_silent "$LAYER_OUT" "dep|$LISTING|" "moved bucket usecase code keeps the app layer"
 expect_silent "$LAYER_OUT" "dep|rustfs/src/protocols/client/layer_probe.rs|" "protocol client edge may use app contracts"
@@ -361,4 +342,4 @@ if [[ $failures -gt 0 ]]; then
   echo "split guard rules probe: $failures of $checked checks failed" >&2
   exit 1
 fi
-echo "split guard rules probe: $checked checks passed (ecfs $ECFS_STATE, bucket usecase $BU_STATE, multipart usecase $MU_STATE)"
+echo "split guard rules probe: $checked checks passed (bucket usecase $BU_STATE, multipart usecase $MU_STATE)"

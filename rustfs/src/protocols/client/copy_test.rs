@@ -94,28 +94,6 @@ fn protocol_copy_runtime_contract() {
         assert_eq!(count(), 0);
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CopyObject);
         assert_eq!(count(), 1);
-        let mut old_input = input();
-        old_input.key = rustfs_gateway_types::ObjectKey::new("legacy-control".to_owned()).expect("legacy control key");
-        let old_input = legacy_input(old_input).expect("legacy input");
-        let before = count();
-        client
-            .legacy_fs()
-            .copy_object(
-                ProtocolStorageClient::create_request(
-                    old_input,
-                    Method::PUT,
-                    build_object_uri("copy-target", "legacy-control", &[]).expect("legacy URI"),
-                    RequestParams {
-                        bucket: Some("copy-target".into()),
-                        object: Some("legacy-control".into()),
-                        credentials: &root,
-                    },
-                )
-                .expect("legacy request"),
-            )
-            .await
-            .expect("legacy copy control");
-        assert_eq!(count() - before, 1);
 
         let mut rows = Vec::new();
         for case in [

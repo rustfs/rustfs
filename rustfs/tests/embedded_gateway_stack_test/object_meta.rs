@@ -766,13 +766,9 @@ fn the_gateway_stack_swaps_the_tagging_action_for_a_named_version() {
     with_stack(GATEWAY, the_tagging_action_follows_the_named_version);
 }
 
-/// What a stack answers for a key outside the floor, independent of the operation and bucket.
-type UniformAnswers = (Answer, Answer);
-
-/// Checks boundary keys across bucket configurations. The legacy stack answers per operation and
-/// bucket from the table below; the gateway stack refuses the key before the bucket is consulted,
-/// so it answers every row with `uniform`: `(NUL key, 1025-byte key)`.
-async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServer, uniform: Option<UniformAnswers>) {
+/// The gateway rejects boundary keys before consulting the bucket. RustFS serves no torrents,
+/// so a NUL key on GetObjectTorrent retains the release's NoSuchKey response.
+async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServer) {
     const BUCKET: &str = "object-meta-keys";
     let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
     create_bucket_in_the_store(BUCKET).await;
@@ -782,37 +778,24 @@ async fn keys_outside_the_floor_are_refused(server: rustfs::embedded::RustFSServ
     assert!(super::bucket_exists_in_the_store(reserved).await);
     put_object_in_the_store(reserved, KEY, HashMap::new()).await;
     assert_eq!(answer(client.get_object_acl().bucket(reserved).key(KEY).send().await), (None, None, None));
+    let refused = |code: &str, status, message: &str| (Some(code.to_owned()), Some(status), Some(message.to_owned()));
+    let invalid_nul = refused("InvalidArgument", 400, "the name contains a NUL byte");
+    let missing_torrent = refused("NoSuchKey", 404, "The specified key does not exist.");
+    let too_long = refused("KeyTooLongError", 400, "the name is longer than the maximum length in bytes");
     let long_key = "k".repeat(1025);
     for (operation, call) in KEY_CALLS {
-        for (bucket, kind) in [(BUCKET, 0), (locked.as_str(), 1), ("object-meta-missing", 2), (reserved, 0)] {
-            let (code, status, message) = match (*operation, kind) {
-                ("GetObjectTorrent", _) => ("NoSuchKey", 404, "The specified key does not exist."),
-                ("GetObjectLegalHold", 0) | ("GetObjectRetention", 0) => {
-                    ("InvalidRequest", 400, "Bucket is missing ObjectLockConfiguration")
-                }
-                ("GetObjectLegalHold", 1) | ("GetObjectRetention", 1) => {
-                    ("InternalError", 500, "XML response contains a control character")
-                }
-                ("GetObjectLegalHold", _) => ("NoSuchBucket", 404, "The specified bucket does not exist"),
-                ("GetObjectRetention", _) => ("InternalError", 500, "Failed to load Object Lock configuration"),
-                _ => ("InvalidArgument", 400, "Invalid argument"),
-            };
-            let expected = match &uniform {
-                Some((nul, _)) => nul.clone(),
-                None => (Some(code.to_owned()), Some(status), Some(message.to_owned())),
-            };
-            assert_eq!(call(&client, bucket, "a\0b").await, expected, "{operation} bucket {bucket}");
-        }
-        let expected = match &uniform {
-            Some((_, long)) => long.clone(),
-            None => (Some("KeyTooLongError".to_owned()), Some(400), Some("Your key is too long.".to_owned())),
+        let expected_nul = if *operation == "GetObjectTorrent" {
+            &missing_torrent
+        } else {
+            &invalid_nul
         };
-        assert_eq!(call(&client, BUCKET, &long_key).await, expected, "{operation} long key");
+        for bucket in [BUCKET, locked.as_str(), "object-meta-missing", reserved] {
+            assert_eq!(&call(&client, bucket, "a\0b").await, expected_nul, "{operation} bucket {bucket}");
+        }
+        assert_eq!(call(&client, BUCKET, &long_key).await, too_long, "{operation} long key");
     }
     server.shutdown().await;
 }
-
-type Answer = (Option<String>, Option<u16>, Option<String>);
 
 type KeyCall = for<'a> fn(&'a Client, &'a str, &'a str) -> BoxFuture<'a, (Option<String>, Option<u16>, Option<String>)>;
 
@@ -853,12 +836,7 @@ fn answer<T, E: ProvideErrorMetadata>(result: Result<T, SdkError<E>>) -> (Option
 
 #[test]
 fn the_gateway_stack_refuses_keys_outside_the_floor() {
-    let refused = |code: &str, message: &str| (Some(code.to_owned()), Some(400), Some(message.to_owned()));
-    let uniform = (
-        refused("InvalidArgument", "the name contains a NUL byte"),
-        refused("KeyTooLongError", "the name is longer than the maximum length in bytes"),
-    );
-    with_stack(GATEWAY, move |server| keys_outside_the_floor_are_refused(server, Some(uniform)));
+    with_stack(GATEWAY, keys_outside_the_floor_are_refused);
 }
 
 fn legal_hold(status: &str) -> aws_sdk_s3::types::ObjectLockLegalHold {

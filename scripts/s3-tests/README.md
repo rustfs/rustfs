@@ -507,11 +507,7 @@ pass/fail table in the job summary.
   lists and the exact pytest collection; run before execution to reject stale
   or missing classifications, then after execution to detect regressions and
   incomplete parameterized cases.
-- `api_coverage.py` — quantifies S3 API surface coverage by comparing the
-  s3s `S3` trait (at the revision pinned in Cargo.toml) against the methods
-  RustFS overrides in `impl S3 for FS`, found exactly once across
-  `rustfs/src/storage/ecfs.rs` and `rustfs/src/storage/legacy_edge/`
-  (contract tests: `test_api_coverage.py`, run by `make script-tests`):
+- `api_coverage.py` compares the pinned s3s reference trait with the operation rows registered by the gateway. Run its contract tests with `make script-tests`.
 
   ```bash
   python3 scripts/s3-tests/api_coverage.py            # summary + missing ops

@@ -99,8 +99,8 @@ use rustfs_config::{DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY, ENV_RUSTFS_KMS_ENFORCE_S
 use rustfs_kms::{DataKey, KmsUnavailableError, is_data_key_envelope, types::ObjectEncryptionContext};
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, KmsAction};
+use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::{get_env_bool, get_env_opt_str};
-use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "rio-v2")]
@@ -4707,7 +4707,8 @@ pub(crate) mod tests {
         };
         request.extensions.insert(crate::storage::req_info::ReqInfo::default());
 
-        let principal = SseKmsPrincipal::from_request(&request).expect("S3-boundary request should build a principal");
+        let envelope = crate::app::RequestEnvelope::from_s3s(&request);
+        let principal = SseKmsPrincipal::from_request(&envelope).expect("S3-boundary request should build a principal");
 
         assert!(principal.account.is_empty());
         assert!(principal.groups.is_none());
@@ -4974,9 +4975,9 @@ pub(crate) mod tests {
     use http::{HeaderMap, HeaderValue};
     use rustfs_kms::types::ObjectEncryptionContext;
     use rustfs_rio::{DecryptReader, EncryptReader};
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT;
     use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
-    use s3s::S3ErrorCode;
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock};
     use temp_env::async_with_vars;

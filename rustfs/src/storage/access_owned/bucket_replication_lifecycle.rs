@@ -91,3 +91,46 @@ pub(crate) fn prepare_replication_config_edit<R: AuthorizationRequest + ?Sized>(
         site_replication_edit_context().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
+        prepare_replication_config_edit,
+    };
+    use crate::storage::authorization::tests::fixture::request;
+    use crate::storage::req_info::ReqInfo;
+    use http::{Method, StatusCode};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replication_config_edit_gate_denies_only_non_owner_under_site_replication() {
+        struct ResetOverride;
+        impl Drop for ResetOverride {
+            fn drop(&mut self) {
+                SITE_REPLICATION_GATE_TEST_OVERRIDE.store(0, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetOverride;
+        for state in [SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_FORCE_DISABLED] {
+            SITE_REPLICATION_GATE_TEST_OVERRIDE.store(state, Ordering::SeqCst);
+            for is_owner in [false, true] {
+                let envelope = request(Method::PUT)
+                    .extension(ReqInfo {
+                        is_owner,
+                        ..Default::default()
+                    })
+                    .build();
+                let result = prepare_replication_config_edit(&envelope).await;
+                if state == SITE_REPLICATION_GATE_FORCE_ENABLED && !is_owner {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.code().as_str(), "XMinioReplicationDenyEdit");
+                    assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+                } else {
+                    result.expect("replication edit admitted");
+                }
+            }
+        }
+    }
+}
