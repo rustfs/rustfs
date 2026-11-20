@@ -390,6 +390,19 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HEAL,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Get, "/rustfs/admin/v4/heal/delete-residue", HEAL, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/delete-residue/inspect",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/heal/delete-residue/discard",
+        HEAL,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v4/heal/replacement-recovery",
@@ -2550,6 +2563,16 @@ mod tests {
     fn route_policy_allows_server_info_for_ilm_expiry_status() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SERVER_INFO);
         assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SET_TIER);
+    }
+
+    #[test]
+    fn delete_residue_routes_require_heal_admin() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v4/heal/delete-residue", HEAL);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v4/heal/delete-residue", SERVER_INFO);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v4/heal/delete-residue/inspect", HEAL);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v4/heal/delete-residue/inspect", SERVER_INFO);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v4/heal/delete-residue/discard", HEAL);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v4/heal/delete-residue/discard", SERVER_INFO);
     }
 
     #[test]

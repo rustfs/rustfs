@@ -30,6 +30,7 @@ use crate::storage::rpc::node_service::heal::{
 #[cfg(test)]
 use crate::storage::rpc::node_service::mrf::MrfLegacyResponsibilityAction;
 use crate::storage::rpc::node_service::mrf::{MrfLegacyResponsibilityActionRequest, validate_mrf_legacy_responsibility_action};
+mod delete_residue;
 mod mrf_management;
 use bytes::Bytes;
 use futures_util::future::join_all;
@@ -203,6 +204,7 @@ fn heal_control_response_id(heal_path: &str, client_token: &str) -> String {
 }
 
 pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    delete_residue::register(r)?;
     mrf_management::register(r)?;
     // Some APIs are only available in EC mode
     // if is_dist_erasure().await || is_erasure().await {
@@ -2192,36 +2194,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_recovery_diagnostics_require_authentication() {
+    async fn recovery_diagnostics_and_delete_residue_require_authentication() {
         use s3s::route::S3Route;
 
         let mut router = super::S3Router::new(false);
         super::register_heal_route(&mut router).expect("register production Heal routes");
         for prefix in ["/rustfs/admin", "/minio/admin"] {
-            let path = format!("{prefix}/v4/heal/replacement-recovery");
-            assert!(router.contains_compatible_route(http::Method::GET, &path));
-            let mut req = s3s::S3Request {
-                input: s3s::Body::empty(),
-                method: http::Method::GET,
-                uri: path.parse().expect("replacement diagnostics URI"),
-                headers: http::HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
-            let err = router
-                .check_access(&mut req)
-                .await
-                .expect_err("diagnostics router must require a signature");
-            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
-            let err = router
-                .call(req)
-                .await
-                .expect_err("diagnostics handler must authenticate before inspecting local records");
-            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-            assert!(err.to_string().contains("authentication required"));
+            for (method, suffix) in [
+                (http::Method::GET, "/v4/heal/replacement-recovery"),
+                (http::Method::GET, "/v4/heal/delete-residue"),
+                (http::Method::GET, "/v4/heal/delete-residue/inspect"),
+                (http::Method::POST, "/v4/heal/delete-residue/discard"),
+            ] {
+                let path = format!("{prefix}{suffix}");
+                assert!(router.contains_compatible_route(method.clone(), &path));
+                let mut req = s3s::S3Request {
+                    input: s3s::Body::empty(),
+                    method,
+                    uri: path.parse().expect("heal administration URI"),
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                let err = router
+                    .check_access(&mut req)
+                    .await
+                    .expect_err("diagnostics router must require a signature");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                let err = router
+                    .call(req)
+                    .await
+                    .expect_err("diagnostics handler must authenticate before inspecting local records");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert!(err.to_string().contains("authentication required"));
+            }
         }
     }
 

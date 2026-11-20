@@ -258,6 +258,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v4/heal/mrf/cluster/responsibilities/node/00000000-0000-4000-8000-000000000001",
         ),
         admin_route(Method::POST, "/v4/heal/mrf/cluster/responsibilities/actions"),
+        admin_route(Method::GET, "/v4/heal/delete-residue"),
+        admin_route(Method::GET, "/v4/heal/delete-residue/inspect"),
+        admin_route(Method::POST, "/v4/heal/delete-residue/discard"),
         admin_route(Method::GET, "/v4/heal/replacement-recovery"),
         admin_route(Method::GET, "/v3/tier"),
         admin_route(Method::GET, "/v3/tier-stats"),
@@ -1432,6 +1435,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/background-heal/status"));
     assert_route(&router, Method::GET, &admin_path("/v4/heal/mrf/responsibilities"));
     assert_route(&router, Method::POST, &admin_path("/v4/heal/mrf/responsibilities/actions"));
+    assert_route(&router, Method::GET, &admin_path("/v4/heal/delete-residue"));
+    assert_route(&router, Method::GET, &admin_path("/v4/heal/delete-residue/inspect"));
+    assert_route(&router, Method::POST, &admin_path("/v4/heal/delete-residue/discard"));
     assert_route(&router, Method::GET, &admin_path("/v4/heal/replacement-recovery"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/tier"));

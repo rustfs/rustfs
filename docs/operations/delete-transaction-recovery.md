@@ -142,6 +142,35 @@ A missing specific-version DELETE first recovers hidden transactions and then
 reads the current version again. It must not acknowledge an unresolved hidden
 version as an idempotent no-op.
 
+## Inspecting blocked deletes on release/1.0.7
+
+Use an account with the Heal admin permission. With a CLI that provides `rc admin heal delete-residue`, list the bucket, inspect a candidate by its exact key and reported pool/set, and save the inspection before considering an action. These operations are also available through the signed Admin API under `/rustfs/admin/v4/heal/delete-residue`.
+
+For example, list the first page on a node-specific alias, resume with its cursor, and inspect the exact key on the pool and set returned in the page.
+
+```sh
+rc admin heal delete-residue list NODE --bucket BUCKET --limit 32
+rc admin heal delete-residue list NODE --bucket BUCKET --cursor CURSOR
+rc admin heal delete-residue inspect NODE --bucket BUCKET --object 'prefix/key' --pool 0 --set 0
+```
+
+| Operation | Request | Result |
+| --- | --- | --- |
+| List physical candidates | `GET ?bucket=BUCKET&limit=32` | A bounded page from one configured drive. Read `source`, `sourceStatus`, `candidates`, and `nextCursor`. |
+| Continue listing | `GET ?bucket=BUCKET&limit=32&cursor=TOKEN` | Send the single-use token back to the same node. Continue even after an empty page if it carries a token. If the token has expired or the drive identity changes, restart the listing. |
+| Inspect one key | `GET /inspect?bucket=BUCKET&object=KEY&pool=0&set=0` | The bucket incarnation, configured participants, per-transaction evidence, reason, and a fingerprint only when a fresh discard is eligible. URL-encode query values. |
+| Discard eligible legacy evidence | `POST /discard` with JSON `{"bucket":"BUCKET","object":"KEY","pool":0,"set":0,"expectedFingerprint":"<inspection fingerprint>"}` | Rechecks and conditionally discards eligible evidence in the selected set. The evidence describes the pre-discard inspection. Check the returned number of reclaimed transaction groups. |
+
+Candidates may repeat across drives and pages. The list reports a traversal of a changing bucket, including records that can be recovered normally. A terminal page with `complete=false` or nonzero `incompleteSources` means some sources were unreadable. An unavailable participant, a work limit or a protected bucket cannot produce an executable preview. Read the evidence for each key before deciding whether to preserve it. A key can have surviving data elsewhere in a multi-pool deployment.
+
+Preserve the original volumes or a snapshot first. Discard is suitable only when the application owner confirms that the exact key was intended to be deleted. The bucket must have authoritative never-versioned state and no Object Lock, every participant in the selected set must be inspected, and every copy must pass the existing absence and layout checks. Bring all participants up to the release containing the guarded discard before executing it. Retain the evidence and use an authoritative backup if the data is needed or the intended decision cannot be established.
+
+Inspection and execution can be separated by a new PUT, a bucket recreation, a drive change or another recovery attempt. Discard re-reads the evidence under lock and rejects a stale fingerprint with HTTP 412. After a lost response or drive failure, some participants may already have finished. Inspect again and review the remaining evidence before issuing a fresh action. Discard does not acknowledge a historical commit or remove an application object through S3.
+
+The 1.0.5 and 1.0.6 release binaries both understand version 1 structured delete records. Recovery can settle a matching journal or receipt when the usual participant, generation and data checks pass. A journal-free backup can remain ambiguous on either version. Before a planned downgrade check each affected bucket for pending transactions, restore drive availability and settle or preserve unresolved evidence; postpone the downgrade while records remain. A version round trip alone cannot establish the intended outcome of an interrupted delete.
+
+On HDD, measure per-key physical recovery attempts separately from object-heal failures and scanner cycle progress. Repeated discovery of a tracked blocked key keeps its cooldown, and eligible unrelated keys can still progress. To check usage convergence, compare a newly completed scanner certificate to a complete S3 inventory of the same static dataset.
+
 ## Historical heal backups
 
 Classify a retained backup from its original evidence before requesting any
