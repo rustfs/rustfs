@@ -34,6 +34,52 @@ pub struct Infos {
 /// enum's crate).
 const DRIVE_STATE_OK: &str = "ok";
 
+/// Inspection of all discovered transactions for one exact object in an erasure set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResidueInspection {
+    pub bucket: String,
+    pub object: String,
+    pub pool: usize,
+    pub set: usize,
+    pub incarnation: String,
+    pub complete: bool,
+    pub reason: String,
+    pub participants: Vec<DeleteResidueParticipant>,
+    pub transactions: Vec<DeleteResidueTransaction>,
+    /// Present only when all participants permit a fresh discard of legacy residue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Number of transaction groups discarded by this request.
+    pub reclaimed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResidueParticipant {
+    pub slot: usize,
+    pub disk_id: Option<String>,
+    pub discovery: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResidueTransaction {
+    pub id: String,
+    pub copies: Vec<DeleteResidueCopy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResidueCopy {
+    pub slot: usize,
+    pub state: String,
+    pub current_metadata_present: Option<bool>,
+    pub backup_present: Option<bool>,
+    pub journal_present: Option<bool>,
+    pub fingerprint: Option<String>,
+}
+
 /// Unresolved delete recovery work, independent of ordinary object healing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteRecoveryStatus {

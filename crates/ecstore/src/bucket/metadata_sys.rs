@@ -1961,6 +1961,46 @@ pub(crate) async fn has_authoritative_never_versioned_state(bucket: &str) -> Res
     bucket_meta_sys.has_authoritative_never_versioned_state(bucket).await
 }
 
+/// Hold the shared bucket config transaction through an operator's inspection and
+/// discard. Read the authoritative disk snapshot under that lock without migrating
+/// historical metadata or accepting a stale notification cache.
+pub(crate) async fn legacy_discard_config_guard_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    incarnation: Uuid,
+) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
+    let sys = bucket_metadata_sys_of(ctx)?.read().await.clone();
+    let guard =
+        acquire_metadata_transaction_guard(sys.object_store(), bucket, "delete_residue_config", rustfs_lock::LockType::Shared)
+            .await?;
+    // The caller already holds the bucket lifecycle fence. The config transaction
+    // guard excludes writers while this scoped read and the eventual discard run.
+    let authority = sys.read_authoritative_metadata_from_disk_under_guard(bucket, &guard).await?;
+    let eligible = match authority {
+        BucketMetadataAuthority::Authoritative(metadata)
+            if metadata.bucket_incarnation_sidecar && metadata.bucket_incarnation_id == incarnation =>
+        {
+            authoritative_metadata_never_versioned(bucket, &metadata)?
+                && matches!(
+                    object_lock_config_state_from_authoritative_metadata(&metadata)?,
+                    ObjectLockConfigState::ConfirmedAbsent
+                )
+        }
+        _ => false,
+    };
+    if guard.is_lock_lost() {
+        return Err(Error::PreconditionFailed);
+    }
+    Ok((guard, eligible))
+}
+
+fn authoritative_metadata_never_versioned(bucket: &str, metadata: &BucketMetadata) -> Result<bool> {
+    if let Some(raw_len) = metadata.xml_config_unreadable_len(super::metadata::BUCKET_VERSIONING_CONFIG) {
+        return Err(unreadable_config_error(bucket, super::metadata::BUCKET_VERSIONING_CONFIG, raw_len));
+    }
+    Ok(metadata.versioning_config.is_none() && metadata.versioning_config_xml.is_empty())
+}
+
 pub(crate) async fn has_authoritative_never_versioned_state_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
@@ -2971,11 +3011,7 @@ impl BucketMetadataSys {
             return Ok(false);
         };
 
-        if let Some(raw_len) = metadata.xml_config_unreadable_len(super::metadata::BUCKET_VERSIONING_CONFIG) {
-            return Err(unreadable_config_error(bucket, super::metadata::BUCKET_VERSIONING_CONFIG, raw_len));
-        }
-
-        Ok(metadata.versioning_config.is_none() && metadata.versioning_config_xml.is_empty())
+        authoritative_metadata_never_versioned(bucket, &metadata)
     }
 
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {

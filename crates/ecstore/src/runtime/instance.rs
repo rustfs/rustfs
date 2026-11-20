@@ -50,6 +50,7 @@ use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
+use crate::store::delete_recovery_inventory::DeleteResidueCursors;
 use crate::store::delete_recovery_runtime::DeleteRecoveryHints;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
@@ -369,6 +370,7 @@ pub struct InstanceContext {
     pub(crate) usage_watches: Arc<super::usage_watch::UsageWatchRegistry>,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
+    pub(crate) delete_residue_cursors: DeleteResidueCursors,
     delete_recovery_hints: DeleteRecoveryHints,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     #[cfg(test)]
@@ -448,6 +450,7 @@ impl InstanceContext {
             namespace_commit_generation: AtomicU64::new(0),
             usage_watches: Arc::new(super::usage_watch::UsageWatchRegistry::default()),
             object_encryption_resolver: OnceLock::new(),
+            delete_residue_cursors: DeleteResidueCursors::default(),
             delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             #[cfg(test)]
