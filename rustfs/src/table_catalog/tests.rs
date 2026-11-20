@@ -14413,7 +14413,7 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
     let restore = include_str!("../app/object/restore.rs");
 
     for (source, signature, delegate) in [
-        (legacy_put, "fn execute_put_object(", "self.execute_put_object_owned(envelope, input)"),
+        (legacy_put, "fn put_object_edge(", ".execute_put_object_owned(envelope, input)"),
         (put, "fn execute_put_object_owned(", "self.execute_put_object_inner(envelope, input)"),
         (
             put,
@@ -14459,11 +14459,6 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             delete,
             "fn execute_delete_objects(",
             "owner.execute_delete_objects_owned(envelope, input)",
-        ),
-        (
-            legacy_put,
-            "fn execute_put_object_extract(",
-            "self.execute_put_object_extract_owned(envelope, input)",
         ),
         (
             extract,
@@ -16791,11 +16786,7 @@ fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
     let edge = include_str!("../storage/legacy_edge/object_write.rs");
     let extract = include_str!("../app/object/extract.rs");
     for (surface, from, to) in [
-        (
-            "edge",
-            "self.execute_put_object_owned(envelope, input)",
-            "self.unchecked_put(envelope, input)",
-        ),
+        ("edge", ".execute_put_object_owned(envelope, input)", ".unchecked_put(envelope, input)"),
         (
             "put",
             "self.execute_put_object_inner(envelope, input)",
@@ -16834,7 +16825,7 @@ fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
             format!("missing or out-of-order object mutation guard: {from}")
         } else {
             let signature = match surface {
-                "edge" => "fn execute_put_object(",
+                "edge" => "fn put_object_edge(",
                 "put" => "fn execute_put_object_owned(",
                 _ => "fn execute_put_object_extract_owned(",
             };

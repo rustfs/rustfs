@@ -139,6 +139,30 @@ fn extract_archive_incomplete_body(remaining: u64) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining })
 }
 
+/// Settle the transport checksum and trailers before giving the final frame to the TAR parser.
+/// A parser that rejects that frame may never poll the body again.
+fn archive_transport_chunks(
+    chunks: super::request_body::UploadChunks,
+    expected_length: u64,
+) -> impl Stream<Item = std::io::Result<Bytes>> {
+    futures::stream::try_unfold((chunks.fuse(), expected_length), |(mut chunks, remaining)| async move {
+        let Some(chunk) = chunks.next().await else {
+            return Ok(None);
+        };
+        let chunk = chunk.map_err(s3s_body_error_to_io)?;
+        let overlong = || std::io::Error::new(std::io::ErrorKind::InvalidData, "archive body exceeded expected Content-Length");
+        let remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(overlong)?;
+        if remaining == 0 {
+            while let Some(trailing) = chunks.next().await {
+                if !trailing.map_err(s3s_body_error_to_io)?.is_empty() {
+                    return Err(overlong());
+                }
+            }
+        }
+        Ok(Some((chunk, (chunks, remaining))))
+    })
+}
+
 impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
@@ -2204,8 +2228,9 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
-        let body =
-            tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))));
+        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?;
+        let chunks = Box::pin(archive_transport_chunks(body, expected_archive_length));
+        let body = tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(chunks));
 
         let md5hex = if let Some(base64_md5) = content_md5 {
             let md5 = base64_simd::STANDARD
@@ -2226,7 +2251,6 @@ impl DefaultObjectUsecase {
             return Err(ApiError::from(err).into());
         }
 
-        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?;
         let archive_upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
         let extract_limits = put_object_extract_limits();
         let tracked_archive =
@@ -4291,6 +4315,28 @@ mod tests {
             .await
             .expect("fixture should contain a logical member")
             .expect("fixture member should parse")
+    }
+
+    #[tokio::test]
+    async fn archive_transport_checks_eof_before_releasing_the_final_frame() {
+        let data = || Ok(Bytes::from_static(b"ab"));
+        let late_error: StdError = Box::new(std::io::Error::other("trailer verification failed"));
+        for (tail, expected) in [
+            (Ok(Bytes::new()), None),
+            (data(), Some("archive body exceeded expected Content-Length")),
+            (Err(late_error), Some("trailer verification failed")),
+        ] {
+            let body = Box::new(futures::stream::iter([data(), data(), tail]));
+            let mut chunks = Box::pin(archive_transport_chunks(body, 4));
+            assert_eq!(chunks.next().await.unwrap().unwrap(), "ab");
+            let last = chunks.next().await.unwrap();
+            if let Some(message) = expected {
+                assert_eq!(last.unwrap_err().to_string(), message);
+            } else {
+                assert_eq!(last.unwrap(), "ab");
+            }
+            assert!(chunks.next().await.is_none());
+        }
     }
 
     #[tokio::test]

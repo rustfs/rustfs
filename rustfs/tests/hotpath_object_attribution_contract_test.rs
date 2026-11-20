@@ -47,7 +47,17 @@ fn object_request_profiling_is_attached_to_the_matching_operation() {
         GET_OBJECT.contains("label = \"rustfs::app::object::get::DefaultObjectUsecase::execute_get_object\""),
         "the native entry must retain the established profiling label"
     );
-    assert_async_method_is_measured(PUT_OBJECT, "execute_put_object");
+    let put_edge = PUT_OBJECT
+        .split_once("async fn put_object_edge(")
+        .unwrap()
+        .1
+        .split_once("\n    }")
+        .unwrap()
+        .0;
+    assert!(
+        put_edge.contains(".execute_put_object_owned(envelope, input)"),
+        "the storage edge must call the measured PUT"
+    );
     assert_async_method_is_measured(PUT_OBJECT_OWNED, "execute_put_object_owned");
     assert!(
         PUT_OBJECT_OWNED.contains("label = \"rustfs::app::object::put::DefaultObjectUsecase::execute_put_object\""),
