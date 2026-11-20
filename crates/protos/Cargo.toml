@@ -35,8 +35,6 @@ path = "src/main.rs"
 [features]
 default = []
 hotpath = [
-    "hotpath/hotpath",
-    "hotpath/tokio",
     "rustfs-common/hotpath",
     "rustfs-config/hotpath",
     "rustfs-io-metrics/hotpath",
@@ -45,7 +43,6 @@ hotpath = [
 ]
 hotpath-alloc = [
     "hotpath",
-    "hotpath/hotpath-alloc",
     "rustfs-common/hotpath-alloc",
     "rustfs-config/hotpath-alloc",
     "rustfs-io-metrics/hotpath-alloc",
@@ -54,7 +51,6 @@ hotpath-alloc = [
 ]
 hotpath-cpu = [
     "hotpath",
-    "hotpath/hotpath-cpu",
     "rustfs-common/hotpath-cpu",
     "rustfs-config/hotpath-cpu",
     "rustfs-io-metrics/hotpath-cpu",
@@ -63,7 +59,6 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath.workspace = true
 rustfs-common.workspace = true
 rustfs-heal-contracts.workspace = true
 rustfs-io-metrics.workspace = true
