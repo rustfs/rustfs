@@ -37,6 +37,7 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
     // local-disk path; the per-disk I/O budget would only slow them down.
     crate::SCANNER_SLEEPER.disable_disk_io_budget_for_tests();
     ScannerDiskScanOptions {
+        checkpoint_endpoints: None,
         scan_mode,
         prefix_scan_scope: None,
         checkpoint_tx: None,
@@ -1305,6 +1306,7 @@ where
                 cache,
                 None,
                 ScannerDiskScanOptions {
+                    checkpoint_endpoints: None,
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
@@ -1389,6 +1391,7 @@ where
             loaded.clone(),
             None,
             ScannerDiskScanOptions {
+                checkpoint_endpoints: None,
                 scan_mode: HealScanMode::Normal,
                 prefix_scan_scope: None,
                 checkpoint_tx: None,

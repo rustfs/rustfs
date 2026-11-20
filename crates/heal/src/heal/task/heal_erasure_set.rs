@@ -228,10 +228,10 @@ impl HealTask {
         // first target format write. A task retry keeps this id; a newly
         // admitted blank replacement gets a fresh id and cannot reuse cursor
         // progress from an older disk at the same endpoint.
-        let replacement_resume = if is_auto_replacement {
-            let identities = self
-                .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
-                .await?;
+        let replacement_resume = if let Some(execution) = &replacement_execution {
+            self.check_control_flags().await?;
+            // Bind durable intent to the mounts whose execution leases we hold.
+            let identities = execution.identities().to_vec();
             let disk = replacement_resume_disk.clone().ok_or_else(|| Error::TaskExecutionFailed {
                 message: format!("Replacement resume disk is missing for automatic heal {set_disk_id}"),
             })?;

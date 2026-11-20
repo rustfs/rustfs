@@ -58,7 +58,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath.workspace = true
+hotpath = { workspace = true, optional = true }
 arc-swap.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 rand = { workspace = true, features = ["serde"] }

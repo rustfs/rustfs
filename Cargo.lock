@@ -10586,7 +10586,6 @@ name = "rustfs-protos"
 version = "1.0.6"
 dependencies = [
  "flatbuffers",
- "hotpath",
  "prost 0.14.4",
  "rmp-serde",
  "rustfs-common",

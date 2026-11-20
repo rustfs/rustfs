@@ -64,6 +64,8 @@ A runtime metadata or identity read failure before any write is dispatched rejec
 
 During startup, an unreadable identity or `pool.bin` replica returns typed `ReadUnavailable` before a partial metadata view is installed or the object store is published. Initialization retries from the complete identity and metadata read at the existing five-second retry interval, within the existing startup attempt budget. A later readable result must still pass the original identity, generation, topology, conditional-write and readback checks. Read-only unavailability does not create a permanent startup block; an existing validation or uncertain-write block is never cleared by a clean retry.
 
+When native recovery reports `no_ordinary_v3_authority`, no ordinary V3 COMMIT or eligible PREPARE proves a generation to restore. `missing_pool_metadata_slot` and `missing_pool_identity_slot` identify absent members of the corresponding erasure sets. `missing_pool_metadata_head` identifies an inspected member without a current metadata shard. `pool_identity_unavailable` means an ordinary identity read could not establish a valid replica. Transport errors retain their original storage error. Investigate the failing stage and preserve the surviving drives before attempting another replacement.
+
 The node checks for interrupted pool metadata transactions every five seconds. Failed recovery attempts back off to at most sixty seconds; each attempt has a thirty-second budget and stops on shutdown. Healthy nodes do not read metadata for this worker. Recovery:
 
 1. Cancels old decommission workers and waits for their supervisors to drain them. It does not cancel a separate rebalance operation; an attached rebalance worker prevents recovery until quiescent.

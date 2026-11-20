@@ -1800,6 +1800,8 @@ pub struct ScannerSourceTurnReceipt {
 
 #[derive(Debug)]
 pub struct ScannerDiskScanOptions {
+    /// All configured replica slots, including temporarily detached scan sources.
+    pub checkpoint_endpoints: Option<HashSet<String>>,
     pub scan_mode: HealScanMode,
     pub prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
     pub checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
@@ -1830,6 +1832,13 @@ pub enum ScannerDiskScanOutcome {
     Complete(DataUsageCache),
     Partial(DataUsageCache),
     NamespaceNotFound(DataUsageCache),
+}
+
+/// A published checkpoint belongs to configured endpoint slots, even while their
+/// handles are unavailable. A walk without checkpoint identity needs no membership set.
+pub(crate) fn scanner_checkpoint_endpoints(set: &SetDisks, cache: &DataUsageCache) -> Option<HashSet<String>> {
+    (cache.info.scan_identity.is_some() && cache.info.scan_progress.is_some())
+        .then(|| set.set_endpoints.iter().map(ToString::to_string).collect())
 }
 
 pub(crate) async fn scanner_set_disk_inventory(set: &SetDisks) -> Vec<Arc<Disk>> {

@@ -194,6 +194,7 @@ impl ScannerIODisk for Disk {
         options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome> {
         let ScannerDiskScanOptions {
+            checkpoint_endpoints,
             scan_mode,
             prefix_scan_scope,
             checkpoint_tx,
@@ -277,6 +278,7 @@ impl ScannerIODisk for Disk {
                 // Every walker of this local disk shares its background I/O budget.
                 SCANNER_SLEEPER.for_disk(&self.path()),
                 prefix_scan_scope,
+                checkpoint_endpoints.as_ref(),
                 checkpoint_tx,
                 Some(local_stop.clone()),
             );

@@ -225,6 +225,14 @@ pub enum PoolMetaNativeRecoveryResponse {
 
 pub type DiskStore = Arc<Disk>;
 
+/// Filesystem evidence for a replacement data directory on its expected mount.
+#[derive(Debug)]
+pub struct ReplacementMount {
+    pub canonical_path: PathBuf,
+    pub physical_device_ids: Vec<String>,
+    pub filesystem_identity: String,
+}
+
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
@@ -1618,6 +1626,15 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
             Disk::Remote(_) => None,
+        }
+    }
+
+    /// Observe the expected mount through the same local disk handle that will
+    /// execute recovery. Call from a blocking context.
+    pub fn replacement_mount(&self, mount_roots: &[PathBuf]) -> Option<ReplacementMount> {
+        match self {
+            Self::Local(disk) => disk.get_disk().replacement_mount(mount_roots),
+            Self::Remote(_) => None,
         }
     }
 

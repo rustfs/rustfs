@@ -3818,6 +3818,7 @@ pub async fn scan_data_folder(
         sleeper,
         None,
         None,
+        None,
         Some(Arc::new(crate::scanner_io::ScannerLocalStop::default())),
     )
     .await
@@ -3834,6 +3835,7 @@ pub(crate) async fn scan_data_folder_scoped(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
     prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+    checkpoint_endpoints: Option<&HashSet<String>>,
     checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
     local_stop: Option<Arc<crate::scanner_io::ScannerLocalStop>>,
 ) -> Result<DataUsageCache, ScannerError> {
@@ -3848,7 +3850,6 @@ pub(crate) async fn scan_data_folder_scoped(
     // its persistent UUID, fencing replacements and clone-like device/inode IDs.
     if cache.info.scan_progress.is_some() && cache.info.scan_identity.is_some() {
         use crate::storage_api::owner::EcstoreDiskAPI;
-        let endpoint = local_disk.endpoint().to_string();
         let source = match wait_for_scanner_io(&ctx, directory_cursor::physical_source(&local_disk)).await {
             Ok(Ok(source)) => source,
             Err(error) | Ok(Err(error)) => {
@@ -3870,9 +3871,18 @@ pub(crate) async fn scan_data_folder_scoped(
                 return Err(error);
             }
         };
-        let mut endpoints: HashSet<_> = disks.iter().map(|disk| disk.endpoint().to_string()).collect();
-        endpoints.insert(endpoint);
-        cache.activate_directory_source(source, &endpoints);
+        let disk_endpoints;
+        let endpoints = if let Some(configured) = checkpoint_endpoints {
+            configured
+        } else {
+            disk_endpoints = disks
+                .iter()
+                .chain(std::iter::once(&local_disk))
+                .map(|disk| disk.endpoint().to_string())
+                .collect();
+            &disk_endpoints
+        };
+        cache.activate_directory_source(source, endpoints);
     }
     let directory_work = std::mem::take(&mut cache.info.scan_directory_work);
     cache.info.scan_directory_work = DirectoryCheckpoint::verified_work(directory_work, &cache.info);
