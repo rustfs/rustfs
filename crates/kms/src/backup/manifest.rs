@@ -22,7 +22,7 @@
 
 use crate::backup::capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
 use crate::backup::error::BackupError;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -503,7 +503,7 @@ pub struct BackupManifest {
     pub backup_id: String,
     /// Creation time of the bundle.
     #[serde(with = "crate::time_serde::zoned")]
-    pub created_at: Zoned,
+    pub created_at: ZonedDateTime,
     /// RustFS version that produced the bundle.
     pub rustfs_version: String,
     /// Opaque identity of the producing deployment, used by restore preflight

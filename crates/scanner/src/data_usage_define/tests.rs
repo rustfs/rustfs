@@ -1341,32 +1341,9 @@ fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
 
 #[test]
 fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after() {
-    #[derive(Serialize)]
-    struct OldDataUsageCacheInfo {
-        name: String,
-        next_cycle: u64,
-        last_update: Option<SystemTime>,
-        skip_healing: bool,
-        lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
-        replication: Option<Arc<ReplicationConfig>>,
-        failed_objects: HashMap<String, u64>,
-    }
-
-    let old_info = OldDataUsageCacheInfo {
-        name: "bucket".to_string(),
-        next_cycle: 7,
-        last_update: None,
-        skip_healing: true,
-        lifecycle: None,
-        replication: None,
-        failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
-    };
-    let mut buf = Vec::new();
-    old_info
-        .serialize(&mut rmp_serde::Serializer::new(&mut buf))
-        .expect("Failed to serialize old cache info");
-
-    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&buf).expect("Failed to deserialize old cache info");
+    // Seven-field tuple written with the pinned legacy scanner codec.
+    let old_info = b"\x97\xa6bucket\x07\xc0\xc3\xc0\xc0\x81\xaabad-object\x0b";
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(old_info).expect("decode the historical cache info tuple");
 
     assert_eq!(decoded.name, "bucket");
     assert_eq!(decoded.next_cycle, 7);
@@ -1391,13 +1368,13 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
         next_cycle: u64,
         last_update: Option<SystemTime>,
         skip_healing: bool,
-        lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
+        lifecycle: Option<()>,
         replication: Option<Arc<ReplicationConfig>>,
         failed_objects: HashMap<String, u64>,
         scan_resume_after: Option<String>,
         scan_checkpoint: Option<DataUsageScanCheckpoint>,
         pending_heals: Vec<PendingScannerHeal>,
-        object_lock: Option<Arc<s3s::dto::ObjectLockConfiguration>>,
+        object_lock: Option<()>,
     }
 
     #[derive(Deserialize)]
@@ -3560,22 +3537,21 @@ const LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD: &[u8] = &[
     0x62, 0x6c, 0x65, 0x64, 0xc0,
 ];
 
-// Keep the old tuple carrier and payload explicit when the production field changes type.
+// Project the seven original fields out of the production map. Keep the nested
+// MessagePack arrays and maps opaque so their bytes can be checked against the old writer.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LegacyLifecycleCacheInfo {
     name: String,
     next_cycle: u64,
     last_update: Option<SystemTime>,
     skip_healing: bool,
-    lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
+    lifecycle: Value,
     replication: Option<Arc<ReplicationConfig>>,
     failed_objects: HashMap<String, u64>,
 }
 
 struct LifecycleCacheOracleCase {
     label: &'static str,
-    old_tuple: Vec<u8>,
-    old_payload: Vec<u8>,
     current: DataUsageCacheInfo,
     current_map: Vec<u8>,
     frozen_tuple: &'static [u8],
@@ -3584,7 +3560,6 @@ struct LifecycleCacheOracleCase {
 }
 
 fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
-    use s3s::dto as legacy;
     use time::OffsetDateTime;
     let expiration_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789)
         .expect("the legacy expiration fixture has an exact timestamp");
@@ -3592,136 +3567,6 @@ fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
         .expect("the legacy transition fixture has an exact timestamp");
     let expiry_updated_at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_002_456_789_123)
         .expect("the legacy expiry update fixture has an exact timestamp");
-
-    let absent = legacy::LifecycleRule {
-        abort_incomplete_multipart_upload: None,
-        del_marker_expiration: None,
-        expiration: None,
-        filter: None,
-        id: None,
-        noncurrent_version_expiration: None,
-        noncurrent_version_transitions: None,
-        prefix: None,
-        status: legacy::ExpirationStatus::from_static(legacy::ExpirationStatus::ENABLED),
-        transitions: None,
-    };
-    let mut empty = absent.clone();
-    empty.id = Some(String::new());
-    empty.prefix = Some(String::new());
-    empty.status = legacy::ExpirationStatus::from_static(legacy::ExpirationStatus::DISABLED);
-    empty.abort_incomplete_multipart_upload = Some(legacy::AbortIncompleteMultipartUpload {
-        days_after_initiation: None,
-    });
-    empty.del_marker_expiration = Some(legacy::DelMarkerExpiration { days: None });
-    empty.expiration = Some(legacy::LifecycleExpiration {
-        days: Some(0),
-        ..Default::default()
-    });
-    empty.filter = Some(legacy::LifecycleRuleFilter {
-        and: Some(legacy::LifecycleRuleAndOperator {
-            tags: Some(Vec::new()),
-            ..Default::default()
-        }),
-        tag: Some(legacy::Tag { key: None, value: None }),
-        ..Default::default()
-    });
-    empty.noncurrent_version_expiration = Some(legacy::NoncurrentVersionExpiration {
-        noncurrent_days: None,
-        newer_noncurrent_versions: Some(-2),
-    });
-    empty.noncurrent_version_transitions = Some(Vec::new());
-    empty.transitions = Some(Vec::new());
-    let mut absent_tags = absent.clone();
-    absent_tags.filter = Some(legacy::LifecycleRuleFilter {
-        and: Some(legacy::LifecycleRuleAndOperator::default()),
-        ..Default::default()
-    });
-    // Cached values must survive independently of lifecycle policy validation.
-    let complete = legacy::BucketLifecycleConfiguration {
-        expiry_updated_at: Some(expiry_updated_at.into()),
-        rules: vec![
-            legacy::LifecycleRule {
-                abort_incomplete_multipart_upload: Some(legacy::AbortIncompleteMultipartUpload {
-                    days_after_initiation: Some(0),
-                }),
-                del_marker_expiration: Some(legacy::DelMarkerExpiration { days: Some(-1) }),
-                expiration: Some(legacy::LifecycleExpiration {
-                    date: Some(expiration_date.into()),
-                    days: Some(-3),
-                    expired_object_delete_marker: Some(false),
-                    expired_object_all_versions: Some(false),
-                }),
-                filter: Some(legacy::LifecycleRuleFilter {
-                    cached_tags: Default::default(),
-                    and: Some(legacy::LifecycleRuleAndOperator {
-                        prefix: Some(String::new()),
-                        tags: Some(vec![
-                            legacy::Tag {
-                                key: Some(String::new()),
-                                value: Some(String::new()),
-                            },
-                            legacy::Tag {
-                                key: None,
-                                value: Some("value-without-key".to_string()),
-                            },
-                            legacy::Tag {
-                                key: Some("key-without-value".to_string()),
-                                value: None,
-                            },
-                        ]),
-                        object_size_greater_than: Some(-1),
-                        object_size_less_than: Some(4096),
-                    }),
-                    prefix: Some(String::new()),
-                    tag: Some(legacy::Tag {
-                        key: Some("kind".to_string()),
-                        value: Some("archive".to_string()),
-                    }),
-                    object_size_greater_than: Some(0),
-                    object_size_less_than: Some(8192),
-                }),
-                id: Some("complete-legacy-rule".to_string()),
-                noncurrent_version_expiration: Some(legacy::NoncurrentVersionExpiration {
-                    noncurrent_days: Some(-7),
-                    newer_noncurrent_versions: Some(0),
-                }),
-                noncurrent_version_transitions: Some(vec![
-                    legacy::NoncurrentVersionTransition {
-                        noncurrent_days: Some(0),
-                        newer_noncurrent_versions: Some(-1),
-                        storage_class: Some(legacy::TransitionStorageClass::from_static("LEGACY_UNKNOWN_CLASS")),
-                    },
-                    legacy::NoncurrentVersionTransition {
-                        noncurrent_days: None,
-                        newer_noncurrent_versions: None,
-                        storage_class: None,
-                    },
-                ]),
-                prefix: Some("legacy-prefix/".to_string()),
-                status: legacy::ExpirationStatus::from_static("LegacyUnknownStatus"),
-                transitions: Some(vec![
-                    legacy::Transition {
-                        date: Some(transition_date.into()),
-                        days: Some(0),
-                        storage_class: Some(legacy::TransitionStorageClass::from_static("LEGACY_UNKNOWN_CLASS")),
-                    },
-                    legacy::Transition {
-                        date: None,
-                        days: None,
-                        storage_class: Some(legacy::TransitionStorageClass::from_static("")),
-                    },
-                    legacy::Transition {
-                        date: None,
-                        days: None,
-                        storage_class: None,
-                    },
-                ]),
-            },
-            empty,
-            absent_tags,
-            absent,
-        ],
-    };
 
     use rustfs_gateway_types::persistence as persisted;
     let domain_absent = persisted::PersistedLifecycleRule {
@@ -3869,17 +3714,12 @@ fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
         (
             "none",
             None,
-            None,
             LEGACY_LIFECYCLE_NONE_TUPLE,
             LEGACY_LIFECYCLE_NONE_MAP,
             LEGACY_LIFECYCLE_NONE_PAYLOAD,
         ),
         (
             "empty",
-            Some(Arc::new(legacy::BucketLifecycleConfiguration {
-                rules: Vec::new(),
-                expiry_updated_at: None,
-            })),
             Some(Arc::new(persisted::PersistedLifecycleConfiguration {
                 rules: Vec::new(),
                 expiry_updated_at: None,
@@ -3890,7 +3730,6 @@ fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
         ),
         (
             "nonempty",
-            Some(Arc::new(complete)),
             Some(Arc::new(domain_complete)),
             LEGACY_LIFECYCLE_NONEMPTY_TUPLE,
             LEGACY_LIFECYCLE_NONEMPTY_MAP,
@@ -3899,35 +3738,17 @@ fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
     ];
     cases
         .into_iter()
-        .map(|(label, lifecycle, domain, frozen_tuple, frozen_map, frozen_payload)| {
-            let old = LegacyLifecycleCacheInfo {
+        .map(|(label, lifecycle, frozen_tuple, frozen_map, frozen_payload)| {
+            let current = DataUsageCacheInfo {
                 name: "legacy-lifecycle-bucket".to_string(),
                 next_cycle: 7,
-                last_update: None,
                 skip_healing: true,
                 lifecycle,
-                replication: None,
-                failed_objects: HashMap::new(),
-            };
-            let mut old_tuple = Vec::new();
-            old.serialize(&mut rmp_serde::Serializer::new(&mut old_tuple))
-                .expect("the real old tuple carrier must encode");
-            let old_payload = rmp_serde::to_vec(&old.lifecycle).expect("the real old lifecycle payload must encode");
-            let current = DataUsageCacheInfo {
-                name: old.name.clone(),
-                next_cycle: old.next_cycle,
-                last_update: old.last_update,
-                skip_healing: old.skip_healing,
-                lifecycle: domain,
-                replication: None,
-                failed_objects: old.failed_objects,
                 ..Default::default()
             };
             let current_map = rmp_serde::to_vec(&current).expect("the actual production map writer must encode the fixture");
             LifecycleCacheOracleCase {
                 label,
-                old_tuple,
-                old_payload,
                 current,
                 current_map,
                 frozen_tuple,
@@ -3940,57 +3761,36 @@ fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
 
 #[test]
 fn test_lifecycle_cache_legacy_msgpack_oracle() {
-    use time::OffsetDateTime;
-
     for case in lifecycle_cache_oracle_cases() {
-        let label = case.label;
-        let old_tuple = case.old_tuple;
-        let old_payload = case.old_payload;
-        let current = case.current;
-        let current_map = case.current_map;
-        let frozen_tuple = case.frozen_tuple;
-        let frozen_map = case.frozen_map;
-        let frozen_payload = case.frozen_payload;
-        println!("legacy_lifecycle_cache {label}: tuple={old_tuple:02x?}; map={current_map:02x?}; payload={old_payload:02x?}");
-        let old_from_current: LegacyLifecycleCacheInfo =
-            rmp_serde::from_slice(&current_map).expect("the actual old reader must read the production map");
-        if label == "nonempty" {
-            let lifecycle = old_from_current
-                .lifecycle
-                .as_ref()
-                .expect("the old reader must retain the nonempty lifecycle");
-            let expiration = lifecycle.rules[0]
-                .expiration
-                .as_ref()
-                .expect("the complete rule has expiration");
-            let transition = &lifecycle.rules[0]
-                .transitions
-                .as_ref()
-                .expect("the complete rule has transitions")[0];
-            let expected_expiration_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_000_000)
-                .expect("the legacy millisecond expiration date is representable");
-            let expected_transition_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_001_987_000_000)
-                .expect("the legacy millisecond transition date is representable");
-            let expected_expiry_updated_at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_002_456_000_000)
-                .expect("the legacy millisecond expiry update is representable");
-            assert_eq!(
-                (
-                    expiration.date.clone().map(OffsetDateTime::from),
-                    transition.date.clone().map(OffsetDateTime::from),
-                    lifecycle.expiry_updated_at.clone().map(OffsetDateTime::from),
-                ),
-                (
-                    Some(expected_expiration_date),
-                    Some(expected_transition_date),
-                    Some(expected_expiry_updated_at),
-                ),
-                "cache serialization must retain the fixed legacy millisecond precision for Date and ExpiryUpdatedAt"
-            );
-        }
+        let LifecycleCacheOracleCase {
+            label,
+            current,
+            current_map,
+            frozen_tuple,
+            frozen_map,
+            frozen_payload,
+        } = case;
         let frozen_tuple_read: DataUsageCacheInfo =
             rmp_serde::from_slice(frozen_tuple).expect("the production reader must accept the fixed legacy tuple bytes");
         let frozen_map_read: DataUsageCacheInfo =
             rmp_serde::from_slice(frozen_map).expect("the production reader must accept the fixed legacy map bytes");
+        if label == "nonempty" {
+            let lifecycle = frozen_map_read.lifecycle.as_ref().expect("nonempty lifecycle");
+            let rule = &lifecycle.rules[0];
+            assert_eq!(
+                [
+                    rule.expiration.as_ref().expect("expiration").date.as_deref(),
+                    rule.transitions.as_ref().expect("transitions")[0].date.as_deref(),
+                    lifecycle.expiry_updated_at.as_deref(),
+                ],
+                [
+                    Some("2023-11-14T22:13:20.123Z"),
+                    Some("2023-11-14T22:13:21.987Z"),
+                    Some("2023-11-14T22:13:22.456Z"),
+                ],
+                "legacy timestamps retain millisecond precision",
+            );
+        }
         assert_eq!(
             [
                 rmp_serde::to_vec(&frozen_tuple_read).expect("encode the fixed legacy tuple after production read"),
@@ -4014,21 +3814,21 @@ fn test_lifecycle_cache_legacy_msgpack_oracle() {
 fn test_lifecycle_cache_legacy_carrier_round_trips() {
     for case in lifecycle_cache_oracle_cases() {
         let label = case.label;
-        let old_tuple = case.old_tuple;
+        let old_tuple = case.frozen_tuple;
         let current_map = case.current_map;
         let from_old: DataUsageCacheInfo =
-            rmp_serde::from_slice(&old_tuple).expect("the production reader must read the old tuple");
+            rmp_serde::from_slice(old_tuple).expect("the production reader must read the old tuple");
         let from_old_map = rmp_serde::to_vec(&from_old).expect("the production writer must retain the old tuple payload");
         let old_via_current: LegacyLifecycleCacheInfo =
-            rmp_serde::from_slice(&from_old_map).expect("the old reader must read the production map after an old-tuple load");
+            rmp_serde::from_slice(&from_old_map).expect("project the old fields after an old-tuple load");
         let old_from_current: LegacyLifecycleCacheInfo =
-            rmp_serde::from_slice(&current_map).expect("the actual old reader must read the production map");
+            rmp_serde::from_slice(&current_map).expect("project the old fields after a production write");
         assert_eq!(
             [
                 rmp_serde::to_vec(&old_via_current).expect("encode the old reader's complete tuple after production reload"),
                 rmp_serde::to_vec(&old_from_current).expect("encode the old reader's complete tuple after production write"),
             ],
-            [old_tuple.clone(), old_tuple],
+            [old_tuple, old_tuple],
             "both cache directions must preserve the full old carrier for {label}"
         );
     }
@@ -4051,32 +3851,12 @@ fn test_lifecycle_cache_current_map_round_trip() {
 
 #[test]
 fn test_lifecycle_cache_strict_cached_tags_contract() {
-    use s3s::dto as legacy;
-    type LegacyPayload = Option<Arc<legacy::BucketLifecycleConfiguration>>;
-
-    let old: LegacyPayload = rmp_serde::from_slice(LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD)
-        .expect("the frozen payload must initialize the real old configuration");
-    let filter = old.as_ref().expect("nonempty old payload").rules[0]
-        .filter
-        .as_ref()
-        .expect("first old rule has a filter");
-    let object_tags = [(String::new(), String::new()), ("kind".to_owned(), "archive".to_owned())]
-        .into_iter()
-        .collect();
-    // The real old inherent method initializes its OnceLock even if matching fails.
-    let _ = filter.test_tags(&object_tags);
+    // The pinned legacy writer produced the same empty map before and after test_tags initialized its cache.
     let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD))
         .expect("the production reader must accept the fixed payload");
     assert_eq!(
-        [
-            rmp_serde::to_vec(&old).expect("encode the initialized old cache"),
-            rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("encode the new cache")
-        ],
-        [
-            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec(),
-            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec()
-        ],
-        "an initialized old CachedTags must still write the same empty map as the new carrier"
+        rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("encode the cached tags"),
+        LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD,
     );
 
     let slot = LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD
@@ -4089,22 +3869,14 @@ fn test_lifecycle_cache_strict_cached_tags_contract() {
         bytes.extend_from_slice(&LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD[slot + 1..]);
         bytes
     };
-    // A historical String/String map is consumed by both real readers, then
-    // rewritten empty. The original populated input is deliberately not the oracle.
+    // The pinned reader discarded populated String/String maps and rejected the other shapes below.
     let populated = input_with_cache(&[0x81, 0xa3, b'e', b'n', b'v', 0xa4, b'p', b'r', b'o', b'd']);
-    let old: LegacyPayload = rmp_serde::from_slice(&populated).expect("old reader accepts String/String cached tags");
     let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(populated.as_slice()))
         .expect("new reader accepts String/String cached tags");
     assert_eq!(
-        [
-            rmp_serde::to_vec(&old).expect("rewrite the old populated cache"),
-            rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("rewrite the new populated cache")
-        ],
-        [
-            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec(),
-            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec()
-        ],
-        "both readers discard populated cached tags and both writers emit an empty map"
+        rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("rewrite the populated cache"),
+        LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD,
+        "populated cached tags are discarded on rewrite",
     );
 
     for (label, replacement) in [
@@ -4115,13 +3887,8 @@ fn test_lifecycle_cache_strict_cached_tags_contract() {
         ("nonstring-value", &[0x81, 0xa1, b'k', 0x01][..]),
     ] {
         let input = input_with_cache(replacement);
-        let old = rmp_serde::from_slice::<LegacyPayload>(&input);
         let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(input.as_slice()));
-        assert_eq!(
-            [old.is_err(), new.is_err()],
-            [true, true],
-            "both real readers must reject {label} cached tags"
-        );
+        assert!(new.is_err(), "must reject {label} cached tags");
     }
 }
 
@@ -4133,73 +3900,59 @@ fn object_lock_cache_matches_the_legacy_dto_bytes() {
     use rustfs_gateway_types::persistence::{
         PersistedDefaultRetention, PersistedObjectLockConfiguration, PersistedObjectLockRule,
     };
-    use s3s::dto as legacy;
-
-    let legacy_cases = vec![
-        legacy::ObjectLockConfiguration {
-            object_lock_enabled: None,
-            rule: None,
-        },
-        legacy::ObjectLockConfiguration {
-            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
-            rule: None,
-        },
-        legacy::ObjectLockConfiguration {
-            object_lock_enabled: Some(legacy::ObjectLockEnabled::from("Disabled".to_owned())),
-            rule: Some(legacy::ObjectLockRule { default_retention: None }),
-        },
-        legacy::ObjectLockConfiguration {
-            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
-            rule: Some(legacy::ObjectLockRule {
-                default_retention: Some(legacy::DefaultRetention {
+    // Captured from the minio-enabled s3s DTO at 5761ddfe4c509fcac87e3b99fd5bd9e176b442c0.
+    let cases = [
+        (b"\x92\xc0\xc0".as_slice(), None, None),
+        (b"\x92\xa7Enabled\xc0".as_slice(), Some("Enabled"), None),
+        (
+            b"\x92\xa8Disabled\x91\xc0".as_slice(),
+            Some("Disabled"),
+            Some(PersistedObjectLockRule { default_retention: None }),
+        ),
+        (
+            b"\x92\xa7Enabled\x91\x93\x1e\xaaGOVERNANCE\xc0".as_slice(),
+            Some("Enabled"),
+            Some(PersistedObjectLockRule {
+                default_retention: Some(PersistedDefaultRetention {
                     days: Some(30),
-                    mode: Some(legacy::ObjectLockRetentionMode::from_static(legacy::ObjectLockRetentionMode::GOVERNANCE)),
+                    mode: Some("GOVERNANCE".to_owned()),
                     years: None,
                 }),
             }),
-        },
-        legacy::ObjectLockConfiguration {
-            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
-            rule: Some(legacy::ObjectLockRule {
-                default_retention: Some(legacy::DefaultRetention {
+        ),
+        (
+            b"\x92\xa7Enabled\x91\x93\xc0\xaecompliance-ish\x02".as_slice(),
+            Some("Enabled"),
+            Some(PersistedObjectLockRule {
+                default_retention: Some(PersistedDefaultRetention {
                     days: None,
-                    mode: Some(legacy::ObjectLockRetentionMode::from("compliance-ish".to_owned())),
+                    mode: Some("compliance-ish".to_owned()),
                     years: Some(2),
                 }),
             }),
-        },
+        ),
     ];
-
-    for legacy_config in legacy_cases {
-        let persisted = PersistedObjectLockConfiguration {
-            object_lock_enabled: legacy_config
-                .object_lock_enabled
-                .as_ref()
-                .map(|value| value.as_str().to_owned()),
-            rule: legacy_config.rule.as_ref().map(|rule| PersistedObjectLockRule {
-                default_retention: rule.default_retention.as_ref().map(|retention| PersistedDefaultRetention {
-                    mode: retention.mode.as_ref().map(|value| value.as_str().to_owned()),
-                    days: retention.days,
-                    years: retention.years,
-                }),
-            }),
-        };
-        let old_bytes = rmp_serde::to_vec(&Some(Arc::new(legacy_config))).expect("encode the legacy DTO");
-        let current = Some(Arc::new(persisted.clone()));
+    for (old_bytes, enabled, rule) in cases {
+        let current = Some(Arc::new(PersistedObjectLockConfiguration {
+            object_lock_enabled: enabled.map(str::to_owned),
+            rule,
+        }));
         let new_bytes = rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&current)).expect("encode the new cache");
-        assert_eq!(new_bytes, old_bytes, "the new writer must produce the legacy bytes for {persisted:?}");
-
-        let decoded = crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(old_bytes.as_slice()))
-            .expect("decode the legacy bytes");
-        assert_eq!(decoded.as_deref(), Some(&persisted));
+        assert_eq!(new_bytes, old_bytes, "must reproduce the original bytes for {current:?}");
+        let decoded =
+            crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(old_bytes)).expect("decode the legacy bytes");
+        assert_eq!(decoded, current);
     }
-
-    let absent_old = rmp_serde::to_vec(&Option::<Arc<legacy::ObjectLockConfiguration>>::None).expect("encode absent");
-    let absent_new = rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&None)).expect("encode absent");
-    assert_eq!(absent_new, absent_old);
-    let decoded =
-        crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(absent_old.as_slice())).expect("decode absent");
-    assert!(decoded.is_none());
+    let absent = b"\xc0";
+    assert_eq!(
+        rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&None)).expect("encode absent"),
+        absent
+    );
+    assert!(
+        crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(&absent[..]))
+            .expect("decode absent")
+            .is_none()
+    );
 }
 
 #[test]

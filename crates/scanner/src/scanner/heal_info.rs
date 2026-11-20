@@ -21,7 +21,7 @@ use std::sync::RwLock as StdRwLock;
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundHealInfo {
     /// Bitrot scan start time
-    pub bitrot_start_time: Option<DateTime<Utc>>,
+    pub bitrot_start_time: Option<Timestamp>,
     /// Bitrot scan start cycle
     pub bitrot_start_cycle: u64,
     /// Current scan mode
@@ -222,11 +222,11 @@ pub(super) enum ScannerBitrotStart {
     None,
     /// A Deep selection window opened at `cycle` / `started`, from the
     /// persisted or the remembered record.
-    Window { cycle: u64, started: DateTime<Utc> },
+    Window { cycle: u64, started: Timestamp },
     /// No Deep window is recorded anywhere; the cadence counts from the first
     /// cycle this process ran without one. Never persisted, so it opens no
     /// selection window and old readers see no new state.
-    Anchor(DateTime<Utc>),
+    Anchor(Timestamp),
 }
 
 impl ScannerBitrotStart {
@@ -245,7 +245,7 @@ impl ScannerBitrotStart {
         }
     }
 
-    fn started(self) -> Option<DateTime<Utc>> {
+    fn started(self) -> Option<Timestamp> {
         match self {
             Self::None => None,
             Self::Window { started, .. } => Some(started),
@@ -290,9 +290,9 @@ static SCANNER_BITROT_STATUS: StdLazyLock<StdRwLock<ScannerBitrotStatus>> =
     StdLazyLock::new(|| StdRwLock::new(ScannerBitrotStatus::default()));
 
 /// When this process first ran a cycle without any recorded Deep window.
-static SCANNER_BITROT_ANCHOR: StdRwLock<Option<DateTime<Utc>>> = StdRwLock::new(None);
+static SCANNER_BITROT_ANCHOR: StdRwLock<Option<Timestamp>> = StdRwLock::new(None);
 
-fn bitrot_cadence_anchor(now: DateTime<Utc>) -> DateTime<Utc> {
+fn bitrot_cadence_anchor(now: Timestamp) -> Timestamp {
     let mut anchor = SCANNER_BITROT_ANCHOR.write().unwrap_or_else(|poisoned| poisoned.into_inner());
     *anchor.get_or_insert(now)
 }
@@ -304,7 +304,7 @@ pub(super) fn reset_bitrot_cadence_anchor_for_test() {
 
 /// The cadence reference for a cycle: the recorded Deep window start when the
 /// record carries one, otherwise this process's in-memory anchor.
-pub(super) fn scanner_bitrot_start_for_cycle(info: &BackgroundHealInfo, now: DateTime<Utc>) -> ScannerBitrotStart {
+pub(super) fn scanner_bitrot_start_for_cycle(info: &BackgroundHealInfo, now: Timestamp) -> ScannerBitrotStart {
     match info.bitrot_start_time {
         Some(started) => ScannerBitrotStart::Window {
             cycle: info.bitrot_start_cycle,
@@ -368,7 +368,7 @@ pub(super) fn record_scanner_bitrot_status(
         bitrot_start_cycle: start.cycle(),
         bitrot_start_unix_secs: start
             .started()
-            .and_then(|started| u64::try_from(started.timestamp()).ok())
+            .and_then(|started| u64::try_from(started.as_second()).ok())
             .unwrap_or(0),
         current_scan_mode: scan_mode.as_str(),
     };

@@ -842,6 +842,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
             user_defined: dst_opts.user_defined.clone(),
             shard_integrity_write_mode: Some(src_info.shard_integrity_write_mode()),
             versioned: dst_opts.versioned,
+            version_suspended: dst_opts.version_suspended,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),

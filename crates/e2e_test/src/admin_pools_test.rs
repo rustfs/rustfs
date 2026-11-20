@@ -15,9 +15,9 @@
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use http::header::HOST;
 use reqwest::StatusCode;
+use rustfs_s3_types::Body;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
-use s3s::Body;
 use serde::Deserialize;
 use std::error::Error;
 

@@ -80,6 +80,33 @@ BASE = {"test_a": "pass", "test_b": "pass", "test_c": "skip"}
 class CompareTests(unittest.TestCase):
     # --- negative cases ---
 
+    def test_parameter_colons_match_results_and_preserve_missing_cases(self):
+        lane = Lane(self)
+        cases = {"test_one[region::a]": "pass", "test_one[region::b]": "pass"}
+        lane.target("reference", cases)
+        candidate = lane.target("candidate-legacy", cases)
+        code, _, err, data = lane.compare()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(data["differences"], [])
+        (candidate / "junit.xml").write_text(junit({"test_one[region::a]": "pass"}))
+        code, _, err, data = lane.compare()
+        self.assertEqual(code, 1, err)
+        self.assertEqual(data["incomplete"]["candidate-legacy"], [PREFIX + "test_one[region::b]"])
+
+    def test_parameter_colons_preserve_class_and_rerun_identity(self):
+        lane = Lane(self)
+        name = "TestClass::test_case[region::a]"
+        case = '<testcase classname="s3tests.functional.test_s3.TestClass" name="test_case[region::a]">'
+        for target in ("reference", "candidate-legacy"):
+            directory = lane.target(target, {}, selected=[name])
+            body = "<failure message='x'/>" if target == "candidate-legacy" else ""
+            (directory / "junit.xml").write_text(f"<testsuites><testsuite>{case}{body}</testcase></testsuite></testsuites>")
+            if target == "candidate-legacy":
+                (directory / "rerun-junit.xml").write_text(f"<testsuites><testsuite>{case}</testcase></testsuite></testsuites>")
+        code, _, err, data = lane.compare()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(data["flaky"]["candidate-legacy"], [PREFIX + name])
+
     def test_pass_versus_fail_is_a_difference(self):
         lane = Lane(self)
         lane.target("reference", BASE)
@@ -311,8 +338,8 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(json.loads(out), TARGETS)
 
     def test_export_env_prints_validated_lines(self):
-        code, out, _ = run("export-env", "--target-json", json.dumps({"env": {"RUSTFS_S3_STACK": "gateway"}}))
-        self.assertEqual((code, out), (0, "RUSTFS_S3_STACK=gateway\n"))
+        code, out, _ = run("export-env", "--target-json", json.dumps({"env": {"RUSTFS_EXAMPLE_SETTING": "on"}}))
+        self.assertEqual((code, out), (0, "RUSTFS_EXAMPLE_SETTING=on\n"))
 
 
 class FailedTests(unittest.TestCase):

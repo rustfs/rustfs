@@ -345,6 +345,29 @@ message RenameDataResponse {
   bytes rename_data_resp_bin = 4;
 }
 
+// Ordinary rename transport batch. Protected rename variants intentionally use
+// their dedicated fail-closed RPCs and are never admitted here.
+message RenameDataBatchItem {
+  uint32 item_index = 1;
+  string disk = 2;
+  bytes file_info_msgpack = 3;
+}
+
+message RenameDataBatchRequest {
+  string src_volume = 1;
+  string src_path = 2;
+  string dst_volume = 3;
+  string dst_path = 4;
+  repeated RenameDataBatchItem items = 5;
+}
+
+message RenameDataBatchResult {
+  uint32 item_index = 1;
+  bool success = 2;
+  optional Error error = 3;
+  bytes rename_data_resp_msgpack = 4;
+}
+
 // Fixed-scope native pool.bin recovery. The typed MessagePack payload never
 // accepts an arbitrary volume or object path.
 message PoolMetaNativeRecoveryRequest {
@@ -1394,6 +1417,7 @@ service NodeService {
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc RenameDataBatch(RenameDataBatchRequest) returns (stream RenameDataBatchResult) {}; // auth-policy: body-bound
   // The method itself requires source-preserving multipart publication on every peer.
   rpc RenameMultipartData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound

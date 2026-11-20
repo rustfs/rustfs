@@ -5591,12 +5591,16 @@ impl RestoreRequestOps for RestoreRequest {
         }
 
         // For non-SELECT requests, days must be at least 1
-        if self.type_.is_none() && self.days.is_none_or(|d| d <= 0) {
+        if !valid_restore_days(self) {
             return Err(std::io::Error::other("restoration days should be at least 1"));
         }
 
         Ok(())
     }
+}
+
+fn valid_restore_days(request: &RestoreRequest) -> bool {
+    request.type_.as_deref() == Some("SELECT") || request.days.is_some_and(|days| days > 0)
 }
 
 const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
@@ -9370,6 +9374,18 @@ mod tests {
             select_parameters: None,
             tier: None,
             type_: Some("SELECT".to_owned()),
+        }
+    }
+
+    #[test]
+    fn standard_restore_days_are_positive_with_or_without_type() {
+        let mut request = select_restore_request(None);
+        for kind in [None, Some("STANDARD".to_owned())] {
+            request.type_ = kind;
+            for days in [None, Some(0), Some(-1), Some(1)] {
+                request.days = days;
+                assert_eq!(super::valid_restore_days(&request), days == Some(1));
+            }
         }
     }
 

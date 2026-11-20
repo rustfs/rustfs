@@ -43,8 +43,8 @@ pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: Cancell
 }
 
 fn configure_metric_gates(metrics_enabled: bool) {
-    let local_summary_enabled = !metrics_enabled
-        && rustfs_utils::get_env_bool(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED, false);
+    let local_summary_enabled =
+        rustfs_utils::get_env_bool(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED, false);
     let sample_rate =
         rustfs_utils::get_env_u64(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE, 64).max(1);
     startup_runtime_sources::set_get_stage_local_summary_enabled(local_summary_enabled);
@@ -72,7 +72,8 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                 _ = ctx.cancelled() => break,
                 _ = interval.tick() => {
                     let rows = rustfs_io_metrics::take_get_stage_local_summary();
-                    if rows.is_empty() {
+                    let rename = rustfs_io_metrics::snapshot_ecstore_rename_diagnostics();
+                    if rows.is_empty() && rename.is_empty() {
                         continue;
                     }
                     let summary = rows.iter().map(|row| {
@@ -83,9 +84,19 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                         .unwrap_or_default()
                         .as_millis();
                     let line = format!(
-                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\n",
+                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\trename_diag_version=4\trename_rpc={}\trename_remote_width={}\trename_batchable_width={}\trename_coverage={}\trename_batch_execution={}\trename_admission={}\trename_quarantine={}\trename_batch_timing_count={}\trename_batch_timing_total_ns={}\trename_batch_timing_max_ns={}\n",
                         rustfs_io_metrics::get_stage_local_summary_sample_rate(),
                         rows.len(),
+                        rustfs_io_metrics::ECSTORE_RENAME_RPC_KINDS.iter().zip(rename.rpc_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_PEER_WIDTHS.iter().zip(rename.remote_width_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_PEER_WIDTHS.iter().zip(rename.batchable_width_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_COVERAGE.iter().zip(rename.coverage_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_EXECUTION.iter().zip(rename.batch_execution_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_ADMISSION.iter().zip(rename.admission_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_QUARANTINE.iter().zip(rename.quarantine_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_TIMING.iter().zip(rename.batch_timing_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_TIMING.iter().zip(rename.batch_timing_total_ns).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_TIMING.iter().zip(rename.batch_timing_max_ns).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
                     );
                     let Ok(mut file) = tokio::fs::OpenOptions::new()
                         .create(true)
@@ -153,6 +164,25 @@ mod tests {
         startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
         startup_runtime_sources::set_get_stage_local_summary_enabled(previous_local_summary);
         startup_runtime_sources::set_get_stage_local_summary_sample_rate(previous_sample_rate);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_local_summary_can_run_with_metrics_export() {
+        let previous_metrics = rustfs_io_metrics::metrics_enabled();
+        let previous_get_stages = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_local_summary = rustfs_io_metrics::get_stage_local_summary_enabled();
+
+        temp_env::with_var(LOCAL_SUMMARY_ENV, Some("true"), || {
+            configure_metric_gates(true);
+            assert!(rustfs_io_metrics::metrics_enabled());
+            assert!(rustfs_io_metrics::get_stage_metrics_enabled());
+            assert!(rustfs_io_metrics::get_stage_local_summary_enabled());
+        });
+
+        startup_runtime_sources::set_metrics_enabled(previous_metrics);
+        startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
+        startup_runtime_sources::set_get_stage_local_summary_enabled(previous_local_summary);
     }
 
     #[test]

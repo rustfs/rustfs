@@ -9,7 +9,10 @@ from unittest.mock import patch
 
 import check_connect_release_boundary as guard
 
-CONNECT, GATEWAY = guard.BOUNDARIES
+(CONNECT,) = guard.BOUNDARIES
+# The enabler mechanism outlives the boundary that used it, so its tests keep a fixture boundary.
+GATEWAY = guard.Boundary("gateway-stack", "gateway-stack is restricted to debug builds",
+                         "rustfs/src/server/gateway_stack.rs", ("e2e-test-hooks",))
 TOOLCHAIN = Path(__file__).resolve().parents[1] / 'rust-toolchain.toml'
 LOCK = 'version = 3\n\n[[package]]\nname = "rustfs"\nversion = "0.1.0"\n'
 

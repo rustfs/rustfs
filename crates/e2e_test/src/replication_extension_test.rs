@@ -59,7 +59,6 @@ use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
 };
-use s3s::header::{X_AMZ_REPLICATION_STATUS, X_AMZ_TAGGING};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -78,6 +77,8 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep, timeout};
 
+const X_AMZ_REPLICATION_STATUS: http::HeaderName = http::HeaderName::from_static("x-amz-replication-status");
+const X_AMZ_TAGGING: http::HeaderName = http::HeaderName::from_static("x-amz-tagging");
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 type BacklogMetricPoints = Arc<Mutex<BTreeMap<String, BTreeMap<String, (u64, f64)>>>>;
 
@@ -464,7 +465,7 @@ pub(crate) async fn set_replication_target_with_options(
     Ok(arn)
 }
 
-async fn send_set_replication_target_request(
+pub(crate) async fn send_set_replication_target_request(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
     update: bool,

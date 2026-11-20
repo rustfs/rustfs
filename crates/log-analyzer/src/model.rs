@@ -14,7 +14,7 @@
 
 //! Unified event model shared by every stage of the analyzer.
 
-use chrono::{DateTime, FixedOffset};
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 use std::sync::Arc;
@@ -102,7 +102,7 @@ pub enum EventKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEvent {
     /// RFC-3339 timestamp with offset. None for panic/text lines that carry none.
-    pub timestamp: Option<DateTime<FixedOffset>>,
+    pub timestamp: Option<ZonedDateTime>,
     /// None when the line carries no recognizable level (text lines).
     pub level: Option<LogLevel>,
     /// tracing `target`, e.g. "rustfs::scanner::io". None for panic/text.

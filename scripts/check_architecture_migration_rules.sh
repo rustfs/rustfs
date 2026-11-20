@@ -124,9 +124,11 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # only the directory part, for rules that select the file itself by glob.
 # shellcheck source=scripts/guard_source_set.sh
 source "${ROOT_DIR}/scripts/guard_source_set.sh"
-guard_source_set "$ROOT_DIR" rustfs/src/storage/ecfs.rs rustfs/src/storage/legacy_edge ||
-  report_failure "ECFS guard source set is unreadable"
-ECFS_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
+for retired in rustfs/src/storage/ecfs.rs rustfs/src/storage/legacy_edge rustfs/src/storage/access.rs; do
+  if [[ -e "$ROOT_DIR/$retired" ]]; then
+    report_failure "Retired S3 storage edge reintroduced: $retired"
+  fi
+done
 guard_source_set "$ROOT_DIR" rustfs/src/app/bucket_usecase.rs rustfs/src/app/bucket_usecase ||
   report_failure "bucket usecase guard source set is unreadable"
 BUCKET_USECASE_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
@@ -139,9 +141,6 @@ guard_source_set "$ROOT_DIR" rustfs/src/app/lifecycle_transition_api_test.rs rus
   report_failure "lifecycle transition API test guard source set is unreadable"
 LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
 LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES=("${GUARD_SOURCES[@]:1}")
-guard_source_set "$ROOT_DIR" rustfs/src/storage/ecfs_test.rs rustfs/src/storage/legacy_edge/tests ||
-  report_failure "ECFS test guard source set is unreadable"
-ECFS_TEST_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
 # Every .rs file under rustfs/src/app, for depth-aware rules over the whole app tree.
 APP_RUNTIME_RULE_SOURCES=()
 while IFS= read -r app_source; do
@@ -433,7 +432,6 @@ RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_
 RUSTFS_SERVER_APP_CONTEXT_ENTRYPOINT_HITS_FILE="${TMP_DIR}/rustfs_server_app_context_entrypoint_hits.txt"
 RUSTFS_OWNER_RUNTIME_APP_CONTEXT_ENTRYPOINT_HITS_FILE="${TMP_DIR}/rustfs_owner_runtime_app_context_entrypoint_hits.txt"
 RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
-RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_ecfs_usecase_bypass_hits.txt"
 RUSTFS_STORAGE_GLOBAL_APP_CONTEXT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_global_app_context_reexport_hits.txt"
 RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_source_bypass_hits.txt"
 RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
@@ -2195,9 +2193,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b|(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b)' \
-    rustfs/src/storage/access.rs \
-    "${ECFS_GUARD_SOURCES[@]}" \
-    rustfs/src/storage/ecfs_extend.rs \
+    rustfs/src/storage/s3_support.rs \
     rustfs/src/storage/helper.rs \
     rustfs/src/storage/concurrency/manager.rs \
     rustfs/src/storage/sse.rs \
@@ -2209,17 +2205,6 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS storage runtime source reads must stay behind rustfs/src/storage/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
-fi
-
-(
-  cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase|object\b)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
-    "${ECFS_GUARD_SOURCES[@]}" \
-    --glob '*.rs' || true
-) >"$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE"
-
-if [[ -s "$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE" ]]; then
-  report_failure "RustFS storage ECFS S3 routes must construct app usecases through rustfs/src/storage/s3_api/mod.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2572,22 +2557,11 @@ fi
 
 (
   cd "$ROOT_DIR"
-  # ecfs_test.rs holds its tests in an inline `mod tests`, so the storage root
-  # is one super:: past the depth of the file itself. legacy_edge/tests/ is
-  # where a split of ecfs.rs moves them, with or without that inline module,
-  # so both depths are forbidden there.
-  {
-    module_relative_rg rustfs/src/storage \
-      'use\s+(?:@UP@super::|crate::storage::)\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
-      -n -U --with-filename -- rustfs/src/storage/ecfs_test.rs ||
-      echo "storage-owner test import rule could not search rustfs/src/storage/ecfs_test.rs"
-    if [[ ${#ECFS_TEST_GUARD_SOURCES[@]} -gt 1 ]]; then
-      module_relative_rg rustfs/src/storage \
-        'use\s+(?:@UP@(?:super::)?|crate::storage::)\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
-        -n -U --with-filename -- "${ECFS_TEST_GUARD_SOURCES[@]:1}" ||
-        echo "storage-owner test import rule could not search rustfs/src/storage/legacy_edge/tests"
-    fi
-  }
+  # The helper tests live in an inline tests module.
+  module_relative_rg rustfs/src/storage \
+    'use\s+(?:@UP@super::|crate::storage::)\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
+    -n -U --with-filename -- rustfs/src/storage/helpers_test.rs ||
+    echo "storage-owner test import rule could not search rustfs/src/storage/helpers_test.rs"
 ) >"$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE"
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE" ]]; then
@@ -4622,9 +4596,7 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'crate::storage::core_storage_compat' \
     rustfs/src/storage/mod.rs \
-    "${ECFS_GUARD_SOURCES[@]}" \
-    rustfs/src/storage/ecfs_extend.rs \
-    rustfs/src/storage/access.rs \
+    rustfs/src/storage/s3_support.rs \
     rustfs/src/storage/head_prefix.rs \
     rustfs/src/storage/options.rs \
     rustfs/src/storage/sse.rs || true
@@ -4643,7 +4615,7 @@ fi
     rg -n --with-filename 'crate::admin::router_storage_compat' \
       rustfs/src/admin/router.rs || true
     rg -n --with-filename 'crate::storage::core_storage_compat' \
-      "${ECFS_TEST_GUARD_SOURCES[@]}" || true
+      rustfs/src/storage/helpers_test.rs || true
   }
 ) >"$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE"
 

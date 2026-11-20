@@ -49,7 +49,7 @@ impl Served for dto::GetBucketLifecycleConfiguration {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketLifecycleAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -65,7 +65,7 @@ impl Served for dto::GetBucketReplication {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetReplicationConfigurationAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -150,7 +150,7 @@ impl Served for dto::GetObjectLockConfiguration {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {

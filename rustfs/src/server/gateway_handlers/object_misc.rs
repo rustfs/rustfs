@@ -49,14 +49,16 @@ impl Served for dto::DeleteObject {
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "server context is missing"))?;
         let version_id = input.version_id.as_deref();
-        Ok(authorize_delete_object(&server_ctx, envelope, input.bucket.as_str(), input.key.as_str(), version_id).await?)
+        authorize_delete_object(&server_ctx, envelope, input.bucket.as_str(), input.key.as_str(), version_id).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let log_error = super::error::object_error_logger("DeleteObject", request.context().transport_extensions().clone());
         let output = DefaultObjectUsecase::with_context(context)
             .execute_delete_object(envelope, request.into_input())
-            .await?;
-        Ok(Resp::new(output))
+            .await;
+        let result = output.map(Resp::new);
+        result.inspect_err(log_error)
     }
 }
 
@@ -69,14 +71,14 @@ impl Served for dto::RestoreObject {
             .server_context()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "server context is missing"))?;
-        Ok(authorize_restore_object(
+        authorize_restore_object(
             &server_ctx,
             envelope,
             input.bucket.as_str(),
             input.key.as_str(),
             input.version_id.as_deref(),
         )
-        .await?)
+        .await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -132,7 +134,7 @@ impl Served for dto::SelectObjectContent {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let input = request.input();
-        Ok(authorize_select_object_content(envelope, input.bucket.as_str(), input.key.as_str()).await?)
+        authorize_select_object_content(envelope, input.bucket.as_str(), input.key.as_str()).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -148,7 +150,7 @@ impl Served for dto::DeleteObjects {
     const METRIC: S3Operation = S3Operation::DeleteObjects;
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
-        Ok(authorize_delete_objects(envelope, request.input().bucket.as_str())?)
+        authorize_delete_objects(envelope, request.input().bucket.as_str())
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use rsa::{
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    Pkcs1v15Encrypt, PrivateKey, PublicKey,
     pkcs8::{DecodePrivateKey, DecodePublicKey},
-    pss::{BlindedSigningKey, Signature, VerifyingKey},
+    pss::{Signature, SigningKey, VerifyingKey},
     sha2::Sha256,
     signature::{RandomizedSigner, Verifier},
     traits::PublicKeyParts,
@@ -37,7 +37,7 @@ pub struct Token {
 pub fn gencode(token: &Token, key: &str) -> Result<String> {
     let data = serde_json::to_vec(token)?;
     let mut rng = rand::rng();
-    let public_key = RsaPublicKey::from_public_key_pem(key).map_err(Error::other)?;
+    let public_key = PublicKey::from_public_key_pem(key).map_err(Error::other)?;
     let encrypted_data = public_key.encrypt(&mut rng, Pkcs1v15Encrypt, &data).map_err(Error::other)?;
     Ok(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encrypted_data))
 }
@@ -51,7 +51,7 @@ pub fn parse(token: &str, key: &str) -> Result<Token> {
     let encrypted_data = base64_simd::URL_SAFE_NO_PAD
         .decode_to_vec(token.as_bytes())
         .map_err(Error::other)?;
-    let private_key = RsaPrivateKey::from_pkcs8_pem(key).map_err(Error::other)?;
+    let private_key = PrivateKey::from_pkcs8_pem(key).map_err(Error::other)?;
     let decrypted_data = private_key.decrypt(Pkcs1v15Encrypt, &encrypted_data).map_err(Error::other)?;
     serde_json::from_slice(&decrypted_data).map_err(Error::other)
 }
@@ -63,8 +63,8 @@ pub fn parse(token: &str, key: &str) -> Result<Token> {
 pub fn sign_license_token(token: &Token, private_key_pem: &str) -> Result<String> {
     let payload = serde_json::to_vec(token)?;
     let mut rng = rand::rng();
-    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem).map_err(Error::other)?;
-    let signing_key = BlindedSigningKey::<Sha256>::new(private_key);
+    let private_key = PrivateKey::from_pkcs8_pem(private_key_pem).map_err(Error::other)?;
+    let signing_key = SigningKey::<Sha256>::new(private_key);
     let signature: Signature = signing_key.try_sign_with_rng(&mut rng, &payload).map_err(Error::other)?;
     let signature: Box<[u8]> = signature.into();
 
@@ -80,7 +80,7 @@ pub fn parse_signed_license_token(token: &str, public_key_pem: &str) -> Result<T
     let signed_payload = base64_simd::URL_SAFE_NO_PAD
         .decode_to_vec(token.as_bytes())
         .map_err(Error::other)?;
-    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem).map_err(Error::other)?;
+    let public_key = PublicKey::from_public_key_pem(public_key_pem).map_err(Error::other)?;
     let signature_len = public_key.size();
 
     if signed_payload.len() <= signature_len {
@@ -103,7 +103,7 @@ pub fn parse_license_with_public_key(license: &str, public_key: &str) -> Result<
 mod tests {
     use super::*;
     use rsa::{
-        RsaPrivateKey,
+        PrivateKey,
         pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -112,8 +112,8 @@ mod tests {
     fn test_sign_license_token_and_parse_signed_license_token() {
         let mut rng = rand::rng();
         let bits = 2048;
-        let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
-        let public_key = RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
+        let public_key = PublicKey::from(&private_key);
 
         let private_key_pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
@@ -144,8 +144,8 @@ mod tests {
     fn test_legacy_gencode_and_parse_roundtrip() {
         let mut rng = rand::rng();
         let bits = 2048;
-        let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
-        let public_key = RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
+        let public_key = PublicKey::from(&private_key);
 
         let private_key_pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
@@ -173,8 +173,8 @@ mod tests {
     #[test]
     fn test_parse_signed_license_token_rejects_tampered_payload() {
         let mut rng = rand::rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");
-        let public_key = RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");
+        let public_key = PublicKey::from(&private_key);
         let private_key_pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("failed to encode private key pem");
@@ -206,8 +206,8 @@ mod tests {
     #[test]
     fn test_parse_signed_license_token_rejects_invalid_token() {
         let mut rng = rand::rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");
-        let public_key = RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");
+        let public_key = PublicKey::from(&private_key);
         let public_key_pem = public_key
             .to_public_key_pem(LineEnding::LF)
             .expect("failed to encode public key pem");
