@@ -1250,7 +1250,7 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
 
 fn map_extract_archive_error(err: std::io::Error) -> S3Error {
     let api_error = ApiError::from(err);
-    if api_error.code != S3ErrorCode::InternalError {
+    if api_error.code != rustfs_s3_types::S3ErrorCode::InternalError {
         return api_error.into();
     }
 
@@ -3666,7 +3666,7 @@ mod tests {
         ] {
             let error = map_extract_archive_error(error);
             assert_eq!(error.code(), &code);
-            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code).as_str()));
+            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code.into()).as_str()));
             assert!(error.source().is_some());
         }
         let error = map_extract_archive_error(io::Error::new(io::ErrorKind::InvalidData, "invalid TAR header"));

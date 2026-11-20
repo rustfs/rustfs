@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::*;
-use crate::app::storage_api::s3::{Body as S3Body, S3Error, S3ErrorCode, StreamingBlob};
+use crate::app::storage_api::s3::{Body as S3Body, S3Error, StreamingBlob};
 use crate::error::ApiError;
 use futures::{StreamExt, poll};
 use http_body_util::StreamBody;
+use rustfs_s3_types::S3ErrorCode;
 use std::io;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;

@@ -32,7 +32,7 @@
 //! `odm-source-etag`.
 
 use super::*;
-use crate::app::storage_api::s3::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 
 use crate::app::storage_api::multipart_usecase::contract::multipart::CompletePart;
 use crate::on_demand_migration::{

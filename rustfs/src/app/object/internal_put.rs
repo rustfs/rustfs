@@ -22,7 +22,8 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode};
+use crate::app::storage_api::s3::S3Error;
+use rustfs_s3_types::S3ErrorCode;
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
@@ -82,7 +83,7 @@ const INTERNAL_PUT_METHOD_NAME: &str = "PUT";
 
 fn api_error_from_s3(err: S3Error) -> ApiError {
     ApiError {
-        code: err.code().clone(),
+        code: err.code().clone().into(),
         message: err.message().unwrap_or_default().to_string(),
         source: None,
     }
@@ -333,7 +334,7 @@ impl DefaultObjectUsecase {
             .put_object_core(write, super::native_body::from_io_stream(body), None, start_time)
             .await
             .map_err(|error| ApiError {
-                code: error.code().clone().into(),
+                code: error.code().clone(),
                 message: error.message().unwrap_or_default().to_owned(),
                 source: None,
             })?;

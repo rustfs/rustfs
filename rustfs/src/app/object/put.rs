@@ -150,7 +150,7 @@ pub(crate) fn reject_oversize_single_upload(size: i64) -> S3Result<()> {
     if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
         return Err(S3Error::with_message(
             S3ErrorCode::EntityTooLarge,
-            ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+            ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge),
         ));
     }
     Ok(())
@@ -5669,7 +5669,7 @@ mod oversize_single_upload_tests {
         assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
         assert_eq!(
             err.message(),
-            Some(ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge).as_str())
+            Some(ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge).as_str())
         );
     }
 }

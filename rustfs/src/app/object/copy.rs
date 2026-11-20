@@ -1051,8 +1051,8 @@ mod tests {
             .expect_err("short copy source must fail before destination write succeeds");
         let api_error = ApiError::from(err);
 
-        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
-        assert_ne!(api_error.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(api_error.code, rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert_ne!(api_error.code, rustfs_s3_types::S3ErrorCode::IncompleteBody);
     }
 
     #[tokio::test]
