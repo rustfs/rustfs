@@ -45,6 +45,7 @@ pub(crate) use crate::bucket::bucket_target_sys::{
 pub(crate) use crate::bucket::target::BucketTarget;
 pub(crate) use crate::bucket::target::BucketTargets;
 pub use rustfs_replication::SsecPassthroughCapability;
+pub(crate) use rustfs_replication::object::replication_target_tags_match;
 pub use rustfs_replication::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use rustfs_replication::{
     SsecPassthroughGate, is_replication_target_offline_error, ssec_passthrough_gate, version_identity_drifted,

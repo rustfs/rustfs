@@ -194,7 +194,8 @@ pub fn replication_action_for_target(
         return ReplicationAction::Metadata;
     }
 
-    if tag_metadata_differs(source, target) {
+    let source_tags = ReplicationTagFilter::decode_tags_to_map(source.user_tags);
+    if !replication_target_tags_match(&source_tags, target.tag_count, target.metadata) {
         return ReplicationAction::Metadata;
     }
 
@@ -219,16 +220,18 @@ fn content_encoding_differs(source: &ReplicationSourceObject<'_>, target: &Repli
     false
 }
 
-fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &ReplicationTargetObject<'_>) -> bool {
-    let source_tags = ReplicationTagFilter::decode_tags_to_map(source.user_tags);
-    let target_tagging = target
-        .metadata
-        .and_then(|metadata| metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str))
-        .unwrap_or_default();
-    let target_tags = ReplicationTagFilter::decode_tags_to_map(target_tagging);
-    let source_tag_count = i32::try_from(source_tags.len()).unwrap_or(i32::MAX);
-
-    (target.tag_count > 0 && source_tags != target_tags) || target.tag_count != source_tag_count
+/// Compare a source tag set with a replica HEAD. A count alone cannot confirm
+/// that a nonempty source tag set reached the replica.
+pub fn replication_target_tags_match(
+    source_tags: &HashMap<String, String>,
+    target_tag_count: i32,
+    target_metadata: Option<&HashMap<String, String>>,
+) -> bool {
+    usize::try_from(target_tag_count) == Ok(source_tags.len())
+        && match target_metadata.and_then(|metadata| metadata.get(AMZ_OBJECT_TAGGING)) {
+            Some(tagging) => ReplicationTagFilter::decode_tags_to_map(tagging) == *source_tags,
+            None => source_tags.is_empty(),
+        }
 }
 
 fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<String, String> {
