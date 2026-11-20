@@ -1777,6 +1777,28 @@ impl LocalDisk {
         })
     }
 
+    /// Read the format through the owning disk's pinned mount, bypassing cached IDs.
+    pub(crate) async fn delete_residue_disk_id(&self) -> Result<Uuid> {
+        let bytes = self.read_format_json().await?;
+        let format = FormatV3::try_from(bytes.as_slice()).map_err(|_| DiskError::CorruptedBackend)?;
+        let id = format.erasure.this;
+        let (set, slot) = format.find_disk_index_by_disk_id(id)?;
+        if id.is_nil()
+            || usize::try_from(self.endpoint.set_idx).ok() != Some(set)
+            || usize::try_from(self.endpoint.disk_idx).ok() != Some(slot)
+        {
+            return Err(DiskError::InconsistentDisk);
+        }
+        Ok(id)
+    }
+
+    pub(crate) async fn require_delete_residue_disk_id(&self, expected: Uuid) -> Result<()> {
+        if expected.is_nil() || self.delete_residue_disk_id().await? != expected {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn delete_recovery_settle(
         &self,
         volume: &str,
@@ -1967,7 +1989,13 @@ impl LocalDisk {
                 return Ok(observed);
             }
         }
-        if action == DeleteRecoveryAction::DiscardLegacy {
+        if matches!(
+            action,
+            DeleteRecoveryAction::DiscardLegacy | DeleteRecoveryAction::DiscardLegacyOnDisk { .. }
+        ) {
+            if let DeleteRecoveryAction::DiscardLegacyOnDisk { disk_id } = action {
+                self.require_delete_residue_disk_id(disk_id).await?;
+            }
             if observed.state != DeleteRecoveryState::LegacyAmbiguous || !observed.explicit_delete_safe {
                 return Err(DiskError::FileCorrupt);
             }
@@ -2416,7 +2444,9 @@ impl LocalDisk {
                 }
             }
             DeleteRecoveryAction::AdoptCommit { .. } => return Err(DiskError::MethodNotAllowed),
-            DeleteRecoveryAction::DiscardLegacy => return Err(DiskError::MethodNotAllowed),
+            DeleteRecoveryAction::DiscardLegacy | DeleteRecoveryAction::DiscardLegacyOnDisk { .. } => {
+                return Err(DiskError::MethodNotAllowed);
+            }
         }
         self.delete_recovery_inspect_owned(volume, object, transaction, owner).await
     }

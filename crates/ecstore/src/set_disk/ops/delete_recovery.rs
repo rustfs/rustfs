@@ -27,6 +27,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod operator;
+
 const DISCOVERY_PAGE_SIZE: u32 = 128;
 const MAX_DISCOVERED_TRANSACTIONS: usize = 1_000_000;
 /// Inline cleanup attempts after a certified decision. Later attempts start
@@ -227,6 +229,18 @@ fn validate(inspection: &DeleteRecoveryInspection, object: &str, transaction: Uu
     Ok(())
 }
 
+fn explicit_legacy_copy_safe(copy: &DeleteRecoveryInspection) -> bool {
+    copy.current_digest.is_none()
+        && match copy.state {
+            DeleteRecoveryState::Absent => true,
+            DeleteRecoveryState::LegacyAmbiguous => copy.explicit_delete_safe,
+            DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished => {
+                copy.journal.as_ref().is_some_and(|journal| journal.target_digest.is_none())
+            }
+            DeleteRecoveryState::NewPrepared => false,
+        }
+}
+
 async fn inspect(
     disks: &[Option<DiskStore>],
     bucket: &str,
@@ -263,6 +277,15 @@ async fn discover_bounded(
 ) -> Result<Vec<DeleteTransactionId>> {
     let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES)?;
     let page = disk.discover_delete_transactions_bounded(bucket, object, admitted).await?;
+    bounded_discovery_ids(page, object, admitted, budget)
+}
+
+fn bounded_discovery_ids(
+    page: crate::disk::BoundedDeleteRecoveryDiscovery,
+    object: &str,
+    admitted: u32,
+    budget: &crate::object_api::DeleteRecoveryWorkBudget,
+) -> Result<Vec<DeleteTransactionId>> {
     if page.visited > admitted
         || page.transactions.len() > 256
         || page
@@ -983,18 +1006,7 @@ impl SetDisks {
         // A fresh authorized removal may discard safe legacy residue beside
         // certified absence receipts. Every participant must have no live metadata;
         // the receipts remain behind the key-wide barrier until all groups settle.
-        let explicit_legacy_removal = explicit_delete
-            && all_states.values().flatten().all(|copy| {
-                copy.current_digest.is_none()
-                    && match copy.state {
-                        DeleteRecoveryState::Absent => true,
-                        DeleteRecoveryState::LegacyAmbiguous => copy.explicit_delete_safe,
-                        DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished => {
-                            copy.journal.as_ref().is_some_and(|journal| journal.target_digest.is_none())
-                        }
-                        DeleteRecoveryState::NewPrepared => false,
-                    }
-            });
+        let explicit_legacy_removal = explicit_delete && all_states.values().flatten().all(explicit_legacy_copy_safe);
         // This is a fresh authorized delete of an absent unversioned key,
         // rather than evidence about the outcome of a historical transaction.
         let fresh_absence_decision = explicit_delete
@@ -3102,13 +3114,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn delete_recovery_set_legacy_requires_explicit_removal() {
-        let bucket = "recover-legacy-remove";
-        let (dirs, store, disks) = fixture(bucket).await;
-        put(&store, bucket, &vec![42; 4096], false).await;
+    async fn interrupt_legacy_delete(disks: &[DiskStore], bucket: &str) -> Uuid {
         let transaction = Uuid::new_v4();
-        for disk in &disks {
+        for disk in disks {
             disk.delete_version(
                 bucket,
                 "object",
@@ -3125,6 +3133,229 @@ mod tests {
             .await
             .expect("create undecided historical delete shape");
         }
+        transaction
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_operator_discard_requires_complete_unchanged_evidence() {
+        let bucket = "recover-operator-proof";
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![42; 4096], false).await;
+        let transaction = interrupt_legacy_delete(&disks, bucket).await;
+        let root = dirs[0].path().join(bucket).join("object");
+        let backup = root.join(transaction.to_string()).join("xl.meta.bkp");
+        let original = std::fs::read(&backup).expect("historical bytes");
+        let preview = store
+            .inspect_delete_residue(bucket, "object", 0, 0)
+            .await
+            .expect("inspect without writes");
+        assert!(preview.complete, "{preview:?}");
+        assert_eq!(preview.transactions.len(), 1);
+        assert_eq!(preview.participants.len(), 4);
+        assert_eq!(preview.transactions[0].copies.len(), 4);
+        let proof = preview.fingerprint.expect("eligible legacy layout");
+        assert_eq!(proof.len(), 64);
+
+        let sibling = root.join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&sibling).expect("introduce a later sibling");
+        std::fs::write(sibling.join("xl.meta.bkp"), &original).expect("seed sibling evidence");
+        assert!(matches!(
+            store.discard_delete_residue(bucket, "object", 0, 0, &proof).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+        assert_eq!(std::fs::read(&backup).expect("first sibling retained"), original);
+        assert_eq!(std::fs::read(sibling.join("xl.meta.bkp")).expect("new sibling retained"), original);
+        std::fs::remove_dir_all(sibling).expect("restore fixture to previewed evidence");
+
+        let copy = disks[0]
+            .inspect_delete_transaction(bucket, "object", transaction)
+            .await
+            .expect("disk evidence");
+        let wrong_disk = disks[1].get_disk_id().await.expect("other disk").expect("formatted");
+        for transaction in [None, Some(transaction)] {
+            assert!(matches!(
+                disks[0]
+                    .read_delete_residue_on_disk(bucket, "object", wrong_disk, transaction, 4096)
+                    .await,
+                Err(DiskError::OutdatedXLMeta)
+            ));
+        }
+        assert!(matches!(
+            disks[0]
+                .settle_delete_transaction(
+                    bucket,
+                    "object",
+                    transaction,
+                    copy.fingerprint,
+                    DeleteRecoveryAction::DiscardLegacyOnDisk { disk_id: wrong_disk }
+                )
+                .await,
+            Err(DiskError::OutdatedXLMeta)
+        ));
+        assert_eq!(std::fs::read(&backup).expect("wrong disk retained all evidence"), original);
+
+        // An actual missing slot invalidates the same fingerprint; the preview reports
+        // the incomplete per-drive picture even though the key is visible on a quorum.
+        let set = &store.pools[0].disk_set[0];
+        let offline = set.disks.write().await[3].take();
+        let incomplete = store
+            .inspect_delete_residue(bucket, "object", 0, 0)
+            .await
+            .expect("partial evidence");
+        assert!(!incomplete.complete && incomplete.fingerprint.is_none());
+        assert!(matches!(
+            store.discard_delete_residue(bucket, "object", 0, 0, &proof).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+        set.disks.write().await[3] = offline;
+
+        // A live copy appearing after the preview must not become a fresh ordinary DELETE.
+        let current = root.join("xl.meta");
+        std::fs::write(&current, &original).expect("publish a live generation");
+        let live = store
+            .inspect_delete_residue(bucket, "object", 0, 0)
+            .await
+            .expect("inspect current object");
+        assert!(live.fingerprint.is_none());
+        assert!(matches!(
+            store.discard_delete_residue(bucket, "object", 0, 0, &proof).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+        assert_eq!(std::fs::read(&current).expect("live object untouched"), original);
+        std::fs::remove_file(current).expect("restore absent fixture");
+
+        let proof = store
+            .inspect_delete_residue(bucket, "object", 0, 0)
+            .await
+            .expect("fresh preview")
+            .fingerprint
+            .expect("eligible");
+        let discarded = store
+            .discard_delete_residue(bucket, "object", 0, 0, &proof)
+            .await
+            .expect("authorized exact discard");
+        assert_eq!(discarded.reclaimed, 1);
+        assert!(discarded.fingerprint.is_none());
+        assert!(dirs.iter().all(|dir| {
+            !dir.path()
+                .join(bucket)
+                .join("object")
+                .join(transaction.to_string())
+                .join("xl.meta.bkp")
+                .exists()
+        }));
+        assert!(matches!(
+            store.discard_delete_residue(bucket, "object", 0, 0, &proof).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_operator_rejects_versioning_and_object_lock_after_preview() {
+        use crate::bucket::metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG};
+        for (bucket, config, xml) in [
+            (
+                "recover-operator-enabled",
+                BUCKET_VERSIONING_CONFIG,
+                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            ),
+            (
+                "recover-operator-suspended",
+                BUCKET_VERSIONING_CONFIG,
+                "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+            ),
+            (
+                "recover-operator-lock",
+                OBJECT_LOCK_CONFIG,
+                "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            ),
+        ] {
+            let (dirs, store, disks) = fixture(bucket).await;
+            put(&store, bucket, &vec![21; 4096], false).await;
+            let transaction = interrupt_legacy_delete(&disks, bucket).await;
+            let backup = dirs[0]
+                .path()
+                .join(bucket)
+                .join("object")
+                .join(transaction.to_string())
+                .join("xl.meta.bkp");
+            let original = std::fs::read(&backup).expect("historical bytes");
+            let pre = store
+                .inspect_delete_residue(bucket, "object", 0, 0)
+                .await
+                .expect("first inspection");
+            let proof = pre.fingerprint.expect("eligible before bucket config change");
+            crate::bucket::metadata_sys::update_in(&store.ctx, bucket, config, xml.as_bytes().to_vec())
+                .await
+                .expect("publish bucket protection");
+            let blocked = store
+                .inspect_delete_residue(bucket, "object", 0, 0)
+                .await
+                .expect("inspect protected residue");
+            assert_eq!(blocked.reason, "bucket_protected");
+            assert!(blocked.fingerprint.is_none());
+            assert!(matches!(
+                store.discard_delete_residue(bucket, "object", 0, 0, &proof).await,
+                Err(StorageError::PreconditionFailed)
+            ));
+            assert_eq!(std::fs::read(backup).expect("protected evidence retained"), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_operator_preview_does_not_survive_bucket_recreation() {
+        let bucket = "recover-operator-recreate";
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, b"stable bytes", false).await;
+        interrupt_legacy_delete(&disks, bucket).await;
+        let old = store
+            .inspect_delete_residue(bucket, "object", 0, 0)
+            .await
+            .expect("old generation");
+        let old_proof = old.fingerprint.expect("historical shape eligible");
+        // Preserve every original byte and drive slot while changing only bucket identity.
+        for dir in &dirs {
+            std::fs::rename(dir.path().join(bucket).join("object"), dir.path().join("saved-residue"))
+                .expect("hold original evidence");
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete empty original bucket");
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        for dir in &dirs {
+            std::fs::rename(dir.path().join("saved-residue"), dir.path().join(bucket).join("object"))
+                .expect("restore original evidence");
+        }
+        let new = store
+            .inspect_delete_residue(bucket, "object", 0, 0)
+            .await
+            .expect("new generation");
+        assert_ne!(old.incarnation, new.incarnation);
+        assert_eq!(old.transactions, new.transactions);
+        assert_ne!(new.fingerprint.as_deref(), Some(old_proof.as_str()));
+        assert!(matches!(
+            store.discard_delete_residue(bucket, "object", 0, 0, &old_proof).await,
+            Err(StorageError::PreconditionFailed)
+        ));
+        assert_eq!(
+            store
+                .inspect_delete_residue(bucket, "object", 0, 0)
+                .await
+                .expect("unchanged evidence"),
+            new
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_set_legacy_requires_explicit_removal() {
+        let bucket = "recover-legacy-remove";
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![42; 4096], false).await;
+        let transaction = interrupt_legacy_delete(&disks, bucket).await;
         let report = store
             .recover_delete_transactions(bucket, &HealOpts::default())
             .await

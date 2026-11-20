@@ -728,7 +728,9 @@ pub mod store_list {
 pub mod storage {
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
-    pub use crate::store::delete_recovery_inventory::{DeleteResidueInventoryPage, DeleteResidueSource, DeleteResidueSourceStatus};
+    pub use crate::store::delete_recovery_inventory::{
+        DeleteResidueInventoryPage, DeleteResidueSource, DeleteResidueSourceStatus,
+    };
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
         all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,

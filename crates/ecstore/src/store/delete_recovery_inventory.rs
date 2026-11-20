@@ -18,10 +18,10 @@
 use super::ECStore;
 use crate::bucket::utils::{check_bucket_and_object_names, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::disk::error::DiskError;
-use crate::disk::{DeleteRecoveryCursor, DeleteRecoveryPage, DeleteTransactionId, Disk, DiskAPI, DiskStore};
+use crate::disk::{DeleteRecoveryCursor, DeleteRecoveryPage, DeleteTransactionId, Disk, DiskStore, MAX_DELETE_RESIDUE_PAGE_SIZE};
 use crate::error::{Result, StorageError};
 use crate::set_disk::SetDisks;
-use rustfs_utils::path::decode_dir_object;
+use rustfs_utils::path::GLOBAL_DIR_SUFFIX;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -32,7 +32,6 @@ use uuid::Uuid;
 
 const MAX_SESSIONS: usize = 8;
 const CURSOR_TTL: Duration = Duration::from_secs(300);
-pub const MAX_DELETE_RESIDUE_PAGE_SIZE: u32 = 64;
 
 /// Coordinates of the single configured drive examined for this page.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -167,6 +166,7 @@ async fn source_disk(set: &SetDisks, drive: usize) -> Result<Option<DiskStore>> 
 async fn observe_source(
     set: &SetDisks,
     session: &mut InventorySession,
+    expected_id: Option<Uuid>,
     limit: u32,
 ) -> Result<(DeleteResidueSourceStatus, Vec<DeleteTransactionId>)> {
     let continuation = session.physical.take();
@@ -176,7 +176,7 @@ async fn observe_source(
         }
         return Ok((DeleteResidueSourceStatus::Unavailable, Vec::new()));
     };
-    let id = disk.get_disk_id().await.ok().flatten().filter(|id| !id.is_nil());
+    let id = expected_id.filter(|id| !id.is_nil());
     if let Some(prior) = &continuation
         && (Some(prior.id) != id || !prior.disk.ptr_eq(&Arc::downgrade(&disk)))
     {
@@ -187,11 +187,15 @@ async fn observe_source(
     };
     let resuming = continuation.is_some();
     let page = disk
-        .discover_delete_transactions(&session.bucket, None, continuation.map(|state| state.cursor), limit)
+        .list_delete_residue_on_disk(&session.bucket, id, continuation.map(|state| state.cursor), limit)
         .await;
     let DeleteRecoveryPage { mut transactions, next } = match page {
         Ok(page) => page,
-        Err(DiskError::FileNotFound | DiskError::InvalidPath) if resuming => return Err(StorageError::PreconditionFailed),
+        Err(DiskError::FileNotFound | DiskError::InvalidPath | DiskError::OutdatedXLMeta | DiskError::InconsistentDisk)
+            if resuming =>
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
         Err(_) => return Ok((DeleteResidueSourceStatus::Unreadable, Vec::new())),
     };
     if transactions.len() > usize::try_from(limit).map_err(|_| StorageError::FileCorrupt)?
@@ -200,7 +204,11 @@ async fn observe_source(
         return Err(StorageError::FileCorrupt);
     }
     for candidate in &mut transactions {
-        candidate.object = decode_dir_object(&candidate.object);
+        // A literal suffix can precede the final on-disk directory marker.
+        // Remove exactly one so re-encoding the listed key selects the same physical path.
+        if let Some(prefix) = candidate.object.strip_suffix(GLOBAL_DIR_SUFFIX) {
+            candidate.object = format!("{prefix}/");
+        }
         if candidate.transaction.is_nil()
             || candidate.object.len() > 1024
             || check_bucket_and_object_names(&session.bucket, &candidate.object).is_err()
@@ -208,10 +216,9 @@ async fn observe_source(
             return Err(StorageError::FileCorrupt);
         }
     }
-    if disk.get_disk_id().await.ok().flatten() != Some(id)
-        || !source_disk(set, session.source.drive)
-            .await?
-            .is_some_and(|current| Arc::ptr_eq(&current, &disk))
+    if !source_disk(set, session.source.drive)
+        .await?
+        .is_some_and(|current| Arc::ptr_eq(&current, &disk))
     {
         return Err(StorageError::PreconditionFailed);
     }
@@ -272,7 +279,14 @@ impl ECStore {
         let incarnation = session.incarnation;
         let source = session.source;
         let set = source.erasure_set(self)?;
-        let (source_status, candidates) = observe_source(set, &mut session, limit).await?;
+        let expected_id = self.pools[source.pool]
+            .format
+            .erasure
+            .sets
+            .get(source.set)
+            .and_then(|ids| ids.get(source.drive))
+            .copied();
+        let (source_status, candidates) = observe_source(set, &mut session, expected_id, limit).await?;
         if fence.is_lock_lost() {
             return Err(StorageError::PreconditionFailed);
         }
@@ -305,6 +319,7 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::DiskAPI;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
     use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
 
@@ -363,6 +378,47 @@ mod tests {
         for marker in markers {
             assert!(std::fs::read(marker).expect("retain legacy marker bytes").is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn delete_residue_inventory_wrong_disk_never_certifies_complete() {
+        let bucket = "residue-wrong-disk";
+        let (_dirs, store) = fixture(bucket).await;
+        let set = &store.pools[0].disk_set[0];
+        let disks = set.disk_inventory().await;
+        let other = disks[1].as_ref().expect("second fixture drive");
+        seed_residue(other, bucket, "only-on-second-drive", Uuid::new_v4());
+        set.disks.write().await[0] = Some(other.clone());
+
+        let page = store
+            .list_delete_residue_candidates(bucket, None, 4)
+            .await
+            .expect("report unverified slot");
+        assert_eq!(page.source.drive, 0);
+        assert_eq!(page.source_status, DeleteResidueSourceStatus::Unreadable);
+        assert_eq!(page.incomplete_sources, 1);
+        assert!(!page.complete);
+        assert!(page.candidates.is_empty(), "never attribute the other slot's evidence to this one");
+    }
+
+    #[tokio::test]
+    async fn delete_residue_inventory_preserves_literal_suffix_in_directory_key() {
+        use rustfs_utils::path::encode_dir_object;
+        let bucket = "residue-dir-suffix";
+        let (_dirs, store) = fixture(bucket).await;
+        let disk = store.pools[0].disk_set[0].disk_inventory().await[0]
+            .clone()
+            .expect("first drive");
+        let key = format!("object{GLOBAL_DIR_SUFFIX}/");
+        let physical = encode_dir_object(&key);
+        seed_residue(&disk, bucket, &physical, Uuid::new_v4());
+        let page = store
+            .list_delete_residue_candidates(bucket, None, 4)
+            .await
+            .expect("list directory key");
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(page.candidates[0].object, key);
+        assert_eq!(encode_dir_object(&page.candidates[0].object), physical);
     }
 
     #[tokio::test]

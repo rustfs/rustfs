@@ -2300,6 +2300,23 @@ impl NodeService {
             {
                 return Err(Status::invalid_argument("recoverable batch delete exceeds 1000 object/version requests"));
             }
+            DeleteRecoveryRpcOperation::ReadResidueOnDisk {
+                disk_id,
+                transaction,
+                max_entries,
+                ..
+            } if disk_id.is_nil()
+                || transaction.is_some_and(|id| id.is_nil())
+                || *max_entries == 0
+                || *max_entries
+                    > if transaction.is_some() {
+                        DELETE_RECOVERY_MAX_INSPECTION_ENTRIES
+                    } else {
+                        DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES
+                    } =>
+            {
+                return Err(Status::invalid_argument("invalid identity-bound residue inspection"));
+            }
             DeleteRecoveryRpcOperation::DiscoverBounded { max_entries, .. }
                 if *max_entries == 0 || *max_entries > DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES =>
             {
@@ -2378,6 +2395,23 @@ impl NodeService {
                         errors.into_iter().map(|error| error.map(|error| error.to_u32())).collect(),
                     ))
                 }
+                DeleteRecoveryRpcOperation::ListResidueOnDisk { disk_id, cursor, limit } => disk
+                    .list_delete_residue_on_disk(&request.volume, disk_id, cursor, limit)
+                    .await
+                    .map(|page| DeleteRecoveryRpcReply::ListedResidueOnDisk { disk_id, page }),
+                DeleteRecoveryRpcOperation::ReadResidueOnDisk {
+                    object,
+                    disk_id,
+                    transaction,
+                    max_entries,
+                } => {
+                    disk.read_delete_residue_on_disk(&request.volume, &object, disk_id, transaction, max_entries)
+                        .await
+                }
+                DeleteRecoveryRpcOperation::ProbeLegacyDiscard => disk
+                    .probe_delete_residue_disk(&request.volume)
+                    .await
+                    .map(|disk_id| DeleteRecoveryRpcReply::LegacyDiscardDisk { disk_id }),
                 DeleteRecoveryRpcOperation::DiscoverBounded { object, max_entries } => disk
                     .discover_delete_transactions_bounded(&request.volume, &object, max_entries)
                     .await
