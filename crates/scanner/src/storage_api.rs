@@ -396,6 +396,8 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::HEALING_MARKER_PATH;
     pub(crate) use super::storage_contracts::BucketOperations;
     pub(crate) use super::storage_contracts::{
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
