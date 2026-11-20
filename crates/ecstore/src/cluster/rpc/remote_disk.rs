@@ -5882,7 +5882,7 @@ impl DiskAPI for RemoteDisk {
 }
 
 #[cfg(test)]
-pub(crate) use tests::with_staged_part_peer;
+pub(crate) use tests::{with_lost_staged_shard_peer, with_staged_part_peer};
 
 #[cfg(test)]
 mod tests {
@@ -7403,6 +7403,40 @@ mod tests {
                         Ok(grpc.unary(method, request).await)
                     })
                 }
+                "/node_service.NodeService/ReadVersion"
+                    if self.peer.verify_disk.lock().expect("verification fixture").is_some() =>
+                {
+                    struct ReadVersionSvc(AuthenticatedReadPeer);
+                    impl tonic::server::UnaryService<ReadVersionRequest> for ReadVersionSvc {
+                        type Response = rustfs_protos::proto_gen::node_service::ReadVersionResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<ReadVersionRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/ReadVersion")?;
+                                let req = request.into_inner();
+                                let disk = peer.verify_disk.lock().expect("verification fixture").clone().expect("disk");
+                                let opts = rmp_serde::from_slice(&req.opts_bin).expect("read options");
+                                let mut response = Self::Response::default();
+                                match disk.read_version("", &req.volume, &req.path, &req.version_id, &opts).await {
+                                    Ok(fi) => {
+                                        response.success = true;
+                                        response.file_info_bin = encode_file_info_msgpack(&fi).expect("encode file info").into();
+                                    }
+                                    Err(err) => response.error = Some(err.into()),
+                                }
+                                Ok(Response::new(response))
+                            })
+                        }
+                    }
+                    let method = ReadVersionSvc(self.peer.clone());
+                    Box::pin(async move {
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(method, request)
+                            .await)
+                    })
+                }
                 "/node_service.NodeService/VerifyFile" => {
                     struct VerifySvc(AuthenticatedReadPeer);
                     impl tonic::server::UnaryService<VerifyFileRequest> for VerifySvc {
@@ -7631,6 +7665,38 @@ mod tests {
         exercise(tcp, nixl).await;
         assert_eq!(peer.peer.read_all_calls(), 0);
         assert!(peer.peer.unsupported_methods.lock().expect("unexpected requests").is_empty());
+        peer.stop().await;
+    }
+
+    /// The peer acknowledges the stream but loses the staged shard. Its signed VerifyFile
+    /// handler reads the actual backing disk, so the upload receives a missing-part status.
+    pub(crate) async fn with_lost_staged_shard_peer<F, Fut>(disk: crate::disk::DiskStore, exercise: F)
+    where
+        F: FnOnce(RemoteDisk) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("bind verification peer");
+        *peer.peer.verify_disk.lock().expect("verification fixture") = Some(disk);
+        let writes = Arc::new(RecordingInternodeDataTransport::default());
+        let mut remote = remote_disk_for_addr(&peer.addr).await;
+        remote.data_transport = writes.clone();
+        exercise(remote).await;
+        assert!(
+            writes
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedTransportCall::Write(_)))
+        );
+        let methods = peer.peer.unsupported_methods.lock().expect("peer requests").clone();
+        assert!(
+            !methods
+                .iter()
+                .any(|path| path.contains("Rename") || path.ends_with("/PreparePartTransaction")),
+            "{methods:?}"
+        );
         peer.stop().await;
     }
 

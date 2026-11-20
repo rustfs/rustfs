@@ -2749,6 +2749,7 @@ impl LocalDisk {
                                     .map_err(|_| DiskError::FileCorrupt)?,
                                     algo.clone(),
                                     codec.shard_size(),
+                                    Duration::ZERO,
                                 )
                                 .await?;
                                 checked = true;

@@ -187,19 +187,19 @@ fn staged_part_file_info(
 fn require_verified_part(results: &[usize]) -> Result<()> {
     match results {
         [CHECK_PART_SUCCESS] => Ok(()),
-        [crate::disk::CHECK_PART_FILE_CORRUPT] => Err(crate::disk::error::DiskError::FileCorrupt.into()),
-        [crate::disk::CHECK_PART_FILE_NOT_FOUND] => Err(crate::disk::error::DiskError::FileNotFound.into()),
-        [status] => Err(Error::other(format!("staged part verification returned status {status}"))),
-        _ => Err(Error::other(format!(
-            "expected one staged part verification result, received {}",
-            results.len()
-        ))),
+        [crate::disk::CHECK_PART_DISK_NOT_FOUND] => Err(Error::DiskNotFound),
+        [crate::disk::CHECK_PART_VOLUME_NOT_FOUND] => Err(Error::VolumeNotFound),
+        [crate::disk::CHECK_PART_FILE_NOT_FOUND] => Err(Error::FileNotFound),
+        [crate::disk::CHECK_PART_FILE_CORRUPT] => Err(Error::FileCorrupt),
+        _ => Err(Error::Unexpected),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
+    use super::super::object::hermetic_set_disks_support::{
+        hermetic_set_disks_for_pool_with_default_parity, hermetic_set_disks_for_pool_with_default_parity_isolated,
+    };
     use super::*;
     use crate::storage_api_contracts::object::ObjectIO as _;
 
@@ -327,12 +327,30 @@ mod tests {
         for results in [
             vec![],
             vec![CHECK_PART_SUCCESS; 2],
-            vec![crate::disk::CHECK_PART_FILE_CORRUPT],
-            vec![0],
+            vec![crate::disk::CHECK_PART_UNKNOWN],
             vec![usize::MAX],
         ] {
-            assert!(require_verified_part(&results).is_err(), "unexpected peer result {results:?}");
+            assert!(
+                matches!(require_verified_part(&results), Err(Error::Unexpected)),
+                "unexpected peer result {results:?}"
+            );
         }
+        assert!(matches!(
+            require_verified_part(&[crate::disk::CHECK_PART_DISK_NOT_FOUND]),
+            Err(Error::DiskNotFound)
+        ));
+        assert!(matches!(
+            require_verified_part(&[crate::disk::CHECK_PART_VOLUME_NOT_FOUND]),
+            Err(Error::VolumeNotFound)
+        ));
+        assert!(matches!(
+            require_verified_part(&[crate::disk::CHECK_PART_FILE_NOT_FOUND]),
+            Err(Error::FileNotFound)
+        ));
+        assert!(matches!(
+            require_verified_part(&[crate::disk::CHECK_PART_FILE_CORRUPT]),
+            Err(Error::FileCorrupt)
+        ));
     }
 
     #[tokio::test]
@@ -399,6 +417,81 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn put_object_remote_verification_failure_does_not_publish_object() {
+        use crate::cluster::rpc::remote_disk::with_lost_staged_shard_peer;
+        use crate::set_disk::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::object::ObjectOperations as _;
+
+        let (_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(2, 0, 0).await;
+        let bucket = "peer-verify-put";
+        let key = "object";
+        let opts = ObjectOptions::default();
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        with_lost_staged_shard_peer(disks[1].clone(), |peer| async {
+            set.disks.write().await[1] = Some(std::sync::Arc::new(Disk::Remote(Box::new(peer))));
+            let mut reader = PutObjReader::from_vec(vec![0x42; 2 * 1024 * 1024]);
+            let error = set
+                .put_object(bucket, key, &mut reader, &opts)
+                .await
+                .expect_err("remote verification must fail the PUT");
+            assert!(error.to_string().contains("bitrot self-verify failed for shard"), "{error}");
+            assert!(error.to_string().ends_with(&Error::FileNotFound.to_string()), "{error}");
+            set.disks.write().await[1] = Some(disks[1].clone());
+        })
+        .await;
+        let error = set
+            .get_object_info(bucket, key, &opts)
+            .await
+            .expect_err("failed PUT must leave the object absent");
+        assert!(crate::error::is_err_object_not_found(&error), "{error}");
+        for disk in disks {
+            assert!(matches!(
+                disk.read_version("", bucket, key, "", &Default::default()).await,
+                Err(crate::disk::error::DiskError::FileNotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_part_remote_verification_failure_does_not_publish_part() {
+        use crate::cluster::rpc::remote_disk::with_lost_staged_shard_peer;
+        use crate::set_disk::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let (_dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(2, 0, 0).await;
+        let bucket = "peer-verify-multipart";
+        let key = "object";
+        let opts = ObjectOptions::default();
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let upload_id = set
+            .new_multipart_upload(bucket, key, &opts)
+            .await
+            .expect("create multipart upload")
+            .upload_id;
+        with_lost_staged_shard_peer(disks[1].clone(), |peer| async {
+            set.disks.write().await[1] = Some(std::sync::Arc::new(Disk::Remote(Box::new(peer))));
+            let mut reader = PutObjReader::from_vec(vec![0x53; 1024 * 1024]);
+            let error = set
+                .put_object_part(bucket, key, &upload_id, 7, &mut reader, &opts)
+                .await
+                .expect_err("remote verification must fail UploadPart");
+            assert!(error.to_string().contains("bitrot self-verify failed for shard"), "{error}");
+            assert!(error.to_string().ends_with(&Error::FileNotFound.to_string()), "{error}");
+            set.disks.write().await[1] = Some(disks[1].clone());
+        })
+        .await;
+        let listed = set
+            .list_object_parts(bucket, key, &upload_id, None, 10, &opts)
+            .await
+            .expect("upload must remain listable");
+        assert!(listed.parts.is_empty(), "failed UploadPart published a part");
     }
 
     #[tokio::test]
