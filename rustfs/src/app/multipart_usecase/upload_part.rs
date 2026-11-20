@@ -207,7 +207,7 @@ impl DefaultMultipartUsecase {
                 let (body, total) =
                     crate::app::object::cuobject::rdma_put_body(bucket, key, &token, true).map_err(S3Error::from)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
-                (Some(crate::app::object::legacy_put_body(body)), Some(total), Some(total))
+                (Some(body), Some(total), Some(total))
             }
             _ => (body, content_length, None),
         };

@@ -185,14 +185,23 @@ pub(super) fn from_io_stream<S>(stream: S) -> Body
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
+    from_io_stream_with_length(stream, None)
+}
+
+pub(super) fn from_io_stream_with_length<S>(stream: S, remaining: Option<u64>) -> Body
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
     Body::from_payload(Payload::Stream(Box::pin(IoPayload {
         stream: Box::pin(stream),
+        remaining,
         ended: false,
     })))
 }
 
 struct IoPayload<S> {
     stream: Pin<Box<S>>,
+    remaining: Option<u64>,
     ended: bool,
 }
 
@@ -205,7 +214,12 @@ impl<S: Stream<Item = std::io::Result<Bytes>>> PayloadStream for IoPayload<S> {
             match self.stream.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
-                Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Ok(PayloadRead::Chunk(bytes))),
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if let Some(remaining) = &mut self.remaining {
+                        *remaining = remaining.saturating_sub(bytes.len() as u64);
+                    }
+                    return Poll::Ready(Ok(PayloadRead::Chunk(bytes)));
+                }
                 Poll::Ready(Some(Err(error))) => {
                     self.ended = true;
                     return Poll::Ready(Err(StreamError::upstream(Box::new(ProducerSource(Box::new(error))))));
@@ -222,10 +236,12 @@ impl<S: Stream<Item = std::io::Result<Bytes>>> PayloadStream for IoPayload<S> {
         Poll::Pending
     }
     fn caps(&self) -> PayloadCaps {
-        PayloadCaps::PUSH
+        let mut caps = PayloadCaps::PUSH;
+        caps.set(PayloadCaps::KNOWN_LENGTH, self.remaining.is_some());
+        caps
     }
     fn len_hint(&self) -> Option<u64> {
-        None
+        self.remaining
     }
 }
 
@@ -377,6 +393,26 @@ mod tests {
     }
 
     impl std::error::Error for InternalProducerFailure {}
+
+    #[tokio::test]
+    async fn io_stream_reports_remaining_rdma_bytes_and_preserves_chunks() {
+        use http_body_util::BodyExt as _;
+        let first = Bytes::from_static(b"abc");
+        let last = Bytes::from_static(b"de");
+        for known in [false, true] {
+            let source = futures::stream::iter([Ok(first.clone()), Ok(last.clone())]);
+            let mut body = from_io_stream_with_length(source, known.then_some(5));
+            assert_eq!(body.caps().contains(PayloadCaps::KNOWN_LENGTH), known);
+            for (expected, remaining) in [(&first, 5), (&last, 2)] {
+                assert_eq!(body.len_hint(), known.then_some(remaining));
+                let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(&chunk, expected);
+                assert_eq!(chunk.as_ptr(), expected.as_ptr());
+            }
+            assert_eq!(body.len_hint(), known.then_some(0));
+            assert!(body.frame().await.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn internal_producer_error_preserves_io_kind_and_nested_source_after_data() {

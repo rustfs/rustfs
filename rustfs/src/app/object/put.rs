@@ -1419,7 +1419,7 @@ impl DefaultObjectUsecase {
                     !i64::try_from(token.buffer_len).is_ok_and(|size| put_body_may_fill_cache(&self.object_data_cache(), size));
                 let (body, total) = super::cuobject::rdma_put_body(&bucket, &key, &token, zero_copy)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
-                (Some(super::native_body::from_legacy(body)), Some(total), Some(total))
+                (Some(body), Some(total), Some(total))
             }
             _ => (body, content_length, None),
         };
