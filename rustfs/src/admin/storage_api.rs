@@ -943,6 +943,7 @@ pub(crate) static ERR_TIER_NOT_FOUND: AdminErrorRef = AdminErrorRef(|| &ecstore_
 pub(crate) static ERR_TIER_RESERVED_NAME: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_RESERVED_NAME);
 
 pub(crate) mod data_usage {
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::verified_account_bucket_usage;
     use std::sync::Arc;
 
     pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {

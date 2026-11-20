@@ -1883,6 +1883,48 @@ where
     .await
 }
 
+/// Observe the outer wait so that an expired drain records the attempt even when
+/// the worker is dropped before its first poll. Only one terminal record is emitted.
+async fn await_observed_scanner_cycle(
+    metrics: &rustfs_scanner_metrics::metrics::Metrics,
+    epoch: u64,
+    cycle: u64,
+    ctx: &CancellationToken,
+    budget: &ScannerCycleBudget,
+    worker: impl Future<Output = ScannerCycleOutcome>,
+    lock_lost: impl Future<Output = ()>,
+) -> ScannerCycleWaitOutcome<ScannerCycleOutcome> {
+    let started = tokio::time::Instant::now();
+    let mut completed = None;
+    let worker = async {
+        let outcome = worker.await;
+        completed = Some(outcome);
+        outcome
+    };
+    let wait = await_scanner_cycle_with_budget_fence(ctx, budget, worker, lock_lost).await;
+    let partial = || ("partial", budget.reason().map(|reason| scan_cycle_partial_reason(Some(reason)).as_str()));
+    let (result, partial_reason) = match (&wait, completed.as_ref()) {
+        (ScannerCycleWaitOutcome::Completed(outcome), _) | (_, Some(outcome)) => match outcome {
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => ("success", None),
+            ScannerCycleOutcome::Partial => partial(),
+            ScannerCycleOutcome::Superseded => ("superseded", None),
+            ScannerCycleOutcome::Deferred(_) => ("deferred", None),
+            ScannerCycleOutcome::Failed | ScannerCycleOutcome::StatePersistenceFailed => ("error", None),
+        },
+        (ScannerCycleWaitOutcome::LockLost, None) => ("lock_lost", None),
+        (ScannerCycleWaitOutcome::Cancelled, None) => ("cancelled", None),
+        (ScannerCycleWaitOutcome::Deadline { .. }, None) => partial(),
+    };
+    metrics.record_cluster_attempt(rustfs_scanner_metrics::metrics::ScannerAttemptRecord {
+        epoch,
+        cycle,
+        result,
+        partial_reason,
+        duration: started.elapsed(),
+    });
+    wait
+}
+
 #[instrument(skip_all)]
 #[hotpath::measure]
 async fn run_data_scanner_cycle_with_budget<S>(
@@ -3369,7 +3411,10 @@ where
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
         record_scanner_cycle_attempt(None);
-        let initial_outcome = match await_scanner_cycle_with_budget_fence(
+        let initial_outcome = match await_observed_scanner_cycle(
+            global_metrics(),
+            leader_epoch,
+            cycle_info.next,
             &cycle_ctx,
             &cycle_budget,
             run_data_scanner_cycle_with_budget(
@@ -3707,7 +3752,10 @@ where
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
         record_scanner_cycle_attempt(Some(wake_reason));
-        let outcome = match await_scanner_cycle_with_budget_fence(
+        let outcome = match await_observed_scanner_cycle(
+            global_metrics(),
+            leader_epoch,
+            cycle_info.next,
             &cycle_ctx,
             &cycle_budget,
             run_data_scanner_cycle_with_budget(
@@ -4462,6 +4510,7 @@ pub use backlog::{
 };
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
+pub use cycle_state::read_scanner_status_fence;
 pub use cycle_state::{
     SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
     ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord, ScannerRecoveryIntentRequest,
