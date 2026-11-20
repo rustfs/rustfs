@@ -8443,7 +8443,10 @@ mod tests {
         let mut mgr = empty_mgr();
         let long_name = "X".repeat(257);
         for name in ["COLD\n", rustfs_data_usage::UNKNOWN_TIER, long_name.as_str()] {
-            let err = mgr.add(build_s3_tier(name), true).await.expect_err("tier name must fail admission");
+            let err = mgr
+                .add(build_s3_tier(name), true)
+                .await
+                .expect_err("tier name must fail admission");
             assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
             assert!(mgr.tiers.is_empty());
         }

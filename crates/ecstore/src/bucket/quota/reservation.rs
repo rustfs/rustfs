@@ -3328,7 +3328,9 @@ mod tests {
             .await
             .expect("write a directory object with billable bytes");
 
-        let usages = exact_shard_usages(&store, bucket).await.expect("reconcile the version listing");
+        let usages = exact_shard_usages(&store, bucket)
+            .await
+            .expect("reconcile the version listing");
         assert_eq!(usages.iter().sum::<u64>(), 3);
         assert_eq!(usages[usize::from(shard_index(&stored_name))], 3);
         assert_eq!(shard_index(listed_name), shard_index(&stored_name));
