@@ -85,6 +85,7 @@ async fn require_local_removal_nodes(cred: &rustfs_credentials::Credentials) -> 
             "/rustfs/admin/v3/site-replication/remove-v2/capabilities?local=true",
             &cred.access_key,
         )
+        .with_session_token(&cred.session_token)
         .send_get(&cred.secret_key)
         .await?;
         let capability: Value =
