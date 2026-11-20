@@ -79,13 +79,15 @@ SEAMS = {
         # P2 splits bucket_usecase.rs into bucket_usecase/*.rs; narrow this to the listing file once it exists.
         owner_dirs=("rustfs/src/app/bucket_usecase/",),
     ),
-    "execute_put_object": Seam(
+    "execute_put_object_owned": Seam(
         batch="D",
         seam_file="rustfs/src/app/test_seams/put_object.rs",
         owners=(
             "rustfs/src/app/object/put.rs",
             "rustfs/src/app/lifecycle_transition_api_test/put.rs",
         ),
+        # PostObject reaches the PutObject use case; its body tests are PutObject's own.
+        owner_dirs=("rustfs/src/app/object/post_body/",),
     ),
 }
 
@@ -396,7 +398,7 @@ SEAM_BODY = {
     "execute_get_object": "pub(crate) fn get_object(u: &U, r: R) -> F { u.execute_get_object_fields(r) }\n",
     "execute_head_object": "pub(crate) fn head_object(u: &U, r: R) -> F { u.execute_head_object_fields(r) }\n",
     "execute_list_objects_v2": "pub(crate) fn list_objects_v2(u: &U, r: R) -> F { u.execute_list_objects_v2(r) }\n",
-    "execute_put_object": "pub(crate) fn put_object(u: &U, f: &Fs, r: R) -> F { u.execute_put_object(f, r) }\n",
+    "execute_put_object_owned": "pub(crate) fn put_object(u: &U, f: &Fs, r: R) -> F { u.execute_put_object_owned(f, r) }\n",
 }
 
 
@@ -506,7 +508,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(len(self.run_check()), 1)
 
     def test_file_declared_under_cfg_test_fails(self):
-        self.write("rustfs/src/app/gating_test.rs", "fn t() { u.execute_put_object(&fs, r); }\n")
+        self.write("rustfs/src/app/gating_test.rs", "fn t() { u.execute_put_object_owned(&fs, r); }\n")
         self.assertEqual(len(self.run_check()), 1)
 
     def test_file_whose_ancestor_is_cfg_test_fails(self):
@@ -515,7 +517,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(len(self.run_check()), 1)
 
     def test_put_from_non_owner_lifecycle_file_fails(self):
-        self.write("rustfs/src/app/lifecycle_transition_api_test/delete.rs", "#[test]\nfn t() { u.execute_put_object(&fs, r); }\n")
+        self.write("rustfs/src/app/lifecycle_transition_api_test/delete.rs", "#[test]\nfn t() { u.execute_put_object_owned(&fs, r); }\n")
         self.write("rustfs/src/app/mod.rs", self.files["rustfs/src/app/mod.rs"].replace("mod lifecycle", "#[cfg(test)]\nmod lifecycle"))
         self.assertEqual(len(self.run_check()), 1)
 
@@ -533,14 +535,14 @@ class SelfTest(unittest.TestCase):
         self.assertRegex(" ".join(self.run_check()), "seam for execute_get_object is missing")
 
     def test_seam_that_stopped_wrapping_fails(self):
-        self.write(SEAMS["execute_put_object"].seam_file, "pub(crate) fn put_object() { todo!() }\n")
-        self.assertRegex(" ".join(self.run_check()), "must call execute_put_object exactly once, found 0")
+        self.write(SEAMS["execute_put_object_owned"].seam_file, "pub(crate) fn put_object() { todo!() }\n")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_put_object_owned exactly once, found 0")
 
     def test_missing_owner_file_fails(self):
-        owner = SEAMS["execute_put_object"].owners[0]
+        owner = SEAMS["execute_put_object_owned"].owners[0]
         (self.root / owner).unlink()
         del self.files[owner]
-        self.assertRegex(" ".join(self.run_check()), "owner file of execute_put_object is missing")
+        self.assertRegex(" ".join(self.run_check()), "owner file of execute_put_object_owned is missing")
 
     def test_undeclared_file_with_direct_call_fails_loudly(self):
         self.write("rustfs/src/app/orphan.rs", "fn t() { u.execute_get_object(r); }\n")
@@ -561,7 +563,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(self.run_check(), [])
 
     def test_owner_test_and_production_calls_pass(self):
-        self.write("rustfs/src/app/object/put.rs", "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() { u.execute_put_object(&fs, r); }\n}\n")
+        self.write("rustfs/src/app/object/put.rs", "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() { u.execute_put_object_owned(&fs, r); }\n}\n")
         self.assertEqual(self.run_check(), [])
 
     def path_module(self, attributes: str = "", body: str = "fn prod() { u.execute_get_object(r); }\n"):

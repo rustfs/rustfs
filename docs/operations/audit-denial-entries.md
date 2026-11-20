@@ -1,7 +1,7 @@
 # Audit Entries for Authorization Denials
 
 **Use this when:** you consume the audit stream and need to know which authorization denials appear in it, how many, and how to tune the limit.
-**Source of truth:** `rustfs/src/storage/denial_audit.rs` (`DenialAuditor`, `DenialRateLimiter`), `rustfs/src/storage/access.rs` (`DenialContext`), `crates/config/src/constants/env.rs` (`ENV_AUDIT_DENIAL_RATE`, `ENV_AUDIT_DENIAL_ANONYMOUS_RATE`).
+**Source of truth:** `rustfs/src/storage/denial_audit.rs` (`DenialAuditor`, `DenialRateLimiter`), `rustfs/src/storage/authorization/decision.rs` (`DenialContext`), `crates/config/src/constants/env.rs` (`ENV_AUDIT_DENIAL_RATE`, `ENV_AUDIT_DENIAL_ANONYMOUS_RATE`).
 
 With audit enabled (`RUSTFS_AUDIT_ENABLE=true`), a request refused by the authorization layer produces an audit entry in addition to the `s3_authorization_denied` log event. The S3 response is unchanged: a bare `Access Denied`.
 

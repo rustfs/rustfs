@@ -25,10 +25,8 @@
 //! Not responsible for: validating configurations, touching the bucket
 //! metadata store, or choosing a canonical shape.
 //!
-//! Upstream: the bucket-config `deserialize`/`serialize` pair, reached through the
-//! integration-test facade `tests/storage_api.rs`, and the configuration types they are
-//! generic over (`BucketConfigXml`: the gateway persistence shapes for the families that
-//! have moved, the s3s DTOs for the rest). Downstream: the DTO/codec
+//! The tests exercise the production bucket configuration codec through `tests/storage_api.rs`.
+//! The lifecycle date cases also pin the results of the legacy codec. The DTO/codec
 //! replacement (T1.4) and the persisted-bytes comparison (T3.7), which must
 //! keep every golden green without regenerating it. Regeneration is reserved
 //! to `scripts/gen_bucket_config_goldens.sh`, which sets
@@ -506,13 +504,12 @@ mod bucket_config_goldens {
 
 mod bucket_config_lifecycle_date_compat {
     use super::*;
-    use rustfs_lifecycle::core::format_lifecycle_date;
-    use time::OffsetDateTime;
-
-    const DATES: [&str; 3] = [
-        "2023-11-14T22:13:20.123456789Z",
-        "2023-11-14T22:13:20.123456789+05:30",
-        "2025-01-02T00:00:00+02:00",
+    // Captured from the 5761ddfe reader and writer. The reader preserves the offset and
+    // nanoseconds. The writer emits the local clock fields at millisecond precision with a Z.
+    const DATES: [(&str, &str); 3] = [
+        ("2023-11-14T22:13:20.123456789Z", "2023-11-14T22:13:20.123Z"),
+        ("2023-11-14T22:13:20.123456789+05:30", "2023-11-14T22:13:20.123Z"),
+        ("2025-01-02T00:00:00+02:00", "2025-01-02T00:00:00.000Z"),
     ];
 
     fn document(date: &str) -> Vec<u8> {
@@ -522,33 +519,17 @@ mod bucket_config_lifecycle_date_compat {
         .into_bytes()
     }
 
-    fn legacy_read(input: &[u8]) -> s3s::dto::BucketLifecycleConfiguration {
-        let mut reader = s3s::xml::Deserializer::new(input);
-        let value = s3s::xml::Deserialize::deserialize(&mut reader).expect("the actual old lifecycle reader accepts the date");
-        reader.expect_eof().expect("the old reader consumes the entire date fixture");
-        value
-    }
-
     #[test]
     fn lifecycle_xml_reader_preserves_legacy_date_precision_and_offset() {
-        for date in DATES {
-            let input = document(date);
-            let old = legacy_read(&input);
-            let new: PersistedLifecycleConfiguration = deserialize(&input).expect("read persisted lifecycle date");
-            let old_date = |value: &s3s::dto::Timestamp| {
-                format_lifecycle_date(OffsetDateTime::from(value.clone())).expect("format the original old-reader date")
-            };
+        for (date, _) in DATES {
+            let new: PersistedLifecycleConfiguration = deserialize(&document(date)).expect("read persisted lifecycle date");
             assert_eq!(
                 [
                     new.expiry_updated_at.clone(),
                     new.rules[0].expiration.as_ref().and_then(|value| value.date.clone()),
                     new.rules[0].transitions.as_ref().unwrap()[0].date.clone(),
                 ],
-                [
-                    Some(old_date(old.expiry_updated_at.as_ref().unwrap())),
-                    Some(old_date(old.rules[0].expiration.as_ref().unwrap().date.as_ref().unwrap())),
-                    Some(old_date(old.rules[0].transitions.as_ref().unwrap()[0].date.as_ref().unwrap())),
-                ],
+                [Some(date.to_owned()), Some(date.to_owned()), Some(date.to_owned())],
                 "the lifecycle reader must retain the old date representation for {date}"
             );
         }
@@ -556,11 +537,10 @@ mod bucket_config_lifecycle_date_compat {
 
     #[test]
     fn lifecycle_xml_writer_preserves_legacy_date_bytes() {
-        for date in DATES {
-            let old = legacy_read(&document(date));
-            let mut old_xml = Vec::new();
-            s3s::xml::Serialize::serialize(&old, &mut s3s::xml::Serializer::new(&mut old_xml))
-                .expect("the actual old lifecycle writer emits the date");
+        for (date, written_date) in DATES {
+            let expected = format!(
+                "<LifecycleConfiguration><ExpiryUpdatedAt>{written_date}</ExpiryUpdatedAt><Rule><Expiration><Date>{written_date}</Date></Expiration><ID>date-compat</ID><Status>Enabled</Status><Transition><Date>{written_date}</Date><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"
+            );
             let new = PersistedLifecycleConfiguration {
                 expiry_updated_at: Some(date.to_owned()),
                 rules: vec![PersistedLifecycleRule {
@@ -585,7 +565,7 @@ mod bucket_config_lifecycle_date_compat {
             };
             assert_eq!(
                 serialize(&new).expect("write persisted lifecycle date"),
-                old_xml,
+                expected.as_bytes(),
                 "legacy date bytes for {date}"
             );
         }

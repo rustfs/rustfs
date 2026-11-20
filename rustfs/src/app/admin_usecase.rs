@@ -37,7 +37,7 @@ use crate::server::collect_dependency_readiness_report as collect_runtime_depend
 use crate::shared_types::DependencyReadiness;
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
-use s3s::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};

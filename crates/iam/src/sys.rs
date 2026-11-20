@@ -2854,6 +2854,9 @@ async fn evaluate_prepared_session_policy(policy: &PreparedSessionPolicy, args: 
         PreparedSessionPolicy::Policy(p) => {
             let mut session_policy_args = args.clone();
             session_policy_args.is_owner = false;
+            // Self-service checks ask whether an explicit session-policy Deny
+            // applies. They must not require an unrelated Allow statement.
+            session_policy_args.deny_only = args.deny_only;
             Some(p.is_allowed(&session_policy_args).await)
         }
     }

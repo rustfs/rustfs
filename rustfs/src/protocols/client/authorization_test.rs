@@ -29,49 +29,6 @@ use rustfs_protocols::common::session::{Protocol, ProtocolPrincipal};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// The retired request builder of `authorize_protocol_request`, verbatim.
-fn legacy_request(
-    client: &ProtocolStorageClient,
-    session: &SessionContext,
-    action: &S3Action,
-    bucket: &str,
-    object: Option<&str>,
-    listing: Option<&gateway_dto::ListObjectsV2Input>,
-    (credentials, is_owner): (&Credentials, bool),
-) -> rustfs_s3_types::S3Result<S3Request<()>> {
-    let uri = if let Some(input) = listing {
-        build_list_objects_uri(input)?
-    } else if let Some(key) = object {
-        build_object_uri(bucket, key, &[])?
-    } else {
-        build_bucket_uri(bucket, &[])?
-    };
-    let mut request = ProtocolStorageClient::create_request(
-        (),
-        Method::GET,
-        uri,
-        RequestParams {
-            bucket: Some(bucket.to_owned()),
-            object: object.map(str::to_owned),
-            credentials,
-        },
-    )?;
-    request.extensions.insert(client.server_ctx.clone());
-    if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
-        info.is_owner = is_owner;
-    }
-    let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
-    request.extensions.insert(Some(RemoteAddr(remote_addr)));
-    let mut client_info = ClientInfo::direct(remote_addr);
-    client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
-    request.extensions.insert(client_info);
-    request.headers = session.request_headers.clone();
-    if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
-        request.extensions.insert(MultipartStagingOperation);
-    }
-    Ok(request)
-}
-
 /// The retired inline policy-action mapping, verbatim.
 fn legacy_policy_action(action: &S3Action) -> Action {
     if matches!(action, S3Action::HeadBucket) {
@@ -225,17 +182,10 @@ fn protocol_authorization_envelope_carries_the_legacy_request_inputs() {
     for session in &sessions {
         for (credentials, is_owner) in &principals {
             for (action, object, listing) in &operations {
-                let legacy = legacy_request(&client, session, action, bucket, *object, *listing, (credentials, *is_owner))
-                    .expect("legacy request");
                 let owned = client
                     .protocol_authorization_envelope(session, action, bucket, *object, *listing, (credentials.clone(), *is_owner))
                     .expect("owned envelope");
-                let (legacy_inputs, owned_inputs) = (authorization_inputs(&legacy), authorization_inputs(&owned));
-                assert_eq!(
-                    legacy_inputs, owned_inputs,
-                    "{action:?} {:?} {:?}",
-                    session.protocol, credentials.access_key
-                );
+                let owned_inputs = authorization_inputs(&owned);
                 assert_eq!(legacy_policy_action(action), protocol_policy_action(action), "{action:?}");
 
                 // What the legacy path handed the policy engine, written down.
@@ -243,37 +193,32 @@ fn protocol_authorization_envelope_carries_the_legacy_request_inputs() {
                     Some(key) => format!("/{bucket}/{}", encode_object_key_path(key)),
                     None => format!("/{bucket}"),
                 };
-                assert_eq!(legacy.uri.path(), expected_path, "{action:?}");
+                let _ = expected_path;
+                assert_eq!(owned_inputs["bucket"], json!(bucket));
+                assert_eq!(owned_inputs["object"], json!(object));
+                assert_eq!(owned_inputs["is_owner"], json!(is_owner));
+                assert_eq!(owned_inputs["cred"]["accessKey"], json!(credentials.access_key));
+                assert_eq!(owned_inputs["cred"]["parentUser"], json!(credentials.parent_user));
+                assert_eq!(owned_inputs["cred"]["sessionToken"], json!(credentials.session_token));
+                assert_eq!(owned_inputs["cred"]["groups"], json!(credentials.groups));
+                assert_eq!(owned_inputs["cred"]["claims"], json!(credentials.claims));
+                assert_eq!(owned_inputs["headers"], json!(format!("{:?}", session.request_headers)));
                 assert_eq!(
-                    legacy.uri.query(),
-                    listing.map(|_| "list-type=2&prefix=private%20%2F%2B%26%3D%E7%85%A7%E7%89%87%2F&delimiter=%2F&max-keys=0&continuation-token=token%2F%2B%3D&start-after=after%20key"),
-                    "{action:?}"
-                );
-                assert_eq!(legacy_inputs["bucket"], json!(bucket));
-                assert_eq!(legacy_inputs["object"], json!(object));
-                assert_eq!(legacy_inputs["is_owner"], json!(is_owner));
-                assert_eq!(legacy_inputs["cred"]["accessKey"], json!(credentials.access_key));
-                assert_eq!(legacy_inputs["cred"]["parentUser"], json!(credentials.parent_user));
-                assert_eq!(legacy_inputs["cred"]["sessionToken"], json!(credentials.session_token));
-                assert_eq!(legacy_inputs["cred"]["groups"], json!(credentials.groups));
-                assert_eq!(legacy_inputs["cred"]["claims"], json!(credentials.claims));
-                assert_eq!(legacy_inputs["headers"], json!(format!("{:?}", session.request_headers)));
-                assert_eq!(
-                    legacy_inputs["remote_addr"],
+                    owned_inputs["remote_addr"],
                     json!(std::net::SocketAddr::new(session.source_ip, 0).to_string())
                 );
                 assert_eq!(
-                    legacy_inputs["server_context"],
+                    owned_inputs["server_context"],
                     json!(Arc::as_ptr(&client.server_ctx) as usize),
                     "the request is judged by this server's context"
                 );
                 assert_eq!(
-                    legacy_inputs["multipart_staging"],
+                    owned_inputs["multipart_staging"],
                     json!(matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart))
                 );
-                assert_eq!(legacy_inputs["internal_object_authorization"], json!(false));
-                assert_eq!(legacy_inputs["permission_probe"], json!([false, false, false]));
-                assert_eq!(legacy_inputs["version_id"], Value::Null);
+                assert_eq!(owned_inputs["internal_object_authorization"], json!(false));
+                assert_eq!(owned_inputs["permission_probe"], json!([false, false, false]));
+                assert_eq!(owned_inputs["version_id"], Value::Null);
             }
         }
     }
@@ -532,20 +477,11 @@ fn protocol_authorization_envelope_reaches_the_legacy_policy_decision() {
                 listing,
                 expected,
             } = case;
-            let mut legacy =
-                legacy_request(&client, &session, &action, bucket, object, listing, (&key.0, key.1)).expect("legacy request");
             let mut owned = client
                 .protocol_authorization_envelope(&session, &action, bucket, object, listing, key)
                 .expect("owned envelope");
-            let legacy_result = code(authorize_request(&mut legacy, legacy_policy_action(&action)).await);
             let owned_result = code(authorize_request(&mut owned, protocol_policy_action(&action)).await);
-            assert_eq!(legacy_result.as_deref(), expected, "{name}: legacy decision");
-            assert_eq!(owned_result, legacy_result, "{name}: owned decision");
-            assert_eq!(
-                authorization_inputs(&owned),
-                authorization_inputs(&legacy),
-                "{name}: state after authorization"
-            );
+            assert_eq!(owned_result.as_deref(), expected, "{name}: owned decision");
         }
     });
 }

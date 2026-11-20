@@ -31,7 +31,7 @@ use super::harness::{
 use crate::common::{
     AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via, init_logging,
 };
-use crate::upgrade_compatibility_test::wait_for_upgrade_write_readiness;
+use crate::upgrade_compatibility_test::{UpgradeSourceCapabilities, wait_for_upgrade_write_readiness};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use std::path::{Path, PathBuf};
@@ -427,7 +427,12 @@ async fn assert_history_and_iam(dist: &DistCluster, seed: &UpgradeSeed, context:
     Ok(())
 }
 
-async fn compare_degraded_legacy_list_parts(dist: &mut DistCluster, seed: &UpgradeSeed, previous: &Path) -> TestResult {
+async fn compare_degraded_legacy_list_parts(
+    dist: &mut DistCluster,
+    seed: &UpgradeSeed,
+    previous: &Path,
+    source: &UpgradeSourceCapabilities,
+) -> TestResult {
     let decoded = String::from_utf8(base64_simd::URL_SAFE_NO_PAD.decode_to_vec(seed.multipart_upload.as_bytes())?)?;
     let (_, upload_dir) = decoded.split_once('.').ok_or("legacy upload ID lacks deployment delimiter")?;
     let hash = sha256_hex(format!("{}/legacy-multipart.bin", seed.history_bucket).as_bytes());
@@ -489,16 +494,22 @@ async fn compare_degraded_legacy_list_parts(dist: &mut DistCluster, seed: &Upgra
     // Three online disks retain metadata quorum but have no part directory;
     // the fourth disk is offline. A legacy empty response is not a proof that
     // the unavailable participant has no part.
-    let legacy = legacy.expect("previous coordinator should expose its legacy empty-list behavior");
-    assert!(legacy.parts().is_empty());
-    let current = current.expect_err("current coordinator must not infer empty from missing directories and offline disks");
-    assert_eq!(current.raw_response().expect("current S3 response").status().as_u16(), 503);
-    // Since #9149, SlowDownRead is reserved for GET/HEAD object reads; a
-    // ListParts read-quorum failure is reported as ServiceUnavailable.
-    assert_eq!(
-        current.as_service_error().and_then(|error| error.meta().code()),
-        Some("ServiceUnavailable")
-    );
+    let mut quorum_errors =
+        vec![current.expect_err("current coordinator must not infer empty from missing directories and offline disks")];
+    if source.requires_list_parts_read_quorum {
+        quorum_errors.push(legacy.expect_err("previous coordinator must require evidence from unavailable disks"));
+    } else {
+        assert!(
+            legacy
+                .expect("previous coordinator should expose its legacy empty-list behavior")
+                .parts()
+                .is_empty()
+        );
+    }
+    for error in quorum_errors {
+        assert_eq!(error.raw_response().expect("S3 response").status().as_u16(), 503);
+        assert_eq!(error.as_service_error().and_then(|error| error.meta().code()), Some("ServiceUnavailable"));
+    }
     dist.cluster.start_node_from_binary(3, previous).await?;
     wait_for_upgrade_write_readiness(&clients, &seed.history_bucket, "mixed-list-restored", CREDENTIAL_TIMEOUT).await?;
     for (path, before) in original_files {
@@ -520,7 +531,7 @@ async fn compare_degraded_legacy_list_parts(dist: &mut DistCluster, seed: &Upgra
         assert_eq!(listed.parts()[0].e_tag(), Some(seed.multipart_etag.as_str()));
     }
     eprintln!(
-        "MPU mixed degraded: one offline disk, three missing part directories; previous returned empty, current returned 503 SlowDownRead; original part restored on both"
+        "MPU mixed degraded: one offline disk, three missing part directories; checked each coordinator against its release contract; original part restored on both"
     );
     Ok(())
 }
@@ -592,6 +603,7 @@ async fn replace_node_and_wait_for_write_readiness(dist: &mut DistCluster, seed:
 async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> TestResult {
     init_logging();
     let previous = source_binary()?;
+    let source = UpgradeSourceCapabilities::from_binary(&previous).await?;
     let mut dist = DistCluster::new_stopped(DistLayout::FourNodeFourDisk).await?;
     dist.cluster.set_env("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
     capture_upgrade_logs(&mut dist, "rolling-upgrade")?;
@@ -601,7 +613,7 @@ async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> Te
 
     replace_node_and_wait_for_write_readiness(&mut dist, &seed, 0).await?;
     assert_history_and_iam(&dist, &seed, "one-current-node").await?;
-    compare_degraded_legacy_list_parts(&mut dist, &seed, &previous).await?;
+    compare_degraded_legacy_list_parts(&mut dist, &seed, &previous, &source).await?;
 
     for node_idx in [1, 2] {
         replace_node_and_wait_for_write_readiness(&mut dist, &seed, node_idx).await?;
