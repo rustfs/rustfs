@@ -23,7 +23,8 @@ use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOpe
 use crate::admin::runtime_sources::{ServerContextSlot, current_object_store_handle, current_region, current_server_config};
 use crate::admin::storage_api::access::ReqInfo;
 use crate::admin::utils::{parse_query_pairs, query_value_exact, query_values_exact};
-use crate::app::RequestEnvelope;
+use crate::app::object_usecase::{GetObjectFields, GetObjectOutputFacts};
+use crate::app::{Answered, RequestEnvelope};
 use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::license::license_check;
 #[cfg(test)]
@@ -47,26 +48,23 @@ use rustfs_config::{
 };
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::notification_system;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
 use rustfs_utils::http::get_source_scheme;
 use rustfs_utils::http::headers::{
     AMZ_CHECKSUM_CRC32, AMZ_CHECKSUM_CRC32C, AMZ_CHECKSUM_CRC64NVME, AMZ_CHECKSUM_SHA1, AMZ_CHECKSUM_SHA256, AMZ_CHECKSUM_TYPE,
 };
+#[cfg(test)]
 use s3s::Body;
-use s3s::S3Error;
-use s3s::S3ErrorCode;
 #[cfg(test)]
 use s3s::S3Request;
+#[cfg(test)]
 use s3s::S3Response;
-use s3s::S3Result;
 #[cfg(test)]
 use s3s::auth::SigV4PathEncoding;
-use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, Timestamp, TimestampFormat};
-use s3s::header;
 #[cfg(test)]
 use s3s::route::S3Route;
-use s3s::s3_error;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::Duration;
@@ -176,29 +174,7 @@ fn parse_optional_header(headers: &HeaderMap, name: HeaderName) -> S3Result<Opti
         .transpose()
 }
 
-fn parse_optional_timestamp_header(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<Timestamp>> {
-    parse_optional_header(headers, name)?
-        .map(|value| {
-            Timestamp::parse(TimestampFormat::HttpDate, &value)
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "request timestamp header is invalid"))
-        })
-        .transpose()
-}
-
-fn parse_optional_etag_condition_header<T>(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<T>>
-where
-    T: std::str::FromStr,
-{
-    parse_optional_header(headers, name)?
-        .map(|value| {
-            value
-                .parse::<T>()
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "request etag condition header is invalid"))
-        })
-        .transpose()
-}
-
-fn build_object_lambda_get_request(req: &RequestEnvelope, bucket: &str, object: &str) -> S3Result<(Uri, GetObjectInput)> {
+fn build_object_lambda_get_request(req: &RequestEnvelope, bucket: &str, object: &str) -> S3Result<(Uri, GetObjectFields)> {
     let filtered_uri = uri_without_query_key(req.uri(), "lambdaArn")?;
     let part_number = query_value_exact(&filtered_uri, "partNumber")
         .filter(|value| !value.is_empty())
@@ -209,40 +185,38 @@ fn build_object_lambda_get_request(req: &RequestEnvelope, bucket: &str, object: 
         })
         .transpose()?;
     let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
-    let range = parse_optional_header(req.headers(), header::RANGE)?
+    let range = parse_optional_header(req.headers(), http::header::RANGE)?
         .map(|value| {
-            Range::parse(&value).map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Range header is invalid"))
+            GetObjectFields::parse_range(&value)
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "Range header is invalid"))
         })
         .transpose()?;
 
-    let mut builder = GetObjectInput::builder()
-        .bucket(bucket.to_string())
-        .key(object.to_string())
-        .part_number(part_number)
-        .version_id(version_id)
-        .range(range)
-        .if_match(parse_optional_etag_condition_header::<IfMatch>(req.headers(), header::IF_MATCH)?)
-        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(req.headers(), header::IF_NONE_MATCH)?)
-        .if_modified_since(parse_optional_timestamp_header(req.headers(), header::IF_MODIFIED_SINCE)?)
-        .if_unmodified_since(parse_optional_timestamp_header(req.headers(), header::IF_UNMODIFIED_SINCE)?);
-
-    builder = builder.sse_customer_algorithm(parse_optional_header(
-        req.headers(),
-        HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm"),
-    )?);
-    builder = builder.sse_customer_key(parse_optional_header(
-        req.headers(),
-        HeaderName::from_static("x-amz-server-side-encryption-customer-key"),
-    )?);
-    builder = builder.sse_customer_key_md5(parse_optional_header(
-        req.headers(),
-        HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
-    )?);
-
-    let input = builder.build().map_err(|err| {
-        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to build object lambda get request: {err}"))
-    })?;
-
+    // The use case evaluates condition and encryption algorithm headers on the envelope.
+    let headers = req.headers();
+    for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+        if parse_optional_header(headers, name)?.is_some_and(|v| !GetObjectFields::valid_etag_condition(v.as_bytes())) {
+            return Err(s3_error!(InvalidRequest, "request etag condition header is invalid"));
+        }
+    }
+    for name in [http::header::IF_MODIFIED_SINCE, http::header::IF_UNMODIFIED_SINCE] {
+        if parse_optional_header(headers, name)?.is_some_and(|v| !GetObjectFields::valid_date_condition(&v)) {
+            return Err(s3_error!(InvalidRequest, "request timestamp header is invalid"));
+        }
+    }
+    let _algorithm = parse_optional_header(headers, HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm"))?;
+    let input = GetObjectFields {
+        bucket: bucket.to_owned(),
+        key: object.to_owned(),
+        part_number,
+        version_id,
+        range,
+        sse_customer_key: parse_optional_header(headers, HeaderName::from_static("x-amz-server-side-encryption-customer-key"))?,
+        sse_customer_key_md5: parse_optional_header(
+            headers,
+            HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
+        )?,
+    };
     Ok((filtered_uri, input))
 }
 
@@ -553,14 +527,6 @@ fn validate_object_lambda_response_auth_headers(headers: &HeaderMap, output_rout
     ))
 }
 
-fn format_timestamp_http_date(value: &Timestamp) -> S3Result<String> {
-    let mut buf = Vec::new();
-    value
-        .format(TimestampFormat::HttpDate, &mut buf)
-        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to format timestamp header"))?;
-    String::from_utf8(buf).map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to format timestamp header"))
-}
-
 fn insert_string_header(headers: &mut HeaderMap, name: HeaderName, value: String) -> S3Result<()> {
     let header_value = HeaderValue::from_str(&value)
         .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to build response header value"))?;
@@ -568,8 +534,8 @@ fn insert_string_header(headers: &mut HeaderMap, name: HeaderName, value: String
     Ok(())
 }
 
-fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &HeaderMap) -> S3Result<HeaderMap> {
-    let mut headers = base_headers.clone();
+fn build_get_object_response_headers(facts: &GetObjectOutputFacts, mut headers: HeaderMap) -> S3Result<HeaderMap> {
+    let output = &facts.dto;
 
     if let Some(accept_ranges) = &output.accept_ranges {
         insert_string_header(&mut headers, http::header::ACCEPT_RANGES, accept_ranges.clone())?;
@@ -595,7 +561,7 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
     if let Some(content_type) = &output.content_type {
         insert_string_header(&mut headers, http::header::CONTENT_TYPE, content_type.to_string())?;
     }
-    if let Some(etag) = &output.e_tag {
+    if let Some(etag) = &facts.etag {
         headers.insert(
             http::header::ETAG,
             etag.to_http_header()
@@ -603,10 +569,16 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
         );
     }
     if let Some(last_modified) = &output.last_modified {
-        insert_string_header(&mut headers, http::header::LAST_MODIFIED, format_timestamp_http_date(last_modified)?)?;
+        insert_string_header(
+            &mut headers,
+            http::header::LAST_MODIFIED,
+            last_modified
+                .render(rustfs_gateway_types::TimestampFormat::HttpDate)
+                .map_err(|_| s3_error!(InternalError, "failed to format timestamp header"))?,
+        )?;
     }
     if let Some(expires) = &output.expires {
-        insert_string_header(&mut headers, http::header::EXPIRES, expires.clone())?;
+        insert_string_header(&mut headers, http::header::EXPIRES, expires.as_str().to_owned())?;
     }
     if let Some(version_id) = &output.version_id {
         insert_string_header(&mut headers, HeaderName::from_static("x-amz-version-id"), version_id.clone())?;
@@ -672,38 +644,22 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
         insert_string_header(&mut headers, HeaderName::from_static("x-amz-tagging-count"), tag_count.to_string())?;
     }
     if let Some(expiration) = &output.expiration {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-expiration"), expiration.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-expiration"), expiration.as_str().to_owned())?;
     }
     if let Some(restore) = &output.restore {
         insert_string_header(&mut headers, HeaderName::from_static("x-amz-restore"), restore.clone())?;
     }
 
-    if let Some(metadata) = &output.metadata {
-        for (key, value) in metadata {
-            let header_name = format!("x-amz-meta-{key}");
-            if let Ok(parsed_name) = HeaderName::from_bytes(header_name.as_bytes()) {
-                let parsed_value = HeaderValue::from_str(value)
-                    .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to build metadata response header"))?;
-                headers.insert(parsed_name, parsed_value);
-            }
+    for (key, value) in &output.metadata {
+        let header_name = format!("x-amz-meta-{key}");
+        if let Ok(parsed_name) = HeaderName::from_bytes(header_name.as_bytes()) {
+            let parsed_value = HeaderValue::from_str(value)
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to build metadata response header"))?;
+            headers.insert(parsed_name, parsed_value);
         }
     }
 
     Ok(headers)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn convert_get_object_response(resp: S3Response<GetObjectOutput>) -> S3Result<S3Response<Body>> {
-    let headers = build_get_object_response_headers(&resp.output, &resp.headers)?;
-
-    let body = resp.output.body.map(Body::from).unwrap_or_else(|| Body::from(String::new()));
-
-    Ok(S3Response {
-        output: body,
-        status: resp.status,
-        headers,
-        extensions: resp.extensions,
-    })
 }
 
 fn clear_object_lambda_variant_headers(headers: &mut HeaderMap) {
@@ -776,7 +732,7 @@ async fn invoke_object_lambda_target(
     req: &RequestEnvelope,
     bucket: &str,
     object: &str,
-    get_resp: S3Response<GetObjectOutput>,
+    get_resp: Answered<GetObjectOutputFacts>,
 ) -> S3Result<AdminResponse> {
     let lambda_config = resolve_object_lambda_webhook_config(req.uri()).await?;
     let client = build_object_lambda_http_client(&lambda_config)?;
@@ -790,13 +746,8 @@ async fn invoke_object_lambda_target(
     let output_token = Uuid::new_v4().to_string();
     let event_payload = build_object_lambda_event_payload(req, &lambda_arn, &input_s3_url, &output_route, &output_token)?;
 
-    let S3Response {
-        output,
-        headers: upstream_headers,
-        ..
-    } = get_resp;
-
-    let response_headers = build_get_object_response_headers(&output, &upstream_headers)?;
+    let Answered { output, headers, .. } = get_resp;
+    let response_headers = build_get_object_response_headers(&output, headers)?;
 
     let mut request_builder = client
         .post(lambda_config.endpoint)
@@ -817,7 +768,7 @@ async fn invoke_object_lambda_target(
         };
     }
 
-    if let Some(version_id) = output.version_id.as_deref() {
+    if let Some(version_id) = output.dto.version_id.as_deref() {
         request_builder = request_builder.header("x-rustfs-object-lambda-version-id", version_id);
     }
 
@@ -865,7 +816,7 @@ async fn authorize_object_lambda_request(req: &mut RequestEnvelope, bucket: &str
         }
     })?;
 
-    // The bridged GetObject hook evaluates the actual version and all read conditions.
+    // GetObject authorizes the requested version and evaluates the read conditions.
     Ok(())
 }
 
@@ -873,7 +824,7 @@ async fn authorized_object_lambda_get_request(
     req: &RequestEnvelope,
     bucket: &str,
     object: &str,
-) -> S3Result<(RequestEnvelope, GetObjectInput)> {
+) -> S3Result<(RequestEnvelope, GetObjectFields)> {
     let (uri, input) = build_object_lambda_get_request(req, bucket, object)?;
     let slot = req.server_context().ok_or_else(server_context_not_ready_error)?;
     let mut envelope = req.fork_for_authorization();
@@ -890,16 +841,7 @@ async fn handle_object_lambda_request(mut req: RequestEnvelope, bucket: &str, ob
     let slot = req.server_context().ok_or_else(server_context_not_ready_error)?;
     let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(slot.app_context());
     rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
-    let crate::app::Answered { output, status, headers } = usecase
-        .execute_get_object_fields(envelope, crate::app::object_usecase::GetObjectFields::from_s3s(get_input))
-        .await?;
-    let mut get_resp = S3Response::new(
-        output
-            .into_s3s()
-            .map_err(|error| S3Error::from(crate::app::dto_values::seam_error(error)))?,
-    );
-    get_resp.status = status;
-    get_resp.headers = headers;
+    let get_resp = usecase.execute_get_object_fields(envelope, get_input).await?;
     invoke_object_lambda_target(&req, bucket, object, get_resp).await
 }
 
@@ -909,14 +851,13 @@ pub(crate) fn object_lambda_target(method: &Method, uri: &Uri) -> Option<(String
     parse_object_lambda_request(method, uri)
 }
 
-/// Serves an admitted Object Lambda request that another edge verified, through the same handler
-/// the legacy `call` runs.
+/// Serves an admitted Object Lambda request using the identity established at the edge.
 pub(crate) async fn serve_object_lambda(
     envelope: crate::app::RequestEnvelope,
     bucket: &str,
     object: &str,
 ) -> rustfs_s3_types::S3Result<AdminResponse> {
-    Ok(Box::pin(handle_object_lambda_request(envelope, bucket, object)).await?)
+    Box::pin(handle_object_lambda_request(envelope, bucket, object)).await
 }
 
 pub struct S3Router<T> {
@@ -1106,14 +1047,14 @@ where
         is_control_plane_route(method, uri, headers)
     }
 
-    async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+    async fn check_access(&self, req: &mut S3Request<Body>) -> s3s::S3Result<()> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
         }
         Ok(self.admit(&req.method, &req.uri, &req.headers, req.credentials.is_some())?)
     }
 
-    async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+    async fn call(&self, mut req: S3Request<Body>) -> s3s::S3Result<S3Response<Body>> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
             if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
@@ -1134,10 +1075,10 @@ where
                 let result = console_router.call(req).await;
                 return match result {
                     Ok(resp) => Ok(convert_response(resp)),
-                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
+                    Err(e) => Err(s3s::s3_error!(InternalError, "{}", e)),
                 };
             }
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
+            return Err(s3s::s3_error!(InternalError, "console is not enabled"));
         }
 
         let envelope = crate::app::RequestEnvelope::from_s3s(&req);
@@ -1303,7 +1244,7 @@ mod tests {
                         let Err(err) = result else {
                             panic!("version read must be denied before usecase or webhook");
                         };
-                        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
+                        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
                     } else {
                         let Ok((envelope, input)) = result else {
                             panic!("authorized read remains available");
@@ -2460,14 +2401,10 @@ mod tests {
         assert_eq!(input.key, "object.txt");
         assert_eq!(input.version_id.as_deref(), Some("v1"));
         assert_eq!(input.part_number, Some(7));
-        assert_eq!(
-            input.range,
-            Some(Range::Int {
-                first: 5,
-                last: Some(10)
-            })
-        );
-        assert!(input.if_match.is_some());
+        assert_eq!(input.range, Some(rustfs_gateway_types::ByteRange::FromTo { first: 5, last: 10 }));
+        req.headers
+            .insert(http::header::IF_MATCH, HeaderValue::from_static("invalid etag"));
+        assert!(build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt").is_err());
     }
 
     #[test]
@@ -2489,59 +2426,42 @@ mod tests {
             .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-5"));
 
         let err = build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt")
-            .expect_err("invalid range must fail");
+            .err()
+            .expect("invalid range must fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
     #[test]
-    fn convert_get_object_response_maps_core_headers() {
-        let mut resp = S3Response::new(GetObjectOutput {
-            body: Some(Body::from("payload".to_string()).into()),
-            content_length: Some(7),
-            content_type: Some("text/plain".to_string()),
-            accept_ranges: Some("bytes".to_string()),
-            version_id: Some("v1".to_string()),
-            metadata: Some(std::collections::HashMap::from([("custom-key".to_string(), "custom-value".to_string())])),
+    fn object_lambda_maps_native_get_object_headers() {
+        let output = GetObjectOutputFacts {
+            dto: rustfs_gateway_types::dto::GetObjectOutput {
+                content_length: Some(7),
+                content_type: Some("text/plain".to_owned()),
+                accept_ranges: Some("bytes".to_owned()),
+                version_id: Some("v1".to_owned()),
+                metadata: [("custom-key".to_owned(), "custom-value".to_owned())].into_iter().collect(),
+                ..Default::default()
+            },
             ..Default::default()
-        });
-        resp.status = Some(StatusCode::OK);
-
-        let converted = convert_get_object_response(resp).expect("response conversion should succeed");
-
-        assert_eq!(converted.status, Some(StatusCode::OK));
+        };
+        let headers = build_get_object_response_headers(&output, HeaderMap::new()).expect("valid object headers");
         assert_eq!(
-            converted
-                .headers
+            headers
                 .get(http::header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok()),
             Some("7")
         );
         assert_eq!(
-            converted
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
+            headers.get(http::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
             Some("text/plain")
         );
         assert_eq!(
-            converted
-                .headers
-                .get(http::header::ACCEPT_RANGES)
-                .and_then(|value| value.to_str().ok()),
+            headers.get(http::header::ACCEPT_RANGES).and_then(|value| value.to_str().ok()),
             Some("bytes")
         );
+        assert_eq!(headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()), Some("v1"));
         assert_eq!(
-            converted
-                .headers
-                .get("x-amz-version-id")
-                .and_then(|value| value.to_str().ok()),
-            Some("v1")
-        );
-        assert_eq!(
-            converted
-                .headers
-                .get("x-amz-meta-custom-key")
-                .and_then(|value| value.to_str().ok()),
+            headers.get("x-amz-meta-custom-key").and_then(|value| value.to_str().ok()),
             Some("custom-value")
         );
     }
@@ -2566,13 +2486,13 @@ mod tests {
                     .check_access(&mut req)
                     .await
                     .expect_err("MRF cluster route must require a signature");
-                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
 
                 let error = router
                     .call(req)
                     .await
                     .expect_err("MRF cluster route must dispatch to an authenticated handler");
-                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
                 assert!(error.to_string().contains("authentication required"));
             }
         }
@@ -2597,7 +2517,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("anonymous extension request must be denied");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 
     #[tokio::test]
@@ -2636,7 +2556,7 @@ mod tests {
                     .check_access(&mut req)
                     .await
                     .expect_err("V2 custom arguments are not signed");
-                assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{uri}");
+                assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied, "{uri}");
                 assert_eq!(
                     error.message(),
                     Some("Header or query Signature Version 4 is required for this operation")
@@ -2679,7 +2599,7 @@ mod tests {
                 .check_access(&mut req)
                 .await
                 .expect_err("upload form signatures do not authorize admin routes");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
         }
     }
 
@@ -2711,7 +2631,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("presigned custom-route request with an unsigned x-amz header must be denied");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
     }
 
@@ -2748,7 +2668,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("header-signed custom-route request with an unsigned x-amz header must be denied");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
     }
 
@@ -2803,7 +2723,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("anonymous extension request must be denied");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 
     #[tokio::test]
@@ -2825,7 +2745,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("anonymous profile request must be denied");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 
     #[tokio::test]
@@ -2855,7 +2775,7 @@ mod tests {
                 .check_access(&mut req)
                 .await
                 .expect_err("anonymous STS request without form content type must be denied");
-            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
         }
 
         let mut req = request(Some("application/x-www-form-urlencoded"));
@@ -2909,7 +2829,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("token download without token must be denied before handler");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 
     #[tokio::test]
@@ -2933,7 +2853,7 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("token exception must not apply to POST");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 }
 
