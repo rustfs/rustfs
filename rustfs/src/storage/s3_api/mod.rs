@@ -17,41 +17,7 @@
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
-use crate::app::bucket_usecase::DefaultBucketUsecase;
-pub(crate) use crate::app::bucket_usecase::{
-    NotificationDestination, PreparedLifecycleConfiguration, validate_lifecycle_rule_status,
-};
-pub(crate) use crate::app::multipart_usecase::{
-    AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
-    UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput, reject_abort_capabilities,
-};
-pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
-pub(crate) use crate::app::object::{
-    CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, PutObjectWriteInput, PutObjectWriteOutput, legacy_put_body,
-};
-pub(crate) use crate::app::object_usecase::DefaultObjectUsecase;
-pub(crate) use crate::app::object_usecase::{
-    DeleteBatchETag, DeleteBatchEntry, DeleteBatchInput, DeleteBatchOutput, GetObjectAttributesFields,
-    GetObjectAttributesOutputFacts, GetObjectBody, GetObjectFields, GetObjectOutputFacts, HeadObjectFields,
-    HeadObjectOutputFacts,
-};
-
 pub(crate) mod bucket;
 pub(crate) mod common;
 pub(crate) mod multipart;
 pub(crate) mod tagging;
-
-/// Resolve the object use-case for a server's request path (backlog#1052 S6):
-/// bind it to the server's own application context so it resolves that
-/// server's store instead of the ambient process default.
-pub(crate) fn object_usecase_for(fs: &crate::storage::ecfs::FS) -> DefaultObjectUsecase {
-    DefaultObjectUsecase::with_context(fs.server_ctx().app_context())
-}
-
-pub(crate) fn bucket_usecase_for(fs: &crate::storage::ecfs::FS) -> DefaultBucketUsecase {
-    DefaultBucketUsecase::with_context(fs.server_ctx().app_context())
-}
-
-pub(crate) fn multipart_usecase_for(fs: &crate::storage::ecfs::FS) -> DefaultMultipartUsecase {
-    DefaultMultipartUsecase::with_context(fs.server_ctx().app_context())
-}

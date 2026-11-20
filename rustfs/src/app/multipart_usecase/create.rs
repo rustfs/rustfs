@@ -456,6 +456,58 @@ impl DefaultMultipartUsecase {
 }
 
 #[cfg(test)]
+impl CreateMultipartUploadFields {
+    pub(crate) fn from_legacy(input: crate::app::storage_api::s3::dto::CreateMultipartUploadInput) -> Self {
+        Self {
+            bucket: input.bucket,
+            key: input.key,
+            metadata: input.metadata,
+            tagging: input.tagging,
+            storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
+            server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+            ssekms_key_id: input.ssekms_key_id,
+            object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+            object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
+            object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
+        }
+    }
+}
+
+#[cfg(test)]
+impl DefaultMultipartUsecase {
+    pub(crate) async fn execute_create_multipart_upload_from_s3s(
+        &self,
+        mut req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::CreateMultipartUploadInput>,
+    ) -> crate::app::storage_api::s3::S3Result<
+        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::CreateMultipartUploadOutput>,
+    > {
+        use crate::app::storage_api::s3::{S3Response, dto::CreateMultipartUploadOutput};
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let query_version = req.input.version_id.take();
+        let output = self
+            .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
+            .await?;
+        let mut response = S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(output.bucket),
+            key: Some(output.key),
+            upload_id: Some(output.upload_id),
+            server_side_encryption: output.server_side_encryption.map(Into::into),
+            sse_customer_algorithm: output.sse_customer_algorithm,
+            sse_customer_key_md5: output.sse_customer_key_md5,
+            ssekms_key_id: output.ssekms_key_id,
+            checksum_algorithm: output.checksum_algorithm.map(Into::into),
+            checksum_type: output.checksum_type.map(Into::into),
+            ..Default::default()
+        });
+        response.headers.extend(output.response_headers);
+        Ok(response)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
@@ -731,11 +783,19 @@ mod tests {
                     .expect("create bucket");
             }
 
-            let mut stale = request(&bucket);
-            let guard = load_bucket_generation_from_store(&store, &stale, &bucket)
+            let make_request = |target_bucket: &str| {
+                let mut req = request(target_bucket);
+                let envelope = RequestEnvelope::from_s3s(&req);
+                let query_version = req.input.version_id.take();
+                let fields = CreateMultipartUploadFields::from_legacy(req.input);
+                (envelope, fields, query_version)
+            };
+
+            let (mut stale_env, stale_fields, stale_ver) = make_request(&bucket);
+            let guard = load_bucket_generation_from_store(&store, &stale_env, &bucket)
                 .await
                 .expect("capture original incarnation");
-            stale.install_bucket_generation(guard);
+            stale_env.install_bucket_generation(guard);
             let original = store.bucket_incarnation_id(&bucket).await.expect("old bucket generation");
 
             store
@@ -749,18 +809,18 @@ mod tests {
             let current = store.bucket_incarnation_id(&bucket).await.expect("new bucket generation");
             assert_ne!(original, current);
 
-            let missing = request(&bucket);
-            let mut wrong = request(&bucket);
-            let guard = load_bucket_generation_from_store(&store, &wrong, &other)
+            let (missing_env, missing_fields, missing_ver) = make_request(&bucket);
+            let (mut wrong_env, wrong_fields, wrong_ver) = make_request(&bucket);
+            let guard = load_bucket_generation_from_store(&store, &wrong_env, &other)
                 .await
                 .expect("capture the other bucket");
-            wrong.install_bucket_generation(guard);
-            for (request, code) in [
-                (stale, S3ErrorCode::NoSuchBucket),
-                (missing, S3ErrorCode::InternalError),
-                (wrong, S3ErrorCode::InternalError),
+            wrong_env.install_bucket_generation(guard);
+            for (envelope, fields, query_version, code) in [
+                (stale_env, stale_fields, stale_ver, S3ErrorCode::NoSuchBucket),
+                (missing_env, missing_fields, missing_ver, S3ErrorCode::InternalError),
+                (wrong_env, wrong_fields, wrong_ver, S3ErrorCode::InternalError),
             ] {
-                let result = usecase.execute_create_multipart_upload_from_s3s(request).await;
+                let result = usecase.execute_create_multipart_upload(envelope, fields, query_version).await;
                 assert!(
                     store
                         .list_multipart_uploads(&bucket, "", None, None, None, 100)
@@ -769,18 +829,20 @@ mod tests {
                         .uploads
                         .is_empty()
                 );
-                let error = result.expect_err("creation requires the target incarnation");
-                assert_eq!(error.code(), &code);
+                let Err(error) = result else {
+                    panic!("creation requires the target incarnation");
+                };
+                assert_eq!(error.code().as_str(), code.as_str());
             }
 
             let probe = crate::app::storage_api::multipart_usecase::helper::MutationCompletionProbe::install(&bucket);
-            let mut allowed = request(&bucket);
-            let guard = load_bucket_generation_from_store(&store, &allowed, &bucket)
+            let (mut allowed_env, allowed_fields, allowed_ver) = make_request(&bucket);
+            let guard = load_bucket_generation_from_store(&store, &allowed_env, &bucket)
                 .await
                 .expect("capture current incarnation");
-            allowed.install_bucket_generation(guard);
-            let response = usecase
-                .execute_create_multipart_upload_from_s3s(allowed)
+            allowed_env.install_bucket_generation(guard);
+            let output = usecase
+                .execute_create_multipart_upload(allowed_env, allowed_fields, allowed_ver)
                 .await
                 .expect("a current guard allows creation");
             let uploads = store
@@ -789,7 +851,7 @@ mod tests {
                 .expect("list durable uploads")
                 .uploads;
             assert_eq!(uploads.len(), 1);
-            assert_eq!(Some(uploads[0].upload_id.as_str()), response.output.upload_id.as_deref());
+            assert_eq!(uploads[0].upload_id.as_str(), output.upload_id.as_str());
             assert_eq!(probe.audits.lock().unwrap().len(), 1);
             assert!(probe.events.lock().unwrap().is_empty());
         });

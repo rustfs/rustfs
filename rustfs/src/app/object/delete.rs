@@ -4460,3 +4460,67 @@ mod bulk_denial_audit_wiring_tests {
         );
     }
 }
+
+#[cfg(test)]
+impl From<crate::app::storage_api::s3::dto::DeleteObjectsInput> for DeleteBatchInput {
+    fn from(input: crate::app::storage_api::s3::dto::DeleteObjectsInput) -> Self {
+        Self {
+            bucket: input.bucket,
+            objects: input.delete.objects.into_iter().map(Into::into).collect(),
+            quiet: input.delete.quiet,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<crate::app::storage_api::s3::dto::ObjectIdentifier> for DeleteBatchEntry {
+    fn from(object: crate::app::storage_api::s3::dto::ObjectIdentifier) -> Self {
+        use crate::app::storage_api::s3::dto::ETag;
+        Self {
+            key: object.key,
+            key_too_long: false,
+            version_id: object.version_id,
+            e_tag: object.e_tag.map(|tag| match tag {
+                ETag::Strong(value) => DeleteBatchETag { value, weak: false },
+                ETag::Weak(value) => DeleteBatchETag { value, weak: true },
+            }),
+            _last_modified_time: object.last_modified_time.map(|value| {
+                let instant = time::OffsetDateTime::from(value);
+                (instant.unix_timestamp(), instant.nanosecond())
+            }),
+            _size: object.size,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<DeleteBatchOutput> for crate::app::storage_api::s3::dto::DeleteObjectsOutput {
+    fn from(output: DeleteBatchOutput) -> Self {
+        use crate::app::storage_api::s3::dto::{DeletedObject, Error};
+        Self {
+            deleted: output.deleted.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| DeletedObject {
+                        delete_marker: entry.delete_marker,
+                        delete_marker_version_id: entry.delete_marker_version_id,
+                        key: entry.key,
+                        version_id: entry.version_id,
+                    })
+                    .collect()
+            }),
+            errors: output.errors.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| Error {
+                        code: entry.code,
+                        key: entry.key,
+                        message: entry.message,
+                        version_id: entry.version_id,
+                    })
+                    .collect()
+            }),
+            request_charged: None,
+        }
+    }
+}

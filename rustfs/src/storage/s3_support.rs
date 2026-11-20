@@ -24,16 +24,17 @@ use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SIN
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
 use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::{
+    PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter, PersistedQueueConfiguration,
+    PersistedTopicConfiguration,
+};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
-use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
-    QueueConfiguration, TopicConfiguration,
-};
+use s3s::dto::{Delimiter, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 #[cfg(test)]
 use s3s::dto::{ObjectLockLegalHold, ObjectLockRetention};
 use s3s::{S3Error, S3ErrorCode, S3Result};
@@ -464,7 +465,10 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
 
 #[cfg(test)]
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
-    parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
+    parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
+        mode: r.mode.map(|m| m.as_str().to_owned()),
+        retain_until: r.retain_until_date.map(OffsetDateTime::from),
+    }))
 }
 
 pub(crate) fn parse_object_lock_retention_native(
@@ -527,7 +531,7 @@ pub(crate) fn parse_object_lock_retention_native(
 
 #[cfg(test)]
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
-    parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
+    parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
 }
 
 pub(crate) fn parse_object_lock_legal_hold_native(
@@ -801,7 +805,7 @@ pub fn parse_etag(object_etag: &str) -> Result<HeaderValue, S3Error> {
 }
 
 /// Auxiliary functions: extract prefixes and suffixes
-pub(crate) fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFilter>) -> (String, String) {
+pub(crate) fn extract_prefix_suffix(filter: Option<&PersistedNotificationConfigurationFilter>) -> (String, String) {
     if let Some(filter) = filter
         && let Some(filter_rules) = &filter.key
     {
@@ -826,7 +830,7 @@ pub(crate) fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFil
 /// Auxiliary functions: Handle configuration
 pub(crate) fn process_queue_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
-    configurations: Option<Vec<QueueConfiguration>>,
+    configurations: Option<Vec<PersistedQueueConfiguration>>,
     target_id_parser: F,
 ) -> Result<(), TargetIDError>
 where
@@ -845,7 +849,7 @@ where
 
 pub(crate) fn process_topic_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
-    configurations: Option<Vec<TopicConfiguration>>,
+    configurations: Option<Vec<PersistedTopicConfiguration>>,
     target_id_parser: F,
 ) -> Result<(), TargetIDError>
 where
@@ -864,7 +868,7 @@ where
 
 pub(crate) fn process_lambda_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
-    configurations: Option<Vec<LambdaFunctionConfiguration>>,
+    configurations: Option<Vec<PersistedLambdaFunctionConfiguration>>,
     target_id_parser: F,
 ) -> Result<(), TargetIDError>
 where

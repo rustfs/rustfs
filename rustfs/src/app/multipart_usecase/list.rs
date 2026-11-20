@@ -26,11 +26,8 @@ use rustfs_s3_types::S3Result;
 use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 pub(crate) enum ListPartsTarget {
-    Legacy {
-        bucket: String,
-        key: String,
-        upload_id: String,
-    },
+    #[allow(dead_code)]
+    Legacy { bucket: String, key: String, upload_id: String },
     Gateway {
         bucket: BucketName,
         key: ObjectKey,

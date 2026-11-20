@@ -294,10 +294,8 @@ impl DefaultMultipartUsecase {
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         // The input member and the header are one value on the wire; both are checked, as the
         // legacy guard checks both.
-        if if_none_match.as_deref().is_some_and(|condition| condition.trim() != "*") {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented));
-        }
-        reject_non_wildcard_write_if_none_match(None, headers)?;
+        let specific_if_none_match = if_none_match.as_deref().is_some_and(|condition| condition.trim() != "*");
+        reject_non_wildcard_write_if_none_match(specific_if_none_match, headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
@@ -737,6 +735,7 @@ impl DefaultMultipartUsecase {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl DefaultMultipartUsecase {
     /// CompleteMultipartUpload for an s3s request: its facts in an envelope and its input across
     /// the compatibility seam, as the tests of the legacy request shape reach the owned use case.
@@ -744,9 +743,41 @@ impl DefaultMultipartUsecase {
         &self,
         req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<CompleteMultipartUploadOutput> {
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
+
         let envelope = RequestEnvelope::from_s3s(&req);
-        let (input, parts) =
-            crate::storage::ecfs::complete_multipart_upload_input(req.input).map_err(crate::app::dto_values::seam_error)?;
+        let mut s3s_input = req.input;
+        let has_upload = s3s_input.multipart_upload.is_some();
+        s3s_input.multipart_upload.get_or_insert_with(Default::default);
+        let tags: Vec<Option<String>> = s3s_input
+            .multipart_upload
+            .iter_mut()
+            .flat_map(|upload| upload.parts.iter_mut().flatten())
+            .map(|part| {
+                part.part_number.get_or_insert(0);
+                part.e_tag.take().map(|tag| tag.value().to_owned())
+            })
+            .collect();
+        for checksum in [
+            &mut s3s_input.checksum_crc32,
+            &mut s3s_input.checksum_crc32c,
+            &mut s3s_input.checksum_crc64nvme,
+            &mut s3s_input.checksum_md5,
+            &mut s3s_input.checksum_sha1,
+            &mut s3s_input.checksum_sha256,
+            &mut s3s_input.checksum_sha512,
+            &mut s3s_input.checksum_xxhash128,
+            &mut s3s_input.checksum_xxhash3,
+            &mut s3s_input.checksum_xxhash64,
+        ] {
+            *checksum = None;
+        }
+        let mut input = complete_multipart_upload::input_from_s3s(s3s_input).map_err(crate::app::dto_values::seam_error)?;
+        for (part, tag) in input.multipart_upload.parts.iter_mut().zip(tags) {
+            part.e_tag = tag.map(rustfs_gateway_types::ETag::from_stored);
+        }
+        let parts = std::mem::take(&mut input.multipart_upload);
+        let parts = has_upload.then_some(parts);
         match parts {
             Some(parts) => {
                 let mut input = input;
@@ -1093,23 +1124,18 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("ssec-completion-checksums", || async {
             let (_store, bucket) =
                 crate::app::gating_test_env::durable_quota_test_bucket("ssec-completion-checksums", 16_384).await;
-            let fs = crate::storage::ecfs::FS::new();
-            crate::app::storage_api::s3::S3::put_bucket_versioning(
-                &fs,
-                build_request(
-                    crate::app::storage_api::s3::dto::PutBucketVersioningInput::builder()
-                        .bucket(bucket.clone())
-                        .versioning_configuration(crate::app::storage_api::s3::dto::VersioningConfiguration {
-                            status: Some(crate::app::storage_api::s3::dto::BucketVersioningStatus::from_static("Enabled")),
-                            ..Default::default()
-                        })
-                        .build()
-                        .expect("bucket versioning input"),
-                    Method::PUT,
-                ),
-            )
-            .await
-            .expect("enable versioning for encrypted multipart listing");
+            let versioning_req = build_request((), Method::PUT);
+            crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
+                .execute_put_bucket_versioning(
+                    RequestEnvelope::from_s3s(&versioning_req),
+                    &bucket,
+                    Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                        status: Some("Enabled".to_owned()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("enable versioning for encrypted multipart listing");
             let usecase = DefaultMultipartUsecase::from_global();
             let key = "customer-encrypted";
             let customer_key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
@@ -1227,9 +1253,9 @@ mod tests {
                     let etag = etag_to_s3s(&response.e_tag.expect("completed encrypted object ETag"));
                     let version_id = response.version_id.expect("completed object version");
                     assert_ne!(version_id, "null");
-                    assert_multipart_etag_listings(&fs, &bucket, key, &etag, &version_id).await;
-                    let head = crate::app::storage_api::s3::S3::head_object(
-                        &fs,
+                    assert_multipart_etag_listings(&bucket, key, &etag, &version_id).await;
+                    let head = crate::app::test_seams::head_object(
+                        &crate::app::object::DefaultObjectUsecase::from_global(),
                         build_request(
                             crate::app::storage_api::s3::dto::HeadObjectInput {
                                 bucket: bucket.clone(),
@@ -1259,15 +1285,10 @@ mod tests {
         });
     }
 
-    async fn assert_multipart_etag_listings(
-        fs: &crate::storage::ecfs::FS,
-        bucket: &str,
-        key: &str,
-        etag: &ETag,
-        version_id: &str,
-    ) {
+    async fn assert_multipart_etag_listings(bucket: &str, key: &str, etag: &ETag, version_id: &str) {
         use crate::app::storage_api::s3::dto::{ListObjectVersionsInput, ListObjectsInput, ListObjectsV2Input};
         use crate::app::storage_api::s3::xml::{Serialize, Serializer};
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{list_object_versions, list_objects};
 
         fn assert_xml_etag<T: Serialize>(output: &T, etag: &ETag) {
             let mut bytes = Vec::new();
@@ -1281,21 +1302,25 @@ mod tests {
             );
         }
 
+        let bucket_usecase = crate::app::bucket_usecase::DefaultBucketUsecase::from_global();
         // Listings carry neither the SSE-C key nor a per-object decryption request.
-        let versions = crate::app::storage_api::s3::S3::list_object_versions(
-            fs,
-            build_request(
-                ListObjectVersionsInput {
-                    bucket: bucket.to_string(),
-                    prefix: Some(key.to_string()),
-                    ..Default::default()
-                },
-                Method::GET,
-            ),
+        let versions_req = build_request(
+            ListObjectVersionsInput {
+                bucket: bucket.to_string(),
+                prefix: Some(key.to_string()),
+                ..Default::default()
+            },
+            Method::GET,
+        );
+        let versions_env = RequestEnvelope::from_s3s(&versions_req);
+        let versions_in = list_object_versions::input_from_s3s(versions_req.input).expect("convert ListObjectVersionsInput");
+        let versions = list_object_versions::output_to_s3s(
+            bucket_usecase
+                .execute_list_object_versions(versions_env, versions_in)
+                .await
+                .expect("keyless version listing"),
         )
-        .await
-        .expect("keyless version listing")
-        .output;
+        .expect("convert ListObjectVersionsOutput");
         let entries = versions.versions.as_ref().expect("completed version must be listed");
         assert_eq!(entries.len(), 1, "completion replay must preserve a single version");
         assert_eq!(entries[0].key.as_deref(), Some(key));
@@ -1303,22 +1328,25 @@ mod tests {
         assert_eq!(entries[0].e_tag.as_ref(), Some(etag));
         assert_xml_etag(&versions, etag);
 
-        let v1 = crate::app::storage_api::s3::S3::list_objects(
-            fs,
-            build_request(
-                ListObjectsInput {
-                    bucket: bucket.to_string(),
-                    prefix: Some(key.to_string()),
-                    ..Default::default()
-                },
-                Method::GET,
-            ),
+        let v1_req = build_request(
+            ListObjectsInput {
+                bucket: bucket.to_string(),
+                prefix: Some(key.to_string()),
+                ..Default::default()
+            },
+            Method::GET,
+        );
+        let v1_env = RequestEnvelope::from_s3s(&v1_req);
+        let v1_in = list_objects::input_from_s3s(v1_req.input).expect("convert ListObjectsInput");
+        let v1 = list_objects::output_to_s3s(
+            bucket_usecase
+                .execute_list_objects(v1_env, v1_in)
+                .await
+                .expect("keyless V1 listing"),
         )
-        .await
-        .expect("keyless V1 listing")
-        .output;
-        let v2 = crate::app::storage_api::s3::S3::list_objects_v2(
-            fs,
+        .expect("convert ListObjectsOutput");
+        let v2 = crate::app::test_seams::list_objects_v2(
+            &bucket_usecase,
             build_request(
                 ListObjectsV2Input {
                     bucket: bucket.to_string(),
@@ -1382,52 +1410,41 @@ mod tests {
                 )
                 .await
                 .expect("create versioned Object Lock bucket");
-            let fs = crate::storage::ecfs::FS::new();
             let key = "kms-encrypted";
-            crate::app::storage_api::s3::S3::put_bucket_encryption(
-                &fs,
-                build_request(
-                    crate::app::storage_api::s3::dto::PutBucketEncryptionInput::builder()
-                        .bucket(bucket.clone())
-                        .server_side_encryption_configuration(
-                            crate::app::storage_api::s3::dto::ServerSideEncryptionConfiguration {
-                                rules: vec![crate::app::storage_api::s3::dto::ServerSideEncryptionRule {
-                                    apply_server_side_encryption_by_default: Some(
-                                        crate::app::storage_api::s3::dto::ServerSideEncryptionByDefault {
-                                            sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                                            kms_master_key_id: Some(kms_key.key_id.clone()),
-                                        },
-                                    ),
-                                    ..Default::default()
-                                }],
-                            },
-                        )
-                        .build()
-                        .expect("bucket encryption input"),
-                    Method::PUT,
-                ),
-            )
-            .await
-            .expect("configure bucket-default SSE-KMS");
-            let upload_id = crate::app::storage_api::s3::S3::create_multipart_upload(
-                &fs,
-                build_request(
+            let enc_req = build_request((), Method::PUT);
+            let enc_cfg = crate::app::storage_api::s3::dto::ServerSideEncryptionConfiguration {
+                rules: vec![crate::app::storage_api::s3::dto::ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(
+                        crate::app::storage_api::s3::dto::ServerSideEncryptionByDefault {
+                            sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            kms_master_key_id: Some(kms_key.key_id.clone()),
+                        },
+                    ),
+                    ..Default::default()
+                }],
+            };
+            let prepared = crate::storage::persisted_from_s3s(&enc_cfg).map_err(Into::into);
+            crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
+                .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&enc_req), &bucket, prepared)
+                .await
+                .expect("configure bucket-default SSE-KMS");
+            let usecase = DefaultMultipartUsecase::from_global();
+            let upload_id = usecase
+                .execute_create_multipart_upload_from_s3s(build_request(
                     CreateMultipartUploadInput {
                         bucket: bucket.clone(),
                         key: key.to_string(),
                         ..Default::default()
                     },
                     Method::POST,
-                ),
-            )
-            .await
-            .expect("create KMS multipart upload")
-            .output
-            .upload_id
-            .expect("KMS upload id");
-            let part = crate::app::storage_api::s3::S3::upload_part(
-                &fs,
-                build_request(
+                ))
+                .await
+                .expect("create KMS multipart upload")
+                .output
+                .upload_id
+                .expect("KMS upload id");
+            let part = usecase
+                .execute_upload_part(build_request(
                     UploadPartInput {
                         bucket: bucket.clone(),
                         key: key.to_string(),
@@ -1438,11 +1455,10 @@ mod tests {
                         ..Default::default()
                     },
                     Method::PUT,
-                ),
-            )
-            .await
-            .expect("upload encrypted KMS part")
-            .output;
+                ))
+                .await
+                .expect("upload encrypted KMS part")
+                .output;
             let complete = CompleteMultipartUploadInput {
                 bucket: bucket.clone(),
                 key: key.to_string(),
@@ -1457,19 +1473,16 @@ mod tests {
                 ..Default::default()
             };
             for _ in 0..2 {
-                let response = crate::app::storage_api::s3::S3::complete_multipart_upload(
-                    &fs,
-                    build_request(complete.clone(), Method::POST),
-                )
-                .await
-                .expect("complete and replay KMS multipart upload")
-                .output;
-                let etag = response.e_tag.expect("KMS completed ETag");
+                let response = usecase
+                    .complete_for_s3s_request(build_request(complete.clone(), Method::POST))
+                    .await
+                    .expect("complete and replay KMS multipart upload");
+                let etag = etag_to_s3s(&response.e_tag.expect("KMS completed ETag"));
                 let version_id = response.version_id.expect("KMS completed version");
                 assert_ne!(version_id, "null");
-                assert_multipart_etag_listings(&fs, &bucket, key, &etag, &version_id).await;
-                let head = crate::app::storage_api::s3::S3::head_object(
-                    &fs,
+                assert_multipart_etag_listings(&bucket, key, &etag, &version_id).await;
+                let head = crate::app::test_seams::head_object(
+                    &crate::app::object::DefaultObjectUsecase::from_global(),
                     build_request(
                         crate::app::storage_api::s3::dto::HeadObjectInput {
                             bucket: bucket.clone(),

@@ -1322,7 +1322,7 @@ impl DefaultObjectUsecase {
         {
             return Err(rustfs_s3_types::s3_error!(InvalidStorageClass));
         }
-        reject_non_wildcard_write_if_none_match_native(input.specific_if_none_match, envelope.headers())?;
+        reject_non_wildcard_write_if_none_match(input.specific_if_none_match, envelope.headers())?;
         // An authorized inbound replication PUT must store the replica verbatim.
         // Legacy snowball-extracted members may still carry the auto-extract
         // metadata, which replication replays as a header. Do not interpret that
