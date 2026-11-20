@@ -165,4 +165,17 @@ fn legacy_get_body_error(error: StreamError) -> Box<dyn std::error::Error + Send
     }
 }
 
-impl s3s::stream::ByteStream for LegacyGetStream {}
+impl s3s::stream::ByteStream for LegacyGetStream {
+    fn remaining_length(&self) -> s3s::stream::RemainingLength {
+        match self
+            .payload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len_hint()
+            .and_then(|length| usize::try_from(length).ok())
+        {
+            Some(length) => s3s::stream::RemainingLength::new_exact(length),
+            None => s3s::stream::RemainingLength::unknown(),
+        }
+    }
+}

@@ -27,13 +27,14 @@ pub(crate) async fn list_objects_v2(
     let envelope = crate::app::RequestEnvelope::from_s3s(&req);
     let input = ops::input_from_s3s(req.input).map_err(crate::app::dto_values::seam_error)?;
     let mut output = list_objects_v2_owned(usecase, envelope, input).await?;
-    let source_left_out = output.rustfs_on_demand_migration_list.take().is_some();
+    let migration_list = output.rustfs_on_demand_migration_list.take();
     let s3s_output = ops::output_to_s3s(output).map_err(crate::app::dto_values::seam_error)?;
     let mut response = S3Response::new(s3s_output);
-    if source_left_out {
-        response
-            .headers
-            .insert("x-rustfs-on-demand-migration-list", http::HeaderValue::from_static("local-only"));
+    if let Some(value) = migration_list {
+        response.headers.insert(
+            "x-rustfs-on-demand-migration-list",
+            http::HeaderValue::from_str(&value).expect("valid migration list header"),
+        );
     }
     Ok(response)
 }

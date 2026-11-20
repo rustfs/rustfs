@@ -545,7 +545,7 @@ async fn put_lifecycle(req: S3Request<PutBucketLifecycleConfigurationInput>) -> 
                 crate::app::bucket_usecase::PreparedLifecycleConfiguration::InvalidStatus
             } else {
                 crate::app::bucket_usecase::PreparedLifecycleConfiguration::Prepared(
-                    crate::storage::persisted_from_s3s(&cfg).map_err(|e| std::io::Error::other(e.to_string())),
+                    crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(cfg),
                 )
             }
         }
