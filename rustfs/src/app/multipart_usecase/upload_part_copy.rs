@@ -159,7 +159,7 @@ impl DefaultMultipartUsecase {
         input: UploadPartCopyWriteInput,
     ) -> S3Result<UploadPartCopyWriteOutput> {
         RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPartCopy, http::StatusCode::OK, |envelope| {
-            self.execute_upload_part_copy_body(envelope, input)
+            Box::pin(self.execute_upload_part_copy_body(envelope, input))
         })
         .await
     }

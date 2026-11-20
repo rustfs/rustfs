@@ -380,6 +380,8 @@ mod tests {
     fn list_apis_report_storage_read_quorum_as_unavailable() {
         use crate::app::bucket_usecase::test_support::owned_envelope;
         use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
+        use crate::error::ApiErrorDiagnostic;
+        use crate::storage_api::error::contract::StorageErrorCode;
         run_large_stack_test("list-quorum-surface", || async {
             let usecase = DefaultBucketUsecase::with_context(Some(shared_gating_ambient().await));
             let store = shared_gating_ecstore().await;
@@ -434,13 +436,13 @@ mod tests {
                 assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
                 assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
                 assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
-                let source = error.source().expect("retain storage diagnostics");
+                let diagnostic = ApiErrorDiagnostic::from_error(&error);
                 assert!(
                     matches!(
-                        source.downcast_ref::<StorageError>(),
-                        Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+                        diagnostic.storage_code,
+                        Some(StorageErrorCode::ErasureReadQuorum | StorageErrorCode::InsufficientReadQuorum)
                     ),
-                    "{source}"
+                    "expected a typed storage read-quorum cause: {diagnostic:?}"
                 );
             }
         });
