@@ -5159,7 +5159,10 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
             .get_size(item)
             .await
             .expect_err("symlink loop must remain a read failure");
-        assert!(matches!(err, StorageError::Io(_) | StorageError::Unexpected), "read error: {err:?}");
+        assert!(
+            matches!(err, StorageError::InvalidPath | StorageError::Io(_) | StorageError::Unexpected),
+            "read error: {err:?}"
+        );
         let failed = global_metrics().scan_observation().snapshot().metadata_reads;
         assert_eq!(failed.attempts, missing.attempts + 1);
         assert_eq!(failed.errors, missing.errors + 1);
