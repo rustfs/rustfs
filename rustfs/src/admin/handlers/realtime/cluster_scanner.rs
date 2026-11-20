@@ -68,7 +68,14 @@ struct LastAttempt {
     duration_seconds: f64,
 }
 
-fn summarize(total: usize, samples: &[(String, ScannerNodeSample)], fence: Option<(u64, u64)>) -> Summary {
+struct DurableCycle {
+    epoch: u64,
+    cycle: u64,
+    last_success_at: Option<Timestamp>,
+}
+
+fn summarize(total: usize, samples: &[(String, ScannerNodeSample)], durable: Option<DurableCycle>) -> Summary {
+    let fence = durable.as_ref().map(|record| (record.epoch, record.cycle));
     let covered = total > 0 && total == samples.len();
     let active_count = samples.iter().filter(|(_, node)| node.active).count();
     let mut holders = samples.iter().filter(|(_, node)| node.leader);
@@ -118,7 +125,6 @@ fn summarize(total: usize, samples: &[(String, ScannerNodeSample)], fence: Optio
             partial_reason: a.partial_reason.clone(),
             duration_seconds: a.duration_seconds,
         });
-    let last_success_at = samples.iter().filter_map(|(_, node)| node.last_success_at).max();
     Summary {
         state,
         nodes_total: total,
@@ -126,7 +132,7 @@ fn summarize(total: usize, samples: &[(String, ScannerNodeSample)], fence: Optio
         sampled_at: Timestamp::now(),
         current,
         last_attempt,
-        last_success_at,
+        last_success_at: durable.and_then(|record| record.last_success_at),
     }
 }
 
@@ -182,11 +188,12 @@ async fn probe(context: &AppContext) -> Summary {
     } else {
         None
     };
-    let mut summary = summarize(total, &samples, fence.as_ref().map(|(epoch, cycle)| (*epoch, cycle.next)));
-    if let Some((_, cycle)) = fence {
-        summary.last_success_at = cycle.last_success_at();
-    }
-    summary
+    let durable = fence.map(|(epoch, record)| DurableCycle {
+        epoch,
+        cycle: record.next,
+        last_success_at: record.last_success_at(),
+    });
+    summarize(total, &samples, durable)
 }
 
 struct Cache {
@@ -230,9 +237,17 @@ pub(super) async fn read(context: Option<Arc<AppContext>>) -> Summary {
 mod tests {
     use super::*;
 
+    fn durable(epoch: u64, cycle: u64) -> Option<DurableCycle> {
+        Some(DurableCycle {
+            epoch,
+            cycle,
+            last_success_at: None,
+        })
+    }
+
     fn with_fence(total: usize, samples: &[(String, ScannerNodeSample)]) -> Summary {
         let cycle = samples.iter().find(|(_, node)| node.leader).map_or(0, |(_, node)| node.cycle);
-        summarize(total, samples, Some((9, cycle)))
+        summarize(total, samples, durable(9, cycle))
     }
 
     fn node(name: &str, sample: ScannerNodeSample) -> (String, ScannerNodeSample) {
@@ -262,12 +277,30 @@ mod tests {
     }
 
     #[test]
+    fn cluster_scanner_only_reports_success_from_durable_history() {
+        let when = Timestamp::constant(1_700_000_000, 0);
+        // An older peer may send its speculative timestamp even if persistence failed.
+        let mut peer = serde_json::to_value(leader(40)).expect("peer sample");
+        peer["last_success_at"] = serde_json::json!(when);
+        let samples = [node("owner", serde_json::from_value(peer).expect("compatible peer"))];
+        assert!(summarize(1, &samples, None).last_success_at.is_none());
+        assert!(summarize(1, &samples, durable(9, 40)).last_success_at.is_none());
+        let confirmed = Timestamp::constant(1_699_000_000, 0);
+        let record = DurableCycle {
+            epoch: 9,
+            cycle: 40,
+            last_success_at: Some(confirmed),
+        };
+        assert_eq!(summarize(1, &samples, Some(record)).last_success_at, Some(confirmed));
+    }
+
+    #[test]
     fn cluster_scanner_requires_a_current_persisted_fence_to_trust_a_leader() {
         let samples = [node("former", leader(40))];
         assert_eq!(summarize(4, &samples, None).state, State::Unknown);
-        assert_eq!(summarize(4, &samples, Some((10, 41))).state, State::Unknown);
-        assert_eq!(summarize(4, &samples, Some((9, 41))).state, State::Unknown);
-        assert_eq!(summarize(4, &samples, Some((9, 40))).state, State::Scanning);
+        assert_eq!(summarize(4, &samples, durable(10, 41)).state, State::Unknown);
+        assert_eq!(summarize(4, &samples, durable(9, 41)).state, State::Unknown);
+        assert_eq!(summarize(4, &samples, durable(9, 40)).state, State::Scanning);
         let idle = [node(
             "owner",
             ScannerNodeSample {
@@ -276,8 +309,8 @@ mod tests {
                 ..Default::default()
             },
         )];
-        assert_eq!(summarize(1, &idle, Some((9, 41))).state, State::Idle);
-        assert_eq!(summarize(2, &idle, Some((9, 41))).state, State::Unknown);
+        assert_eq!(summarize(1, &idle, durable(9, 41)).state, State::Idle);
+        assert_eq!(summarize(2, &idle, durable(9, 41)).state, State::Unknown);
         assert_eq!(summarize(1, &idle, None).state, State::Unknown);
     }
 
@@ -342,8 +375,8 @@ mod tests {
             ..Default::default()
         };
         let members = [node("new", b), node("old", a)];
-        assert!(summarize(2, &members, Some((9, 501))).last_attempt.is_none());
-        let status = summarize(2, &members, Some((10, 3)));
+        assert!(summarize(2, &members, durable(9, 501)).last_attempt.is_none());
+        let status = summarize(2, &members, durable(10, 3));
         assert_eq!(status.last_attempt.expect("latest epoch").cycle, 2);
         let json = serde_json::to_value(status.state).expect("state");
         assert_eq!(json, "unknown");
