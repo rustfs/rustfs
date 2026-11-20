@@ -3457,6 +3457,8 @@ async fn direct_upgrade_from_previous_release_preserves_bucket_configuration() -
 #[tokio::test]
 #[ignore = "requires a pinned previous RustFS release binary"]
 async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestResult {
+    use sha2::Digest;
+
     init_logging();
     let previous_binary = source_binary()?;
     let evidence_context = g09_evidence_context(&previous_binary).await?;
@@ -3494,6 +3496,16 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
     let multipart_bytes = multipart_parts.concat();
     write_multipart(&new_client, ROLLBACK_BUCKET, multipart_key, &multipart_parts).await?;
 
+    // This release can finish an upload staged by the current gateway.
+    let inflight = if binary_source_revision(&previous_binary).await? == STABLE_1_0_5_COMMIT {
+        env.create_test_bucket(PENDING_MULTIPART_BUCKET).await?;
+        let parts = [vec![1; LAYOUT_PART_SIZE], vec![2; LAYOUT_PART_SIZE], vec![3; 4096]];
+        let pending = stage_multipart(&new_client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, &parts).await?;
+        Some((pending, parts.concat()))
+    } else {
+        None
+    };
+
     restart_from_binary(&mut env, &previous_binary, &server_env).await?;
     let old_client = env.create_s3_client();
 
@@ -3508,6 +3520,16 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
     let (encryption, body) = read_object(&old_client, ROLLBACK_BUCKET, multipart_key, None).await?;
     assert_eq!(encryption, Some(ServerSideEncryption::Aes256));
     assert_eq!(body, multipart_bytes, "the multipart object did not survive the rollback");
+
+    let rollback_multipart = if let Some((pending, expected)) = inflight {
+        assert_pending_parts(&old_client, &pending).await?;
+        complete_pending_multipart(&old_client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, &pending).await?;
+        let (_, body) = read_object(&old_client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, None).await?;
+        assert_eq!(body, expected);
+        Some((pending.part_sizes, body))
+    } else {
+        None
+    };
 
     // A PUT on the rolled-back release must still honour the encryption
     // configuration it decoded out of the current build's metadata blob.
@@ -3548,6 +3570,25 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
         read_object(&current_again, ROLLBACK_BUCKET, post_rollback_key, None).await?.1,
         post_rollback_bytes
     );
+
+    if let Some((part_sizes, rollback_read)) = rollback_multipart {
+        let (_, current_read) = read_object(&current_again, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, None).await?;
+        assert_eq!(current_read, rollback_read);
+        if let Some(context) = &evidence_context {
+            let evidence = serde_json::json!({
+                "previous_revision": context.previous_revision,
+                "current_revision": context.current_revision,
+                "part_sizes": part_sizes,
+                "bytes": current_read.len(),
+                "rollback_read_sha256": format!("{:x}", sha2::Sha256::digest(&rollback_read)),
+                "roll_forward_read_sha256": format!("{:x}", sha2::Sha256::digest(&current_read)),
+            });
+            std::fs::write(
+                context.directory.join("inflight-multipart-rollback.json"),
+                serde_json::to_vec_pretty(&evidence)?,
+            )?;
+        }
+    }
 
     if let Some(context) = evidence_context.as_ref() {
         write_g09_evidence(
