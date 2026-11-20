@@ -209,7 +209,7 @@ fn website_conditions_are_refused_as_the_s3_decoder_refuses_them() {
     headers.insert("if-modified-since", HeaderValue::from_static("Tue, 14 Nov 2023 22:13:20 GMT"));
     assert!(matches!(
         validated_conditions(&headers).expect("well-formed conditions"),
-        Some(Range::Int { first: 2, last: None })
+        Some(rustfs_gateway_types::ByteRange::From { first: 2 })
     ));
     let stripped = without_conditions(&headers);
     assert!(stripped.is_empty(), "{stripped:?}");
