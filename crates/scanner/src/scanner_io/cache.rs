@@ -1745,7 +1745,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             .save_with_revisions_for_epoch(
                 store.clone(),
                 DATA_USAGE_CACHE_NAME,
-                &revisions,
+                revisions,
                 expected_publication_epoch,
                 CancellationToken::new(),
             )

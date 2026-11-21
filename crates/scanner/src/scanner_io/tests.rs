@@ -2713,7 +2713,13 @@ async fn set_cache_cas_preserves_updates_after_backup_catchup_validation() {
         candidate.info.next_cycle += 1;
         candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
         let result = candidate
-            .save_with_revisions_for_epoch(Arc::clone(&set), DATA_USAGE_CACHE_NAME, current.revisions(), epoch)
+            .save_with_revisions_for_epoch(
+                Arc::clone(&set),
+                DATA_USAGE_CACHE_NAME,
+                current.revisions(),
+                epoch,
+                CancellationToken::new(),
+            )
             .await;
         if changed_copy == "primary" {
             assert!(result.is_err(), "primary CAS refuses the intervening update");

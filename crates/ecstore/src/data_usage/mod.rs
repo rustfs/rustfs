@@ -1472,8 +1472,11 @@ async fn project_admin_data_usage_for_current_buckets(
     with_memory_overlay: bool,
 ) -> DataUsageInfo {
     use futures::StreamExt as _;
-    let snapshot_measured = response.is_complete_bucket_usage_snapshot() || response.is_valid_partial_snapshot();
-    let overlay_authoritative = with_memory_overlay && snapshot_measured && !runtime_sources::setup_is_dist_erasure().await;
+    if !(response.is_complete_bucket_usage_snapshot() || response.is_valid_partial_snapshot()) {
+        return DataUsageInfo::default();
+    }
+
+    let overlay_authoritative = with_memory_overlay && !runtime_sources::setup_is_dist_erasure().await;
     let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
     let mut incarnations = HashMap::new();
     {

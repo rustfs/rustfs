@@ -452,6 +452,88 @@ async fn admin_memory_overlay_requires_a_measured_scanner_baseline() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn admin_identity_filter_does_not_validate_an_unmeasured_partial_snapshot() {
+    use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+    use crate::config::com::save_config;
+
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    let current = "usage-partial-current";
+    let stale = "usage-partial-stale";
+    let mut baseline = data_usage_info_for_test(current, 5, 100, SystemTime::UNIX_EPOCH);
+    baseline.buckets_usage.insert(
+        stale.to_owned(),
+        BucketUsageInfo {
+            size: 200,
+            objects_count: 10,
+            ..Default::default()
+        },
+    );
+    baseline.bucket_sizes.insert(stale.to_owned(), 200);
+    baseline.buckets_count = 2;
+    baseline.calculate_totals();
+    baseline.usage_snapshot_complete = false;
+    baseline.usage_snapshot_partial = true;
+    baseline.usage_snapshot_converged = Some(false);
+    baseline.scanner_epoch = Some(2);
+    baseline.scanner_cycle = Some(9);
+    baseline.usage_snapshot_set_states = vec![DataUsageSnapshotSetState {
+        scanner_epoch: baseline.scanner_epoch,
+        scanner_cycle: baseline.scanner_cycle,
+        scan_plan_digest: Some([1; 32]),
+        ..Default::default()
+    }];
+    bind_admin_usage_test_identities(&store, &mut baseline).await;
+    let current_incarnation = baseline.buckets_usage[current].bucket_incarnation.clone();
+    assert_ne!(current_incarnation, baseline.buckets_usage[stale].bucket_incarnation);
+    baseline
+        .buckets_usage
+        .get_mut(stale)
+        .expect("stale bucket fixture")
+        .bucket_incarnation = current_incarnation;
+
+    for (case, snapshot, expected_size) in [
+        (
+            "missing set provenance",
+            DataUsageInfo {
+                usage_snapshot_set_states: Vec::new(),
+                ..baseline.clone()
+            },
+            None,
+        ),
+        (
+            "mismatched bucket count",
+            DataUsageInfo {
+                buckets_count: 3,
+                ..baseline.clone()
+            },
+            None,
+        ),
+        ("valid partial snapshot", baseline, Some(100)),
+    ] {
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&snapshot).expect("encode partial snapshot"),
+        )
+        .await
+        .expect("persist partial snapshot");
+        invalidate_admin_data_usage_snapshot_cache().await;
+
+        let response = load_admin_data_usage_from_backend_cached(store.clone())
+            .await
+            .expect("load admin usage through the identity filter");
+        assert_eq!(response.buckets_usage.get(current).map(|usage| usage.size), expected_size, "{case}");
+        assert_eq!(response.bucket_sizes.get(current).copied(), expected_size, "{case}");
+        assert!(!response.buckets_usage.contains_key(stale), "{case}");
+        assert!(!response.bucket_sizes.contains_key(stale), "{case}");
+        assert_eq!(response.objects_total_size, expected_size.unwrap_or_default(), "{case}");
+        assert_eq!(response.usage_snapshot_admin_projection, expected_size.is_some(), "{case}");
+    }
+    invalidate_admin_data_usage_snapshot_cache().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn admin_memory_overlay_cannot_reintroduce_a_predecessor_identity() {
     use crate::bucket::metadata::save_bucket_incarnation;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
