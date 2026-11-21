@@ -105,8 +105,8 @@ pub enum CuObjectError {
 /// Parsed `x-amz-rdma-token`.
 ///
 /// Wire format (cuObject RDMA descriptor protocol): colon-separated hex
-/// fields `addr:size:rkey:lid:dctn:gid_present:gid`; only the leading
-/// address and size are interpreted here, the library consumes the rest.
+/// fields `addr:size:rkey:lid:dctn:gid_present:gid`, optionally followed
+/// by a second GID slot. The SDK receives the original descriptor.
 #[derive(Debug, Clone)]
 pub struct RdmaToken {
     inner: Arc<Descriptor>,
@@ -127,13 +127,27 @@ impl RdmaToken {
     pub fn parse(raw: &str) -> Result<Self, CuObjectError> {
         let raw = raw.trim();
         let mut fields = raw.split(':');
-        let mut hex = || fields.next().and_then(|s| u64::from_str_radix(s, 16).ok());
+        let mut hex = || {
+            let field = fields.next()?;
+            field.as_bytes().first().filter(|byte| byte.is_ascii_hexdigit())?;
+            u64::from_str_radix(field, 16).ok()
+        };
         let address = hex().ok_or_else(|| CuObjectError::Token("invalid address".into()))?;
         let size = hex()
             .filter(|&s| s > 0)
             .ok_or_else(|| CuObjectError::Token("invalid length".into()))?;
-        if raw.contains('\0') || fields.take(4).count() < 4 {
-            return Err(CuObjectError::Token("invalid descriptor".into()));
+        if hex().and_then(|key| u32::try_from(key).ok()).is_none()
+            || hex().and_then(|lid| u16::try_from(lid).ok()).is_none()
+            || hex().and_then(|dctn| u32::try_from(dctn).ok()).is_none()
+        {
+            return Err(CuObjectError::Token("invalid routing fields".into()));
+        }
+        let mut routes = fields.peekable();
+        if !valid_gid_slot(routes.next(), routes.next())
+            || (routes.peek().is_some() && !valid_gid_slot(routes.next(), routes.next()))
+            || routes.next().is_some()
+        {
+            return Err(CuObjectError::Token("invalid GID".into()));
         }
         Ok(Self {
             inner: Arc::new(Descriptor {
@@ -148,6 +162,15 @@ impl RdmaToken {
 
     pub fn as_str(&self) -> &str {
         &self.inner.raw
+    }
+}
+
+/// LID-only descriptors can omit the GID or carry a fixed-width placeholder.
+fn valid_gid_slot(flag: Option<&str>, gid: Option<&str>) -> bool {
+    match (flag, gid) {
+        (Some("0"), None | Some("")) => true,
+        (Some("0" | "1"), Some(gid)) => gid.len() == 32 && gid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        _ => false,
     }
 }
 
@@ -889,23 +912,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_parses_leading_fields_and_rejects_garbage() {
+    fn token_parses_dc_routing_and_rejects_malformed_fields() {
         let token =
             RdmaToken::parse("0000f52eddc00000:00100000:001824d2:0000:002873:1:00000000000000000000ffff0a0d5410").expect("token");
         assert_eq!(token.remote_addr, 0x0000_f52e_ddc0_0000);
         assert_eq!(token.buffer_len, 0x0010_0000);
-        assert!(matches!(RdmaToken::parse("nothex:00100000:1:2:3:4:5"), Err(CuObjectError::Token(_))));
-        assert!(RdmaToken::parse("0000f52eddc00000:00000000:1:2:3:4:5").is_err());
-        assert!(RdmaToken::parse("0000f52eddc00000:00100000").is_err());
+        for raw in [
+            "1:10:a:b:c:0",
+            "1:10:a:b:c:0:",
+            "1:10:a:b:c:0:00000000000000000000000000000000",
+            "1:10:a:b:c:0::1:00000000000000000000ffff0a0d5410",
+        ] {
+            assert!(RdmaToken::parse(raw).is_ok(), "{raw}");
+        }
+        for raw in [
+            "nothex:10:1:2:3:0",
+            "1:0:1:2:3:0",
+            "1:10",
+            "1:10::::",
+            "1:10:nothex:0:1:0",
+            "1:10:100000000:0:1:0",
+            "1:10:1:10000:1:0",
+            "1:10:1:0:+1:0",
+            "1:10:1:0:1:2",
+            "1:10:1:0:1:1",
+            "1:10:1:0:1:1:face",
+            "1:10:1:0:1:1:00000000000000000000ffff0a0d541z",
+            "1:10:1:0:1:0::1:",
+            "1:10:1:0:1:0::0::extra",
+        ] {
+            assert!(matches!(RdmaToken::parse(raw), Err(CuObjectError::Token(_))), "{raw}");
+        }
     }
     #[test]
     fn validates_the_entire_remote_range_and_uses_the_parsed_descriptor() {
-        let mut token = RdmaToken::parse("  fffffffffffffff0:10:a:b:c:d  ").unwrap();
+        let mut token = RdmaToken::parse("  fffffffffffffff0:10:a:b:c:0  ").unwrap();
         token.buffer_len = u64::MAX;
         token.remote_addr = 0;
         assert_eq!(token.inner.address(15, 1).unwrap(), u64::MAX);
         assert!(matches!(token.inner.address(15, 2), Err(CuObjectError::TokenTooSmall { .. })));
-        let wrapping = RdmaToken::parse("ffffffffffffffff:2:a:b:c:d").unwrap();
+        let wrapping = RdmaToken::parse("ffffffffffffffff:2:a:b:c:0").unwrap();
         assert!(matches!(wrapping.inner.address(0, 2), Err(CuObjectError::Invalid(_))));
         assert!(token.inner.address(u64::MAX, 2).is_err());
         assert!(token.inner.address(0, MAX_RDMA_OP_BYTES + 1).is_err());
