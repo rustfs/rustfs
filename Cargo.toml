@@ -313,7 +313,8 @@ hostname = "0.4.2"
 ipnetwork = { version = "0.21.1" }
 lazy_static = "1.5.1"
 libc = "0.2.191"
-cuobject = { version = "0.1.0", default-features = false }
+cxx = "1"
+cxx-build = "1"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 log = "0.4"

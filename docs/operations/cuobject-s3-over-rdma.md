@@ -13,12 +13,11 @@ either can be enabled on its own.
 
 ## Build
 
-The feature links NVIDIA's cuObject *server* library (`libcuobjserver`, part
-of the CUDA apt repository as `libcuobjserver` / `libcuobjserver-dev`) through
-the [`cuobject`](https://crates.io/crates/cuobject) bindings; their
-`cuobject-sys` build script generates the FFI with bindgen (needs libclang)
-and compiles a C++ wrapper over the library. It is off by default and
-Linux-only:
+The optional Linux `cuobject` feature builds the workspace crate
+`rustfs-cuobject`. Its C++17 bridge includes `cuobjserver.h` and links
+directly to NVIDIA's `libcuobjserver`. Install `libcuobjserver`,
+`libcuobjserver-dev` and the RDMA development headers for the target
+architecture. A default build does not require the NVIDIA SDK.
 
 ```bash
 # CUOBJSERVER_ROOT points at a prefix holding include/cuobjserver.h and lib/libcuobjserver.so

@@ -21,7 +21,7 @@
 //! through NVIDIA's `libcuobjserver` and answers with an empty body plus
 //! `x-amz-rdma-reply` and `x-amz-rdma-bytes-transferred`.
 //!
-//! The library bindings come from the [`cuobject`] crate. This crate owns
+//! This crate binds the NVIDIA server SDK directly and owns
 //! RustFS's pool of registered, page-aligned host staging buffers: the regular
 //! read path fills a staging chunk and
 //! [`CuObjectServer::write_to_client_owned`] pushes it.
@@ -32,36 +32,41 @@
 #![cfg(feature = "server")]
 
 use bytes::Bytes;
-use cuobject::{Channel, Completion, RegisteredBuffer, Server, ServerOptions, SgBuffer, SgEntry, Source};
+// SAFETY: the private bridge declares the SDK ABI and channel ownership rules.
+#[allow(unsafe_code)]
+mod sdk;
+use cxx::SharedPtr;
+use sdk::{Channel, ffi};
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{future::Future, mem::ManuallyDrop};
 use thiserror::Error;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Header carrying the client's RDMA descriptor on a request.
-pub const RDMA_TOKEN_HEADER: &str = cuobject::TOKEN_HEADER;
+pub const RDMA_TOKEN_HEADER: &str = "x-amz-rdma-token";
 /// Header carrying the transfer status on the response (HTTP-style code).
-pub const RDMA_REPLY_HEADER: &str = cuobject::REPLY_HEADER;
+pub const RDMA_REPLY_HEADER: &str = "x-amz-rdma-reply";
 /// Header carrying the payload byte count moved over RDMA.
-pub const RDMA_BYTES_TRANSFERRED_HEADER: &str = cuobject::BYTES_TRANSFERRED_HEADER;
+pub const RDMA_BYTES_TRANSFERRED_HEADER: &str = "x-amz-rdma-bytes-transferred";
 /// Reply code for a declined transfer (the client then errors or falls back).
-pub const RDMA_REPLY_NOT_IMPLEMENTED: u16 = cuobject::REPLY_NOT_IMPLEMENTED;
+pub const RDMA_REPLY_NOT_IMPLEMENTED: u16 = 501;
 /// Largest single `handleGetObject` the library accepts.
-pub const MAX_RDMA_OP_BYTES: usize = cuobject::MAX_TRANSFER_BYTES;
+pub const MAX_RDMA_OP_BYTES: usize = 1 << 30;
 /// Default RDMA control port of the cuObject server.
-pub const DEFAULT_PORT: u16 = cuobject::DEFAULT_PORT;
+pub const DEFAULT_PORT: u16 = 18515;
 /// Most ranges one scatter-gather transfer may carry (the library's `max_sge`).
-pub const MAX_SG_RANGES: usize = cuobject::DEFAULT_MAX_SG_ENTRIES;
+pub const MAX_SG_RANGES: usize = 10;
 
 /// Version of the cuObject server headers the bindings were built against, as
 /// (major, minor).
 pub fn library_version() -> (u32, u32) {
-    cuobject::header_version()
+    let version = ffi::header_version();
+    (version / 1000, version % 1000)
 }
 
 #[derive(Debug, Error)]
@@ -94,23 +99,6 @@ pub enum CuObjectError {
     Source(#[source] std::io::Error),
 }
 
-impl From<cuobject::Error> for CuObjectError {
-    fn from(error: cuobject::Error) -> Self {
-        match error {
-            cuobject::Error::Library { op, source } => Self::Os { op, source },
-            cuobject::Error::Transfer { verbs_status, source } => Self::Transfer { verbs_status, source },
-            cuobject::Error::InvalidArgument(reason) => Self::Invalid(reason),
-            cuobject::Error::InvalidToken(reason) => Self::Token(reason.to_owned()),
-            cuobject::Error::TokenTooSmall { buffer, needed } => Self::TokenTooSmall { buffer, needed },
-            cuobject::Error::AsyncUnavailable(channel) => Self::AsyncUnavailable(channel),
-            other => Self::Os {
-                op: "cuobject",
-                source: std::io::Error::other(other),
-            },
-        }
-    }
-}
-
 /// Parsed `x-amz-rdma-token`.
 ///
 /// Wire format (cuObject RDMA descriptor protocol): colon-separated hex
@@ -118,25 +106,66 @@ impl From<cuobject::Error> for CuObjectError {
 /// address and size are interpreted here, the library consumes the rest.
 #[derive(Debug, Clone)]
 pub struct RdmaToken {
-    inner: cuobject::RdmaToken,
+    inner: Arc<Descriptor>,
     /// Start of the client buffer (a copy of the parsed field).
     pub remote_addr: u64,
     /// Length of the client buffer (a copy of the parsed field).
     pub buffer_len: u64,
 }
 
+#[derive(Debug)]
+struct Descriptor {
+    raw: String,
+    address: u64,
+    size: u64,
+}
+
 impl RdmaToken {
     pub fn parse(raw: &str) -> Result<Self, CuObjectError> {
-        let inner = cuobject::RdmaToken::parse(raw)?;
+        let raw = raw.trim();
+        let mut fields = raw.split(':');
+        let mut hex = || fields.next().and_then(|s| u64::from_str_radix(s, 16).ok());
+        let address = hex().ok_or_else(|| CuObjectError::Token("invalid address".into()))?;
+        let size = hex()
+            .filter(|&s| s > 0)
+            .ok_or_else(|| CuObjectError::Token("invalid length".into()))?;
+        if raw.contains('\0') || fields.take(4).count() < 4 {
+            return Err(CuObjectError::Token("invalid descriptor".into()));
+        }
         Ok(Self {
-            remote_addr: inner.remote_addr(),
-            buffer_len: inner.buffer_len(),
-            inner,
+            inner: Arc::new(Descriptor {
+                raw: raw.into(),
+                address,
+                size,
+            }),
+            remote_addr: address,
+            buffer_len: size,
         })
     }
 
     pub fn as_str(&self) -> &str {
-        self.inner.as_str()
+        &self.inner.raw
+    }
+}
+
+impl Descriptor {
+    fn address(&self, offset: u64, length: usize) -> Result<u64, CuObjectError> {
+        if length == 0 || length > MAX_RDMA_OP_BYTES {
+            return Err(CuObjectError::Invalid("invalid RDMA transfer length"));
+        }
+        let needed = offset
+            .checked_add(length as u64)
+            .ok_or(CuObjectError::Invalid("remote range overflow"))?;
+        if needed > self.size {
+            return Err(CuObjectError::TokenTooSmall {
+                buffer: self.size,
+                needed,
+            });
+        }
+        self.address
+            .checked_add(needed - 1)
+            .ok_or(CuObjectError::Invalid("remote address overflow"))?;
+        Ok(self.address + offset)
     }
 }
 
@@ -170,7 +199,7 @@ impl Default for CuObjectConfig {
 }
 
 struct Staging {
-    buffer: RegisteredBuffer<Arc<Server>>,
+    buffer: SharedPtr<ffi::Buffer>,
     free: parking_lot::Mutex<VecDeque<usize>>,
     permits: Semaphore,
     chunk_bytes: usize,
@@ -178,7 +207,7 @@ struct Staging {
 
 /// One cuObject server bound to the RDMA device that owns an IP address.
 pub struct CuObjectServer {
-    server: Arc<Server>,
+    server: SharedPtr<ffi::Server>,
     staging: Staging,
     addr: IpAddr,
     port: u16,
@@ -208,7 +237,7 @@ pub struct ArenaRanges {
 
 impl ArenaRanges {
     pub fn total_len(&self) -> usize {
-        self.ranges.iter().map(|(_, len)| *len).sum()
+        self.ranges.iter().fold(0usize, |total, (_, len)| total.saturating_add(*len))
     }
 }
 
@@ -222,7 +251,7 @@ pub struct ArenaRange {
 /// Host memory registered with one server, owned by the caller (see
 /// [`CuObjectServer::register_arena`]).
 pub struct RegisteredArena {
-    buffer: RegisteredBuffer<Arc<Server>>,
+    buffer: SharedPtr<ffi::Buffer>,
     server: Arc<CuObjectServer>,
     id: u64,
 }
@@ -230,11 +259,11 @@ pub struct RegisteredArena {
 impl RegisteredArena {
     /// Length of the registered memory.
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        ffi::size(&self.buffer)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.len() == 0
     }
 
     /// Process-unique id of this registration.
@@ -251,7 +280,7 @@ impl RegisteredArena {
     /// long as this arena; callers hand out disjoint ranges of it and never
     /// touch a range while a transfer sends it.
     pub fn as_mut_ptr(&self) -> *mut u8 {
-        self.buffer.as_mut_ptr()
+        ffi::data(&self.buffer)
     }
 }
 
@@ -291,7 +320,7 @@ impl StagingChunk {
 
     /// Copies `data` at `self.len()` and advances the staged length.
     pub fn append(&mut self, data: &[u8]) -> Result<(), CuObjectError> {
-        if self.len + data.len() > self.capacity() {
+        if data.len() > self.capacity() - self.len {
             return Err(CuObjectError::Invalid("staging append exceeds chunk"));
         }
         self.spare_mut()?[..data.len()].copy_from_slice(data);
@@ -312,7 +341,7 @@ impl StagingChunk {
     pub fn staged(&self) -> Result<&[u8], CuObjectError> {
         // SAFETY: the range lies in this chunk (see the type docs); `&self`
         // excludes `spare_mut`, and transfers own the chunk they move.
-        Ok(unsafe { self.server.staging.buffer.slice(self.start(), self.len)? })
+        Ok(unsafe { std::slice::from_raw_parts(ffi::data(&self.server.staging.buffer).add(self.start()), self.len) })
     }
 
     /// The unfilled remainder of the chunk, for a reader to fill directly.
@@ -321,12 +350,12 @@ impl StagingChunk {
         let len = self.capacity() - self.len;
         // SAFETY: the range lies in this chunk (see the type docs) and
         // `&mut self` excludes every other borrow of it.
-        Ok(unsafe { self.server.staging.buffer.slice_mut(self.start() + self.len, len)? })
+        Ok(unsafe { std::slice::from_raw_parts_mut(ffi::data(&self.server.staging.buffer).add(self.start() + self.len), len) })
     }
 
     /// Marks `n` more bytes of the spare area as staged.
     pub fn advance(&mut self, n: usize) -> Result<(), CuObjectError> {
-        if self.len + n > self.capacity() {
+        if n > self.capacity() - self.len {
             return Err(CuObjectError::Invalid("staging advance exceeds chunk"));
         }
         self.len += n;
@@ -358,37 +387,9 @@ enum Local {
     /// Several ranges of a caller-owned arena, sent as one operation.
     ArenaList {
         arena: Arc<RegisteredArena>,
-        entries: Vec<SgEntry>,
+        entries: Vec<ffi::Range>,
     },
 }
-
-impl Local {
-    fn len(&self) -> usize {
-        match self {
-            Self::Staging { len, .. } | Self::Arena { len, .. } => *len,
-            Self::ArenaList { entries, .. } => entries.iter().map(|entry| entry.size).sum(),
-        }
-    }
-}
-
-/// Why an asynchronous GET did not complete.
-enum AsyncFailure {
-    /// The library has no completion descriptor; nothing was submitted.
-    Unavailable,
-    /// The GET failed, or was never submitted; nothing is in flight.
-    Failed(CuObjectError),
-    /// Waiting failed after submission: the NIC may still read the memory.
-    InFlight(CuObjectError),
-}
-
-impl From<cuobject::Error> for AsyncFailure {
-    fn from(error: cuobject::Error) -> Self {
-        Self::Failed(error.into())
-    }
-}
-
-/// The handle of the one GET in flight on an asynchronous channel.
-const ASYNC_HANDLE: NonZeroUsize = NonZeroUsize::MIN;
 
 impl CuObjectServer {
     /// Creates the server and its registered staging pool.
@@ -396,13 +397,11 @@ impl CuObjectServer {
         if config.chunk_bytes == 0 || config.chunk_bytes > MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
             return Err(CuObjectError::Invalid("invalid staging configuration"));
         }
-        let mut options = ServerOptions::default();
-        // A non-positive count keeps the library default.
-        options.num_dcis = u32::try_from(config.num_dcis).unwrap_or(0);
-        options.cq_depth = config.cq_depth;
-        let server = Arc::new(Server::new(addr, config.port, &options)?);
+        let server = ffi::open_server(&addr.to_string(), config.port, config.num_dcis, config.cq_depth)
+            .map_err(|e| sdk::failure("open server", e))?;
         let chunks = config.pool_bytes / config.chunk_bytes;
-        let buffer = RegisteredBuffer::new(Arc::clone(&server), chunks * config.chunk_bytes)?;
+        let buffer = ffi::register_buffer(server.clone(), chunks * config.chunk_bytes)
+            .map_err(|e| sdk::failure("register staging memory", e))?;
         Ok(Arc::new(Self {
             channels: Arc::new(Semaphore::new(usize::try_from(config.num_dcis).unwrap_or(1).max(1))),
             async_transfers: config.async_transfers,
@@ -466,7 +465,7 @@ impl CuObjectServer {
     /// server for callers that manage the memory themselves (a shard arena the
     /// decoder reads into and the server RDMA-writes from without staging).
     pub fn register_arena(self: &Arc<Self>, len: usize) -> Result<Arc<RegisteredArena>, CuObjectError> {
-        let buffer = RegisteredBuffer::new(Arc::clone(&self.server), len)?;
+        let buffer = ffi::register_buffer(self.server.clone(), len).map_err(|e| sdk::failure("register arena", e))?;
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Arc::new(RegisteredArena {
             buffer,
@@ -486,6 +485,9 @@ impl CuObjectServer {
         remote_offset: u64,
         chunk: StagingChunk,
     ) -> Result<(u64, StagingChunk), CuObjectError> {
+        if !Arc::ptr_eq(self, &chunk.server) {
+            return Err(CuObjectError::Invalid("chunk belongs to another server"));
+        }
         if chunk.is_empty() {
             return Ok((0, chunk));
         }
@@ -533,16 +535,13 @@ impl CuObjectServer {
         if source.ranges.len() > MAX_SG_RANGES {
             return Err(CuObjectError::Invalid("too many scatter-gather ranges"));
         }
-        if source.total_len() == 0 {
+        if source.ranges.iter().all(|&(_, size)| size == 0) {
             return Ok((0, keep));
         }
         let entries = source
             .ranges
             .iter()
-            .map(|&(offset, size)| SgEntry {
-                offset: offset as u64,
-                size,
-            })
+            .map(|&(offset, size)| ffi::Range { offset, size })
             .collect();
         let local = Local::ArenaList {
             arena: source.arena,
@@ -563,6 +562,9 @@ impl CuObjectServer {
         len: usize,
         mut chunk: StagingChunk,
     ) -> Result<StagingChunk, CuObjectError> {
+        if !Arc::ptr_eq(self, &chunk.server) {
+            return Err(CuObjectError::Invalid("chunk belongs to another server"));
+        }
         chunk.clear();
         if len == 0 {
             return Ok(chunk);
@@ -575,10 +577,18 @@ impl CuObjectServer {
         let token = token.inner.clone();
         let channel_permit = self.channel_permit().await?;
         tokio::task::spawn_blocking(move || {
-            let _channel_permit = channel_permit;
-            let mut channel = Channel::lease(Arc::clone(&server.server))?;
-            let moved = channel.put(&key, &token, remote_offset, &server.staging.buffer, chunk.start(), len)?;
-            check_moved(moved as u64, len as u64)?;
+            let region = Region {
+                buffer: server.staging.buffer.clone(),
+                offset: chunk.start(),
+                length: len,
+            };
+            let transfer = Transfer {
+                channel: Channel::lease(&server.server)?,
+                region,
+                keep: chunk,
+                _permit: channel_permit,
+            };
+            let (_, mut chunk) = transfer.blocking(&key, &token, remote_offset, Mode::Put)?;
             chunk.advance(len)?;
             Ok(chunk)
         })
@@ -605,137 +615,185 @@ impl CuObjectServer {
         local: Local,
         keep: T,
     ) -> Result<(u64, T), CuObjectError> {
-        let expected = local.len() as u64;
         let server = Arc::clone(self);
         let key = key.to_owned();
         let token = token.inner.clone();
-        let channel_permit = self.channel_permit().await?;
-        tokio::spawn(async move {
-            if server.async_transfers {
-                match server.get_async(&key, &token, remote_offset, &local).await {
-                    Ok(()) => {
-                        drop(channel_permit);
-                        return Ok((expected, keep));
-                    }
-                    Err(AsyncFailure::Unavailable) => {}
-                    Err(AsyncFailure::Failed(error)) => return Err(error),
-                    Err(AsyncFailure::InFlight(error)) => {
-                        // The NIC may still read this memory: never release it.
-                        std::mem::forget(local);
-                        std::mem::forget(keep);
-                        return Err(error);
-                    }
-                }
-            }
-            tokio::task::spawn_blocking(move || {
-                let _channel_permit = channel_permit;
-                let mut channel = Channel::lease(Arc::clone(&server.server))?;
-                let mut list = None;
-                let source = server.source(&local, &mut list)?;
-                let moved = channel.get(&key, &token, remote_offset, source)?;
-                check_moved(moved as u64, expected)?;
-                // `keep` (the chunk or the arena owner) is released only here.
-                Ok((expected, keep))
+        let permit = self.channel_permit().await?;
+        let prepare = move || -> Result<_, CuObjectError> {
+            Ok(Transfer {
+                channel: Channel::lease(&server.server)?,
+                region: server.region(&local)?,
+                keep,
+                _permit: permit,
             })
-            .await
-            .map_err(|error| join_error("write task", error))?
+        };
+        if !self.async_transfers {
+            return tokio::task::spawn_blocking(move || prepare()?.blocking(&key, &token, remote_offset, Mode::Get))
+                .await
+                .map_err(|error| join_error("write task", error))?;
+        }
+        tokio::spawn(async move {
+            let transfer = prepare()?;
+            if let Some(fd) = transfer.channel.fd() {
+                // SAFETY: the FD is owned by the SDK. The registered object holds
+                // its server and the channel remains leased until deregistration.
+                #[allow(unsafe_code)]
+                let completions =
+                    unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|e| CuObjectError::Os {
+                        op: "completion fd",
+                        source: e.into_parts().1,
+                    })?;
+                let (_, transfer) = transfer.submit(&key, &token, remote_offset, Mode::AsyncGet)?;
+                // Cancellation or a poll error leaves DMA ownership with the SDK.
+                let (transfer, status) = retain_until_completion(transfer, await_completion(&completions)).await?;
+                drop(completions);
+                if status < 0 {
+                    return Err(CuObjectError::Transfer {
+                        verbs_status: 0,
+                        source: sdk::errno(status),
+                    });
+                }
+                return Ok((transfer.region.length as u64, transfer.keep));
+            }
+            tokio::task::spawn_blocking(move || transfer.blocking(&key, &token, remote_offset, Mode::Get))
+                .await
+                .map_err(|error| join_error("write task", error))?
         })
         .await
         .map_err(|error| join_error("write task", error))?
     }
 
-    /// Moves `local` with the library's asynchronous mode: the GET is
-    /// submitted on a channel of its own and the task waits on that channel's
-    /// completion descriptor instead of holding a blocking thread.
-    // SAFETY: the allowance covers only this function; its two unsafe calls
-    // each state the invariant they rely on.
-    #[allow(unsafe_code)]
-    async fn get_async(
-        &self,
-        key: &str,
-        token: &cuobject::RdmaToken,
-        remote_offset: u64,
-        local: &Local,
-    ) -> Result<(), AsyncFailure> {
-        let mut channel = Channel::lease(Arc::clone(&self.server))?;
-        let fd = match channel.completion_fd() {
-            Ok(fd) => fd,
-            Err(cuobject::Error::AsyncUnavailable(_)) => return Err(AsyncFailure::Unavailable),
-            Err(error) => return Err(error.into()),
-        };
-        // SAFETY: the library owns the descriptor and keeps it open while the
-        // server lives; `fd` holds the server, and nothing here closes or
-        // replaces the descriptor while it is registered.
-        let completions = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|error| {
-            AsyncFailure::Failed(CuObjectError::Os {
-                op: "completion fd",
-                source: error.into_parts().1,
-            })
-        })?;
-        let mut list = None;
-        let source = self.source(local, &mut list).map_err(AsyncFailure::Failed)?;
-        // SAFETY: the memory behind `source` belongs to `local`, owned by the
-        // calling task together with the transfer's `keep`; staging chunks and
-        // arena ranges given to a transfer are not borrowed by anyone else.
-        // This function returns only after the completion carrying the handle
-        // was drained, except through `InFlight`, where the channel and the
-        // list are leaked here and the caller leaks `local` and `keep`.
-        unsafe { channel.get_async(key, token, remote_offset, source, ASYNC_HANDLE) }?;
-        let mut events = [Completion::default(); 8];
-        loop {
-            let mut ready = match completions.readable().await {
-                Ok(ready) => ready,
-                Err(source) => {
-                    std::mem::forget(list);
-                    std::mem::forget(channel);
-                    return Err(AsyncFailure::InFlight(CuObjectError::Os {
-                        op: "completion wait",
-                        source,
-                    }));
-                }
-            };
-            loop {
-                let landed = match channel.process_completions(&mut events) {
-                    Ok(landed) => landed,
-                    Err(error) => {
-                        std::mem::forget(list);
-                        std::mem::forget(channel);
-                        return Err(AsyncFailure::InFlight(error.into()));
-                    }
-                };
-                if let Some(done) = events[..landed].iter().find(|event| event.handle() == ASYNC_HANDLE.get()) {
-                    // A completion carries no byte count: success moved the whole range.
-                    return done
-                        .result()
-                        .map_err(|source| AsyncFailure::Failed(CuObjectError::Transfer { verbs_status: 0, source }));
-                }
-                if landed < events.len() {
-                    break;
-                }
-            }
-            ready.clear_ready();
+    fn region(&self, local: &Local) -> Result<Region, CuObjectError> {
+        if let Local::Arena { arena, .. } | Local::ArenaList { arena, .. } = local
+            && !std::ptr::eq(self, arena.server().as_ref())
+        {
+            return Err(CuObjectError::Invalid("arena belongs to another server"));
         }
+        let (buffer, offset, length) = match local {
+            Local::Staging { offset, len } => (self.staging.buffer.clone(), *offset, *len),
+            Local::Arena { arena, offset, len } => (arena.buffer.clone(), *offset, *len),
+            Local::ArenaList { arena, entries } => {
+                let list =
+                    ffi::scatter_list(arena.buffer.clone(), entries).map_err(|e| sdk::failure("register scatter list", e))?;
+                let size = ffi::size(&list);
+                (list, 0, size)
+            }
+        };
+        Ok(Region { buffer, offset, length })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Get,
+    AsyncGet,
+    Put,
+}
+
+struct Region {
+    buffer: SharedPtr<ffi::Buffer>,
+    offset: usize,
+    length: usize,
+}
+
+impl Region {
+    fn operation<'a>(
+        &self,
+        key: &'a str,
+        token: &'a Descriptor,
+        remote_offset: u64,
+        mode: Mode,
+    ) -> Result<ffi::Operation<'a>, CuObjectError> {
+        if key.contains('\0') {
+            return Err(CuObjectError::Invalid("key contains NUL"));
+        }
+        let end = self
+            .offset
+            .checked_add(self.length)
+            .ok_or(CuObjectError::Invalid("local range overflow"))?;
+        if end > ffi::size(&self.buffer) {
+            return Err(CuObjectError::Invalid("transfer exceeds registration"));
+        }
+        Ok(ffi::Operation {
+            key,
+            token: &token.raw,
+            address: token.address(remote_offset, self.length)?,
+            offset: self.offset,
+            length: self.length,
+            channel: 0,
+            handle: usize::from(matches!(mode, Mode::AsyncGet)),
+            put: matches!(mode, Mode::Put),
+        })
+    }
+}
+
+/// Owns every resource the SDK may access or the allocator could reissue.
+struct Transfer<T> {
+    channel: Channel,
+    region: Region,
+    keep: T,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<T> Transfer<T> {
+    fn submit(mut self, key: &str, token: &Descriptor, offset: u64, mode: Mode) -> Result<(u64, Self), CuObjectError> {
+        let op = self.region.operation(key, token, offset, mode)?;
+        // SAFETY: this owner holds the exclusive range, registration and channel.
+        // The async caller retains it through CQ completion. An ambiguous SDK
+        // exception retains the entire owner, including its channel permit.
+        #[allow(unsafe_code)]
+        let outcome = unsafe { self.channel.submit(&self.region.buffer, op) };
+        if outcome.uncertain {
+            std::mem::forget(self);
+            return Err(CuObjectError::Os {
+                op: "unknown native transfer outcome",
+                source: sdk::errno(outcome.count),
+            });
+        }
+        let count = u64::try_from(outcome.count).map_err(|_| CuObjectError::Transfer {
+            verbs_status: outcome.verbs,
+            source: sdk::errno(outcome.count),
+        })?;
+        Ok((count, self))
     }
 
-    /// The library view of `local`; a scatter-gather list is built into `list`.
-    fn source<'a: 'l, 'l>(
-        &'a self,
-        local: &'a Local,
-        list: &'l mut Option<SgBuffer<'a, Arc<Server>>>,
-    ) -> Result<Source<'l, Arc<Server>>, CuObjectError> {
-        Ok(match local {
-            Local::Staging { offset, len } => Source::Range {
-                buffer: &self.staging.buffer,
-                offset: *offset,
-                len: *len,
-            },
-            Local::Arena { arena, offset, len } => Source::Range {
-                buffer: &arena.buffer,
-                offset: *offset,
-                len: *len,
-            },
-            Local::ArenaList { arena, entries } => Source::List(list.insert(arena.buffer.sg_buffer(entries)?)),
-        })
+    fn blocking(self, key: &str, token: &Descriptor, offset: u64, mode: Mode) -> Result<(u64, T), CuObjectError> {
+        let (moved, transfer) = self.submit(key, token, offset, mode)?;
+        check_moved(moved, transfer.region.length as u64)?;
+        Ok((moved, transfer.keep))
+    }
+}
+
+/// Once submitted, only a completion event permits the channel and registered
+/// memory to be reused. Dropping the wait or losing the CQ leaves them pinned.
+fn retain_until_completion<T>(
+    owner: T,
+    event: impl Future<Output = Result<isize, CuObjectError>>,
+) -> impl Future<Output = Result<(T, isize), CuObjectError>> {
+    let owner = ManuallyDrop::new(owner);
+    async move {
+        let status = event.await?;
+        Ok((ManuallyDrop::into_inner(owner), status))
+    }
+}
+
+async fn await_completion(fd: &AsyncFd<sdk::CompletionFd>) -> Result<isize, CuObjectError> {
+    let mut events = [ffi::Completion::default(); 8];
+    loop {
+        let mut ready = fd.readable().await.map_err(|source| CuObjectError::Os {
+            op: "completion wait",
+            source,
+        })?;
+        loop {
+            let n = fd.get_ref().drain(&mut events)?;
+            if let Some(done) = events[..n].iter().find(|e| e.handle == 1) {
+                return Ok(done.status);
+            }
+            if n < events.len() {
+                break;
+            }
+        }
+        ready.clear_ready();
     }
 }
 
@@ -771,5 +829,91 @@ mod tests {
         assert!(matches!(RdmaToken::parse("nothex:00100000:1:2:3:4:5"), Err(CuObjectError::Token(_))));
         assert!(RdmaToken::parse("0000f52eddc00000:00000000:1:2:3:4:5").is_err());
         assert!(RdmaToken::parse("0000f52eddc00000:00100000").is_err());
+    }
+    #[test]
+    fn validates_the_entire_remote_range_and_uses_the_parsed_descriptor() {
+        let mut token = RdmaToken::parse("  fffffffffffffff0:10:a:b:c:d  ").unwrap();
+        token.buffer_len = u64::MAX;
+        token.remote_addr = 0;
+        assert_eq!(token.inner.address(15, 1).unwrap(), u64::MAX);
+        assert!(matches!(token.inner.address(15, 2), Err(CuObjectError::TokenTooSmall { .. })));
+        let wrapping = RdmaToken::parse("ffffffffffffffff:2:a:b:c:d").unwrap();
+        assert!(matches!(wrapping.inner.address(0, 2), Err(CuObjectError::Invalid(_))));
+        assert!(token.inner.address(u64::MAX, 2).is_err());
+        assert!(token.inner.address(0, MAX_RDMA_OP_BYTES + 1).is_err());
+        assert!(RdmaToken::parse("1:10:a:b:c:d\0x").is_err());
+    }
+
+    #[test]
+    fn only_delivered_completions_release_dma_owners() {
+        use std::{
+            future,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        struct Owner<'a>(&'a AtomicUsize);
+        impl Drop for Owner<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let freed = AtomicUsize::new(0);
+        use std::task::{Context, Poll, Waker};
+        let mut ctx = Context::from_waker(Waker::noop());
+        drop(retain_until_completion(Owner(&freed), future::pending()));
+        {
+            let mut waiting = std::pin::pin!(retain_until_completion(Owner(&freed), future::pending()));
+            assert!(waiting.as_mut().poll(&mut ctx).is_pending());
+        }
+        let refused = retain_until_completion(Owner(&freed), future::ready(Err(CuObjectError::PoolExhausted)));
+        assert!(matches!(std::pin::pin!(refused).as_mut().poll(&mut ctx), Poll::Ready(Err(_))));
+        assert_eq!(freed.load(Ordering::SeqCst), 0);
+        for status in [0, -5] {
+            let completed = retain_until_completion(Owner(&freed), future::ready(Ok(status)));
+            let Poll::Ready(Ok((owner, observed))) = std::pin::pin!(completed).as_mut().poll(&mut ctx) else {
+                panic!("expected completion");
+            };
+            assert_eq!(observed, status);
+            drop(owner);
+        }
+        assert_eq!(freed.load(Ordering::SeqCst), 2);
+    }
+    /// Set CUOBJECT_TEST_ADDR and CUOBJECT_TEST_PORT to a free RDMA endpoint.
+    #[test]
+    #[ignore = "requires an NVIDIA-supported RDMA device and a free listener port"]
+    fn native_staging_and_scatter_views_keep_their_registration() {
+        let addr = std::env::var("CUOBJECT_TEST_ADDR").unwrap().parse().unwrap();
+        let port = std::env::var("CUOBJECT_TEST_PORT").unwrap().parse().unwrap();
+        let server = CuObjectServer::new(
+            addr,
+            &CuObjectConfig {
+                port,
+                num_dcis: 2,
+                cq_depth: 64,
+                chunk_bytes: 4096,
+                pool_bytes: 8192,
+                async_transfers: true,
+            },
+        )
+        .unwrap();
+        let mut first = server.try_reserve().unwrap();
+        let mut second = server.try_reserve().unwrap();
+        assert!(server.try_reserve().is_none());
+        first.append(b"first").unwrap();
+        second.append(b"second").unwrap();
+        assert_eq!(first.staged().unwrap(), b"first");
+        assert_eq!(second.staged().unwrap(), b"second");
+        assert!(second.advance(usize::MAX).is_err());
+        drop(first);
+        drop(second);
+        assert_eq!(server.available_chunks(), 2);
+        let arena = server.register_arena(8192).unwrap();
+        let local = Local::ArenaList {
+            arena,
+            entries: vec![ffi::Range { offset: 4096, size: 17 }, ffi::Range { offset: 1, size: 23 }],
+        };
+        let region = server.region(&local).unwrap();
+        drop(local);
+        drop(server);
+        assert_eq!(ffi::size(&region.buffer), 40);
     }
 }
