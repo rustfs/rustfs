@@ -8617,18 +8617,14 @@ impl Operation for SiteReplicationRepairHandler {
                 .to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let response = execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
+        let (status, headers, body) = execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
             local_peer,
             preflight_token: supplied_token.to_string(),
             operation_id,
             signing_key,
         })
         .await?;
-        // The repair executor still answers with the s3s response type; the
-        // router reads the status from the output tuple, so only the tuple and
-        // the headers carry over to the owned response.
-        let (status, body) = response.output;
-        Ok(AdminResponse::with_headers(status, body.into(), response.headers))
+        Ok(AdminResponse::with_headers(status, body, headers))
     }
 }
 
