@@ -524,6 +524,10 @@ pub struct DataUsageScanCoverageReceipt {
     pub digest: [u8; 32],
 }
 
+pub(crate) fn scan_measurement_time_millis(time: SystemTime) -> Option<u64> {
+    u64::try_from(time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
 impl Serialize for DataUsageScanCoverageReceipt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(2))?;
@@ -1063,6 +1067,9 @@ pub struct DataUsageCacheInfo {
     pub scan_bucket_observations: HashMap<String, DataUsageBucketObservation>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub scan_bucket_value_origins: HashMap<String, DataUsageBucketValueOrigin>,
+    /// Original accepted-frontier measurement time; absent on legacy checkpoints.
+    #[serde(default)]
+    pub scan_coverage_measured_at: Option<u64>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -1083,6 +1090,7 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_usage_watch.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
+            + usize::from(self.scan_coverage_measured_at.is_some())
             + usize::from(self.scan_coverage_digest.is_some())
             + usize::from(self.tier_registry_generation.is_some())
             + usize::from(!self.size_reconciliation.is_empty())
@@ -1137,6 +1145,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(receipt) = &self.scan_coverage_receipt {
             state.serialize_entry("scan_coverage_receipt", receipt)?;
+        }
+        if let Some(measured_at) = self.scan_coverage_measured_at {
+            state.serialize_entry("scan_coverage_measured_at", &measured_at)?;
         }
         state.serialize_entry("pending_heals", &self.pending_heals)?;
         state.serialize_entry("object_lock", &crate::object_lock_cache::ObjectLockCache(&self.object_lock))?;
@@ -1569,6 +1580,7 @@ impl DataUsageCache {
             self.info.scan_directory_source = None;
             self.info.scan_source_trees.clear();
             self.info.scan_coverage_receipt = None;
+            self.info.scan_coverage_measured_at = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
@@ -1748,9 +1760,22 @@ impl DataUsageCache {
     pub(crate) fn seal_scan_frontier(&mut self, frontier: Option<&str>) -> Result<(), serde_json::Error> {
         if self.info.scan_progress.is_none() {
             self.info.scan_coverage_receipt = None;
+            self.info.scan_coverage_measured_at = None;
             return Ok(());
         }
         let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
+        let measured_at = frontier.and_then(|through| {
+            if self
+                .info
+                .scan_coverage_receipt
+                .as_ref()
+                .is_some_and(|previous| previous.through == through)
+            {
+                self.info.scan_coverage_measured_at
+            } else {
+                scan_measurement_time_millis(SystemTime::now())
+            }
+        });
         self.info.scan_coverage_receipt = match frontier {
             Some(through) => Some(DataUsageScanCoverageReceipt {
                 through: clone_cache_value(through),
@@ -1758,6 +1783,7 @@ impl DataUsageCache {
             }),
             None => None,
         };
+        self.info.scan_coverage_measured_at = measured_at;
         self.info.scan_resume_after = frontier.map(clone_cache_value);
         let reason = self
             .info

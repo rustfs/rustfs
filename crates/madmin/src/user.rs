@@ -413,9 +413,10 @@ pub struct BucketAccessInfo {
     pub name: String,
     /// Display-only accepted scan progress, never a replacement for total usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scan_progress: Option<rustfs_data_usage::BucketScanProgress>,
+    pub scan_progress: Option<BucketScanProgress>,
+    /// Value provenance: certified, carried, observed or unknown. Preserve future labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage_value_state: Option<rustfs_data_usage::BucketUsageValueState>,
+    pub usage_value_state: Option<String>,
     /// Unix milliseconds of the original complete statistic, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_updated_at: Option<u64>,
@@ -435,6 +436,20 @@ pub struct BucketAccessInfo {
     #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
     pub created: Option<OffsetDateTime>,
     pub access: AccountAccess,
+}
+
+/// Accepted scan coverage for display, independent of total usage and quotas.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BucketScanProgress {
+    /// Observation stage. Clients must preserve unfamiliar diagnostic labels.
+    pub stage: String,
+    /// Oldest contributing measurement time in Unix milliseconds.
+    pub updated_at: u64,
+    /// Enumeration alone leaves both counters absent.
+    pub objects: Option<u64>,
+    pub size: Option<u64>,
+    pub sources_observed: u64,
+    pub sources_total: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -762,6 +777,33 @@ mod tests {
         assert!(!obj.contains_key("objects"));
         assert!(!obj.contains_key("object_sizes_histogram"));
         assert!(!obj.contains_key("object_versions_histogram"));
+        assert!(!obj.contains_key("scan_progress"));
+        assert!(!obj.contains_key("usage_value_state"));
+        assert!(!obj.contains_key("usage_updated_at"));
+    }
+
+    #[test]
+    fn bucket_access_info_scan_progress_does_not_fill_total_usage() {
+        let mut wire = serde_json::to_value(BucketAccessInfo::default()).expect("empty account bucket response");
+        wire["scan_progress"] = serde_json::json!({
+            "stage": "scanning", "updated_at": 1000, "objects": 7, "size": 71,
+            "sources_observed": 1, "sources_total": 2,
+        });
+        let bucket: BucketAccessInfo = serde_json::from_value(wire.clone()).expect("decode scan progress response");
+        let value = serde_json::to_value(bucket).expect("encode scan progress response");
+        assert_eq!(value, wire, "scan coverage must round-trip without synthesizing total usage");
+    }
+
+    #[test]
+    fn bucket_access_info_preserves_future_progress_and_provenance_values() {
+        let mut wire = serde_json::to_value(BucketAccessInfo::default()).expect("empty account bucket response");
+        wire["scan_progress"] = serde_json::json!({
+            "stage": "future_stage", "updated_at": 1000, "objects": null, "size": null,
+            "sources_observed": 1, "sources_total": 2,
+        });
+        wire["usage_value_state"] = serde_json::json!("future_provenance");
+        let bucket: BucketAccessInfo = serde_json::from_value(wire.clone()).expect("SDK accepts future diagnostic labels");
+        assert_eq!(serde_json::to_value(bucket).expect("preserve diagnostic labels"), wire);
     }
 
     /// Wire pin (rustfs/backlog#1306): populated usage stats keep their

@@ -10821,7 +10821,6 @@ dependencies = [
  "jiff 1.0.1",
  "reqwest",
  "rmp-serde",
- "rustfs-data-usage",
  "rustfs-signer",
  "serde",
  "serde_json",

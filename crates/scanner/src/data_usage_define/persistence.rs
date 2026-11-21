@@ -813,7 +813,11 @@ impl DataUsageCache {
             }
             Ok::<_, StorageError>(())
         };
-        if let Err(e) = save_backup.await {
+        let backup_result = match timeout(backup_timeout_duration, save_backup).await {
+            Ok(result) => result,
+            Err(_) => Err(StorageError::other("scanner cache backup save timed out")),
+        };
+        if let Err(e) = backup_result {
             warn!(
                 target: "rustfs::scanner::data_usage",
                 event = EVENT_SCANNER_CACHE_SAVE_STATE,

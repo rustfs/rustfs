@@ -358,6 +358,7 @@ async fn display_progress_keeps_reference_during_executor_enumeration_then_repla
     let (mut cache, _) = bound_checkpoint();
     let original_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
     cache.info.last_update = Some(original_time);
+    cache.info.scan_coverage_measured_at = Some(10_000);
     cache.info.scan_directory_source = Some("first-executor".into());
     let mut revisions = DataUsageCache::default()
         .load_with_revisions(writer.clone(), CACHE_NAME)

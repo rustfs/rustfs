@@ -30,7 +30,7 @@ use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+use rustfs_data_usage::{BucketScanStage, BucketUsageInfo, BucketUsageValueState, DataUsageInfo};
 use rustfs_gateway_types::dto::Status;
 use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
@@ -91,7 +91,15 @@ fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAcce
 
     bucket_info.size = Some(usage.size);
     bucket_info.objects = Some(usage.objects_count);
-    bucket_info.usage_value_state = usage.usage_value_state;
+    bucket_info.usage_value_state = usage.usage_value_state.map(|state| {
+        match state {
+            BucketUsageValueState::Certified => "certified",
+            BucketUsageValueState::Carried => "carried",
+            BucketUsageValueState::Observed => "observed",
+            BucketUsageValueState::Unknown => "unknown",
+        }
+        .to_owned()
+    });
     bucket_info.usage_updated_at = usage.usage_certification.and_then(|certificate| {
         u64::try_from(
             certificate
@@ -104,6 +112,23 @@ fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAcce
     });
     bucket_info.object_sizes_histogram = Some(usage.object_size_histogram.clone());
     bucket_info.object_versions_histogram = Some(usage.object_versions_histogram.clone());
+}
+
+fn bucket_scan_progress_response(progress: rustfs_data_usage::BucketScanProgress) -> rustfs_madmin::BucketScanProgress {
+    let stage = match progress.stage {
+        BucketScanStage::Enumerating => "enumerating",
+        BucketScanStage::Scanning => "scanning",
+        BucketScanStage::AwaitingSources => "awaiting_sources",
+        BucketScanStage::Completed => "completed",
+    };
+    rustfs_madmin::BucketScanProgress {
+        stage: stage.to_owned(),
+        updated_at: progress.updated_at,
+        objects: progress.objects,
+        size: progress.size,
+        sources_observed: progress.sources_observed,
+        sources_total: progress.sources_total,
+    }
 }
 
 fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
@@ -323,7 +348,7 @@ impl Operation for AccountInfoHandler {
             .collect::<Vec<_>>();
         let mut progress = load_bucket_scan_progress_for_admin(store, &visible_buckets, &data_usage_info).await;
         for bucket in &mut account_info.buckets {
-            bucket.scan_progress = progress.remove(&bucket.name);
+            bucket.scan_progress = progress.remove(&bucket.name).map(bucket_scan_progress_response);
         }
 
         let data = serde_json::to_vec(&AccountInfoResponse {
@@ -442,14 +467,14 @@ mod tests {
     fn accountinfo_partial_progress_never_fills_total_usage_fields() {
         let mut bucket_info = rustfs_madmin::BucketAccessInfo {
             name: "scanning".into(),
-            scan_progress: Some(rustfs_data_usage::BucketScanProgress {
+            scan_progress: Some(bucket_scan_progress_response(rustfs_data_usage::BucketScanProgress {
                 stage: rustfs_data_usage::BucketScanStage::Scanning,
                 updated_at: 1000,
                 objects: Some(7),
                 size: Some(71),
                 sources_observed: 1,
                 sources_total: 2,
-            }),
+            })),
             ..Default::default()
         };
         apply_usage_to_bucket_access_info(&mut bucket_info, None);
@@ -472,6 +497,49 @@ mod tests {
         assert_eq!((bucket_info.objects, bucket_info.size), (Some(90), Some(900)));
         assert_eq!(bucket_info.usage_updated_at, Some(500));
         assert_eq!(bucket_info.scan_progress.expect("separate partial view").objects, Some(7));
+    }
+
+    #[test]
+    fn accountinfo_scan_progress_projection_preserves_wire_contract() {
+        for (stage, objects, size, sources_observed) in [
+            (BucketScanStage::Enumerating, None, None, 2),
+            (BucketScanStage::Scanning, Some(7), Some(71), 2),
+            (BucketScanStage::AwaitingSources, Some(0), Some(0), 1),
+            (BucketScanStage::Completed, Some(7), Some(71), 2),
+        ] {
+            let progress = rustfs_data_usage::BucketScanProgress {
+                stage,
+                updated_at: 1000,
+                objects,
+                size,
+                sources_observed,
+                sources_total: 2,
+            };
+            let expected = serde_json::to_value(&progress).expect("domain progress wire contract");
+            let response = bucket_scan_progress_response(progress);
+            assert_eq!(serde_json::to_value(response).expect("SDK progress response"), expected);
+        }
+    }
+
+    #[test]
+    fn accountinfo_usage_provenance_projection_preserves_wire_contract() {
+        for state in [
+            BucketUsageValueState::Certified,
+            BucketUsageValueState::Carried,
+            BucketUsageValueState::Observed,
+            BucketUsageValueState::Unknown,
+        ] {
+            let usage = BucketUsageInfo {
+                usage_value_state: Some(state),
+                ..Default::default()
+            };
+            let mut bucket = rustfs_madmin::BucketAccessInfo::default();
+            apply_usage_to_bucket_access_info(&mut bucket, Some(&usage));
+            assert_eq!(
+                serde_json::to_value(bucket).expect("SDK usage provenance")["usage_value_state"],
+                serde_json::to_value(state).expect("domain provenance wire contract")
+            );
+        }
     }
 
     #[test]

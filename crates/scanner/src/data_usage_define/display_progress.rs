@@ -132,13 +132,16 @@ impl DataUsageCache {
                 .filter(|observation| Some(observation.completed_at) == self.info.last_update && !self.has_scan_position())
                 .map(|observation| observation.entry.clone())
         };
-        let mut accepted = completed.as_ref().map(|entry| (entry.objects, entry.size));
+        let mut accepted = completed.as_ref().map(|entry| (entry.objects, entry.size, updated_at));
         if completed.is_none() {
             let frontier = self.validated_scan_frontier();
             let mut replicas = BTreeMap::<&str, Vec<_>>::new();
             for checkpoint in &self.info.scan_directory_work {
-                if let Some((coverage, entry)) = checkpoint.display_usage(&self.info) {
-                    replicas.entry(checkpoint.endpoint()).or_default().push((coverage, entry));
+                if let Some((coverage, entry, measured_at)) = checkpoint.display_usage(&self.info) {
+                    replicas
+                        .entry(checkpoint.endpoint())
+                        .or_default()
+                        .push((coverage, entry, measured_at));
                 }
             }
             if let Some(active) = self.info.scan_directory_source.as_deref() {
@@ -150,7 +153,9 @@ impl DataUsageCache {
                 receipts.sort_by(|a, b| a.0.parent.split('/').cmp(b.0.parent.split('/')));
                 let mut selected = Vec::new();
                 let mut subtotal: Option<(usize, usize)> = None;
-                for (coverage, entry) in &receipts {
+                let mut measured_at: Option<u64> = None;
+                let mut known_time = true;
+                for (coverage, entry, time) in &receipts {
                     if selected.iter().any(|parent: &&crate::scanner_folder::DirectoryProgress| {
                         parent.parent == coverage.parent || parent.covers(&coverage.parent)
                     }) {
@@ -163,6 +168,11 @@ impl DataUsageCache {
                     }
                     let (objects, size) = subtotal.unwrap_or_default();
                     subtotal = Some((objects.checked_add(entry.objects)?, size.checked_add(entry.size)?));
+                    if let Some(time) = time {
+                        measured_at = Some(measured_at.map_or(*time, |previous| previous.min(*time)));
+                    } else {
+                        known_time = false;
+                    }
                     selected.push(coverage);
                 }
                 if Some(endpoint) == self.info.scan_directory_source.as_deref()
@@ -171,16 +181,30 @@ impl DataUsageCache {
                     // A validated receipt signs this prefix. Sum each scalar
                     // once, excluding the ranges represented by compacted work.
                     self.checked_flatten_complete_scope(&self.info.name)?;
+                    let mut contributed = false;
                     for (path, entry) in &self.cache {
                         if scan_frontier_covers_path(path, through) && !selected.iter().any(|proof| proof.covers(path)) {
                             let (objects, size) = subtotal.unwrap_or_default();
                             subtotal = Some((objects.checked_add(entry.objects)?, size.checked_add(entry.size)?));
+                            contributed = true;
+                        }
+                    }
+                    if contributed {
+                        if let Some(time) = self.info.scan_coverage_measured_at {
+                            measured_at = Some(measured_at.map_or(time, |previous| previous.min(time)));
+                        } else {
+                            known_time = false;
                         }
                     }
                 }
                 // Replicas overlap. Select one sample; never sum or append them.
-                if subtotal.is_some_and(|sample| accepted.is_none_or(|previous| sample > previous)) {
-                    accepted = subtotal;
+                // Legacy coverage without a measurement time cannot borrow a
+                // newer checkpoint time. Keep the prior companion instead.
+                if known_time
+                    && let (Some((objects, size)), Some(time)) = (subtotal, measured_at)
+                    && accepted.is_none_or(|previous| (objects, size, time) > previous)
+                {
+                    accepted = Some((objects, size, time));
                 }
             }
         }
@@ -195,7 +219,7 @@ impl DataUsageCache {
             movement_generation: Some(movement_generation),
             scanner_epoch: self.info.leader_epoch,
             scanner_cycle: self.info.next_cycle,
-            updated_at,
+            updated_at: accepted.map_or(updated_at, |(_, _, time)| time),
             stage: if completed.is_some() {
                 BucketScanStage::Completed
             } else if accepted.is_some() {
@@ -203,8 +227,8 @@ impl DataUsageCache {
             } else {
                 BucketScanStage::Enumerating
             },
-            objects: accepted.map(|(objects, _)| u64::try_from(objects)).transpose().ok()?,
-            size: accepted.map(|(_, size)| u64::try_from(size)).transpose().ok()?,
+            objects: accepted.map(|(objects, _, _)| u64::try_from(objects)).transpose().ok()?,
+            size: accepted.map(|(_, size, _)| u64::try_from(size)).transpose().ok()?,
         })
     }
 
@@ -478,6 +502,53 @@ mod tests {
         cache.info.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10));
         cache.info.scan_directory_source = Some("source".into());
         cache
+    }
+
+    #[test]
+    fn display_progress_frontier_resealing_and_cold_source_handoff_preserve_time() {
+        let mut cache = checkpoint();
+        cache.replace("bucket", "", DataUsageEntry::default());
+        cache.replace(
+            "bucket/a",
+            "bucket",
+            DataUsageEntry {
+                objects: 1,
+                size: 11,
+                ..Default::default()
+            },
+        );
+        cache.seal_scan_frontier(Some("bucket/a")).expect("seal measured frontier");
+        cache.info.scan_coverage_measured_at = Some(10_000);
+        cache.info.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(70));
+        cache.seal_scan_frontier(Some("bucket/a")).expect("reseal unchanged frontier");
+        assert_eq!(cache.display_scan_progress(0).expect("unchanged observation").updated_at, 10_000);
+        let endpoints = std::collections::HashSet::from(["source".to_owned(), "other".to_owned()]);
+        cache.activate_directory_source("other".into(), &endpoints);
+        cache.replace("bucket", "", DataUsageEntry::default());
+        let bytes = cache.marshal_msg().expect("save inactive source with its measurement time");
+        let mut cold = DataUsageCache::unmarshal(&bytes).expect("cold source handoff");
+        cold.activate_directory_source("source".into(), &endpoints);
+        let sample = cold.display_scan_progress(0).expect("restored measured frontier");
+        assert_eq!((sample.objects, sample.size, sample.updated_at), (Some(1), Some(11), 10_000));
+    }
+
+    #[test]
+    fn display_progress_legacy_frontier_cannot_borrow_a_new_checkpoint_time() {
+        let mut cache = checkpoint();
+        cache.replace("bucket", "", DataUsageEntry::default());
+        cache.replace(
+            "bucket/a",
+            "bucket",
+            DataUsageEntry {
+                objects: 1,
+                size: 11,
+                ..Default::default()
+            },
+        );
+        cache.seal_scan_frontier(Some("bucket/a")).expect("legacy coverage");
+        cache.info.scan_coverage_measured_at = None;
+        let sample = cache.display_scan_progress(0).expect("enumeration remains observable");
+        assert_eq!((sample.objects, sample.size), (None, None));
     }
 
     #[test]

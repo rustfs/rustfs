@@ -992,6 +992,7 @@ impl Drop for ScannerDefaultCycleGuard {
 
 #[derive(Debug, Default)]
 struct MemoryConfigStore {
+    display_progress_generation: Option<u64>,
     #[cfg(feature = "diagnostic-read-version-caller")]
     entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
     #[cfg(feature = "diagnostic-read-version-caller")]
@@ -5028,6 +5029,9 @@ async fn scanner_backup_sync_distinguishes_movement_from_missing_or_corrupt_prim
 
 #[async_trait::async_trait]
 impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        self.display_progress_generation
+    }
     async fn delete_config_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> EcstoreResult<ObjectInfo> {
         let key = memory_config_key(bucket, object);
         let mut objects = self.objects.lock().await;
