@@ -111,7 +111,7 @@ webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util",
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2", "dep:urlencoding"]
 
 [dependencies]
-hotpath.workspace = true
+hotpath = { workspace = true, optional = true }
 # Core RustFS dependencies
 rustfs-iam = { workspace = true }
 rustfs-credentials = { workspace = true }
