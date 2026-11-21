@@ -37,7 +37,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 /// The client's NIXL agent name.
 pub const NIXL_AGENT_HEADER: &str = "x-rustfs-nixl-agent";
@@ -430,8 +430,7 @@ struct Job {
     op: XferOp,
     token: RdmaToken,
     build: BuildLists,
-    keep: KeepAlive,
-    done: tokio::sync::oneshot::Sender<Result<KeepAlive, NixlError>>,
+    completion: TransferCompletion,
 }
 
 /// A posted transfer the completion thread is polling.
@@ -440,9 +439,53 @@ struct Pending {
     _remote: remotes::RemoteLease,
     /// The remote agent, forgotten if the transfer fails.
     agent: String,
-    keep: Option<KeepAlive>,
-    done: Option<tokio::sync::oneshot::Sender<Result<KeepAlive, NixlError>>>,
+    completion: TransferCompletion,
     deadline: std::time::Instant,
+}
+
+/// A timeout completes the caller's reply while the native request still owns
+/// its buffers and its slot in the server's transfer limit.
+struct TransferCompletion {
+    keep: KeepAlive,
+    done: Option<oneshot::Sender<Result<KeepAlive, NixlError>>>,
+    _inflight: OwnedSemaphorePermit,
+}
+
+impl TransferCompletion {
+    async fn acquire(
+        keep: impl std::any::Any + Send,
+        limit: &Arc<Semaphore>,
+        timeout: Duration,
+    ) -> Result<(Self, oneshot::Receiver<Result<KeepAlive, NixlError>>), NixlError> {
+        let permit = match limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => tokio::time::timeout(timeout, limit.clone().acquire_owned())
+                .await
+                .map_err(|_| NixlError::TransferTimeout(timeout))?
+                .map_err(|_| NixlError::Token("server closed".to_owned()))?,
+        };
+        let (done, receiver) = oneshot::channel();
+        Ok((
+            Self {
+                keep: Box::new(keep),
+                done: Some(done),
+                _inflight: permit,
+            },
+            receiver,
+        ))
+    }
+
+    fn succeed(self) {
+        if let Some(done) = self.done {
+            let _ = done.send(Ok(self.keep));
+        }
+    }
+
+    fn fail(&mut self, error: NixlError) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Err(error));
+        }
+    }
 }
 
 impl std::fmt::Debug for NixlServer {
@@ -636,21 +679,16 @@ impl NixlServer {
         B: FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send + 'static,
         K: std::any::Any + Send + 'static,
     {
-        let _inflight = Arc::clone(&self.inflight)
-            .acquire_owned()
-            .await
-            .map_err(|_| NixlError::Token("server closed".to_owned()))?;
-        let (done, completion) = tokio::sync::oneshot::channel();
+        let (completion, receiver) = TransferCompletion::acquire(keep, &self.inflight, self.engine.transfer_timeout).await?;
         self.jobs
             .send(Job {
                 op,
                 token: token.clone(),
                 build: Box::new(build),
-                keep: Box::new(keep),
-                done,
+                completion,
             })
             .map_err(|_| NixlError::Token("transfer thread stopped".to_owned()))?;
-        let keep = completion
+        let keep = receiver
             .await
             .map_err(|_| NixlError::Token("transfer thread stopped".to_owned()))??;
         keep.downcast::<K>()
@@ -833,12 +871,11 @@ impl Engine {
         Ok(in_progress.then_some(request))
     }
 
-    fn admit(&self, job: Job, pending: &mut Vec<Pending>, remotes: &mut remotes::RemoteCache) {
-        let lease = match remotes.acquire(&self.agent, &job.token.agent, job.token.metadata.as_deref(), std::time::Instant::now())
-        {
+    fn admit(&self, mut job: Job, pending: &mut Vec<Pending>, remotes: &mut remotes::RemoteCache) {
+        let lease = match remotes.acquire(&self.agent, &job.token.agent, job.token.metadata.as_deref()) {
             Ok(lease) => lease,
             Err(error) => {
-                let _ = job.done.send(Err(error));
+                job.completion.fail(error);
                 return;
             }
         };
@@ -847,16 +884,15 @@ impl Engine {
                 request,
                 _remote: lease,
                 agent: job.token.agent,
-                keep: Some(job.keep),
-                done: Some(job.done),
+                completion: job.completion,
                 deadline: std::time::Instant::now() + self.transfer_timeout,
             }),
             Ok(None) => {
-                let _ = job.done.send(Ok(job.keep));
+                job.completion.succeed();
             }
             Err(err) => {
                 remotes.mark_stale(&job.token.agent);
-                let _ = job.done.send(Err(err));
+                job.completion.fail(err);
             }
         }
     }
@@ -873,21 +909,16 @@ impl Engine {
         let mut next_sweep = std::time::Instant::now() + remotes::SWEEP_INTERVAL;
         let mut idle_polls = 0u32;
         loop {
-            let now = std::time::Instant::now();
-            if now >= next_sweep {
-                remotes.sweep(&self.agent, now);
-                next_sweep = now + remotes::SWEEP_INTERVAL;
-            }
             if pending.is_empty() && expired.is_empty() {
                 use std::sync::mpsc::RecvTimeoutError;
                 let received = if remotes.is_empty() {
                     queue.recv().map_err(|_| RecvTimeoutError::Disconnected)
                 } else {
-                    queue.recv_timeout(next_sweep.saturating_duration_since(now))
+                    queue.recv_timeout(next_sweep.saturating_duration_since(std::time::Instant::now()))
                 };
                 match received {
                     Ok(job) => self.admit(job, &mut pending, &mut remotes),
-                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -910,14 +941,14 @@ impl Engine {
                 match self.agent.get_xfer_status(&pending[index].request) {
                     Ok(XferStatus::Success) => {
                         progressed = true;
-                        let mut transfer = pending.swap_remove(index);
-                        Self::finish(&mut transfer, Ok(()));
+                        let transfer = pending.swap_remove(index);
+                        transfer.completion.succeed();
                     }
                     Ok(XferStatus::InProgress) if now >= pending[index].deadline => {
                         // The task gets the error; the request and the buffers it
                         // references stay here until the library completes it.
                         let mut transfer = pending.swap_remove(index);
-                        Self::finish(&mut transfer, Err(NixlError::TransferTimeout(self.transfer_timeout)));
+                        transfer.completion.fail(NixlError::TransferTimeout(self.transfer_timeout));
                         tracing::warn!(
                             agent = %"nixl",
                             timeout_ms = self.transfer_timeout.as_millis() as u64,
@@ -930,7 +961,7 @@ impl Engine {
                         progressed = true;
                         let mut transfer = pending.swap_remove(index);
                         remotes.mark_stale(&transfer.agent);
-                        Self::finish(&mut transfer, Err(nixl_err("transfer status")(err)));
+                        transfer.completion.fail(nixl_err("transfer status")(err));
                     }
                 }
             }
@@ -942,6 +973,10 @@ impl Engine {
                     false
                 }
             });
+            if now >= next_sweep {
+                remotes.sweep(&self.agent, now);
+                next_sweep = now + remotes::SWEEP_INTERVAL;
+            }
             if progressed {
                 idle_polls = 0;
             } else {
@@ -953,19 +988,6 @@ impl Engine {
                 }
             }
         }
-    }
-
-    fn finish(transfer: &mut Pending, result: Result<(), NixlError>) {
-        let Some(done) = transfer.done.take() else {
-            return;
-        };
-        let result = match result {
-            // The buffers go back with a completed transfer; a caller that
-            // stopped waiting drops them here, after the library is done.
-            Ok(()) => Ok(transfer.keep.take().expect("buffers travel with the transfer")),
-            Err(err) => Err(err),
-        };
-        let _ = done.send(result);
     }
 }
 
@@ -995,6 +1017,37 @@ mod tests {
         assert!(RdmaToken::from_headers("a", None, "vram:0:0xffffffffffffffff:2").is_err());
         assert!(RdmaToken::from_headers("a", Some("not base64!"), "vram:0:1:1").is_err());
         assert!(RdmaToken::from_headers("a", None, "vram:0:1").is_err());
+    }
+
+    #[test]
+    fn native_completion_releases_the_transfer_slot_after_timeout_or_cancellation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let limit = Arc::new(Semaphore::new(1));
+                let timeout = Duration::ZERO;
+                let buffers = Arc::new(());
+                let (mut native, reply) = TransferCompletion::acquire(Arc::clone(&buffers), &limit, timeout)
+                    .await
+                    .expect("first transfer");
+                native.fail(NixlError::TransferTimeout(timeout));
+                assert!(matches!(reply.await.expect("caller notified"), Err(NixlError::TransferTimeout(_))));
+                assert_eq!(Arc::strong_count(&buffers), 2);
+                assert!(matches!(
+                    TransferCompletion::acquire((), &limit, timeout).await,
+                    Err(NixlError::TransferTimeout(_))
+                ));
+
+                drop(native);
+                assert_eq!(Arc::strong_count(&buffers), 1);
+                let (native, reply) = TransferCompletion::acquire((), &limit, timeout).await.expect("slot released");
+                drop(reply);
+                assert_eq!(limit.available_permits(), 0);
+                native.succeed();
+                assert_eq!(limit.available_permits(), 1);
+            });
     }
 
     #[test]

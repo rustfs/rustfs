@@ -74,7 +74,6 @@ impl RemoteCache {
         registry: &impl MetadataRegistry,
         name: &str,
         metadata: Option<&[u8]>,
-        now: Instant,
     ) -> Result<RemoteLease, NixlError> {
         let hash = metadata.map(metadata_hash);
         if let Some(peer) = self.peers.get(name) {
@@ -87,26 +86,19 @@ impl RemoteCache {
             self.evict(registry, name)?;
         }
         let metadata = metadata.ok_or_else(|| NixlError::Token(format!("agent {name:?} needs {NIXL_METADATA_HEADER}")))?;
-        if self.peers.len() >= self.capacity
-            && let Some((oldest, _)) = self
-                .peers
-                .iter()
-                .filter(|(_, peer)| peer.idle())
-                .min_by_key(|(_, peer)| peer.idle_since.get())
-        {
-            let oldest = oldest.clone();
-            self.evict(registry, &oldest)?;
-        }
+        // Retry outstanding cleanup before loading another registration.
+        self.trim(registry, |peer| peer.hash.is_none())?;
         let loaded = registry.load(metadata)?;
         if loaded != name {
-            if !self.peers.contains_key(&loaded)
-                && let Err(error) = registry.unload(&loaded)
-            {
+            if let Some(peer) = self.peers.get_mut(&loaded) {
+                // Native loads can merge descriptors into an existing registration.
+                peer.hash = None;
+            } else if let Err(error) = registry.unload(&loaded) {
                 self.peers.insert(
                     loaded,
                     Peer {
                         hash: None,
-                        idle_since: Rc::new(Cell::new(now)),
+                        idle_since: Rc::new(Cell::new(Instant::now())),
                     },
                 );
                 return Err(error);
@@ -115,11 +107,28 @@ impl RemoteCache {
         }
         let peer = Peer {
             hash,
-            idle_since: Rc::new(Cell::new(now)),
+            idle_since: Rc::new(Cell::new(Instant::now())),
         };
         let lease = peer.acquire();
         self.peers.insert(loaded, peer);
+        // Only a successful registration displaces an idle peer. Failed cleanup
+        // leaves the victim stale for the next admission or periodic sweep.
+        let _ = self.trim(registry, |_| true);
         Ok(lease)
+    }
+
+    fn trim(&mut self, registry: &impl MetadataRegistry, eligible: impl Fn(&Peer) -> bool) -> Result<(), NixlError> {
+        if self.peers.len() > self.capacity
+            && let Some((oldest, _)) = self
+                .peers
+                .iter()
+                .filter(|(_, peer)| peer.idle() && eligible(peer))
+                .min_by_key(|(_, peer)| peer.idle_since.get())
+        {
+            let oldest = oldest.clone();
+            self.evict(registry, &oldest)?;
+        }
+        Ok(())
     }
 
     fn evict(&mut self, registry: &impl MetadataRegistry, name: &str) -> Result<(), NixlError> {

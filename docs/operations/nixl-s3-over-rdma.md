@@ -41,8 +41,8 @@ also enabled.
 | `RUSTFS_NIXL_NUM_WORKERS` | `1` | UCX progress workers of the agent. |
 | `RUSTFS_NIXL_CHUNK_BYTES` | `16 MiB` | Staging chunk, one transfer descriptor at most. |
 | `RUSTFS_NIXL_POOL_BYTES` | `1 GiB` | Registered staging memory. |
-| `RUSTFS_NIXL_MAX_INFLIGHT` | `256` | Transfers in flight per node. |
-| `RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS` | `60` | A transfer that has not completed by then fails the request instead of hanging it. |
+| `RUSTFS_NIXL_MAX_INFLIGHT` | `256` | Maximum queued and active native transfers per node. A timeout or caller cancellation holds the slot until the native operation finishes. |
+| `RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS` | `60` | Maximum wait for a free transfer slot and, separately, for a posted transfer to complete. |
 | `RUSTFS_NIXL_DEVICE_CHECK` | `true` | Check the devices at startup and leave out unhealthy ones (see below). |
 | `RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS` | `16` | Leave out a device whose link dropped this many times more since boot than the quietest device of its link layer; `0` skips this test. |
 | `RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS` | `3000` | How long the startup check watches the link counters; `0` skips the watch. |
