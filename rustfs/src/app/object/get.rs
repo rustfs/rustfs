@@ -6285,9 +6285,17 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("create test bucket");
+        // The fixture edits every disk directly after PUT returns.
+        let write_options = ObjectOptions {
+            write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
         for (object, length) in [("inline.bin", 4096), ("shards.bin", 1_300_000)] {
-            let payload = vec![b'c'; length];
-            let info = put_real_cold_fill_object(&store, &bucket, object, &payload).await;
+            let mut reader = PutObjReader::from_vec(vec![b'c'; length]);
+            let info = store
+                .put_object(&bucket, object, &mut reader, &write_options)
+                .await
+                .expect("write test object before modifying its disk files");
             let etag = info.etag.as_deref().expect("committed ETag");
             for disk in &disk_paths {
                 let object_path = disk.join(&bucket).join(object);
