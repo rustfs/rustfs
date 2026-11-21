@@ -17,14 +17,16 @@ use super::{
     RawEnumerationPageIndexState, owner_entry_is_valid,
 };
 use crate::data_usage_define::clone_cache_value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Exclusive, validated owner of an index during one directory enumeration.
 /// The auxiliary sets are never serialized: restored indexes must cross the
 /// validation boundary again before any pages can be trusted or extended.
 pub(crate) struct RawEnumerationPageWriter {
     inner: RawEnumerationPageIndexInner,
-    indexed: HashSet<String>,
+    // True only for names in sealed pages at the start of this walk.
+    indexed: HashMap<String, bool>,
+    restored_committed_entries: usize,
     pending: BTreeSet<String>,
     observed_complete: HashSet<String>,
     complete_source_changed: bool,
@@ -38,23 +40,15 @@ impl RawEnumerationPageWriter {
         let RawEnumerationPageIndexState::Supported(inner) = index.state else {
             return Err(RawEnumerationPageIndexError::Unsupported);
         };
-        if inner.parent.is_empty() || inner.page_entry_limit == 0 {
-            return Err(RawEnumerationPageIndexError::CorruptIndex);
-        }
-        let entries = inner.validated_indexed_entries()?;
-        let entry_count = entries.len();
-        let indexed: HashSet<_> = entries.into_iter().collect();
-        if indexed.len() != entry_count
-            || inner.pages.iter().any(|page| page.entries.len() > inner.page_entry_limit)
-            || (inner.complete && inner.building.is_some())
-            || inner.pages.last().is_some_and(|page| page.terminal != inner.complete)
-        {
-            return Err(RawEnumerationPageIndexError::CorruptIndex);
-        }
-        let committed_entries = entry_count.saturating_sub(inner.building.as_ref().map_or(0, |page| page.entries.len()));
+        let mut indexed = HashMap::new();
+        inner.validate_membership(|name, sealed| indexed.insert(name.to_owned(), sealed).is_none())?;
+        let entry_count = indexed.len();
+        let committed_entries = entry_count - inner.building.as_ref().map_or(0, |page| page.entries.len());
+        let restored_committed_entries = if inner.generation > 0 { committed_entries } else { 0 };
         Ok(Self {
             inner,
             indexed,
+            restored_committed_entries,
             pending: BTreeSet::new(),
             observed_complete: HashSet::new(),
             complete_source_changed: false,
@@ -77,13 +71,19 @@ impl RawEnumerationPageWriter {
         self.indexed.len()
     }
 
+    pub(crate) fn is_replay(&self, entry: &str, continues_stream: bool) -> bool {
+        self.restored_committed_entries != 0
+            && ((!continues_stream && self.observations < self.restored_committed_entries)
+                || self.indexed.get(entry) == Some(&true))
+    }
+
     pub(crate) fn record_entry(&mut self, entry: &str) -> Result<(), RawEnumerationPageIndexError> {
         if !owner_entry_is_valid(entry) {
             return Err(RawEnumerationPageIndexError::InvalidEntry);
         }
         self.observations = self.observations.saturating_add(1);
         if self.inner.complete || self.inner.building.as_ref().is_some_and(|page| page.terminal) {
-            if self.indexed.contains(entry) {
+            if self.indexed.contains_key(entry) {
                 self.observed_complete.insert(entry.to_owned());
             } else {
                 self.complete_source_changed = true;
@@ -97,7 +97,7 @@ impl RawEnumerationPageWriter {
             }
             return Ok(());
         }
-        if !self.indexed.contains(entry) {
+        if !self.indexed.contains_key(entry) {
             self.pending.insert(entry.to_owned());
         }
         // A restored directory can be enumerated in a different order. Keep
@@ -121,7 +121,7 @@ impl RawEnumerationPageWriter {
                 entries: Vec::new(),
                 terminal: false,
             });
-            self.indexed.insert(clone_cache_value(&entry));
+            self.indexed.insert(clone_cache_value(&entry), false);
             // The building page is normalized (strictly increasing) on every
             // path that reaches here, so a positional insert keeps it so.
             let position = building.entries.binary_search(&entry).unwrap_or_else(|position| position);

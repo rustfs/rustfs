@@ -150,7 +150,8 @@ fn raw_enumeration_writer_rejects_corruption_at_restore() {
             _ => unreachable!(),
         }
         let bytes = rmp_serde::to_vec(&corrupt).expect("encode damaged checkpoint");
-        let restored = rmp_serde::from_slice(&bytes).expect("decode untrusted checkpoint");
+        let restored: RawEnumerationPageIndex = rmp_serde::from_slice(&bytes).expect("decode untrusted checkpoint");
+        assert!(!restored.is_valid_for_restore(), "planner accepted corruption case {case}");
         assert!(
             matches!(RawEnumerationPageWriter::new(restored), Err(RawEnumerationPageIndexError::CorruptIndex)),
             "corruption case {case} must not become trusted runtime state"
