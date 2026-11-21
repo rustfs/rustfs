@@ -85,7 +85,7 @@ async fn fixture() -> (Arc<MemoryConfigStore>, DataUsageCache) {
         .await
         .expect("initial revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("seed both copies");
     (store, cache)

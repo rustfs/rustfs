@@ -47,7 +47,17 @@ pub(super) fn gateway_bucket(name: &str) -> rustfs_gateway_types::BucketName {
 
 /// The envelope of a request that carries nothing but `method`.
 pub(super) fn owned_envelope(method: Method) -> RequestEnvelope {
-    RequestEnvelope::from_s3s(&build_request((), method))
+    RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        Extensions::new(),
+    )
 }
 
 pub(super) fn build_request_with_req_info<T>(input: T, method: Method, req_info: ReqInfo) -> S3Request<T> {
