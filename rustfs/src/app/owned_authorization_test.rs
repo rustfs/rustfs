@@ -1999,47 +1999,53 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
 
 #[tokio::test]
 #[serial]
-async fn metadata_mutation_authorization_binds_both_request_edges_to_the_server_bucket() {
+async fn metadata_mutation_authorization_binds_to_the_server_bucket() {
+    use crate::app::RequestHead;
     use crate::app::storage_api::object_usecase::{StorageObjectOptions, access::apply_bucket_generation_guard};
     use crate::app::storage_api::owned_parity::{
-        AuthorizationRequest, authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
     };
-    async fn authorize<R: AuthorizationRequest + ?Sized>(
-        request: &mut R,
-        slot: &ServerContextSlot,
-        operation: usize,
-    ) -> rustfs_s3_types::S3Result<()> {
-        match operation {
-            0 => authorize_put_object_tagging(request, slot, PRIVATE, "allowed", None, RequestedObjectTags(vec![])).await,
-            1 => authorize_delete_object_tagging(request, slot, PRIVATE, "allowed", None).await,
-            _ => authorize_put_object_acl(request, slot, PRIVATE, "allowed", None).await,
-        }
-    }
     let (_dirs, store, slot, _user, owner) = decision_world().await;
     let identity = store.bucket_incarnation_id(PRIVATE).await.expect("server bucket identity");
-    for operation in 0..3 {
-        let mut legacy = build_request((), Method::PUT);
-        legacy.uri = Uri::from_static("/parity-private/allowed");
-        legacy.extensions.insert(Arc::clone(&slot));
-        legacy.extensions.insert(ReqInfo {
+    let request = |method| {
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
             cred: Some(owner.clone()),
             is_owner: true,
             bucket: Some(PRIVATE.to_string()),
             object: Some("allowed".to_string()),
             ..Default::default()
         });
-        let mut owned = RequestEnvelope::from_s3s(&legacy);
-        authorize(&mut legacy, &slot, operation)
-            .await
-            .expect("authorize legacy metadata mutation");
-        authorize(&mut owned, &slot, operation)
-            .await
-            .expect("authorize owned metadata mutation");
-        let mut legacy_options = StorageObjectOptions::default();
-        let mut owned_options = StorageObjectOptions::default();
-        apply_bucket_generation_guard(&legacy, PRIVATE, &mut legacy_options).expect("legacy guard");
-        apply_bucket_generation_guard(&owned, PRIVATE, &mut owned_options).expect("owned guard");
-        assert_eq!(legacy_options.expected_bucket_incarnation_id, Some(identity));
-        assert_eq!(owned_options.expected_bucket_incarnation_id, Some(identity));
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method,
+                uri: Uri::from_static("/parity-private/allowed"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
+    };
+
+    let mut put_tagging = request(Method::PUT);
+    authorize_put_object_tagging(&mut put_tagging, &slot, PRIVATE, "allowed", None, RequestedObjectTags(vec![]))
+        .await
+        .expect("authorize PutObjectTagging");
+    let mut delete_tagging = request(Method::DELETE);
+    authorize_delete_object_tagging(&mut delete_tagging, &slot, PRIVATE, "allowed", None)
+        .await
+        .expect("authorize DeleteObjectTagging");
+    let mut put_acl = request(Method::PUT);
+    authorize_put_object_acl(&mut put_acl, &slot, PRIVATE, "allowed", None)
+        .await
+        .expect("authorize PutObjectAcl");
+
+    for request in [&put_tagging, &delete_tagging, &put_acl] {
+        let mut options = StorageObjectOptions::default();
+        apply_bucket_generation_guard(request, PRIVATE, &mut options).expect("bucket generation guard");
+        assert_eq!(options.expected_bucket_incarnation_id, Some(identity));
     }
 }
