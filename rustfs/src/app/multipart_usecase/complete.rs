@@ -1303,16 +1303,13 @@ mod tests {
 
         let bucket_usecase = crate::app::bucket_usecase::DefaultBucketUsecase::from_global();
         // Listings carry neither the SSE-C key nor a per-object decryption request.
-        let versions_req = build_request(
-            ListObjectVersionsInput {
-                bucket: bucket.to_string(),
-                prefix: Some(key.to_string()),
-                ..Default::default()
-            },
-            Method::GET,
-        );
-        let versions_env = RequestEnvelope::from_s3s(&versions_req);
-        let versions_in = list_object_versions::input_from_s3s(versions_req.input).expect("convert ListObjectVersionsInput");
+        let versions_input = ListObjectVersionsInput {
+            bucket: bucket.to_string(),
+            prefix: Some(key.to_string()),
+            ..Default::default()
+        };
+        let versions_env = super::super::test_support::owned_envelope(Method::GET);
+        let versions_in = list_object_versions::input_from_s3s(versions_input).expect("convert ListObjectVersionsInput");
         let versions = list_object_versions::output_to_s3s(
             bucket_usecase
                 .execute_list_object_versions(versions_env, versions_in)
@@ -1327,16 +1324,13 @@ mod tests {
         assert_eq!(entries[0].e_tag.as_ref(), Some(etag));
         assert_xml_etag(&versions, etag);
 
-        let v1_req = build_request(
-            ListObjectsInput {
-                bucket: bucket.to_string(),
-                prefix: Some(key.to_string()),
-                ..Default::default()
-            },
-            Method::GET,
-        );
-        let v1_env = RequestEnvelope::from_s3s(&v1_req);
-        let v1_in = list_objects::input_from_s3s(v1_req.input).expect("convert ListObjectsInput");
+        let v1_input = ListObjectsInput {
+            bucket: bucket.to_string(),
+            prefix: Some(key.to_string()),
+            ..Default::default()
+        };
+        let v1_env = super::super::test_support::owned_envelope(Method::GET);
+        let v1_in = list_objects::input_from_s3s(v1_input).expect("convert ListObjectsInput");
         let v1 = list_objects::output_to_s3s(
             bucket_usecase
                 .execute_list_objects(v1_env, v1_in)
