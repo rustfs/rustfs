@@ -545,10 +545,17 @@ mod tests {
                 .object_lock_retain_until_date(date.map(Timestamp::from))
                 .build()
                 .expect("direct fixture DTO");
-            let error = make_usecase()
-                .execute_create_multipart_upload_from_s3s(build_request(input, Method::POST))
+            let error = match make_usecase()
+                .execute_create_multipart_upload(
+                    owned_envelope(Method::POST),
+                    CreateMultipartUploadFields::from_legacy(input),
+                    None,
+                )
                 .await
-                .expect_err("direct fixture does not create an upload");
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("direct fixture does not create an upload"),
+            };
             assert_eq!(
                 (error.code().as_str(), error.message()),
                 (expected.0, Some(expected.1)),
