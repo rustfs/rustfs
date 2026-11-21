@@ -565,9 +565,15 @@ mod tests {
                 .multipart_upload(Some(CompletedMultipartUpload::default()))
                 .build()
                 .expect("valid complete request DTO");
-            let error = Box::pin(make_usecase().complete_for_s3s_request(build_request(complete, Method::POST)))
-                .await
-                .expect_err("uploads created before the fix must not publish reserved keys");
+            let error =
+                match rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload::input_from_s3s(
+                    complete,
+                ) {
+                    Err(error) => crate::app::dto_values::seam_error(error),
+                    Ok(input) => Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), input))
+                        .await
+                        .expect_err("uploads created before the fix must not publish reserved keys"),
+                };
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         }
     }
