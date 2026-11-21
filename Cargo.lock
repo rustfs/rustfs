@@ -10326,7 +10326,6 @@ dependencies = [
  "jiff",
  "reqwest",
  "rmp-serde",
- "rustfs-data-usage",
  "rustfs-signer",
  "s3s",
  "serde",
