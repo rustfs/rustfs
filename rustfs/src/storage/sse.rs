@@ -167,11 +167,17 @@ use rustfs_utils::http::headers::{
 #[cfg(test)]
 use rustfs_utils::http::headers::{AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID};
 use rustfs_utils::path::path_join_buf;
-use s3s::header::{
-    X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
-    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
-};
 use std::borrow::Cow;
+
+// The same header names s3s publishes. Owned so this module does not import s3s.
+const X_AMZ_SERVER_SIDE_ENCRYPTION: HeaderName = HeaderName::from_static("x-amz-server-side-encryption");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID: HeaderName =
+    HeaderName::from_static("x-amz-server-side-encryption-aws-kms-key-id");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT: HeaderName = HeaderName::from_static("x-amz-server-side-encryption-context");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM: HeaderName =
+    HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5: HeaderName =
+    HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5");
 
 // ============================================================================
 // High-Level SSE Configuration
@@ -4694,20 +4700,19 @@ pub(crate) mod tests {
 
     #[test]
     fn anonymous_s3_request_builds_kms_principal() {
-        let mut request = s3s::S3Request {
-            input: (),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/bucket/object"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        request.extensions.insert(crate::storage::req_info::ReqInfo::default());
-
-        let envelope = crate::app::RequestEnvelope::from_s3s(&request);
+        let mut extensions = http::Extensions::new();
+        extensions.insert(crate::storage::req_info::ReqInfo::default());
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/bucket/object"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         let principal = SseKmsPrincipal::from_request(&envelope).expect("S3-boundary request should build a principal");
 
         assert!(principal.account.is_empty());
@@ -8526,7 +8531,7 @@ pub(crate) mod tests {
         let err = map_get_object_reader_error(StorageError::other(resolution_error));
         assert_eq!(err.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
         assert_eq!(err.message, "KMS key not found: finance-key");
-        let s3_error = s3s::S3Error::from(err);
+        let s3_error = rustfs_s3_types::S3Error::from(err);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
 
         let denied = map_get_object_reader_error(StorageError::other(super::EncryptionResolutionError::new(
