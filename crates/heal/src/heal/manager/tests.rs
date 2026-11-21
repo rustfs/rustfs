@@ -4575,6 +4575,32 @@ fn test_retry_request_for_scoped_slowdown_preserves_scope() {
 }
 
 #[test]
+fn background_erasure_set_retries_busy_bucket_prepass() {
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket".to_string()],
+            set_disk_id: "pool_1_set_0".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    let task = HealTask::from_request(request, Arc::new(MockStorage));
+
+    for error in [
+        Error::Storage(EcstoreError::TooManyOpenFiles),
+        Error::Disk(DiskError::TooManyOpenFiles),
+    ] {
+        let (retry, delay, _) = retry_request_for_result(&task, &Err(error)).expect("busy bucket prepass should retry");
+        assert_eq!(retry.id, task.id);
+        assert_eq!(retry.heal_type, task.heal_type);
+        assert_eq!(retry.source, HealRequestSource::AutoHeal);
+        assert_eq!(retry.retry_attempts, 1);
+        assert!(delay > Duration::ZERO);
+    }
+}
+
+#[test]
 fn test_retry_request_for_typed_not_found_error_is_not_retryable() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);

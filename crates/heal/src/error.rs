@@ -292,6 +292,7 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
         | EcstoreError::FaultyDisk
         | EcstoreError::FaultyRemoteDisk
         | EcstoreError::SlowDown
+        | EcstoreError::TooManyOpenFiles
         | EcstoreError::DeleteRecoveryWorkLimit
         | EcstoreError::OperationCanceled
         | EcstoreError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
@@ -317,6 +318,7 @@ pub(crate) fn classify_disk_error(error: &DiskError) -> HealErrorClass {
         | DiskError::ErasureReadQuorum
         | DiskError::ErasureWriteQuorum
         | DiskError::SourceStalled
+        | DiskError::TooManyOpenFiles
         | DiskError::FaultyRemoteDisk
         | DiskError::FaultyDisk
         | DiskError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
