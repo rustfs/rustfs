@@ -419,14 +419,14 @@ dependencies = [
 
 [[package]]
 name = "arrow-array"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f3d22a41d3df78b71df0b685af219ae3a94188ab98d6fb29c958eb55c3247f4"
+checksum = "a7a75080e8066219ed2d1e3b8fd2eb0b1a4b35d03b6fa87fb1035e93bd8dac95"
 dependencies = [
  "ahash",
- "arrow-buffer 60.1.0",
- "arrow-data 60.1.0",
- "arrow-schema 60.1.0",
+ "arrow-buffer 60.2.0",
+ "arrow-data 60.2.0",
+ "arrow-schema 60.2.0",
  "chrono",
  "half",
  "hashbrown 0.17.1",
@@ -449,9 +449,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-buffer"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bd46a530bc1a8e763102fc36c1dc0f51f3ffa150c78e7f5658ccb54b1458ade"
+checksum = "6c6bf2edf52662586214410c6030204215453eb86b8715037e8951326e173b19"
 dependencies = [
  "bytes",
  "half",
@@ -483,13 +483,13 @@ dependencies = [
 
 [[package]]
 name = "arrow-cmp"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1913e57a64fbf2c4502fa6d54b547d6a1ae59e3146cbc15321d47468c937abd1"
+checksum = "c7e23e1092a61d7addfe57a69bf5cde7628b7b6685adea11731c19acdfd86695"
 dependencies = [
- "arrow-array 60.1.0",
- "arrow-buffer 60.1.0",
- "arrow-schema 60.1.0",
+ "arrow-array 60.2.0",
+ "arrow-buffer 60.2.0",
+ "arrow-schema 60.2.0",
 ]
 
 [[package]]
@@ -522,12 +522,12 @@ dependencies = [
 
 [[package]]
 name = "arrow-data"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "415b7fbc4cf56b080bb5677a4ae74211b5c79e571ed37a1d547633ec07f3b43b"
+checksum = "d0a7becabdb9bf3fa058b55845c52e0f792bedc88fd0e28d6580c9730a902b60"
 dependencies = [
- "arrow-buffer 60.1.0",
- "arrow-schema 60.1.0",
+ "arrow-buffer 60.2.0",
+ "arrow-schema 60.2.0",
  "half",
  "num-integer",
  "num-traits",
@@ -551,15 +551,15 @@ dependencies = [
 
 [[package]]
 name = "arrow-ipc"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45f3e766bccf5a0cb57a5de52a4cba450dea5171547c2cb5939b486d08887cba"
+checksum = "3d6fe9198046b67abf4e3e3ef70de2d705099975bdc2a7d9f0661675a978a083"
 dependencies = [
- "arrow-array 60.1.0",
- "arrow-buffer 60.1.0",
- "arrow-data 60.1.0",
- "arrow-schema 60.1.0",
- "arrow-select 60.1.0",
+ "arrow-array 60.2.0",
+ "arrow-buffer 60.2.0",
+ "arrow-data 60.2.0",
+ "arrow-schema 60.2.0",
+ "arrow-select 60.2.0",
  "flatbuffers",
  "zstd 0.14.4",
 ]
@@ -627,9 +627,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-schema"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de2c8e714b466404cdc1189e89f892426efea614d938e16c15518c340cd43ba3"
+checksum = "3e7574c4175cc731e0d26a8384bc25d455c5e220250988a772c1af843592444b"
 
 [[package]]
 name = "arrow-select"
@@ -647,16 +647,16 @@ dependencies = [
 
 [[package]]
 name = "arrow-select"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5af3f6656c5f2c6944f93d9a357a7f204c93d5f349385a44cf46c4a26fbcf30"
+checksum = "8d6a571e56e54b485b9f2d1dac4c3c34edcaffaa2668a23a7204108b66ef163d"
 dependencies = [
  "ahash",
- "arrow-array 60.1.0",
- "arrow-buffer 60.1.0",
+ "arrow-array 60.2.0",
+ "arrow-buffer 60.2.0",
  "arrow-cmp",
- "arrow-data 60.1.0",
- "arrow-schema 60.1.0",
+ "arrow-data 60.2.0",
+ "arrow-schema 60.2.0",
  "num-traits",
 ]
 
@@ -4134,7 +4134,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4208,7 +4208,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "local-ip-address",
  "md-5",
  "minlz",
@@ -4450,7 +4450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5845,7 +5845,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5965,12 +5965,12 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5d126d72eb017f10b302e73bdeca446bea405ee449af4d9e7866d6b082d83e"
+checksum = "c5e77cbfb9fff4798e283c2d69dff39fc2c45e7da017e5ce95b654e46ea41236"
 dependencies = [
  "jiff-core 1.0.1",
- "jiff-static 1.0.1",
+ "jiff-static 1.0.2",
  "jiff-tzdb-platform 1.0.0",
  "log",
  "portable-atomic",
@@ -6011,9 +6011,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0127e9bde3c6130d6169e7d8d68676e4be69c4bf7573c308b6f960a5089c428"
+checksum = "e9067a0b23e5be3147d56b2dcf652b18e6b1364caca93fb157653b6fbcab23a9"
 dependencies = [
  "jiff-core 1.0.1",
  "proc-macro2",
@@ -7138,7 +7138,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7997,17 +7997,17 @@ dependencies = [
 
 [[package]]
 name = "parquet"
-version = "60.1.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "806eaa0f1c0436dcb43bee8e6a82bf2efff90521a60172f8281cb9ef577b43a4"
+checksum = "6701f0dd63f5ee23a0f1f2865ff76825c301759d6ab649e3e5686cc32d066957"
 dependencies = [
  "ahash",
- "arrow-array 60.1.0",
- "arrow-buffer 60.1.0",
- "arrow-data 60.1.0",
- "arrow-ipc 60.1.0",
- "arrow-schema 60.1.0",
- "arrow-select 60.1.0",
+ "arrow-array 60.2.0",
+ "arrow-buffer 60.2.0",
+ "arrow-data 60.2.0",
+ "arrow-ipc 60.2.0",
+ "arrow-schema 60.2.0",
+ "arrow-select 60.2.0",
  "base64 0.23.1",
  "bytes",
  "chrono",
@@ -8699,7 +8699,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.13.0",
  "log",
  "multimap",
@@ -8719,7 +8719,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e4d69d0fa3e7f6f9cf6b53a0e83e4fc99ba3586f65ce166cff30bd13bb4ad2"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.15.0",
  "log",
  "multimap",
@@ -9091,7 +9091,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9425,7 +9425,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9891,7 +9891,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "insta",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "libc",
  "libsystemd",
  "matchit 0.9.2",
@@ -10024,7 +10024,7 @@ dependencies = [
  "futures",
  "hashbrown 0.17.1",
  "hotpath",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "metrics",
  "rustfs-config",
  "rustfs-s3-types",
@@ -10071,7 +10071,6 @@ dependencies = [
 name = "rustfs-concurrency"
 version = "1.0.5"
 dependencies = [
- "hotpath",
  "insta",
  "rustfs-io-core",
  "serde",
@@ -10192,7 +10191,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "insta",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "lazy_static",
  "libc",
  "md-5",
@@ -10509,7 +10508,7 @@ dependencies = [
  "futures",
  "hotpath",
  "http 1.5.0",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "metrics",
  "rustfs-common",
  "rustfs-concurrency",
@@ -10604,7 +10603,6 @@ name = "rustfs-io-core"
 version = "1.0.5"
 dependencies = [
  "bytes",
- "hotpath",
  "metrics",
  "rustfs-io-metrics",
  "thiserror 2.0.21",
@@ -10721,7 +10719,7 @@ dependencies = [
  "hotpath",
  "http 1.5.0",
  "insta",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "md-5",
  "metrics",
  "metrics-util",
@@ -10809,7 +10807,7 @@ name = "rustfs-log-analyzer"
 version = "1.0.5"
 dependencies = [
  "flate2",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "regex",
  "serde",
  "serde_json",
@@ -10829,7 +10827,7 @@ dependencies = [
  "http 1.5.0",
  "humantime",
  "hyper",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "reqwest",
  "rmp-serde",
  "rustfs-signer",
@@ -10883,7 +10881,7 @@ dependencies = [
  "form_urlencoded",
  "hashbrown 0.17.1",
  "hotpath",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "metrics",
  "percent-encoding",
  "quick-xml 0.42.0",
@@ -10954,7 +10952,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hotpath",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "libc",
  "log",
  "metrics",
@@ -11012,7 +11010,7 @@ dependencies = [
  "base64-simd",
  "futures",
  "ipnetwork",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "jsonwebtoken 12.0.0",
  "moka",
  "pollster",
@@ -11105,7 +11103,6 @@ name = "rustfs-protos"
 version = "1.0.5"
 dependencies = [
  "flatbuffers",
- "hotpath",
  "hyper",
  "hyper-util",
  "prost 0.14.6",
@@ -11202,7 +11199,6 @@ dependencies = [
  "chacha20poly1305",
  "hex-simd",
  "hmac 0.13.0",
- "hotpath",
  "minlz",
  "pin-project-lite",
  "rand 0.10.4",
@@ -11305,7 +11301,7 @@ dependencies = [
  "futures-core",
  "hotpath",
  "http 1.5.0",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "lz4",
  "lz4_flex",
  "memchr",
@@ -11361,7 +11357,7 @@ dependencies = [
  "hmac 0.13.0",
  "hotpath",
  "http 1.5.0",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "metrics",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -11405,7 +11401,7 @@ dependencies = [
 name = "rustfs-scanner-metrics"
 version = "1.0.5"
 dependencies = [
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "metrics",
  "rmp-serde",
  "rustfs-heal-contracts",
@@ -11470,7 +11466,7 @@ dependencies = [
  "hotpath",
  "hyper",
  "hyper-rustls",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "lapin",
  "libc",
  "metrics",
@@ -11648,7 +11644,6 @@ version = "1.0.5"
 dependencies = [
  "async-compression",
  "futures",
- "hotpath",
  "rustfs-rio",
  "rustfs-tokio-tar",
  "serde",
@@ -11713,7 +11708,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11795,7 +11790,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12265,7 +12260,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.14.2",
  "jiff 0.2.46",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",
@@ -12849,7 +12844,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "919688e3d2128f0c3e77f4dff7a2035f2d73ccf488851ba96ba42002e850cad5"
 dependencies = [
  "async-trait",
- "jiff 1.0.1",
+ "jiff 1.0.2",
  "lazy-regex",
  "log",
  "pin-project",
@@ -13072,10 +13067,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -14188,7 +14183,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -14831,12 +14826,12 @@ name = "zstd"
 version = "0.13.4"
 dependencies = [
  "apache-avro",
- "arrow-array 60.1.0",
- "arrow-ipc 60.1.0",
- "arrow-schema 60.1.0",
+ "arrow-array 60.2.0",
+ "arrow-ipc 60.2.0",
+ "arrow-schema 60.2.0",
  "bytes",
  "kafka-protocol",
- "parquet 60.1.0",
+ "parquet 60.2.0",
  "semver",
  "toml",
  "zstd 0.14.4",
