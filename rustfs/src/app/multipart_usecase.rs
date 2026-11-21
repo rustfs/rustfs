@@ -545,10 +545,17 @@ mod tests {
                 .key(key.to_owned())
                 .build()
                 .expect("valid create request DTO");
-            let error = make_usecase()
-                .execute_create_multipart_upload_from_s3s(build_request(create, Method::POST))
+            let error = match make_usecase()
+                .execute_create_multipart_upload(
+                    owned_envelope(Method::POST),
+                    super::create_values::CreateMultipartUploadFields::from_legacy(create),
+                    None,
+                )
                 .await
-                .expect_err("reserved key must be rejected before accessing storage");
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("reserved key must be rejected before accessing storage"),
+            };
             assert_eq!(error.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
 
             let complete = CompleteMultipartUploadInput::builder()
