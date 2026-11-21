@@ -757,6 +757,10 @@ impl DataUsageCache {
             _ => (inline.clone(), None),
         };
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let display_progress = timeout(Duration::from_secs(2), self.prepare_display_progress(store.clone(), expected_epoch))
+            .await
+            .ok()
+            .flatten();
         let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),
@@ -768,6 +772,8 @@ impl DataUsageCache {
             expected_epoch,
         )
         .await?;
+
+        Self::persist_display_progress(store.clone(), display_progress, expected_epoch).await;
 
         if let (Some(retired), Some(epoch)) = (primary_retired, expected_epoch) {
             let _ = pages::reclaim(store.clone(), name, retired, epoch).await;

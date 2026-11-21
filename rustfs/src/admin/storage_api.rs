@@ -939,6 +939,14 @@ pub(crate) static ERR_TIER_RESERVED_NAME: AdminErrorRef = AdminErrorRef(|| &ecst
 pub(crate) mod data_usage {
     use std::sync::Arc;
 
+    pub(crate) async fn load_bucket_scan_progress_for_admin(
+        store: Arc<crate::storage::storage_api::ECStore>,
+        buckets: &[String],
+        baseline: &rustfs_data_usage::DataUsageInfo,
+    ) -> std::collections::HashMap<String, rustfs_data_usage::BucketScanProgress> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_scan_progress_for_admin(store, buckets, baseline).await
+    }
+
     pub(crate) async fn load_data_usage_from_backend(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {

@@ -1053,6 +1053,16 @@ impl ECStore {
         self.ctx.data_movement_generation()
     }
 
+    /// Derive the cross-node scope from persisted movement metadata, excluding
+    /// local admission/wakeup counters. Writers capture this under their
+    /// movement permit; diagnostic readers validate it before and after I/O.
+    pub async fn scanner_durable_data_movement_generation(&self) -> Option<u64> {
+        let pool_meta = self.pool_meta.read().await.clone();
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        let generation = durable_scanner_data_movement_generation(&pool_meta, rebalance_meta.as_ref());
+        (generation != u64::MAX).then_some(generation)
+    }
+
     pub fn scanner_data_movement_generation_exhausted(&self) -> bool {
         self.ctx.data_movement_generation_exhausted()
     }

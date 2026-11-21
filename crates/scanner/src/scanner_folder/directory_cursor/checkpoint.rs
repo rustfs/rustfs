@@ -251,6 +251,10 @@ impl DirectoryCheckpoint {
             through: done.through.clone(),
         })
     }
+    /// A display contribution contains only acknowledged compacted children.
+    pub(crate) fn display_usage(&self, info: &DataUsageCacheInfo) -> Option<(DirectoryProgress, &DataUsageEntry)> {
+        Some((self.progress(info)?, &self.aggregate.as_ref()?.value))
+    }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }

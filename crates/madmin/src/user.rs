@@ -411,6 +411,14 @@ pub struct AccountInfo {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketAccessInfo {
     pub name: String,
+    /// Display-only accepted scan progress, never a replacement for total usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_progress: Option<rustfs_data_usage::BucketScanProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_value_state: Option<rustfs_data_usage::BucketUsageValueState>,
+    /// Unix milliseconds of the original complete statistic, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_updated_at: Option<u64>,
     // Usage stats are absent (not zero) when no scanner snapshot covers the
     // bucket yet, so clients can distinguish "unknown" from "empty"
     // (rustfs/backlog#1306).
@@ -1119,6 +1127,9 @@ mod tests {
 
         let bucket_info = BucketAccessInfo {
             name: "test-bucket".to_string(),
+            scan_progress: None,
+            usage_value_state: None,
+            usage_updated_at: None,
             size: Some(6000000),
             objects: Some(150),
             object_sizes_histogram: Some(sizes_histogram),
