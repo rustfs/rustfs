@@ -595,7 +595,13 @@ pub(crate) async fn write_budget_drain_fixture_frames<W: AsyncWrite + Unpin>(
     cache.info.scan_plan_digest = Some(request.scan_plan_digest);
     cache.info.last_update = Some(std::time::SystemTime::now());
     cache
-        .save_with_revisions_for_epoch(store.clone(), &cache_name, &revisions, identity.publication_epoch)
+        .save_with_revisions_for_epoch(
+            store.clone(),
+            &cache_name,
+            &revisions,
+            identity.publication_epoch,
+            CancellationToken::new(),
+        )
         .await
         .expect("durable current-request root CAS");
     let mut persisted = DataUsageCache::default();
@@ -848,6 +854,7 @@ async fn classify_remote_usage_watch_outcome(
                 // The folder completes under its coverage plan; finished cache
                 // reuse and the response remain bound to the requested reuse plan.
                 cache.info.scan_plan_digest = Some(scan_plan_digest);
+                cache.info.scan_coverage_digest = checkpoint_plan_digest;
                 (cache, None)
             }
         }
@@ -982,6 +989,27 @@ async fn scan_and_persist_local_bucket_with_store(
     let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
         .await
         .generation;
+    // Only a leader handoff needs this authoritative floor; ordinary cycles
+    // avoid an extra config read. An unavailable/legacy floor forces a walk.
+    let completed_checkpoint_cycle_floor = if cache.info.snapshot_complete
+        && cache.info.leader_epoch < leader_epoch
+        && cache.info.scan_plan_digest == Some(scan_plan_digest)
+        && checkpoint_plan_digest.is_some()
+        && cache.info.scan_coverage_digest == checkpoint_plan_digest
+        && cache.info.next_cycle < next_cycle
+    {
+        let baseline = read_config(store.clone(), crate::DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .ok();
+        let sources = store
+            .all_set_disks()
+            .iter()
+            .map(|set| DataUsageCacheSource::new(set.pool_index, set.set_index))
+            .collect();
+        crate::scanner_io::completed_checkpoint_cycle_floor(baseline.as_deref(), &sources, next_cycle, leader_epoch)
+    } else {
+        None
+    };
     let current_identity = crate::scanner_io::scanner_bucket_checkpoint_identity(
         &set,
         &bucket,
@@ -1012,6 +1040,7 @@ async fn scan_and_persist_local_bucket_with_store(
             tier_registry_generation: Some(tier_registry_generation),
             checkpoint_identity: current_identity,
             checkpoint_plan_digest,
+            completed_checkpoint_cycle_floor,
         },
     );
     match scan_state {
@@ -1264,7 +1293,7 @@ async fn scan_and_persist_local_bucket_with_store(
     // the scan. A movement transition that starts and ends during the scan
     // therefore cannot admit the stale cache under the new epoch.
     let save_result = cache
-        .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch)
+        .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch, CancellationToken::new())
         .await;
     done_save();
     if let Err(err) = save_result {

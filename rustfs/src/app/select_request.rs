@@ -12,64 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SelectObjectContent requests from either S3 edge.
+//! SelectObjectContent requests the query engine reads.
 //!
-//! Both S3 edges pass the request in the shape the query engine reads.
+//! The gateway edge passes the request in the shape the query engine reads.
 //! The select use case validates it before building the engine.
-//! The s3s conversion is deleted with the legacy edge (rustfs/backlog#2783).
 
-#[cfg(test)]
-use rustfs_gateway_types::compat::ConversionError;
-#[cfg(test)]
-use rustfs_gateway_types::compat::s3s_5761ddfe::generated::shapes::input_serialization::input_serialization_from_s3s;
-#[cfg(test)]
-use rustfs_gateway_types::compat::s3s_5761ddfe::generated::shapes::output_serialization::output_serialization_from_s3s;
 use rustfs_s3select_api::request as engine;
-
-/// Converts the decoded request, keeping the SSE-C members as the client sent them.
-#[cfg(test)]
-pub(crate) fn select_input_from_s3s(
-    input: s3s::dto::SelectObjectContentInput,
-) -> Result<engine::SelectObjectContentInput, ConversionError> {
-    let s3s::dto::SelectObjectContentInput {
-        bucket,
-        expected_bucket_owner,
-        key,
-        sse_customer_algorithm,
-        sse_customer_key,
-        sse_customer_key_md5,
-        request,
-    } = input;
-    let s3s::dto::SelectObjectContentRequest {
-        expression,
-        expression_type,
-        input_serialization,
-        output_serialization,
-        request_progress,
-        scan_range,
-    } = request;
-    Ok(engine::SelectObjectContentInput {
-        bucket,
-        expected_bucket_owner,
-        key,
-        sse_customer_algorithm,
-        sse_customer_key,
-        sse_customer_key_md5,
-        request: engine::SelectObjectContentRequest {
-            expression,
-            expression_type: engine::ExpressionType::custom(expression_type.as_str().to_owned()),
-            input_serialization: input_serialization_from_s3s(input_serialization)?,
-            output_serialization: output_serialization_from_s3s(output_serialization)?,
-            request_progress: request_progress.map(|progress| engine::RequestProgress {
-                enabled: progress.enabled,
-            }),
-            scan_range: scan_range.map(|range| engine::ScanRange {
-                start: range.start,
-                end: range.end,
-            }),
-        },
-    })
-}
 
 /// Moves the gateway's flat request into the shape the query engine reads.
 pub(crate) fn select_input_from_gateway(
@@ -109,60 +57,57 @@ pub(crate) fn select_input_from_gateway(
 
 #[cfg(test)]
 mod tests {
-    use super::select_input_from_s3s;
-    use s3s::dto::{
-        CSVInput, CSVOutput, CompressionType, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONType,
-        OutputSerialization, RequestProgress, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
+    use rustfs_gateway_types::dto::{
+        CompressionType, CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, OutputSerialization,
+        RequestProgress, ScanRange, SelectObjectContentInput, Type as JsonType,
     };
+    use rustfs_gateway_types::{BucketName, ObjectKey, SseCustomerKey};
 
     fn input(input_serialization: InputSerialization) -> SelectObjectContentInput {
         SelectObjectContentInput {
-            bucket: "bucket".to_owned(),
+            bucket: BucketName::new("bucket").expect("bucket"),
             expected_bucket_owner: Some("owner".to_owned()),
-            key: "key".to_owned(),
+            key: ObjectKey::new("key").expect("key"),
             sse_customer_algorithm: Some("AES256".to_owned()),
-            sse_customer_key: Some("key-text".to_owned()),
+            sse_customer_key: Some(SseCustomerKey::new("key-text".to_owned())),
             sse_customer_key_md5: Some("client-md5".to_owned()),
-            request: SelectObjectContentRequest {
-                expression: "SELECT * FROM S3Object".to_owned(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
-                input_serialization,
-                output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput {
-                        field_delimiter: Some(";".to_owned()),
-                        quote_fields: None,
-                        quote_character: Some("'".to_owned()),
-                        quote_escape_character: None,
-                        record_delimiter: Some("\r\n".to_owned()),
-                    }),
-                    json: None,
-                },
-                request_progress: Some(RequestProgress { enabled: Some(true) }),
-                scan_range: Some(ScanRange {
-                    start: Some(3),
-                    end: Some(9),
+            expression: "SELECT * FROM S3Object".to_owned(),
+            expression_type: ExpressionType::SQL,
+            input_serialization,
+            output_serialization: OutputSerialization {
+                csv: Some(CsvOutput {
+                    field_delimiter: Some(";".to_owned()),
+                    quote_fields: None,
+                    quote_character: Some("'".to_owned()),
+                    quote_escape_character: None,
+                    record_delimiter: Some("\r\n".to_owned()),
                 }),
+                json: None,
             },
+            request_progress: Some(RequestProgress { enabled: Some(true) }),
+            scan_range: Some(ScanRange {
+                start: Some(3),
+                end: Some(9),
+            }),
         }
     }
 
     #[test]
     fn keeps_every_member_the_engine_reads() {
-        let converted = select_input_from_s3s(input(InputSerialization {
-            csv: Some(CSVInput {
+        let converted = super::select_input_from_gateway(input(InputSerialization {
+            csv: Some(CsvInput {
                 allow_quoted_record_delimiter: Some(true),
                 comments: Some("#".to_owned()),
                 field_delimiter: Some("|".to_owned()),
-                file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                file_header_info: Some(FileHeaderInfo::USE),
                 quote_character: Some("\"".to_owned()),
                 quote_escape_character: Some("\\".to_owned()),
                 record_delimiter: Some("\n".to_owned()),
             }),
-            compression_type: Some(CompressionType::from_static(CompressionType::GZIP)),
+            compression_type: Some(CompressionType::GZIP),
             json: None,
             parquet: None,
-        }))
-        .expect("convert");
+        }));
 
         assert_eq!((converted.bucket.as_str(), converted.key.as_str()), ("bucket", "key"));
         assert_eq!(converted.expected_bucket_owner.as_deref(), Some("owner"));
@@ -199,12 +144,10 @@ mod tests {
 
     #[test]
     fn gateway_projection_preserves_the_query_and_read_parameters() {
-        let source = input(InputSerialization {
-            csv: Some(CSVInput::default()),
+        let owned = input(InputSerialization {
+            csv: Some(CsvInput::default()),
             ..Default::default()
         });
-        let owned = rustfs_gateway_types::compat::s3s_5761ddfe::select::input_from_s3s(source, &Default::default())
-            .expect("materialize the test request");
         let converted = super::select_input_from_gateway(owned);
         assert_eq!((converted.bucket.as_str(), converted.key.as_str()), ("bucket", "key"));
         assert_eq!(converted.expected_bucket_owner.as_deref(), Some("owner"));
@@ -225,13 +168,13 @@ mod tests {
     #[test]
     fn keeps_the_json_type_and_an_unknown_expression_type() {
         let mut source = input(InputSerialization {
-            json: Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::LINES)),
+            json: Some(JsonInput {
+                r#type: Some(JsonType::LINES),
             }),
             ..Default::default()
         });
-        source.request.expression_type = ExpressionType::from("SQL2".to_owned());
-        let converted = select_input_from_s3s(source).expect("convert");
+        source.expression_type = ExpressionType::custom("SQL2");
+        let converted = super::select_input_from_gateway(source);
         let json = converted.request.input_serialization.json.as_ref().expect("json input");
         assert_eq!(json.r#type.as_ref().map(|value| value.as_str()), Some("LINES"));
         assert_eq!(converted.request.expression_type.as_str(), "SQL2");

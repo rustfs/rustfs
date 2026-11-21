@@ -40,6 +40,8 @@ static DIRTY_USAGE_MUTATION_OBSERVER: LazyLock<StdRwLock<Option<ScannerDirtyUsag
 pub(super) static DIRTY_USAGE_PRODUCER_COVERAGE: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 pub(super) static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
+static SCANNER_CHECKPOINT_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SCANNER_PROCESS_MUTATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(super) static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(super) static SCANNER_MAINTENANCE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 const SCANNER_DURABLE_DIRTY_USAGE_REPLAY_SCHEMA: u16 = 1;
@@ -152,6 +154,7 @@ fn notify_dirty_usage_mutation(
     if bucket.is_empty() {
         return;
     }
+    SCANNER_PROCESS_MUTATED.store(true, Ordering::Release);
     let observer = DIRTY_USAGE_MUTATION_OBSERVER
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1370,6 +1373,30 @@ pub(crate) async fn scanner_maintenance_changed() {
 
 pub fn scanner_activity_epoch() -> &'static str {
     SCANNER_ACTIVITY_EPOCH.as_str()
+}
+
+/// Identity used only for checkpoint continuity, never for RPC or dirty ACKs.
+/// Without a consumed clean-shutdown receipt it is the fresh process identity.
+pub fn scanner_checkpoint_instance_id() -> &'static str {
+    SCANNER_CHECKPOINT_INSTANCE.get_or_init(|| scanner_activity_epoch().to_owned())
+}
+
+/// Dirty replay is not a new mutation. Live invalidations prevent handing
+/// checkpoint authority to another process even after their dirty ACKs drain.
+pub fn scanner_process_was_read_only() -> bool {
+    !SCANNER_PROCESS_MUTATED.load(Ordering::Acquire) && scanner_maintenance_generation() == 0
+}
+
+/// Restore continuity before starting any scanner or mutation producer.
+/// The caller must first consume matching, durable, read-only shutdown receipts
+/// on every local disk. Returns false for invalid or already initialized state.
+pub fn restore_scanner_checkpoint_instance_id(instance: &str) -> bool {
+    instance.len() == 32
+        && instance
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && instance.bytes().any(|byte| byte != b'0')
+        && SCANNER_CHECKPOINT_INSTANCE.set(instance.to_owned()).is_ok()
 }
 
 pub fn scanner_dirty_usage_state() -> ScannerDirtyUsageState {

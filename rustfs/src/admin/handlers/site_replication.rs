@@ -8769,18 +8769,14 @@ impl Operation for SiteReplicationRepairHandler {
                 .to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let response = execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
+        let (status, headers, body) = execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
             local_peer,
             preflight_token: supplied_token.to_string(),
             operation_id,
             signing_key,
         })
         .await?;
-        // The repair executor still answers with the s3s response type; the
-        // router reads the status from the output tuple, so only the tuple and
-        // the headers carry over to the owned response.
-        let (status, body) = response.output;
-        Ok(AdminResponse::with_headers(status, body.into(), response.headers))
+        Ok(AdminResponse::with_headers(status, body, headers))
     }
 }
 
@@ -14073,18 +14069,18 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../crates/ecstore/tests/fixtures/bucket-config-goldens/lifecycle/minio.in.xml"
         ));
-        let mut old_reader = s3s::xml::Deserializer::new(raw);
-        let old: s3s::dto::BucketLifecycleConfiguration =
-            s3s::xml::Deserialize::deserialize(&mut old_reader).expect("read the actual old lifecycle expiry axis");
-        old_reader.expect_eof().expect("the old expiry reader consumes the document");
-        let old_axis = OffsetDateTime::from(old.expiry_updated_at.expect("the old config contains its expiry axis"));
+        // Answer of s3s 5761ddfe (`Timestamp::parse(DateTime)` on this document's
+        // ExpiryUpdatedAt). The owned axis must keep that instant.
+        let legacy_axis =
+            parse_lifecycle_date("2026-07-07T15:58:57.337315Z").expect("the legacy expiry axis is the minio.in.xml value");
         let new = deserialize(raw).expect("read the persisted lifecycle expiry axis");
         let new_axis = local_lifecycle_staleness_axis(Some(&new), OffsetDateTime::UNIX_EPOCH)
             .expect("the parsed lifecycle axis is readable");
         let incoming = parse_lifecycle_date("2026-07-07T15:58:57.337100Z").expect("the incoming expiry axis is valid");
+        assert_eq!(new_axis, legacy_axis, "the parsed axis must keep the legacy submillisecond instant");
         assert_eq!(
             is_stale_update(new_axis, Some(incoming)),
-            is_stale_update(old_axis, Some(incoming)),
+            is_stale_update(legacy_axis, Some(incoming)),
             "a peer update older than the full-precision local axis must remain stale"
         );
     }
