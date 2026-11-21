@@ -757,10 +757,20 @@ impl DataUsageCache {
             _ => (inline.clone(), None),
         };
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
-        let display_progress = timeout(Duration::from_secs(2), self.prepare_display_progress(store.clone(), expected_epoch))
-            .await
-            .ok()
-            .flatten();
+        let display_progress = timeout(Duration::from_secs(2), async {
+            let input = if expected_epoch.is_some() && self.info.scan_identity.is_some() && self.info.name != DATA_USAGE_ROOT {
+                match &encoded {
+                    Some(encoded) => encoded.progress_input().await,
+                    None => Some(vec![inline.clone()]),
+                }
+            } else {
+                None
+            };
+            self.prepare_display_progress(store.clone(), expected_epoch, input).await
+        })
+        .await
+        .ok()
+        .flatten();
         let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),

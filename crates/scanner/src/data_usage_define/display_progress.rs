@@ -2,12 +2,75 @@
 // Licensed under the Apache License, Version 2.0.
 
 use super::*;
+use bytes::{Buf, Bytes};
 use rustfs_data_usage::{
     BUCKET_SCAN_PROGRESS_MAX_BYTES, BUCKET_SCAN_PROGRESS_VERSION, BucketScanProgressSource, BucketScanStage,
     bucket_scan_progress_path,
 };
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+
+// A timed-out worker retains its permit until it exits, so repeated saves
+// cannot accumulate CPU work or decoded copies of large checkpoints.
+static DISPLAY_PROGRESS_WORKER: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+async fn extract_progress<F>(
+    admission: crate::ScannerDataUsagePublicationAdmission,
+    workers: Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+    extract: F,
+) -> Option<BucketScanProgressSource>
+where
+    F: FnOnce(CancellationToken) -> Option<BucketScanProgressSource> + Send + 'static,
+{
+    // Only capture the durable movement generation under admission. CPU work
+    // and waiting for the bounded worker must never retain the movement fence.
+    drop(admission);
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let permit = tokio::time::timeout_at(deadline, workers.acquire_owned()).await.ok()?.ok()?;
+    let (complete, result) = tokio::sync::oneshot::channel();
+    let runtime = tokio::runtime::Handle::current();
+    // A dedicated, admitted CPU worker cannot occupy the native I/O pool
+    // needed to finish the primary save after this waiter has expired.
+    std::thread::Builder::new()
+        .name("scanner-progress".into())
+        .spawn(move || {
+            let _runtime = runtime.enter();
+            let _permit = permit;
+            let sample = (!cancel.is_cancelled() && tokio::time::Instant::now() < deadline)
+                .then(|| extract(cancel))
+                .flatten();
+            let _ = complete.send(sample);
+        })
+        .ok()?;
+    tokio::time::timeout_at(deadline, result).await.ok()?.ok()?
+}
+
+struct ProgressInput {
+    chunks: std::collections::VecDeque<Bytes>,
+    cancel: CancellationToken,
+    deadline: tokio::time::Instant,
+}
+
+impl std::io::Read for ProgressInput {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() || tokio::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        while self.chunks.front().is_some_and(Bytes::is_empty) {
+            self.chunks.pop_front();
+        }
+        let Some(chunk) = self.chunks.front_mut() else { return Ok(0) };
+        let count = output.len().min(chunk.len());
+        output[..count].copy_from_slice(&chunk[..count]);
+        chunk.advance(count);
+        Ok(count)
+    }
+}
 
 async fn read_display_progress<S: ScannerObjectIO>(
     store: Arc<S>,
@@ -149,15 +212,29 @@ impl DataUsageCache {
         &self,
         store: Arc<S>,
         expected_epoch: Option<u64>,
+        input: Option<Vec<Bytes>>,
     ) -> Option<(String, Vec<u8>, DataUsageCacheRevision)> {
         if self.info.name.is_empty() || self.info.name == DATA_USAGE_ROOT || self.info.scan_identity.is_none() {
             return None;
         }
         let expected_epoch = expected_epoch?;
+        let input = input?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let admission = scanner_publication_admission_for_epoch(store.clone(), expected_epoch).await?;
         let movement_generation = store.scanner_data_usage_movement_generation().await?;
-        let sample = self.display_scan_progress(movement_generation)?;
-        drop(admission);
+        let sample = extract_progress(admission, DISPLAY_PROGRESS_WORKER.clone(), deadline, move |cancel| {
+            let reader = ProgressInput {
+                chunks: input.into(),
+                cancel: cancel.clone(),
+                deadline,
+            };
+            let cache: DataUsageCache = rmp_serde::from_read(reader).ok()?;
+            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            cache.display_scan_progress(movement_generation)
+        })
+        .await?;
         if expected_epoch != sample.publication_epoch {
             return None;
         }
@@ -210,6 +287,176 @@ impl DataUsageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReleaseWorker(Option<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for ReleaseWorker {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn display_progress_extraction_releases_movement_guard_before_cpu_work() {
+        let movement = Arc::new(tokio::sync::RwLock::new(()));
+        let admission = crate::ScannerDataUsagePublicationAdmission::fenced(movement.clone().read_owned().await, 0);
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let release = ReleaseWorker(Some(release));
+        let task = tokio::spawn(extract_progress(
+            admission,
+            Arc::new(Semaphore::new(1)),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            move |_| {
+                let _ = started.send(());
+                blocked
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("bounded test worker release");
+                None
+            },
+        ));
+        entered.await.expect("CPU projection started");
+        assert!(
+            movement.try_write().is_ok(),
+            "a running diagnostic projection must not hold movement admission"
+        );
+        drop(release);
+        assert!(task.await.expect("projection task").is_none());
+    }
+
+    #[tokio::test]
+    async fn display_progress_timeout_keeps_detached_cpu_work_bounded() {
+        let movement = Arc::new(tokio::sync::RwLock::new(()));
+        let workers = Arc::new(Semaphore::new(1));
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (finished, stopped) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let release = ReleaseWorker(Some(release));
+        let admission = crate::ScannerDataUsagePublicationAdmission::fenced(movement.clone().read_owned().await, 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let first = tokio::spawn(extract_progress(admission, workers.clone(), deadline, move |cancel| {
+            let _ = started.send(());
+            blocked
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bounded test worker release");
+            let _ = finished.send(cancel.is_cancelled());
+            None
+        }));
+        entered.await.expect("CPU work entered");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(first.await.expect("expired waiter").is_none());
+        assert!(
+            movement.try_write().is_ok(),
+            "expired diagnostics cannot block movement or primary publication"
+        );
+        assert_eq!(workers.available_permits(), 0, "the detached worker retains its resource admission");
+
+        let admission = crate::ScannerDataUsagePublicationAdmission::fenced(movement.clone().read_owned().await, 0);
+        let next_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let queued = tokio::spawn(extract_progress(admission, workers.clone(), next_deadline, |_| {
+            panic!("an expired waiter must not queue another CPU worker")
+        }));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(queued.await.expect("second expired waiter").is_none());
+        drop(release);
+        tokio::time::resume();
+        assert!(stopped.await.expect("worker stopped after cancellation"));
+        let permit = timeout(Duration::from_secs(5), workers.acquire_owned())
+            .await
+            .expect("worker releases its permit")
+            .expect("worker gate remains open");
+        drop(permit);
+    }
+
+    #[test]
+    fn display_progress_cpu_work_cannot_starve_native_io_workers() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime with one native I/O worker");
+        runtime.block_on(async {
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let release = ReleaseWorker(Some(release));
+            let task = tokio::spawn(extract_progress(
+                crate::ScannerDataUsagePublicationAdmission::unfenced(),
+                Arc::new(Semaphore::new(1)),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                move |_| {
+                    let _ = started.send(());
+                    blocked
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("bounded diagnostic worker");
+                    None
+                },
+            ));
+            entered.await.expect("diagnostic CPU worker started");
+            let native_io = timeout(Duration::from_secs(1), tokio::task::spawn_blocking(|| 7)).await;
+            drop(release);
+            assert!(task.await.expect("released diagnostic task").is_none());
+            assert_eq!(
+                native_io
+                    .expect("diagnostics must leave native I/O available")
+                    .expect("native job"),
+                7
+            );
+        });
+    }
+
+    #[test]
+    fn display_progress_input_honors_cancellation_and_deadline() {
+        use std::io::Read;
+        let cancel = CancellationToken::new();
+        let mut reader = ProgressInput {
+            chunks: vec![Bytes::from_static(b"a"), Bytes::new(), Bytes::from_static(b"bc")].into(),
+            cancel: cancel.clone(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        };
+        let mut bytes = [0; 1];
+        assert_eq!(reader.read(&mut bytes).expect("first shared chunk"), 1);
+        assert_eq!(bytes, *b"a");
+        cancel.cancel();
+        assert_eq!(
+            reader.read(&mut bytes).expect_err("cancelled decode").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        reader.cancel = CancellationToken::new();
+        reader.deadline = tokio::time::Instant::now();
+        assert_eq!(reader.read(&mut bytes).expect_err("expired decode").kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn display_progress_decodes_shared_chunks_without_changing_usage() {
+        let mut cache = checkpoint();
+        cache.info.snapshot_complete = true;
+        cache.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                objects: 3,
+                size: 33,
+                ..Default::default()
+            },
+        );
+        let expected = cache.display_scan_progress(0).expect("complete reference sample");
+        let bytes = cache.marshal_msg().expect("encode checkpoint");
+        let mut chunks = std::collections::VecDeque::new();
+        for part in bytes.chunks(7) {
+            chunks.push_back(Bytes::new());
+            chunks.push_back(Bytes::copy_from_slice(part));
+        }
+        let decoded: DataUsageCache = rmp_serde::from_read(ProgressInput {
+            chunks,
+            cancel: CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        })
+        .expect("decode across fragmented and empty chunks");
+        assert_eq!(decoded.display_scan_progress(0), Some(expected));
+    }
 
     fn checkpoint() -> DataUsageCache {
         let mut cache = DataUsageCache::default();
