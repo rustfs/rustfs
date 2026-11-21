@@ -239,8 +239,6 @@ pub(crate) mod server {
 
         pub(crate) mod rpc {
             pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
-            #[cfg(test)]
-            pub(crate) use s3s::Body;
         }
 
         pub(crate) mod tonic_service {
@@ -376,7 +374,6 @@ pub(crate) mod site_replication {
         };
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedTransition};
-        pub(crate) use s3s::{Body, S3Response};
     }
 }
 
