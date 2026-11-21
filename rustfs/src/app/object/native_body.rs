@@ -395,6 +395,26 @@ mod tests {
     impl std::error::Error for InternalProducerFailure {}
 
     #[tokio::test]
+    async fn io_stream_reports_remaining_rdma_bytes_and_preserves_chunks() {
+        use http_body_util::BodyExt as _;
+        let first = Bytes::from_static(b"abc");
+        let last = Bytes::from_static(b"de");
+        for known in [false, true] {
+            let source = futures::stream::iter([Ok(first.clone()), Ok(last.clone())]);
+            let mut body = from_io_stream_with_length(source, known.then_some(5));
+            assert_eq!(body.caps().contains(PayloadCaps::KNOWN_LENGTH), known);
+            for (expected, remaining) in [(&first, 5), (&last, 2)] {
+                assert_eq!(body.len_hint(), known.then_some(remaining));
+                let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(&chunk, expected);
+                assert_eq!(chunk.as_ptr(), expected.as_ptr());
+            }
+            assert_eq!(body.len_hint(), known.then_some(0));
+            assert!(body.frame().await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn internal_producer_error_preserves_io_kind_and_nested_source_after_data() {
         for kind in [
             std::io::ErrorKind::ConnectionReset,

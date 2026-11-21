@@ -167,7 +167,7 @@ async fn assert_cancelled_responses_are_ignored(bulk: bool) {
         address.clone()
     };
     let result = tokio::time::timeout(Duration::from_secs(30), async {
-        let (channel, _) = dial_channel(&address, &cache_key, Duration::from_secs(10))
+        let (channel, _) = dial_channel(&address, &cache_key, Some(Duration::from_secs(10)))
             .await
             .expect("dial real internode channel");
         let mut client = node_service::node_service_client::NodeServiceClient::new(channel);
@@ -265,7 +265,7 @@ async fn cancelled_stream_retention_preserves_the_protocol_error_limit() {
     let (attack_tx, attack_rx) = oneshot::channel();
     let mut peer = tokio::spawn(unsolicited_response_peer(listener, attack_rx));
     let result = tokio::time::timeout(Duration::from_secs(30), async {
-        let (channel, _) = dial_channel(&address, &address, Duration::from_secs(10))
+        let (channel, _) = dial_channel(&address, &address, Some(Duration::from_secs(10)))
             .await
             .expect("dial real internode channel");
         let mut client = node_service::node_service_client::NodeServiceClient::new(channel);

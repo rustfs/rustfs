@@ -3990,7 +3990,7 @@ pub async fn get_internode_channel_for_class(addr: &str, class: ChannelClass) ->
             if let Some(channel) = cached_channel_for_tls_generation(addr, addr).await {
                 return Ok(channel);
             }
-            return build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+            return build_channel_until(addr, addr, deadline, Some(internode_rpc_timeout())).await;
         }
 
         let pool_size = bulk_channel_pool_size();
@@ -4000,7 +4000,7 @@ pub async fn get_internode_channel_for_class(addr: &str, class: ChannelClass) ->
         if let Some(channel) = cached_channel_for_tls_generation(addr, &cache_key).await {
             return Ok(channel);
         }
-        build_channel_until(addr, &cache_key, deadline, internode_rpc_timeout()).await
+        build_channel_until(addr, &cache_key, deadline, Some(internode_rpc_timeout())).await
     })
     .await
     .map_err(channel_acquisition_timeout)?
@@ -4047,7 +4047,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// channels to the same peer be cached independently.
 async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<InternodeChannel, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
-    build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
+    build_channel_until(dial_addr, cache_key, deadline, Some(internode_rpc_timeout())).await
 }
 
 /// A separate channel deadline for slow authenticated recovery work. The cache
@@ -4091,16 +4091,32 @@ pub async fn create_internode_channel_with_timeout(
 ) -> Result<InternodeChannel, DeleteRecoveryChannelError> {
     let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
-    build_channel_until(addr, &cache_key, deadline, rpc_timeout)
+    build_channel_until(addr, &cache_key, deadline, Some(rpc_timeout))
         .await
         .map_err(DeleteRecoveryChannelError::Connection)
+}
+
+fn staged_verify_cache_key(addr: &str) -> String {
+    format!("{addr}\0verify-shard")
+}
+
+/// Acquire a per-peer channel for VerifyFile requests carrying a deadline sized
+/// for the staged shard. Connection establishment uses the usual connect timeout.
+///
+/// # Errors
+///
+/// Returns an error if the authenticated internode transport cannot be established.
+pub async fn staged_shard_verification_channel(addr: &str) -> Result<InternodeChannel, Box<dyn Error>> {
+    let cache_key = staged_verify_cache_key(addr);
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(addr, &cache_key, deadline, None).await
 }
 
 async fn build_channel_until(
     dial_addr: &str,
     cache_key: &str,
     deadline: tokio::time::Instant,
-    rpc_timeout: Duration,
+    rpc_timeout: Option<Duration>,
 ) -> Result<InternodeChannel, Box<dyn Error>> {
     tokio::time::timeout_at(deadline, async {
         if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
@@ -4208,7 +4224,7 @@ impl hyper::rt::Executor<std::pin::Pin<Box<dyn std::future::Future<Output = ()> 
 async fn dial_channel(
     dial_addr: &str,
     cache_key: &str,
-    rpc_timeout: Duration,
+    rpc_timeout: Option<Duration>,
 ) -> Result<(InternodeChannel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
@@ -4241,9 +4257,10 @@ async fn dial_channel(
         // How long to wait for PING ACK before considering connection dead
         .keep_alive_timeout(http2_keepalive_timeout)
         // Send PINGs even when no active streams (critical for idle connections)
-        .keep_alive_while_idle(true)
-        // Overall timeout for any RPC - fail fast on unresponsive peers
-        .timeout(rpc_timeout);
+        .keep_alive_while_idle(true);
+    if let Some(timeout) = rpc_timeout {
+        endpoint = endpoint.timeout(timeout);
+    }
 
     // Apply the selected receive-credit policy. A zero setting delegates to the linked
     // library's defaults; isolated bulk channels can override the common RPC settings.
@@ -4376,6 +4393,7 @@ pub async fn evict_failed_connection_with_reason(
         level => level,
     };
     evict_cached_channel_for_reason(addr, cache_log_level, Some(reason)).await;
+    evict_cached_channel_for_reason(&staged_verify_cache_key(addr), cache_log_level, Some(reason)).await;
 
     // An RPC-triggered eviction is a peer-failure signal; feed it into the online/offline state so
     // the peer flips offline after enough consecutive failures (grpc-optimization P3).
@@ -4824,7 +4842,7 @@ mod tests {
         let addr = "https://tls02-stale-cache.invalid:9000";
         let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
         let stale_generation = generation.checked_add(1).unwrap_or(0);
-        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+        for key in [addr.to_string(), bulk_cache_key(addr, 0), staged_verify_cache_key(addr)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
             TLS_GENERATION_CACHE.write().await.insert(key.clone(), stale_generation);
             assert!(
@@ -4842,7 +4860,7 @@ mod tests {
     async fn tls02_missing_https_generation_control_and_bulk_cache_entries_are_evicted() {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "https://tls02-missing-generation.invalid:9000";
-        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+        for key in [addr.to_string(), bulk_cache_key(addr, 0), staged_verify_cache_key(addr)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
             TLS_GENERATION_CACHE.write().await.remove(&key);
             assert!(
@@ -4886,7 +4904,7 @@ mod tests {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "https://tls02-current-generation.invalid:9000";
         let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
-        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+        for key in [addr.to_string(), bulk_cache_key(addr, 0), staged_verify_cache_key(addr)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
             TLS_GENERATION_CACHE.write().await.insert(key.clone(), generation);
             assert!(
@@ -4904,7 +4922,7 @@ mod tests {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "http://tls02-http-cache.invalid:9000";
         let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
-        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+        for key in [addr.to_string(), bulk_cache_key(addr, 0), staged_verify_cache_key(addr)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
             TLS_GENERATION_CACHE
                 .write()
@@ -5269,7 +5287,7 @@ mod tests {
             started_rx.await.expect("blocking worker is occupied");
             let errors_before = runtime_sources::grpc_dial_errors_total();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-            let result = build_channel_until(&addr, &addr, deadline, internode_rpc_timeout()).await;
+            let result = build_channel_until(&addr, &addr, deadline, Some(internode_rpc_timeout())).await;
             let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
             let timed_out = result
                 .as_ref()
@@ -5364,7 +5382,7 @@ mod tests {
         for _ in 0..8 {
             tasks.push(tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-                let result = build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+                let result = build_channel_until(addr, addr, deadline, Some(internode_rpc_timeout())).await;
                 result.err().is_some_and(|error| {
                     error
                         .downcast_ref::<std::io::Error>()
@@ -5836,7 +5854,7 @@ mod tests {
             [(rustfs_config::ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE, Some("4294967295"))],
             async {
                 let addr = "http://127.0.0.1:1";
-                let error = dial_channel(addr, &bulk_cache_key(addr, 0), Duration::from_secs(1))
+                let error = dial_channel(addr, &bulk_cache_key(addr, 0), Some(Duration::from_secs(1)))
                     .await
                     .expect_err("reject overflowing bulk window");
                 assert_eq!(
