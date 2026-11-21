@@ -906,9 +906,7 @@ mod tests {
             .expect_err("full queue rejects immediately");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
-        let response = s3s::S3Error::from(error)
-            .to_http_response()
-            .expect("serialize admission error");
+        let response = error.to_http_response().expect("serialize admission error");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
         use http_body_util::BodyExt as _;

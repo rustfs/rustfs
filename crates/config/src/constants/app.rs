@@ -21,6 +21,11 @@ pub const APP_NAME: &str = "RustFS";
 /// Cargo package version for this workspace member.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Opt in to scanner checkpoint continuity across verified read-only restarts.
+/// Defaults to false. Enable only after all possible writers support receipt
+/// consumption; disable and restart before rolling back to an older writer.
+pub const ENV_SCANNER_READ_ONLY_HANDOFF: &str = "RUSTFS_SCANNER_READ_ONLY_HANDOFF";
+
 /// Default configuration logger level
 /// Default value: error
 /// Environment variable: RUSTFS_OBS_LOGGER_LEVEL
