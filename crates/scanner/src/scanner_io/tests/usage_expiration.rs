@@ -80,6 +80,98 @@ async fn disk_scan_withdraws_persisted_lifecycle_policy() {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn compacted_prefix_expiration_between_usage_samples() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 4).await;
+    let bucket = "compacted-expiration";
+    let expired = "photos/vehicle/old.jpg";
+    let fresh = "photos/vehicle/new.jpg";
+    let unrelated = "archive/old.jpg";
+    let now = OffsetDateTime::now_utc();
+    let old = now - time::Duration::days(4);
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    for (key, mod_time) in [(expired, old), (fresh, now), (unrelated, old)] {
+        let mut reader = ScannerPutObjReader::from_vec(vec![1]);
+        store
+            .put_object(
+                bucket,
+                key,
+                &mut reader,
+                &ScannerObjectOptions {
+                    mod_time: Some(mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write dated object");
+    }
+    let disks = scanner_set_disk_inventory(&store.pools[0].disk_set[0]).await;
+    let scan = async |cache| {
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, Default::default());
+        let outcome = disks[0]
+            .clone()
+            .nsscanner_disk(
+                ctx,
+                budget.clone(),
+                disks.clone(),
+                cache,
+                None,
+                ScannerDiskScanOptions {
+                    scan_mode: HealScanMode::Normal,
+                    prefix_scan_scope: None,
+                    checkpoint_tx: None,
+                },
+            )
+            .await
+            .expect("scan bucket");
+        let ScannerDiskScanOutcome::Complete(cache) = outcome else { panic!("expected complete scan") };
+        (cache, budget.progress().0)
+    };
+    let mut cache = DataUsageCache::default();
+    cache.info.name = bucket.into();
+    let (mut cache, scanned) = scan(cache).await;
+    assert_eq!(scanned, 3);
+    let prefixes = ["photos", "archive"].map(|prefix| rustfs_data_usage::hash_path(&format!("{bucket}/{prefix}")));
+    assert!(prefixes.iter().all(|prefix| cache.is_compacted(prefix)));
+    let xml = br#"<LifecycleConfiguration><Rule><ID>photos</ID><Status>Enabled</Status><Filter><Prefix>photos/vehicle/</Prefix></Filter><Expiration><Days>2</Days></Expiration></Rule></LifecycleConfiguration>"#;
+    update_bucket_metadata(bucket, BUCKET_LIFECYCLE_CONFIG, xml.to_vec())
+        .await
+        .expect("configure expiration");
+    init_background_expiry(store.clone()).await;
+    let (_, scanned) = temp_env::async_with_vars([("RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES", None::<&str>)], async {
+        let interval = crate::scanner_folder::data_usage_update_dir_cycles();
+        let off_cycle = (1..=interval)
+            .find(|cycle| prefixes.iter().all(|prefix| !prefix.mod_(*cycle, interval)))
+            .expect("cycle that samples neither compacted prefix");
+        cache.info.next_cycle = u64::from(off_cycle);
+        scan(cache).await
+    })
+    .await;
+    assert_eq!(scanned, 2, "visit the matching subtree and reuse the unrelated prefix");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match store.get_object_info(bucket, expired, &ScannerObjectOptions::default()).await {
+                Err(Error::ObjectNotFound(_, _)) => break,
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(err) => panic!("read expired object: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("expiry worker must delete the old matching object");
+    for key in [fresh, unrelated] {
+        store
+            .get_object_info(bucket, key, &ScannerObjectOptions::default())
+            .await
+            .expect("retain non-expiring object");
+    }
+}
+
 // Lifecycle expiry goes through the process-global store, which the first
 // store created in the process claims. Nextest runs this test in its own
 // process; the lifecycle scenarios share the store that owns expiry processing.
