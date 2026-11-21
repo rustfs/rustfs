@@ -81,7 +81,7 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
         // left quarantined targets so the caller can retry with a fixed config.
         // The reconciliation path quarantines instead and stays admin-usable.
         let result = task_system.set_targets_enabled(true, Some(config)).await.and_then(|()| {
-            if task_system.runtime_lifecycle_is_converged() {
+            if task_system.runtime_lifecycle_all_targets_activated() {
                 Ok(())
             } else {
                 Err(NotificationError::Initialization(

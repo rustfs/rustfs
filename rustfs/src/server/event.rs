@@ -172,7 +172,7 @@ fn ensure_live_events_initialized() -> std::sync::Arc<NotificationSystem> {
 /// reported by the admin target list. Only an unpublished generation means the
 /// runtime is not available yet.
 fn ensure_event_notifier_converged(system: &NotificationSystem) -> Result<(), NotificationError> {
-    if system.runtime_lifecycle_is_published() {
+    if system.runtime_lifecycle_is_converged() {
         Ok(())
     } else {
         Err(NotificationError::Initialization(

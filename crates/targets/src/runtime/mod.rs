@@ -87,14 +87,7 @@ where
     E: PluginEvent,
 {
     Ready(SharedTarget<E>),
-    Degraded {
-        error: TargetError,
-        target: SharedTarget<E>,
-    },
-    Failed {
-        error: TargetError,
-        target: Box<dyn Target<E> + Send + Sync>,
-    },
+    Degraded { error: TargetError, target: SharedTarget<E> },
     Cancelled(Box<dyn Target<E> + Send + Sync>),
 }
 
@@ -537,12 +530,7 @@ where
     ) -> (mpsc::Sender<()>, JoinHandle<()>),
 {
     let shared = match prepare_target(target, None).await {
-        PrepareTargetResult::Ready(target) => target,
-        PrepareTargetResult::Degraded { target, .. } => target,
-        PrepareTargetResult::Failed { target, .. } => {
-            let _ = target.close().await;
-            return None;
-        }
+        PrepareTargetResult::Ready(target) | PrepareTargetResult::Degraded { target, .. } => target,
         PrepareTargetResult::Cancelled(_) => unreachable!("preparation without a cancellation token cannot be cancelled"),
     };
     let target_id = shared.id().to_string();
@@ -567,7 +555,6 @@ where
     E: PluginEvent,
 {
     let target_id = target.id().to_string();
-    let has_store = target.store().is_some();
 
     let init_result = match cancellation {
         Some(cancellation) => {
@@ -582,13 +569,9 @@ where
 
     if let Err(err) = init_result {
         tracing::error!(target_id = %target_id, reason = "initialization_failed", "Failed to initialize target");
-        if !has_store {
-            return PrepareTargetResult::Failed { error: err, target };
-        }
-        tracing::warn!(
-            target_id = %target_id,
-            "Proceeding with store-backed target despite init failure"
-        );
+        // Keep the target in the runtime whether or not it has a queue store: a
+        // quarantined target self-heals through delivery retries and is reported
+        // by the target list, so recovery never needs a runtime rebuild.
         return PrepareTargetResult::Degraded {
             error: err,
             target: Arc::from(target),

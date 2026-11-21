@@ -21,7 +21,7 @@ use rustfs_config::server_config::Config;
 use rustfs_targets::Target;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -288,6 +288,7 @@ impl LifecycleRuntime for DefaultLifecycleRuntime {
 struct LifecycleCoordinatorInner {
     applied_generation: AtomicU64,
     apply_lock: Mutex<()>,
+    all_targets_activated: AtomicBool,
     desired: StdMutex<DesiredState>,
     publication_gate: Arc<StdMutex<()>>,
     runtime: Arc<dyn LifecycleRuntime>,
@@ -316,6 +317,7 @@ impl NotifyLifecycleCoordinator {
             inner: Arc::new(LifecycleCoordinatorInner {
                 applied_generation: AtomicU64::new(0),
                 apply_lock: Mutex::new(()),
+                all_targets_activated: AtomicBool::new(true),
                 desired: StdMutex::new(DesiredState {
                     cancellation: CancellationToken::new(),
                     config: initial_config,
@@ -364,9 +366,20 @@ impl NotifyLifecycleCoordinator {
         *self.inner.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// Whether the latest accepted generation has been handed to the runtime.
+    /// This is the rebuild trigger and the admin availability gate: a published
+    /// generation stays published until the configuration changes, so one
+    /// unreachable target cannot keep the runtime churning through rebuilds.
     pub(crate) fn is_converged(&self) -> bool {
         let desired_generation = self.inner.desired.lock().unwrap_or_else(|err| err.into_inner()).generation;
         self.inner.applied_generation.load(Ordering::Acquire) >= desired_generation
+    }
+
+    /// Whether the last published generation activated every configured target.
+    /// Per-target health is reported by the admin target list; this only drives
+    /// the one-shot `initialize` API's strict contract.
+    pub(crate) fn all_targets_activated(&self) -> bool {
+        self.inner.all_targets_activated.load(Ordering::Acquire)
     }
 
     fn accept<F>(&self, allow_terminated: bool, update: F) -> NotificationLifecycleTransition
@@ -461,9 +474,8 @@ impl LifecycleCoordinatorInner {
 
     fn mark_published(&self, generation: u64, state: NotificationRuntimeState, complete: bool) {
         *self.state.lock().unwrap_or_else(|err| err.into_inner()) = state;
-        if complete {
-            self.applied_generation.store(generation, Ordering::Release);
-        }
+        self.all_targets_activated.store(complete, Ordering::Release);
+        self.applied_generation.store(generation, Ordering::Release);
     }
 }
 
@@ -986,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_activation_quarantines_failed_target_and_same_config_can_retry() {
+    async fn partial_activation_quarantines_failed_target_without_rebuild_churn() {
         // The template's single-failure init budget is shared by every clone the factory hands
         // out, so the "bad" instance fails once in the first generation and recovers on retry.
         let bad_template = MockTarget::new("bad", RETRY_INIT_TARGET_TYPE).with_init_failures(1);
@@ -1021,8 +1033,17 @@ mod tests {
             .await
             .expect("a quarantined target must not fail the lifecycle transition");
         let partial = runtime_view.runtime_status_snapshot().await;
-        assert_eq!(partial.target_count, 1, "the healthy target should remain fault-isolated and active");
-        assert!(!coordinator.is_converged(), "a partial generation must remain retryable");
+        assert_eq!(partial.target_count, 2, "a quarantined target stays in the runtime beside healthy ones");
+        // A published generation must not look stale: otherwise the reconciler
+        // tears the whole runtime down and rebuilds it on every tick.
+        assert!(
+            coordinator.is_converged(),
+            "a quarantined target must not leave the generation unpublished"
+        );
+        assert!(
+            !coordinator.all_targets_activated(),
+            "the quarantined target is still reported as not fully activated"
+        );
         assert_eq!(coordinator.state(), NotificationRuntimeState::TargetsEnabled { generation: 1 });
 
         coordinator
@@ -1033,6 +1054,7 @@ mod tests {
         let recovered = runtime_view.runtime_status_snapshot().await;
         assert_eq!(recovered.target_count, 2);
         assert!(coordinator.is_converged());
+        assert!(coordinator.all_targets_activated(), "the transient failure recovers on the next apply");
         assert_eq!(coordinator.state(), NotificationRuntimeState::TargetsEnabled { generation: 2 });
 
         coordinator

@@ -20,7 +20,7 @@ use std::sync::Arc;
 pub(crate) async fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
     if is_event_notifier_reconciled()
         && let Some(system) = rustfs_notify::notification_system()
-        && system.runtime_lifecycle_is_published()
+        && system.runtime_lifecycle_is_converged()
     {
         return Ok(system);
     }
@@ -30,7 +30,7 @@ pub(crate) async fn get_notification_system() -> S3Result<Arc<rustfs_notify::Not
         .map_err(|err| s3_error!(InternalError, "failed to reconcile notification runtime: {}", err))?;
     let system =
         rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
-    if !system.runtime_lifecycle_is_published() {
+    if !system.runtime_lifecycle_is_converged() {
         return Err(s3_error!(InternalError, "latest notification lifecycle generation has not converged"));
     }
     Ok(system)
