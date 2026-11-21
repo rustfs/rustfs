@@ -77,6 +77,32 @@ fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, c
     (can_list_bucket || can_get_bucket_location, can_put_object)
 }
 
+fn admin_scan_progress(progress: rustfs_data_usage::BucketScanProgress) -> rustfs_madmin::BucketScanProgress {
+    use rustfs_data_usage::BucketScanStage;
+    let rustfs_data_usage::BucketScanProgress {
+        stage,
+        updated_at,
+        objects,
+        size,
+        sources_observed,
+        sources_total,
+    } = progress;
+
+    rustfs_madmin::BucketScanProgress {
+        stage: match stage {
+            BucketScanStage::Enumerating => rustfs_madmin::BucketScanStage::Enumerating,
+            BucketScanStage::Scanning => rustfs_madmin::BucketScanStage::Scanning,
+            BucketScanStage::AwaitingSources => rustfs_madmin::BucketScanStage::AwaitingSources,
+            BucketScanStage::Completed => rustfs_madmin::BucketScanStage::Completed,
+        },
+        updated_at,
+        objects,
+        size,
+        sources_observed,
+        sources_total,
+    }
+}
+
 fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAccessInfo, usage: Option<&BucketUsageInfo>) {
     // No snapshot coverage for this bucket: leave the stats absent so clients
     // render "unknown" instead of confirmed zeros (rustfs/backlog#1306).
@@ -86,7 +112,15 @@ fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAcce
 
     bucket_info.size = Some(usage.size);
     bucket_info.objects = Some(usage.objects_count);
-    bucket_info.usage_value_state = usage.usage_value_state;
+    bucket_info.usage_value_state = usage.usage_value_state.map(|state| {
+        use rustfs_data_usage::BucketUsageValueState;
+        match state {
+            BucketUsageValueState::Certified => rustfs_madmin::BucketUsageValueState::Certified,
+            BucketUsageValueState::Carried => rustfs_madmin::BucketUsageValueState::Carried,
+            BucketUsageValueState::Observed => rustfs_madmin::BucketUsageValueState::Observed,
+            BucketUsageValueState::Unknown => rustfs_madmin::BucketUsageValueState::Unknown,
+        }
+    });
     bucket_info.usage_updated_at = usage.usage_certification.and_then(|certificate| {
         u64::try_from(
             certificate
@@ -317,7 +351,7 @@ impl Operation for AccountInfoHandler {
             .collect::<Vec<_>>();
         let mut progress = load_bucket_scan_progress_for_admin(store, &visible_buckets, &data_usage_info).await;
         for bucket in &mut account_info.buckets {
-            bucket.scan_progress = progress.remove(&bucket.name);
+            bucket.scan_progress = progress.remove(&bucket.name).map(admin_scan_progress);
         }
 
         let data = serde_json::to_vec(&AccountInfoResponse {
@@ -433,17 +467,53 @@ mod tests {
     }
 
     #[test]
+    fn accountinfo_scanner_fields_preserve_the_wire_format() {
+        use rustfs_data_usage::{BucketScanProgress, BucketScanStage::*, BucketUsageValueState::*};
+        for (stage, state, counts) in [
+            (Enumerating, Unknown, None),
+            (Scanning, Observed, Some((7, 71))),
+            (AwaitingSources, Carried, None),
+            (Completed, Certified, Some((0, 0))),
+        ] {
+            let progress = BucketScanProgress {
+                stage,
+                updated_at: 1000,
+                objects: counts.map(|(objects, _)| objects),
+                size: counts.map(|(_, size)| size),
+                sources_observed: 1,
+                sources_total: 2,
+            };
+            let expected = serde_json::to_value(&progress).unwrap();
+            let mut bucket = rustfs_madmin::BucketAccessInfo {
+                scan_progress: Some(admin_scan_progress(progress)),
+                ..Default::default()
+            };
+            let usage = BucketUsageInfo {
+                usage_value_state: Some(state),
+                ..Default::default()
+            };
+            apply_usage_to_bucket_access_info(&mut bucket, Some(&usage));
+            let wire = serde_json::to_value(&bucket).unwrap();
+            assert_eq!(wire["scan_progress"], expected);
+            assert_eq!(wire["usage_value_state"], serde_json::to_value(state).unwrap());
+            let decoded: rustfs_madmin::BucketAccessInfo = serde_json::from_value(wire).unwrap();
+            assert_eq!(decoded.scan_progress, bucket.scan_progress);
+            assert_eq!(decoded.usage_value_state, bucket.usage_value_state);
+        }
+    }
+
+    #[test]
     fn accountinfo_partial_progress_never_fills_total_usage_fields() {
         let mut bucket_info = rustfs_madmin::BucketAccessInfo {
             name: "scanning".into(),
-            scan_progress: Some(rustfs_data_usage::BucketScanProgress {
+            scan_progress: Some(admin_scan_progress(rustfs_data_usage::BucketScanProgress {
                 stage: rustfs_data_usage::BucketScanStage::Scanning,
                 updated_at: 1000,
                 objects: Some(7),
                 size: Some(71),
                 sources_observed: 1,
                 sources_total: 2,
-            }),
+            })),
             ..Default::default()
         };
         apply_usage_to_bucket_access_info(&mut bucket_info, None);

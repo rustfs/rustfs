@@ -408,14 +408,44 @@ pub struct AccountInfo {
     pub usage_snapshot_converged: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketScanStage {
+    Enumerating,
+    Scanning,
+    AwaitingSources,
+    Completed,
+}
+
+/// Partial usage reported by the scanner for display in the admin API.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BucketScanProgress {
+    pub stage: BucketScanStage,
+    pub updated_at: u64,
+    pub objects: Option<u64>,
+    pub size: Option<u64>,
+    pub sources_observed: u64,
+    pub sources_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketUsageValueState {
+    Certified,
+    Carried,
+    Observed,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketAccessInfo {
     pub name: String,
     /// Display-only accepted scan progress, never a replacement for total usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scan_progress: Option<rustfs_data_usage::BucketScanProgress>,
+    pub scan_progress: Option<BucketScanProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage_value_state: Option<rustfs_data_usage::BucketUsageValueState>,
+    pub usage_value_state: Option<BucketUsageValueState>,
     /// Unix milliseconds of the original complete statistic, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_updated_at: Option<u64>,
@@ -762,6 +792,19 @@ mod tests {
         assert!(!obj.contains_key("objects"));
         assert!(!obj.contains_key("object_sizes_histogram"));
         assert!(!obj.contains_key("object_versions_histogram"));
+        assert!(!obj.contains_key("scan_progress"));
+        assert!(!obj.contains_key("usage_value_state"));
+        let legacy: BucketAccessInfo = serde_json::from_value(value).unwrap();
+        assert!(legacy.scan_progress.is_none());
+        assert!(legacy.usage_value_state.is_none());
+    }
+
+    #[test]
+    fn bucket_access_info_accepts_future_usage_value_states() {
+        let mut wire = serde_json::to_value(BucketAccessInfo::default()).unwrap();
+        wire["usage_value_state"] = serde_json::json!("future_state");
+        let bucket: BucketAccessInfo = serde_json::from_value(wire).unwrap();
+        assert_eq!(bucket.usage_value_state, Some(BucketUsageValueState::Unknown));
     }
 
     /// Wire pin (rustfs/backlog#1306): populated usage stats keep their
