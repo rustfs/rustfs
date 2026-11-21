@@ -15,6 +15,7 @@ struct Observation {
     name_bytes: u64,
     first_entry: Option<String>,
     last_entry: Option<String>,
+    cancel_owner: Option<CancellationToken>,
 }
 
 static OBSERVATION: Mutex<Option<Observation>> = Mutex::new(None);
@@ -38,7 +39,11 @@ pub(in crate::scanner_folder) fn observe_raw_entry(dir: &str, name: &std::ffi::O
         observation.entries += 1;
         observation.name_bytes += u64::try_from(name.as_encoded_bytes().len()).expect("bounded entry name");
         if observation.entries >= observation.limit {
-            budget.cancel_for_runtime();
+            if let Some(owner) = &observation.cancel_owner {
+                owner.cancel();
+            } else {
+                budget.cancel_for_runtime();
+            }
         }
     }
 }
@@ -63,8 +68,24 @@ pub(in crate::scanner_folder) fn install_raw_entry_budget(root: PathBuf, limit: 
         name_bytes: 0,
         first_entry: None,
         last_entry: None,
+        cancel_owner: None,
     });
     ObservationGuard
+}
+
+pub(in crate::scanner_folder) fn install_raw_entry_owner_cancel(
+    root: PathBuf,
+    limit: u64,
+    owner: CancellationToken,
+) -> ObservationGuard {
+    let guard = install_raw_entry_budget(root, limit);
+    OBSERVATION
+        .lock()
+        .expect("install owner cancellation")
+        .as_mut()
+        .expect("installed observation")
+        .cancel_owner = Some(owner);
+    guard
 }
 
 #[derive(serde::Deserialize)]

@@ -653,6 +653,7 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
     cache.replace("bucket", "", DataUsageEntry::default());
     let revisions = DataUsageCacheRevisions {
         main: DataUsageCacheRevision::Missing,
+        damaged_pages: DamagedPages::default(),
         backup: None,
     };
 
@@ -2857,6 +2858,7 @@ async fn test_save_backup_budget_tracks_primary_cost() {
         let store = Arc::new(store);
         let revisions = DataUsageCacheRevisions {
             main: DataUsageCacheRevision::Missing,
+            damaged_pages: DamagedPages::default(),
             backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
         };
         DataUsageCache::default()
@@ -2909,6 +2911,7 @@ async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
             let store = Arc::new(store);
             let revisions = DataUsageCacheRevisions {
                 main: DataUsageCacheRevision::Missing,
+                damaged_pages: DamagedPages::default(),
                 backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
             };
             let started = Instant::now();
@@ -2921,7 +2924,15 @@ async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
             .expect("a successful or reconciled primary must survive a best-effort backup failure");
             assert_eq!(store.put_attempts[0].load(Ordering::SeqCst), 3);
             assert_eq!(store.put_attempts[1].load(Ordering::SeqCst), 1, "backup writes must not retry");
-            assert_eq!(*store.backup_reads.lock().await, 1, "backup must finish its bounded reconciliation");
+            assert_eq!(
+                *store.backup_reads.lock().await,
+                0,
+                "backup reconciliation must not outlive the total backup budget"
+            );
+            assert!(
+                store.puts.lock().await.iter().all(|put| !put.object.ends_with(".bkp")),
+                "a timed-out backup must not replace the previous fallback"
+            );
             assert!(started.elapsed() < DataUsageCache::persistence_timeout());
         }
     })

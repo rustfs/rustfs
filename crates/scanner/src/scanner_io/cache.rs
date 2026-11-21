@@ -862,6 +862,7 @@ pub(super) fn completed_data_usage_info(
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     completed_usage_candidate(results, scope, tier_registry_names, bucket_plan_complete, cancelled)
+        .ok()
         .map(|candidate| (candidate.data, candidate.last_update))
 }
 
@@ -880,7 +881,7 @@ pub(super) fn completed_usage_candidate(
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
     cancelled: bool,
-) -> Option<ValidatedUsageCandidate> {
+) -> std::result::Result<ValidatedUsageCandidate, CandidateOutcome> {
     let candidate: std::result::Result<ValidatedUsageCandidate, CandidateOutcome> = (|| {
         if !bucket_plan_complete {
             return Err(CandidateOutcome::InventoryIncomplete);
@@ -1004,7 +1005,7 @@ pub(super) fn completed_usage_candidate(
             Err(outcome) => *outcome,
         },
     );
-    candidate.ok()
+    candidate
 }
 
 fn tier_accounting_proof_is_publishable(
