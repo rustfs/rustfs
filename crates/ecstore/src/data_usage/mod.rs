@@ -15,6 +15,8 @@
 // #730: scanner/data-usage state is partially migrated and still owns staged cache helpers.
 
 pub mod local_snapshot;
+mod scan_progress;
+pub use scan_progress::load_bucket_scan_progress_for_admin;
 
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
