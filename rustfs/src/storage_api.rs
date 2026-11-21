@@ -323,7 +323,7 @@ pub(crate) mod connect {
 /// targets, replication-config primitives, and the config-object lock
 /// helpers its state transaction runs on.
 pub(crate) mod site_replication {
-    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, NamespaceLocking};
     pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::{
         format_lifecycle_date, parse_lifecycle_date,
@@ -353,11 +353,13 @@ pub(crate) mod site_replication {
         ECStore, EndpointServerPools, StorageError, delete_config_no_lock, is_err_bucket_not_found, lock_bucket_targets_metadata,
         read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
     };
+    pub(crate) use crate::storage::storage_api::{RUSTFS_META_BUCKET, get_lock_acquire_timeout};
 
     pub(crate) mod metadata_sys {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            BucketMetadataMutationGuard, acquire_bucket_metadata_transaction_lock_for_incarnation,
             capture_bucket_metadata_incarnation, get, get_replication_config, get_versioning_config, list_bucket_targets,
-            update_if_incarnation,
+            update_if_incarnation, update_under_transaction_lock,
         };
     }
 
