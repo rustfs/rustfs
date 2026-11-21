@@ -2881,10 +2881,7 @@ impl FolderScanner {
             // A directory with queued children keeps its index until they end:
             // a restart replays this listing to reach the unfinished child.
             if indexed && dir_reader.as_ref().is_some_and(|reader| !reader.finished_listing()) {
-                return Err(ScannerError::Io(std::io::Error::new(
-                    ErrorKind::Interrupted,
-                    "scanner directory changed before listing completed",
-                )));
+                return Err(ScannerError::DirectoryChanged);
             }
             if raw_enumeration_complete
                 && dir_reader
@@ -3216,7 +3213,7 @@ impl FolderScanner {
                             outcome
                         }
                         Err(e) => {
-                            if matches!(&e, ScannerError::SourceUnavailable(_)) {
+                            if matches!(&e, ScannerError::SourceUnavailable(_) | ScannerError::DirectoryChanged) {
                                 return Err(e);
                             }
                             if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
@@ -3730,7 +3727,7 @@ impl FolderScanner {
                             )
                             .await
                         {
-                            if matches!(e, ScannerError::SourceUnavailable(_)) {
+                            if matches!(&e, ScannerError::SourceUnavailable(_) | ScannerError::DirectoryChanged) {
                                 return Err(e);
                             }
                             if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
@@ -4075,6 +4072,19 @@ pub(crate) async fn scan_data_folder_scoped(
     {
         stop.stop(crate::scanner_io::ScannerLocalStopReason::Unavailable, &ctx);
     }
+    // A changed directory invalidates the speculative traversal, not the disk.
+    // Keep the input tree as an uncertified value. The incomplete-sweep path
+    // discards every cursor and parks no work from the raced generation.
+    let outcome = if matches!(outcome, Err(ScannerError::DirectoryChanged)) {
+        scanner.coverage_gap = true;
+        scanner.new_cache.cache = std::mem::take(&mut scanner.old_cache.cache);
+        scanner.new_cache.info.scan_bucket_observations.clear();
+        scanner.new_cache.info.scan_bucket_value_origins.clear();
+        scanner.new_cache.info.lkg_snapshot_complete = false;
+        Ok(())
+    } else {
+        outcome
+    };
     match outcome {
         Ok(()) => {
             directory_cursor::forget_bucket(&scanner.local_disk, &scanner.old_cache.info);

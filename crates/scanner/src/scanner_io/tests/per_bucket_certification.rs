@@ -67,7 +67,8 @@ async fn run_cycle(
         assert_eq!(
             result.status,
             ScannerCycleStatus::Complete,
-            "one remote hot bucket cannot supersede certified cold buckets"
+            "one remote hot bucket cannot supersede certified cold buckets in cycle {cycle}: {:?}",
+            result.partial_stage
         );
     }
     let snapshot = receiver.recv().await.expect("cycle should publish a snapshot");

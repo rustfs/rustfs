@@ -1152,6 +1152,60 @@ async fn ordinary_owner_cancellation_persists_directory_position_for_cold_resume
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn insertion_during_directory_walk_retries_only_the_uncertified_bucket() {
+    use super::enumeration_restart::install_raw_entry_owner_cancel;
+    use crate::sleeper::ScannerDiskIoBudgetLimits;
+
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let root = temp.path().join("disk");
+    let cache = seed_flat_bucket(&root, 64).await;
+    let metadata = metadata_for_object_version("bucket", "late", Some(Uuid::from_u128(100)));
+    write_test_object_metadata_bytes(&root, "staging", "late", &metadata).await;
+    let disk = open_fixture_disk(&root).await;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let sleeper = SCANNER_SLEEPER.for_disk_with_budget_for_tests(
+        &root,
+        ScannerDiskIoBudgetLimits {
+            iops: Some(1),
+            bytes_per_sec: None,
+        },
+    );
+    let observed = CancellationToken::new();
+    let observer = install_raw_entry_owner_cancel(disk.path(), 1, observed.clone());
+    let scan = scan_data_folder(
+        budget.token(),
+        budget,
+        vec![disk.clone()],
+        disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        sleeper,
+    );
+    tokio::pin!(scan);
+    tokio::select! {
+        biased;
+        () = observed.cancelled() => {}
+        result = &mut scan => panic!("scan finished before the first name could be changed: {result:?}"),
+    }
+    std::fs::rename(root.join("staging/late"), root.join("bucket/late")).expect("insert object during discovery");
+    let Err(ScannerError::PartialCache(partial)) = scan.await else {
+        panic!("a concurrent namespace mutation must leave this bucket pending")
+    };
+    drop(observer);
+    assert!(!partial.info.snapshot_complete);
+    assert!(!partial.has_scan_position());
+    assert!(partial.info.scan_bucket_observations.is_empty());
+    assert!(partial.info.failed_objects.is_empty());
+    let complete = run_until_finished(&root, *partial, Default::default(), 1).await;
+    let total = complete.checked_flatten("bucket").expect("stable bucket");
+    assert_eq!((total.objects, total.versions, total.size), (65, 65, 65));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[serial]
 async fn changed_directory_listing_clears_its_physical_receipt() {
@@ -1185,7 +1239,7 @@ async fn changed_directory_listing_clears_its_physical_receipt() {
         .expect("replace physical directory");
     tokio::fs::create_dir(&path).await.expect("create successor directory");
     let error = directory.verify_current().await.expect_err("the old listing is invalid");
-    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert!(matches!(error, ScannerError::DirectoryChanged));
     drop(directory);
     assert!(
         saved.lock().expect("receipt").is_none(),

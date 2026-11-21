@@ -61,6 +61,10 @@ pub enum ScannerError {
     #[error("Scanner node resource admission deferred")]
     ResourceDeferred,
 
+    /// A directory changed generation after its physical listing began.
+    #[error("scanner directory changed during traversal")]
+    DirectoryChanged,
+
     /// Partial data usage cache produced before the scanner stopped.
     #[error("Scanner stopped with partial data usage cache")]
     PartialCache(Box<DataUsageCache>),

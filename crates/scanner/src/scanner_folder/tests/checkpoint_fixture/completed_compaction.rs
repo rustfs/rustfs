@@ -126,7 +126,7 @@ async fn assert_completed_compaction_resumes(mode: HealScanMode) {
         .checked_flatten_complete_scope("bucket")
         .expect("partial graph has no orphan entries");
     assert_eq!((partial.objects, partial.versions, partial.size), (6, 0, 14));
-    assert_eq!(cache.validated_scan_frontier(), Some("bucket/nested/b/0000"));
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/nested/b/0001"));
 
     let store = FixtureStore::new();
     let revisions = DataUsageCache::default()
@@ -148,8 +148,8 @@ async fn assert_completed_compaction_resumes(mode: HealScanMode) {
     let (outcome, budget) = scan(&scanner.local_disk, reloaded, mode, 13).await;
     assert_eq!(
         budget.progress().0,
-        7,
-        "only the interrupted boundary object and six unseen objects may be read on resume"
+        6,
+        "the final counted object was acknowledged; only the six unseen objects may be read on resume"
     );
     let ScannerDiskScanOutcome::Complete(completed) = outcome else {
         panic!("resumed sweep must complete")

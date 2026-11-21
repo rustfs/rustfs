@@ -522,17 +522,22 @@ impl ScannerDirectory {
     pub(super) fn indexed(&self) -> bool {
         self.scope.is_some()
     }
-    pub(super) async fn verify_current(&mut self) -> io::Result<()> {
+    pub(super) async fn verify_current(&mut self) -> Result<(), super::ScannerError> {
         let Some((_, original)) = &self.scope else { return Ok(()) };
-        let path = self.path.to_str().ok_or(io::ErrorKind::InvalidInput)?;
-        let current = DirectoryStamp::at(path).await?;
-        if *original == current {
-            return Ok(());
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        match DirectoryStamp::at(path).await {
+            Ok(current) if *original == current => return Ok(()),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {}
+            Err(e) => return Err(e.into()),
         }
         if let Some(listing) = &mut self.listing {
             listing.failed = true;
         }
-        Err(io::Error::new(io::ErrorKind::Interrupted, "scanner directory changed during traversal"))
+        Err(super::ScannerError::DirectoryChanged)
     }
 
     pub(super) fn folder_count(&self) -> Option<usize> {
