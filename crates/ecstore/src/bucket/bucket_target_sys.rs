@@ -5082,7 +5082,14 @@ mod tests {
         let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
         let (port, server) = spawn_https_server(&cert, 2);
         let endpoint = format!("https://localhost:{port}");
-        let strict = target_client_for_test("arn:strict", endpoint.clone(), s3_client_for_test(port, None));
+        let strict_client = s3_client_for_test(port, None);
+        // A failed trust check must consume just one of the two fixture connections.
+        let strict_config = strict_client
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        let strict = target_client_for_test("arn:strict", endpoint.clone(), S3Client::from_conf(strict_config));
         let insecure = target_client_for_test(
             "arn:insecure",
             endpoint,

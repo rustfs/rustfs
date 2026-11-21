@@ -56,6 +56,7 @@ pub(crate) mod transport {
 }
 use crate::app::storage_api::object_usecase::rdma::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
+use rustfs_gateway_stream::Body;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u64, get_env_usize};
 use std::collections::VecDeque;
 use std::io;
@@ -813,18 +814,14 @@ fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaTok
 /// consumer that keeps a chunk keeps it out of the pool: only callers whose
 /// body is consumed and dropped with the request (UploadPart) may set it.
 /// PutObject may hand its body to the object data cache, so it copies.
-pub(crate) fn rdma_put_body(
-    bucket: &str,
-    key: &str,
-    token: &RdmaToken,
-    zero_copy: bool,
-) -> S3Result<(rustfs_gateway_stream::Body, u64)> {
+pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_copy: bool) -> S3Result<(Body, u64)> {
     let service = SERVICE
         .get()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma put is not enabled"))?;
     let server = Arc::clone(service.pick());
     let read_ahead = service.put_read_ahead;
     let total = token.buffer_len;
+    let length = usize::try_from(total).map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?;
     let chunk_bytes = server.chunk_bytes();
     let object = format!("{bucket}/{key}");
     let token = token.clone();
@@ -865,7 +862,7 @@ pub(crate) fn rdma_put_body(
             Ok::<_, io::Error>(Some((bytes, (pending, next_offset))))
         }
     });
-    Ok((super::native_body::from_io_stream_with_length(stream, Some(total)), total))
+    Ok((super::native_body::from_io_stream_with_length(stream, Some(length)), total))
 }
 
 /// State shared by the segment writers of one RDMA GET: the server, the

@@ -129,6 +129,12 @@ when restoring `/rustfs/console` for a custom OEM build.
 - `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (canonical)
 - `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (canonical)
 - `RUSTFS_SCANNER_WALKERS_PER_DISK` (canonical)
+- `RUSTFS_SCANNER_READ_ONLY_HANDOFF` (canonical, default `false`)
+
+Read-only restart continuity:
+
+- `RUSTFS_SCANNER_READ_ONLY_HANDOFF=true` enables reuse of unpublished scanner progress across verified read-only process restarts. Unset, false or invalid values disable both identity restoration and receipt creation. Existing receipts are still durably consumed before recovery starts, even when the feature is disabled.
+- Deploy receipt-aware readers to every possible writer before enabling this flag. Before rolling back to an older binary, disable it on every node, start each node with all its drives present, wait for readiness, and shut down cleanly. Do not start the older binary until every node completes this preparation. Direct rollback after enabling receipt writes is unsupported: older startup/recovery paths can write without durably invalidating the receipt. See [the receipt and rollback contract](../../docs/architecture/scanner-usage-publication.md#read-only-restart-continuity).
 
 Scanner cycle budget controls:
 
