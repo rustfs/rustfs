@@ -519,7 +519,7 @@ async fn source_turn_zero_new_frontier_stops_requeuing_without_starving_other_so
         clear_dirty_usage_buckets_for_tests();
         create_cohort_bucket_objects(&store, "blocked-frontier", 3).await;
         let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
-            max_objects: Some(1),
+            max_directories: Some(1),
             ..Default::default()
         });
         let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));

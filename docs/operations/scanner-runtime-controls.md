@@ -913,6 +913,8 @@ The `aggregated.scanner` payload preserves the same scanner progress, checkpoint
 
 ## Reading Cached Bucket Statistics
 
+If a directory changes while the scanner is walking it, the bucket stays pending and its next sweep starts from a fresh listing. Other buckets in the set can still publish certified values. A continuously changing bucket may need a stable sweep before its own value becomes certified.
+
 Admin usage reads cache the selected scanner baseline for the existing 30-second TTL, then verify every returned bucket against uncached storage-owned incarnation metadata. Identity reads use at most four concurrent operations and a shared two-second deadline after releasing snapshot/refresh locks. Each bucket read linearizes independently against metadata transactions; the response is not an atomic snapshot of the entire namespace. Delayed peer invalidation cannot authorize a predecessor's statistics for a recreated bucket.
 
 Missing, failed, timed-out, nil, mismatched, or legacy absent identities leave the bucket value absent (unknown), rather than returning the predecessor's value or a confirmed zero. Legacy statistics become visible after a scanner snapshot supplies the current identity. Account-info and usage display apply the existing single-process memory overlay before the final identity filter; distributed local counters are not promoted. When a projection omits values or changes an overlay, totals are partial and `usage_snapshot_converged=false`, and per-tier/replication aggregates are unavailable. Verified cold bucket values remain visible. Such response-only projections cannot be persisted, used for quota admission, or acknowledge dirty work.

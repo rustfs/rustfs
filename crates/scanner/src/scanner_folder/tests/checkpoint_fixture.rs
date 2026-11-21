@@ -802,7 +802,7 @@ async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() 
 
 #[tokio::test]
 #[serial]
-async fn checkpoint_fixture_failed_child_prevents_receipt_advancing_past_gap() {
+async fn checkpoint_fixture_completed_traversal_retains_unreadable_object_until_repair() {
     let (scanner, root) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -810,6 +810,10 @@ async fn checkpoint_fixture_failed_child_prevents_receipt_advancing_past_gap() {
     for object in ["a-good", "b-skipped", "c-later"] {
         write_checkpoint_object(&root, object, &[(None, 1)]).await;
     }
+    // A damaged object must stay pending even after the walk reaches the later child.
+    tokio::fs::write(root.join("bucket/b-skipped/xl.meta"), b"invalid object metadata")
+        .await
+        .expect("corrupt the failed child");
     let identity = crate::DataUsageScanIdentity {
         tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
         ..bound_checkpoint().1
@@ -817,10 +821,6 @@ async fn checkpoint_fixture_failed_child_prevents_receipt_advancing_past_gap() {
     let mut cache = DataUsageCache::default();
     cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
     cache.info.skip_healing = true;
-    cache.info.failed_objects.insert(
-        root.join("bucket/b-skipped/xl.meta").to_string_lossy().into_owned(),
-        FolderScanner::now_secs(),
-    );
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
         &parent,
@@ -845,9 +845,38 @@ async fn checkpoint_fixture_failed_child_prevents_receipt_advancing_past_gap() {
     let ScannerDiskScanOutcome::Partial(cache) = result else {
         panic!("skipped failure is not complete")
     };
-    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a-good"));
-    assert!(!cache.info.failed_objects.is_empty());
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/c-later"));
+    let failed = scanner.local_disk.path().join("bucket/b-skipped/xl.meta");
+    assert!(cache.info.failed_objects.contains_key(failed.to_str().expect("fixture path")));
     assert!(!cache.info.snapshot_complete);
+
+    write_checkpoint_object(&root, "b-skipped", &[(None, 1)]).await;
+    let mut restored = DataUsageCache::unmarshal(&cache.marshal_msg().expect("save partial cache")).expect("cold load");
+    assert_eq!(
+        restored.prepare_bucket_checkpoint("bucket", 12, 8, SOURCE, PLAN, identity),
+        crate::DataUsageCachePrepareOutcome::Reused
+    );
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let result = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            restored,
+            None,
+            scan_options(HealScanMode::Normal),
+        )
+        .await
+        .expect("retry the repaired object");
+    let ScannerDiskScanOutcome::Complete(repaired) = result else {
+        panic!("the repaired bucket must finish")
+    };
+    let total = repaired.checked_flatten("bucket").expect("repaired inventory");
+    assert_eq!((total.objects, total.size), (3, 3));
+    assert!(repaired.info.snapshot_complete);
+    assert!(repaired.info.failed_objects.is_empty());
 }
 
 #[tokio::test]
