@@ -24,8 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
 async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
-    let request = build_request((), Method::DELETE);
-    let envelope = RequestEnvelope::from_s3s(&request);
+    let envelope = owned_envelope(Method::DELETE);
     let before = s3_op_total(S3Operation::AbortMultipartUpload);
     let target = AbortMultipartUploadTarget::Legacy {
         bucket: "bucket".to_owned(),
