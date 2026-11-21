@@ -708,7 +708,7 @@ pub(crate) fn admit_site_replication_repair_operation(
 
 pub(crate) async fn execute_site_replication_repair(
     request: SiteReplicationRepairExecutionRequest,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+) -> S3Result<(StatusCode, HeaderMap, rustfs_s3_types::Body)> {
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
     with_config_object_write_lock(
@@ -724,7 +724,7 @@ pub(crate) async fn execute_site_replication_repair(
 
 pub(crate) async fn execute_site_replication_repair_locked(
     request: SiteReplicationRepairExecutionRequest,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+) -> S3Result<(StatusCode, HeaderMap, rustfs_s3_types::Body)> {
     let state = load_site_replication_state().await?;
     if !state.enabled() || state.service_account_access_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "site replication is not configured"));
