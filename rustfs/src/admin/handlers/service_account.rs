@@ -2297,6 +2297,13 @@ mod tests {
                 }
             }
 
+            if rustfs_credentials::get_global_action_cred().is_none() {
+                let _ = rustfs_credentials::init_global_action_credentials(
+                    Some("root-9514".to_owned()),
+                    Some("root-secret-9514".to_owned()),
+                );
+            }
+
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let _restore = RestoreAmbient(Arc::clone(&ambient));
             let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
