@@ -4346,7 +4346,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         if let Some(wtcs) = opts.want_checksum.as_ref() {
             if checksum_type.full_object_requested() {
-                let has_part_suffix = wtcs.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) || wtcs.want_parts != 0;
+                // A wire `-N` suffix (including `-0`) sets MULTIPART without INCLUDES_MULTIPART;
+                // stored multipart records carry both flags and are not suffixed claims.
+                let has_part_suffix = wtcs.want_parts != 0
+                    || (wtcs.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART)
+                        && !wtcs.checksum_type.is(rustfs_rio::ChecksumType::INCLUDES_MULTIPART));
                 if (!wtcs.encoded.is_empty() && wtcs.encoded != checksum.encoded) || has_part_suffix {
                     let want = if has_part_suffix {
                         format!("{}-{}", wtcs.encoded, wtcs.want_parts)
@@ -18219,6 +18223,39 @@ mod tests {
             .await
             .expect("matching full-object CRC32 without optional checksum-type flag should succeed");
         assert_eq!(completed_full.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
+
+        // A stored multipart record carries MULTIPART | INCLUDES_MULTIPART with no wire suffix;
+        // a matching value in that shape must still complete a FULL_OBJECT upload.
+        let (internal_upload_id, internal_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "full-obj-internal", Some(full_object_type), &[payload]).await;
+        let mut internal_type = full_object_type;
+        internal_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+        let stored_record_crc32 = rustfs_rio::Checksum {
+            checksum_type: internal_type,
+            encoded: right_crc32.encoded.clone(),
+            raw: right_crc32.raw.clone(),
+            want_parts: 0,
+        };
+        let completed_internal = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "full-obj-internal",
+                &internal_upload_id,
+                internal_parts,
+                &ObjectOptions {
+                    want_checksum: Some(stored_record_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching stored-record FULL_OBJECT checksum should complete");
+        assert_eq!(
+            completed_internal.size,
+            i64::try_from(payload.len()).expect("test payload length fits i64")
+        );
 
         let (plain_upload_id, plain_parts, _) =
             stage_checksummed_multipart_upload(&set, bucket, "plain-obj", None, &[payload]).await;
