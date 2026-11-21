@@ -112,7 +112,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_delete_public_access_block_returns_internal_error_when_store_uninitialized() {
-        let envelope = RequestEnvelope::from_s3s(&build_request((), Method::DELETE));
+        let envelope = owned_envelope(Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
         let err = usecase
             .execute_delete_public_access_block(envelope, "test-bucket")
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_public_access_block_returns_internal_error_when_store_uninitialized() {
-        let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
+        let envelope = owned_envelope(Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
         let err = usecase
             .execute_put_public_access_block(envelope, "test-bucket", Ok(PersistedPublicAccessBlockConfiguration::default()))
