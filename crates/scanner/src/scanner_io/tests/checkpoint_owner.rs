@@ -243,6 +243,9 @@ async fn periodic_checkpoint_drains_work_stop_but_rejects_owner_loss() {
             .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
             .env(WORKER_ENV, mode)
             .env(REPORT_ENV, &report_path)
+            // The first real read is deliberately held for the five-second checkpoint
+            // interval. Its own deadline must allow the ownership test to reach the save.
+            .env(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, PHASE_TIMEOUT.as_secs().to_string())
             .env(rustfs_config::ENV_SCANNER_SPEED, "fastest")
             // Return the walk's poll after each object. At object 1024 the
             // checkpoint is already queued, so its handler can take over

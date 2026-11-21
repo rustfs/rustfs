@@ -3213,13 +3213,14 @@ impl FolderScanner {
                             outcome
                         }
                         Err(e) => {
-                            if matches!(&e, ScannerError::SourceUnavailable(_) | ScannerError::DirectoryChanged) {
+                            if matches!(&e, ScannerError::DirectoryChanged) {
                                 return Err(e);
                             }
-                            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
+                            if ctx.is_cancelled()
+                                || matches!(&e, ScannerError::SourceUnavailable(_) | ScannerError::ResourceDeferred)
+                            {
                                 if child_summary {
-                                    // Cancellation and resource deferral keep completed
-                                    // work even though the child has not finished.
+                                    // Propagate the counted prefix up the stack before the source yields.
                                     into.merge(&dst);
                                 } else {
                                     self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
@@ -3727,10 +3728,12 @@ impl FolderScanner {
                             )
                             .await
                         {
-                            if matches!(&e, ScannerError::SourceUnavailable(_) | ScannerError::DirectoryChanged) {
+                            if matches!(&e, ScannerError::DirectoryChanged) {
                                 return Err(e);
                             }
-                            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
+                            if ctx.is_cancelled()
+                                || matches!(&e, ScannerError::SourceUnavailable(_) | ScannerError::ResourceDeferred)
+                            {
                                 self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
                                     .await;
                                 return Err(e);
