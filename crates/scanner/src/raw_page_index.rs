@@ -444,7 +444,7 @@ impl RawEnumerationPageIndexInner {
     /// Only sealed entries can exempt a replayed name from the next cycle's entry budget.
     fn validate_membership<'a>(
         &'a self,
-        mut insert: impl FnMut(&'a str, bool) -> bool,
+        mut insert: impl FnMut(&'a str, Option<(usize, usize)>) -> bool,
     ) -> Result<(), RawEnumerationPageIndexError> {
         if self.parent.is_empty() || self.page_entry_limit == 0 || (self.complete && self.building.is_some()) {
             return Err(RawEnumerationPageIndexError::CorruptIndex);
@@ -454,7 +454,11 @@ impl RawEnumerationPageIndexInner {
             page.validate(&self.parent, ordinal as u64, offset)?;
             if page.entries.len() > self.page_entry_limit
                 || page.terminal != (self.complete && ordinal + 1 == self.pages.len())
-                || !page.entries.iter().all(|name| insert(name, true))
+                || !page
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .all(|(slot, name)| insert(name, Some((ordinal, slot))))
             {
                 return Err(RawEnumerationPageIndexError::CorruptIndex);
             }
@@ -462,7 +466,7 @@ impl RawEnumerationPageIndexInner {
         }
         if let Some(building) = &self.building {
             building.validate(self.pages.len() as u64, offset, self.page_entry_limit)?;
-            if !building.entries.iter().all(|name| insert(name, false)) {
+            if !building.entries.iter().all(|name| insert(name, None)) {
                 return Err(RawEnumerationPageIndexError::CorruptIndex);
             }
         }
@@ -473,7 +477,7 @@ impl RawEnumerationPageIndexInner {
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
         self.validate_membership(|name, sealed| {
-            if sealed || include_building {
+            if sealed.is_some() || include_building {
                 entries.push(name.to_owned());
             }
             seen.insert(name)
