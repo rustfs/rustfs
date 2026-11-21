@@ -53,7 +53,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath.workspace = true
+hotpath = { workspace = true, optional = true }
 aes-gcm = { workspace = true, features = ["rand_core"] }
 bytes = { workspace = true, features = ["serde"] }
 chacha20poly1305.workspace = true

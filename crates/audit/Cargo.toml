@@ -51,7 +51,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath.workspace = true
+hotpath = { workspace = true, optional = true }
 rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "server-config-model"] }
 rustfs-s3-types = { workspace = true }

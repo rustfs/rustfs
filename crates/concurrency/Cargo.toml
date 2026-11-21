@@ -20,7 +20,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-io-core/hotpath-all
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-io-core/hotpath-cpu"]
 
 [dependencies]
-hotpath.workspace = true
+hotpath = { workspace = true, optional = true }
 # Internal crates
 rustfs-io-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

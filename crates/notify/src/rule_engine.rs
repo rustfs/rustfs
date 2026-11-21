@@ -47,8 +47,9 @@ pub struct NotifyRuleEngine {
 struct CachedBucketRules {
     metadata: Option<Weak<BucketMetadata>>,
     // Cache rejected snapshots too, so corrupt persisted routes are not
-    // repeatedly compiled on the event hot path.
-    rules: Option<RulesMap>,
+    // repeatedly compiled on the event hot path. Shared by `Arc` so matching an
+    // event does not clone the whole rule set.
+    rules: Option<Arc<RulesMap>>,
 }
 
 fn rules_from_metadata(metadata: &BucketMetadata) -> Option<RulesMap> {
@@ -134,7 +135,7 @@ impl NotifyRuleEngine {
                     bucket.to_string(),
                     CachedBucketRules {
                         metadata: None,
-                        rules: Some(rules_map),
+                        rules: Some(Arc::new(rules_map)),
                     },
                 )
                 .await;
@@ -150,7 +151,7 @@ impl NotifyRuleEngine {
         );
     }
 
-    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<RulesMap> {
+    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<Arc<RulesMap>> {
         if let Some(source) = self.metadata_source() {
             let metadata = match source.upgrade() {
                 Some(store) => store.get_bucket_metadata(bucket).await.ok(),
@@ -158,13 +159,17 @@ impl NotifyRuleEngine {
             };
             return self.rules_for_metadata(bucket, metadata).await;
         }
+        self.cached_rules(bucket).await
+    }
+
+    async fn cached_rules(&self, bucket: &str) -> Option<Arc<RulesMap>> {
         self.bucket_rules_map
-            .get(&bucket.to_string())
+            .get(&bucket.to_owned())
             .await
             .and_then(|cached| cached.rules)
     }
 
-    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<RulesMap> {
+    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<Arc<RulesMap>> {
         let key = bucket.to_owned();
         let Some(metadata) = metadata else {
             self.bucket_rules_map.remove(&key).await;
@@ -181,7 +186,7 @@ impl NotifyRuleEngine {
         // Snapshot identity covers incarnation, revision AND bytes, without
         // trusting wall-clock ordering. A late compilation may evict a newer
         // cache entry, but cannot be reused by a reader of a different snapshot.
-        let rules = rules_from_metadata(&metadata);
+        let rules = rules_from_metadata(&metadata).map(Arc::new);
         self.bucket_rules_map
             .insert(
                 key,
@@ -428,7 +433,7 @@ mod tests {
                 .await
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![target_id.clone()]
+            vec![std::sync::Arc::new(target_id.clone())]
         );
 
         engine.clear_bucket_rules("bucket").await;
