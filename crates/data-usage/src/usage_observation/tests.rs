@@ -321,3 +321,110 @@ fn provenance_and_companions_change_candidate_bytes_and_round_trip_as_maps() {
     let restored: DataUsageInfo = rmp_serde::from_slice(&named).expect("read named map with additive fields");
     assert_eq!(restored, canonical);
 }
+
+#[test]
+fn current_identity_filter_preserves_an_unchanged_complete_snapshot() {
+    let mut candidate = snapshot();
+    let original = candidate.clone();
+    assert_eq!(candidate.retain_current_bucket_usage_for_admin(&incarnations()), 0);
+    assert_eq!(candidate, original);
+    assert!(candidate.is_complete_bucket_usage_snapshot());
+}
+
+#[test]
+fn current_identity_filter_hides_unbound_values_without_confirming_zero() {
+    for identity in [
+        None,
+        Some(""),
+        Some("corrupt"),
+        Some("00000000-0000-0000-0000-000000000000"),
+        Some("22222222-2222-4222-8222-222222222222"),
+    ] {
+        let mut candidate = snapshot();
+        candidate.usage_snapshot_bucket_observations.clear();
+        candidate
+            .buckets_usage
+            .get_mut("bucket")
+            .expect("canonical")
+            .bucket_incarnation = identity.map(str::to_string);
+        assert_eq!(
+            candidate.retain_current_bucket_usage_for_admin(&incarnations()),
+            1,
+            "identity {identity:?}"
+        );
+        assert!(!candidate.buckets_usage.contains_key("bucket"));
+        assert!(!candidate.bucket_sizes.contains_key("bucket"));
+        assert_eq!(candidate.usage_snapshot_converged, Some(false));
+        assert!(candidate.usage_snapshot_admin_projection);
+        assert!(!candidate.is_complete_bucket_usage_snapshot());
+        assert!(!candidate.is_valid_partial_snapshot());
+    }
+    for current in ["", "00000000-0000-0000-0000-000000000000"] {
+        let mut candidate = snapshot();
+        candidate
+            .buckets_usage
+            .get_mut("bucket")
+            .expect("canonical")
+            .bucket_incarnation = Some(current.to_string());
+        assert_eq!(
+            candidate.retain_current_bucket_usage_for_admin(&HashMap::from([("bucket".to_string(), current.to_string())])),
+            1
+        );
+        assert!(candidate.usage_snapshot_admin_projection);
+    }
+    let mut candidate = snapshot();
+    assert_eq!(candidate.retain_current_bucket_usage_for_admin(&HashMap::new()), 1);
+    assert!(candidate.usage_snapshot_bucket_observations.is_empty());
+    assert_eq!(candidate.usage_snapshot_converged, Some(false));
+}
+
+#[test]
+fn current_identity_filter_keeps_healthy_buckets_and_recalculates_partial_totals() {
+    let mut candidate = snapshot();
+    candidate.buckets_usage.insert("cold".to_string(), usage(7));
+    candidate.buckets_count = 2;
+    candidate.bucket_sizes.insert("cold".to_string(), 7);
+    candidate.calculate_totals();
+    candidate.replication_info.insert("target".to_string(), Default::default());
+    candidate.tier_stats = Some(Default::default());
+    candidate.unknown_tier_stats = Some(Default::default());
+    assert_eq!(
+        candidate.retain_current_bucket_usage_for_admin(&HashMap::from([("cold".to_string(), INCARNATION.to_string())])),
+        1
+    );
+    assert_eq!(candidate.buckets_usage.len(), 1);
+    assert_eq!(candidate.buckets_usage["cold"].size, 7);
+    assert_eq!(candidate.bucket_sizes, HashMap::from([("cold".to_string(), 7)]));
+    assert_eq!(
+        (
+            candidate.buckets_count,
+            candidate.objects_total_size,
+            candidate.objects_total_count,
+            candidate.versions_total_count
+        ),
+        (1, 7, 7, 7)
+    );
+    assert!(candidate.replication_info.is_empty());
+    assert!(candidate.tier_stats.is_none());
+    assert!(candidate.unknown_tier_stats.is_none());
+    assert!(candidate.usage_snapshot_admin_projection);
+    assert_eq!(candidate.usage_snapshot_converged, Some(false));
+}
+
+#[test]
+fn current_identity_filter_overflow_leaves_totals_unknown() {
+    let mut candidate = snapshot();
+    candidate.buckets_usage.insert("large".to_string(), usage(u64::MAX));
+    candidate.buckets_usage.insert("small".to_string(), usage(1));
+    candidate.buckets_count = 3;
+    let current = HashMap::from([
+        ("large".to_string(), INCARNATION.to_string()),
+        ("small".to_string(), INCARNATION.to_string()),
+    ]);
+    assert_eq!(candidate.retain_current_bucket_usage_for_admin(&current), 3);
+    assert!(candidate.buckets_usage.is_empty());
+    assert!(candidate.bucket_sizes.is_empty());
+    assert_eq!(candidate.usage_snapshot_converged, Some(false));
+    assert!(candidate.usage_snapshot_admin_projection);
+    assert!(!candidate.is_complete_bucket_usage_snapshot());
+}

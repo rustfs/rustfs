@@ -945,10 +945,6 @@ pub(crate) static ERR_TIER_RESERVED_NAME: AdminErrorRef = AdminErrorRef(|| &ecst
 pub(crate) mod data_usage {
     use std::sync::Arc;
 
-    pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
-    }
-
     pub(crate) async fn load_data_usage_from_backend(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
@@ -959,6 +955,12 @@ pub(crate) mod data_usage {
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+    }
+
+    pub(crate) async fn load_admin_data_usage_with_memory_overlay(
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_with_memory_overlay(store).await
     }
 }
 

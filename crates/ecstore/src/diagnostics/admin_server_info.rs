@@ -1033,16 +1033,26 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn server_info_reads_complete_observation_without_promoting_authority() {
-        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
         use crate::config::com::{read_config, save_config};
         use crate::data_usage::{
             DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH, invalidate_data_usage_snapshot_cache,
             load_data_usage_from_backend_cached,
         };
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
         use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
         use std::time::{Duration, SystemTime};
 
         let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket("bucket", &MakeBucketOptions::default())
+            .await
+            .expect("create a real observed bucket");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk("bucket")
+            .await
+            .expect("read current storage-owned incarnation");
         let primary = DataUsageInfo {
             last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
             scanner_epoch: Some(1),
@@ -1066,6 +1076,7 @@ mod tests {
                     versions_count: 4,
                     delete_markers_count: 1,
                     size: 6,
+                    bucket_incarnation: Some(incarnation.to_string()),
                     ..Default::default()
                 },
             )]
@@ -1115,6 +1126,46 @@ mod tests {
             primary_bytes
         );
         invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[test]
+    fn identity_filtered_usage_remains_unknown_in_server_info() {
+        let mut info = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            buckets_count: 1,
+            objects_total_count: 107,
+            objects_total_size: 1024,
+            buckets_usage: [(
+                "bucket".to_string(),
+                rustfs_data_usage::BucketUsageInfo {
+                    objects_count: 107,
+                    size: 1024,
+                    bucket_incarnation: Some("11111111-1111-4111-8111-111111111111".to_string()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let current =
+            std::collections::HashMap::from([("bucket".to_string(), "22222222-2222-4222-8222-222222222222".to_string())]);
+        assert_eq!(info.retain_current_bucket_usage_for_admin(&current), 1);
+        assert!(info.buckets_usage.is_empty());
+        assert!(info.usage_snapshot_admin_projection);
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        let mut buckets = rustfs_madmin::Buckets::default();
+        let mut objects = rustfs_madmin::Objects::default();
+        let mut versions = rustfs_madmin::Versions::default();
+        let mut delete_markers = rustfs_madmin::DeleteMarkers::default();
+        let mut usage = rustfs_madmin::Usage::default();
+        apply_data_usage_result(Ok(info), &mut buckets, &mut objects, &mut versions, &mut delete_markers, &mut usage);
+        assert_eq!(buckets.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(objects.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(versions.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(delete_markers.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(usage.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached};
+use crate::admin::storage_api::data_usage::load_admin_data_usage_with_memory_overlay;
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
@@ -278,8 +278,7 @@ impl Operation for AccountInfoHandler {
         // process-local absolute counters to cluster-wide bucket totals.
         // This path never triggers a live full-version listing
         // (rustfs/backlog#1306); freshness is owned by the scanner.
-        let mut data_usage_info = map_data_usage_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
-        apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
+        let data_usage_info = map_data_usage_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
         account_info.usage_snapshot_converged = data_usage_info.usage_snapshot_converged;
 
         for bucket in buckets.iter() {

@@ -125,14 +125,15 @@ pub(crate) mod data_usage {
 
     pub(crate) use crate::storage::storage_api::ecstore_data_usage::quota_object_size;
 
+    #[cfg(test)]
     pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
-    pub(crate) async fn load_admin_data_usage_from_backend_cached(
+    pub(crate) async fn load_admin_data_usage_with_memory_overlay(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_with_memory_overlay(store).await
     }
 
     pub(crate) async fn load_bucket_usage_from_backend_cached(

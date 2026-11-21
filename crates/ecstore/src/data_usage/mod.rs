@@ -1463,22 +1463,39 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
     let observed = load_observed_data_usage_snapshot(store.clone()).await.ok().flatten();
     let (selected, selected_is_current_format) =
         select_admin_data_usage_snapshot(authoritative, source.is_authoritative(), observed);
-    let mut response = normalize_loaded_data_usage(selected, selected_is_current_format).await.0;
+    Ok(normalize_loaded_data_usage(selected, selected_is_current_format).await.0)
+}
+
+async fn project_admin_data_usage_for_current_buckets(
+    store: Arc<ECStore>,
+    mut response: DataUsageInfo,
+    with_memory_overlay: bool,
+) -> DataUsageInfo {
     use futures::StreamExt as _;
+    if !(response.is_complete_bucket_usage_snapshot() || response.is_valid_partial_snapshot()) {
+        return DataUsageInfo::default();
+    }
+
+    let overlay_authoritative = with_memory_overlay && !runtime_sources::setup_is_dist_erasure().await;
     let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
     let mut incarnations = HashMap::new();
     {
-        // Display-only identity reads must not serialize every bucket behind a
-        // slow metadata lock while holding the shared admin refresh permit.
-        // The common deadline bounds their total added latency; dropping this
-        // stream cancels all unfinished reads without spawning detached work.
-        // Own the names and store across awaits so this future remains Send
-        // when composed into spawned metrics collectors.
-        let buckets = response
-            .usage_snapshot_bucket_observations
+        // Identity reads happen after releasing snapshot and refresh locks,
+        // including on cache hits. Metadata transaction reads linearize each
+        // bucket against creation/deletion without relying on peer notices.
+        // The common deadline cancels unfinished work and bounds added latency.
+        let mut buckets = response
+            .buckets_usage
             .keys()
+            .chain(response.usage_snapshot_bucket_observations.keys())
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        if overlay_authoritative {
+            // Copy only names while holding the memory lock, then release it
+            // before storage I/O. A later new entry has no identity proof and
+            // will remain unknown in this response.
+            buckets.extend(memory_cache().read().await.keys().cloned());
+        }
         let mut identities = futures::stream::iter(buckets)
             .map(move |bucket| {
                 let store = store.clone();
@@ -1492,7 +1509,6 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
             let Ok(Some((bucket, identity))) = tokio::time::timeout_at(deadline, identities.next()).await else {
                 break;
             };
-            // Unavailable, timed-out or recreated buckets retain canonical values.
             if let Ok(incarnation) = identity
                 && !incarnation.is_nil()
             {
@@ -1501,7 +1517,17 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
         }
     }
     response.project_bucket_observations_for_admin(&incarnations);
-    Ok(response)
+    if apply_bucket_usage_memory_overlay_if_authoritative(&mut response, overlay_authoritative).await {
+        response.usage_snapshot_complete = false;
+        response.usage_snapshot_partial = true;
+        response.usage_snapshot_converged = Some(false);
+        response.usage_snapshot_admin_projection = true;
+        response.replication_info.clear();
+        response.tier_stats = None;
+        response.unknown_tier_stats = None;
+    }
+    response.retain_current_bucket_usage_for_admin(&incarnations);
+    response
 }
 
 fn discard_incomplete_bucket_usage(data_usage_info: &mut DataUsageInfo) {
@@ -1690,11 +1716,7 @@ async fn project_data_usage_from_backend_cached<T>(
     }
 }
 
-/// Load the freshest structurally complete snapshot for authenticated admin
-/// observability. A scan raced by namespace activity may be selected here, but
-/// never by [`load_data_usage_from_backend_cached`], which remains the
-/// converged source for quota admission.
-pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+async fn load_admin_data_usage_snapshot_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
 
     loop {
@@ -1741,6 +1763,38 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
         drop(cache);
         drop(refresh_guard);
     }
+}
+
+/// Load cached scanner statistics for authenticated admin observability.
+///
+/// Each response verifies bucket identities against current storage metadata,
+/// including cache hits. Missing, failed, or timed-out identity reads leave that
+/// bucket's usage absent (unknown). Legacy values without an incarnation stay
+/// unknown until a scanner snapshot certifies their identity. Per-bucket reads
+/// linearize independently; this is not an atomic namespace snapshot.
+/// Identity reads have a shared deadline and do not outlive cancellation. The
+/// unchanged cached baseline remains independent of quota and persistence.
+///
+/// # Errors
+/// Returns the cached snapshot loading error when no baseline can be loaded.
+pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let response = load_admin_data_usage_snapshot_cached(store.clone()).await?;
+    Ok(project_admin_data_usage_for_current_buckets(store, response, false).await)
+}
+
+/// Load the admin view with the existing authoritative single-process overlay.
+///
+/// Only a complete or valid partial scanner snapshot can receive memory values.
+/// The final identity check excludes statistics from retired or unverified buckets.
+/// Distributed nodes continue to use scanner statistics without local totals.
+/// Cancellation, unknown values, and per-bucket read semantics are the same as
+/// [`load_admin_data_usage_from_backend_cached`]. No overlay is persisted.
+///
+/// # Errors
+/// Returns the cached snapshot loading error when no baseline can be loaded.
+pub async fn load_admin_data_usage_with_memory_overlay(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let response = load_admin_data_usage_snapshot_cached(store.clone()).await?;
+    Ok(project_admin_data_usage_for_current_buckets(store, response, true).await)
 }
 
 /// Invalidate the process-local persisted usage snapshot cache after a durable
@@ -2805,16 +2859,17 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
     *cache = next_cache;
 }
 
-async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mut DataUsageInfo, authoritative: bool) {
+async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mut DataUsageInfo, authoritative: bool) -> bool {
     if !authoritative {
-        return;
+        return false;
     }
 
     let cache = memory_cache().read().await;
     if cache.is_empty() {
-        return;
+        return false;
     }
 
+    let was_complete = data_usage_info.usage_snapshot_complete;
     let persisted_update = data_usage_info.last_update;
     let mut changed = false;
     let mut added_bucket = false;
@@ -2851,6 +2906,7 @@ async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mu
         data_usage_info.buckets_count = data_usage_info.buckets_usage.len() as u64;
         data_usage_info.calculate_totals();
     }
+    changed || was_complete != data_usage_info.usage_snapshot_complete
 }
 
 pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
@@ -3744,6 +3800,23 @@ mod tests {
         *cache_updating().write().await = false;
     }
 
+    async fn bind_admin_usage_test_identities(store: &Arc<ECStore>, snapshot: &mut DataUsageInfo) {
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        for (bucket, usage) in &mut snapshot.buckets_usage {
+            store
+                .make_bucket(bucket, &crate::storage_api_contracts::bucket::MakeBucketOptions::default())
+                .await
+                .expect("create a real bucket for current admin identity validation");
+            usage.bucket_incarnation = Some(
+                store
+                    .bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .expect("read the storage-owned fixture identity")
+                    .to_string(),
+            );
+        }
+    }
+
     fn data_usage_info_for_test(bucket: &str, objects_count: u64, size: u64, last_update: SystemTime) -> DataUsageInfo {
         let mut info = DataUsageInfo {
             last_update: Some(last_update),
@@ -4279,7 +4352,11 @@ mod tests {
         use crate::config::com::save_config;
 
         let (_dirs, store) = isolated_store_over_temp_disks().await;
-        let (authoritative, observed) = usage_snapshots_with_missing_observed_set();
+        let (mut authoritative, mut observed) = usage_snapshots_with_missing_observed_set();
+        bind_admin_usage_test_identities(&store, &mut authoritative).await;
+        for (bucket, usage) in &mut observed.buckets_usage {
+            usage.bucket_incarnation = authoritative.buckets_usage[bucket].bucket_incarnation.clone();
+        }
         let primary_bytes = serde_json::to_vec(&authoritative).expect("encode complete usage");
         let observed_bytes = serde_json::to_vec(&observed).expect("encode partial observation");
         save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), primary_bytes.clone())
@@ -4328,6 +4405,11 @@ mod tests {
         reconciled.scanner_epoch = Some(4);
         reconciled.scanner_cycle = Some(12);
         reconciled.usage_snapshot_converged = Some(true);
+        reconciled
+            .buckets_usage
+            .get_mut("large-bucket")
+            .expect("reconciled bucket")
+            .bucket_incarnation = authoritative.buckets_usage["large-bucket"].bucket_incarnation.clone();
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -4849,6 +4931,12 @@ mod tests {
         backup.scanner_epoch = Some(4);
         backup.scanner_cycle = Some(10);
         backup.usage_snapshot_converged = Some(true);
+        bind_admin_usage_test_identities(&store, &mut current).await;
+        backup
+            .buckets_usage
+            .get_mut("existing")
+            .expect("backup bucket")
+            .bucket_incarnation = current.buckets_usage["existing"].bucket_incarnation.clone();
         for (path, info) in [
             (DATA_USAGE_OBJ_NAME_PATH.as_str(), &current),
             (DATA_USAGE_OBJ_BACKUP_PATH.as_str(), &backup),
@@ -4871,6 +4959,11 @@ mod tests {
         after_delete.scanner_epoch = current.scanner_epoch;
         after_delete.scanner_cycle = current.scanner_cycle;
         after_delete.usage_snapshot_converged = Some(true);
+        after_delete
+            .buckets_usage
+            .get_mut("existing")
+            .expect("post-delete bucket")
+            .bucket_incarnation = current.buckets_usage["existing"].bucket_incarnation.clone();
         let mut stale_observation =
             data_usage_info_for_test("retired-incarnation", 99, 999, SystemTime::UNIX_EPOCH + Duration::from_secs(4));
         stale_observation.scanner_epoch = Some(4);
@@ -4932,6 +5025,7 @@ mod tests {
         authoritative.scanner_epoch = Some(7);
         authoritative.scanner_cycle = Some(10);
         authoritative.usage_snapshot_converged = Some(true);
+        bind_admin_usage_test_identities(&store, &mut authoritative).await;
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -4946,6 +5040,10 @@ mod tests {
             info.scanner_cycle = Some(cycle);
             info.usage_snapshot_converged = Some(false);
             info.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
+            info.buckets_usage
+                .get_mut("bucket")
+                .expect("observed bucket")
+                .bucket_incarnation = authoritative.buckets_usage["bucket"].bucket_incarnation.clone();
             info
         };
         let first = observation(7, 11, 200, 11, 1_100);
