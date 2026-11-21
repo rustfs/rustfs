@@ -5625,6 +5625,12 @@ impl SetDisks {
         crate::bucket::retirement::is_retired(store, bucket, incarnation).await
     }
 
+    /// Shared durable movement generation used for display-only scan samples.
+    pub async fn scanner_durable_data_movement_generation(&self) -> Option<u64> {
+        let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
+        owner.scanner_durable_data_movement_generation().await
+    }
+
     /// Admit one short scanner cache publication under this set's instance
     /// movement fence. The caller must hold the returned guard through its
     /// final conditional cache write; no scan-round work belongs under it.

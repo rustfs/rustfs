@@ -41,6 +41,7 @@ http.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
 reqwest = { workspace = true, features = ["json"] }
 rustfs-signer.workspace = true
+rustfs-data-usage.workspace = true
 s3s.workspace = true
 jiff = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }

@@ -2336,6 +2336,7 @@ impl DataUsageCache {
     }
 }
 
+mod display_progress;
 mod persistence;
 mod source_tree;
 

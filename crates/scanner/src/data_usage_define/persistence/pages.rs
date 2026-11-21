@@ -198,6 +198,32 @@ impl EncodedPages {
     pub(super) fn length(&self) -> u64 {
         self.archive.length
     }
+
+    /// Share the original MessagePack stream without copying page payloads.
+    pub(super) async fn progress_input(&self) -> Option<Vec<Bytes>> {
+        let mut pending = vec![(self.root.root, self.root.level)];
+        let mut chunks = Vec::new();
+        let mut visits = 0_usize;
+        while let Some((key, level)) = pending.pop() {
+            visits += 1;
+            if visits.is_multiple_of(256) {
+                tokio::task::yield_now().await;
+            }
+            let bytes = self.archive.blocks.get(&key)?;
+            if level == 0 {
+                chunks.push(bytes.clone());
+            } else {
+                let (children, remainder) = bytes.as_chunks::<32>();
+                if !remainder.is_empty() {
+                    return None;
+                }
+                for child in children.iter().rev() {
+                    pending.push((*child, level - 1));
+                }
+            }
+        }
+        Some(chunks)
+    }
 }
 
 pub(super) fn encode(cache: &DataUsageCache) -> StorageResult<EncodedPages> {
@@ -575,5 +601,47 @@ pub(super) async fn reclaim<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         Ok(Ok(_)) | Ok(Err(StorageError::FileNotFound | StorageError::ObjectNotFound(..))) => Ok(()),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(Error::other("retired scanner checkpoint cleanup timed out")),
+    }
+}
+
+#[cfg(test)]
+mod progress_input_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn display_progress_input_reassembles_multilevel_checkpoint_pages() {
+        for count in [0, 3, 16_384] {
+            let mut cache = DataUsageCache::default();
+            cache.info.name = "bucket".into();
+            cache.replace("bucket", "", DataUsageEntry::default());
+            for index in 0..count {
+                let path = format!("bucket/object-{index:05}-{}", "x".repeat(512));
+                cache.replace(
+                    &path,
+                    "bucket",
+                    DataUsageEntry {
+                        objects: 1,
+                        size: 11,
+                        ..Default::default()
+                    },
+                );
+            }
+            let encoded = encode(&cache).expect("encode checkpoint pages");
+            if count == 16_384 {
+                assert!(encoded.root.level >= 2, "the fixture must cover multiple manifest levels");
+            }
+            let chunks = encoded.progress_input().await.expect("borrow immutable serialized chunks");
+            assert_eq!(
+                chunks.iter().map(Bytes::len).sum::<usize>(),
+                usize::try_from(encoded.length()).expect("fixture length")
+            );
+            let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+            let recovered = DataUsageCache::unmarshal(&bytes).expect("decode the original MessagePack stream");
+            let totals = recovered
+                .checked_flatten_complete_scope("bucket")
+                .expect("connected checkpoint");
+            assert_eq!((totals.objects, totals.size), (count, count * 11));
+            assert_eq!(recovered.cache.len(), cache.cache.len());
+        }
     }
 }

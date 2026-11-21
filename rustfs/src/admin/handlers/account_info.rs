@@ -19,7 +19,7 @@ use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::admin::storage_api::data_usage::load_admin_data_usage_with_memory_overlay;
+use crate::admin::storage_api::data_usage::{load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
@@ -86,6 +86,17 @@ fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAcce
 
     bucket_info.size = Some(usage.size);
     bucket_info.objects = Some(usage.objects_count);
+    bucket_info.usage_value_state = usage.usage_value_state;
+    bucket_info.usage_updated_at = usage.usage_certification.and_then(|certificate| {
+        u64::try_from(
+            certificate
+                .certified_at
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()?
+                .as_millis(),
+        )
+        .ok()
+    });
     bucket_info.object_sizes_histogram = Some(usage.object_size_histogram.clone());
     bucket_info.object_versions_histogram = Some(usage.object_versions_histogram.clone());
 }
@@ -299,6 +310,16 @@ impl Operation for AccountInfoHandler {
             }
         }
 
+        let visible_buckets = account_info
+            .buckets
+            .iter()
+            .map(|bucket| bucket.name.clone())
+            .collect::<Vec<_>>();
+        let mut progress = load_bucket_scan_progress_for_admin(store, &visible_buckets, &data_usage_info).await;
+        for bucket in &mut account_info.buckets {
+            bucket.scan_progress = progress.remove(&bucket.name);
+        }
+
         let data = serde_json::to_vec(&AccountInfoResponse {
             account: account_info,
             username,
@@ -409,6 +430,42 @@ mod tests {
         assert_eq!(bucket_info.objects, None);
         assert_eq!(bucket_info.object_sizes_histogram, None);
         assert_eq!(bucket_info.object_versions_histogram, None);
+    }
+
+    #[test]
+    fn accountinfo_partial_progress_never_fills_total_usage_fields() {
+        let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+            name: "scanning".into(),
+            scan_progress: Some(rustfs_data_usage::BucketScanProgress {
+                stage: rustfs_data_usage::BucketScanStage::Scanning,
+                updated_at: 1000,
+                objects: Some(7),
+                size: Some(71),
+                sources_observed: 1,
+                sources_total: 2,
+            }),
+            ..Default::default()
+        };
+        apply_usage_to_bucket_access_info(&mut bucket_info, None);
+        let value = serde_json::to_value(&bucket_info).expect("serialize partial-only bucket");
+        assert!(value.get("objects").is_none());
+        assert!(value.get("size").is_none());
+        assert_eq!(value["scan_progress"]["objects"], 7);
+        assert_eq!(value["scan_progress"]["size"], 71);
+        let mut usage = BucketUsageInfo {
+            size: 900,
+            objects_count: 90,
+            ..Default::default()
+        };
+        usage.certify(rustfs_data_usage::BucketUsageCertification {
+            epoch: 1,
+            cycle: 2,
+            certified_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(500),
+        });
+        apply_usage_to_bucket_access_info(&mut bucket_info, Some(&usage));
+        assert_eq!((bucket_info.objects, bucket_info.size), (Some(90), Some(900)));
+        assert_eq!(bucket_info.usage_updated_at, Some(500));
+        assert_eq!(bucket_info.scan_progress.expect("separate partial view").objects, Some(7));
     }
 
     #[test]

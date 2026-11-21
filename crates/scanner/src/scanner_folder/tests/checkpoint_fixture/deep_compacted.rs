@@ -46,6 +46,13 @@ async fn save_reload(store: &Arc<FixtureStore>, cache: &DataUsageCache) -> DataU
         .await
         .expect("save compacted checkpoint through real codec and revision checks");
     let loaded = store.strict_load().await;
+    let restarted_store = FixtureStore::reopen(store.root.clone());
+    let progress_bytes = tokio::fs::read(restarted_store.root.join("progress"))
+        .await
+        .expect("durable display progress survives a cold store reopen");
+    let progress: rustfs_data_usage::BucketScanProgressSource =
+        serde_json::from_slice(&progress_bytes).expect("decode independent display progress");
+    assert_eq!(Some(&progress), loaded.display_scan_progress(0).as_ref());
     assert_eq!(loaded.info.snapshot_complete, cache.info.snapshot_complete);
     assert_eq!(loaded.info.scan_checkpoint, cache.info.scan_checkpoint);
     assert_eq!(loaded.info.scan_identity, cache.info.scan_identity);
