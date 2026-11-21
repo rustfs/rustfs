@@ -15,6 +15,7 @@
 use super::*;
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 struct CachePublicationAdmissionUnavailable;
@@ -625,14 +626,22 @@ impl DataUsageCache {
         self.save_inner(store, name, Some(revisions), None).await
     }
 
+    /// All epoch-fenced cache writes use background disk admission. Incremental
+    /// checkpoints pass their scan token; finalization uses a fresh token so a
+    /// spent scan budget can still persist progress within the save timeout.
     pub(crate) async fn save_with_revisions_for_epoch<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,
         name: &str,
         revisions: &DataUsageCacheRevisions,
         expected_epoch: u64,
+        cancellation: CancellationToken,
     ) -> StorageResult<()> {
-        self.save_inner(store, name, Some(revisions), Some(expected_epoch)).await
+        crate::storage_api::ecstore_with_background_disk_io(
+            cancellation,
+            self.save_inner(store, name, Some(revisions), Some(expected_epoch)),
+        )
+        .await
     }
 
     async fn save_inner<S: ScannerObjectIO + ScannerConfigObjectDelete>(

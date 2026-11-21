@@ -188,20 +188,20 @@ where
     from_io_stream_with_length(stream, None)
 }
 
-pub(super) fn from_io_stream_with_length<S>(stream: S, remaining: Option<u64>) -> Body
+pub(super) fn from_io_stream_with_length<S>(stream: S, length: Option<usize>) -> Body
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
     Body::from_payload(Payload::Stream(Box::pin(IoPayload {
         stream: Box::pin(stream),
-        remaining,
+        remaining: length,
         ended: false,
     })))
 }
 
 struct IoPayload<S> {
     stream: Pin<Box<S>>,
-    remaining: Option<u64>,
+    remaining: Option<usize>,
     ended: bool,
 }
 
@@ -216,7 +216,7 @@ impl<S: Stream<Item = std::io::Result<Bytes>>> PayloadStream for IoPayload<S> {
                 Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Some(remaining) = &mut self.remaining {
-                        *remaining = remaining.saturating_sub(bytes.len() as u64);
+                        *remaining = remaining.saturating_sub(bytes.len());
                     }
                     return Poll::Ready(Ok(PayloadRead::Chunk(bytes)));
                 }
@@ -241,7 +241,7 @@ impl<S: Stream<Item = std::io::Result<Bytes>>> PayloadStream for IoPayload<S> {
         caps
     }
     fn len_hint(&self) -> Option<u64> {
-        self.remaining
+        self.remaining.map(|length| length as u64)
     }
 }
 
@@ -437,6 +437,35 @@ mod tests {
             assert_eq!(trailers.lookup("x-test"), TrailerValue::Pending);
             assert!(chunks.next().await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn io_stream_with_length_tracks_data_and_preserves_producer_error() {
+        let mut body = from_io_stream_with_length(
+            futures::stream::iter([
+                Ok(Bytes::new()),
+                Ok(Bytes::from_static(b"abc")),
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, InternalProducerFailure)),
+            ]),
+            Some(5),
+        );
+        assert_eq!(body.size_hint().exact(), Some(5));
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"abc"));
+        assert_eq!(body.size_hint().exact(), Some(2));
+
+        let (mut chunks, trailers) = BodyChunks::new(body);
+        let error = chunks.next().await.unwrap().unwrap_err();
+        let error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("the original io::Error reaches RIO");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.get_ref().unwrap().is::<InternalProducerFailure>());
+        assert_eq!(trailers.lookup("x-test"), TrailerValue::Pending);
+        assert!(chunks.next().await.is_none());
     }
 
     #[test]

@@ -821,6 +821,7 @@ pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_cop
     let server = Arc::clone(service.pick());
     let read_ahead = service.put_read_ahead;
     let total = token.buffer_len;
+    let length = usize::try_from(total).map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?;
     let chunk_bytes = server.chunk_bytes();
     let object = format!("{bucket}/{key}");
     let token = token.clone();
@@ -861,7 +862,7 @@ pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_cop
             Ok::<_, io::Error>(Some((bytes, (pending, next_offset))))
         }
     });
-    Ok((super::native_body::from_io_stream_with_length(stream, Some(total)), total))
+    Ok((super::native_body::from_io_stream_with_length(stream, Some(length)), total))
 }
 
 /// State shared by the segment writers of one RDMA GET: the server, the
