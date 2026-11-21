@@ -41,7 +41,9 @@ async fn raw_enumeration_reuses_validated_parent_and_skips_unrelated_index() {
         saved.record_entry(&format!("entry-{i:04}")).expect("initial entry");
     }
     scanner.old_cache.info.scan_raw_enumeration_page_index = Some(saved.checkpoint().expect("saved index"));
+    RAW_PAGE_DIGEST_ENTRIES.set(0);
     scanner.record_raw_enumeration_entry("bucket/metadata", "entry-0000");
+    assert_eq!(RAW_PAGE_DIGEST_ENTRIES.get(), 1024, "restore must validate each sealed entry once");
     RAW_PAGE_DIGEST_ENTRIES.set(0);
     for i in 1..1024 {
         scanner.record_raw_enumeration_entry("bucket/metadata", &format!("entry-{i:04}"));
@@ -61,7 +63,6 @@ async fn raw_enumeration_reuses_validated_parent_and_skips_unrelated_index() {
     );
     for i in 0..32 {
         let parent = format!("bucket/other-{i}");
-        assert!(scanner.raw_enumeration_committed_entry_oracle(&parent).is_empty());
         scanner.record_raw_enumeration_entry(&parent, "object");
         scanner.finish_raw_enumeration_parent(&parent);
     }

@@ -605,7 +605,8 @@ async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeui
     create_cohort_bucket_objects(&store, "a-flat", 3).await;
     let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
     let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
-        max_objects: Some(1),
+        // The root consumes the only directory slot on every turn.
+        max_directories: Some(1),
         ..Default::default()
     });
     let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget).await;

@@ -254,10 +254,9 @@ async fn fair_prefix_quantum_nested_wide_directories_converge_across_restarts() 
         max_entries: Some(8),
         ..Default::default()
     };
-    // 41 root and 40 prefix entries at 8 per round, then 80 objects at the 7
-    // that survive each object-budget stop. Rebuilding a dropped index costs
-    // a full prefix enumeration per classification round and overruns this.
-    const ROUND_BOUND: usize = 6 + 5 + 12 + 2;
+    // 41 root and 40 prefix entries at eight per round, then 80 objects.
+    // Allow a boundary round for each directory; rebuilding an index overruns this.
+    const ROUND_BOUND: usize = 6 + 5 + 10 + 2;
     let finished = run_until_finished(&disk_root, cache, config, ROUND_BOUND).await;
     let totals = finished.checked_flatten("bucket").expect("bucket root");
     let expected = u64::try_from(WIDTH * 2).expect("fixture size");
@@ -1192,4 +1191,98 @@ async fn changed_directory_listing_clears_its_physical_receipt() {
         saved.lock().expect("receipt").is_none(),
         "an invalid listing cannot retain a resumable receipt"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[serial]
+async fn wide_listing_charges_disk_refills_and_preserves_the_logical_cut() {
+    use crate::sleeper::{ScannerDiskIoBudgetLimits, scanner_disk_io_budget_status};
+
+    const WIDTH: usize = 130;
+    let temp = tempfile::tempdir().expect("temporary disk");
+    let root = temp.path().join("disk");
+    let cache = seed_flat_bucket(&root, WIDTH).await;
+    let disk = open_fixture_disk(&root).await;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_entries: Some(65),
+            ..Default::default()
+        },
+    );
+    let sleeper = SCANNER_SLEEPER.for_disk_with_budget_for_tests(
+        &root,
+        ScannerDiskIoBudgetLimits {
+            iops: Some(1000),
+            bytes_per_sec: None,
+        },
+    );
+    let result = scan_data_folder(
+        budget.token(),
+        budget.clone(),
+        vec![disk.clone()],
+        disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        sleeper,
+    )
+    .await;
+    let Err(ScannerError::PartialCache(partial)) = result else {
+        panic!("logical limit must interrupt discovery")
+    };
+    assert!(!partial.info.snapshot_complete);
+    assert_eq!(budget.entries_visited(), 65);
+    assert_eq!(budget.progress().0, 0);
+    let charges = scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == root.to_string_lossy())
+        .expect("disk budget");
+    assert_eq!(charges.charged_ops, 4, "one open and three native directory batches");
+
+    let bytes = partial.marshal_msg().expect("save partial");
+    let mut restored = DataUsageCache::unmarshal(&bytes).expect("cold restore");
+    let source = restored.info.source.expect("source set");
+    let identity = restored.info.scan_identity.expect("bucket identity");
+    let plan = restored.info.scan_progress.expect("incomplete plan").started_plan;
+    assert_eq!(
+        restored.prepare_bucket_checkpoint("bucket", 2, 1, source, plan, identity),
+        crate::data_usage_define::DataUsageCachePrepareOutcome::Reused,
+    );
+    assert!(restored.has_scan_position());
+    let yields_before = global_metrics().lifetime(Metric::Yield);
+    let finished = temp_env::async_with_vars([(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("32"))], async {
+        run_until_finished(&root, restored, Default::default(), 1).await
+    })
+    .await;
+    assert_eq!(
+        global_metrics().lifetime(Metric::Yield) - yields_before,
+        4,
+        "130 objects across 130 directories"
+    );
+    let total = finished.checked_flatten("bucket").expect("complete inventory");
+    assert_eq!((total.objects, total.versions, total.size), (WIDTH, WIDTH, WIDTH));
+}
+
+#[tokio::test]
+#[serial]
+async fn one_object_quantum_commits_the_object_before_yielding() {
+    const WIDTH: usize = 5;
+    let temp = tempfile::tempdir().expect("temporary disk");
+    let root = temp.path().join("disk");
+    let cache = seed_flat_bucket(&root, WIDTH).await;
+    for key in ["object-0002/nested", "object-0002/nested/deep"] {
+        let bytes = metadata_for_object_version("bucket", key, Some(Uuid::new_v4()));
+        write_test_object_metadata_bytes(&root, "bucket", key, &bytes).await;
+    }
+    let expected = WIDTH + 2;
+    let config = ScannerCycleBudgetConfig {
+        max_objects: Some(1),
+        ..Default::default()
+    };
+    let cache = run_until_finished(&root, cache, config, expected + 2).await;
+    let total = cache.checked_flatten("bucket").expect("complete bucket");
+    assert_eq!((total.objects, total.versions, total.size), (expected, expected, expected));
 }

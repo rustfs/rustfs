@@ -535,20 +535,20 @@ async fn erasure_candidate_defers_metadata_until_part_classification_finishes() 
 #[tokio::test]
 #[serial]
 async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassifies_on_resume() {
-    check_candidate_resume(CandidateResume::Legacy, 136).await;
+    check_candidate_resume(CandidateResume::Legacy).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn erasure_candidate_warm_resume_avoids_rereading_sealed_root() {
-    check_candidate_resume(CandidateResume::Warm, 135).await;
+    check_candidate_resume(CandidateResume::Warm).await;
 }
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
 #[serial]
 async fn erasure_candidate_cold_resume_uses_the_validated_sealed_root() {
-    check_candidate_resume(CandidateResume::Cold, 135).await;
+    check_candidate_resume(CandidateResume::Cold).await;
 }
 
 enum CandidateResume {
@@ -558,7 +558,7 @@ enum CandidateResume {
     Cold,
 }
 
-async fn check_candidate_resume(kind: CandidateResume, expected_io: u64) {
+async fn check_candidate_resume(kind: CandidateResume) {
     use crate::storage_api::owner::EcstoreDiskAPI;
 
     let (mut scanner, root, folder) = candidate_scanner().await;
@@ -667,10 +667,18 @@ async fn check_candidate_resume(kind: CandidateResume, expected_io: u64) {
             .failed_objects
             .contains_key(&failed_object_key(&root, "bucket/xl.meta"))
     );
+    // 67 charges before cancellation, then two reopens. The positioned
+    // reader fetches 66 regular names in three batches and resolves their type once.
+    let listing_ops = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        4
+    } else {
+        66
+    };
+    let root_replay = u64::from(matches!(kind, CandidateResume::Legacy));
     assert_eq!(
         charged_ops(&root),
-        expected_io,
-        "resume charges every physical read, including cold reconstruction of the root"
+        67 + 2 + listing_ops + root_replay,
+        "only a legacy resume must enumerate the root again"
     );
 }
 
@@ -1023,8 +1031,12 @@ async fn erasure_candidate_vanished_before_open_preserves_other_namespace_progre
         );
         assert_eq!(
             charged_ops(&root),
-            7,
-            "vanished open is charged but contributes no entry or metadata read"
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                6
+            } else {
+                7
+            },
+            "two root names share a positioned read; the vanished child costs only an open"
         );
         assert!(scanner.new_cache.info.failed_objects.is_empty());
         assert!(

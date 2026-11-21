@@ -15,8 +15,8 @@
 //! Per-disk background I/O budget for the data scanner.
 //!
 //! Each local disk owns two token buckets, one for operations per second and
-//! one for bytes per second. Directory opens, enumerated entries, scanner
-//! metadata/stat operations, and metadata bytes charge the relevant buckets;
+//! one for bytes per second. Directory opens, directory reads, scanner metadata/stat
+//! operations, and metadata bytes charge the relevant buckets;
 //! an exhausted bucket delays the walk. This paces scanner work on top of the
 //! local-disk foreground-priority admission gate: admission decides *when*
 //! background I/O may start while foreground requests are active, while the

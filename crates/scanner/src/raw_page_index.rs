@@ -15,6 +15,7 @@
 use crate::data_usage_define::clone_cache_value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -245,7 +246,7 @@ impl RawEnumerationPageIndex {
             return Err(RawEnumerationPageIndexError::StaleGeneration);
         }
         let entries = normalize_owner_entries(entries)?;
-        let committed_entries = inner.validated_committed_entries()?;
+        let committed_entries = inner.validated_entries(false)?;
         if inner.complete {
             if !entry_sets_match(&entries, &committed_entries) {
                 return Err(RawEnumerationPageIndexError::IdentityMismatch);
@@ -343,7 +344,7 @@ impl RawEnumerationPageIndex {
         if inner.generation != expected_generation {
             return Err(RawEnumerationPageIndexError::StaleGeneration);
         }
-        let entries_start = inner.validated_committed_entries()?.len();
+        let entries_start = inner.validated_entries(false)?.len();
         inner.commit_building_page(entries_start)?;
         inner
             .pages
@@ -369,17 +370,25 @@ impl RawEnumerationPageIndex {
         Ok(page)
     }
 
+    pub(crate) fn is_valid_for_restore(&self) -> bool {
+        let RawEnumerationPageIndexState::Supported(inner) = &self.state else {
+            return false;
+        };
+        let mut seen = HashSet::new();
+        inner.validate_membership(|name, _| seen.insert(name)).is_ok()
+    }
+
     pub fn committed_entries(&self) -> Result<Vec<String>, RawEnumerationPageIndexError> {
         match &self.state {
             RawEnumerationPageIndexState::Unsupported => Ok(Vec::new()),
-            RawEnumerationPageIndexState::Supported(inner) => inner.validated_committed_entries(),
+            RawEnumerationPageIndexState::Supported(inner) => inner.validated_entries(false),
         }
     }
 
     pub fn indexed_entries(&self) -> Result<Vec<String>, RawEnumerationPageIndexError> {
         match &self.state {
             RawEnumerationPageIndexState::Unsupported => Ok(Vec::new()),
-            RawEnumerationPageIndexState::Supported(inner) => inner.validated_indexed_entries(),
+            RawEnumerationPageIndexState::Supported(inner) => inner.validated_entries(true),
         }
     }
 }
@@ -431,41 +440,44 @@ impl RawEnumerationPageIndexInner {
         }
     }
 
-    fn validated_committed_entries(&self) -> Result<Vec<String>, RawEnumerationPageIndexError> {
-        let mut entries = Vec::new();
-        for (page_index, page) in self.pages.iter().enumerate() {
-            page.validate(
-                &self.parent,
-                u64::try_from(page_index).unwrap_or(u64::MAX),
-                u64::try_from(entries.len()).unwrap_or(u64::MAX),
-            )?;
-            if page.terminal && page_index + 1 != self.pages.len() {
+    /// Validate the wire representation and build the caller's membership table in one pass.
+    /// Only sealed entries can exempt a replayed name from the next cycle's entry budget.
+    fn validate_membership<'a>(
+        &'a self,
+        mut insert: impl FnMut(&'a str, bool) -> bool,
+    ) -> Result<(), RawEnumerationPageIndexError> {
+        if self.parent.is_empty() || self.page_entry_limit == 0 || (self.complete && self.building.is_some()) {
+            return Err(RawEnumerationPageIndexError::CorruptIndex);
+        }
+        let mut offset = 0;
+        for (ordinal, page) in self.pages.iter().enumerate() {
+            page.validate(&self.parent, ordinal as u64, offset)?;
+            if page.entries.len() > self.page_entry_limit
+                || page.terminal != (self.complete && ordinal + 1 == self.pages.len())
+                || !page.entries.iter().all(|name| insert(name, true))
+            {
                 return Err(RawEnumerationPageIndexError::CorruptIndex);
             }
-            entries.extend(page.entries.iter().map(clone_cache_value));
+            offset += page.entries.len() as u64;
         }
-        if self.complete && self.pages.last().is_some_and(|page| !page.terminal) {
-            return Err(RawEnumerationPageIndexError::CorruptIndex);
+        if let Some(building) = &self.building {
+            building.validate(self.pages.len() as u64, offset, self.page_entry_limit)?;
+            if !building.entries.iter().all(|name| insert(name, false)) {
+                return Err(RawEnumerationPageIndexError::CorruptIndex);
+            }
         }
-        let mut unique_entries = clone_cache_value(&entries);
-        unique_entries.sort();
-        unique_entries.dedup();
-        if unique_entries.len() != entries.len() {
-            return Err(RawEnumerationPageIndexError::CorruptIndex);
-        }
-        Ok(entries)
+        Ok(())
     }
 
-    fn validated_indexed_entries(&self) -> Result<Vec<String>, RawEnumerationPageIndexError> {
-        let mut entries = self.validated_committed_entries()?;
-        if let Some(building) = &self.building {
-            building.validate(
-                u64::try_from(self.pages.len()).unwrap_or(u64::MAX),
-                u64::try_from(entries.len()).unwrap_or(u64::MAX),
-                self.page_entry_limit,
-            )?;
-            entries.extend(building.entries.iter().map(clone_cache_value));
-        }
+    fn validated_entries(&self, include_building: bool) -> Result<Vec<String>, RawEnumerationPageIndexError> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        self.validate_membership(|name, sealed| {
+            if sealed || include_building {
+                entries.push(name.to_owned());
+            }
+            seen.insert(name)
+        })?;
         Ok(entries)
     }
 

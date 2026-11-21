@@ -883,6 +883,13 @@ pub struct FolderScanner {
     partial_heal_discovery_observer: Option<mpsc::UnboundedSender<(usize, usize)>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawEntryAccounting {
+    Untracked,
+    Replay,
+    Admitted,
+}
+
 struct RawEnumerationProgress {
     parent: String,
     last_entry: Option<String>,
@@ -897,8 +904,11 @@ impl RawEnumerationProgress {
         let mut digest = Sha256::new();
         update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
         let page_index = page_index
-            .or_else(|| RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok())
-            .and_then(|index| RawEnumerationPageWriter::new(index).ok());
+            .and_then(|index| RawEnumerationPageWriter::new(index).ok())
+            .or_else(|| {
+                let empty = RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok()?;
+                RawEnumerationPageWriter::new(empty).ok()
+            });
         Self {
             parent: parent.to_string(),
             last_entry: None,
@@ -929,17 +939,30 @@ impl RawEnumerationProgress {
         })
     }
 
+    #[cfg(test)]
     fn record_entry(&mut self, entry: &str) {
+        self.record_entry_with_stream(entry, false);
+    }
+
+    fn record_entry_with_stream(&mut self, entry: &str, continues_stream: bool) -> RawEntryAccounting {
         if let Some((index, _)) = self.sealed_pages.take() {
             *self = Self::new(&self.parent, Some(index));
         }
         update_raw_enumeration_digest(&mut self.digest, b"entry", entry.as_bytes());
         self.last_entry = Some(entry.to_string());
         self.entries_seen = self.entries_seen.saturating_add(1);
-        if let Some(index) = &mut self.page_index
-            && index.record_entry(entry).is_err()
-        {
+        let Some(writer) = &mut self.page_index else {
+            return RawEntryAccounting::Untracked;
+        };
+        let replay = writer.is_replay(entry, continues_stream);
+        if writer.record_entry(entry).is_err() {
             self.page_index = None;
+            return RawEntryAccounting::Untracked;
+        }
+        if replay {
+            RawEntryAccounting::Replay
+        } else {
+            RawEntryAccounting::Admitted
         }
     }
 
@@ -1098,10 +1121,12 @@ async fn next_scanner_dir_entry(
         entries.batch_entries = 0;
     }
     let entry = wait_for_scanner_io(ctx, run_scanner_node_operation(admission, ctx, entries.peek_entry())).await???;
-    if entry.as_ref().is_some_and(|item| !item.is_recorded()) {
-        // Tokio prefetches bounded chunks. Pacing consumption also paces the
-        // next refill, without charging an extra entry for EOF.
-        wait_for_scanner_io(ctx, sleeper.admit_disk_io(1, 0)).await?;
+    if let Some(item) = &entry
+        && item.disk_ops != 0
+    {
+        // The reader owns the I/O cost. Accepting a buffered name still consumes
+        // its logical scan budget, independently of the physical read.
+        wait_for_scanner_io(ctx, sleeper.admit_disk_io(item.disk_ops, 0)).await?;
     }
     if entry.is_some() {
         entries.accept_entry();
@@ -1459,16 +1484,19 @@ impl FolderScanner {
         }
     }
 
-    /// Records one raw entry. Returns whether a durable index holds it, which
-    /// is what makes stopping at this entry recoverable.
     #[cfg(test)]
-    fn record_raw_enumeration_entry(&mut self, parent: &str, entry: &str) -> bool {
+    fn record_raw_enumeration_entry(&mut self, parent: &str, entry: &str) -> RawEntryAccounting {
         self.record_raw_enumeration_entry_with_stream(parent, entry, false)
     }
 
-    fn record_raw_enumeration_entry_with_stream(&mut self, parent: &str, entry: &str, continues_stream: bool) -> bool {
+    fn record_raw_enumeration_entry_with_stream(
+        &mut self,
+        parent: &str,
+        entry: &str,
+        continues_stream: bool,
+    ) -> RawEntryAccounting {
         if self.old_cache.info.scan_progress.is_none() {
-            return false;
+            return RawEntryAccounting::Untracked;
         }
         if let Some(position) = self
             .raw_enumeration_progress
@@ -1477,44 +1505,21 @@ impl FolderScanner {
         {
             self.raw_enumeration_progress.truncate(position + 1);
         } else {
-            let page_index = self.raw_enumeration_page_index_for_parent(parent).map(clone_cache_value);
+            let page_index = self
+                .old_cache
+                .raw_enumeration_page_index_for_parent(parent)
+                .map(clone_cache_value);
             let mut progress = RawEnumerationProgress::new(parent, page_index);
             if continues_stream && let Some(writer) = &mut progress.page_index {
                 writer.continue_native_stream();
             }
             self.raw_enumeration_progress.push(progress);
         }
-        self.raw_enumeration_progress.last_mut().is_some_and(|progress| {
-            progress.record_entry(entry);
-            progress.page_index.is_some()
-        })
-    }
-
-    fn raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
-        self.old_cache.validated_raw_enumeration_page_index_for_parent(parent)
-    }
-
-    fn raw_enumeration_committed_entry_oracle(&self, parent: &str) -> HashSet<String> {
-        let Some(index) = self.raw_enumeration_page_index_for_parent(parent) else {
-            return HashSet::new();
-        };
-        let generation_matches_parent = match index.status() {
-            crate::raw_page_index::RawEnumerationPageOwnerStatus::Building {
-                generation,
-                parent: index_parent,
-                ..
-            }
-            | crate::raw_page_index::RawEnumerationPageOwnerStatus::Ready {
-                generation,
-                parent: index_parent,
-                ..
-            } => generation > 0 && index_parent == parent,
-            crate::raw_page_index::RawEnumerationPageOwnerStatus::Unsupported => false,
-        };
-        if !generation_matches_parent {
-            return HashSet::new();
-        }
-        index.committed_entries().unwrap_or_default().into_iter().collect()
+        self.raw_enumeration_progress
+            .last_mut()
+            .map_or(RawEntryAccounting::Untracked, |progress| {
+                progress.record_entry_with_stream(entry, continues_stream)
+            })
     }
 
     fn finish_raw_enumeration_parent(&mut self, parent: &str) {
@@ -2072,6 +2077,232 @@ impl FolderScanner {
             .map(|_| ())
     }
 
+    fn has_resumable_object_limit(&self) -> bool {
+        self.old_cache.info.scan_progress.is_some() && self.budget.limits_objects()
+    }
+
+    async fn scan_object_metadata(
+        &mut self,
+        ctx: &CancellationToken,
+        folder: &CachedFolder,
+        hash: &DataUsageHash,
+        into: &mut DataUsageEntry,
+        mut item: ScannerItem,
+        entry_metadata_len: Option<u64>,
+    ) -> Result<Option<String>, ScannerError> {
+        let work_started = tokio::time::Instant::now();
+        // Keep failed paths visible to this scan so repair success can
+        // clear stale failure state and a complete walk can discard
+        // paths that were removed since the previous cycle.
+        let repeated_failed_path = self.mark_failed_path_seen(&item.path);
+        if repeated_failed_path && self.failed_retry_suppressed(&item.path) {
+            // A new FolderScanner starts with an empty seen set, so
+            // cached paths are still rechecked once per cycle. Skip
+            // duplicate listings within this same scanner pass.
+            into.failed_objects = into.failed_objects.max(1);
+            return Ok(None);
+        }
+
+        // Budget and admission waits already pace this walker. Charge
+        // only work performed after admission, never those waits again.
+        let mut work_elapsed = work_started.elapsed();
+
+        // Reuse a resolved symlink's size; otherwise admit the size
+        // stat only when the byte budget needs it.
+        let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
+            if let Some(len) = entry_metadata_len {
+                len
+            } else {
+                wait_for_scanner_io(ctx, self.sleeper.admit_disk_io(1, 0)).await?;
+                wait_for_scanner_io(
+                    ctx,
+                    run_scanner_node_operation(self.node_admission.as_ref(), ctx, async {
+                        let started = tokio::time::Instant::now();
+                        let result = native_io::metadata(&item.path).await;
+                        work_elapsed = work_elapsed.saturating_add(started.elapsed());
+                        result
+                    }),
+                )
+                .await??
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+            }
+        } else {
+            0
+        };
+        wait_for_scanner_io(ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
+
+        let size_result = run_scanner_metadata_operation(self.node_admission.as_ref(), ctx, async {
+            let started = tokio::time::Instant::now();
+            self.object_metadata_visits.increment(1);
+            #[cfg(feature = "diagnostic-prefix-attribution")]
+            if let Some(attribution) = &self.prefix_attribution {
+                attribution.record(&item.bucket, &item.prefix);
+            }
+            let result = self
+                .local_disk
+                .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
+                .await;
+            #[cfg(feature = "diagnostic-prefix-attribution")]
+            if result.is_ok()
+                && let Some(attribution) = &self.prefix_attribution
+            {
+                attribution.record_success(&item.bucket, &item.prefix);
+            }
+            work_elapsed = work_elapsed.saturating_add(started.elapsed());
+            result
+        })
+        .await?;
+        let work_started = tokio::time::Instant::now();
+        if self.node_admission.is_some()
+            && ctx.is_cancelled()
+            && !matches!(&size_result, Err(error) if is_scanner_source_unavailable(error))
+        {
+            return Err(ScannerError::Other("Operation cancelled".to_string()));
+        }
+        let sz = match size_result {
+            Ok(sz) => sz,
+            Err(e) => {
+                let failure_action = classify_get_size_failure(&item, &e);
+                if failure_action == GetSizeFailureAction::AbandonSource {
+                    return Err(ScannerError::source_unavailable(e));
+                }
+                let retry_suppressed = self.failed_retry_suppressed(&item.path);
+
+                if failure_action != GetSizeFailureAction::Skip {
+                    self.resolved_failed_object_paths.remove(&item.path);
+                    into.failed_objects = into.failed_objects.saturating_add(1);
+                    if !retry_suppressed {
+                        self.record_failed(&item.path);
+                    }
+
+                    if !retry_suppressed && should_log_failed_object(into.failed_objects) {
+                        if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
+                            error!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_METADATA_CORRUPT,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                drive = %self.local_disk.path().display(),
+                                bucket = %item.bucket,
+                                object = %object,
+                                metadata_path = %item.path,
+                                failed_objects = into.failed_objects,
+                                state = "metadata_corrupt",
+                                error = %e,
+                                "Scanner detected corrupt object metadata"
+                            );
+                        } else {
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                path = %item.path,
+                                failed_objects = into.failed_objects,
+                                state = "get_size_failed",
+                                error = %e,
+                                "Scanner folder failed to get object size"
+                            );
+                        }
+                    }
+                } else {
+                    self.clear_failed_path(&item.path);
+                }
+
+                if let GetSizeFailureAction::HealMetadata { object } = failure_action
+                    && !retry_suppressed
+                {
+                    // Single-flight (backlog#1894 axis A) — the
+                    // recording mode and its guarantees are pinned by
+                    // corrupt_metadata_recording below.
+                    let mrf_result = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
+                        rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
+                        &item.bucket,
+                        &object,
+                        None,
+                        None,
+                    );
+                    match corrupt_metadata_recording(mrf_result) {
+                        CorruptMetadataRecording::LedgerOnly => {
+                            // Recorded as Full (retry-later): admission
+                            // for this target happens in the MRF
+                            // consumer, not in the manager's queue here.
+                            self.update_pending_scanner_heal_after_admission(
+                                PendingScannerHealKind::Object,
+                                &item.bucket,
+                                Some(&object),
+                                None,
+                                self.scan_mode,
+                                HealAdmissionResult::Full,
+                            );
+                        }
+                        CorruptMetadataRecording::ImmediateAndLedger => {
+                            self.send_required_scanner_heal_request(
+                                PendingScannerHealKind::Object,
+                                item.bucket.clone(),
+                                Some(object.clone()),
+                                None,
+                                build_object_heal_request(
+                                    item.bucket.clone(),
+                                    object.clone(),
+                                    None,
+                                    self.scan_mode,
+                                    HealChannelPriority::High,
+                                ),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+
+                wait_for_scanner_io(
+                    ctx,
+                    self.sleeper
+                        .pace_object(&mut self.pacing_debt, work_elapsed.saturating_add(work_started.elapsed())),
+                )
+                .await?;
+                return Ok(None);
+            }
+        };
+
+        self.clear_failed_path(&item.path);
+
+        item.transform_meta_dir();
+
+        let resolved = path_join_buf(&[&item.bucket, &item.object_path()]);
+        apply_scanner_size_summary(into, &sz);
+        if !sz.size_reconciliation.is_empty() {
+            self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
+        }
+        self.apply_size_reconciliation(&sz);
+        into.objects += 1;
+        if !self.has_resumable_object_limit() {
+            self.budget.record_object_scanned();
+        }
+        self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
+        self.maybe_send_checkpoint(folder, hash, into);
+
+        wait_for_scanner_io(
+            ctx,
+            self.sleeper
+                .pace_object(&mut self.pacing_debt, work_elapsed.saturating_add(work_started.elapsed())),
+        )
+        .await?;
+
+        if ctx.is_cancelled() {
+            return Err(ScannerError::Other("Operation cancelled".to_string()));
+        }
+
+        if should_yield_after_object(self.checkpoint_objects, scanner_yield_every_n_objects()) {
+            self.send_update_for_entry(hash, &folder.parent, into).await;
+            let yield_start = Instant::now();
+            tokio::task::yield_now().await;
+            global_metrics().record_scanner_yield(yield_start.elapsed());
+        }
+        Ok(Some(resolved))
+    }
+
     #[allow(clippy::never_loop)]
     #[allow(unused_assignments)]
     async fn scan_folder_inner(
@@ -2098,6 +2329,7 @@ impl FolderScanner {
         // Store initial compaction state.
         let was_compacted = into.compacted;
 
+        let mut completed_budgeted_object = false;
         'scan: loop {
             if ctx.is_cancelled() {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -2156,8 +2388,7 @@ impl FolderScanner {
 
             let mut queued_folders: Vec<QueuedFolder> = Vec::new();
             let mut found_object_metadata = false;
-            let mut object_count: u64 = 0;
-            let yield_every_objects = scanner_yield_every_n_objects();
+            let mut object_to_finish = None;
 
             let dir_path = path_join_buf(&[&self.root, &folder.name]);
 
@@ -2258,7 +2489,7 @@ impl FolderScanner {
             let continues_stream = dir_reader.as_ref().is_some_and(ScannerDirectory::continues_stream);
             // A sealed work queue only emits the two classification markers;
             // it never needs the raw-name membership table again.
-            let raw_enumeration_committed_entries = if dir_reader.as_ref().is_some_and(ScannerDirectory::finished_listing) {
+            if dir_reader.as_ref().is_some_and(ScannerDirectory::finished_listing) {
                 // A later quantum can stop in a child. Its durable proof
                 // still needs every ancestor's prior immutable pages, even
                 // though this cursor need not enumerate those names again.
@@ -2273,12 +2504,7 @@ impl FolderScanner {
                 {
                     self.raw_enumeration_progress.push(progress);
                 }
-                HashSet::new()
-            } else {
-                self.raw_enumeration_committed_entry_oracle(&folder.name)
-            };
-            let raw_replay_floor = u64::try_from(raw_enumeration_committed_entries.len()).unwrap_or(u64::MAX);
-            let mut raw_entries_observed = 0_u64;
+            }
             let mut raw_entries_charged = 0_u64;
 
             let mut candidate_unclassified = mode != FolderScanMode::Namespace;
@@ -2393,11 +2619,9 @@ impl FolderScanner {
                     // A restored index appends one pending name per entry past
                     // its old size, so charging only that tail keeps each
                     // budget unit durable even if the listing order changed.
-                    raw_entries_observed = raw_entries_observed.saturating_add(1);
-                    let raw_entry_is_new = (continues_stream || raw_entries_observed > raw_replay_floor)
-                        && !raw_enumeration_committed_entries.contains(&file_name);
+                    let accounting = self.record_raw_enumeration_entry_with_stream(&folder.name, &file_name, continues_stream);
                     #[cfg(test)]
-                    if raw_entry_is_new {
+                    if accounting != RawEntryAccounting::Replay {
                         tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
                     }
                     // Physical discovery is progress even when a changed directory
@@ -2411,12 +2635,10 @@ impl FolderScanner {
                         pending_entry_progress = 0;
                         last_entry_progress = Instant::now();
                     }
-                    let raw_entry_is_durable =
-                        self.record_raw_enumeration_entry_with_stream(&folder.name, &file_name, continues_stream);
                     // Object metadata and the entries behind it are charged to
                     // the object budget; this one covers listing work.
                     let object_entry = file_name == STORAGE_FORMAT_FILE || deferred_metadata.is_some();
-                    if raw_entry_is_new && raw_entry_is_durable && !object_entry {
+                    if accounting == RawEntryAccounting::Admitted && !object_entry {
                         raw_entries_charged = raw_entries_charged.saturating_add(1);
                         let name_bytes = u64::try_from(file_name.len()).unwrap_or(u64::MAX);
                         if !self.budget.try_charge_raw_entry(name_bytes, raw_entries_charged) {
@@ -2623,14 +2845,12 @@ impl FolderScanner {
                     continue;
                 }
 
-                let work_started = tokio::time::Instant::now();
-
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
                     self.heal_object_select / folder.object_heal_prob_div,
                 ) && self.try_should_heal().await?;
 
-                let mut item = ScannerItem {
+                let item = ScannerItem {
                     path: file_path,
                     bucket,
                     prefix: rustfs_utils::path::dir(&prefix),
@@ -2645,219 +2865,16 @@ impl FolderScanner {
                     file_type: entry_type,
                 };
 
-                // Keep failed paths visible to this scan so repair success can
-                // clear stale failure state and a complete walk can discard
-                // paths that were removed since the previous cycle.
-                let repeated_failed_path = self.mark_failed_path_seen(&item.path);
-                if repeated_failed_path && self.failed_retry_suppressed(&item.path) {
-                    // A new FolderScanner starts with an empty seen set, so
-                    // cached paths are still rechecked once per cycle. Skip
-                    // duplicate listings within this same scanner pass.
-                    into.failed_objects = into.failed_objects.max(1);
-                    continue;
-                }
-
-                // Budget and admission waits already pace this walker. Charge
-                // only work performed after admission, never those waits again.
-                let mut work_elapsed = work_started.elapsed();
-
-                // Reuse a resolved symlink's size; otherwise admit the size
-                // stat only when the byte budget needs it.
-                let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
-                    if let Some(len) = entry_metadata_len {
-                        len
-                    } else {
-                        wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
-                        wait_for_scanner_io(
-                            &ctx,
-                            run_scanner_node_operation(self.node_admission.as_ref(), &ctx, async {
-                                let started = tokio::time::Instant::now();
-                                let result = native_io::metadata(&item.path).await;
-                                work_elapsed = work_elapsed.saturating_add(started.elapsed());
-                                result
-                            }),
-                        )
-                        .await??
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0)
-                    }
-                } else {
-                    0
-                };
-                wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
-
-                let size_result = run_scanner_metadata_operation(self.node_admission.as_ref(), &ctx, async {
-                    let started = tokio::time::Instant::now();
-                    self.object_metadata_visits.increment(1);
-                    #[cfg(feature = "diagnostic-prefix-attribution")]
-                    if let Some(attribution) = &self.prefix_attribution {
-                        attribution.record(&item.bucket, &item.prefix);
-                    }
-                    let result = self
-                        .local_disk
-                        .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
-                        .await;
-                    #[cfg(feature = "diagnostic-prefix-attribution")]
-                    if result.is_ok()
-                        && let Some(attribution) = &self.prefix_attribution
-                    {
-                        attribution.record_success(&item.bucket, &item.prefix);
-                    }
-                    work_elapsed = work_elapsed.saturating_add(started.elapsed());
-                    result
-                })
-                .await?;
-                let work_started = tokio::time::Instant::now();
-                if self.node_admission.is_some()
-                    && ctx.is_cancelled()
-                    && !matches!(&size_result, Err(error) if is_scanner_source_unavailable(error))
+                if self.has_resumable_object_limit() {
+                    object_to_finish = Some((item, entry_metadata_len));
+                } else if let Some(resolved) = self
+                    .scan_object_metadata(&ctx, &folder, &this_hash, into, item, entry_metadata_len)
+                    .await?
                 {
-                    return Err(ScannerError::Other("Operation cancelled".to_string()));
-                }
-                let sz = match size_result {
-                    Ok(sz) => sz,
-                    Err(e) => {
-                        let failure_action = classify_get_size_failure(&item, &e);
-                        if failure_action == GetSizeFailureAction::AbandonSource {
-                            return Err(ScannerError::source_unavailable(e));
-                        }
-                        let retry_suppressed = self.failed_retry_suppressed(&item.path);
-
-                        if failure_action != GetSizeFailureAction::Skip {
-                            self.resolved_failed_object_paths.remove(&item.path);
-                            into.failed_objects = into.failed_objects.saturating_add(1);
-                            if !retry_suppressed {
-                                self.record_failed(&item.path);
-                            }
-
-                            if !retry_suppressed && should_log_failed_object(into.failed_objects) {
-                                if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
-                                    error!(
-                                        target: "rustfs::scanner::folder",
-                                        event = EVENT_SCANNER_METADATA_CORRUPT,
-                                        component = LOG_COMPONENT_SCANNER,
-                                        subsystem = LOG_SUBSYSTEM_FOLDER,
-                                        drive = %self.local_disk.path().display(),
-                                        bucket = %item.bucket,
-                                        object = %object,
-                                        metadata_path = %item.path,
-                                        failed_objects = into.failed_objects,
-                                        state = "metadata_corrupt",
-                                        error = %e,
-                                        "Scanner detected corrupt object metadata"
-                                    );
-                                } else {
-                                    warn!(
-                                        target: "rustfs::scanner::folder",
-                                        event = EVENT_SCANNER_FOLDER_STATE,
-                                        component = LOG_COMPONENT_SCANNER,
-                                        subsystem = LOG_SUBSYSTEM_FOLDER,
-                                        path = %item.path,
-                                        failed_objects = into.failed_objects,
-                                        state = "get_size_failed",
-                                        error = %e,
-                                        "Scanner folder failed to get object size"
-                                    );
-                                }
-                            }
-                        } else {
-                            self.clear_failed_path(&item.path);
-                        }
-
-                        if let GetSizeFailureAction::HealMetadata { object } = failure_action
-                            && !retry_suppressed
-                        {
-                            // Single-flight (backlog#1894 axis A) — the
-                            // recording mode and its guarantees are pinned by
-                            // corrupt_metadata_recording below.
-                            let mrf_result = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
-                                rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
-                                &item.bucket,
-                                &object,
-                                None,
-                                None,
-                            );
-                            match corrupt_metadata_recording(mrf_result) {
-                                CorruptMetadataRecording::LedgerOnly => {
-                                    // Recorded as Full (retry-later): admission
-                                    // for this target happens in the MRF
-                                    // consumer, not in the manager's queue here.
-                                    self.update_pending_scanner_heal_after_admission(
-                                        PendingScannerHealKind::Object,
-                                        &item.bucket,
-                                        Some(&object),
-                                        None,
-                                        self.scan_mode,
-                                        HealAdmissionResult::Full,
-                                    );
-                                }
-                                CorruptMetadataRecording::ImmediateAndLedger => {
-                                    self.send_required_scanner_heal_request(
-                                        PendingScannerHealKind::Object,
-                                        item.bucket.clone(),
-                                        Some(object.clone()),
-                                        None,
-                                        build_object_heal_request(
-                                            item.bucket.clone(),
-                                            object.clone(),
-                                            None,
-                                            self.scan_mode,
-                                            HealChannelPriority::High,
-                                        ),
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-
-                        wait_for_scanner_io(
-                            &ctx,
-                            self.sleeper
-                                .pace_object(&mut self.pacing_debt, work_elapsed.saturating_add(work_started.elapsed())),
-                        )
-                        .await?;
-                        continue;
+                    abandoned_children.remove(&resolved);
+                    if let Some(reader) = &mut dir_reader {
+                        reader.resolve_abandoned(&resolved);
                     }
-                };
-
-                self.clear_failed_path(&item.path);
-                found_object_metadata = true;
-
-                item.transform_meta_dir();
-
-                let resolved = path_join_buf(&[&item.bucket, &item.object_path()]);
-                abandoned_children.remove(&resolved);
-                if let Some(reader) = &mut dir_reader {
-                    reader.resolve_abandoned(&resolved);
-                }
-
-                apply_scanner_size_summary(into, &sz);
-                if !sz.size_reconciliation.is_empty() {
-                    self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
-                }
-                self.apply_size_reconciliation(&sz);
-                into.objects += 1;
-                object_count += 1;
-                self.budget.record_object_scanned();
-                self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
-                self.maybe_send_checkpoint(&folder, &this_hash, into);
-
-                wait_for_scanner_io(
-                    &ctx,
-                    self.sleeper
-                        .pace_object(&mut self.pacing_debt, work_elapsed.saturating_add(work_started.elapsed())),
-                )
-                .await?;
-
-                if ctx.is_cancelled() {
-                    return Err(ScannerError::Other("Operation cancelled".to_string()));
-                }
-
-                if should_yield_after_object(object_count, yield_every_objects) {
-                    self.send_update_for_entry(&this_hash, &folder.parent, into).await;
-                    let yield_start = Instant::now();
-                    tokio::task::yield_now().await;
-                    global_metrics().record_scanner_yield(yield_start.elapsed());
                 }
             }
             self.budget.record_entries_visited(pending_entry_progress);
@@ -3286,6 +3303,16 @@ impl FolderScanner {
                     self.refresh_usage_subtree(&h, &folder_item.parent);
                     self.send_update().await;
                 }
+            }
+
+            // A key can own both metadata and descendants. With an object quota,
+            // finish its children first so their receipts survive a stop before
+            // the parent is read, and the last admitted object can be committed.
+            if let Some((item, len)) = object_to_finish
+                && let Some(resolved) = self.scan_object_metadata(&ctx, &folder, &this_hash, into, item, len).await?
+            {
+                abandoned_children.remove(&resolved);
+                completed_budgeted_object = true;
             }
 
             if let Some(reader) = &mut dir_reader {
@@ -3786,6 +3813,11 @@ impl FolderScanner {
         emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
 
         self.directory_checkpoints.remove(&folder.name);
+        // A count limit cancels immediately. Return the completed directory to its
+        // parent in the same poll so its contribution can be acknowledged before yielding.
+        if completed_budgeted_object {
+            self.budget.record_object_scanned();
+        }
         Ok(FolderScanOutcome::Namespace)
     }
 

@@ -35,6 +35,7 @@ pub(crate) struct DirectoryAnchor {
 #[derive(Clone)]
 pub(super) struct DirEntry {
     source: EntrySource,
+    pub(super) disk_ops: u64,
     file_type: Option<FileType>,
 }
 
@@ -61,6 +62,7 @@ impl DirEntry {
     pub(super) fn recorded(parent: Arc<std::path::Path>, name: OsString, file_type: Option<FileType>) -> Self {
         Self {
             source: EntrySource::Recorded { parent, name },
+            disk_ops: u64::from(file_type.is_none()),
             file_type,
         }
     }
@@ -152,16 +154,20 @@ impl PhysicalReader {
         std::fs::read_dir(path).map(Self::Standard)
     }
 
-    fn next(&mut self) -> Option<io::Result<DirEntry>> {
+    fn next(&mut self, first_in_batch: bool) -> Option<io::Result<DirEntry>> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = first_in_batch;
         match self {
             Self::Standard(reader) => reader.next().map(|entry| {
                 entry.map(|entry| DirEntry {
                     file_type: entry.file_type().ok(),
                     source: EntrySource::Native(Arc::new(entry)),
+                    // std does not expose whether file_type needed a separate stat.
+                    disk_ops: 1,
                 })
             }),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Positioned(reader) => reader.next(),
+            Self::Positioned(reader) => reader.next(first_in_batch),
         }
     }
 }
@@ -174,8 +180,8 @@ struct DirectoryBuffer {
 
 impl DirectoryBuffer {
     fn refill(&mut self) {
-        for _ in 0..DIRECTORY_CHUNK_SIZE {
-            let Some(entry) = self.reader.next() else {
+        for index in 0..DIRECTORY_CHUNK_SIZE {
+            let Some(entry) = self.reader.next(index == 0) else {
                 self.more = false;
                 break;
             };

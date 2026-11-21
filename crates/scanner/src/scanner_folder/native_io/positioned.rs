@@ -163,27 +163,31 @@ impl Reader {
         })
     }
 
-    fn file_type(&mut self, kind: NativeType, name: &OsStr) -> Option<FileType> {
+    fn file_type(&mut self, kind: NativeType, name: &OsStr) -> (Option<FileType>, u64) {
         // std::fs::FileType has no public constructor. Reuse the observed type
         // only when the kernel dirent identified the same class. DT_UNKNOWN
         // and special files retain the per-entry symlink_metadata fallback.
         let cached = match kind {
-            NativeType::Directory => return Some(self.directory_type),
+            NativeType::Directory => return (Some(self.directory_type), 0),
             NativeType::RegularFile => &mut self.regular_type,
             NativeType::Symlink => &mut self.link_type,
-            _ => return None,
+            _ => return (None, 1),
         };
         if cached.is_none() {
-            let ty = std::fs::symlink_metadata(self.parent.join(name)).ok()?.file_type();
+            let Ok(meta) = std::fs::symlink_metadata(self.parent.join(name)) else {
+                // The caller will retry classification using the entry path.
+                return (None, 2);
+            };
+            let ty = meta.file_type();
             if (ty.is_file() && kind == NativeType::RegularFile) || (ty.is_symlink() && kind == NativeType::Symlink) {
                 *cached = Some(ty);
             }
-            return Some(ty);
+            return (Some(ty), 1);
         }
-        *cached
+        (*cached, 0)
     }
 
-    pub(super) fn next(&mut self) -> Option<io::Result<DirEntry>> {
+    pub(super) fn next(&mut self, first_in_batch: bool) -> Option<io::Result<DirEntry>> {
         loop {
             let raw = match self.dir.read()? {
                 Ok(record) => record,
@@ -195,7 +199,7 @@ impl Reader {
                 continue;
             }
             let name = OsStr::from_bytes(bytes);
-            let file_type = self.file_type(raw.file_type(), name);
+            let (file_type, type_ops) = self.file_type(raw.file_type(), name);
             return Some(Ok(DirEntry {
                 source: EntrySource::Positioned(Arc::new(PositionedEntry {
                     parent: self.parent.clone(),
@@ -203,6 +207,7 @@ impl Reader {
                     anchor,
                 })),
                 file_type,
+                disk_ops: u64::from(first_in_batch) + type_ops,
             }));
         }
     }

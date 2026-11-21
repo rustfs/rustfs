@@ -127,7 +127,7 @@ pub(super) async fn seed_flat_bucket(disk_root: &Path, objects: usize) -> DataUs
         bucket_incarnation: Uuid::from_u128(31),
         set_layout: crate::data_usage_define::DataUsageScanPlanDigest([32; 32]),
         publication_epoch: 1,
-        tier_registry_generation: 0,
+        tier_registry_generation: runtime_tier_registry_for_cycle(1, 0).await.generation,
         scan_mode: HealScanMode::Normal,
     };
     assert_eq!(

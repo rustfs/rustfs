@@ -279,6 +279,10 @@ impl ScannerCycleBudget {
         self.source_turn_admissions.lock().expect("source admission observer").clone()
     }
 
+    pub(crate) fn limits_objects(&self) -> bool {
+        self.max_objects.is_some() || self.parent.as_ref().is_some_and(|parent| parent.limits_objects())
+    }
+
     pub(crate) fn budget_elapsed(&self) -> bool {
         self.stop.get().is_some() || self.parent.as_ref().is_some_and(|parent| parent.budget_elapsed())
     }

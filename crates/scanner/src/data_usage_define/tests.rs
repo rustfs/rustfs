@@ -87,11 +87,9 @@ fn raw_enumeration_path_indexes_preserve_map_compatibility_and_validation() {
         },
         cache: HashMap::new(),
     };
-    assert!(cache.validated_raw_enumeration_page_index_for_parent("bucket").is_some());
+    assert!(cache.raw_enumeration_page_index_for_parent("bucket").is_some());
     assert!(
-        cache
-            .validated_raw_enumeration_page_index_for_parent("other-bucket/wide")
-            .is_none(),
+        cache.raw_enumeration_page_index_for_parent("other-bucket/wide").is_none(),
         "a saved path index must stay inside its bucket"
     );
 

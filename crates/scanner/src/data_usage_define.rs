@@ -39,7 +39,7 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{debug, warn};
 
-use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageOwnerStatus};
+use crate::raw_page_index::RawEnumerationPageIndex;
 use crate::storage_api::owner::HTTPPreconditions;
 use crate::{
     BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
@@ -1741,31 +1741,26 @@ impl DataUsageCache {
             .filter(|index| self.raw_enumeration_page_index_is_valid(index))
     }
 
-    /// The durable index of one directory on the saved walk path.
-    pub(crate) fn validated_raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
+    /// The live writer validates the pages while building its membership table.
+    pub(crate) fn raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
         self.info
             .scan_raw_enumeration_page_index
             .iter()
             .chain(&self.info.scan_raw_enumeration_path_page_indexes)
-            .find(|index| index.parent() == Some(parent))
-            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+            .find(|index| index.parent() == Some(parent) && self.raw_enumeration_owner_matches(index))
+    }
+
+    fn raw_enumeration_owner_matches(&self, index: &RawEnumerationPageIndex) -> bool {
+        self.info.scan_progress.is_some()
+            && self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            && self.info.source.is_some()
+            && index
+                .parent()
+                .is_some_and(|parent| path_is_in_bucket_scope(&self.info.name, parent))
     }
 
     fn raw_enumeration_page_index_is_valid(&self, index: &RawEnumerationPageIndex) -> bool {
-        if self.info.scan_progress.is_none()
-            || !self.info.scan_identity.is_some_and(|identity| identity.is_valid())
-            || self.info.source.is_none()
-            || index.committed_entries().is_err()
-            || index.indexed_entries().is_err()
-        {
-            return false;
-        }
-        match index.status() {
-            RawEnumerationPageOwnerStatus::Unsupported => false,
-            RawEnumerationPageOwnerStatus::Building { parent, .. } | RawEnumerationPageOwnerStatus::Ready { parent, .. } => {
-                path_is_in_bucket_scope(&self.info.name, &parent)
-            }
-        }
+        self.raw_enumeration_owner_matches(index) && index.is_valid_for_restore()
     }
 
     /// Seal only the frontier supplied by completed traversal, never a restored cursor.
