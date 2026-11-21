@@ -264,7 +264,7 @@ async fn receiver() {
     let counts = Arc::new(RpcCounts::default());
     let (faults, _) = watch::channel(Fault::default());
     let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
-    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(storage::rpc::Body::empty())) });
+    let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(rustfs_s3_types::Body::empty())) });
     let production = hybrid(
         InternodeRpcService::new(fallback),
         RpcRequestPathService::new(Routes::new(node).prepare()),
