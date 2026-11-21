@@ -52,38 +52,31 @@ fn website_and_object_lambda_ranges_match_the_legacy_wire_reader() {
 
 #[test]
 fn website_and_object_lambda_conditions_match_the_legacy_wire_reader() {
-    use s3s::dto::{ETagCondition, Timestamp, TimestampFormat};
-    for value in [
-        b"*".as_slice(),
-        b"abc-2",
-        b"\"\"",
-        b"W/\"x\"",
-        b"\"a \tb\"",
-        b"\"a\"b\"",
-        b"",
-        b"bad etag",
-        b"w/\"x\"",
-        b"\"\xff\"",
-        b"\"\x7f\"",
-        b"\"x",
+    // Answers measured on s3s 5761ddfe (`ETagCondition::parse_http_header` and
+    // `Timestamp::parse(HttpDate)`). The owned checks must keep those answers.
+    for (value, accepted) in [
+        (b"*".as_slice(), true),
+        (b"abc-2", true),
+        (b"\"\"", true),
+        (b"W/\"x\"", true),
+        (b"\"a \tb\"", true),
+        (b"\"a\"b\"", true),
+        (b"", false),
+        (b"bad etag", false),
+        (b"w/\"x\"", false),
+        (b"\"\xff\"", false),
+        (b"\"\x7f\"", false),
+        (b"\"x", false),
     ] {
-        assert_eq!(
-            GetObjectFields::valid_etag_condition(value),
-            ETagCondition::parse_http_header(value).is_ok(),
-            "{value:?}"
-        );
+        assert_eq!(GetObjectFields::valid_etag_condition(value), accepted, "{value:?}");
     }
-    for value in [
-        "Sun, 06 Nov 1994 08:49:37 GMT",
-        "Sunday, 06-Nov-94 08:49:37 GMT",
-        "2025-01-01",
-        "Sun, 32 Nov 1994 08:49:37 GMT",
+    for (value, accepted) in [
+        ("Sun, 06 Nov 1994 08:49:37 GMT", true),
+        ("Sunday, 06-Nov-94 08:49:37 GMT", false),
+        ("2025-01-01", false),
+        ("Sun, 32 Nov 1994 08:49:37 GMT", false),
     ] {
-        assert_eq!(
-            GetObjectFields::valid_date_condition(value),
-            Timestamp::parse(TimestampFormat::HttpDate, value).is_ok(),
-            "{value}"
-        );
+        assert_eq!(GetObjectFields::valid_date_condition(value), accepted, "{value}");
     }
 }
 

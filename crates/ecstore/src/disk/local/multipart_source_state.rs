@@ -316,11 +316,18 @@ pub(super) fn put_active_multipart_source_head(source: impl AsRef<Path>, raw: By
 }
 
 fn stamp_matches_active_disk(source: &Path, expected_head_stamp: FileStamp) -> bool {
-    FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(expected_head_stamp)
-        && !(cfg!(test)
-            && (source.join(STATE).exists()
-                || source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
-                || source.join(".mpu-completions").exists()))
+    let stamp_matches = FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(expected_head_stamp);
+    #[cfg(test)]
+    {
+        stamp_matches
+            && !source.join(STATE).exists()
+            && !source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
+            && !source.join(".mpu-completions").exists()
+    }
+    #[cfg(not(test))]
+    {
+        stamp_matches
+    }
 }
 
 pub(super) fn get_active_multipart_source_head(source: &Path) -> Option<(Bytes, FileInfo)> {
@@ -600,11 +607,13 @@ impl SourceStore {
         let disk_id = self.disk_id;
         let physical_slot = self.physical_slot;
         let disk_ids = self.disk_ids.clone();
+        // Keep the loaded state out of each blocking-queue and oneshot poll frame.
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
-            Ok(load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids))
+            Ok(load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids).map(Box::new))
         })
         .await
         .map_err(DiskError::from)?
+        .map(|loaded| *loaded)
     }
     pub async fn persist(&self, state: &SourceState) -> Result<()> {
         self.persist_with_source_sync(state, false).await.map(|_| ())

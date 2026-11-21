@@ -684,6 +684,18 @@ fn host_memory(contents: &str, key: &str) -> io::Result<u64> {
     value.checked_mul(1024).ok_or_else(invalid)
 }
 
+fn controller_disabled(scope: &Scope, directory: &fs::File, controller: &str) -> io::Result<bool> {
+    let root = scope.directories.first().ok_or_else(invalid)?;
+    // A controller absent from the v2 root may enforce invisible v1 limits.
+    // Only a controller proven available in this hierarchy can be disabled here.
+    Ok(resource_text_at(root, "cgroup.controllers")?
+        .split_ascii_whitespace()
+        .any(|name| name == controller)
+        && !resource_text_at(directory, "cgroup.controllers")?
+            .split_ascii_whitespace()
+            .any(|name| name == controller))
+}
+
 fn read_limits(scope: &Scope, mut cpus: u64, mut memory: u64, mut headroom: u64) -> io::Result<LimitsObservation> {
     let mut levels = Vec::with_capacity(scope.directories.len());
     for (index, directory) in scope.directories.iter().enumerate() {
@@ -696,7 +708,9 @@ fn read_limits(scope: &Scope, mut cpus: u64, mut memory: u64, mut headroom: u64)
                 }
                 Some(limit)
             }
-            Err(error) if root && error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && (root || controller_disabled(scope, directory, "cpu")?) => {
+                None
+            }
             Err(error) => return Err(error),
         };
         let memory_max = match resource_text_at(directory, "memory.max") {
@@ -710,7 +724,11 @@ fn read_limits(scope: &Scope, mut cpus: u64, mut memory: u64, mut headroom: u64)
                 }
                 Some(limit)
             }
-            Err(error) if root && error.kind() == io::ErrorKind::NotFound => None,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && (root || controller_disabled(scope, directory, "memory")?) =>
+            {
+                None
+            }
             Err(error) => return Err(error),
         };
         levels.push(LevelLimits { cpu, memory: memory_max });
@@ -1150,6 +1168,62 @@ mod tests {
         fixture.limits("parent", "50000 100000", "2147483648", "2147483640");
         let later = read_limits(&scope, 8000, 8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024).expect("later usage");
         assert_eq!(first.confirm(later).expect("unchanged caps").memory_headroom, 8);
+    }
+
+    #[test]
+    fn disabled_leaf_controllers_preserve_ancestor_limits_and_unknown_counters() {
+        let fixture = Fixture::new();
+        fs::write(fixture.mount.join("cgroup.controllers"), "cpu memory\n").expect("v2 controllers");
+        fs::write(fixture.leaf.join("cgroup.controllers"), "pids\n").expect("disabled leaf controllers");
+        fs::remove_file(fixture.leaf.join("cpu.max")).expect("disabled CPU controller");
+        fs::remove_file(fixture.leaf.join("memory.max")).expect("disabled memory controller");
+        fs::write(fixture.leaf.join("cpu.stat"), "usage_usec 15000\n").expect("uncontrolled CPU usage");
+
+        let (sample, ancestors, _) = fixture.parser_admission_sample().expect("known disabled controllers");
+        assert_eq!(sample.cpu_millis, 4000, "the parent quota still applies");
+        assert_eq!(sample.memory_limit, 3 * 1024 * 1024 * 1024);
+        assert_eq!(sample.memory_headroom, 1024 * 1024 * 1024, "parent sibling memory still counts");
+        assert_eq!(sample.cpu_usage_usec, Some(15000));
+        assert_eq!(sample.cpu_throttled_usec, None, "do not manufacture a missing pressure counter");
+        assert_eq!(ancestors.len(), 1, "the parent quota still requires its own pressure observation");
+    }
+
+    #[test]
+    fn missing_controller_limits_require_proven_v2_unavailability() {
+        for controller in ["cpu", "memory"] {
+            let fixture = Fixture::new();
+            fs::remove_file(fixture.leaf.join(format!("{controller}.max"))).expect("missing limit");
+            assert!(fixture.parser_sample().is_err(), "unreadable controller availability stays unknown");
+
+            fs::write(fixture.mount.join("cgroup.controllers"), "cpu memory\n").expect("v2 controllers");
+            fs::write(fixture.leaf.join("cgroup.controllers"), "cpu memory\n").expect("enabled controllers");
+            assert!(fixture.parser_sample().is_err(), "an enabled controller must expose its limit");
+
+            fs::write(fixture.leaf.join("cgroup.controllers"), "\n").expect("disabled leaf controllers");
+            fs::write(fixture.mount.join("cgroup.controllers"), "pids\n").expect("unproven v2 controller");
+            assert!(fixture.parser_sample().is_err(), "a controller outside v2 may have invisible limits");
+
+            fs::write(fixture.mount.join("cgroup.controllers"), "cpu memory\n").expect("restore v2 availability");
+            fs::write(fixture.leaf.join("cgroup.controllers"), " ".repeat(64 * 1024 + 1)).expect("oversized availability");
+            assert!(fixture.parser_sample().is_err(), "oversized availability stays unknown");
+        }
+    }
+
+    #[test]
+    fn enabling_a_controller_during_a_sample_invalidates_the_observation() {
+        let fixture = Fixture::new();
+        fs::write(fixture.mount.join("cgroup.controllers"), "cpu memory\n").expect("v2 controllers");
+        fs::write(fixture.leaf.join("cgroup.controllers"), "memory\n").expect("disabled CPU controller");
+        fs::remove_file(fixture.leaf.join("cpu.max")).expect("disabled CPU controller");
+        let membership = fs::read_to_string(fixture.proc.join("self/cgroup")).expect("membership");
+        let mounts = fs::read_to_string(fixture.proc.join("self/mountinfo")).expect("mount table");
+        let scope = resolve_scope_with_root(&membership, &mounts, 42, &|path| fs::File::open(path)).expect("parser scope");
+        let first = read_limits(&scope, 8000, 8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024).expect("disabled limits");
+        fs::write(fixture.leaf.join("cgroup.controllers"), "cpu memory\n").expect("enable CPU controller");
+        fs::write(fixture.leaf.join("cpu.max"), "max 100000\n").expect("unlimited local quota");
+        let later = read_limits(&scope, 8000, 8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024).expect("enabled limits");
+        assert_eq!(first.cpu_millis, later.cpu_millis, "unchanged effective capacity is insufficient");
+        assert!(first.confirm(later).is_err(), "controller state changed within the sample");
     }
 
     #[test]

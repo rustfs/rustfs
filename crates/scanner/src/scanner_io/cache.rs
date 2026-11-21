@@ -97,11 +97,15 @@ where
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    let checkpoint_save = crate::storage_api::ecstore_with_background_disk_io(
-        context.ctx.clone(),
-        checkpoint.save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch),
-    )
-    .await;
+    let checkpoint_save = checkpoint
+        .save_with_revisions_for_epoch(
+            store.clone(),
+            cache_name,
+            revisions,
+            context.expected_publication_epoch,
+            context.ctx.clone(),
+        )
+        .await;
     if let Err(error) = checkpoint_save {
         record_checkpoint_save_failure(cache_name, checkpoint, &error);
         return if matches!(error, StorageError::PreconditionFailed) {
@@ -359,6 +363,39 @@ pub(crate) struct DataUsageCacheReuseOptions {
     /// (`scanner_activity_coverage_digest`); `None` resumes under the reuse
     /// plan itself for requests from older remote coordinators.
     pub(crate) checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
+    /// The last authoritative aggregate's cycle. Later completed bucket
+    /// sweeps are still checkpoints of an unpublished aggregate.
+    pub(crate) completed_checkpoint_cycle_floor: Option<u64>,
+}
+
+pub(crate) fn completed_checkpoint_cycle_floor(
+    data: Option<&[u8]>,
+    expected_sources: &HashSet<DataUsageCacheSource>,
+    next_cycle: u64,
+    leader_epoch: u64,
+) -> Option<u64> {
+    let usage: DataUsageInfo = serde_json::from_slice(data?).ok()?;
+    if usage.scanner_epoch.is_some_and(|epoch| epoch > leader_epoch) {
+        return None;
+    }
+    if crate::scanner::data_usage_info_is_bootstrap_pending(&usage) {
+        return Some(0);
+    }
+    let cycle = usage.scanner_cycle.filter(|cycle| *cycle < next_cycle)?;
+    let plan = DataUsageScanPlanDigest(usage.usage_snapshot_set_states.first()?.scan_plan_digest?);
+    complete_scanner_cache_snapshot_plan_digest(
+        &usage,
+        ScannerCacheBaselineProof {
+            authoritative_data: None,
+            observed_candidate_data: None,
+            expected_sources,
+            leader_epoch: usage.scanner_epoch?,
+            want_cycle: cycle,
+            scan_plan_digest: plan,
+        },
+        None,
+    )?;
+    Some(cycle)
 }
 
 #[cfg(test)]
@@ -383,6 +420,7 @@ pub(crate) fn current_cache_root_or_prepare(
             tier_registry_generation: None,
             checkpoint_identity: None,
             checkpoint_plan_digest: None,
+            completed_checkpoint_cycle_floor: None,
         },
     )
 }
@@ -397,6 +435,38 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
     let checkpoint_plan_digest = options.checkpoint_plan_digest.unwrap_or(scan_plan_digest);
+    // A new leader must not discard finished progress while other buckets
+    // still need budget. Adopt only completed, unpublished coverage; after
+    // the aggregate is published the cycle floor forces the usual refresh.
+    // Keep the saved cycle unchanged so reuse cannot extend this authority.
+    // The reuse plan still binds every process incarnation: a restart may
+    // lose unflushed dirty hints and must invalidate completed coverage.
+    let unpublished_completion = options.completed_checkpoint_cycle_floor.is_some_and(|floor| {
+        cache.info.next_cycle > floor && cache.info.next_cycle < next_cycle && cache.info.leader_epoch < leader_epoch
+    }) && options.checkpoint_identity.is_some_and(|identity| {
+        identity.is_valid()
+            && cache.info.scan_identity == Some(identity)
+            && cache.info.tier_registry_generation == Some(identity.tier_registry_generation)
+            && options.tier_registry_generation == Some(identity.tier_registry_generation)
+    }) && name != DATA_USAGE_ROOT
+        && cache.info.name == name
+        && cache.info.source == Some(source)
+        && cache.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
+        && cache.info.snapshot_complete
+        && cache.info.last_update.is_some()
+        && cache.info.scan_progress.is_none()
+        && !cache.has_scan_position()
+        && cache.info.scan_plan_digest == Some(scan_plan_digest)
+        && options.checkpoint_plan_digest.is_some()
+        && cache.info.scan_coverage_digest == Some(checkpoint_plan_digest)
+        && !cache
+            .info
+            .replication
+            .as_ref()
+            .is_some_and(|config| config.has_active_rules("", true));
+    if unpublished_completion && let Ok(root) = cache_root_entry_info(cache) {
+        return DataUsageCacheScanState::Current(Box::new(root));
+    }
     if cache.info.next_cycle <= next_cycle
         && cache.info.leader_epoch <= leader_epoch
         && cache.info.scan_identity != options.checkpoint_identity
@@ -1479,7 +1549,13 @@ pub(super) async fn persist_scanner_service_ledger(
     ledger.leader_epoch = leader_epoch;
     persisted.info.scan_bucket_service = Some(ledger);
     match persisted
-        .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+        .save_with_revisions_for_epoch(
+            store,
+            DATA_USAGE_CACHE_NAME,
+            &revisions,
+            expected_publication_epoch,
+            CancellationToken::new(),
+        )
         .await
     {
         Ok(()) => true,
@@ -1662,7 +1738,13 @@ pub(super) async fn persist_and_publish_cache_snapshot(
 
         let done_save = Metrics::time(Metric::SaveUsage);
         if let Err(e) = cache_snapshot
-            .save_with_revisions_for_epoch(store.clone(), DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+            .save_with_revisions_for_epoch(
+                store.clone(),
+                DATA_USAGE_CACHE_NAME,
+                &revisions,
+                expected_publication_epoch,
+                CancellationToken::new(),
+            )
             .await
         {
             error!(
