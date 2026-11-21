@@ -20,11 +20,12 @@ use rustfs_s3_types::EventName;
 use rustfs_targets::arn::{ARN, TargetID};
 use starshard::{AsyncShardedHashMap, DEFAULT_SHARDS, SnapshotMode};
 use std::sync::{Arc, RwLock, Weak};
-use tracing::info;
+use tracing::{info, warn};
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_RULE_ENGINE: &str = "rule_engine";
 const EVENT_NOTIFY_RULES_UPDATED: &str = "notify_bucket_rules_updated";
+const EVENT_NOTIFY_RULES_READ_FAILED: &str = "notify_bucket_rules_read_failed";
 
 fn decoded_object_key_for_matching(object_key: &str) -> Option<String> {
     if !object_key.contains('%') {
@@ -47,8 +48,9 @@ pub struct NotifyRuleEngine {
 struct CachedBucketRules {
     metadata: Option<Weak<BucketMetadata>>,
     // Cache rejected snapshots too, so corrupt persisted routes are not
-    // repeatedly compiled on the event hot path.
-    rules: Option<RulesMap>,
+    // repeatedly compiled on the event hot path. Shared by `Arc` so matching an
+    // event does not clone the whole rule set.
+    rules: Option<Arc<RulesMap>>,
 }
 
 fn rules_from_metadata(metadata: &BucketMetadata) -> Option<RulesMap> {
@@ -134,7 +136,7 @@ impl NotifyRuleEngine {
                     bucket.to_string(),
                     CachedBucketRules {
                         metadata: None,
-                        rules: Some(rules_map),
+                        rules: Some(Arc::new(rules_map)),
                     },
                 )
                 .await;
@@ -150,26 +152,51 @@ impl NotifyRuleEngine {
         );
     }
 
-    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<RulesMap> {
-        if let Some(source) = self.metadata_source() {
-            let metadata = match source.upgrade() {
-                Some(store) => store.get_bucket_metadata(bucket).await.ok(),
-                None => None,
-            };
-            return self.rules_for_metadata(bucket, metadata).await;
+    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<Arc<RulesMap>> {
+        let Some(source) = self.metadata_source() else {
+            return self.cached_rules(bucket, true).await;
+        };
+        let Some(store) = source.upgrade() else {
+            // Once a metadata source is bound it is the only authority, so a
+            // standalone-table leftover must not be revived.
+            return self.cached_rules(bucket, false).await;
+        };
+        match store.get_bucket_metadata(bucket).await {
+            Ok(metadata) => self.rules_for_metadata(bucket, metadata).await,
+            // A failed read is not authority to drop the bucket's compiled
+            // rules: serve the last metadata-backed snapshot so a transient
+            // store error does not silently discard notifications. Explicit
+            // removal goes through `clear_bucket_rules` instead.
+            Err(err) => {
+                warn!(
+                    event = EVENT_NOTIFY_RULES_READ_FAILED,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_RULE_ENGINE,
+                    state = "read_failed",
+                    bucket = %bucket,
+                    error = %err,
+                    "notify bucket rules state"
+                );
+                self.cached_rules(bucket, false).await
+            }
         }
+    }
+
+    /// Returns the cached rules for `bucket`.
+    ///
+    /// `allow_standalone` decides whether entries installed by `set_bucket_rules`
+    /// count: those carry no metadata snapshot and are only authoritative while
+    /// no metadata source is bound.
+    async fn cached_rules(&self, bucket: &str, allow_standalone: bool) -> Option<Arc<RulesMap>> {
         self.bucket_rules_map
-            .get(&bucket.to_string())
+            .get(&bucket.to_owned())
             .await
+            .filter(|cached| allow_standalone || cached.metadata.is_some())
             .and_then(|cached| cached.rules)
     }
 
-    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<RulesMap> {
+    async fn rules_for_metadata(&self, bucket: &str, metadata: Arc<BucketMetadata>) -> Option<Arc<RulesMap>> {
         let key = bucket.to_owned();
-        let Some(metadata) = metadata else {
-            self.bucket_rules_map.remove(&key).await;
-            return None;
-        };
         if let Some(cached) = self.bucket_rules_map.get(&key).await
             && cached
                 .metadata
@@ -181,7 +208,7 @@ impl NotifyRuleEngine {
         // Snapshot identity covers incarnation, revision AND bytes, without
         // trusting wall-clock ordering. A late compilation may evict a newer
         // cache entry, but cannot be reused by a reader of a different snapshot.
-        let rules = rules_from_metadata(&metadata);
+        let rules = rules_from_metadata(&metadata).map(Arc::new);
         self.bucket_rules_map
             .insert(
                 key,
@@ -273,7 +300,7 @@ mod tests {
             (replacement.clone(), &new_target, &old_target),
         ] {
             let rules = engine
-                .rules_for_metadata("bucket", Some(snapshot))
+                .rules_for_metadata("bucket", snapshot)
                 .await
                 .expect("readable snapshot");
             let targets = rules.match_rules(EventName::ObjectCreatedPut, "object");
@@ -285,7 +312,7 @@ mod tests {
         next_revision.notification_config = replacement.notification_config.clone();
         next_revision.notification_config_xml = replacement.notification_config_xml.clone();
         let rules = engine
-            .rules_for_metadata("bucket", Some(Arc::new(next_revision)))
+            .rules_for_metadata("bucket", Arc::new(next_revision))
             .await
             .expect("same-incarnation revision");
         assert!(!rules.contains_target_id(&old_target));
@@ -293,20 +320,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_snapshot_absence_and_corruption_never_fall_back_to_old_rules() {
+    async fn notification_snapshot_corruption_never_falls_back_to_old_rules() {
         let engine = NotifyRuleEngine::new();
         let old = metadata("old");
-        assert!(engine.rules_for_metadata("bucket", Some(old.clone())).await.is_some());
+        assert!(engine.rules_for_metadata("bucket", old.clone()).await.is_some());
 
         let mut unreadable = (*old).clone();
         unreadable.notification_config = None;
         unreadable.notification_config_xml = b"<broken>".to_vec();
-        assert!(
-            engine
-                .rules_for_metadata("bucket", Some(Arc::new(unreadable)))
-                .await
-                .is_none()
-        );
+        assert!(engine.rules_for_metadata("bucket", Arc::new(unreadable)).await.is_none());
         assert!(
             engine
                 .bucket_rules_map
@@ -316,14 +338,11 @@ mod tests {
                 .rules
                 .is_none()
         );
-        assert!(engine.rules_for_metadata("bucket", None).await.is_none());
-        assert!(engine.bucket_rules_map.get(&"bucket".to_owned()).await.is_none());
-
         // A recreated bucket without notifications has no inherited targets.
         let replacement = Arc::new(BucketMetadata::new("bucket"));
         assert!(
             engine
-                .rules_for_metadata("bucket", Some(replacement))
+                .rules_for_metadata("bucket", replacement)
                 .await
                 .expect("empty snapshot")
                 .is_empty()
@@ -351,6 +370,29 @@ mod tests {
                 .is_empty()
         );
         assert!(engine.is_target_bound_to_any_bucket(&target).await);
+    }
+
+    #[tokio::test]
+    async fn standalone_rules_are_not_served_once_a_metadata_source_is_bound() {
+        let engine = NotifyRuleEngine::new();
+        let target = TargetID::new("old".into(), "webhook".into());
+        let mut rules = RulesMap::new();
+        rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".into(), target.clone());
+        engine.set_bucket_rules("bucket", rules).await;
+
+        // The explicit table is authoritative while nothing is bound to it.
+        assert!(engine.cached_rules("bucket", true).await.is_some());
+        // A bound metadata source is the only authority afterwards.
+        assert!(engine.cached_rules("bucket", false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_backed_rules_survive_a_failed_read() {
+        let engine = NotifyRuleEngine::new();
+        assert!(engine.rules_for_metadata("bucket", metadata("queue")).await.is_some());
+        // A compiled-from-metadata snapshot is the last known good state, so a
+        // transient store error can serve it instead of dropping the bucket.
+        assert!(engine.cached_rules("bucket", false).await.is_some());
     }
 
     #[test]

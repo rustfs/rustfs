@@ -263,6 +263,16 @@ impl EventNotifier {
         let mut deferred_handles = Vec::new();
         let mut direct_handles = Vec::new();
 
+        // The entity carries only event-level fields and every target reads it
+        // without mutation, so build it once and share it across the matched
+        // targets instead of cloning the whole event per target.
+        let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
+            object_name: object_key.to_string(),
+            bucket_name: bucket_name.to_string(),
+            event_name,
+            data: event.as_ref().clone(),
+        });
+
         // A lifecycle writer holds this gate only while handing queue-store
         // ownership from one runtime generation to the next. Taking the read
         // guard before cloning targets means the writer both blocks new sends
@@ -307,7 +317,6 @@ impl EventNotifier {
                     self.send_limiter.clone()
                 };
                 let metrics = self.metrics.clone();
-                let event_clone = event.clone();
                 let target_name_for_task = target_for_task.name(); // Get the name before generating the task
                 debug!(
                     event = EVENT_NOTIFY_DISPATCH_STARTED,
@@ -317,14 +326,7 @@ impl EventNotifier {
                     deferred = is_deferred,
                     "notify dispatch"
                 );
-                // Use cloned data in closures to avoid borrowing conflicts
-                // Create an EntityTarget from the event
-                let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
-                    object_name: object_key.to_string(),
-                    bucket_name: bucket_name.to_string(),
-                    event_name,
-                    data: event_clone.as_ref().clone(),
-                });
+                let entity_target = Arc::clone(&entity_target);
                 let handle = tokio::spawn(async move {
                     let _direct_dispatch_lease = direct_dispatch_lease;
                     let _deferred_dispatch_guard = deferred_dispatch_guard;
@@ -366,7 +368,7 @@ impl EventNotifier {
                             return;
                         }
                     };
-                    if let Err(e) = target_for_task.save(entity_target.clone()).await {
+                    if let Err(e) = target_for_task.save(entity_target).await {
                         metrics.increment_failed();
                         error!(
                             event = EVENT_NOTIFY_DISPATCH_FAILED,
