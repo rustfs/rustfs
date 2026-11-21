@@ -631,6 +631,8 @@ pub(crate) struct StartupShutdownServices {
     pub(crate) capacity: Option<CapacityBackgroundTasks>,
     pub(crate) table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
     pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
+    pub(crate) scanner_cleanup: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) store: std::sync::Arc<crate::storage_api::startup::storage::ECStore>,
 }
 
 pub(crate) async fn run_startup_shutdown_sequence(
@@ -647,6 +649,8 @@ pub(crate) async fn run_startup_shutdown_sequence(
         peer_control,
         capacity: capacity_tasks,
         table_maintenance,
+        scanner_cleanup,
+        store,
         table_rename_recovery,
     } = background_tasks;
     ctx.cancel();
@@ -854,15 +858,41 @@ pub(crate) async fn run_startup_shutdown_sequence(
         stop_catalog_background_task(table_rename_recovery),
     );
     let maintenance_result = maintenance_result.and(recovery_result);
+    let scanner_stopped = match scanner_cleanup {
+        Some(cleanup) => crate::startup_lifecycle::wait_for_scanner_cleanup(cleanup).await,
+        None => true,
+    };
     // Unknown front leaves cannot authorize the downstream fence. A retired HTTP
     // scope may finish cleanup after a late/failed receipt, while its marker stays dirty.
     finish_detached_mutations_and_clear_unclean_shutdown_markers(
-        heal_handoff_complete && capacity_report.allows_marker_clear(),
+        heal_handoff_complete && scanner_stopped && capacity_report.allows_marker_clear(),
         &maintenance_result,
         &front_result,
         DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
         wait_for_detached_mutations,
-        rustfs_heal::heal::clear_unclean_shutdown_markers(),
+        async {
+            if rustfs_utils::get_env_bool(rustfs_config::ENV_SCANNER_READ_ONLY_HANDOFF, false)
+                && store.scanner_namespace_mutation_generation() == 0
+                && rustfs_scanner::scanner_process_was_read_only()
+            {
+                let owner = rustfs_common::get_global_local_node_name().await;
+                if let Err(error) =
+                    rustfs_heal::heal::save_read_only_scanner_handoff(&owner, rustfs_scanner::scanner_checkpoint_instance_id())
+                        .await
+                {
+                    warn!(
+                        event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                        component = LOG_COMPONENT_MAIN,
+                        subsystem = LOG_SUBSYSTEM_STARTUP,
+                        state = "scanner_handoff_failed",
+                        error = %error,
+                        "Scanner shutdown receipt was not saved"
+                    );
+                }
+            } else {
+                rustfs_heal::heal::clear_unclean_shutdown_markers().await;
+            }
+        },
     )
     .await;
     state_manager.update(ServiceState::Stopped);

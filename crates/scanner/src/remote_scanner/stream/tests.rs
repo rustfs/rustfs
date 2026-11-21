@@ -591,6 +591,7 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
             tier_registry_generation: Some(tier_generation),
             checkpoint_identity: Some(identity),
             checkpoint_plan_digest: Some(plan),
+            completed_checkpoint_cycle_floor: None,
         },
     );
     crate::scanner_io::bind_usage_watch_to_checkpoint(&mut cache, Some(&proof), plan);

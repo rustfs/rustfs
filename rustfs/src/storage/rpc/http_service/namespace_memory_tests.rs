@@ -90,7 +90,7 @@ fn namespace_post_memory_admission_and_output_owner() {
         println!("NAMESPACE_MEMORY_STREAM_OK");
         return;
     }
-    for mode in ["zero", "tight", "funded", "disabled"] {
+    for mode in ["zero", "tight", "funded", "disabled", "busy", "timeout"] {
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
             .env(CHILD, mode)
@@ -176,7 +176,7 @@ async fn run_namespace_case(mode: &str) {
         match mode {
             "zero" | "disabled" => 0,
             "tight" => OUTPUT_CAPACITY,
-            "funded" => 16 * 1024 * 1024,
+            "funded" | "busy" | "timeout" => 16 * 1024 * 1024,
             _ => panic!("unknown namespace test mode"),
         },
         Duration::from_secs(120),
@@ -188,15 +188,46 @@ async fn run_namespace_case(mode: &str) {
     let server_retained = retained.clone();
     let response_status = Arc::new(AtomicU16::new(0));
     let server_status = response_status.clone();
+    // Hyper clones the service; every clone must share this single test owner.
+    let busy = Arc::new(Mutex::new(
+        matches!(mode, "busy" | "timeout").then(|| physical.try_acquire().expect("concurrent physical work")),
+    ));
+    let deadline = mode == "timeout";
+    let server_node = node.clone();
+    let server_physical = physical.clone();
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.expect("namespace connection");
         let service = tower::service_fn(move |request| {
             let retained = server_retained.clone();
             let status = server_status.clone();
+            let busy = busy.lock().expect("single contention owner").take();
+            let node = server_node.clone();
+            let physical = server_physical.clone();
             async move {
                 let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(Body::empty())) });
                 let mut receiver = InternodeRpcService::new(fallback);
-                let response = receiver.call(request).await?;
+                let response = receiver.call(request);
+                tokio::pin!(response);
+                let response = if let Some(busy) = busy {
+                    if deadline {
+                        tokio::time::pause();
+                    }
+                    assert!(futures_util::poll!(&mut response).is_pending(), "busy namespace preflight must wait");
+                    assert_eq!(node.snapshot().active, 0, "no node unit while waiting for the disk");
+                    if deadline {
+                        tokio::time::advance(super::NS_SCANNER_PREFLIGHT_TIMEOUT).await;
+                        let response = response.await?;
+                        drop(busy);
+                        tokio::time::resume();
+                        response
+                    } else {
+                        drop(busy);
+                        assert_eq!(physical.snapshot().active, 0, "service clones cannot retain the test owner");
+                        response.await?
+                    }
+                } else {
+                    response.await?
+                };
                 status.store(response.status().as_u16(), Ordering::Release);
                 let (parts, body) = response.into_parts();
                 let tapped = body.into_data_stream().inspect_ok(move |bytes| {
@@ -282,7 +313,11 @@ async fn run_namespace_case(mode: &str) {
         Ok(response) => {
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
+                if deadline {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                },
                 "must pass disk, signature, digest, replay and persisted-fence gates"
             );
             let mut stream = response.into_body().into_data_stream();
@@ -304,6 +339,19 @@ async fn run_namespace_case(mode: &str) {
     drop(sender);
     client.await.expect("namespace client task");
     server.await.expect("namespace server task");
+    if deadline {
+        assert_eq!(response_status.load(Ordering::Acquire), 503);
+        assert!(!failed, "the receiver must return its bounded deferral");
+        assert_eq!(wire, b"background storage admission deferred");
+        assert_eq!([node.snapshot().active, physical.snapshot().active], [0, 0]);
+        assert_eq!([node.completed(), physical.completed()], [Some(0), Some(0)]);
+        drop(retained.lock().expect("deferred output").take());
+        wait_for_used(&memory, 0).await;
+        if let Some(cancel) = store.background_cancel_token() {
+            cancel.cancel();
+        }
+        return;
+    }
     // Hyper may report a first-poll body error before flushing its headers.
     // Observe the handler result to distinguish that from preflight failure.
     assert_eq!(
@@ -335,7 +383,11 @@ async fn run_namespace_case(mode: &str) {
     })
     .await
     .expect("HTTP completion releases the node and physical units");
-    let expected = if mode == "funded" { OUTPUT_CAPACITY } else { 0 };
+    let expected = if matches!(mode, "funded" | "busy") {
+        OUTPUT_CAPACITY
+    } else {
+        0
+    };
     wait_for_used(&memory, expected).await;
     drop(retained.lock().expect("output owner").take());
     wait_for_used(&memory, 0).await;

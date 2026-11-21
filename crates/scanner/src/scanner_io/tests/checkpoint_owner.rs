@@ -27,6 +27,7 @@ async fn checkpoint_plan(set: &Arc<SetDisks>, owner: &CancellationToken) -> Scan
         digest,
         bucket_coverage_digest: digest,
         checkpoint_coverage_digest: digest,
+        completed_checkpoint_cycle_floor: None,
         requires_full_scan: true,
         service_cohort: None,
         execution_digest: digest,

@@ -929,6 +929,7 @@ pin_project! {
     struct GetObjectReaderStream<R> {
         #[pin]
         reader: Option<R>,
+        primed_byte: Option<u8>,
         capacity: usize,
         strategy: &'static str,
         buffer_source: &'static str,
@@ -993,6 +994,7 @@ where
         }
         Self {
             reader: Some(reader),
+            primed_byte: None,
             capacity,
             strategy,
             buffer_source,
@@ -1437,9 +1439,14 @@ where
             Some(reader) => reader,
             None => return Poll::Ready(None),
         };
-        let read_capacity = (*this.capacity).min(*this.remaining);
-        let mut buf = BytesMut::with_capacity(read_capacity);
-        let poll_read = poll_read_buf(reader, cx, &mut buf);
+        let (poll_read, buf) = if let Some(byte) = this.primed_byte.take() {
+            (Poll::Ready(Ok(1)), BytesMut::from(&[byte][..]))
+        } else {
+            let read_capacity = (*this.capacity).min(*this.remaining);
+            let mut buf = BytesMut::with_capacity(read_capacity);
+            let poll_read = poll_read_buf(reader, cx, &mut buf);
+            (poll_read, buf)
+        };
 
         let result: Poll<Option<Self::Item>> = match poll_read {
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
@@ -2514,19 +2521,21 @@ impl DefaultObjectUsecase {
             lifecycle,
             resume,
         );
-        let mut prefix = [0_u8; 1];
-        let prefix_len = if expected == 0 {
-            0
+        let primed_byte = if expected == 0 {
+            None
         } else {
+            let mut prefix = [0_u8; 1];
             reader
                 .read_exact(&mut prefix)
                 .await
                 .map_err(|error| map_get_object_reader_error(StorageError::from(error)))?;
-            1
+            Some(prefix[0])
         };
-        let reader = std::io::Cursor::new(prefix).take(prefix_len).chain(reader);
-        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
-            .with_diagnostics(bucket, key, request_id);
+        let mut stream =
+            GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
+                .with_diagnostics(bucket, key, request_id);
+        // Keep the preflight byte in the stream until the transport asks for it.
+        stream.primed_byte = primed_byte;
         let blob = GetObjectBody::Stream(Box::pin(stream));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
@@ -9010,7 +9019,7 @@ mod tests {
         let error = result.expect_err("a read quorum failure before the first byte must reject response construction");
         assert_eq!(error.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
         assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(error.message(), Some("Resource requested is unreadable, please reduce your request rate"));
+        assert_eq!(error.message(), Some("The object could not be read from storage."));
     }
 
     #[tokio::test]
@@ -9037,7 +9046,20 @@ mod tests {
             .expect("the first byte should be available before response handoff");
 
             assert_eq!(reads.load(AtomicOrdering::Relaxed), 1, "response construction must prime one byte");
-            let mut received = Vec::new();
+            let first = body
+                .next()
+                .await
+                .expect("the primed byte should be present")
+                .expect("the first chunk should be readable");
+            assert_eq!(&first[..], b"h");
+            let first = first.try_into_mut().expect("the first chunk should own its buffer");
+            assert!(first.capacity() < 5, "the preflight byte must not reserve the remaining body capacity");
+            assert_eq!(
+                reads.load(AtomicOrdering::Relaxed),
+                1,
+                "emitting the primed byte must not poll storage again"
+            );
+            let mut received = first.to_vec();
             while let Some(chunk) = body.next().await {
                 received.extend_from_slice(&chunk.expect("the primed body should remain readable"));
             }
