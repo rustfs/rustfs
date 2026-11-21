@@ -10826,6 +10826,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hashbrown 0.17.1",
  "hex-simd",
  "hmac 0.13.0",
  "hotpath",

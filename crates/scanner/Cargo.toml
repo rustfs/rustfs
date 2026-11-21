@@ -73,6 +73,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
+hashbrown.workspace = true
 tempfile.workspace = true
 hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["server-config-model"] }

@@ -121,6 +121,40 @@ fn raw_enumeration_writer_rejects_complete_source_drift_after_observation_floor(
 }
 
 #[test]
+fn raw_enumeration_writer_checks_the_name_on_a_hash_collision() {
+    let index = RawEnumerationPageIndex::new("bucket", 2).expect("index");
+    let mut writer = RawEnumerationPageWriter::new(index).expect("writer");
+    writer.record_entry("a").expect("first name");
+    writer.record_entry("b").expect("seal page");
+
+    let mut names = SealedNames::default();
+    let hash = names.hasher.hash_one("b");
+    names.slots.insert_unique(hash, (0, 0), |_| hash);
+    assert_eq!(names.ordinal(&writer.inner, "b"), None);
+    assert!(names.insert(&writer.inner, (0, 1)));
+    assert_eq!(names.ordinal(&writer.inner, "b"), Some(1));
+    assert!(!names.insert(&writer.inner, (0, 1)));
+}
+
+#[test]
+fn raw_enumeration_writer_replays_interleaved_names_across_short_pages() {
+    let mut index = RawEnumerationPageIndex::new("bucket", 8).expect("index");
+    index
+        .ingest_partial_owner_entries(["b", "d"].map(str::to_owned), 2, 0)
+        .expect("partial page");
+    let mut index = checkpoint(index);
+    let generation = index.generation().expect("sealed generation");
+    index
+        .ingest_owner_entries(["a", "b", "c", "d", "e"].map(str::to_owned), 3, generation)
+        .expect("terminal builder");
+
+    for restored in [index.clone(), checkpoint(index)] {
+        compare_with_cumulative_ingestion(restored.clone(), &["e", "b", "c", "d", "a"]);
+        compare_with_cumulative_ingestion(restored, &["e", "b", "c", "d", "b"]);
+    }
+}
+
+#[test]
 fn raw_enumeration_writer_rejects_corruption_at_restore() {
     let mut writer = RawEnumerationPageWriter::new(RawEnumerationPageIndex::new("bucket", 2).expect("index")).expect("writer");
     for entry in ["a", "b", "c"] {
