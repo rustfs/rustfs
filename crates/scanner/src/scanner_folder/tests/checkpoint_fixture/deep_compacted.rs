@@ -45,14 +45,19 @@ async fn save_reload(store: &Arc<FixtureStore>, cache: &DataUsageCache) -> DataU
         .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
         .await
         .expect("save compacted checkpoint through real codec and revision checks");
-    let loaded = store.strict_load().await;
     let restarted_store = FixtureStore::reopen(store.root.clone());
-    let progress_bytes = tokio::fs::read(restarted_store.root.join("progress"))
-        .await
-        .expect("durable display progress survives a cold store reopen");
-    let progress: rustfs_data_usage::BucketScanProgressSource =
-        serde_json::from_slice(&progress_bytes).expect("decode independent display progress");
-    assert_eq!(Some(&progress), loaded.display_scan_progress(0).as_ref());
+    let loaded = restarted_store.strict_load().await;
+    let progress_bytes = tokio::fs::read(restarted_store.root.join("progress")).await;
+    if cache.info.scan_identity.is_some() {
+        let bytes = progress_bytes.expect("identity-bound progress survives a cold store reopen");
+        let progress: rustfs_data_usage::BucketScanProgressSource =
+            serde_json::from_slice(&bytes).expect("decode independent display progress");
+        assert_eq!(loaded.display_scan_progress(0), Some(progress));
+    } else {
+        let err = progress_bytes.expect_err("legacy checkpoints cannot publish progress without a bucket identity");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(loaded.display_scan_progress(0).is_none());
+    }
     assert_eq!(loaded.info.snapshot_complete, cache.info.snapshot_complete);
     assert_eq!(loaded.info.scan_checkpoint, cache.info.scan_checkpoint);
     assert_eq!(loaded.info.scan_identity, cache.info.scan_identity);
