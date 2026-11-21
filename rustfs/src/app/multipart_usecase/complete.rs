@@ -1124,10 +1124,9 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("ssec-completion-checksums", || async {
             let (_store, bucket) =
                 crate::app::gating_test_env::durable_quota_test_bucket("ssec-completion-checksums", 16_384).await;
-            let versioning_req = build_request((), Method::PUT);
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
                 .execute_put_bucket_versioning(
-                    RequestEnvelope::from_s3s(&versioning_req),
+                    super::super::test_support::owned_envelope(Method::PUT),
                     &bucket,
                     Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
                         status: Some("Enabled".to_owned()),
@@ -1411,7 +1410,6 @@ mod tests {
                 .await
                 .expect("create versioned Object Lock bucket");
             let key = "kms-encrypted";
-            let enc_req = build_request((), Method::PUT);
             let enc_cfg = crate::app::storage_api::s3::dto::ServerSideEncryptionConfiguration {
                 rules: vec![crate::app::storage_api::s3::dto::ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(
@@ -1425,7 +1423,7 @@ mod tests {
             };
             let prepared = crate::storage::persisted_from_s3s(&enc_cfg).map_err(Into::into);
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
-                .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&enc_req), &bucket, prepared)
+                .execute_put_bucket_encryption(super::super::test_support::owned_envelope(Method::PUT), &bucket, prepared)
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();
