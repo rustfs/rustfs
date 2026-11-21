@@ -156,18 +156,25 @@ fn add_service_account_parent_within_scope(
     owner || (effective_parent != root_access_key && (target_user == req_user || target_user == req_parent_user))
 }
 
-/// Fail-closed ownership check used by DeleteServiceAccount for a caller that
-/// lacks the RemoveServiceAccount admin action.
+/// Fail-closed ownership check used by non-admin service-account read/delete
+/// fallbacks after the primary `is_allowed(..., deny_only: false)` check fails.
 ///
-/// Returns `true` only when the target service account was successfully loaded
-/// AND is owned by the caller. A `None` target — meaning `get_service_account`
-/// failed with a non-not-found error (e.g. a stored-credential decode error) so
-/// ownership could not be verified — denies, as does an owner mismatch. The
-/// previous `svc_account.is_some_and(|v| v.parent_user != user)` form returned
-/// `false` for a `None` target and thus fell through to the delete, an authz
-/// bypass (backlog#806).
-fn non_admin_may_delete_service_account(caller_user: &str, target_parent_user: Option<&str>) -> bool {
-    matches!(target_parent_user, Some(parent) if parent == caller_user)
+/// Returns `true` only when:
+/// 1. The caller has no explicit `Deny` on the required admin action (`no_explicit_deny`),
+/// 2. The caller is not itself a service account (preventing a restricted
+///    service account from impersonating its parent against sibling or own keys, #9514),
+/// 3. The target service account was successfully loaded (`Some(parent)`) with a
+///    non-empty parent matching the caller's resolved identity (`request_user_name`).
+///    A `None` target — meaning `get_service_account` failed with a not-found or
+///    decode error — denies fail-closed (backlog#806).
+fn non_admin_may_access_owned_service_account(
+    caller: &StoredCredentials,
+    target_parent_user: Option<&str>,
+    no_explicit_deny: bool,
+) -> bool {
+    no_explicit_deny
+        && !caller.is_service_account()
+        && matches!(target_parent_user, Some(parent) if !parent.is_empty() && parent == request_user_name(caller))
 }
 
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
@@ -754,10 +761,11 @@ impl Operation for InfoServiceAccount {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-        let (svc_account, session_policy) = iam_store
-            .get_service_account(&access_key)
-            .await
-            .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
+        // Keep lookup errors behind authorization so unauthorized callers cannot
+        // distinguish missing service accounts from forbidden ones.
+        let existing_account = iam_store.get_service_account(&access_key).await;
+        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let claims = cred.claims_or_empty();
 
         if !iam_store
             .is_allowed(&Args {
@@ -765,17 +773,42 @@ impl Operation for InfoServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                conditions: &conditions,
                 is_owner: owner,
                 object: "",
-                claims: cred.claims_or_empty(),
+                claims,
                 deny_only: false,
             })
             .await
-            && request_user_name(&cred) != svc_account.parent_user
         {
-            return Err(s3_error!(AccessDenied, "access denied"));
+            let no_explicit_deny = if cred.is_service_account() {
+                false
+            } else {
+                iam_store
+                    .is_allowed(&Args {
+                        account: &cred.access_key,
+                        groups: &cred.groups,
+                        action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
+                        bucket: "",
+                        conditions: &conditions,
+                        is_owner: owner,
+                        object: "",
+                        claims,
+                        deny_only: true,
+                    })
+                    .await
+            };
+            let target_parent = existing_account
+                .as_ref()
+                .ok()
+                .map(|(account, _)| account.parent_user.as_str());
+            if !non_admin_may_access_owned_service_account(&cred, target_parent, no_explicit_deny) {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            }
         }
+
+        let (svc_account, session_policy) =
+            existing_account.map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
         let resp = build_info_service_account_resp(&iam_store, &svc_account, session_policy).await?;
 
@@ -999,31 +1032,32 @@ impl Operation for ListServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let target_account = if query.user.as_ref().is_some_and(|v| v != &cred.access_key) {
-            // Cross-user listing must be authorized by ListServiceAccounts, matching the
-            // sibling InfoServiceAccount/InfoAccessKey/ListAccessKeysBulk handlers.
-            if !iam_store
-                .is_allowed(&Args {
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
-                    bucket: "",
-                    conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
-                    is_owner: owner,
-                    object: "",
-                    claims: cred.claims_or_empty(),
-                    deny_only: false,
-                })
-                .await
-            {
-                return Err(s3_error!(AccessDenied, "access denied"));
-            }
+        // Cross-user listing and any service-account caller must be explicitly
+        // authorized by ListServiceAccounts; self-listing by a non-service-account
+        // caller still enforces explicit Deny statements (deny_only).
+        let cross_user = query.user.as_ref().is_some_and(|v| v != &cred.access_key);
+        let deny_only = !cross_user && !cred.is_service_account();
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
+                bucket: "",
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                is_owner: owner,
+                object: "",
+                claims: cred.claims_or_empty(),
+                deny_only,
+            })
+            .await
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
 
+        let target_account = if cross_user {
             query.user.unwrap_or_default()
-        } else if cred.parent_user.is_empty() {
-            cred.access_key
         } else {
-            cred.parent_user
+            request_user_name(&cred).to_string()
         };
 
         let service_accounts = iam_store.list_service_accounts(&target_account).await.map_err(|e| {
@@ -1167,7 +1201,7 @@ impl Operation for ListAccessKeysBulk {
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
-                deny_only: self_only,
+                deny_only: self_only && !cred.is_service_account(),
             })
             .await
         {
@@ -1321,16 +1355,11 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let svc_account = match iam_store.get_service_account(&query.access_key).await {
-            Ok((res, _)) => Some(res),
-            Err(err) => {
-                if is_err_no_such_service_account(&err) {
-                    return Err(s3_error!(InvalidRequest, "service account not exist"));
-                }
-
-                None
-            }
-        };
+        // Keep lookup errors behind authorization so unauthorized callers cannot
+        // distinguish missing service accounts from forbidden ones.
+        let existing_account = iam_store.get_service_account(&query.access_key).await;
+        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let claims = cred.claims_or_empty();
 
         if !iam_store
             .is_allowed(&Args {
@@ -1338,31 +1367,46 @@ impl Operation for DeleteServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::RemoveServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                conditions: &conditions,
                 is_owner: owner,
                 object: "",
-                claims: cred.claims_or_empty(),
+                claims,
                 deny_only: false,
             })
             .await
         {
-            let user = if cred.parent_user.is_empty() {
-                cred.access_key.as_str()
+            let no_explicit_deny = if cred.is_service_account() {
+                false
             } else {
-                cred.parent_user.as_str()
+                iam_store
+                    .is_allowed(&Args {
+                        account: &cred.access_key,
+                        groups: &cred.groups,
+                        action: Action::AdminAction(AdminAction::RemoveServiceAccountAdminAction),
+                        bucket: "",
+                        conditions: &conditions,
+                        is_owner: owner,
+                        object: "",
+                        claims,
+                        deny_only: true,
+                    })
+                    .await
             };
 
-            // Fail closed: a caller without the RemoveServiceAccount admin action
-            // may only delete a service account it OWNS. If the target could not be
-            // loaded (svc_account is None because get_service_account failed with a
-            // non-not-found error — e.g. a credential decode error), ownership cannot
-            // be verified, so deny rather than fall through to the delete. The
-            // previous `is_some_and(parent != user)` form skipped the guard on a
-            // None target, an authz bypass (backlog#806).
-            let target_parent = svc_account.as_ref().map(|v| v.parent_user.as_str());
-            if !non_admin_may_delete_service_account(user, target_parent) {
-                return Err(s3_error!(InvalidRequest, "service account not exist"));
+            // Fail closed: a caller without RemoveServiceAccount may delete a
+            // service account only when it is not itself a service account, has no
+            // explicit Deny on RemoveServiceAccount, and owns the loaded target
+            // (backlog#806, #9514).
+            let target_parent = existing_account.as_ref().ok().map(|(v, _)| v.parent_user.as_str());
+            if !non_admin_may_access_owned_service_account(&cred, target_parent, no_explicit_deny) {
+                return Err(s3_error!(AccessDenied, "access denied"));
             }
+        }
+
+        if let Err(err) = existing_account
+            && is_err_no_such_service_account(&err)
+        {
+            return Err(s3_error!(InvalidRequest, "service account not exist"));
         }
 
         let deleted_at = iam_store
@@ -1583,21 +1627,66 @@ mod tests {
 
     #[test]
     fn non_admin_delete_is_fail_closed_on_unloadable_target() {
-        // Regression (backlog#806): a non-admin caller may delete ONLY a service
-        // account it owns; a None target (get_service_account failed to load /
-        // decode) must DENY, not fall through to the delete.
+        // Regression (backlog#806, #9514): a non-admin caller may fall back to
+        // owner access ONLY when it is not itself a service account, has no
+        // explicit Deny, and owns the successfully loaded target.
+        let alice = StoredCredentials {
+            access_key: "alice".to_string(),
+            ..Default::default()
+        };
+        let empty = StoredCredentials::default();
+        let alice_sts = StoredCredentials {
+            access_key: "alice-sts".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "alice".to_string(),
+            ..Default::default()
+        };
+        let alice_sa = StoredCredentials {
+            access_key: "alice-sa".to_string(),
+            parent_user: "alice".to_string(),
+            claims: Some(HashMap::from([(IAM_POLICY_CLAIM_NAME_SA.to_string(), json!("session-policy"))])),
+            ..Default::default()
+        };
+
         assert!(
-            non_admin_may_delete_service_account("alice", Some("alice")),
-            "owner may delete own service account"
+            non_admin_may_access_owned_service_account(&alice, Some("alice"), true),
+            "owner without explicit Deny may access own service account"
         );
-        assert!(!non_admin_may_delete_service_account("alice", Some("bob")), "non-owner must be denied");
         assert!(
-            !non_admin_may_delete_service_account("alice", None),
+            !non_admin_may_access_owned_service_account(&alice, Some("alice"), false),
+            "owner with explicit Deny must be denied"
+        );
+        assert!(
+            !non_admin_may_access_owned_service_account(&alice, Some("bob"), true),
+            "non-owner must be denied"
+        );
+        assert!(
+            !non_admin_may_access_owned_service_account(&alice, None, true),
             "unloadable target (None) must be denied (fail-closed), not bypass the owner check"
         );
         assert!(
-            !non_admin_may_delete_service_account("", None),
+            !non_admin_may_access_owned_service_account(&alice, Some(""), true),
+            "empty target parent must be denied"
+        );
+        assert!(
+            !non_admin_may_access_owned_service_account(&empty, None, true),
             "empty caller + unloadable target must still deny"
+        );
+        assert!(
+            !non_admin_may_access_owned_service_account(&alice_sa, Some("alice"), true),
+            "service account caller must never impersonate its parent (#9514)"
+        );
+        assert!(
+            !non_admin_may_access_owned_service_account(&alice_sa, Some("alice"), false),
+            "service account caller with explicit Deny must be denied (#9514)"
+        );
+        assert!(
+            non_admin_may_access_owned_service_account(&alice_sts, Some("alice"), true),
+            "non-service-account STS session without explicit Deny retains parent owner fallback"
+        );
+        assert!(
+            !non_admin_may_access_owned_service_account(&alice_sts, Some("alice"), false),
+            "STS session with explicit Deny must be denied"
         );
     }
 
@@ -2179,5 +2268,471 @@ mod tests {
         assert_eq!(resp.name.as_deref(), Some("Owner"));
         assert_eq!(resp.description.as_deref(), Some("Primary user"));
         assert_eq!(resp.expiration, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restricted_service_account_cannot_delete_inspect_or_list_sibling_accounts_issue_9514() {
+        crate::app::gating_test_env::run_large_stack_test("service-account-sibling-authz-9514", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, publish_test_app_context};
+            use rustfs_iam::store::UserType;
+            use rustfs_iam::store::object::ObjectStore;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    self.0.clone()
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+
+            struct RestoreAmbient(Arc<AppContext>);
+            impl Drop for RestoreAmbient {
+                fn drop(&mut self) {
+                    publish_test_app_context(Arc::clone(&self.0));
+                }
+            }
+
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let _restore = RestoreAmbient(Arc::clone(&ambient));
+            let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            ObjectStore::new(store.clone())
+                .save_iam_config(
+                    json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("initialize IAM storage");
+            let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialized IAM");
+
+            let s3_rw_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,
+            )
+            .expect("s3 rw policy");
+            let deny_admin_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]},
+                    {"Effect":"Deny","Action":["admin:*"],"Resource":["arn:aws:s3:::*"]}
+                ]}"#,
+            )
+            .expect("deny admin policy");
+            let svc_admin_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":["admin:ListServiceAccounts","admin:RemoveServiceAccount"],"Resource":["arn:aws:s3:::*"]}
+                ]}"#,
+            )
+            .expect("service account admin policy");
+
+            iam.set_policy("s3-rw-9514", s3_rw_policy).await.expect("set s3-rw policy");
+            iam.set_policy("deny-admin-9514", deny_admin_policy)
+                .await
+                .expect("set deny-admin policy");
+            iam.set_policy("svc-admin-9514", svc_admin_policy.clone())
+                .await
+                .expect("set svc-admin policy");
+
+            let secret = "secret-key-9514";
+            for (user, policy_name) in [
+                ("alice-9514", "s3-rw-9514"),
+                ("carol-9514", "deny-admin-9514"),
+                ("admin-9514", "svc-admin-9514"),
+            ] {
+                iam.create_user(
+                    user,
+                    &rustfs_madmin::AddOrUpdateUserReq {
+                        secret_key: secret.to_owned(),
+                        policy: None,
+                        status: rustfs_madmin::AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create test user");
+                iam.policy_db_set(user, UserType::Reg, false, policy_name)
+                    .await
+                    .expect("attach test policy");
+            }
+
+            let restricted_deny_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+                    {"Sid":"ReadOneSharedFile","Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::test-bucket/share-test/hello.txt"]},
+                    {"Sid":"DenyCredentialAndAdminManagement","Effect":"Deny","Action":["admin:*"],"Resource":["arn:aws:s3:::*"]}
+                ]}"#,
+            )
+            .expect("restricted deny policy");
+            let restricted_s3_only_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::test-bucket/*"]}
+                ]}"#,
+            )
+            .expect("restricted s3-only policy");
+
+            let (sa_denied, _) = iam
+                .new_service_account(
+                    "alice-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "sa-denied-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(restricted_deny_policy.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create restricted service account with explicit admin deny");
+            let (sa_s3_only, _) = iam
+                .new_service_account(
+                    "alice-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "sa-s3only-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(restricted_s3_only_policy.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create s3-only service account");
+            let (sa_sibling, _) = iam
+                .new_service_account(
+                    "alice-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "sa-sibling-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create sibling service account");
+            let (carol_sa, _) = iam
+                .new_service_account(
+                    "carol-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "carol-sa-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create carol service account");
+            let (admin_sa_denied, _) = iam
+                .new_service_account(
+                    "admin-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "admin-sa-denied-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(restricted_deny_policy),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create admin-parented restricted service account with explicit admin deny");
+            let (admin_sa_s3_only, _) = iam
+                .new_service_account(
+                    "admin-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "admin-sa-s3only-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(restricted_s3_only_policy),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create admin-parented s3-only service account");
+            let (admin_sa, _) = iam
+                .new_service_account(
+                    "admin-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "admin-sa-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(svc_admin_policy),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create authorized admin service account");
+            let (admin_target, _) = iam
+                .new_service_account(
+                    "admin-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "admin-target-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create admin sibling target");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(Arc::clone(&iam))), ambient.kms()));
+            assert!(context.publish_action_credentials(StoredCredentials {
+                access_key: "root-9514".to_owned(),
+                secret_key: "root-secret-9514".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            // Restricted service accounts (both explicit Deny admin:* and least-privilege S3-only,
+            // under either a regular parent or an admin parent) must be denied from deleting,
+            // inspecting, or listing sibling/own service accounts.
+            for (caller, parent, sibling) in [
+                (&sa_denied.access_key, "alice-9514", sa_sibling.access_key.as_str()),
+                (&sa_s3_only.access_key, "alice-9514", sa_sibling.access_key.as_str()),
+                (&admin_sa_denied.access_key, "admin-9514", admin_target.access_key.as_str()),
+                (&admin_sa_s3_only.access_key, "admin-9514", admin_target.access_key.as_str()),
+            ] {
+                for target in [sibling, caller.as_str(), "missing-sa-9514"] {
+                    let req = TestRequest::new(
+                        http::Method::DELETE,
+                        format!("/rustfs/admin/v3/delete-service-account?accessKey={target}").as_str(),
+                    )
+                    .credentials(caller, secret, None)
+                    .build();
+                    let err = DeleteServiceAccount {}
+                        .call(req, Params::new())
+                        .await
+                        .expect_err("restricted service account delete must fail");
+                    assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{caller} delete {target}");
+                }
+                assert!(
+                    iam.get_service_account(sibling).await.is_ok(),
+                    "sibling service account {sibling} must still exist after rejected delete by {caller}"
+                );
+
+                for target in [sibling, "missing-sa-9514"] {
+                    let req = TestRequest::new(
+                        http::Method::GET,
+                        format!("/rustfs/admin/v3/info-service-account?accessKey={target}").as_str(),
+                    )
+                    .credentials(caller, secret, None)
+                    .build();
+                    let err = InfoServiceAccount {}
+                        .call(req, Params::new())
+                        .await
+                        .expect_err("restricted service account info must fail");
+                    assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{caller} info {target}");
+                }
+
+                for uri in [
+                    "/rustfs/admin/v3/list-service-accounts".to_owned(),
+                    format!("/rustfs/admin/v3/list-service-accounts?user={caller}"),
+                    format!("/rustfs/admin/v3/list-service-accounts?user={parent}"),
+                ] {
+                    let req = TestRequest::new(http::Method::GET, uri.as_str())
+                        .credentials(caller, secret, None)
+                        .build();
+                    let err = ListServiceAccount {}
+                        .call(req, Params::new())
+                        .await
+                        .expect_err("restricted service account list must fail");
+                    assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{caller} {uri}");
+                }
+
+                for uri in [
+                    "/rustfs/admin/v3/list-access-keys-bulk".to_owned(),
+                    format!("/rustfs/admin/v3/list-access-keys-bulk?users={caller}"),
+                    format!("/rustfs/admin/v3/list-access-keys-bulk?users={parent}"),
+                ] {
+                    let req = TestRequest::new(http::Method::GET, uri.as_str())
+                        .credentials(caller, secret, None)
+                        .build();
+                    let err = ListAccessKeysBulk {}
+                        .call(req, Params::new())
+                        .await
+                        .expect_err("restricted service account bulk list must fail");
+                    assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{caller} {uri}");
+                }
+            }
+
+            // A regular parent user with explicit Deny admin:* must also be blocked from owner fallback.
+            let carol_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={}", carol_sa.access_key).as_str(),
+            )
+            .credentials("carol-9514", secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(carol_delete, Params::new())
+                    .await
+                    .expect_err("explicit admin deny must block owner delete")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            assert!(
+                iam.get_service_account(&carol_sa.access_key).await.is_ok(),
+                "carol service account must remain after denied delete"
+            );
+            let carol_info = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-service-account?accessKey={}", carol_sa.access_key).as_str(),
+            )
+            .credentials("carol-9514", secret, None)
+            .build();
+            assert_eq!(
+                InfoServiceAccount {}
+                    .call(carol_info, Params::new())
+                    .await
+                    .expect_err("explicit admin deny must block owner info")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            let carol_list = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .credentials("carol-9514", secret, None)
+                .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(carol_list, Params::new())
+                    .await
+                    .expect_err("explicit admin deny must block owner list")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            let carol_bulk = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .credentials("carol-9514", secret, None)
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(carol_bulk, Params::new())
+                    .await
+                    .expect_err("explicit admin deny must block owner bulk list")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+
+            // Regular parent user without explicit admin Deny retains self-service access to own accounts.
+            let alice_list = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .credentials("alice-9514", secret, None)
+                .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(alice_list, Params::new())
+                    .await
+                    .expect("owner list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let alice_info = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-service-account?accessKey={}", sa_sibling.access_key).as_str(),
+            )
+            .credentials("alice-9514", secret, None)
+            .build();
+            assert_eq!(
+                InfoServiceAccount {}
+                    .call(alice_info, Params::new())
+                    .await
+                    .expect("owner info should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let alice_bulk = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .credentials("alice-9514", secret, None)
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(alice_bulk, Params::new())
+                    .await
+                    .expect("owner bulk list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let alice_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={}", sa_sibling.access_key).as_str(),
+            )
+            .credentials("alice-9514", secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(alice_delete, Params::new())
+                    .await
+                    .expect("owner delete should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            assert!(
+                iam.get_service_account(&sa_sibling.access_key)
+                    .await
+                    .is_err_and(|err| is_err_no_such_service_account(&err)),
+                "owner delete must remove the target service account"
+            );
+
+            // A service account explicitly granted ListServiceAccounts and RemoveServiceAccount
+            // continues to work through the primary IAM policy check.
+            let admin_sa_list = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .credentials(&admin_sa.access_key, secret, None)
+                .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(admin_sa_list, Params::new())
+                    .await
+                    .expect("authorized service account list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let admin_sa_info = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-service-account?accessKey={}", admin_target.access_key).as_str(),
+            )
+            .credentials(&admin_sa.access_key, secret, None)
+            .build();
+            assert_eq!(
+                InfoServiceAccount {}
+                    .call(admin_sa_info, Params::new())
+                    .await
+                    .expect("authorized service account info should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let admin_sa_bulk = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .credentials(&admin_sa.access_key, secret, None)
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(admin_sa_bulk, Params::new())
+                    .await
+                    .expect("authorized service account bulk list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let admin_sa_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={}", admin_target.access_key).as_str(),
+            )
+            .credentials(&admin_sa.access_key, secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(admin_sa_delete, Params::new())
+                    .await
+                    .expect("authorized service account delete should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            assert!(
+                iam.get_service_account(&admin_target.access_key)
+                    .await
+                    .is_err_and(|err| is_err_no_such_service_account(&err)),
+                "authorized service account delete must remove the target service account"
+            );
+        });
     }
 }
