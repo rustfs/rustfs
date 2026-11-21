@@ -340,11 +340,8 @@ impl StagingChunk {
     }
 
     /// The bytes staged so far.
-    #[allow(unsafe_code)]
     pub fn staged(&self) -> Result<&[u8], CuObjectError> {
-        // SAFETY: the range lies in this chunk (see the type docs); `&self`
-        // excludes `spare_mut`, and transfers own the chunk they move.
-        Ok(unsafe { std::slice::from_raw_parts(ffi::data(&self.server.staging.buffer).add(self.start()), self.len) })
+        Ok(self.as_ref())
     }
 
     /// The unfilled remainder of the chunk, for a reader to fill directly.
@@ -367,6 +364,15 @@ impl StagingChunk {
 
     fn start(&self) -> usize {
         self.index * self.capacity()
+    }
+}
+
+impl AsRef<[u8]> for StagingChunk {
+    #[allow(unsafe_code)]
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the chunk owns this range of the registration. A shared borrow
+        // excludes mutation and DMA reads into the chunk require owned access.
+        unsafe { std::slice::from_raw_parts(ffi::data(&self.server.staging.buffer).add(self.start()), self.len) }
     }
 }
 
@@ -996,8 +1002,15 @@ mod tests {
         assert_eq!(first.staged().unwrap(), b"first");
         assert_eq!(second.staged().unwrap(), b"second");
         assert!(second.advance(usize::MAX).is_err());
-        drop(first);
+        let addr = first.as_ref().as_ptr();
+        let owned = Bytes::from_owner(first);
+        let part = owned.slice(1..);
+        assert_eq!(owned.as_ptr(), addr);
+        drop(owned);
         drop(second);
+        assert_eq!(&part[..], b"irst");
+        assert_eq!(server.available_chunks(), 1);
+        drop(part);
         assert_eq!(server.available_chunks(), 2);
         let arena = server.register_arena(8192).unwrap();
         for ranges in [vec![(8, 40)], vec![(8, 17), (25, 23)]] {

@@ -782,17 +782,10 @@ type StagedRead = JoinHandle<Result<StagingChunk, CuObjectError>>;
 
 /// The staged bytes of `chunk`: with `zero_copy`, a `Bytes` that owns the
 /// chunk (it returns to the pool when the last clone drops), otherwise a copy.
-#[cfg(feature = "nixl")]
 fn staged_bytes(chunk: StagingChunk, zero_copy: bool) -> io::Result<Bytes> {
     if zero_copy {
         return Ok(Bytes::from_owner(chunk));
     }
-    Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
-}
-
-/// The staged bytes of `chunk`, copied (the cuObject chunk is not a byte owner).
-#[cfg(not(feature = "nixl"))]
-fn staged_bytes(chunk: StagingChunk, _zero_copy: bool) -> io::Result<Bytes> {
     Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
 }
 
@@ -812,8 +805,8 @@ fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaTok
 ///
 /// With `zero_copy` the body's chunks are the staging chunks themselves, so a
 /// consumer that keeps a chunk keeps it out of the pool: only callers whose
-/// body is consumed and dropped with the request (UploadPart) may set it.
-/// PutObject may hand its body to the object data cache, so it copies.
+/// body is consumed with the request may set it. UploadPart uses ownership
+/// directly. PutObject requests that can populate the object cache use a copy.
 pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_copy: bool) -> S3Result<(Body, u64)> {
     let service = SERVICE
         .get()
