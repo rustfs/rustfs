@@ -11256,6 +11256,9 @@ mod heal_result_report_tests {
 }
 
 #[cfg(test)]
+mod remote_object_heal_tests;
+
+#[cfg(test)]
 mod shard_integrity_rollout_tests;
 
 #[cfg(test)]

@@ -864,6 +864,13 @@ impl LocalDisk {
         } else {
             None
         };
+        // Healing a transitioned object stages no data dir, so nothing has created its tmp source parent.
+        let remote_metadata_source = no_inline
+            && fi.is_remote()
+            && has_data_dir_path.is_none()
+            && multipart_publication.is_none()
+            && src_volume == super::super::RUSTFS_META_TMP_BUCKET;
+        let create_source_parent = (!no_inline || remote_metadata_source) && !preserve_upload_metadata;
 
         if multipart_publication.is_none()
             && let Some((source_directory, target_directory)) = has_data_dir_path.as_ref()
@@ -943,7 +950,7 @@ impl LocalDisk {
             let fused_attempt = move |is_cancelled: &dyn Fn() -> bool| -> std::io::Result<FusedCommitAttempt> {
                 let source_mode = if flat_inline_tmp {
                     SourcePreparationMode::FlatInlineTmp { defer_dst_preflight }
-                } else if !no_inline {
+                } else if !no_inline || remote_metadata_source {
                     SourcePreparationMode::CreateParent
                 } else {
                     SourcePreparationMode::ExistingParent
@@ -1693,7 +1700,7 @@ impl LocalDisk {
             }
         } else {
             prepare_rename_commit_and_destination_metadata(
-                !no_inline && !preserve_upload_metadata,
+                create_source_parent,
                 src_file_parent,
                 dst_file_parent,
                 &dst_file_path,
@@ -1709,7 +1716,7 @@ impl LocalDisk {
         // Multipart authority already created its source tree. Recreating it
         // here would resurrect staging retired before a delayed request arrived.
         let (rename_commit_guard, has_dst_buf) = prepare_rename_commit_and_destination_metadata(
-            !no_inline && !preserve_upload_metadata,
+            create_source_parent,
             src_file_parent,
             dst_file_parent,
             &dst_file_path,
