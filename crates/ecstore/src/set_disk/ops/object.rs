@@ -12777,7 +12777,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         send_event(EventArgs {
             event_name: event_name.to_string(),
-            bucket_incarnation_id: opts.expected_bucket_incarnation_id,
+            bucket_incarnation_id: opts.notification_bucket_incarnation_id,
             bucket_name: bucket.to_string(),
             object: obj_info,
             user_agent: "Internal: [ILM-Transition]".to_string(),

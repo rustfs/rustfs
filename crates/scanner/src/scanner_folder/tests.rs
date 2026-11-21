@@ -377,6 +377,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
+        notification_bucket_incarnation: None,
         usage_updates: None,
         checkpoint_tx: None,
         checkpoint_ancestors: Vec::new(),
@@ -782,6 +783,7 @@ fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_CORRUPT_ERROR));
 
@@ -814,6 +816,7 @@ fn test_classify_get_size_failure_records_transient_metadata_error_without_heal(
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     let err = StorageError::other(format!("{}: temporary read failure", crate::scanner_io::SCANNER_METADATA_TRANSIENT_ERROR));
 
@@ -871,6 +874,7 @@ async fn test_heal_replication_skips_only_unversioned_data_versions() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     // An unversioned listing carries no version id: nothing can be replicated
     // from it, so it never reaches replication admission.
@@ -2274,6 +2278,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
         heal_enabled: true,
         heal_bitrot: true,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     let object_info = ObjectInfo {
         bucket: "bucket".to_string(),

@@ -5222,6 +5222,7 @@ async fn transition_object(
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         mod_time: oi.mod_time,
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+        notification_bucket_incarnation_id: notification_bucket_incarnation,
         ..Default::default()
     };
     opts.add_namespace_lock_guard(&publication_guard);
@@ -5838,12 +5839,22 @@ fn lifecycle_replication_blocks_action(oi: &ObjectInfo) -> bool {
 }
 
 pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    apply_transition_rule_with_incarnation(event, src, oi, None).await
+}
+
+pub async fn apply_transition_rule_with_incarnation(
+    event: &lifecycle::Event,
+    src: &LcEventSrc,
+    oi: &ObjectInfo,
+    notification_bucket_incarnation: Option<Uuid>,
+) -> bool {
     if oi.delete_marker || oi.is_dir {
         return false;
     }
     runtime_sources::transition_state_handle()
-        .queue_transition_task(oi, event, src)
+        .queue_transition_task_outcome(None, oi, event, src, None, notification_bucket_incarnation)
         .await
+        .is_handled()
 }
 
 async fn acquire_lifecycle_publication_guard(api: &ECStore, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard, Error> {

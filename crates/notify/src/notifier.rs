@@ -34,6 +34,7 @@ const EVENT_NOTIFY_DISPATCH_FAILED: &str = "notify_dispatch_failed";
 const EVENT_NOTIFY_DISPATCH_STARTED: &str = "notify_dispatch_started";
 const EVENT_NOTIFY_DISPATCH_COMPLETED: &str = "notify_dispatch_completed";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
+const MAX_BUCKET_RULE_REFRESH_ATTEMPTS: usize = 3;
 
 async fn wait_for_dispatch_tasks(handles: Vec<JoinHandle<()>>) {
     for handle in handles {
@@ -249,18 +250,22 @@ impl EventNotifier {
         let target_ids = match &event.bucket_removed_targets {
             Some(targets) if event_name == EventName::BucketRemoved => targets.clone(),
             _ => {
-                let match_targets = || {
-                    self.rule_engine
+                let mut refresh_attempts = 0;
+                let mut reload_succeeded = false;
+                loop {
+                    let targets = self
+                        .rule_engine
                         .match_bucket_targets(bucket_name, event.bucket_incarnation_id, event_name, object_key)
-                };
-                let targets = match_targets().await;
-                if targets.is_empty()
-                    && let Some(id) = event.bucket_incarnation_id
-                    && self.rule_engine.refresh_incarnation(bucket_name, id).await
-                {
-                    match_targets().await
-                } else {
-                    targets
+                        .await;
+                    if !targets.is_empty() {
+                        break targets;
+                    }
+                    let Some(id) = event.bucket_incarnation_id else { break targets };
+                    if reload_succeeded || refresh_attempts >= MAX_BUCKET_RULE_REFRESH_ATTEMPTS {
+                        break targets;
+                    }
+                    refresh_attempts += 1;
+                    reload_succeeded = self.rule_engine.refresh_incarnation(bucket_name, id).await;
                 }
             }
         };
