@@ -1349,6 +1349,9 @@ impl ScannerItem {
 
 pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) -> GetSizeFailureAction {
     match err {
+        // A drive read deadline leaves the object unexamined. Keep its directory
+        // position for the next source attempt instead of recording a failed object.
+        StorageError::Timeout | StorageError::SourceStalled => GetSizeFailureAction::AbandonSource,
         err if is_scanner_source_unavailable(err) => GetSizeFailureAction::AbandonSource,
         StorageError::FileNotFound | StorageError::FileVersionNotFound | StorageError::VolumeNotFound => {
             GetSizeFailureAction::Skip

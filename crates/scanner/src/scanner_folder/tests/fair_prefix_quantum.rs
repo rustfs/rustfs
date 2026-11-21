@@ -1340,3 +1340,94 @@ async fn one_object_quantum_commits_the_object_before_yielding() {
     let total = cache.checked_flatten("bucket").expect("complete bucket");
     assert_eq!((total.objects, total.versions, total.size), (expected, expected, expected));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn metadata_read_deadline_resumes_at_the_unread_object() {
+    for prefix in ["", "nested/"] {
+        assert_metadata_deadline_resume(prefix).await;
+    }
+}
+
+#[cfg(unix)]
+async fn assert_metadata_deadline_resume(prefix: &str) {
+    use crate::storage_api::owner::{EcstoreLocalPublicationPause, EcstoreLocalPublicationStage};
+    let temp = tempfile::tempdir().expect("fixture directory");
+    let root = temp.path().join("disk");
+    let cache = seed_flat_bucket(&root, 0).await;
+    for index in 0..10 {
+        let name = format!("{prefix}object-{index:04}");
+        let bytes = metadata_for_object_version("bucket", &name, Some(Uuid::from_u128(index + 1)));
+        write_test_object_metadata_bytes(&root, "bucket", &name, &bytes).await;
+    }
+    let disk = open_fixture_disk(&root).await;
+    let mut pause = EcstoreLocalPublicationPause::install(
+        &disk,
+        "bucket",
+        &format!("{prefix}object-0008/xl.meta"),
+        EcstoreLocalPublicationStage::MetadataReadAfterOpen,
+    )
+    .expect("pause the ninth real metadata read");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let partial = temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some("1"))], async {
+        let scan = scan_data_folder(
+            budget.token(),
+            budget.clone(),
+            vec![disk.clone()],
+            disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        );
+        tokio::pin!(scan);
+        tokio::select! {
+            entered = pause.entered() => entered.expect("native read opened"),
+            outcome = &mut scan => panic!("scan finished before the held read: {outcome:?}"),
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the drive must enforce its read deadline");
+        let Err(ScannerError::PartialCache(partial)) = outcome else {
+            panic!("a timed-out read must return an uncertified checkpoint")
+        };
+        partial
+    })
+    .await;
+    drop(pause);
+    assert!(partial.has_scan_position(), "a drive deadline must not discard the completed prefix");
+    assert!(
+        partial.info.failed_objects.is_empty(),
+        "a drive deadline is not evidence of object damage"
+    );
+    assert!(!partial.info.snapshot_complete);
+    assert_eq!(budget.progress().0, 8);
+    let mut cache = DataUsageCache::unmarshal(&partial.marshal_msg().expect("persist partial")).expect("cold load");
+    let owner = cache.info.scan_identity.expect("scan identity");
+    let source = cache.info.source.expect("scan source");
+    let plan = crate::DataUsageScanPlanDigest([31; 32]);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 1, source, plan, owner),
+        crate::DataUsageCachePrepareOutcome::Reused
+    );
+    let disk = open_fixture_disk(&root).await;
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let complete = scan_data_folder(
+        budget.token(),
+        budget.clone(),
+        vec![disk.clone()],
+        disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await
+    .expect("recover after the drive serves reads again");
+    assert!(complete.info.snapshot_complete);
+    let total = complete.checked_flatten("bucket").expect("complete bucket");
+    assert_eq!((total.objects, total.versions, total.size), (10, 10, 10));
+    assert_eq!(budget.progress().0, 2, "the eight acknowledged objects must not be read again");
+}

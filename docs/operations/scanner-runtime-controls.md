@@ -913,6 +913,8 @@ The `aggregated.scanner` payload preserves the same scanner progress, checkpoint
 
 ## Reading Cached Bucket Statistics
 
+When a drive reaches its metadata-read deadline, the scanner checkpoints the completed prefix and leaves the unread object for the next source attempt. A corrupt metadata file remains an object-level failure and keeps the bucket pending until it can be reconciled.
+
 If a directory changes while the scanner is walking it, the bucket stays pending and its next sweep starts from a fresh listing. Other buckets in the set can still publish certified values. A continuously changing bucket may need a stable sweep before its own value becomes certified.
 
 Admin usage reads cache the selected scanner baseline for the existing 30-second TTL, then verify every returned bucket against uncached storage-owned incarnation metadata. Identity reads use at most four concurrent operations and a shared two-second deadline after releasing snapshot/refresh locks. Each bucket read linearizes independently against metadata transactions; the response is not an atomic snapshot of the entire namespace. Delayed peer invalidation cannot authorize a predecessor's statistics for a recreated bucket.
