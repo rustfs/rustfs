@@ -55,7 +55,7 @@ pub(crate) mod s3 {
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
     pub(crate) use rustfs_s3_types::StdError;
-    #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) use s3s::Body;
     #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};

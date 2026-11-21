@@ -15,7 +15,7 @@
 use crate::disk::cleanup_runtime;
 use crate::disk::io_admission::{
     AdmissionReader, BoxedChunkReader, DiskIoAdmission, DiskIoClass, DiskIoContext, current_disk_io_context,
-    current_resource_unit, with_disk_io_context, with_disk_io_permit, with_optional_resource_unit,
+    current_resource_unit, with_detached_disk_io_context, with_disk_io_context, with_disk_io_permit, with_optional_resource_unit,
 };
 use crate::disk::{
     CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint,
@@ -479,10 +479,13 @@ where
     if external_guard.is_none() {
         return operation().await;
     }
-    tokio::spawn(with_optional_resource_unit(current_resource_unit(), async move {
-        let _external_guard = external_guard;
-        operation().await
-    }))
+    tokio::spawn(with_optional_resource_unit(
+        current_resource_unit(),
+        with_detached_disk_io_context(async move {
+            let _external_guard = external_guard;
+            operation().await
+        }),
+    ))
     .await
     .map_err(|_| Error::other("owned mutation task failed"))?
 }
@@ -1828,6 +1831,7 @@ impl LocalDiskWrapper {
         current_disk_io_context().unwrap_or_else(|| DiskIoContext {
             class: DiskIoClass::Foreground,
             cancellation: CancellationToken::new(),
+            admission_deadline: None,
             admission: None,
             permit: None,
             resource_unit: current_resource_unit(),
@@ -1870,10 +1874,10 @@ impl LocalDiskWrapper {
 
     async fn acquire_disk_io_permit(&self) -> Result<Option<crate::disk::io_admission::DiskIoPermit>> {
         if let Some(context) = current_disk_io_context() {
-            if let Some(permit) = context.permit
+            if let Some(permit) = context.permit.as_ref()
                 && permit.is_for(&self.io_admission)
             {
-                return Ok(Some(permit));
+                return Ok(Some(permit.clone()));
             }
             if context
                 .admission
@@ -1883,9 +1887,8 @@ impl LocalDiskWrapper {
                 return Ok(None);
             }
             if context.class == DiskIoClass::Background {
-                return self
-                    .io_admission
-                    .background(&context.cancellation)
+                return context
+                    .background_permit(&self.io_admission)
                     .await
                     .map(Some)
                     .map_err(DiskError::Io);
@@ -4407,6 +4410,29 @@ mod tests {
             DataDirDeleteStatus::Deleted
         );
         assert!(matches!(wrapper.read_all(volume, &body_path).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn owned_mutation_retains_background_class_without_waiter_cancellation() {
+        let cancellation = CancellationToken::new();
+        let caller = cancellation.clone();
+        let guard: Arc<dyn Send + Sync> = Arc::new(());
+        crate::disk::with_background_disk_io(
+            cancellation,
+            run_owned_mutation(Some(guard), move || async move {
+                caller.cancel();
+                let context = current_disk_io_context().expect("publication owner retains background class");
+                assert_eq!(context.class, DiskIoClass::Background);
+                assert!(!context.cancellation.is_cancelled(), "waiter cancellation must not interrupt publication");
+                assert!(
+                    context.admission_deadline.is_some(),
+                    "queued publication must retain a bounded admission lifetime"
+                );
+                Ok(())
+            }),
+        )
+        .await
+        .expect("owned publication completes");
     }
 
     #[tokio::test]

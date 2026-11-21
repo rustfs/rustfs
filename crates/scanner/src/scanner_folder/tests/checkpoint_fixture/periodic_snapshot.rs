@@ -150,7 +150,7 @@ async fn nested_periodic_snapshot(
         .await
         .expect("initial periodic fixture revisions");
     snapshot
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist real mid-walk periodic snapshot");
     let mut loaded = DataUsageCache::default();
@@ -223,7 +223,7 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
         .await
         .expect("initial periodic fixture revisions");
     periodic
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("seed durable periodic snapshot");
 
@@ -281,7 +281,7 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
 
         store.reject_save.store(round == 0, Ordering::SeqCst);
         let saved = terminal
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await;
         if round == 0 {
             assert!(saved.is_err(), "injected terminal persistence failure must be observable");
@@ -369,7 +369,7 @@ async fn periodic_nested_snapshot_keeps_durable_frontier_across_early_repeated_h
         .await
         .expect("initial repeated-handoff revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("save the inherited valid subtree frontier");
     let (mut scanner, unused_root) = build_test_scanner().await;
@@ -442,7 +442,7 @@ async fn periodic_nested_snapshot_keeps_durable_frontier_across_early_repeated_h
         "inherited completed object and both newly read objects must survive"
     );
     candidate
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist later coverage without losing the inherited prefix");
     let mut latest = DataUsageCache::default();
@@ -958,7 +958,7 @@ async fn periodic_failed_subtree_resumes_healthy_descendants_and_compacted_debt(
             .await
             .expect("fresh revisions");
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist failure-bearing coverage");
         let mut adopted = DataUsageCache::default();
@@ -1220,7 +1220,7 @@ async fn checkpoint_debt_restart_round(request: &CheckpointDebtRequest) -> serde
     let expected = checkpoint_debt_observation(&cache, state.identity, frontier, failed_objects);
     assert_eq!(cache.info.leader_epoch, 8 + u64::from(request.round));
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist combined healthy coverage and failure debt with CAS");
     let saved = store.strict_load().await;
