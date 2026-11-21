@@ -451,7 +451,14 @@ impl Disk {
         transaction: Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
-    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+    ) -> Result<
+        Option<(
+            DeleteRecoveryJournal,
+            bool,
+            bool,
+            Option<local::delete_recovery::LocalPublishedDeleteState>,
+        )>,
+    > {
         match self {
             Self::Local(disk) => {
                 disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner, work_budget)
@@ -461,6 +468,7 @@ impl Disk {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
         &self,
         volume: &str,
@@ -469,6 +477,7 @@ impl Disk {
         journal: &DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
+        published_state: Option<local::delete_recovery::LocalPublishedDeleteState>,
     ) -> Result<bool> {
         match self {
             Self::Local(disk) => {
@@ -479,6 +488,7 @@ impl Disk {
                     journal,
                     namespace_owner,
                     work_budget,
+                    published_state,
                 )
                 .await
             }

@@ -284,14 +284,9 @@ impl DefaultMultipartUsecase {
 
         let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
 
-        // Apply adaptive buffer sizing based on part size for optimal streaming performance.
-        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
-        // Buffer sizes range from 32KB to 4MB depending on part size and configured workload profile.
-        let buffer_size = get_buffer_size_opt_in(size);
-        let body = tokio::io::BufReader::with_capacity(
-            buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
-        );
+        // Stream directly from the chunked HTTP body stream; adaptive buffering is
+        // applied below only when disk compression is enabled.
+        let body = StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io)));
 
         // An SSE-C passthrough session stores ciphertext parts verbatim: a
         // compression key restored on the session describes those stored
@@ -321,6 +316,8 @@ impl DefaultMultipartUsecase {
         let mut write_plan = WritePlan::new();
         let etag_algorithm = multipart_etag_algorithm(&fi.user_defined);
         let mut reader = if is_disk_compressed {
+            let buffer_size = get_buffer_size_opt_in(size);
+            let body = tokio::io::BufReader::with_capacity(buffer_size, body);
             let algorithm = CompressionAlgorithm::default();
             let mut hrd = HashReader::from_stream_with_etag(
                 body,
