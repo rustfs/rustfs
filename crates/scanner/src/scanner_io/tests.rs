@@ -4731,7 +4731,7 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         .get_size(item)
         .await
         .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
-    assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+    assert!(matches!(err, StorageError::FileNotFound));
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -4791,7 +4791,7 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
             .get_size(item.clone())
             .await
             .expect_err("corrupt metadata should be surfaced as scanner-heal work");
-        assert!(is_scanner_metadata_corrupt_error(&err));
+        assert!(matches!(err, StorageError::FileCorrupt));
     }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

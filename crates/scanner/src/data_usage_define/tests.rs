@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
 mod cache_cost;
+mod checkpoint_layouts;
 mod save_metrics;
 
 #[test]

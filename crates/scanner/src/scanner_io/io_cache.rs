@@ -621,7 +621,15 @@ impl ScannerIOCache for SetDisks {
             .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
         }
 
-        let (disks, healing) = self.get_online_disks_with_healing(false).await;
+        let (disks, infos, healing_count) = self.get_online_disks_with_healing_and_info(false).await;
+        let healing = healing_count != 0;
+        // A verified blank replacement may already occupy its slot so the formatter can claim it.
+        // Directory readability or the configured slot UUID does not make it a scan source.
+        let disks: Vec<_> = disks
+            .into_iter()
+            .zip(infos)
+            .filter_map(|(disk, info)| info.id.is_some_and(|id| !id.is_nil()).then_some(disk))
+            .collect();
         #[cfg(test)]
         let disks = super::tests::usage_remote_drain::walker_disks(&self, &buckets, disks);
         if disks.is_empty() {
@@ -1048,6 +1056,9 @@ impl ScannerIOCache for SetDisks {
                         break;
                     };
                     if ctx_clone.is_cancelled() || budget_clone.budget_elapsed() {
+                        break;
+                    }
+                    if check_local_scanner_handle(&disk).is_err() {
                         break;
                     }
                     let permit_wait_elapsed = permit_wait_start.elapsed();
@@ -1558,6 +1569,10 @@ impl ScannerIOCache for SetDisks {
                                 );
                                 continue;
                             }
+                            if check_local_scanner_handle(&disk).is_err() {
+                                record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                                break;
+                            }
                             record_completed_usage_watch(&usage_watch_completions_clone, source, &bucket.name, bucket_usage_watch.as_ref()).await;
                             if let Err(e) =
                                 send_cache_root_entry(&bucket_result_tx_clone, *root, &cache, &pending_maintenance_work_clone)
@@ -1719,6 +1734,11 @@ impl ScannerIOCache for SetDisks {
                                     checkpoint_channel_closed = true;
                                     continue;
                                 };
+                                if let Err(error) = check_local_scanner_handle(&disk) {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(error);
+                                }
                                 if cache_guard.is_lock_lost() {
                                     scan_ctx.cancel();
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
@@ -1770,6 +1790,24 @@ impl ScannerIOCache for SetDisks {
                             }
                         }
                     };
+                    let scan_result = check_local_scanner_handle(&disk).and(scan_result);
+                    if let Err(error) = &scan_result && is_scanner_source_unavailable(error) {
+                        // Nothing after the last persisted checkpoint is trusted. Leave the range
+                        // pending for fresh inventory rather than assigning this handle another bucket.
+                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                        warn!(
+                            target: "rustfs::scanner::io",
+                            event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_IO,
+                            state = "scan_source_unavailable",
+                            bucket = %bucket.name,
+                            disk = %disk.path().display(),
+                            error = %error,
+                            "Scanner retired disk worker with bucket coverage pending"
+                        );
+                        break;
+                    }
                     if let Some(expected) = checkpoint_identity {
                         let current_identity = match scanner_bucket_checkpoint_identity(
                             &store_clone_clone,
@@ -1921,6 +1959,10 @@ impl ScannerIOCache for SetDisks {
                             break;
                         }
                     };
+                    if check_local_scanner_handle(&disk).is_err() {
+                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                        break;
+                    }
                     if partial {
                         let done_save = Metrics::time(Metric::SaveUsage);
                         let partial_saved = if owner_ctx_clone.is_cancelled() || cache_guard.is_lock_lost() {
@@ -1963,6 +2005,10 @@ impl ScannerIOCache for SetDisks {
                             }
                         };
                         done_save();
+                        if check_local_scanner_handle(&disk).is_err() {
+                            record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                            break;
+                        }
                         let partial_progress_proven = partial_saved
                             && !cache_guard.is_lock_lost()
                             && !owner_ctx_clone.is_cancelled()
@@ -2112,6 +2158,10 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
 
+                    if check_local_scanner_handle(&disk).is_err() {
+                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                        break;
+                    }
                     bucket_budget.record_durable_turn_progress();
                     record_completed_usage_watch(&usage_watch_completions_clone, source, &bucket.name, bucket_usage_watch.as_ref()).await;
                     debug!(

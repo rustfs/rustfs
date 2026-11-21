@@ -1,5 +1,7 @@
 # Scanner Checkpoint Fixture
 
+To compare encoded write cost and recovery across experimental full, segment, and paged layouts, see the standalone [checkpoint layout experiment](scanner-checkpoint-layouts.md).
+
 ## Raw Enumeration Restart Diagnostic
 
 `enumeration_restart_worker` exercises the real `scan_data_folder` with a local disk and valid `xl.meta` objects. Without configuration it is a positive CI control: four one-byte objects must complete and survive a cache codec round trip. It is not an ignored test or an assertion that a known defect must persist.
