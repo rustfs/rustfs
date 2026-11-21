@@ -423,7 +423,10 @@ hotpath = { version = "0.32.1", default-features = false }
 insta = { version = "1.49" }
 
 [workspace.metadata.cargo-shear]
-ignored = ["hotpath", "rustfs"]
+# The `#[path]` test modules under `rustfs/src/server/http/tests/` are linked by
+# rustc (including the `http.rs` + `http/` sibling-directory rule), but cargo-shear
+# resolves those nested `#[path]` attributes against the wrong base directory.
+ignored-paths = ["rustfs/src/server/http/tests/**/*.rs"]
 
 [profile.dev]
 # Full debuginfo roughly doubles compile+link time and produces multi-GB
