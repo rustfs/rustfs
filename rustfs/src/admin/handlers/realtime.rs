@@ -24,6 +24,7 @@ use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::Operation;
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
+use crate::error::ApiError;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -229,10 +230,9 @@ impl Operation for MetricsHandler {
 
         if mp.scope == "cluster" {
             if !mp.is_single_cluster_scanner_sample() {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "cluster scanner summaries require n=1, types=1 and no node filters"
-                ));
+                return Err(
+                    ApiError::invalid_request("cluster scanner summaries require n=1, types=1 and no node filters").into(),
+                );
             }
             let cluster_scanner = cluster_scanner::read(crate::admin::runtime_sources::app_context_from_req(&req)).await;
             #[derive(Serialize)]
@@ -245,7 +245,7 @@ impl Operation for MetricsHandler {
                 cluster_scanner,
                 finished: true,
             })
-            .map_err(|_| s3_error!(InternalError, "could not encode cluster scanner status"))?;
+            .map_err(|_| ApiError::other("could not encode cluster scanner status"))?;
             encoded.push(b'\n');
             let mut header = HeaderMap::new();
             header.insert(CONTENT_TYPE, HeaderValue::from_static(CONSOLE_METRICS_CONTENT_TYPE));
