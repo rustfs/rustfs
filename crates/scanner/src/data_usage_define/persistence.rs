@@ -741,7 +741,7 @@ impl DataUsageCache {
                 ))
                 .await?
             }
-            _ => (inline.clone(), None),
+            _ => (inline.clone(), [None, None]),
         };
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
         let primary_save_started = Instant::now();
@@ -756,9 +756,7 @@ impl DataUsageCache {
         )
         .await?;
 
-        if let (Some(retired), Some(epoch)) = (primary_retired, expected_epoch) {
-            let _ = pages::reclaim(store.clone(), name, retired, epoch).await;
-        }
+        pages::reclaim_retired(store.clone(), name, primary_retired, expected_epoch).await;
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration, primary_save_started.elapsed());
@@ -780,7 +778,7 @@ impl DataUsageCache {
                     ))
                     .await?
                 }
-                _ => (inline, None),
+                _ => (inline, [None, None]),
             };
             Self::save_path_with_retry(
                 store.clone(),
@@ -792,9 +790,7 @@ impl DataUsageCache {
                 expected_epoch,
             )
             .await?;
-            if let (Some(bundle), Some(epoch)) = (retired, expected_epoch) {
-                let _ = pages::reclaim(store, &backup_name, bundle, epoch).await;
-            }
+            pages::reclaim_retired(store, &backup_name, retired, expected_epoch).await;
             Ok::<_, StorageError>(())
         };
         if let Err(e) = save_backup.await {

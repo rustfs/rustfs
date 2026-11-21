@@ -95,7 +95,7 @@ async fn compacted_checkpoint_advances_one_child_without_rewriting_300k_names() 
             .await
             .expect("current revisions");
         cache
-            .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save compacted receipt");
         let after = layout(&store).await;
@@ -145,7 +145,7 @@ async fn dormant_linked_tree_pages_survive_source_switch_and_cold_reencoding() {
         .await
         .expect("before first checkpoint");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist dormant linked tree");
     let previous = layout(&store).await;
@@ -170,7 +170,7 @@ async fn dormant_linked_tree_pages_survive_source_switch_and_cold_reencoding() {
     let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
         .await
         .expect("before second checkpoint");
-    cold.save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+    cold.save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("save one new child");
     let after = layout(&store).await;
@@ -190,7 +190,7 @@ async fn paged_checkpoint_writes_only_changed_pages_and_commits_root_last() {
         .await
         .expect("empty revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0, CancellationToken::new())
         .await
         .expect("initial checkpoint");
     let before = layout(&store).await;
@@ -217,7 +217,7 @@ async fn paged_checkpoint_writes_only_changed_pages_and_commits_root_last() {
     );
     store.fail_puts_from.lock().await.insert(main.clone(), before[&main].0 + 1);
     restarted
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect_err("commit interrupted after writing pages");
     let interrupted = layout(&store).await;
@@ -226,7 +226,7 @@ async fn paged_checkpoint_writes_only_changed_pages_and_commits_root_last() {
     assert_eq!(observer.checked_flatten("bucket").expect("previous coverage").size, prior.size);
     store.fail_puts_from.lock().await.remove(&main);
     restarted
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("retry interrupted commit");
     observer.load(store.clone(), NAME).await.expect("load committed result");
@@ -253,7 +253,9 @@ async fn paged_checkpoint_writes_only_changed_pages_and_commits_root_last() {
         }
     }
     restarted.info.next_cycle += 1;
-    let stale = restarted.save_with_revisions_for_epoch(store.clone(), NAME, &first, 0).await;
+    let stale = restarted
+        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0, CancellationToken::new())
+        .await;
     assert!(
         matches!(stale, Err(EcstoreError::PreconditionFailed)),
         "stale writer cannot replace the new root"
@@ -268,7 +270,7 @@ async fn paged_checkpoint_cold_restore_spans_fixed_duration_and_repairs_corrupt_
         .await
         .expect("read revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("write both copies");
     store.checkpoint_page_delay_ms.store(16, Ordering::Relaxed);
@@ -308,7 +310,7 @@ async fn paged_checkpoint_cold_restore_spans_fixed_duration_and_repairs_corrupt_
             .expect("re-enter admission on same heads")
     );
     loaded
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("replace damaged primary generation");
     store.objects.lock().await.retain(|key, _| !key.contains(".bkp"));
@@ -323,7 +325,7 @@ async fn paged_checkpoint_bucket_admission_uses_the_scan_budget_during_cold_load
     let cache = seeded();
     let revisions = DataUsageCache::read_revisions(store.clone(), NAME).await.unwrap();
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .unwrap();
     store.checkpoint_page_delay_ms.store(16, Ordering::Relaxed);
@@ -365,7 +367,7 @@ async fn paged_checkpoint_retirement_preserves_independent_backup_and_legacy_pro
         .await
         .expect("initial revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0, CancellationToken::new())
         .await
         .expect("persist first generation");
     let original = layout(&store).await;
@@ -387,7 +389,7 @@ async fn paged_checkpoint_retirement_preserves_independent_backup_and_legacy_pro
         .await
         .insert(backup.clone(), original[&backup].0 + 1);
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &initial, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &initial, 0, CancellationToken::new())
         .await
         .expect("commit primary despite failed backup");
     let updated = layout(&store).await;
@@ -428,7 +430,7 @@ async fn paged_checkpoint_scan_handoff_checks_the_latest_root_before_using_its_t
     replace(&mut cache, 17);
     let revisions = DataUsageCache::read_revisions(store.clone(), NAME).await.unwrap();
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .unwrap();
     let main = memory_config_key(RUSTFS_META_BUCKET, &format!("{BUCKET_META_PREFIX}/{NAME}"));
@@ -458,7 +460,7 @@ async fn paged_checkpoint_scan_handoff_checks_the_latest_root_before_using_its_t
     let revisions = DataUsageCache::read_revisions(store.clone(), NAME).await.unwrap();
     replace(&mut cache, 99);
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .unwrap();
     let next = budget();

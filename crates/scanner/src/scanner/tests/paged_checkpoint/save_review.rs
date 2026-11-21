@@ -20,7 +20,7 @@ async fn indefinite_partial_checkpoints_keep_unreachable_bytes_bounded() {
             .await
             .expect("current heads");
         cache
-            .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("commit partial");
         let current: usize = layout(&store)
@@ -47,6 +47,87 @@ async fn indefinite_partial_checkpoints_keep_unreachable_bytes_bounded() {
     );
 }
 
+async fn reopen_checkpoint_store(store: &MemoryConfigStore) -> Arc<MemoryConfigStore> {
+    let reopened = Arc::new(MemoryConfigStore::default());
+    *reopened.objects.lock().await = store.objects.lock().await.clone();
+    *reopened.revisions.lock().await = store.revisions.lock().await.clone();
+    *reopened.put_counts.lock().await = store.put_counts.lock().await.clone();
+    reopened
+}
+
+#[tokio::test]
+async fn abandoned_checkpoint_generation_is_reclaimed_after_an_inline_commit() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let main = memory_config_key(RUSTFS_META_BUCKET, &format!("{BUCKET_META_PREFIX}/{NAME}"));
+    let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+        .await
+        .expect("empty store");
+    let mut committed = empty_bucket_checkpoint();
+    committed
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("commit small checkpoint");
+
+    let before = layout(&store).await;
+    let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+        .await
+        .expect("inline revision");
+    store.fail_puts_from.lock().await.insert(main.clone(), before[&main].0 + 1);
+    seeded()
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect_err("interrupt the root commit after staging the large checkpoint");
+
+    let staged: Vec<_> = layout(&store)
+        .await
+        .into_keys()
+        .filter(|path| path.contains(".bin.pages/") && !before.contains_key(path))
+        .collect();
+    assert!(staged.len() > 1, "the interrupted commit must have written pages");
+    assert_eq!(
+        DataUsageCache::read_revisions(store.clone(), NAME)
+            .await
+            .expect("roots remain readable"),
+        revisions
+    );
+
+    // Preserve durable objects while dropping the interrupted writer's receipts.
+    let store = reopen_checkpoint_store(&store).await;
+    store.fail_prefix_deletes.store(true, Ordering::Relaxed);
+    committed.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 1,
+            size: 17,
+            ..Default::default()
+        },
+    );
+    committed
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("publish the different inline checkpoint despite interrupted cleanup");
+    let interrupted_cleanup = layout(&store).await;
+    assert!(staged.iter().all(|path| interrupted_cleanup.contains_key(path)));
+
+    // A second restart leaves only the new root's durable cleanup record.
+    let restarted = reopen_checkpoint_store(&store).await;
+    let mut restored = DataUsageCache::default();
+    let revisions = restored
+        .load_with_revisions(restarted.clone(), NAME)
+        .await
+        .expect("restore the committed inline checkpoint");
+    assert_eq!(restored.checked_flatten("bucket").expect("inline totals").size, 17);
+    restored
+        .save_with_revisions_for_epoch(restarted.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("reclaim the abandoned generation after restart");
+    let after = layout(&restarted).await;
+    assert!(staged.iter().all(|path| !after.contains_key(path)), "abandoned pages leaked");
+    restored.load(restarted, NAME).await.expect("load after reclaim");
+    assert_eq!(restored.checked_flatten("bucket").expect("retained inline totals").size, 17);
+}
+
 enum BackupDamage {
     Missing,
     Corrupt,
@@ -60,7 +141,7 @@ async fn survives_lost_primary_after_backup_page_damage(damage: BackupDamage) {
         .await
         .expect("empty heads");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &first, 0, CancellationToken::new())
         .await
         .expect("initial checkpoint");
     let modify_tail = |cache: &mut DataUsageCache| {
@@ -73,7 +154,7 @@ async fn survives_lost_primary_after_backup_page_damage(damage: BackupDamage) {
         .await
         .expect("empty control store");
     target
-        .save_with_revisions_for_epoch(control.clone(), NAME, &empty, 0)
+        .save_with_revisions_for_epoch(control.clone(), NAME, &empty, 0, CancellationToken::new())
         .await
         .expect("encode target in an independent fresh bundle");
     {
@@ -105,7 +186,7 @@ async fn survives_lost_primary_after_backup_page_damage(damage: BackupDamage) {
         .expect("primary remains healthy");
     modify_tail(&mut from_main);
     from_main
-        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("incremental commit while primary is healthy");
     let main = memory_config_key(RUSTFS_META_BUCKET, &format!("{BUCKET_META_PREFIX}/{NAME}"));
@@ -142,7 +223,7 @@ async fn unreclaimed_partial_generation_bounds_staging_and_can_retry() {
         .await
         .expect("empty store");
     cache
-        .save_with_revisions_for_epoch(store.clone(), NAME, &empty, 0)
+        .save_with_revisions_for_epoch(store.clone(), NAME, &empty, 0, CancellationToken::new())
         .await
         .expect("committed predecessor");
     store.fail_prefix_deletes.store(true, Ordering::Relaxed);
@@ -158,12 +239,15 @@ async fn unreclaimed_partial_generation_bounds_staging_and_can_retry() {
             .await
             .expect("current heads");
         let before = layout(&store).await;
-        if let Err(error) = cache.save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0).await {
+        if let Err(error) = cache
+            .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+            .await
+        {
             assert!(error.to_string().contains("reclaim"), "unexpected save failure: {error}");
             assert_eq!(before, layout(&store).await, "a blocked retirement must not stage further objects");
             assert!(
                 cache
-                    .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+                    .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
                     .await
                     .is_err()
             );
@@ -177,7 +261,7 @@ async fn unreclaimed_partial_generation_bounds_staging_and_can_retry() {
             assert!(previous.checked_flatten("bucket").is_some());
             store.fail_prefix_deletes.store(false, Ordering::Relaxed);
             cache
-                .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0)
+                .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
                 .await
                 .expect("save after previous retirement is reclaimed");
             previous.load(store.clone(), NAME).await.expect("read latest checkpoint");

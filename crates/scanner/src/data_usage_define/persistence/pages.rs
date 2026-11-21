@@ -18,6 +18,7 @@ const FANOUT: usize = 128;
 const IO_CONCURRENCY: usize = 4;
 const PREFIX: &[u8] = b"\x83\xa7pagesV1";
 type Digest = [u8; 32];
+pub(super) type RetiredBundles = [Option<uuid::Uuid>; 2];
 
 /// Older readers see the committed compact bucket or an incomplete empty tree.
 #[derive(Deserialize)]
@@ -33,6 +34,8 @@ struct PageEnvelope {
 struct Header {
     body: Payload,
     retired: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abandoned: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +50,22 @@ impl Header {
             Payload::Pages(manifest) => Some(manifest),
             Payload::Inline => None,
         }
+    }
+
+    fn retired_bundles(&self) -> RetiredBundles {
+        [self.retired, self.abandoned]
+    }
+
+    fn is_valid(&self) -> bool {
+        let live = self.manifest().map(|manifest| manifest.bundle);
+        self.manifest()
+            .is_none_or(|manifest| !manifest.bundle.is_nil() && manifest.length != 0 && manifest.level <= 9)
+            && (self.abandoned.is_none() || self.abandoned != self.retired)
+            && self
+                .retired_bundles()
+                .into_iter()
+                .flatten()
+                .all(|id| !id.is_nil() && Some(id) != live)
     }
 }
 
@@ -86,9 +105,13 @@ fn digest(data: &[u8]) -> Digest {
     Sha256::digest(data).into()
 }
 
+fn bundle_prefix(name: &str, bundle: uuid::Uuid) -> String {
+    format!("{BUCKET_META_PREFIX}/{name}.pages/{bundle}/")
+}
+
 fn block_path(name: &str, bundle: uuid::Uuid, block: &Digest) -> String {
     let hash = hex_simd::encode_to_string(block, hex_simd::AsciiCase::Lower);
-    format!("{BUCKET_META_PREFIX}/{name}.pages/{bundle}/{hash}")
+    format!("{}{hash}", bundle_prefix(name, bundle))
 }
 
 fn bucket_cache_name(name: &str) -> Option<&str> {
@@ -253,12 +276,7 @@ pub(super) fn is_manifest(bytes: &[u8]) -> bool {
 
 fn read_envelope(bytes: &[u8], bucket: &str) -> StorageResult<PageEnvelope> {
     let head: PageEnvelope = rmp_serde::from_slice(bytes).map_err(|_| invalid("invalid scanner checkpoint manifest"))?;
-    if head.info.name != bucket
-        || head.header.retired.is_some_and(|id| id.is_nil())
-        || head.header.manifest().is_some_and(|manifest| {
-            manifest.bundle.is_nil() || manifest.length == 0 || manifest.level > 9 || head.header.retired == Some(manifest.bundle)
-        })
-    {
+    if head.info.name != bucket || !head.header.is_valid() {
         return Err(invalid("invalid scanner checkpoint identity or size"));
     }
     Ok(head)
@@ -396,12 +414,7 @@ async fn previous_header<S: ScannerObjectIO>(
     let mut deserializer = rmp_serde::Deserializer::new(&prefix[PREFIX.len()..]);
     // A damaged old header cannot participate in reuse or reclamation.
     // Rebuilding uses the CAS revision obtained by the normal loader.
-    Ok(Header::deserialize(&mut deserializer).ok().filter(|header| {
-        header.retired.is_none_or(|id| !id.is_nil())
-            && header
-                .manifest()
-                .is_none_or(|m| !m.bundle.is_nil() && m.length != 0 && m.level <= 9 && header.retired != Some(m.bundle))
-    }))
+    Ok(Header::deserialize(&mut deserializer).ok().filter(Header::is_valid))
 }
 
 fn build_bundle(name: &str, revision: &DataUsageCacheRevision, cache: &DataUsageCache) -> uuid::Uuid {
@@ -435,58 +448,95 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
     encoded: &EncodedPages,
     epoch: u64,
     damaged: bool,
-) -> StorageResult<(Bytes, Option<uuid::Uuid>)> {
+) -> StorageResult<(Bytes, RetiredBundles)> {
     let previous_header = previous_header(store.clone(), name, revision).await?;
     let previous = previous_header.as_ref().and_then(Header::manifest);
-    let mut retired = previous_header.as_ref().and_then(|header| header.retired);
-    if let Some(id) = retired
-        && reclaim(store.clone(), name, id, epoch).await.is_ok()
-    {
-        retired = None;
+    let [mut retired, mut abandoned] = previous_header.as_ref().map_or([None, None], Header::retired_bundles);
+    for pending in [&mut retired, &mut abandoned] {
+        if let Some(id) = *pending
+            && reclaim(store.clone(), name, id, epoch).await.is_ok()
+        {
+            *pending = None;
+        }
     }
-    // Each root has its own page namespace and can retire independently of
-    // the other copy after a successful conditional commit.
-    let allow_rotation = retired.is_none();
-    if let Some(inline) = &encoded.inline
-        && (previous.is_none() || allow_rotation)
-    {
-        retired = retired.or_else(|| previous.map(|head| head.bundle));
-        let bytes = if retired.is_some() {
-            rmp_serde::to_vec_named(&CompatibilityEnvelope {
-                header: &Header {
-                    body: Payload::Inline,
-                    retired,
-                },
-                info: &cache.info,
-                cache: &cache.cache,
-            })
-            .map_err(|_| invalid("failed to encode inline scanner checkpoint"))?
-        } else {
-            return Ok((inline.clone(), None));
-        };
-        return Ok((Bytes::from(bytes), retired));
-    }
+
+    // A marker lives beside a new bundle's pages and commits before any of
+    // them. We can rediscover that bundle even if the writer never committed
+    // its manifest or retained its in-memory write receipts.
+    let candidate = build_bundle(name, revision, cache);
+    let marker = format!("{}staging", bundle_prefix(name, candidate));
+    let has_marker = match read_config_revision(store.clone(), &marker).await {
+        Ok(revision) => revision != DataUsageCacheRevision::Missing,
+        Err(error) if unreadable_page(&error) => true,
+        Err(error) => return Err(error),
+    };
+    let allow_rotation = retired.is_none() && abandoned.is_none();
+    let inline = encoded.inline.as_ref().filter(|_| previous.is_none() || allow_rotation);
     let live_bytes = save::block_bytes(encoded.archive.blocks.values());
     let reuse = match previous {
-        Some(head) if !damaged && !(head.finished && head.cycle != cache.info.next_cycle) => {
+        Some(head) if inline.is_none() && !damaged && !(head.finished && head.cycle != cache.info.next_cycle) => {
             save::reuse(store.clone(), name, head, &encoded.archive, live_bytes).await?
         }
         _ => None,
     };
+    if (inline.is_some() || reuse.is_some()) && has_marker && previous.is_none_or(|head| head.bundle != candidate) {
+        if abandoned.is_some_and(|pending| pending != candidate) {
+            return Err(Error::other(
+                "cannot abandon scanner checkpoint before reclaiming its previous staging bundle",
+            ));
+        }
+        abandoned = Some(candidate);
+    }
+
+    if let Some(inline) = inline {
+        retired = retired.or_else(|| previous.map(|head| head.bundle));
+        let header = Header {
+            body: Payload::Inline,
+            retired,
+            abandoned,
+        };
+        let cleanup = header.retired_bundles();
+        if cleanup == [None, None] {
+            return Ok((inline.clone(), cleanup));
+        }
+        let bytes = rmp_serde::to_vec_named(&CompatibilityEnvelope {
+            header: &header,
+            info: &cache.info,
+            cache: &cache.cache,
+        })
+        .map_err(|_| invalid("failed to encode inline scanner checkpoint"))?;
+        return Ok((Bytes::from(bytes), cleanup));
+    }
+
     let verify_backup = name.ends_with(".bkp");
     let (bundle, known, bundle_bytes, bundle_commits) = if let Some((head, known, total)) = reuse {
         (head.bundle, known, total, head.bundle_commits + 1)
     } else {
-        if let Some(head) = previous {
-            if !allow_rotation {
-                // Keep both readable generations and their cleanup obligation.
-                // Further staging into either bundle would defeat the space bound.
-                return Err(Error::other("cannot rotate scanner checkpoint before reclaiming its retired bundle"));
-            }
-            retired = Some(head.bundle);
+        if !allow_rotation {
+            // Keep the readable generations and their cleanup obligations.
+            return Err(Error::other("cannot rotate scanner checkpoint before reclaiming its retired bundle"));
         }
-        (build_bundle(name, revision, cache), HashSet::new(), live_bytes, 1)
+        retired = previous.map(|head| head.bundle);
+        (candidate, HashSet::new(), live_bytes, 1)
     };
+    let reserve_candidate = || async {
+        if !has_marker {
+            DataUsageCache::save_path_with_retry(
+                store.clone(),
+                &marker,
+                &Bytes::from_static(b"scanner checkpoint staging"),
+                DataUsageCache::cache_save_timeout(),
+                DATA_USAGE_CACHE_SAVE_RETRIES,
+                Some(DataUsageCacheRevision::Missing),
+                Some(epoch),
+            )
+            .await?;
+        }
+        Ok::<(), StorageError>(())
+    };
+    if bundle == candidate {
+        reserve_candidate().await?;
+    }
     let mut manifest = encoded.root.clone();
     manifest.bundle = bundle;
     manifest.finished = cache.info.snapshot_complete;
@@ -502,7 +552,9 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
             return Err(error);
         }
         retired = Some(manifest.bundle);
-        manifest.bundle = build_bundle(name, revision, cache);
+        abandoned = None;
+        manifest.bundle = candidate;
+        reserve_candidate().await?;
         manifest.bundle_bytes = live_bytes;
         manifest.bundle_commits = 1;
         save::stage(store.clone(), name, revision, epoch, &manifest, &encoded.archive, &HashSet::new()).await?;
@@ -510,7 +562,9 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
     let header = Header {
         body: Payload::Pages(manifest),
         retired,
+        abandoned,
     };
+    let cleanup = header.retired_bundles();
     let projection = |info: &DataUsageCacheInfo, cache: &BTreeMap<String, DataUsageEntry>| {
         rmp_serde::to_vec_named(&CompatibilityEnvelope {
             header: &header,
@@ -529,7 +583,7 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         root.compacted = true;
         let bytes = projection(&cache.info, &BTreeMap::from([(cache.info.name.clone(), root)]))?;
         if bytes.len() <= PAGE_MIN {
-            return Ok((Bytes::from(bytes), retired));
+            return Ok((Bytes::from(bytes), cleanup));
         }
     }
     let info = DataUsageCacheInfo {
@@ -541,7 +595,7 @@ pub(super) async fn prepare<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         ..Default::default()
     };
     let bytes = projection(&info, &BTreeMap::new())?;
-    Ok((Bytes::from(bytes), retired))
+    Ok((Bytes::from(bytes), cleanup))
 }
 
 #[derive(Serialize)]
@@ -552,7 +606,20 @@ struct CompatibilityEnvelope<'a, T> {
     cache: &'a T,
 }
 
-pub(super) async fn reclaim<S: ScannerObjectIO + ScannerConfigObjectDelete>(
+pub(super) async fn reclaim_retired<S: ScannerObjectIO + ScannerConfigObjectDelete>(
+    store: Arc<S>,
+    name: &str,
+    bundles: RetiredBundles,
+    epoch: Option<u64>,
+) {
+    if let Some(epoch) = epoch {
+        for bundle in bundles.into_iter().flatten() {
+            let _ = reclaim(store.clone(), name, bundle, epoch).await;
+        }
+    }
+}
+
+async fn reclaim<S: ScannerObjectIO + ScannerConfigObjectDelete>(
     store: Arc<S>,
     name: &str,
     bundle: uuid::Uuid,
@@ -561,7 +628,7 @@ pub(super) async fn reclaim<S: ScannerObjectIO + ScannerConfigObjectDelete>(
     let _admission = scanner_publication_admission_for_epoch(store.clone(), epoch)
         .await
         .ok_or_else(cache_publication_epoch_changed)?;
-    let prefix = format!("{BUCKET_META_PREFIX}/{name}.pages/{bundle}/");
+    let prefix = bundle_prefix(name, bundle);
     let opts = ObjectOptions {
         delete_prefix: true,
         ..Default::default()
