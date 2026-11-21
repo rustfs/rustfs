@@ -26,6 +26,28 @@ impl FileMeta {
         Ok(xl)
     }
 
+    /// Parses and validates the `xl.meta` envelope (including `InlineData::validate_slice`),
+    /// returning the decoded version headers/metadata and the borrowed `inline_buf` slice
+    /// without eagerly copying `inline_buf` into `self.data`.
+    pub fn load_with_borrowed_inline_data(buf: &[u8]) -> Result<(FileMeta, &[u8])> {
+        let mut xl = FileMeta::default();
+        let (meta, inline_buf) = Self::parse_validated_xl_envelope(buf)?;
+        if !meta.is_empty() {
+            let (versions_len, header_ver, meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
+            xl.meta_ver = meta_ver;
+            xl.versions = Vec::with_capacity(versions_len);
+            let mut cur: Cursor<&[u8]> = Cursor::new(meta);
+            for _ in 0..versions_len {
+                let (header, ver_meta) = Self::read_next_shallow_slice(meta, &mut cur, header_ver)?;
+                xl.versions.push(FileMetaShallowVersion {
+                    header,
+                    meta: ver_meta.to_vec(),
+                });
+            }
+        }
+        Ok((xl, inline_buf))
+    }
+
     /// Read (major, minor, header_ver, meta_ver) from xl.meta without full parse.
     /// Returns Err if format is not feat (e.g. legacy  uses rmp_serde in meta block).
     pub fn read_format_versions(buf: &[u8]) -> Result<(u16, u16, u8, u8)> {
@@ -256,29 +278,11 @@ impl FileMeta {
     #[hotpath::measure(impl_type = "FileMeta")]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let i = buf.len() as u64;
-        let (meta, inline_buf) = Self::parse_validated_xl_envelope(buf)?;
-
+        let (mut loaded, inline_buf) = Self::load_with_borrowed_inline_data(buf)?;
         if !inline_buf.is_empty() {
-            self.data.update(inline_buf);
+            loaded.data.update(inline_buf);
         }
-
-        // Parse meta
-        if !meta.is_empty() {
-            let (versions_len, header_ver, meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
-
-            self.meta_ver = meta_ver;
-            self.versions = Vec::with_capacity(versions_len);
-
-            let mut cur: Cursor<&[u8]> = Cursor::new(meta);
-            for _ in 0..versions_len {
-                let (header, ver_meta) = Self::read_next_shallow_slice(meta, &mut cur, header_ver)?;
-                self.versions.push(FileMetaShallowVersion {
-                    header,
-                    meta: ver_meta.to_vec(),
-                });
-            }
-        }
-
+        *self = loaded;
         Ok(i)
     }
 

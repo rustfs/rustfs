@@ -534,7 +534,7 @@ impl SetDisks {
             };
         let mut fast_receipt_quorum = false;
         if can_try_local_fast_path && can_commit() {
-            let fast_published = join_all(disks.iter().map(|disk| async {
+            let mut fast_published = join_all(disks.iter().map(|disk| async {
                 if !can_commit() {
                     return Err(DiskError::other("delete recovery namespace fence was lost"));
                 }
@@ -558,13 +558,17 @@ impl SetDisks {
                 return Ok(());
             }
             let all_fast_published = fast_published.len() == self.set_drive_count
-                && fast_published.iter().all(|res| matches!(res, Ok(Some((_, true, true)))));
+                && fast_published.iter().all(|res| matches!(res, Ok(Some((_, true, true, _)))));
             if all_fast_published && can_commit() {
                 #[cfg(test)]
                 test_hooks::record_cleanup_attempt(bucket, object);
-                let finalized = join_all(disks.iter().zip(fast_published.iter()).map(|(disk, pub_res)| {
+                let finalized = join_all(disks.iter().zip(fast_published.iter_mut()).map(|(disk, pub_res)| {
                     let ns_owner = context.namespace_owner.clone();
                     let work_budget = context.work_budget.clone();
+                    let published_input = match pub_res {
+                        Ok(Some((journal, _, _, state))) => Some((&*journal, state.take())),
+                        _ => None,
+                    };
                     async move {
                         if !can_commit() {
                             return Ok(false);
@@ -572,7 +576,7 @@ impl SetDisks {
                         let Some(disk) = disk.as_ref() else {
                             return Ok(false);
                         };
-                        let Ok(Some((journal, _, _))) = pub_res else {
+                        let Some((journal, state)) = published_input else {
                             return Ok(false);
                         };
                         disk.try_finish_and_finalize_prepared_delete_local(
@@ -582,6 +586,7 @@ impl SetDisks {
                             journal,
                             ns_owner,
                             work_budget,
+                            state,
                         )
                         .await
                     }
@@ -600,6 +605,9 @@ impl SetDisks {
                     return Ok(());
                 }
             }
+            // Flush any unconsumed Stage 2 receipt entries into `PUBLISHED_DELETE_RECEIPTS`
+            // (via `LocalPublishedDeleteState::drop`) before falling back to `inspect`.
+            drop(fast_published);
         }
         let states = inspect(disks, bucket, object, transaction, context.work_budget.as_deref()).await;
         if states
