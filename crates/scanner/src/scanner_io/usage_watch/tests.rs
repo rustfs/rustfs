@@ -168,8 +168,8 @@ fn watch_structure_ignores_unrelated_dirty_generations_but_requires_every_owner(
     unrelated.insert("peer".into(), crate::scanner::scanner_node_activity_for_tests("remote", 103, 104, false));
     assert_eq!(original, watch_structure_digest(&unrelated, &routes).unwrap());
     assert_ne!(
-        crate::scanner::scanner_activity_coverage_digest(&before),
-        crate::scanner::scanner_activity_coverage_digest(&unrelated)
+        crate::scanner::scanner_activity_coverage_digest(&before, LOCAL_SCANNER_ACTIVITY_NODE),
+        crate::scanner::scanner_activity_coverage_digest(&unrelated, LOCAL_SCANNER_ACTIVITY_NODE)
     );
     unrelated.remove("peer");
     assert!(watch_structure_digest(&unrelated, &routes).is_none());

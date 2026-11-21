@@ -4638,10 +4638,11 @@ impl SetDisks {
                 write_quorum,
             };
             let resource_unit = resource_unit.clone();
-            tasks.spawn(crate::disk::with_optional_resource_unit(resource_unit, async move {
+            let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
                 let outcome = Self::run_unary_rename_slot(context).await;
                 let _ = outcome_tx.send(outcome).await;
-            }));
+            });
+            tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
         }
         for group in fanout_plan.batch_groups {
             let outcome_tx = outcome_tx.clone();
@@ -4652,7 +4653,7 @@ impl SetDisks {
             let group_disks = disks.clone();
             let group_tokens = fence_tokens.clone();
             let resource_unit = resource_unit.clone();
-            tasks.spawn(crate::disk::with_optional_resource_unit(resource_unit, async move {
+            let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
                 let prepared = join_all(group.slots.into_iter().map(|slot| {
                     let context = RenameSlotContext {
                         slot,
@@ -4815,7 +4816,8 @@ impl SetDisks {
                         }
                     }
                 }
-            }));
+            });
+            tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
         }
         drop(outcome_tx);
         RenameOutcomeProducers {
@@ -4870,7 +4872,7 @@ impl SetDisks {
 
         let coordinator_failure_receipt = rollback_receipt.clone();
         let early_ack_spawn_to_quorum_wait_started = rustfs_io_metrics::put_stage_timer();
-        let tail_drain = tokio::spawn({
+        let tail_drain = tokio::spawn(crate::disk::with_detached_disk_io_context({
             let fanout_src_bucket = src_bucket.clone();
             let fanout_src_object = src_object.clone();
             let fanout_dst_bucket = dst_bucket.clone();
@@ -5124,7 +5126,7 @@ impl SetDisks {
                     all_online_local_succeeded,
                 })
             }
-        });
+        }));
 
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_SPAWN_TO_QUORUM_WAIT,
@@ -5305,6 +5307,7 @@ impl SetDisks {
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
         };
+        let fanout_future = crate::disk::with_detached_disk_io_context(fanout_future);
         let fanout = if protected_multipart {
             tokio::spawn(crate::disk::with_optional_resource_unit(
                 crate::disk::current_resource_unit(),

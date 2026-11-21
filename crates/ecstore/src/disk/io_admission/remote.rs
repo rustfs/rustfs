@@ -140,6 +140,28 @@ pub(crate) fn admit(binding: &PhysicalDiskBinding) -> io::Result<()> {
         .unwrap_or(Ok(()))
 }
 
+/// Wait only at the namespace RPC entry, before storage locks or native I/O.
+/// The caller owns the deadline; dropping this future releases its queue turn.
+pub(crate) async fn admit_scanner_preflight(binding: &PhysicalDiskBinding) -> io::Result<()> {
+    let node = REMOTE_RESOURCES
+        .try_with(|context| context.admitted.borrow().is_none().then(|| context.node.clone()))
+        .ok()
+        .flatten();
+    let Some(node) = node else {
+        return admit(binding);
+    };
+    let deferred = || io::Error::from(io::ErrorKind::WouldBlock);
+    let plan = binding.plan().ok_or_else(deferred)?;
+    let permit = plan.acquire(&node).await.ok_or_else(deferred)?;
+    REMOTE_RESOURCES.with(|context| {
+        let mut admitted = context.admitted.borrow_mut();
+        if admitted.is_none() {
+            *admitted = Some(permit);
+        }
+    });
+    admit(binding)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +182,76 @@ mod tests {
             }),
         );
         node
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_preflight_cancellation_and_timeout_release_queued_capacity() {
+        let node = node();
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![gate.clone()]).expect("device plan");
+        for deadline in [false, true] {
+            let held = gate.try_acquire().expect("concurrent disk operation");
+            with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+                let mut wait = Box::pin(admit_scanner_preflight(&binding));
+                assert!(futures_util::poll!(&mut wait).is_pending());
+                assert_eq!(node.snapshot().active, 0, "queued disk work cannot reserve node capacity");
+                if deadline {
+                    assert!(tokio::time::timeout(std::time::Duration::from_secs(1), wait).await.is_err());
+                } else {
+                    drop(wait);
+                }
+                drop(held);
+                admit(&binding).expect("cancelled queue turn cannot block the immediate path");
+            })
+            .await;
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+            assert_eq!([node.completed(), gate.completed()], [Some(0), Some(0)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn scanner_preflight_rejects_a_plan_replaced_while_waiting() {
+        let node = node();
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![gate.clone()]).expect("old plan");
+        let held = gate.try_acquire().expect("busy disk");
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            let wait = admit_scanner_preflight(&binding);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            binding
+                .set_test_capacity(vec![AdaptiveAdmission::new(NonZeroU16::MIN, 1)])
+                .expect("new plan");
+            drop(held);
+            assert_eq!(wait.await.expect_err("old plan is invalid").kind(), io::ErrorKind::WouldBlock);
+            assert!(resources().is_none());
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+        assert_eq!(node.completed(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn scanner_preflight_never_waits_for_additional_devices_under_existing_admission() {
+        let node = node();
+        let first = PhysicalDiskBinding::default();
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        first.set_test_capacity(vec![gate.clone()]).expect("first plan");
+        let other = PhysicalDiskBinding::default();
+        other
+            .set_test_capacity(vec![AdaptiveAdmission::new(NonZeroU16::MIN, 0)])
+            .expect("closed plan");
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            admit(&first).expect("existing request admission");
+            let other = admit_scanner_preflight(&other);
+            tokio::pin!(other);
+            assert!(matches!(futures_util::poll!(other), std::task::Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [1, 1]);
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
     }
 
     #[tokio::test]
