@@ -398,6 +398,14 @@ impl NotificationSystem {
         self.services.config_manager.lifecycle().is_converged()
     }
 
+    /// Returns whether a lifecycle generation has been handed to the runtime.
+    /// A published generation serves admin operations even when some targets
+    /// are quarantined; per-target health is reported by the target list.
+    pub fn runtime_lifecycle_is_published(&self) -> bool {
+        self.runtime_lifecycle_is_converged()
+            || matches!(self.runtime_lifecycle_state(), NotificationRuntimeState::TargetsEnabled { .. })
+    }
+
     /// Validates a bucket notification configuration against the runtime targets
     /// without publishing it, so callers can reject a request before persisting.
     pub async fn validate_bucket_notification_config(

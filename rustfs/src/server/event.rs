@@ -167,8 +167,12 @@ fn ensure_live_events_initialized() -> std::sync::Arc<NotificationSystem> {
     system
 }
 
+/// A published lifecycle generation is usable even when some targets are
+/// quarantined: healthy targets already carry events and per-target health is
+/// reported by the admin target list. Only an unpublished generation means the
+/// runtime is not available yet.
 fn ensure_event_notifier_converged(system: &NotificationSystem) -> Result<(), NotificationError> {
-    if system.runtime_lifecycle_is_converged() {
+    if system.runtime_lifecycle_is_published() {
         Ok(())
     } else {
         Err(NotificationError::Initialization(

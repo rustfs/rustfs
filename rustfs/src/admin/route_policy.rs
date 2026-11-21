@@ -307,6 +307,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Delete,
+        "/rustfs/admin/v3/target/{target_type}/{target_name}",
+        SET_BUCKET_TARGET,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
         "/rustfs/admin/v3/target/{target_type}/{target_name}/reset",
         SET_BUCKET_TARGET,
         RouteRiskLevel::High,

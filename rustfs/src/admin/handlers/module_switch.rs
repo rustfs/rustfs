@@ -174,7 +174,7 @@ async fn apply_module_switch_update(context: Arc<AppContext>, switches: Persiste
             notify_converged = false;
             failures.push("local notify config cache");
         }
-        if notify_converged && notification_system.runtime_lifecycle_is_converged() {
+        if notify_converged && notification_system.runtime_lifecycle_is_published() {
             mark_event_notifier_reconciled();
         } else if notify_converged {
             failures.push("local notify convergence");

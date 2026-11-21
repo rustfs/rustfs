@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 type CurrentGeneration = Arc<dyn Fn() -> bool + Send + Sync>;
 type CommitGeneration = Box<dyn FnOnce(bool) + Send>;
@@ -238,11 +238,18 @@ impl LifecycleRuntime for DefaultLifecycleRuntime {
             close_old?;
             close_rejected?;
             close_activation_rejected?;
+            // A target that cannot activate is quarantined and reported by the
+            // admin target list. Failing the whole generation here would leave
+            // the lifecycle permanently unconverged and block every admin call.
             if !activation_failures.is_empty() {
-                return Err(NotificationError::Initialization(format!(
-                    "one or more notification targets failed to activate: {}",
-                    activation_failures.join("; ")
-                )));
+                warn!(
+                    event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "degraded",
+                    failures = %activation_failures.join("; "),
+                    "one or more notification targets failed to activate"
+                );
             }
             Ok(())
         })))
@@ -979,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_activation_reports_error_and_same_config_can_retry() {
+    async fn partial_activation_quarantines_failed_target_and_same_config_can_retry() {
         // The template's single-failure init budget is shared by every clone the factory hands
         // out, so the "bad" instance fails once in the first generation and recovers on retry.
         let bad_template = MockTarget::new("bad", RETRY_INIT_TARGET_TYPE).with_init_failures(1);
@@ -1006,11 +1013,13 @@ mod tests {
             .insert("bad".to_string(), bad);
         let (coordinator, runtime_view, _) = real_runtime(config.clone(), Arc::new(TargetRegistry::with_plugins(plugins)), None);
 
+        // A quarantined target is a per-target health outcome, so the mutation
+        // itself succeeds and admin callers are not locked out.
         coordinator
             .set_mode(true, Some(config.clone()))
             .wait()
             .await
-            .expect_err("the originating transition must report the failed target");
+            .expect("a quarantined target must not fail the lifecycle transition");
         let partial = runtime_view.runtime_status_snapshot().await;
         assert_eq!(partial.target_count, 1, "the healthy target should remain fault-isolated and active");
         assert!(!coordinator.is_converged(), "a partial generation must remain retryable");

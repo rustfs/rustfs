@@ -212,6 +212,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/idp/builtin/policy-entities"),
         admin_route(Method::GET, "/v3/target/list"),
         admin_route_sample(Method::PUT, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
+        admin_route_sample(Method::DELETE, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
         admin_route_sample(
             Method::DELETE,
             "/v3/target/{target_type}/{target_name}/reset",
