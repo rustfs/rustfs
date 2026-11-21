@@ -25,7 +25,7 @@ where
     /// fences and validate ordinary artifact hashes and metadata separately.
     /// Recovery classification is shared with the normal commit-recovery API;
     /// this check never finalizes a log, repairs an index, or changes a pointer.
-    pub(super) fn validate_backup_commit_recovery(
+    pub(in crate::table_catalog) fn validate_backup_commit_recovery(
         &self,
         table_bucket: &str,
         objects: &[ObjectCatalogBackupObject],

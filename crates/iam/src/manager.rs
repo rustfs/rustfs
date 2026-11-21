@@ -665,6 +665,51 @@ where
         self.list_policies(bucket_name).await
     }
 
+    /// Resolve every applicable mapping, including group cache misses when the user
+    /// already has a direct policy. A failed read cannot become an implicit denial.
+    pub(crate) async fn policy_db_get_checked(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        if let Some(groups) = groups {
+            for group in groups {
+                match self.policy_db_get_internal(group, true, false).await {
+                    Ok((group_policies, _)) => policies.extend(group_policies),
+                    Err(error) if is_err_no_such_group(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        policies.sort_unstable();
+        policies.dedup();
+        Ok(policies)
+    }
+
+    /// Resolve all named documents or return the original read/validation error.
+    pub(crate) async fn merge_policies_checked(&self, names: &[String]) -> Result<Policy> {
+        let documents = Arc::clone(&self.cache.snapshot().policy_docs);
+        let mut loaded = HashMap::new();
+        let mut policies = Vec::with_capacity(names.len());
+        for name in names {
+            if name.is_empty() {
+                return Err(Error::InvalidArgument);
+            }
+            let document = match documents.get(name) {
+                Some(document) => document.clone(),
+                None => {
+                    self.api.load_policy_doc(name, &mut loaded).await?;
+                    loaded.get(name).cloned().ok_or(Error::NoSuchPolicy)?
+                }
+            };
+            document.policy.validate()?;
+            policies.push(document.policy);
+        }
+        // Loaded documents belong to this evaluation. A policy update published
+        // while storage reads were pending must remain authoritative in the cache.
+        Ok(Policy::merge_policies(policies))
+    }
+
     pub async fn merge_policies(&self, name: &str) -> (String, Policy) {
         let mut policies = Vec::new();
         let mut to_merge = Vec::new();

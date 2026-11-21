@@ -59,6 +59,42 @@ pub(crate) fn reject_abort_capabilities(envelope: &RequestEnvelope) -> S3Result<
 }
 
 impl DefaultMultipartUsecase {
+    pub(crate) async fn abort_multipart_with_origin(
+        &self,
+        envelope: RequestEnvelope,
+        target: AbortMultipartUploadTarget,
+        origin: MultipartOrigin,
+    ) -> S3Result<()> {
+        if !origin.is_managed() {
+            reject_abort_capabilities(&envelope)?;
+        }
+        rustfs_io_metrics::record_s3_op(S3Operation::AbortMultipartUpload);
+        let (bucket, key) = target.resource();
+        let mut opts = ObjectOptions::default();
+        origin.apply_bucket_guard(&envelope, bucket, &mut opts)?;
+        if !origin.is_managed() {
+            reject_veeam_sosapi_mutation(|| self.object_store(), bucket, key).await?;
+        }
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
+        };
+        match &target {
+            AbortMultipartUploadTarget::Legacy { upload_id, .. } => store
+                .abort_multipart_upload(bucket, key, upload_id, &opts)
+                .await
+                .map_err(multipart_upload_api_error)?,
+            AbortMultipartUploadTarget::Gateway { bucket, key, upload_id } => {
+                abort_gateway(&store, bucket, key, upload_id, opts).await?
+            }
+        }
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            bucket,
+            key,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+        );
+        Ok(())
+    }
+
     #[instrument(level = "debug", skip(self, envelope, target))]
     pub(crate) async fn execute_abort_multipart_upload(
         &self,

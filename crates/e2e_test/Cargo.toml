@@ -26,6 +26,7 @@ workspace = true
 [features]
 default = []
 scanner-peer-mixed-version = []
+catalog-fault-worker = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

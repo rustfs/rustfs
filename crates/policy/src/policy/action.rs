@@ -183,6 +183,7 @@ impl<'de> Deserialize<'de> for ActionSet {
 pub enum Action {
     All,
     S3Action(S3Action),
+    S3VectorsAction(S3VectorsAction),
     AdminAction(AdminAction),
     StsAction(StsAction),
     KmsAction(KmsAction),
@@ -245,6 +246,7 @@ impl From<&Action> for &str {
         match value {
             Action::All => "*",
             Action::S3Action(s) => s.into(),
+            Action::S3VectorsAction(s) => s.into(),
             Action::AdminAction(s) => s.into(),
             Action::StsAction(s) => s.into(),
             Action::KmsAction(s) => s.into(),
@@ -255,6 +257,7 @@ impl From<&Action> for &str {
 
 impl Action {
     const S3_PREFIX: &'static str = "s3:";
+    const S3_VECTORS_PREFIX: &'static str = "s3vectors:";
     const ADMIN_PREFIX: &'static str = "admin:";
     const STS_PREFIX: &'static str = "sts:";
     const KMS_PREFIX: &'static str = "kms:";
@@ -269,6 +272,10 @@ impl TryFrom<&str> for Action {
         if value.starts_with(Self::S3_PREFIX) {
             Ok(Self::S3Action(
                 S3Action::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
+            ))
+        } else if value.starts_with(Self::S3_VECTORS_PREFIX) {
+            Ok(Self::S3VectorsAction(
+                S3VectorsAction::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
             ))
         } else if value.starts_with(Self::ADMIN_PREFIX) {
             Ok(Self::AdminAction(
@@ -286,6 +293,56 @@ impl TryFrom<&str> for Action {
             Err(IamError::InvalidAction(value.into()).into())
         }
     }
+}
+
+/// S3 Vectors actions from the fixed 2025-07-15 service model.
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
+#[serde(try_from = "&str", into = "&str")]
+pub enum S3VectorsAction {
+    #[strum(serialize = "s3vectors:*")]
+    AllActions,
+    #[strum(serialize = "s3vectors:CreateIndex")]
+    CreateIndexAction,
+    #[strum(serialize = "s3vectors:CreateVectorBucket")]
+    CreateVectorBucketAction,
+    #[strum(serialize = "s3vectors:DeleteIndex")]
+    DeleteIndexAction,
+    #[strum(serialize = "s3vectors:DeleteVectorBucket")]
+    DeleteVectorBucketAction,
+    #[strum(serialize = "s3vectors:DeleteVectorBucketPolicy")]
+    DeleteVectorBucketPolicyAction,
+    #[strum(serialize = "s3vectors:DeleteVectors")]
+    DeleteVectorsAction,
+    #[strum(serialize = "s3vectors:GetIndex")]
+    GetIndexAction,
+    #[strum(serialize = "s3vectors:GetVectorBucket")]
+    GetVectorBucketAction,
+    #[strum(serialize = "s3vectors:GetVectorBucketPolicy")]
+    GetVectorBucketPolicyAction,
+    #[strum(serialize = "s3vectors:GetVectors")]
+    GetVectorsAction,
+    #[strum(serialize = "s3vectors:ListIndexes")]
+    ListIndexesAction,
+    #[strum(serialize = "s3vectors:ListTagsForResource")]
+    ListTagsForResourceAction,
+    #[strum(serialize = "s3vectors:ListVectorBuckets")]
+    ListVectorBucketsAction,
+    #[strum(serialize = "s3vectors:ListVectors")]
+    ListVectorsAction,
+    #[strum(serialize = "s3vectors:PutVectorBucketDefaultIndexMode")]
+    PutVectorBucketDefaultIndexModeAction,
+    #[strum(serialize = "s3vectors:PutVectorBucketPolicy")]
+    PutVectorBucketPolicyAction,
+    #[strum(serialize = "s3vectors:PutVectors")]
+    PutVectorsAction,
+    #[strum(serialize = "s3vectors:QueryVectors")]
+    QueryVectorsAction,
+    #[strum(serialize = "s3vectors:TagResource")]
+    TagResourceAction,
+    #[strum(serialize = "s3vectors:UntagResource")]
+    UntagResourceAction,
+    #[strum(serialize = "s3vectors:UpdateIndexMode")]
+    UpdateIndexModeAction,
 }
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]

@@ -77,6 +77,7 @@ fn recovery_error_kind(error: &TableCatalogStoreError) -> &'static str {
         TableCatalogStoreError::Unavailable(_) => "unavailable",
         TableCatalogStoreError::LockUnavailable { .. } => "lock_unavailable",
         TableCatalogStoreError::Internal(_) => "internal",
+        TableCatalogStoreError::Io { .. } => "io",
     }
 }
 

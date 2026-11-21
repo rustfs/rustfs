@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::*;
+use crate::table_catalog::identifier::is_valid_table_metadata_file_name;
+use crate::table_catalog::*;
 
 pub(crate) fn insert_metadata_maintenance_reason(
     reasons_by_location: &mut BTreeMap<String, BTreeSet<TableMetadataMaintenanceReason>>,
@@ -496,29 +497,6 @@ fn mark_referenced_object_manual_review(
     }
 }
 
-pub(crate) fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
-    let object = if let Some(location) = location.strip_prefix("s3://") {
-        let (bucket, object) = location.split_once('/')?;
-        if bucket != table_bucket {
-            return None;
-        }
-        object
-    } else {
-        location
-    };
-
-    if object.is_empty()
-        || object.starts_with('/')
-        || object.contains("..")
-        || object.contains('\\')
-        || object.bytes().any(|byte| byte.is_ascii_control())
-    {
-        return None;
-    }
-
-    Some(object.to_string())
-}
-
 pub(crate) fn table_maintenance_object_kind(
     namespace: &Namespace,
     table: &IdentifierSegment,
@@ -913,4 +891,98 @@ pub(crate) fn mark_deleted_object_cleanup_reports(
                 .push(TableMetadataMaintenanceReason::DeletedByMaintenance);
         }
     }
+}
+
+pub(crate) async fn diagnose_table_catalog_from_export<B>(
+    backend: &B,
+    catalog: TableCatalogExport,
+    commit_recovery: TableCommitRecoveryReport,
+    retain_recent_metadata_files: usize,
+) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport>
+where
+    B: TableCatalogObjectBackend,
+{
+    let current_metadata_location =
+        table_catalog_object_key_from_location(&catalog.table.table_bucket, &catalog.table.metadata_location);
+    let backing_manifest = catalog.backing_manifest.clone();
+    let metadata_prefix = table_metadata_dir_path_for_entry(&catalog.table)
+        .ok()
+        .map(|directory| format!("{directory}/"));
+    let is_valid_location = |location: &str| {
+        metadata_prefix.as_ref().is_some_and(|prefix| {
+            location
+                .strip_prefix(prefix.as_str())
+                .is_some_and(is_valid_table_metadata_file_name)
+        })
+    };
+    let mut retained = BTreeSet::new();
+    let mut current_metadata_for_refs = None;
+    let current_metadata_status =
+        if let Some(current_metadata_location) = current_metadata_location.filter(|location| is_valid_location(location)) {
+            retained.insert(current_metadata_location.clone());
+            match read_table_metadata_value(backend, &catalog.table_bucket.table_bucket, &current_metadata_location).await {
+                Ok(Some(current_metadata)) => {
+                    retained.extend(metadata_log_locations_matching(
+                        &current_metadata,
+                        &catalog.table_bucket.table_bucket,
+                        is_valid_location,
+                    ));
+                    current_metadata_for_refs = Some(current_metadata);
+                    TableMetadataPointerStatus::Valid
+                }
+                Ok(None) => TableMetadataPointerStatus::MissingObject,
+                Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
+                Err(err) => return Err(err),
+            }
+        } else {
+            TableMetadataPointerStatus::InvalidLocation
+        };
+
+    let mut metadata_locations = Vec::new();
+    // A renamed or registered table can keep a metadata directory unrelated to its current name.
+    // If the pointer is invalid, no directory can safely be treated as owned by this table.
+    if let Some(metadata_prefix) = metadata_prefix.as_ref() {
+        for object in backend
+            .list_objects(&catalog.table_bucket.table_bucket, metadata_prefix)
+            .await?
+        {
+            if is_valid_location(&object) {
+                metadata_locations.push(object);
+            }
+        }
+    }
+    metadata_locations.sort();
+    metadata_locations.dedup();
+
+    for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
+        retained.insert(metadata_location.clone());
+    }
+    if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
+        retained.extend(
+            metadata_locations_for_protected_snapshot_refs_matching(
+                backend,
+                &catalog.table_bucket.table_bucket,
+                current_metadata,
+                &metadata_locations,
+                is_valid_location,
+            )
+            .await?,
+        );
+    }
+
+    let orphan_metadata_candidate_locations = metadata_locations
+        .into_iter()
+        .filter(|metadata_location| !retained.contains(metadata_location))
+        .collect();
+    let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+
+    Ok(TableCatalogDiagnosticsReport {
+        catalog,
+        current_metadata_status,
+        recovery_status,
+        recommended_actions,
+        commit_recovery,
+        backing_manifest,
+        orphan_metadata_candidate_locations,
+    })
 }

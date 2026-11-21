@@ -289,7 +289,6 @@ pub(crate) mod runtime_sources {
 pub(crate) mod access {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::PostObjectRequestMarker;
-    #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::requested_bucket_force_delete;
     pub(crate) use crate::storage::storage_api::access_consumer::{
@@ -1623,6 +1622,30 @@ pub(crate) mod admin_usecase {
     pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
 }
 
+pub(crate) mod managed {
+    pub(crate) use crate::storage::storage_api::managed::BUCKET_VECTOR_STORAGE_PREFIX;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::managed::ManagedTableId;
+    pub(crate) use crate::storage::storage_api::managed::delete_managed_bucket_with_preparation;
+    pub(crate) use crate::storage::storage_api::managed::{
+        AccountNamespaceId, BUCKET_TAGGING_CONFIG, BucketHandle, BucketIdentityError, BucketIncarnation,
+        BucketIncarnationFenceGuard, BucketKind, BucketMetadata, BucketPublicName, ConfigState, ManagedBucketConfigMutation,
+        ManagedObjectAccess, ManagedObjectOperation, StorageBucketId, acquire_bucket_incarnation_fence, get_bucket_metadata,
+        make_managed_bucket, mutate_managed_bucket_config, validate_bucket_incarnation_fence,
+    };
+}
+
+pub(crate) mod vector_usecase {
+    pub(crate) use super::access::ReqInfo;
+    pub(crate) use super::bucket::utils::serialize;
+    pub(crate) use super::helper::{OperationHelper, run_owned_mutation};
+    #[cfg(test)]
+    pub(crate) use super::request_context::RequestContext;
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::NamespaceLocking;
+    pub(crate) use crate::storage::storage_api::StorageError;
+}
+
 pub(crate) mod bucket_usecase {
     pub(crate) mod contract {
         pub(crate) mod bucket {
@@ -1688,7 +1711,6 @@ pub(crate) mod object_usecase {
     }
 
     pub(crate) mod contract {
-        #[cfg(test)]
         pub(crate) mod http {
             pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
         }
@@ -1837,6 +1859,7 @@ pub(crate) mod context {
 #[cfg(test)]
 pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
+    pub(crate) use crate::storage::storage_api::RUSTFS_META_BUCKET;
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{
@@ -1867,10 +1890,18 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
+    #[cfg(not(windows))]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::RUSTFS_META_MULTIPART_BUCKET;
     pub(crate) use crate::storage::storage_api::test_consumer::authorize_head_object;
+    #[cfg(not(windows))]
+    pub(crate) use crate::storage::storage_api::{
+        LocalPublicationPause, LocalPublicationStage, ReadOptions, StorageDiskRpcExt, all_local_disk_path, find_local_disk_by_ref,
+    };
     pub(crate) mod sse {
+        pub(crate) use crate::storage::storage_api::ecstore_object::{EncryptionResolutionError, EncryptionResolutionErrorKind};
         pub(crate) use crate::storage::storage_api::test_consumer::sse::{
-            RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+            KmsKeyAuthorizer, LocalSseDekProvider, RecordingKmsKeyAuthorizer, TestAuthorizationHooks,
+            kms_sse_dek_provider_for_test, reset_sse_dek_provider, set_sse_dek_provider_for_test, sse_kms_object_metadata,
         };
     }
     pub(crate) use super::{bucket, runtime};
@@ -1883,7 +1914,8 @@ pub(crate) mod test {
         DeleteAfterObjectLockSnapshotBarrier, get_global_bucket_metadata_sys, set_bucket_metadata,
     };
     pub(crate) use crate::storage::storage_api::{
-        ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
+        ECStore, Endpoint, Endpoints, InstanceContext, PoolEndpoints, StorageObjectInfo, StorageObjectOptions,
+        StoragePutObjReader,
     };
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{

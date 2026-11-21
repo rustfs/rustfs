@@ -440,6 +440,10 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         return Err(denial.deny(req, "reserved_bucket", action));
     }
 
+    if bucket.starts_with(crate::storage::storage_api::managed::BUCKET_VECTOR_STORAGE_PREFIX) {
+        return Err(denial.deny(req, "managed_bucket_requires_managed_access", action));
+    }
+
     let store = request_object_store(req)?;
 
     if let Some(cred) = &cred {

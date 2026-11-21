@@ -1503,14 +1503,14 @@ where
 }
 
 /// The error of the S3 service under the middleware.
-type EdgeError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type EdgeError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The body of the S3 service under the middleware: whatever the gateway, the native console or a
 /// refusal written in this file answers, behind one type the middleware is written against.
 pub(crate) struct EdgeBody(http_body_util::combinators::UnsyncBoxBody<Bytes, EdgeError>);
 
 impl EdgeBody {
-    fn new<B>(body: B) -> Self
+    pub(super) fn new<B>(body: B) -> Self
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<EdgeError>,
@@ -1599,7 +1599,8 @@ type S3Gateway = GatewayEdgeService;
 
 /// The S3 service mounted under the middleware: the gateway stack with its claimed-route hosts
 /// (`server/stack.rs`).
-type S3EdgeService = S3StackService<S3Gateway, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
+type GatewayS3Service = S3StackService<S3Gateway, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
+type S3EdgeService = super::vector::VectorDispatch<GatewayS3Service>;
 
 /// The gateway stack under the middleware, answering in the middleware's body and error types.
 #[derive(Clone)]
@@ -1703,7 +1704,7 @@ fn assemble_s3_stack(
     config: &config::Config,
     website: Option<crate::app::website::WebsiteHost>,
     assembly: GatewayAssembly,
-) -> Result<S3EdgeService> {
+) -> Result<GatewayS3Service> {
     let native_admin = GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?);
     let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
     let control_plane =
@@ -2685,6 +2686,21 @@ async fn start_http_server_inner(
             keystone_auth: keystone_provider_in_configuration().map_err(Error::other)?,
         },
     )?;
+    let vector_service = super::vector::assemble(
+        super::vector::VectorAssembly {
+            server_ctx: Arc::clone(&server_ctx),
+            root_access_key: config.access_key.clone(),
+            root_secret_key: config.secret_key.clone(),
+            region: config.region.clone(),
+            body_read_timeout: http_request_body_read_timeout,
+        },
+        crate::vector::lance::ManifestIoLimits {
+            max_manifest_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024).expect("positive manifest read limit"),
+            max_concurrent_reads: std::num::NonZeroUsize::new(4).expect("positive manifest concurrency"),
+        },
+        std::num::NonZeroUsize::new(3).expect("positive Vector write attempt limit"),
+    );
+    let s3_service = super::vector::VectorDispatch::new(s3_service, vector_service);
     #[cfg(feature = "http3")]
     let http3_server = if let Some(server_config) = http3_server_config {
         let h3_s3_service = s3_service.clone();

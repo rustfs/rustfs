@@ -147,9 +147,10 @@ filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustf
 setup = 'ecstore-base-stack'
 
 # These handler/store fixtures and the relocated-pool GET compose deep storage
-# futures in libtest threads; on Linux they overflow the default 2 MiB stack.
+# futures in libtest threads; they overflow the default 2 MiB stack.
+# The real Lance Catalog fixture composes the same ECStore publication path.
 [[profile.default.scripts]]
-filter = 'package(rustfs) & (test(/^admin::handlers::table_catalog::tests::/) | test(/^table_catalog::store::tests::/) | test(=app::object::get::tests::execute_get_object_resumes_from_relocated_pool_without_splicing_body))'
+filter = 'package(rustfs) & (test(/^admin::handlers::table_catalog::tests::/) | test(/^table_catalog::store::tests::/) | test(=app::object::get::tests::execute_get_object_resumes_from_relocated_pool_without_splicing_body) | test(=startup_services::tests::managed_lance_ecstore_catalog_commits_exact_files))'
 setup = 'ecstore-base-stack'
 
 [[profile.default.scripts]]
@@ -482,7 +483,7 @@ filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustf
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
-filter = 'package(rustfs) & (test(/^admin::handlers::table_catalog::tests::/) | test(/^table_catalog::store::tests::/) | test(=app::object::get::tests::execute_get_object_resumes_from_relocated_pool_without_splicing_body))'
+filter = 'package(rustfs) & (test(/^admin::handlers::table_catalog::tests::/) | test(/^table_catalog::store::tests::/) | test(=app::object::get::tests::execute_get_object_resumes_from_relocated_pool_without_splicing_body) | test(=startup_services::tests::managed_lance_ecstore_catalog_commits_exact_files))'
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
@@ -1055,4 +1056,12 @@ test-threads = 1
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.core-contract.junit]
+path = "junit.xml"
+
+# The same compiled Vector SDK cases run with KMS policy enforcement enabled.
+[profile.vector-kms]
+retries = 0
+fail-fast = false
+
+[profile.vector-kms.junit]
 path = "junit.xml"

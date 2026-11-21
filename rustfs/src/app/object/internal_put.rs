@@ -100,7 +100,7 @@ fn not_initialized() -> ApiError {
 /// Build the header view of an internal write so header-driven policy
 /// (content-type detection, compressibility, standard metadata capture) runs
 /// unchanged.
-fn internal_put_headers(content_headers: &HashMap<String, String>) -> Result<HeaderMap, ApiError> {
+pub(super) fn internal_put_headers(content_headers: &HashMap<String, String>) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::with_capacity(content_headers.len());
     for (name, value) in content_headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -116,7 +116,7 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name).and_then(|value| value.to_str().ok()).map(ToOwned::to_owned)
 }
 
-fn internal_put_content_input(headers: &HeaderMap, tags: Option<String>) -> PutObjectContentInput {
+pub(super) fn internal_put_content_input(headers: &HeaderMap, tags: Option<String>) -> PutObjectContentInput {
     PutObjectContentInput {
         cache_control: header_string(headers, "cache-control"),
         content_disposition: header_string(headers, "content-disposition"),
@@ -332,7 +332,7 @@ impl DefaultObjectUsecase {
                 emit_events,
                 preserve_delete_marker,
                 expected_bucket_incarnation_id,
-                table_publication_guard,
+                table_publication_guard: table_publication_guard.map(Box::new),
             },
         };
         let committed = self

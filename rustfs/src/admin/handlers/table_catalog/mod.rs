@@ -27,7 +27,10 @@ use crate::app::RequestEnvelope;
 use crate::auth::{check_key_valid_with_context, get_session_token};
 use crate::error::ApiError;
 use crate::server::{TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
-use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
+use crate::table_catalog::{
+    CatalogBodyRevision, CatalogContentSha256, DEFAULT_WAREHOUSE_ID, IcebergGraphObjectIdentity, IcebergGraphObjectObservation,
+    IcebergGraphObserverId, IcebergGraphPublication, IcebergGraphReadSet, TableCatalogStore,
+};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use http::header::CONTENT_TYPE;
@@ -1385,24 +1388,11 @@ enum TableCommitPublicationPhase {
     Complete,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-enum TableCommitObjectIdentity {
-    Missing,
-    Metadata(crate::table_catalog::TableCatalogObjectMetadata),
-    ContentSha256(String),
-}
-
 // Legacy objects without a write-unique body identity retain SHA validation,
 // with a total byte budget independent of the manifest graph's larger limit.
 const TABLE_COMMIT_LEGACY_REVALIDATION_MAX_BYTES: usize = 2 * MAX_ADMIN_REQUEST_BODY_SIZE;
 
-#[derive(Clone, PartialEq, Eq)]
-struct TableCommitObservedObject {
-    body_revision: Option<Uuid>,
-    content_size: usize,
-    identity: TableCommitObjectIdentity,
-    max_size: Option<usize>,
-}
+type TableCommitGuardLease = Arc<parking_lot::Mutex<crate::table_catalog::TableCatalogLockGuard>>;
 
 #[derive(Default)]
 struct TableCommitPublicationState {
@@ -1410,9 +1400,17 @@ struct TableCommitPublicationState {
     bucket_fence: Option<String>,
     table_fence: Option<(String, String, String)>,
     catalog_migration_read_permit: bool,
-    observed_objects: BTreeMap<(String, String), TableCommitObservedObject>,
+    observed_objects: BTreeMap<(String, String), Arc<IcebergGraphObjectObservation>>,
     legacy_revalidation_bytes: usize,
-    guards: Vec<crate::table_catalog::TableCatalogLockGuard>,
+    guards: Vec<TableCommitGuardLease>,
+    object_guards: BTreeMap<(String, String), TableCommitGuardLease>,
+}
+
+struct TableCommitReadLease {
+    observation: Arc<IcebergGraphObjectObservation>,
+    guards: Vec<TableCommitGuardLease>,
+    object_guard: Option<TableCommitGuardLease>,
+    table_fence: (String, String, String),
 }
 
 #[derive(Clone)]
@@ -1422,6 +1420,7 @@ struct TableCommitObjectBackend<B> {
     authorization_error: Arc<tokio::sync::Mutex<Option<S3Error>>>,
     publication: Arc<parking_lot::Mutex<TableCommitPublicationState>>,
     publication_fence_fleet_confirmed: bool,
+    graph_observer: IcebergGraphObserverId,
     preparation: Arc<crate::table_catalog::TablePublicationPreparation>,
 }
 
@@ -1436,6 +1435,7 @@ where
             authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
             publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
             publication_fence_fleet_confirmed,
+            graph_observer: IcebergGraphObserverId::new(),
             preparation: Arc::new(crate::table_catalog::TablePublicationPreparation::default()),
         }
     }
@@ -1487,7 +1487,7 @@ where
         bucket: &str,
         object: &str,
         data: &[u8],
-    ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitObservedObject> {
+    ) -> crate::table_catalog::TableCatalogStoreResult<IcebergGraphObjectObservation> {
         self.prepare_put_observation_with(bucket, object, data, true).await
     }
 
@@ -1500,7 +1500,7 @@ where
         object: &str,
         data: &[u8],
         begins_mutation: bool,
-    ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitObservedObject> {
+    ) -> crate::table_catalog::TableCatalogStoreResult<IcebergGraphObjectObservation> {
         let fence = {
             let publication = self.publication.lock();
             publication.bucket_fence.as_ref().map(|_| {
@@ -1508,7 +1508,8 @@ where
                     publication
                         .guards
                         .iter()
-                        .map(crate::table_catalog::TableCatalogLockGuard::lock_lost_signal),
+                        .chain(publication.object_guards.values())
+                        .map(|guard| guard.lock().lock_lost_signal()),
                 )
             })
         };
@@ -1519,12 +1520,14 @@ where
             authorize.await?;
         }
         self.ensure_observation_allowed(bucket, object)?;
-        let observation = TableCommitObservedObject {
-            identity: TableCommitObjectIdentity::ContentSha256(hex_sha256(data, str::to_string)),
-            body_revision: None,
-            content_size: data.len(),
-            max_size: Some(data.len()),
-        };
+        let observation = IcebergGraphObjectObservation::try_new(
+            bucket.to_owned(),
+            object.to_owned(),
+            None,
+            data.len(),
+            IcebergGraphObjectIdentity::ContentSha256(CatalogContentSha256::digest(data)),
+            Some(data.len()),
+        )?;
         if let Some(fence) = fence {
             // An unfenced candidate write precedes the publication transaction. Only a PUT
             // under the bucket fence commits this preparation to finishing its durable tail.
@@ -1594,24 +1597,35 @@ where
         &self,
         bucket: &str,
         object: &str,
-        observation: TableCommitObservedObject,
+        observation: IcebergGraphObjectObservation,
         enforce_legacy_budget: bool,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        let key = (bucket.to_string(), object.to_string());
+        let key = (bucket.to_owned(), object.to_owned());
         let mut publication = self.publication.lock();
-        if publication.phase == TableCommitPublicationPhase::Complete {
-            return Ok(());
+        match publication.phase {
+            TableCommitPublicationPhase::Complete => return Ok(()),
+            TableCommitPublicationPhase::Discovering => {}
+            _ => {
+                return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                    "catalog object observation completed after publication preparation began".to_owned(),
+                ));
+            }
         }
-        let previous_legacy_bytes = publication.observed_objects.get(&key).map_or(0, |observed| {
-            if observed.body_revision.is_none() {
-                observed.content_size
+        let previous = publication.observed_objects.get(&key);
+        let merged = match previous {
+            Some(previous) => previous.merge(&observation)?,
+            None => observation,
+        };
+        let previous_bytes = previous.map_or(0, |item| {
+            if item.body_revision().is_none() {
+                item.content_size()
             } else {
                 0
             }
         });
-        let legacy_bytes = publication.legacy_revalidation_bytes - previous_legacy_bytes;
-        let legacy_bytes = legacy_bytes.checked_add(if observation.body_revision.is_none() {
-            observation.content_size
+        let legacy_bytes = publication.legacy_revalidation_bytes - previous_bytes;
+        let legacy_bytes = legacy_bytes.checked_add(if merged.body_revision().is_none() {
+            merged.content_size()
         } else {
             0
         });
@@ -1620,78 +1634,62 @@ where
         else {
             return Err(crate::table_catalog::TableCatalogStoreError::Unavailable(
                 "legacy catalog objects exceed the publication validation budget; rewrite the referenced objects and retry"
-                    .to_string(),
+                    .to_owned(),
             ));
         };
-        let Some(existing) = publication.observed_objects.get_mut(&key) else {
-            if publication.phase != TableCommitPublicationPhase::Discovering {
-                return Err(crate::table_catalog::TableCatalogStoreError::Internal(format!(
-                    "table commit accessed an unvalidated object after publication preparation: {bucket}/{object}"
-                )));
-            }
-            publication.legacy_revalidation_bytes = legacy_bytes;
-            publication.observed_objects.insert(key, observation);
-            return Ok(());
-        };
-        if existing.identity != observation.identity
-            || existing
-                .body_revision
-                .zip(observation.body_revision)
-                .is_some_and(|(before, after)| before != after)
-        {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
-                "table commit object changed during validation: {bucket}/{object}"
-            )));
-        }
-        existing.body_revision = observation.body_revision;
-        existing.content_size = observation.content_size;
-        existing.max_size = match (existing.max_size, observation.max_size) {
-            (Some(expected), Some(actual)) => Some(expected.min(actual)),
-            (Some(expected), None) => Some(expected),
-            (None, actual) => actual,
-        };
         publication.legacy_revalidation_bytes = legacy_bytes;
+        publication.observed_objects.insert(key, Arc::new(merged));
         Ok(())
     }
 
     fn observed_content(
+        bucket: &str,
+        key: &str,
         object: Option<&crate::table_catalog::TableCatalogObject>,
         max_size: Option<usize>,
-    ) -> TableCommitObservedObject {
+    ) -> crate::table_catalog::TableCatalogStoreResult<IcebergGraphObjectObservation> {
         let identity = match object {
-            None => TableCommitObjectIdentity::Missing,
-            Some(object) => TableCommitObjectIdentity::ContentSha256(hex_sha256(&object.data, str::to_string)),
+            None => IcebergGraphObjectIdentity::Missing,
+            Some(object) => IcebergGraphObjectIdentity::ContentSha256(CatalogContentSha256::digest(&object.data)),
         };
-        TableCommitObservedObject {
+        IcebergGraphObjectObservation::try_new(
+            bucket.to_owned(),
+            key.to_owned(),
+            object
+                .and_then(|object| object.body_revision)
+                .filter(|id| !id.is_nil())
+                .map(CatalogBodyRevision::try_new)
+                .transpose()?,
+            object.map_or(0, |object| object.data.len()),
             identity,
             max_size,
-            body_revision: object.and_then(|object| object.body_revision).filter(|id| !id.is_nil()),
-            content_size: object.map_or(0, |object| object.data.len()),
-        }
+        )
     }
 
     fn observed_metadata(
         bucket: &str,
         object: &str,
         metadata: Option<crate::table_catalog::TableCatalogObjectMetadata>,
-    ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitObservedObject> {
+    ) -> crate::table_catalog::TableCatalogStoreResult<IcebergGraphObjectObservation> {
         let identity = match metadata {
-            None => TableCommitObjectIdentity::Missing,
-            Some(metadata) if metadata.etag.is_some() || metadata.mod_time.is_some() => {
-                TableCommitObjectIdentity::Metadata(metadata)
-            }
+            None => IcebergGraphObjectIdentity::Missing,
+            Some(metadata) if metadata.etag.is_some() || metadata.mod_time.is_some() => IcebergGraphObjectIdentity::Metadata {
+                body_revision: metadata
+                    .body_revision
+                    .filter(|id| !id.is_nil())
+                    .map(CatalogBodyRevision::try_new)
+                    .transpose()?,
+                etag: metadata.etag,
+                mod_time: metadata.mod_time,
+                size: metadata.size,
+            },
             Some(_) => {
                 return Err(crate::table_catalog::TableCatalogStoreError::Internal(format!(
                     "catalog object {bucket}/{object} does not expose a stable fingerprint"
                 )));
             }
         };
-        Ok(TableCommitObservedObject {
-            identity,
-            max_size: None,
-            body_revision: None,
-            content_size: 0,
-        })
+        IcebergGraphObjectObservation::try_new(bucket.to_owned(), object.to_owned(), None, 0, identity, None)
     }
 
     async fn begin_bucket_publication(&self, table_bucket: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
@@ -1737,8 +1735,12 @@ where
         };
         let mut publication = self.publication.lock();
         publication.catalog_migration_read_permit = !migration_guards.is_empty();
-        publication.guards.extend(migration_guards);
-        publication.guards.push(guard);
+        publication.guards.extend(
+            migration_guards
+                .into_iter()
+                .map(|guard| Arc::new(parking_lot::Mutex::new(guard))),
+        );
+        publication.guards.push(Arc::new(parking_lot::Mutex::new(guard)));
         Ok(())
     }
 
@@ -1784,7 +1786,7 @@ where
                 }
                 TableCommitPublicationPhase::Discovering => {
                     publication.phase = TableCommitPublicationPhase::Preparing;
-                    std::mem::take(&mut publication.observed_objects)
+                    publication.observed_objects.clone()
                 }
                 TableCommitPublicationPhase::Preparing => {
                     return Err(crate::table_catalog::TableCatalogStoreError::Internal(
@@ -1802,29 +1804,28 @@ where
         let prepared = async {
             // RUSTFS_COMPAT_TODO(table-publication-fence-v1): Retain exact live-file guards for old nodes. Remove after the minimum supported release uses table and bucket publication fences.
             let retain_legacy_object_guards = !self.publication_fence_fleet_confirmed;
-            let guarded_object_count = if retain_legacy_object_guards {
-                expected.len()
-            } else {
-                expected
-                    .values()
-                    .filter(|object| matches!(&object.identity, TableCommitObjectIdentity::ContentSha256(_)))
-                    .count()
-            };
-            let mut guards = Vec::with_capacity(guarded_object_count.saturating_add(1));
-            guards.push(self.backend.acquire_write_lock(table_bucket, &publication_lock).await?);
+            let mut guards = Vec::with_capacity(1);
+            let mut object_guards = BTreeMap::new();
+            guards.push(Arc::new(parking_lot::Mutex::new(
+                self.backend.acquire_write_lock(table_bucket, &publication_lock).await?,
+            )));
             for ((bucket, object), expected_object) in &expected {
-                if retain_legacy_object_guards || matches!(&expected_object.identity, TableCommitObjectIdentity::ContentSha256(_))
+                if retain_legacy_object_guards
+                    || matches!(expected_object.identity(), IcebergGraphObjectIdentity::ContentSha256(_))
                 {
-                    guards.push(self.backend.acquire_read_lock(bucket, object).await?);
+                    object_guards.insert(
+                        (bucket.clone(), object.clone()),
+                        Arc::new(parking_lot::Mutex::new(self.backend.acquire_read_lock(bucket, object).await?)),
+                    );
                 }
             }
             for ((bucket, object), expected_object) in &expected {
-                if !matches!(&expected_object.identity, TableCommitObjectIdentity::ContentSha256(_)) {
+                if !matches!(expected_object.identity(), IcebergGraphObjectIdentity::ContentSha256(_)) {
                     continue;
                 }
-                if let Some(revision) = expected_object.body_revision {
+                if let Some(revision) = expected_object.body_revision() {
                     let actual = self.backend.object_metadata_unlocked(bucket, object).await?;
-                    if actual.and_then(|metadata| metadata.body_revision) != Some(revision) {
+                    if actual.and_then(|metadata| metadata.body_revision) != Some(revision.as_uuid()) {
                         return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
                             "table commit object changed before catalog publication: {bucket}/{object}"
                         )));
@@ -1832,26 +1833,24 @@ where
                     continue;
                 }
                 let max_size = expected_object
-                    .max_size
-                    .map_or(expected_object.content_size, |limit| limit.min(expected_object.content_size));
+                    .max_size()
+                    .map_or(expected_object.content_size(), |limit| limit.min(expected_object.content_size()));
                 let actual_object = self.backend.read_object_unlocked_limited(bucket, object, max_size).await?;
-                let actual = Self::observed_content(actual_object.as_ref(), expected_object.max_size);
-                if actual.identity != expected_object.identity {
+                let actual = Self::observed_content(bucket, object, actual_object.as_ref(), expected_object.max_size())?;
+                if actual.identity() != expected_object.identity() {
                     return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
                         "table commit object changed before catalog publication: {bucket}/{object}"
                     )));
                 }
             }
-            stream::iter(
-                expected
-                    .into_iter()
-                    .filter_map(|((bucket, object), expected_object)| match expected_object.identity {
-                        expected_identity @ (TableCommitObjectIdentity::Metadata(_) | TableCommitObjectIdentity::Missing) => {
-                            Some((bucket, object, expected_identity))
-                        }
-                        TableCommitObjectIdentity::ContentSha256(_) => None,
-                    }),
-            )
+            stream::iter(expected.into_iter().filter_map(|((bucket, object), expected_object)| {
+                match expected_object.identity().clone() {
+                    expected_identity @ (IcebergGraphObjectIdentity::Metadata { .. } | IcebergGraphObjectIdentity::Missing) => {
+                        Some((bucket, object, expected_identity))
+                    }
+                    IcebergGraphObjectIdentity::ContentSha256(_) => None,
+                }
+            }))
             .map(|(bucket, object, expected_identity)| async move {
                 let metadata = if retain_legacy_object_guards {
                     self.backend.object_metadata_unlocked(&bucket, &object).await?
@@ -1859,7 +1858,7 @@ where
                     self.backend.object_metadata(&bucket, &object).await?
                 };
                 let actual = Self::observed_metadata(&bucket, &object, metadata)?;
-                if actual.identity != expected_identity {
+                if actual.identity() != &expected_identity {
                     return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
                         "table commit object changed before catalog publication: {bucket}/{object}"
                     )));
@@ -1869,34 +1868,148 @@ where
             .buffer_unordered(crate::table_catalog::TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY)
             .try_for_each(|()| async { Ok::<(), crate::table_catalog::TableCatalogStoreError>(()) })
             .await?;
-            Ok(guards)
+            Ok((guards, object_guards))
         }
         .await;
 
         let mut publication = self.publication.lock();
         match prepared {
-            Ok(guards) if publication.phase == TableCommitPublicationPhase::Preparing => {
+            Ok((guards, object_guards)) if publication.phase == TableCommitPublicationPhase::Preparing => {
                 publication.guards.extend(guards);
+                publication.object_guards = object_guards;
                 publication.table_fence = Some(table_fence);
                 publication.phase = TableCommitPublicationPhase::Prepared;
                 Ok(())
             }
-            Ok(_) => {
-                publication.phase = TableCommitPublicationPhase::Discovering;
-                Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                    "table commit publication state changed during preparation".to_string(),
-                ))
-            }
+            Ok(_) => Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                "table commit publication state changed during preparation".to_string(),
+            )),
             Err(err) => {
-                publication.phase = TableCommitPublicationPhase::Discovering;
+                if publication.phase == TableCommitPublicationPhase::Preparing {
+                    publication.phase = TableCommitPublicationPhase::Discovering;
+                }
                 Err(err)
             }
         }
     }
 
+    fn check_prepared_state(
+        publication: &TableCommitPublicationState,
+    ) -> crate::table_catalog::TableCatalogStoreResult<&(String, String, String)> {
+        let Some(table_fence) = publication.table_fence.as_ref().filter(|fence| {
+            publication.phase == TableCommitPublicationPhase::Prepared
+                && publication.bucket_fence.as_deref() == Some(fence.0.as_str())
+        }) else {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "catalog object reader requires the prepared bucket and table publication".to_owned(),
+            ));
+        };
+        if publication
+            .guards
+            .iter()
+            .chain(publication.object_guards.values())
+            .any(|guard| guard.lock().is_lock_lost())
+        {
+            return Err(crate::table_catalog::TableCatalogStoreError::Unavailable(
+                "catalog publication lock was lost".to_owned(),
+            ));
+        }
+        Ok(table_fence)
+    }
+
+    fn prepared_read_lease(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitReadLease> {
+        let publication = self.publication.lock();
+        let table_fence = Self::check_prepared_state(&publication)?;
+        if table_fence.0 != bucket {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "catalog reader bucket does not match publication".to_owned(),
+            ));
+        }
+        let key = (bucket.to_owned(), object.to_owned());
+        let observation = publication
+            .observed_objects
+            .get(&key)
+            .ok_or_else(|| {
+                crate::table_catalog::TableCatalogStoreError::Conflict(format!(
+                    "catalog reader object was not observed: {bucket}/{object}"
+                ))
+            })?
+            .clone();
+        Ok(TableCommitReadLease {
+            observation,
+            guards: publication.guards.clone(),
+            object_guard: publication.object_guards.get(&key).cloned(),
+            table_fence: table_fence.clone(),
+        })
+    }
+
+    fn check_read_lease(&self, lease: &TableCommitReadLease) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let publication = self.publication.lock();
+        let fence = Self::check_prepared_state(&publication)?;
+        if fence != &lease.table_fence
+            || lease
+                .guards
+                .iter()
+                .chain(lease.object_guard.iter())
+                .any(|guard| guard.lock().is_lock_lost())
+        {
+            return Err(crate::table_catalog::TableCatalogStoreError::Unavailable(
+                "catalog reader publication guard changed".to_owned(),
+            ));
+        }
+        let (bucket, object) = lease.observation.location();
+        let frozen = publication
+            .observed_objects
+            .get(&(bucket.to_owned(), object.to_owned()))
+            .ok_or_else(|| {
+                crate::table_catalog::TableCatalogStoreError::Conflict(
+                    "catalog reader observation is no longer available".to_owned(),
+                )
+            })?;
+        frozen.validate_supports(&lease.observation)
+    }
+
+    fn validate_read_metadata(
+        lease: &TableCommitReadLease,
+        actual: Option<&crate::table_catalog::TableCatalogObjectMetadata>,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let expected = &lease.observation;
+        let (bucket, object) = expected.location();
+        let matches = match (expected.identity(), actual) {
+            (IcebergGraphObjectIdentity::Missing, None) => true,
+            (IcebergGraphObjectIdentity::Metadata { .. }, metadata) => {
+                Self::observed_metadata(bucket, object, metadata.cloned())?.identity() == expected.identity()
+            }
+            (IcebergGraphObjectIdentity::ContentSha256(_), Some(metadata)) => {
+                lease.object_guard.is_some()
+                    && metadata.size
+                        == u64::try_from(expected.content_size()).map_err(|_| {
+                            crate::table_catalog::TableCatalogStoreError::Invalid(
+                                "catalog object size cannot be represented".to_owned(),
+                            )
+                        })?
+                    && expected
+                        .body_revision()
+                        .is_none_or(|revision| metadata.body_revision == Some(revision.as_uuid()))
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
+                "catalog object changed after publication preparation: {bucket}/{object}"
+            )));
+        }
+        Ok(())
+    }
+
     fn complete_publication(&self) {
         let mut publication = self.publication.lock();
         publication.guards.clear();
+        publication.object_guards.clear();
         publication.observed_objects.clear();
         publication.bucket_fence = None;
         publication.table_fence = None;
@@ -1912,11 +2025,134 @@ where
     }
 }
 
+impl<B: crate::table_catalog::TableCatalogObjectBackend> IcebergGraphPublication for TableCommitObjectBackend<B> {
+    fn capture_graph_read_set(&self) -> crate::table_catalog::TableCatalogStoreResult<IcebergGraphReadSet> {
+        let publication = self.publication.lock();
+        if publication.phase != TableCommitPublicationPhase::Discovering {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "graph observations can only be captured during discovery".to_owned(),
+            ));
+        }
+        IcebergGraphReadSet::try_new(self.graph_observer.clone(), publication.observed_objects.values().cloned().collect())
+    }
+
+    fn validate_prepared_graph_read_set(&self, reads: &IcebergGraphReadSet) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let publication = self.publication.lock();
+        Self::check_prepared_state(&publication)?;
+        if !self.graph_observer.same_observer(reads.observer()) {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "graph proof belongs to another publication observer".to_owned(),
+            ));
+        }
+        for captured in reads.objects() {
+            let (bucket, object) = captured.location();
+            let frozen = publication
+                .observed_objects
+                .get(&(bucket.to_owned(), object.to_owned()))
+                .ok_or_else(|| {
+                    crate::table_catalog::TableCatalogStoreError::Conflict(
+                        "graph proof observation is missing from publication".to_owned(),
+                    )
+                })?;
+            frozen.validate_supports(captured)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::CatalogObjectReader
+    for TableCommitObjectBackend<B>
+{
+    async fn read_object_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
+        let lease = self.prepared_read_lease(bucket, object)?;
+        let max_size = lease.observation.max_size().map_or(max_size, |limit| limit.min(max_size));
+        let result = if lease.object_guard.is_some() {
+            self.backend.read_object_unlocked_limited(bucket, object, max_size).await
+        } else {
+            self.backend.read_object_limited(bucket, object, max_size).await
+        };
+        self.check_read_lease(&lease)?;
+        let result = result?;
+        match lease.observation.identity() {
+            IcebergGraphObjectIdentity::ContentSha256(_) | IcebergGraphObjectIdentity::Missing => {
+                let observed = Self::observed_content(bucket, object, result.as_ref(), Some(max_size))?;
+                if observed.identity() != lease.observation.identity()
+                    || lease
+                        .observation
+                        .body_revision()
+                        .is_some_and(|revision| observed.body_revision() != Some(revision))
+                {
+                    return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
+                        "catalog object content changed after publication preparation: {bucket}/{object}"
+                    )));
+                }
+            }
+            IcebergGraphObjectIdentity::Metadata { .. } => {
+                let metadata = result.as_ref().map(|item| crate::table_catalog::TableCatalogObjectMetadata {
+                    body_revision: item.body_revision,
+                    etag: item.etag.clone(),
+                    mod_time: item.mod_time,
+                    size: item.data.len() as u64,
+                });
+                Self::validate_read_metadata(&lease, metadata.as_ref())?;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObjectMetadata>> {
+        let lease = self.prepared_read_lease(bucket, object)?;
+        let result = if lease.object_guard.is_some() {
+            self.backend.object_metadata_unlocked(bucket, object).await
+        } else {
+            self.backend.object_metadata(bucket, object).await
+        };
+        self.check_read_lease(&lease)?;
+        let result = result?;
+        Self::validate_read_metadata(&lease, result.as_ref())?;
+        Ok(result)
+    }
+
+    async fn object_exists(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<bool> {
+        Ok(crate::table_catalog::CatalogObjectReader::object_metadata(self, bucket, object)
+            .await?
+            .is_some())
+    }
+}
+
 #[async_trait::async_trait]
 impl<B> crate::table_catalog::TableCatalogObjectBackend for TableCommitObjectBackend<B>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
+    async fn read_table_bucket_incarnation(&self, bucket: &str) -> crate::table_catalog::TableCatalogStoreResult<Uuid> {
+        self.backend.read_table_bucket_incarnation(bucket).await
+    }
+
+    async fn revalidate_bucket_handle(
+        &self,
+        expected: &crate::admin::storage_api::managed::BucketHandle,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.backend.revalidate_bucket_handle(expected).await
+    }
+
+    async fn acquire_bucket_lifecycle_read(
+        &self,
+        expected: &crate::admin::storage_api::managed::BucketHandle,
+    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
+        self.backend.acquire_bucket_lifecycle_read(expected).await
+    }
+
     async fn read_object(
         &self,
         bucket: &str,
@@ -1925,7 +2161,7 @@ where
         self.authorize(bucket, object, S3Action::GetObjectAction).await?;
         self.ensure_observation_allowed(bucket, object)?;
         let result = self.backend.read_object(bucket, object).await?;
-        self.record_observation(bucket, object, Self::observed_content(result.as_ref(), None), true)?;
+        self.record_observation(bucket, object, Self::observed_content(bucket, object, result.as_ref(), None)?, true)?;
         Ok(result)
     }
 
@@ -1938,7 +2174,12 @@ where
         self.authorize(bucket, object, S3Action::GetObjectAction).await?;
         self.ensure_observation_allowed(bucket, object)?;
         let result = self.backend.read_object_limited(bucket, object, max_size).await?;
-        self.record_observation(bucket, object, Self::observed_content(result.as_ref(), Some(max_size)), true)?;
+        self.record_observation(
+            bucket,
+            object,
+            Self::observed_content(bucket, object, result.as_ref(), Some(max_size))?,
+            true,
+        )?;
         Ok(result)
     }
 
@@ -1964,7 +2205,7 @@ where
         self.ensure_observation_allowed(bucket, object)?;
         let metadata = self.backend.object_metadata(bucket, object).await?;
         let observation = Self::observed_metadata(bucket, object, metadata)?;
-        let exists = observation.identity != TableCommitObjectIdentity::Missing;
+        let exists = observation.identity() != &IcebergGraphObjectIdentity::Missing;
         self.record_observation(bucket, object, observation, true)?;
         Ok(exists)
     }
@@ -2058,6 +2299,13 @@ where
         self.backend.acquire_write_lock(bucket, object).await
     }
 
+    fn prepared_catalog_object_reader(
+        &self,
+    ) -> crate::table_catalog::TableCatalogStoreResult<&dyn crate::table_catalog::CatalogObjectReader> {
+        Self::check_prepared_state(&self.publication.lock())?;
+        Ok(self)
+    }
+
     fn table_publication_preparation_budget(&self) -> Arc<crate::table_catalog::TablePublicationPreparation> {
         self.preparation.clone()
     }
@@ -2090,7 +2338,12 @@ where
 
     fn table_bucket_commit_publication_is_held(&self, table_bucket: &str) -> bool {
         let publication = self.publication.lock();
-        publication.bucket_fence.as_deref() == Some(table_bucket) && publication.guards.iter().all(|guard| !guard.is_lock_lost())
+        publication.bucket_fence.as_deref() == Some(table_bucket)
+            && publication
+                .guards
+                .iter()
+                .chain(publication.object_guards.values())
+                .all(|guard| !guard.lock().is_lock_lost())
     }
 
     async fn prepare_table_commit_publication(
@@ -2108,14 +2361,22 @@ where
             .table_fence
             .as_ref()
             .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
-            && publication.guards.iter().all(|guard| !guard.is_lock_lost())
+            && publication
+                .guards
+                .iter()
+                .chain(publication.object_guards.values())
+                .all(|guard| !guard.lock().is_lock_lost())
     }
 
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         let publication = self.publication.lock();
-        publication
-            .catalog_migration_read_permit
-            .then(|| publication.guards.iter().all(|guard| !guard.is_lock_lost()))
+        publication.catalog_migration_read_permit.then(|| {
+            publication
+                .guards
+                .iter()
+                .chain(publication.object_guards.values())
+                .all(|guard| !guard.lock().is_lock_lost())
+        })
     }
 
     fn table_commit_object_mutation_fence(&self) -> Option<crate::table_catalog::TableCatalogObjectMutationFence> {
@@ -2124,7 +2385,8 @@ where
             publication
                 .guards
                 .iter()
-                .map(crate::table_catalog::TableCatalogLockGuard::lock_lost_signal),
+                .chain(publication.object_guards.values())
+                .map(|guard| guard.lock().lock_lost_signal()),
         ))
     }
 
@@ -2648,6 +2910,7 @@ async fn ensure_table_bucket_enabled_from_envelope(envelope: &RequestEnvelope, b
 
 fn table_bucket_entry_from_metadata_marker(bucket: &str) -> crate::table_catalog::TableBucketEntry {
     crate::table_catalog::TableBucketEntry {
+        vector_bucket_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         catalog_type: crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),
@@ -3584,6 +3847,8 @@ fn table_entry_from_register_request(
 
     let table_id = Uuid::new_v4().to_string();
     Ok(crate::table_catalog::TableEntry {
+        vector_head_binding: None,
+        vector_index_definition: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -3618,6 +3883,8 @@ fn table_entry_from_import_request(
 
     let table_id = Uuid::new_v4().to_string();
     Ok(crate::table_catalog::TableEntry {
+        vector_head_binding: None,
+        vector_index_definition: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -3678,6 +3945,8 @@ fn table_entry_from_create_table_request(
         .map_err(catalog_store_error)?;
 
     let entry = crate::table_catalog::TableEntry {
+        vector_head_binding: None,
+        vector_index_definition: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -3967,64 +4236,11 @@ fn compare_generated_metadata_with_standard_commit(
 }
 
 fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements: &[serde_json::Value]) -> S3Result<()> {
-    for requirement in requirements {
-        let requirement_type = requirement
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| s3_error!(InvalidRequest, "commit requirement type is required"))?;
-        match requirement_type {
-            "assert-create" => {
-                return Err(commit_requirement_failed("commit requirement failed: table already exists"));
-            }
-            "assert-table-uuid" => {
-                let expected = requirement
-                    .get("uuid")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| s3_error!(InvalidRequest, "assert-table-uuid requires uuid"))?;
-                let actual = metadata
-                    .get("table-uuid")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| s3_error!(InvalidRequest, "current table metadata is missing table-uuid"))?;
-                if actual != expected {
-                    return Err(commit_requirement_failed("commit requirement failed: table uuid changed"));
-                }
-            }
-            "assert-current-schema-id" => {
-                validate_i64_requirement(metadata, requirement, "current-schema-id", "current schema id")?;
-            }
-            "assert-default-spec-id" => {
-                validate_i64_requirement(metadata, requirement, "default-spec-id", "default spec id")?;
-            }
-            "assert-default-sort-order-id" => {
-                validate_i64_requirement(metadata, requirement, "default-sort-order-id", "default sort order id")?;
-            }
-            "assert-last-assigned-field-id" => {
-                validate_i64_requirement_with_metadata_key(
-                    metadata,
-                    requirement,
-                    "last-assigned-field-id",
-                    "last-column-id",
-                    "last assigned field id",
-                )?;
-            }
-            "assert-last-assigned-partition-id" => {
-                validate_i64_requirement_with_metadata_key(
-                    metadata,
-                    requirement,
-                    "last-assigned-partition-id",
-                    "last-partition-id",
-                    "last assigned partition id",
-                )?;
-            }
-            "assert-ref-snapshot-id" => validate_ref_snapshot_requirement(metadata, requirement)?,
-            _ => {
-                return Err(S3Error::from(ApiError::invalid_request(format!(
-                    "unsupported commit requirement: {requirement_type}"
-                ))));
-            }
-        }
-    }
-    Ok(())
+    crate::table_catalog::validate_table_commit_requirements(metadata, requirements).map_err(|error| match error {
+        crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{message}"),
+        crate::table_catalog::TableCatalogStoreError::Conflict(message) => commit_requirement_failed(message),
+        other => catalog_store_error(other),
+    })
 }
 
 fn request_has_assert_create_requirement(request: &RestCommitTableRequest) -> bool {
@@ -4043,62 +4259,6 @@ fn validate_create_table_commit_requirements(requirements: &[serde_json::Value])
         return Err(S3Error::from(ApiError::invalid_request(
             "create table commit requires only assert-create requirements",
         )));
-    }
-    Ok(())
-}
-
-fn validate_i64_requirement(
-    metadata: &serde_json::Value,
-    requirement: &serde_json::Value,
-    key: &str,
-    label: &str,
-) -> S3Result<()> {
-    validate_i64_requirement_with_metadata_key(metadata, requirement, key, key, label)
-}
-
-fn validate_i64_requirement_with_metadata_key(
-    metadata: &serde_json::Value,
-    requirement: &serde_json::Value,
-    requirement_key: &str,
-    metadata_key: &str,
-    label: &str,
-) -> S3Result<()> {
-    let expected = requirement
-        .get(requirement_key)
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| s3_error!(InvalidRequest, "{requirement_key} must be an integer"))?;
-    let actual = metadata
-        .get(metadata_key)
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| s3_error!(InvalidRequest, "current table metadata is missing {metadata_key}"))?;
-    if actual != expected {
-        return Err(commit_requirement_failed(format!("commit requirement failed: {label} changed")));
-    }
-    Ok(())
-}
-
-fn validate_ref_snapshot_requirement(metadata: &serde_json::Value, requirement: &serde_json::Value) -> S3Result<()> {
-    let ref_name = requirement
-        .get("ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| s3_error!(InvalidRequest, "assert-ref-snapshot-id requires ref"))?;
-    let refs = metadata.get("refs").and_then(serde_json::Value::as_object);
-    let actual = refs
-        .and_then(|refs| refs.get(ref_name))
-        .and_then(|reference| reference.get("snapshot-id"))
-        .and_then(serde_json::Value::as_i64);
-    if requirement.get("snapshot-id").is_some_and(serde_json::Value::is_null) {
-        if actual.is_some() {
-            return Err(commit_requirement_failed("commit requirement failed: snapshot ref exists"));
-        }
-        return Ok(());
-    }
-    let expected = requirement
-        .get("snapshot-id")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| s3_error!(InvalidRequest, "assert-ref-snapshot-id requires snapshot-id"))?;
-    if actual != Some(expected) {
-        return Err(commit_requirement_failed("commit requirement failed: snapshot ref changed"));
     }
     Ok(())
 }
@@ -5922,6 +6082,24 @@ fn persisted_metadata_error(entity: &str) -> S3Error {
 
 fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
     match err {
+        err @ crate::table_catalog::TableCatalogStoreError::Io { classification, .. } => {
+            use crate::table_catalog::CatalogIoErrorKind;
+            let (error_type, status, message) = match classification {
+                CatalogIoErrorKind::Denied => (ICEBERG_ERROR_REST, StatusCode::FORBIDDEN, "catalog object access denied"),
+                CatalogIoErrorKind::Conflict => (ICEBERG_ERROR_COMMIT_FAILED, StatusCode::CONFLICT, "catalog object changed"),
+                CatalogIoErrorKind::Unavailable => (
+                    ICEBERG_ERROR_REST,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "catalog storage is temporarily unavailable",
+                ),
+                CatalogIoErrorKind::Internal => {
+                    (ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, "catalog storage operation failed")
+                }
+            };
+            let mut response = iceberg_rest_error(error_type, status, message);
+            response.set_source(Box::new(err));
+            response
+        }
         crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
             iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_RESOURCE, StatusCode::NOT_FOUND, message)
         }
@@ -6364,6 +6542,29 @@ where
     crate::table_catalog::validate_table_snapshot_changes(&context, current_metadata, metadata).await
 }
 
+async fn validate_table_metadata_snapshot_graph_proof<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    entry: &crate::table_catalog::TableEntry,
+    current_metadata: Option<&serde_json::Value>,
+    metadata: &serde_json::Value,
+) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::ValidatedIcebergSnapshotGraph>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication,
+{
+    let mut target_entry = entry.clone();
+    target_entry.warehouse_location = crate::table_catalog::table_metadata_location(metadata)?.to_owned();
+    if crate::table_catalog::table_warehouse_object_prefix(&target_entry)?
+        != crate::table_catalog::table_warehouse_object_prefix(entry)?
+    {
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &target_entry.warehouse_location)
+            .await?;
+    }
+    let context = crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, &target_entry);
+    crate::table_catalog::validate_table_snapshot_changes_with_publication(&context, current_metadata, metadata).await
+}
+
 async fn list_tables_response<S>(
     store: &S,
     bucket: &str,
@@ -6529,7 +6730,7 @@ async fn replace_view_response<S>(
     request: RestCommitViewRequest,
 ) -> S3Result<RestLoadViewResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     validate_rest_commit_item_counts(&request.requirements, &request.updates)?;
     validate_rest_commit_identifier(request.identifier.as_ref(), namespace, view)?;
@@ -6680,12 +6881,13 @@ where
 
 async fn publish_table_commit<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     table_bucket_fence_required: bool,
     request: crate::table_catalog::TableCommitRequest,
+    graph: Option<crate::table_catalog::ValidatedIcebergSnapshotGraph>,
 ) -> S3Result<crate::table_catalog::TableCommitResult>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     // Real request backends acquire the migration permit here, before the store chooses its
     // inline/child route. Nested publication reuses that same permit and preparation budget.
@@ -6699,22 +6901,27 @@ where
         } else {
             None
         };
-    store
-        .commit_table_with_publication(request, metadata_backend)
-        .await
-        .map_err(catalog_store_error)
+    match graph {
+        Some(graph) => {
+            store
+                .commit_table_with_validated_graph(request, graph, metadata_backend)
+                .await
+        }
+        None => store.commit_table_with_publication(request, metadata_backend).await,
+    }
+    .map_err(catalog_store_error)
 }
 
 async fn update_table_metadata_location_response<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
     request: UpdateTableMetadataLocationRequest,
 ) -> S3Result<TableMetadataLocationResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
@@ -6750,8 +6957,15 @@ where
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
     validate_metadata_matches_current_metadata(&previous_metadata, &target_metadata)?;
-    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&previous_metadata), &target_metadata)
-        .await?;
+    let graph = validate_table_metadata_snapshot_graph_proof(
+        metadata_backend,
+        bucket,
+        &current,
+        Some(&previous_metadata),
+        &target_metadata,
+    )
+    .await
+    .map_err(catalog_store_error)?;
     let requirements = match existing_commit.as_ref() {
         Some(existing_commit) => replay_commit_requirements(existing_commit, &[], &target_metadata)?,
         None => Vec::new(),
@@ -6784,20 +6998,20 @@ where
             "commit retry does not match the original request",
         ));
     }
-    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request, Some(graph)).await?;
     Ok(table_metadata_location_response_from_entry(result.table))
 }
 
 async fn commit_table_response<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
     mut request: RestCommitTableRequest,
 ) -> S3Result<RestCommitTableResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     validate_rest_commit_item_counts(&request.requirements, &request.updates)?;
     validate_rest_commit_identifier(request.identifier.as_ref(), namespace, table)?;
@@ -6846,30 +7060,45 @@ where
         .await?;
         validate_table_commit_requirements(&previous_metadata, &client_requirements)?;
         validate_metadata_matches_current_metadata(&previous_metadata, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&previous_metadata), &target_metadata)
-            .await?;
+        let graph = validate_table_metadata_snapshot_graph_proof(
+            metadata_backend,
+            bucket,
+            &current,
+            Some(&previous_metadata),
+            &target_metadata,
+        )
+        .await
+        .map_err(catalog_store_error)?;
         let committed_metadata_location = request.new_metadata_location.clone();
-        let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request).await?;
+        let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request, Some(graph)).await?;
         return commit_table_replay_response(metadata_backend, bucket, result, &committed_metadata_location, target_metadata)
             .await;
     }
     validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
     validate_table_commit_requirements(&current_metadata, &client_requirements)?;
-    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&current_metadata), &target_metadata).await?;
-    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request).await?;
+    let graph = validate_table_metadata_snapshot_graph_proof(
+        metadata_backend,
+        bucket,
+        &current,
+        Some(&current_metadata),
+        &target_metadata,
+    )
+    .await
+    .map_err(catalog_store_error)?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request, Some(graph)).await?;
     Ok(commit_table_response_from_result(result, target_metadata))
 }
 
 async fn standard_commit_table_response<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
     request: RestCommitTableRequest,
 ) -> S3Result<RestCommitTableResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     let current = store
         .load_table(bucket, &namespace.public_name(), table)
@@ -6896,12 +7125,18 @@ where
         apply_table_commit_updates_at(current_metadata, &request.updates, &previous_metadata_location, commit_timestamp_ms)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     validate_metadata_identity_matches_current_metadata(&expected_metadata, &next_metadata)?;
-    validate_table_metadata_snapshot_graph_result(metadata_backend, bucket, &current, Some(&expected_metadata), &next_metadata)
-        .await
-        .map_err(|err| match err {
-            crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
-            err => catalog_store_error(err),
-        })?;
+    let mut graph = validate_table_metadata_snapshot_graph_proof(
+        metadata_backend,
+        bucket,
+        &current,
+        Some(&expected_metadata),
+        &next_metadata,
+    )
+    .await
+    .map_err(|err| match err {
+        crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
+        err => catalog_store_error(err),
+    })?;
     validate_table_snapshot_commit_conflicts(metadata_backend, bucket, &current, &expected_metadata, &request.updates).await?;
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id.or_else(|| request.idempotency_key.clone()));
@@ -6946,6 +7181,9 @@ where
                     &previous_metadata_location,
                 )? {
                     GeneratedMetadataComparison::MatchingCommit => {
+                        graph = graph
+                            .rebind_after_matching_commit(&persisted_metadata)
+                            .map_err(catalog_store_error)?;
                         next_metadata = persisted_metadata;
                         break;
                     }
@@ -6984,7 +7222,7 @@ where
         requirements: request.requirements,
         writer: request.writer,
     };
-    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request, Some(graph)).await?;
     Ok(commit_table_response_from_result(result, next_metadata))
 }
 
@@ -7031,6 +7269,8 @@ where
     )
     .map_err(|_| S3Error::from(ApiError::invalid_request("table property values must be strings")))?;
     let mut entry = crate::table_catalog::TableEntry {
+        vector_head_binding: None,
+        vector_index_definition: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -7185,7 +7425,7 @@ async fn commit_table_replay_response(
 
 async fn replay_standard_table_commit<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -7193,7 +7433,7 @@ async fn replay_standard_table_commit<S>(
     request: &RestCommitTableRequest,
 ) -> S3Result<Option<RestCommitTableResponse>>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     let Some(commit) = table_commit_for_retry(store, bucket, &current.table_id, request).await? else {
         return Ok(None);
@@ -7246,8 +7486,8 @@ where
             "commit retry operation does not match the original commit",
         ));
     }
-    if crate::table_catalog::table_matches_staged_base(current, &commit) {
-        validate_table_metadata_snapshot_graph_result(
+    let graph = if crate::table_catalog::table_matches_staged_base(current, &commit) {
+        let graph = validate_table_metadata_snapshot_graph_proof(
             metadata_backend,
             bucket,
             current,
@@ -7260,7 +7500,10 @@ where
             err => catalog_store_error(err),
         })?;
         validate_table_snapshot_commit_conflicts(metadata_backend, bucket, current, &previous_metadata, &request.updates).await?;
-    }
+        Some(graph)
+    } else {
+        None
+    };
     let requirements = replay_commit_requirements(&commit, &request.requirements, &target_metadata)?;
     let committed_metadata_location = commit.new_metadata_location.clone();
     let table_bucket_fence_required = table_warehouse_location_changes(current, &target_metadata)?;
@@ -7281,6 +7524,7 @@ where
             requirements,
             writer: request.writer.clone(),
         },
+        graph,
     )
     .await?;
     Ok(Some(
@@ -7452,7 +7696,7 @@ async fn commit_table_snapshot_expiration_response<B, M>(
 ) -> S3Result<crate::table_catalog::TableSnapshotExpirationReport>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
-    M: crate::table_catalog::TableCatalogObjectBackend,
+    M: crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication,
 {
     let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
@@ -7487,7 +7731,10 @@ where
     let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &previous_metadata_location)?;
     validate_metadata_matches_current_metadata(&current_metadata, &next_metadata)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
-    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&current_metadata), &next_metadata).await?;
+    let graph =
+        validate_table_metadata_snapshot_graph_proof(metadata_backend, bucket, &current, Some(&current_metadata), &next_metadata)
+            .await
+            .map_err(catalog_store_error)?;
     let (commit_id, metadata_file_token) = standard_commit_ids(None);
     let next_generation = current.generation.saturating_add(1);
     let next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
@@ -7521,7 +7768,7 @@ where
         requirements: Vec::new(),
         writer: Some("rustfs-maintenance".to_string()),
     };
-    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request, Some(graph)).await?;
     report.expired_snapshot_ids = expired_snapshot_ids;
     report.committed_metadata_location = Some(result.table.metadata_location);
     Ok(report)
@@ -7578,7 +7825,7 @@ where
 
 async fn put_table_ref_response<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -7586,7 +7833,7 @@ async fn put_table_ref_response<S>(
     request: PutTableRefRequest,
 ) -> S3Result<RestCommitTableResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     if !matches!(request.ref_type.as_str(), "branch" | "tag") {
         return Err(s3_error!(InvalidRequest, "snapshot ref type must be branch or tag"));
@@ -7638,7 +7885,7 @@ where
 
 async fn delete_table_ref_response<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -7646,7 +7893,7 @@ async fn delete_table_ref_response<S>(
     request: DeleteTableRefRequest,
 ) -> S3Result<RestCommitTableResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     if ref_name == "main" {
         return Err(s3_error!(InvalidRequest, "main snapshot ref cannot be deleted"));
@@ -7980,7 +8227,7 @@ async fn sync_external_catalog_bridge_response<B, M>(
 ) -> S3Result<ExternalCatalogBridgeSyncResponse>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
-    M: crate::table_catalog::TableCatalogObjectBackend,
+    M: crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication,
 {
     let mut request = request;
     request.metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
@@ -8009,8 +8256,15 @@ where
         let current_metadata =
             read_persisted_table_metadata_for_entry(metadata_backend, &current, &current.metadata_location, true).await?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&current_metadata), &target_metadata)
-            .await?;
+        let graph = validate_table_metadata_snapshot_graph_proof(
+            metadata_backend,
+            bucket,
+            &current,
+            Some(&current_metadata),
+            &target_metadata,
+        )
+        .await
+        .map_err(catalog_store_error)?;
         let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
         let result = publish_table_commit(
             store,
@@ -8029,6 +8283,7 @@ where
                 requirements: Vec::new(),
                 writer: Some(EXTERNAL_CATALOG_SYNC_WRITER.to_string()),
             },
+            Some(graph),
         )
         .await?;
         (
@@ -8133,14 +8388,14 @@ where
 
 async fn rollback_table_response<S>(
     store: &S,
-    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_backend: &(impl crate::table_catalog::TableCatalogObjectBackend + IcebergGraphPublication),
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
     request: RollbackTableRequest,
 ) -> S3Result<RestCommitTableResponse>
 where
-    S: crate::table_catalog::TableCatalogStore + ?Sized,
+    S: crate::table_catalog::TableCatalogStore + crate::table_catalog::IcebergCatalogCommit + ?Sized,
 {
     let started = Instant::now();
     let result = async {
@@ -8160,7 +8415,9 @@ where
         let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, None, &target_metadata).await?;
+        let graph = validate_table_metadata_snapshot_graph_proof(metadata_backend, bucket, &current, None, &target_metadata)
+            .await
+            .map_err(catalog_store_error)?;
         let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
         let commit_request = crate::table_catalog::TableCommitRequest {
             table_bucket: bucket.to_string(),
@@ -8175,7 +8432,8 @@ where
             requirements: Vec::new(),
             writer: Some("rustfs-catalog-rollback-api".to_string()),
         };
-        let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
+        let result =
+            publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request, Some(graph)).await?;
         Ok(commit_table_response_from_result(result, target_metadata))
     }
     .await;

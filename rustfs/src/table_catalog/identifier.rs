@@ -15,6 +15,49 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogName(String);
+
+impl CatalogName {
+    pub(crate) fn parse(value: impl Into<String>) -> Result<Self, CatalogIdentifierError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(CatalogIdentifierError::Empty);
+        }
+        if value.len() > IdentifierSegment::MAX_LEN {
+            return Err(CatalogIdentifierError::TooLong {
+                max: IdentifierSegment::MAX_LEN,
+            });
+        }
+        if matches!(value.as_str(), "." | "..") || value.chars().any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | '%')) {
+            return Err(CatalogIdentifierError::InvalidCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&IdentifierSegment> for CatalogName {
+    fn from(value: &IdentifierSegment) -> Self {
+        Self(value.as_str().to_string())
+    }
+}
+
+impl AsRef<str> for CatalogName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for IdentifierSegment {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentifierSegment(String);
 
 impl IdentifierSegment {
@@ -513,4 +556,27 @@ fn validate_identifier_segment(value: &str) -> Result<(), CatalogIdentifierError
 
 fn is_lower_ascii_alnum(value: u8) -> bool {
     value.is_ascii_lowercase() || value.is_ascii_digit()
+}
+
+pub(crate) fn table_catalog_object_key_from_location(table_bucket: &str, location: &str) -> Option<String> {
+    let object = if let Some(location) = location.strip_prefix("s3://") {
+        let (bucket, object) = location.split_once('/')?;
+        if bucket != table_bucket {
+            return None;
+        }
+        object
+    } else {
+        location
+    };
+
+    if object.is_empty()
+        || object.starts_with('/')
+        || object.contains("..")
+        || object.contains('\\')
+        || object.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+
+    Some(object.to_string())
 }

@@ -8,6 +8,8 @@ async fn seed_commit(
     receipt: bool,
 ) -> (String, Option<String>) {
     let record = CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_id: table_id.to_string(),
         commit_id: id.to_string(),

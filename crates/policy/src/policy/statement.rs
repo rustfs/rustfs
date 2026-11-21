@@ -14,13 +14,14 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::{Action, KmsAction, S3Action},
-    function::key_name::{KeyName, S3KeyName},
-    resource::Resource,
-    variables::{VariableContext, VariableResolver},
+    action::{Action, KmsAction, S3Action, S3VectorsAction},
+    function::key_name::{AwsKeyName, KeyName, S3KeyName, S3VectorsKeyName},
+    resource::{Resource, s3vectors_request_resource},
+    variables::{PolicyVariableResolver, VariableContext, VariableResolver},
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
@@ -83,10 +84,162 @@ fn build_resource(action: &Action, bucket: &str, object: &str, bucket_resource_o
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActionFamily {
     S3,
+    S3Vectors,
     Admin,
     Sts,
     Kms,
     Mixed,
+}
+
+fn requested_vector_resource(
+    action: S3VectorsAction,
+    bucket: &str,
+    index: &str,
+    conditions: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    use S3VectorsAction::*;
+    let target_matches = match action {
+        AllActions => false,
+        ListVectorBucketsAction => bucket.is_empty() && index.is_empty(),
+        CreateVectorBucketAction
+        | DeleteVectorBucketAction
+        | DeleteVectorBucketPolicyAction
+        | GetVectorBucketAction
+        | GetVectorBucketPolicyAction
+        | ListIndexesAction
+        | PutVectorBucketDefaultIndexModeAction
+        | PutVectorBucketPolicyAction => !bucket.is_empty() && index.is_empty(),
+        TagResourceAction | UntagResourceAction | ListTagsForResourceAction => !bucket.is_empty(),
+        CreateIndexAction
+        | DeleteIndexAction
+        | DeleteVectorsAction
+        | GetIndexAction
+        | GetVectorsAction
+        | ListVectorsAction
+        | PutVectorsAction
+        | QueryVectorsAction
+        | UpdateIndexModeAction => !bucket.is_empty() && !index.is_empty(),
+    };
+    if !target_matches {
+        return None;
+    }
+    let [region] = conditions.get("RequestedRegion")?.as_slice() else {
+        return None;
+    };
+    s3vectors_request_resource(region, bucket, index)
+}
+
+/// Vector callers supply public names and a server-owned deployment region.
+/// This check also runs before owner and deny-only shortcuts.
+pub(crate) fn s3vectors_request_is_valid(
+    action: &Action,
+    bucket: &str,
+    index: &str,
+    conditions: &HashMap<String, Vec<String>>,
+) -> bool {
+    match action {
+        Action::S3VectorsAction(action) => requested_vector_resource(*action, bucket, index, conditions).is_some(),
+        _ => true,
+    }
+}
+
+fn vector_condition_is_supported(action: S3VectorsAction, key: &KeyName) -> bool {
+    use S3VectorsAction::*;
+    match key {
+        KeyName::S3(_) => false,
+        KeyName::Aws(AwsKeyName::AWSResourceTag) | KeyName::S3Vectors(S3VectorsKeyName::VectorBucketTag) => {
+            action != ListVectorBucketsAction
+        }
+        KeyName::Aws(AwsKeyName::AWSRequestTag) => {
+            matches!(action, AllActions | CreateIndexAction | CreateVectorBucketAction | TagResourceAction)
+        }
+        KeyName::Aws(AwsKeyName::AWSTagKeys) => matches!(
+            action,
+            AllActions | CreateIndexAction | CreateVectorBucketAction | TagResourceAction | UntagResourceAction
+        ),
+        KeyName::S3Vectors(S3VectorsKeyName::KmsKeyArn | S3VectorsKeyName::SseType) => {
+            matches!(action, AllActions | CreateIndexAction | CreateVectorBucketAction)
+        }
+        _ => true,
+    }
+}
+
+fn validate_vector_statement(
+    actions: &ActionSet,
+    resources: &ResourceSet,
+    not_resources: &ResourceSet,
+    conditions: &Functions,
+) -> Result<()> {
+    let has_vector_action = actions.iter().any(|action| matches!(action, Action::S3VectorsAction(_)));
+    let has_vector_resource = resources
+        .iter()
+        .chain(not_resources.iter())
+        .any(|resource| matches!(resource, Resource::S3Vectors(_)));
+    if has_vector_action && actions.iter().any(|action| !matches!(action, Action::S3VectorsAction(_))) {
+        return Err(IamError::MixedActionFamilies.into());
+    }
+    if (has_vector_action
+        && resources
+            .iter()
+            .chain(not_resources.iter())
+            .any(|resource| !matches!(resource, Resource::S3Vectors(_) | Resource::All)))
+        || (has_vector_resource
+            && actions
+                .iter()
+                .any(|action| !matches!(action, Action::S3VectorsAction(_) | Action::All)))
+    {
+        return Err(IamError::InvalidResource("s3vectors".into(), "resource and action families differ".into()).into());
+    }
+    if has_vector_action || has_vector_resource {
+        for key in conditions.keys() {
+            key.is_valid()?;
+            let supported = if has_vector_action {
+                actions.iter().any(|action| {
+                    matches!(action, Action::S3VectorsAction(action) if vector_condition_is_supported(*action, &key.name))
+                })
+            } else {
+                vector_condition_is_supported(S3VectorsAction::AllActions, &key.name)
+            };
+            if !supported {
+                return Err(IamError::InvalidKey(String::from(key.clone())).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn vector_scope_matches(
+    resources: &ResourceSet,
+    not_resources: &ResourceSet,
+    requested: &str,
+    conditions: &HashMap<String, Vec<String>>,
+    resolver: Option<&dyn PolicyVariableResolver>,
+) -> bool {
+    if resources.is_empty() && not_resources.is_empty() {
+        return false;
+    }
+    if !resources.is_empty() {
+        let mut matched = false;
+        for resource in resources.iter() {
+            if matches!(resource, Resource::S3Vectors(_) | Resource::All)
+                && resource.is_match_with_resolver(requested, conditions, resolver).await
+            {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+    for resource in not_resources.iter() {
+        if matches!(resource, Resource::S3Vectors(_) | Resource::All)
+            && resource.is_match_with_resolver(requested, conditions, resolver).await
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// A requested KMS key identifier, reduced to what `key/<key_id>` patterns are
@@ -183,6 +336,7 @@ impl Statement {
         }
 
         let mut saw_s3 = false;
+        let mut saw_vectors = false;
         let mut saw_admin = false;
         let mut saw_sts = false;
         let mut saw_kms = false;
@@ -190,6 +344,7 @@ impl Statement {
         for action in self.actions.iter() {
             match action {
                 Action::All | Action::S3Action(_) => saw_s3 = true,
+                Action::S3VectorsAction(_) => saw_vectors = true,
                 Action::AdminAction(_) => saw_admin = true,
                 Action::StsAction(_) => saw_sts = true,
                 Action::KmsAction(_) => saw_kms = true,
@@ -197,7 +352,7 @@ impl Statement {
             }
         }
 
-        let family_count = u8::from(saw_s3) + u8::from(saw_admin) + u8::from(saw_sts) + u8::from(saw_kms);
+        let family_count = u8::from(saw_s3) + u8::from(saw_vectors) + u8::from(saw_admin) + u8::from(saw_sts) + u8::from(saw_kms);
 
         if family_count != 1 {
             return Some(ActionFamily::Mixed);
@@ -205,6 +360,9 @@ impl Statement {
 
         if saw_s3 {
             return Some(ActionFamily::S3);
+        }
+        if saw_vectors {
+            return Some(ActionFamily::S3Vectors);
         }
         if saw_admin {
             return Some(ActionFamily::Admin);
@@ -228,6 +386,14 @@ impl Statement {
     /// against. An empty `args.object` means the caller did not scope the request to a
     /// key, which preserves the legacy match-every-key behaviour.
     async fn kms_key_scope_matches(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
+        if self
+            .resources
+            .iter()
+            .chain(self.not_resources.iter())
+            .any(|resource| matches!(resource, Resource::S3Vectors(_)))
+        {
+            return false;
+        }
         if self.not_resources.iter().any(|resource| matches!(resource, Resource::All)) {
             return false;
         }
@@ -283,7 +449,7 @@ impl Statement {
                             && kms_resources.iter().any(|resource| match resource {
                                 Resource::All => true,
                                 Resource::Kms(pattern) => pattern == "*",
-                                Resource::S3(_) => false,
+                                Resource::S3(_) | Resource::S3Vectors(_) => false,
                             })
                     }
                 };
@@ -325,6 +491,16 @@ impl Statement {
         let deny = matches!(self.effect, Effect::Deny);
         if !self.actions.statement_covers(&self.not_actions, &args.action, deny) {
             return false;
+        }
+
+        if let Action::S3VectorsAction(action) = args.action {
+            let Some(resource) = requested_vector_resource(action, args.bucket, args.object, args.conditions) else {
+                return false;
+            };
+            if validate_vector_statement(&self.actions, &self.resources, &self.not_resources, &self.conditions).is_err() {
+                return false;
+            }
+            return vector_scope_matches(&self.resources, &self.not_resources, &resource, args.conditions, Some(resolver)).await;
         }
 
         if self.is_kms() {
@@ -437,6 +613,7 @@ impl Validator for Statement {
         self.not_actions.is_valid()?;
         self.resources.is_valid()?;
         self.not_resources.is_valid()?;
+        validate_vector_statement(&self.actions, &self.resources, &self.not_resources, &self.conditions)?;
 
         Ok(())
     }
@@ -502,6 +679,16 @@ impl BPStatement {
         let deny = matches!(self.effect, Effect::Deny);
         if !self.actions.statement_covers(&self.not_actions, &args.action, deny) {
             return false;
+        }
+
+        if let Action::S3VectorsAction(action) = args.action {
+            let Some(resource) = requested_vector_resource(action, args.bucket, args.object, args.conditions) else {
+                return false;
+            };
+            if validate_vector_statement(&self.actions, &self.resources, &self.not_resources, &self.conditions).is_err() {
+                return false;
+            }
+            return vector_scope_matches(&self.resources, &self.not_resources, &resource, args.conditions, None).await;
         }
 
         let resource = build_resource(
@@ -594,7 +781,474 @@ impl Validator for BPStatement {
         self.not_actions.is_valid()?;
         self.resources.is_valid()?;
         self.not_resources.is_valid()?;
+        validate_vector_statement(&self.actions, &self.resources, &self.not_resources, &self.conditions)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod s3vectors_tests {
+    use crate::policy::action::Action;
+    use crate::policy::resource::Resource;
+    use crate::policy::{Args, BucketPolicy, BucketPolicyArgs, Policy, Validator};
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+
+    const OPERATIONS: [&str; 21] = [
+        "CreateIndex",
+        "CreateVectorBucket",
+        "DeleteIndex",
+        "DeleteVectorBucket",
+        "DeleteVectorBucketPolicy",
+        "DeleteVectors",
+        "GetIndex",
+        "GetVectorBucket",
+        "GetVectorBucketPolicy",
+        "GetVectors",
+        "ListIndexes",
+        "ListTagsForResource",
+        "ListVectorBuckets",
+        "ListVectors",
+        "PutVectorBucketDefaultIndexMode",
+        "PutVectorBucketPolicy",
+        "PutVectors",
+        "QueryVectors",
+        "TagResource",
+        "UntagResource",
+        "UpdateIndexMode",
+    ];
+    const BUCKET: &str = "arn:aws:s3vectors:us-east-1::bucket/media";
+    const INDEX: &str = "arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings.v1";
+
+    fn parse_json<T: DeserializeOwned>(value: Value) -> serde_json::Result<T> {
+        let bytes = serde_json::to_vec(&value)?;
+        serde_json::from_slice(&bytes)
+    }
+
+    fn policy(statements: Value) -> Policy {
+        let policy: Policy = parse_json(json!({
+            "Version": "2012-10-17",
+            "Statement": statements,
+        }))
+        .expect("policy JSON must parse");
+        policy.is_valid().expect("policy must validate");
+        policy
+    }
+
+    fn conditions() -> HashMap<String, Vec<String>> {
+        HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned()])])
+    }
+
+    async fn allowed(
+        policy: &Policy,
+        operation: &str,
+        bucket: &str,
+        index: &str,
+        conditions: &HashMap<String, Vec<String>>,
+    ) -> bool {
+        let action = Action::try_from(operation).expect("request action must parse");
+        policy
+            .is_allowed(&Args {
+                account: "vector-user",
+                groups: &None,
+                action,
+                bucket,
+                conditions,
+                is_owner: false,
+                object: index,
+                claims: &HashMap::new(),
+                deny_only: false,
+            })
+            .await
+    }
+
+    #[test]
+    fn s3vectors_actions_cover_fixed_model_and_round_trip() {
+        for operation in OPERATIONS.into_iter().chain(["*"]) {
+            let name = format!("s3vectors:{operation}");
+            let action = Action::try_from(name.as_str()).expect("fixed S3 Vectors action must parse");
+            assert_eq!(serde_json::to_value(action).expect("action must serialize"), name);
+            assert_eq!(parse_json::<Action>(json!(name)).expect("action must deserialize"), action);
+        }
+    }
+
+    #[test]
+    fn s3vectors_actions_keep_service_wildcards_separate() {
+        let vectors = Action::try_from("s3vectors:*").expect("Vector wildcard must parse");
+        let request = Action::try_from("s3vectors:GetVectors").expect("Vector action must parse");
+        assert!(vectors.is_match(&request));
+        for pattern in ["s3:*", "kms:*", "sts:*", "admin:*", "*"] {
+            let pattern = Action::try_from(pattern).expect("existing wildcard must parse");
+            assert!(!pattern.is_match(&request));
+        }
+        let star = Action::try_from("*").expect("global wildcard must parse");
+        assert!(star.is_match_for_effect(&request, true));
+        for operation in ["s3:GetObject", "kms:Decrypt", "sts:AssumeRole", "admin:ServerInfo"] {
+            let action = Action::try_from(operation).expect("existing action must parse");
+            assert!(!vectors.is_match(&action));
+            assert!(!vectors.is_match_for_effect(&action, true));
+        }
+        for action in [
+            "s3vectors:GetVector",
+            "s3vectors:getvectors",
+            "s3vectors:Get*",
+            "S3Vectors:GetVectors",
+        ] {
+            assert!(Action::try_from(action).is_err(), "unexpected action accepted: {action}");
+        }
+    }
+
+    #[test]
+    fn s3vectors_resource_round_trip_and_invalid_identity() {
+        for arn in [BUCKET, INDEX, "arn:aws:s3vectors:*::bucket/media-*/index/*"] {
+            let resource = Resource::try_from(arn).expect("Vector policy resource must parse");
+            assert_eq!(serde_json::to_value(resource).expect("resource must serialize"), arn);
+        }
+        for arn in [
+            "arn:aws:s3vectors:us-east-1:123456789012:bucket/media",
+            "arn:aws-cn:s3vectors:us-east-1::bucket/media",
+            "arn:aws:s3vectors:::bucket/media",
+            "arn:aws:s3vectors:us-east-1::bucket/",
+            "arn:aws:s3vectors:us-east-1::bucket/media/",
+            "arn:aws:s3vectors:us-east-1::bucket/media/index/",
+            "arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings/extra",
+            "arn:aws:s3vectors:us-east-1::bucket/media/index/../embeddings",
+            "arn:aws:s3vectors:us-east-1::bucket/media%2fprivate",
+            "arn:aws:s3vectors:us-east-1::bucket/MEDIA",
+            "arn:aws:s3vectors:us-east-1:*:bucket/media",
+        ] {
+            assert!(Resource::try_from(arn).is_err(), "malformed Vector resource accepted: {arn}");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_resource_matching_preserves_type_region_and_account() {
+        let resource =
+            Resource::try_from("arn:aws:s3vectors:us-east-1::bucket/media/index/*").expect("Vector Index wildcard must parse");
+        assert!(resource.match_resource(INDEX).await);
+        for request in [
+            BUCKET,
+            "arn:aws:s3vectors:us-west-2::bucket/media/index/embeddings.v1",
+            "arn:aws:s3vectors:us-east-1:123456789012:bucket/media/index/embeddings.v1",
+            "arn:aws:s3vectors:us-east-1::bucket/media-other/index/embeddings.v1",
+            "arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings.v1/extra",
+            "arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings.v1/../other",
+            "arn:aws:s3vectors:us-east-1::bucket/media/index/*",
+            "arn:aws:s3:::media/index/embeddings.v1",
+            "media/index/embeddings.v1",
+        ] {
+            assert!(!resource.match_resource(request).await, "unexpected Vector resource match: {request}");
+        }
+        let bucket = Resource::try_from("arn:aws:s3vectors:us-east-1::bucket/*").expect("bucket wildcard must parse");
+        assert!(bucket.match_resource(BUCKET).await);
+        assert!(bucket.match_resource(INDEX).await);
+        let exact_bucket = Resource::try_from(BUCKET).expect("bucket ARN must parse");
+        assert!(!exact_bucket.match_resource(INDEX).await);
+    }
+
+    #[tokio::test]
+    async fn s3vectors_policy_scopes_index_and_deployment_region() {
+        let policy = policy(json!([{"Effect":"Allow","Action":"s3vectors:GetVectors","Resource":INDEX}]));
+        let conditions = conditions();
+        assert!(allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:GetVectors", "other", "embeddings.v1", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:GetVectors", "media", "other", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:QueryVectors", "media", "embeddings.v1", &conditions).await);
+        let foreign_region = HashMap::from([("RequestedRegion".to_owned(), vec!["us-west-2".to_owned()])]);
+        assert!(!allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &foreign_region).await);
+        assert!(!allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &HashMap::new()).await);
+    }
+
+    #[tokio::test]
+    async fn s3vectors_invalid_context_is_denied_before_owner_and_deny_only() {
+        let policy = Policy::default();
+        let action = Action::try_from("s3vectors:GetVectors").expect("Vector action must parse");
+        let claims = HashMap::new();
+        let valid_conditions = conditions();
+        let multiple_regions =
+            HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned(), "us-west-2".to_owned()])]);
+        for (bucket, index, context) in [
+            ("media", "embeddings.v1", HashMap::new()),
+            ("media", "embeddings.v1", multiple_regions),
+            ("media", "", valid_conditions.clone()),
+            ("media", "../other", valid_conditions.clone()),
+            (BUCKET, "embeddings.v1", valid_conditions.clone()),
+        ] {
+            for (is_owner, deny_only) in [(true, false), (false, true)] {
+                let args = Args {
+                    account: "vector-user",
+                    groups: &None,
+                    action,
+                    bucket,
+                    conditions: &context,
+                    is_owner,
+                    object: index,
+                    claims: &claims,
+                    deny_only,
+                };
+                assert!(!policy.is_allowed(&args).await);
+                assert_eq!(crate::policy::probe::policy_probe_decision(&policy, &args).await, Some(false));
+                assert!(!crate::policy::probe::policy_action_potential(&policy, &args).await);
+                let bucket_args = BucketPolicyArgs {
+                    account: args.account,
+                    groups: args.groups,
+                    action,
+                    bucket,
+                    conditions: &context,
+                    is_owner,
+                    object: index,
+                };
+                let bucket_policy = BucketPolicy::default();
+                assert!(!bucket_policy.is_allowed(&bucket_args).await);
+                assert_eq!(
+                    crate::policy::probe::bucket_policy_probe_decision(&bucket_policy, &bucket_args).await,
+                    Some(false)
+                );
+                assert!(!crate::policy::probe::bucket_policy_action_potential(&bucket_policy, &bucket_args).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_explicit_deny_precedes_allow() {
+        for deny in ["s3vectors:GetVectors", "s3vectors:*", "*"] {
+            let policy = policy(json!([
+                {"Effect":"Allow","Action":"s3vectors:*","Resource":"*"},
+                {"Effect":"Deny","Action":deny,"Resource":"*"}
+            ]));
+            assert!(!allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &conditions()).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_not_action_and_not_resource_keep_deny_scope() {
+        let policy = policy(json!([
+            {"Effect":"Allow","Action":"s3vectors:*","Resource":"*"},
+            {"Effect":"Deny","NotAction":"s3vectors:GetVectors","Resource":"*"},
+            {"Effect":"Deny","Action":"s3vectors:GetVectors","NotResource":INDEX}
+        ]));
+        let conditions = conditions();
+        assert!(allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:GetVectors", "media", "other", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:QueryVectors", "media", "embeddings.v1", &conditions).await);
+    }
+
+    #[test]
+    fn s3vectors_policy_rejects_resource_family_mismatches() {
+        for (action, resource) in [
+            ("s3vectors:GetVectors", "arn:aws:s3:::media/*"),
+            ("s3vectors:GetVectors", "arn:aws:kms:::key/key-a"),
+            ("s3:GetObject", INDEX),
+            ("kms:Decrypt", INDEX),
+        ] {
+            let parsed: Policy = parse_json(json!({
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Action":action,"Resource":resource}]
+            }))
+            .expect("all resource and action spellings must parse independently");
+            assert!(parsed.is_valid().is_err(), "incompatible family validated: {action} {resource}");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_unvalidated_policy_cannot_expand_s3_or_kms() {
+        for action in ["s3:GetObject", "kms:Decrypt"] {
+            let parsed: Policy = parse_json(json!({
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Action":action,"Resource":INDEX}]
+            }))
+            .expect("policy must deserialize before semantic validation");
+            let (bucket, object) = if action == "kms:Decrypt" {
+                ("", "key-a")
+            } else {
+                ("media", "file.txt")
+            };
+            assert!(!allowed(&parsed, action, bucket, object, &conditions()).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_bucket_and_account_list_targets_are_distinct() {
+        let policy = policy(json!([
+            {"Effect":"Allow","Action":"s3vectors:ListIndexes","Resource":BUCKET},
+            {"Effect":"Allow","Action":"s3vectors:ListVectorBuckets","Resource":"*"}
+        ]));
+        let conditions = conditions();
+        assert!(allowed(&policy, "s3vectors:ListIndexes", "media", "", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:ListIndexes", "media", "embeddings.v1", &conditions).await);
+        assert!(allowed(&policy, "s3vectors:ListVectorBuckets", "", "", &conditions).await);
+        assert!(!allowed(&policy, "s3vectors:ListVectorBuckets", "media", "", &conditions).await);
+    }
+
+    #[tokio::test]
+    async fn s3vectors_creation_conditions_use_verified_request_fields() {
+        let policy = policy(json!([{
+            "Effect":"Allow","Action":"s3vectors:CreateIndex","Resource":INDEX,
+            "Condition":{
+                "StringEquals":{
+                    "aws:RequestedRegion":"us-east-1",
+                    "aws:RequestTag/team":"search",
+                    "s3vectors:VectorBucketTag/environment":"production",
+                    "s3vectors:sseType":"aws:kms"
+                },
+                "ArnEquals":{"s3vectors:kmsKeyArn":"arn:aws:kms:::key/key-a"},
+                "ForAllValues:StringEquals":{"aws:TagKeys":["team"]},
+                "Null":{"aws:TagKeys":"false"}
+            }
+        }]));
+        let mut context = conditions();
+        for (name, value) in [
+            ("RequestTag/team", "search"),
+            ("VectorBucketTag/environment", "production"),
+            ("sseType", "aws:kms"),
+            ("kmsKeyArn", "arn:aws:kms:::key/key-a"),
+            ("TagKeys", "team"),
+        ] {
+            context.insert(name.to_owned(), vec![value.to_owned()]);
+        }
+        assert!(allowed(&policy, "s3vectors:CreateIndex", "media", "embeddings.v1", &context).await);
+        for key in [
+            "RequestTag/team",
+            "VectorBucketTag/environment",
+            "sseType",
+            "kmsKeyArn",
+            "TagKeys",
+        ] {
+            let mut missing = context.clone();
+            missing.remove(key);
+            assert!(!allowed(&policy, "s3vectors:CreateIndex", "media", "embeddings.v1", &missing).await);
+        }
+        context.insert("TagKeys".to_owned(), vec!["team".to_owned(), "unapproved".to_owned()]);
+        assert!(!allowed(&policy, "s3vectors:CreateIndex", "media", "embeddings.v1", &context).await);
+    }
+
+    #[tokio::test]
+    async fn s3vectors_resource_tag_deny_uses_current_conditions() {
+        let policy = policy(json!([
+            {"Effect":"Allow","Action":"s3vectors:GetVectors","Resource":INDEX},
+            {"Effect":"Deny","Action":"s3vectors:GetVectors","Resource":INDEX,
+             "Condition":{"StringEquals":{"aws:ResourceTag/restricted":"true"}}}
+        ]));
+        let mut context = conditions();
+        context.insert("ResourceTag/restricted".to_owned(), vec!["false".to_owned()]);
+        assert!(allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &context).await);
+        context.insert("ResourceTag/restricted".to_owned(), vec!["true".to_owned()]);
+        assert!(!allowed(&policy, "s3vectors:GetVectors", "media", "embeddings.v1", &context).await);
+    }
+
+    #[test]
+    fn s3vectors_condition_key_shape_and_action_allowlist_are_validated() {
+        for key in [
+            "aws:RequestTag",
+            "aws:RequestTag/",
+            "aws:ResourceTag/",
+            "s3vectors:VectorBucketTag/",
+            "aws:RequestedRegion/extra",
+            "aws:TagKeys/extra",
+            "s3vectors:sseType/extra",
+            "s3vectors:kmsKeyArn/extra",
+            "s3vectors:Unknown",
+        ] {
+            let parsed = parse_json::<Policy>(json!({
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Action":"s3vectors:CreateIndex","Resource":INDEX,
+                              "Condition":{"StringEquals":{(key):"value"}}}]
+            }));
+            assert!(parsed.is_err() || parsed.expect("parsed policy must be available").is_valid().is_err());
+        }
+        for (action, key) in [
+            ("s3vectors:GetVectors", "s3vectors:sseType"),
+            ("s3vectors:GetVectors", "aws:RequestTag/team"),
+            ("s3vectors:UntagResource", "aws:RequestTag/team"),
+            ("s3vectors:ListVectorBuckets", "s3vectors:VectorBucketTag/team"),
+            ("s3vectors:GetVectors", "s3:prefix"),
+        ] {
+            let parsed: Policy = parse_json(json!({
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Action":action,"Resource":"*",
+                              "Condition":{"StringEquals":{(key):"value"}}}]
+            }))
+            .expect("known condition key must deserialize");
+            assert!(parsed.is_valid().is_err(), "unsupported action condition accepted: {action} {key}");
+        }
+    }
+
+    #[test]
+    fn s3vectors_condition_names_are_reserved_from_untrusted_input() {
+        for key in [
+            "RequestedRegion",
+            "requestEDregion",
+            "RequestTag/team",
+            "ResourceTag/team",
+            "TagKeys",
+            "VectorBucketTag/team",
+            "kmsKeyArn",
+            "sseType",
+        ] {
+            assert!(
+                crate::policy::is_server_derived_condition_key(key),
+                "condition key must be reserved: {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_bucket_policy_uses_same_resource_and_deny_rules() {
+        let policy: BucketPolicy = parse_json(json!({
+            "Version":"2012-10-17",
+            "Statement":[
+                {"Effect":"Allow","Principal":{"AWS":"vector-user"},"Action":"s3vectors:GetVectors","Resource":INDEX},
+                {"Effect":"Deny","Principal":"*","Action":"s3vectors:GetVectors","Resource":INDEX,
+                 "Condition":{"StringEquals":{"aws:ResourceTag/restricted":"true"}}}
+            ]
+        }))
+        .expect("Vector bucket policy must parse");
+        policy.is_valid().expect("Vector bucket policy must validate");
+        let mut context = conditions();
+        let action = Action::try_from("s3vectors:GetVectors").expect("Vector action must parse");
+        for restricted in ["false", "true"] {
+            context.insert("ResourceTag/restricted".to_owned(), vec![restricted.to_owned()]);
+            let args = BucketPolicyArgs {
+                account: "vector-user",
+                groups: &None,
+                action,
+                bucket: "media",
+                conditions: &context,
+                is_owner: false,
+                object: "embeddings.v1",
+            };
+            assert_eq!(policy.is_allowed(&args).await, restricted == "false");
+        }
+    }
+
+    #[test]
+    fn s3vectors_public_principal_classification_covers_every_action() {
+        for operation in OPERATIONS {
+            for principal in [json!("*"), json!({"AWS":"*"}), json!({"AWS":["vector-user", "*"]})] {
+                let policy: BucketPolicy = parse_json(json!({
+                    "Version":"2012-10-17",
+                    "Statement":[{
+                        "Effect":"Allow",
+                        "Principal":principal,
+                        "Action":format!("s3vectors:{operation}"),
+                        "Resource":"*"
+                    }]
+                }))
+                .expect("public principal policy must deserialize");
+                policy
+                    .is_valid()
+                    .expect("public access restrictions are applied by the mutation entry point");
+                assert!(policy.statements[0].principal.is_match("*"));
+            }
+        }
+        let policy: BucketPolicy = parse_json(json!({
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Principal":{"AWS":"vector-user"},
+                          "Action":"s3vectors:GetVectors","Resource":INDEX}]
+        }))
+        .expect("named principal policy must deserialize");
+        assert!(!policy.statements[0].principal.is_match("*"));
     }
 }

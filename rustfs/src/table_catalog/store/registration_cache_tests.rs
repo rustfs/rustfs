@@ -270,11 +270,13 @@ async fn leased_registration_publication<'a>(
         .expect("publication lease acquisition succeeds")
         .expect("publication lease is acquired");
     let signal = guard.lock_lost_signal().expect("distributed publication has a loss signal");
-    let publication = TableCommitLockPublication::new(backend);
+    let publication = TableCommitLockPublication::new(backend, &TableCatalogObjectPaths::default());
     {
         let mut state = publication.state.lock();
         state.table_bucket = Some("analytics".to_string());
-        state.guards.push(TableCatalogLockGuard::namespace(guard));
+        state
+            .guards
+            .push(Arc::new(parking_lot::Mutex::new(TableCatalogLockGuard::namespace(guard))));
     }
     (publication, signal)
 }

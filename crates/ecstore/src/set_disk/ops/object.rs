@@ -5251,7 +5251,10 @@ impl SetDisks {
                 let expected = source_bucket_incarnation_id
                     .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
                 let store = metadata_sys::object_store_in(&self.ctx).await?;
-                let snapshot = store.object_lock_config_snapshot_for_single_put(bucket).await?;
+                let snapshot = match opts.bucket_lifecycle_lock_fence.as_ref() {
+                    Some(fence) => store.object_lock_config_snapshot_under_lifecycle_fence(bucket, fence).await?,
+                    None => store.object_lock_config_snapshot_for_single_put(bucket).await?,
+                };
                 if !snapshot.is_valid_for_destructive_put(store.id, bucket, expected) {
                     return Err(Error::other("PUT bucket generation or configuration changed while staging"));
                 }

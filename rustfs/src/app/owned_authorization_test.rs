@@ -1944,3 +1944,46 @@ async fn metadata_mutation_authorization_binds_to_the_server_bucket() {
         assert_eq!(options.expected_bucket_incarnation_id, Some(identity));
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn vector_bucket_denied_by_generic_and_owned_authorization() {
+    use rustfs_credentials::Credentials;
+    let _ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+    for is_owner in [false, true] {
+        for action in [
+            S3Action::ListBucketAction,
+            S3Action::ListBucketVersionsAction,
+            S3Action::GetObjectAction,
+            S3Action::GetObjectVersionAction,
+            S3Action::PutObjectAction,
+            S3Action::DeleteObjectAction,
+            S3Action::DeleteObjectVersionAction,
+            S3Action::AbortMultipartUploadAction,
+            S3Action::ListMultipartUploadPartsAction,
+        ] {
+            let mut request = build_request((), Method::GET);
+            request.extensions.insert(ReqInfo {
+                cred: Some(Credentials {
+                    access_key: "managed-isolation-user".to_owned(),
+                    ..Default::default()
+                }),
+                is_owner,
+                bucket: Some("rustfs-v-reserved-even-without-metadata".to_owned()),
+                object: Some("indexes/private/object".to_owned()),
+                ..Default::default()
+            });
+            let mut generic = envelope_from_request(&request);
+            let mut owned = envelope_from_request(&request);
+            let action = Action::S3Action(action);
+            let error = crate::app::storage_api::object_usecase::access::authorize_request(&mut generic, action)
+                .await
+                .expect_err("ordinary generic access must reject managed storage");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+            let error = crate::app::authorize_owned_request(&mut owned, action, None)
+                .await
+                .expect_err("ordinary owned access must reject managed storage");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+        }
+    }
+}

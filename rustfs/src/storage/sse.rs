@@ -40,15 +40,14 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_s3_types::S3ErrorCode;
 use rustfs_sse::{
-    BucketDefaultEncryption, BucketEncryption, DEFAULT_SSE_ALGORITHM, KMS_KEY_NOT_FOUND_ERROR_CODE, KmsKeyAuthorizer, SseError,
-    SseHost, normalize_encryption_metadata_case, ssec_invalid_request,
+    BucketDefaultEncryption, BucketEncryption, DEFAULT_SSE_ALGORITHM, KMS_KEY_NOT_FOUND_ERROR_CODE, SseError, SseHost,
+    normalize_encryption_metadata_case, ssec_invalid_request,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(all(test, feature = "rio-v2"))]
-pub(crate) use rustfs_sse::reset_sse_dek_provider;
+pub(crate) use rustfs_sse::KmsKeyAuthorizer;
 pub(crate) use rustfs_sse::startup::init as init_sse_startup;
 #[cfg(test)]
 pub(crate) use rustfs_sse::testing::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
@@ -59,7 +58,10 @@ pub(crate) use rustfs_sse::{
     strip_managed_encryption_metadata,
 };
 #[cfg(test)]
-pub(crate) use rustfs_sse::{SseDekProvider, TestAuthorizationHooks, TestSseDekProvider};
+pub(crate) use rustfs_sse::{
+    LocalSseDekProvider, SseDekProvider, TestAuthorizationHooks, TestSseDekProvider, reset_sse_dek_provider,
+    set_sse_dek_provider_for_test,
+};
 
 // ============================================================================
 // The server `rustfs-sse` runs in
@@ -581,6 +583,13 @@ impl super::storage_api::contract::multipart::MultipartCompletionAuthorization f
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn kms_sse_dek_provider_for_test(
+    manager: Arc<rustfs_kms::KmsServiceManager>,
+) -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    Ok(rustfs_sse::testing::kms_sse_dek_provider_for_test(manager).await?)
 }
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ pub mod bitrot {
 }
 
 pub mod bucket {
+    pub use crate::store::BucketIncarnationFenceGuard;
     pub mod bandwidth {
         pub mod monitor {
             pub use crate::bucket::bandwidth::monitor::{BandwidthDetails, Monitor};
@@ -190,8 +191,8 @@ pub mod bucket {
             BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
             BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_SSECONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
             BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG,
-            BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, ConfigState,
-            OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
+            BUCKET_TARGETS_FILE, BUCKET_VECTOR_STORAGE_PREFIX, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata,
+            ConfigState, OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
             table_catalog_path_hash, unreadable_config_refusal,
         };
         pub use crate::bucket::metadata::{

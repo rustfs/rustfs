@@ -16,8 +16,8 @@ use super::super::object::validate_table_maintenance_report_path;
 use super::*;
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct ObjectCatalogBackupMaintenanceSummary {
-    pub(super) object_count: usize,
+pub(in crate::table_catalog) struct ObjectCatalogBackupMaintenanceSummary {
+    pub(in crate::table_catalog) object_count: usize,
 }
 
 #[derive(Default)]
@@ -32,7 +32,11 @@ where
     B: TableCatalogObjectBackend,
 {
     /// Counts recognized sidecars without granting authority to a candidate.
-    pub(super) fn backup_maintenance_object_count(&self, table_bucket: &str, objects: &[ObjectCatalogBackupObject]) -> usize {
+    pub(in crate::table_catalog) fn backup_maintenance_object_count(
+        &self,
+        table_bucket: &str,
+        objects: &[ObjectCatalogBackupObject],
+    ) -> usize {
         let config = self.paths.table_bucket_maintenance_config_path(table_bucket);
         objects
             .iter()
@@ -53,7 +57,7 @@ where
     /// ordinary entry, size, hash and metadata contracts separately. This pure
     /// check never expires a lease or repairs aliases. It preserves all source
     /// bytes, including audit, quarantine and historical worker identities.
-    pub(super) fn validate_backup_maintenance_authority(
+    pub(in crate::table_catalog) fn validate_backup_maintenance_authority(
         &self,
         table_bucket: &str,
         objects: &[ObjectCatalogBackupObject],
