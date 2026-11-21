@@ -248,7 +248,7 @@ impl LifecycleRuntime for DefaultLifecycleRuntime {
                     subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                     state = "degraded",
                     failures = %activation_failures.join("; "),
-                    "one or more notification targets failed to activate"
+                    "notify runtime lifecycle"
                 );
             }
             Ok(())
