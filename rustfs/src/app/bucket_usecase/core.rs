@@ -262,26 +262,20 @@ impl DefaultBucketUsecase {
         // same-name make while it waits for repair coordination.
         let operation_bucket = bucket.clone();
         let operation_store = store.clone();
-        with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
+        let removed_targets = with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
             let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;
             let delete_result = operation_store
-                .delete_bucket(
-                    &operation_bucket,
-                    &DeleteBucketOptions {
-                        force,
-                        ..Default::default()
-                    },
-                )
+                .delete_bucket_with_notification(&operation_bucket, force)
                 .await;
             match delete_result {
-                Ok(()) => {
+                Ok(notification) => {
                     crate::storage::invalidate_bucket_validation_cache(&operation_bucket);
                     if let Some(intent) = intent
                         && let Err(err) = commit_site_replication_delete_bucket(&intent).await
                     {
                         warn!(bucket = %operation_bucket, error = ?err, "site replication delete bucket hook failed");
                     }
-                    Ok::<(), S3Error>(())
+                    Ok::<_, S3Error>(notification)
                 }
                 Err(err) => {
                     if let Some(intent) = intent {
@@ -306,6 +300,17 @@ impl DefaultBucketUsecase {
         // Notify peers to drop their cached metadata for the now-deleted bucket.
         notify_bucket_metadata_delete(bucket, envelope.request_context().cloned());
 
+        let (incarnation, targets) = removed_targets
+            .map(|metadata| {
+                (
+                    Some(metadata.bucket_incarnation_id),
+                    rustfs_notify::bucket_removed_targets_from_metadata(&metadata),
+                )
+            })
+            .unwrap_or_default();
+        let helper = helper
+            .with_bucket_incarnation_id(incarnation)
+            .with_bucket_removed_targets(targets);
         let result = Ok(gateway_dto::DeleteBucketOutput::default());
         let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
         result

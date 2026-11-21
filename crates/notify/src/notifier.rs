@@ -15,6 +15,7 @@
 use crate::error::NotificationError;
 use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
+use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
@@ -245,7 +246,24 @@ impl EventNotifier {
         let object_key = &event.s3.object.key;
         let event_name = event.event_name;
 
-        let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
+        let target_ids = match &event.bucket_removed_targets {
+            Some(targets) if event_name == EventName::BucketRemoved => targets.clone(),
+            _ => {
+                let match_targets = || {
+                    self.rule_engine
+                        .match_bucket_targets(bucket_name, event.bucket_incarnation_id, event_name, object_key)
+                };
+                let targets = match_targets().await;
+                if targets.is_empty()
+                    && let Some(id) = event.bucket_incarnation_id
+                    && self.rule_engine.refresh_incarnation(bucket_name, id).await
+                {
+                    match_targets().await
+                } else {
+                    targets
+                }
+            }
+        };
         if target_ids.is_empty() {
             debug!(
                 event = EVENT_NOTIFY_DISPATCH_SKIPPED,
@@ -1108,6 +1126,53 @@ mod tests {
 
         assert_eq!(enabled_target.save_call_count(), 1);
         assert_eq!(disabled_target.save_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_removal_targets_survive_withdrawal_without_routing_recreated_objects() {
+        let engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), engine.clone());
+        let target = MockTarget::new("removed-bucket", "webhook");
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        let mut rules = RulesMap::new();
+        rules.add_rule_config(
+            &[EventName::BucketRemoved, EventName::ObjectCreatedPut],
+            "*".to_owned(),
+            target.target_id(),
+        );
+        engine.publish_bucket_rules("bucket", Some(old_id), rules).await;
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target.clone()))
+            .expect("register target");
+
+        let mut metadata = crate::storage_api::bucket_metadata::BucketMetadata::new("bucket");
+        metadata.bucket_incarnation_id = old_id;
+        metadata.notification_config_xml = b"<NotificationConfiguration><QueueConfiguration><Queue>arn:rustfs:sqs:us-east-1:removed-bucket:webhook</Queue><Event>s3:BucketRemoved:*</Event></QueueConfiguration></NotificationConfiguration>".to_vec();
+        metadata.notification_config = Some(
+            crate::storage_api::bucket_metadata::deserialize_bucket_config(&metadata.notification_config_xml)
+                .expect("parse removal subscription"),
+        );
+        let targets = crate::bucket_removed_targets_from_metadata(&metadata);
+        assert!(targets.contains(&target.target_id()));
+        engine.withdraw_bucket_rules("bucket").await;
+
+        let mut removed = Event::new_test_event("bucket", "", EventName::BucketRemoved);
+        removed.bucket_incarnation_id = Some(old_id);
+        removed.bucket_removed_targets = Some(targets);
+        let encoded = serde_json::to_value(&removed).expect("serialize webhook event");
+        assert!(encoded.get("bucketIncarnationId").is_none());
+        assert!(encoded.get("bucketRemovedTargets").is_none());
+        notifier.send(Arc::new(removed)).await;
+        assert_eq!(target.save_call_count(), 1, "the deleted bucket earns its final removal event");
+
+        let mut created = Event::new_test_event("bucket", "fresh.txt", EventName::ObjectCreatedPut);
+        created.bucket_incarnation_id = Some(new_id);
+        notifier.send(Arc::new(created)).await;
+        assert_eq!(target.save_call_count(), 1, "the new bucket has no subscription");
     }
 
     #[tokio::test]

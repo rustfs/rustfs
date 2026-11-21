@@ -878,9 +878,12 @@ pub(crate) mod bucket {
             pub(crate) async fn enqueue_transition_immediate(
                 oi: &crate::storage::storage_api::StorageObjectInfo,
                 src: LcEventSrc,
+                incarnation: Option<uuid::Uuid>,
             ) {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_immediate(
-                    oi, src,
+                    oi,
+                    src,
+                    incarnation,
                 )
                 .await;
             }
@@ -1385,42 +1388,67 @@ pub(crate) mod bucket {
             oi: crate::storage::storage_api::StorageObjectInfo,
             store: Arc<crate::storage::storage_api::ECStore>,
             dsc: ReplicateDecision,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
-            ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Object).await;
+            ReplicationObjectBridge::schedule_object(
+                oi,
+                store,
+                dsc,
+                replication_contracts::ReplicationType::Object,
+                notification_bucket_incarnation,
+            )
+            .await;
         }
 
         pub(crate) async fn schedule_metadata_replication(
             oi: crate::storage::storage_api::StorageObjectInfo,
             store: Arc<crate::storage::storage_api::ECStore>,
             dsc: ReplicateDecision,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
-            ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Metadata).await;
+            ReplicationObjectBridge::schedule_object(
+                oi,
+                store,
+                dsc,
+                replication_contracts::ReplicationType::Metadata,
+                notification_bucket_incarnation,
+            )
+            .await;
         }
 
         pub(crate) async fn schedule_replication_delete(
             delete_object: crate::storage::storage_api::StorageDeletedObject,
             bucket: String,
             event_type: String,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
             #[cfg(test)]
             SCHEDULED_REPLICATION_DELETES
                 .lock()
                 .expect("scheduled replication delete lock should not be poisoned")
                 .push(delete_object.clone());
-            ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type).await;
+            ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type, notification_bucket_incarnation)
+                .await;
         }
 
         pub(crate) async fn schedule_replication_deletes(
             delete_objects: Vec<crate::storage::storage_api::StorageDeletedObject>,
             bucket: String,
             event_type: String,
+            notification_bucket_incarnation: Option<Uuid>,
         ) {
             #[cfg(test)]
             SCHEDULED_REPLICATION_DELETES
                 .lock()
                 .expect("scheduled replication delete lock should not be poisoned")
                 .extend(delete_objects.iter().cloned());
-            ReplicationObjectBridge::schedule_storage_deletes(delete_objects, bucket, event_type).await;
+            ReplicationObjectBridge::schedule_storage_deletes(
+                delete_objects,
+                bucket,
+                event_type,
+                notification_bucket_incarnation,
+            )
+            .await;
         }
 
         pub(crate) fn set_deleted_object_replication_state(
@@ -1736,9 +1764,9 @@ pub(crate) mod admin_usecase {
 pub(crate) mod bucket_usecase {
     pub(crate) mod contract {
         pub(crate) mod bucket {
-            pub(crate) use super::super::super::storage_contracts::{
-                BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-            };
+            #[cfg(test)]
+            pub(crate) use super::super::super::storage_contracts::DeleteBucketOptions;
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions, MakeBucketOptions};
         }
 
         pub(crate) mod list {
@@ -1915,6 +1943,9 @@ pub(crate) mod owned_parity {
         authorization_denial_entry_for_view, authorize_bucket_config_mutation, authorize_create_bucket, authorize_delete_bucket,
         authorize_object_request, authorize_replication_only_put_headers, authorize_staged_multipart_part,
         authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
+    };
+    pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
     };
 }
 

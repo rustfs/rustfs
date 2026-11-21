@@ -2142,6 +2142,7 @@ impl DefaultObjectUsecase {
                         &key,
                         principal_id,
                     )
+                    .map(|event| event.with_bucket_incarnation(opts.expected_bucket_incarnation_id))
                 });
                 (PutObjectCompletion::Internal(event.flatten().map(Box::new)), Some(request_context))
             }
@@ -2407,7 +2408,7 @@ impl DefaultObjectUsecase {
 
                 let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let transition_enqueue_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject, opts.expected_bucket_incarnation_id).await;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_post_store_transition_enqueue",
                     transition_enqueue_stage_start,
@@ -2468,7 +2469,7 @@ impl DefaultObjectUsecase {
 
                 if dsc.replicate_any() {
                     let replication_schedule_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                    schedule_object_replication(obj_info.clone(), store, dsc, opts.expected_bucket_incarnation_id).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_post_store_replication_schedule",
                         replication_schedule_stage_start,

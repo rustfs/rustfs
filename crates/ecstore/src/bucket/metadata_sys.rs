@@ -2253,6 +2253,7 @@ impl BucketMetadataSys {
         .await?;
         self.publish_if_unchanged(bucket, expected.as_ref(), metadata, persisted, &guard)
             .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -2550,7 +2551,7 @@ impl BucketMetadataSys {
         metadata: BucketMetadata,
         persisted: bool,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.revoke_pending_bucket_creation(bucket).await;
         if !persisted {
             let _publish_guard = self
@@ -2563,7 +2564,7 @@ impl BucketMetadataSys {
                 _ => false,
             };
             if !unchanged {
-                return Ok(());
+                return Ok(false);
             }
             let removed = map.remove(bucket).is_some();
             drop(map);
@@ -2574,7 +2575,7 @@ impl BucketMetadataSys {
                 clear_bucket_overrides(bucket);
                 clear_on_demand_migration(bucket);
             }
-            return Ok(());
+            return Ok(true);
         }
         let _publish_guard = self
             .lock_metadata_publish(bucket, namespace_guard, "refreshed bucket metadata publish")
@@ -2587,7 +2588,7 @@ impl BucketMetadataSys {
             _ => false,
         };
         if !unchanged {
-            return Ok(());
+            return Ok(false);
         }
         map.insert(bucket.to_string(), Arc::clone(&metadata));
         drop(map);
@@ -2596,7 +2597,7 @@ impl BucketMetadataSys {
         sync_bucket_target_sys(bucket, &metadata).await;
         sync_bucket_overrides(bucket, &metadata);
         sync_on_demand_migration(bucket, &metadata);
-        Ok(())
+        Ok(true)
     }
 
     pub async fn get(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -2880,25 +2881,35 @@ impl BucketMetadataSys {
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
         self.revoke_pending_bucket_creation(bucket).await;
-        let expected = self.metadata_map.read().await.get(bucket).cloned();
         if !self
             .bucket_exists(bucket, namespace_guard, "peer bucket metadata existence check")
             .await?
         {
             return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
         }
-        let (metadata, persisted) = await_bucket_namespace_operation(
-            Some(namespace_guard),
-            bucket,
-            "peer bucket metadata load",
-            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
-        )
-        .await?;
-        if !persisted {
-            return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
+        // A concurrent publication can reject the snapshot we read. Re-read
+        // from storage so a newer committed config does not lose its reload to
+        // an older one that happened to publish first.
+        for _ in 0..3 {
+            let expected = self.metadata_map.read().await.get(bucket).cloned();
+            let (metadata, persisted) = await_bucket_namespace_operation(
+                Some(namespace_guard),
+                bucket,
+                "peer bucket metadata load",
+                load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
+            )
+            .await?;
+            if !persisted {
+                return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
+            }
+            if self
+                .publish_if_unchanged(bucket, expected.as_ref(), metadata, true, namespace_guard)
+                .await?
+            {
+                return Ok(());
+            }
         }
-        self.publish_if_unchanged(bucket, expected.as_ref(), metadata, true, namespace_guard)
-            .await
+        Err(Error::other("bucket metadata changed repeatedly during peer reload"))
     }
 
     pub async fn get_config(&self, bucket: &str) -> Result<(Arc<BucketMetadata>, bool)> {

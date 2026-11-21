@@ -114,6 +114,8 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs>
     };
 
     Some(NotifyEventArgs {
+        bucket_incarnation_id: args.bucket_incarnation_id,
+        bucket_removed_targets: None,
         event_name,
         bucket_name: args.bucket_name,
         object: convert_ecstore_object_info(args.object),
