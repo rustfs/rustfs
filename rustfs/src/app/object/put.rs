@@ -4596,10 +4596,24 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let input = PutObjectWriteInput::from_legacy(input, None);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
