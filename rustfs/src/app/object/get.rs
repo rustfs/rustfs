@@ -6536,13 +6536,24 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_get_object_response_injects_accept_ranges_header() {
-        let req = build_request(GetObjectInput::default(), Method::GET);
-        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::GET,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+            .suppress_event();
         let response = DefaultObjectUsecase::finalize_get_object_response(
             helper,
             "bucket",
-            &req.method,
-            &req.headers,
+            envelope.method(),
+            envelope.headers(),
             None,
             Some(262_144),
             String::new(),

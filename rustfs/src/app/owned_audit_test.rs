@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Owned-versus-legacy audit parity: one logical request through the s3s
-//! constructors of `OperationHelper` and through `RequestEnvelope::audit_view`
-//! must produce the same audit entry (every serialized field) and the same
-//! notification event (the fields `event_json` lists). Each negative row
-//! changes one input the audit view derives, on the owned side only, and pins
-//! the owned value it must then carry.
+//! The legacy audit entries and notification events in the golden fixture were
+//! recorded from the completion probe at b55931ccc. The owned path must emit
+//! the same fields, including their absence. Each negative row changes a
+//! single input and checks which fields changed.
+//!
+//! The fixture normalizes wall-clock time and records whether timing was present.
 //!
 //! The completion probe is a process-global map keyed by bucket, so every test
 //! here runs under one `serial` key.
@@ -25,10 +25,8 @@
 use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::object_usecase::helper::MutationCompletionProbe;
 use crate::app::storage_api::owned_parity::{ReqInfo, RequestContext};
-use crate::app::storage_api::s3::{Credentials as S3sCredentials, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
 use crate::shared_types::RemoteAddr;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::storage_api::helper_consumer::StorageObjectInfo;
 use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use rustfs_audit::{AuditEntry, ObjectVersion};
@@ -294,25 +292,6 @@ fn response_headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         .collect()
 }
 
-fn legacy_result(answer: Answer) -> S3Result<S3Response<()>> {
-    match answer {
-        Answer::Ok(status, headers) => {
-            let mut response = S3Response::with_status((), status);
-            response.headers = response_headers(headers);
-            Ok(response)
-        }
-        Answer::NoSuchKey(message) => Err(S3Error::with_message(S3ErrorCode::NoSuchKey, message)),
-        Answer::Custom => Err(S3Error::with_message(S3ErrorCode::Custom("H2Custom".into()), "h2 custom refusal")),
-        Answer::BareCustom => Err(S3Error::new(S3ErrorCode::Custom("H2Custom".into()))),
-        Answer::Internal => {
-            let mut err = S3Error::internal_error(std::io::Error::other("disk fault"));
-            err.set_message("h2 storage fault");
-            Err(err)
-        }
-        Answer::Bare => Err(S3Error::new(S3ErrorCode::InternalError)),
-    }
-}
-
 fn owned_result(answer: Answer) -> rustfs_s3_types::S3Result<()> {
     use rustfs_s3_types::{S3Error, S3ErrorCode};
     match answer {
@@ -409,28 +388,6 @@ fn capture(probe: &MutationCompletionProbe) -> Captured {
     Captured { fields, rendered }
 }
 
-fn run_legacy(case: &Case) -> Captured {
-    let probe = MutationCompletionProbe::install(bucket(case));
-    let (uri, headers, extensions) = parts(case, None);
-    let req = S3Request {
-        input: (),
-        method: Method::PUT,
-        uri,
-        headers,
-        extensions,
-        credentials: case.credentials.then(|| S3sCredentials {
-            access_key: "h2-user".to_owned(),
-            secret_key: SECRET.into(),
-        }),
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    let helper = (case.steps)(OperationHelper::new(&req, case.event, case.op));
-    drop(helper.complete(&legacy_result(case.answer)));
-    capture(&probe)
-}
-
 fn run_owned(case: &Case, extra: Option<Request>) -> Captured {
     let probe = MutationCompletionProbe::install(bucket(case));
     let (uri, headers, extensions) = parts(case, extra);
@@ -454,34 +411,42 @@ fn run_owned(case: &Case, extra: Option<Request>) -> Captured {
     capture(&probe)
 }
 
-fn differing(legacy: &Captured, owned: &Captured) -> Vec<String> {
-    let keys: std::collections::BTreeSet<&String> = legacy.fields.keys().chain(owned.fields.keys()).collect();
+fn legacy_fields(name: &str) -> BTreeMap<String, Value> {
+    #[derive(serde::Deserialize)]
+    struct Golden {
+        common: BTreeMap<String, Value>,
+        cases: BTreeMap<String, BTreeMap<String, Value>>,
+    }
+
+    let mut golden: Golden = serde_json::from_str(include_str!("owned_audit_golden.json")).expect("legacy audit fixture");
+    golden.common.extend(golden.cases.remove(name).expect("recorded audit case"));
+    golden.common
+}
+
+fn differing(baseline: &BTreeMap<String, Value>, actual: &BTreeMap<String, Value>) -> Vec<String> {
+    let keys: std::collections::BTreeSet<_> = baseline.keys().chain(actual.keys()).collect();
     keys.into_iter()
-        .filter(|key| legacy.fields.get(*key) != owned.fields.get(*key))
+        .filter(|key| baseline.get(*key) != actual.get(*key))
         .cloned()
         .collect()
 }
 
 #[test]
 #[serial(owned_audit_probe)]
-fn owned_and_legacy_helpers_record_the_same_entry_and_event() {
+fn owned_helper_matches_the_recorded_audit_entry_and_event() {
     for case in CASES {
-        let legacy = run_legacy(case);
         let owned = run_owned(case, None);
-        assert_eq!(differing(&legacy, &owned), Vec::<String>::new(), "{}", case.name);
-        assert_eq!(legacy.fields["audit.count"], json!(1), "{}", case.name);
-        assert_eq!(legacy.fields["audit.timed"], json!(true), "{}", case.name);
+        assert_eq!(owned.fields, legacy_fields(case.name), "{}", case.name);
+        assert_eq!(owned.fields["audit.count"], json!(1), "{}", case.name);
+        assert_eq!(owned.fields["audit.timed"], json!(true), "{}", case.name);
         let expect_event = matches!(case.answer, Answer::Ok(..)) && case.name != "bulk delete objects";
-        assert_eq!(legacy.fields["event.count"], json!(usize::from(expect_event)), "{}", case.name);
-        for rendered in [&legacy.rendered, &owned.rendered] {
-            assert!(!rendered.contains(TOKEN), "{}: session token leaked: {rendered}", case.name);
-            assert!(!rendered.contains(SECRET), "{}: secret leaked: {rendered}", case.name);
-        }
+        assert_eq!(owned.fields["event.count"], json!(usize::from(expect_event)), "{}", case.name);
+        assert!(!owned.rendered.contains(TOKEN), "{}: session token leaked", case.name);
+        assert!(!owned.rendered.contains(SECRET), "{}: secret leaked", case.name);
     }
 }
 
-/// The rows a reader would check first are pinned to their legacy values, so
-/// "both paths agree" cannot mean "both paths lost the field".
+/// Pin the operation-specific fields exercised by these rows.
 #[test]
 #[serial(owned_audit_probe)]
 fn parity_rows_carry_the_fields_they_exercise() {
@@ -618,10 +583,10 @@ fn an_input_of_the_audit_view_reaches_the_owned_entry() {
     ];
     for (name, extra, expected) in rows {
         let case = case(name);
-        let legacy = run_legacy(&case);
+        let legacy = legacy_fields(case.name);
         let owned = run_owned(&case, Some(extra));
         let keys: Vec<String> = expected.iter().map(|(key, _)| (*key).to_owned()).collect();
-        assert_eq!(differing(&legacy, &owned), keys, "{name}");
+        assert_eq!(differing(&legacy, &owned.fields), keys, "{name}");
         for (key, value) in expected {
             assert_eq!(owned.fields.get(key), Some(&value), "{name}: {key}");
         }
@@ -632,35 +597,17 @@ fn an_input_of_the_audit_view_reaches_the_owned_entry() {
 /// hands the handler's result back unchanged, and builds no notification event.
 #[tokio::test]
 #[serial(owned_audit_probe)]
-async fn owned_audit_only_operation_matches_the_legacy_wrapper() {
+async fn owned_audit_only_operation_matches_the_recorded_entries() {
     let bucket = "h2-audit-only";
     let request = |h: &mut HeaderMap, e: &mut Extensions| common(h, e, bucket, "");
-    let rows: &[(StatusCode, Option<&'static str>)] = &[
-        (StatusCode::OK, None),
-        (StatusCode::NO_CONTENT, None),
-        (StatusCode::OK, Some("refused")),
+    let rows = [
+        ("audit-only 200", StatusCode::OK, None),
+        ("audit-only 204", StatusCode::NO_CONTENT, None),
+        ("audit-only refused", StatusCode::OK, Some("refused")),
     ];
-    for (status, refusal) in rows {
+    for (name, status, refusal) in rows {
         let probe = MutationCompletionProbe::install(bucket);
-        let (mut headers, mut extensions) = (HeaderMap::new(), Extensions::new());
-        request(&mut headers, &mut extensions);
-        let mut req = S3Request {
-            input: (),
-            method: Method::DELETE,
-            uri: Uri::from_static("/h2-audit-only?encryption"),
-            headers,
-            extensions,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        req.headers.insert("host", HeaderValue::from_static("h2.example.test"));
-        let legacy_answer = refusal.map_or(Answer::Ok(*status, &[]), Answer::NoSuchKey);
-        let legacy_result =
-            audit_only_operation(req, S3Operation::DeleteBucketEncryption, |_| async move { legacy_result(legacy_answer) }).await;
-        let legacy = capture(&probe);
-
+        let answer = refusal.map_or(Answer::Ok(status, &[]), Answer::NoSuchKey);
         let (mut headers, mut extensions) = (HeaderMap::new(), Extensions::new());
         request(&mut headers, &mut extensions);
         headers.insert("host", HeaderValue::from_static("h2.example.test"));
@@ -674,19 +621,19 @@ async fn owned_audit_only_operation_matches_the_legacy_wrapper() {
         };
         let envelope = RequestEnvelope::from_parts(head, extensions);
         let owned_result =
-            RequestEnvelope::audit_only_operation(envelope, S3Operation::DeleteBucketEncryption, *status, |req| async move {
+            RequestEnvelope::audit_only_operation(envelope, S3Operation::DeleteBucketEncryption, status, |req| async move {
                 assert_eq!(req.uri().path(), "/h2-audit-only", "the handler receives the request");
-                owned_result(legacy_answer)
+                owned_result(answer)
             })
             .await;
         let owned = capture(&probe);
 
-        assert_eq!(differing(&legacy, &owned), Vec::<String>::new(), "{status} {refusal:?}");
+        assert_eq!(owned.fields, legacy_fields(name), "{name}");
         assert_eq!(owned.fields["audit.count"], json!(1));
         assert_eq!(owned.fields["event.count"], json!(0), "audit-only builds no event");
         assert_eq!(owned.fields["audit.api.status_code"], json!(refusal.map_or(status.as_u16(), |_| 404)));
-        assert_eq!(legacy_result.is_ok(), owned_result.is_ok());
-        assert_eq!(owned_result.err().and_then(|err| err.message().map(str::to_owned)).as_deref(), *refusal);
+        assert_eq!(owned_result.is_ok(), refusal.is_none());
+        assert_eq!(owned_result.err().and_then(|err| err.message().map(str::to_owned)).as_deref(), refusal);
     }
 }
 
@@ -697,17 +644,25 @@ async fn owned_audit_only_operation_matches_the_legacy_wrapper() {
 #[test]
 #[serial(owned_audit_probe)]
 fn an_error_without_a_message_is_audited_under_its_code_name() {
-    for (answer, owned_error) in [(Answer::Bare, "InternalError"), (Answer::BareCustom, "H2Custom")] {
+    for (name, answer, owned_error) in [
+        ("bare error", Answer::Bare, "InternalError"),
+        ("bare custom error", Answer::BareCustom, "H2Custom"),
+    ] {
         let case = Case {
             answer,
             ..case("non-s3 cause")
         };
-        let (legacy, owned) = (run_legacy(&case), run_owned(&case, None));
-        assert_eq!(differing(&legacy, &owned), vec!["audit.error".to_owned()], "{owned_error}");
+        let legacy = legacy_fields(name);
+        let owned = run_owned(&case, None);
+        assert_eq!(differing(&legacy, &owned.fields), vec!["audit.error".to_owned()], "{owned_error}");
         assert_eq!(owned.fields.get("audit.error"), Some(&json!(owned_error)));
-        let legacy_error = legacy.fields.get("audit.error").and_then(Value::as_str);
+        let legacy_error = legacy.get("audit.error");
         match answer {
-            Answer::Bare => assert!(legacy_error.is_some_and(|message| !message.is_empty() && message != owned_error)),
+            Answer::Bare => assert!(
+                legacy_error
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| !message.is_empty() && message != owned_error)
+            ),
             _ => assert_eq!(legacy_error, None),
         }
     }
@@ -720,26 +675,22 @@ fn s3_op_total(op: S3Operation) -> u64 {
         .map_or(0, |snapshot| snapshot.total)
 }
 
-/// An operation is counted once per request, by its edge: the legacy constructor counts, as it
-/// did, for operations whose edge does not; the owned constructor never does, because the owned
-/// edge already counted before the use case built it.
+/// The owned gateway counts at the edge. Constructing and completing its helper
+/// must leave the count unchanged.
 #[test]
 #[serial(owned_audit_probe)]
-fn only_the_legacy_helper_counts_the_operation() {
+fn the_owned_helper_leaves_the_operation_count_unchanged() {
     let op = S3Operation::GetObjectRetention;
     let event = EventName::ObjectAccessedGetRetention;
-    let req = S3Request {
-        input: (),
+    let head = RequestHead {
         method: Method::GET,
         uri: Uri::from_static("/count-bucket/count-object?retention"),
         headers: HeaderMap::new(),
-        extensions: Extensions::new(),
         credentials: None,
         region: None,
         service: None,
-        trailing_headers: None,
     };
-    let envelope = RequestEnvelope::from_s3s(&req);
+    let envelope = RequestEnvelope::from_parts(head, Extensions::new());
 
     let before = s3_op_total(op);
     drop(OperationHelper::from_view(&envelope.audit_view(), event, op).complete_owned(
@@ -748,7 +699,65 @@ fn only_the_legacy_helper_counts_the_operation() {
         &HeaderMap::new(),
     ));
     assert_eq!(s3_op_total(op), before, "the owned helper counts nothing");
+}
 
-    drop(OperationHelper::new(&req, event, op).complete(&Ok(S3Response::new(()))));
-    assert_eq!(s3_op_total(op), before + 1, "the legacy helper counts once");
+#[test]
+#[serial_test::serial]
+fn gateway_still_counts_get_object_when_audit_and_notify_are_disabled() {
+    crate::app::gating_test_env::run_large_stack_test("get-counter-disabled-audit", || async {
+        use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
+        use std::sync::Arc;
+        use temp_env::async_with_vars;
+
+        async_with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("false")),
+            ],
+            async {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+                let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+                let context = Arc::new(crate::app::gating_test_env::app_context_from_current_environment(&ambient));
+                let slot = crate::runtime_sources::ServerContextSlot::new();
+                assert!(slot.install(Arc::clone(&context)));
+                let gateway = crate::server::TestGateway::over(&context, slot);
+                let req = RequestEnvelope::from_parts(
+                    RequestHead {
+                        method: Method::GET,
+                        uri: Uri::from_static("/missing-counter-bucket/object"),
+                        headers: HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    Extensions::new(),
+                );
+                assert!(matches!(
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject),
+                    OperationHelper::Disabled,
+                ));
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                let response = gateway
+                    .signed(Method::GET, "/missing-counter-bucket/object", vec![], bytes::Bytes::new())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert!(
+                    snapshotter.snapshot().into_vec().into_iter().any(|(key, _, _, value)| {
+                        key.key().name() == "rustfs_s3_operations_total"
+                            && key
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "op" && l.value() == S3Operation::GetObject.as_str())
+                            && matches!(value, metrics_util::debugging::DebugValue::Counter(1))
+                    }),
+                    "an admitted GET must count when audit and notify are disabled"
+                );
+            },
+        )
+        .await;
+    });
 }

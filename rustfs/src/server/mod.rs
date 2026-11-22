@@ -70,6 +70,8 @@ pub(crate) use event::{
     reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
 };
 #[cfg(test)]
+pub(crate) use gateway_handlers::{handler_error, prepare_lifecycle_configuration};
+#[cfg(test)]
 pub(crate) use gateway_stack::TestGateway;
 #[cfg(test)]
 pub(crate) use health::{

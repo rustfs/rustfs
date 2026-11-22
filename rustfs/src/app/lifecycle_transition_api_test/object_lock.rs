@@ -69,13 +69,7 @@ async fn object_lock_handlers_schedule_replication() {
     // A bucket without a replication configuration can skip the decision.
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
     object_meta
-        .put_object_legal_hold_fields(
-            envelope(),
-            &bucket,
-            object,
-            None,
-            Some(RequestedObjectLegalHold(Some(ObjectLockLegalHoldStatus::OFF.to_owned()))),
-        )
+        .put_object_legal_hold_fields(envelope(), &bucket, object, None, Some(RequestedObjectLegalHold(Some("OFF".to_owned()))))
         .await
         .expect("legal hold without replication should succeed");
     assert_eq!(
@@ -95,7 +89,7 @@ async fn object_lock_handlers_schedule_replication() {
             object,
             None,
             Some(RequestedObjectLockRetention {
-                mode: Some(ObjectLockRetentionMode::COMPLIANCE.to_owned()),
+                mode: Some("COMPLIANCE".to_owned()),
                 retain_until: Some(time::macros::datetime!(2030-01-01 00:00:00 UTC)),
             }),
         )
@@ -111,13 +105,7 @@ async fn object_lock_handlers_schedule_replication() {
     // A configured bucket must still evaluate the metadata replication decision.
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
     object_meta
-        .put_object_legal_hold_fields(
-            envelope(),
-            &bucket,
-            object,
-            None,
-            Some(RequestedObjectLegalHold(Some(ObjectLockLegalHoldStatus::ON.to_owned()))),
-        )
+        .put_object_legal_hold_fields(envelope(), &bucket, object, None, Some(RequestedObjectLegalHold(Some("ON".to_owned()))))
         .await
         .expect("put_object_legal_hold should succeed");
     assert_eq!(

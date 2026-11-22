@@ -203,7 +203,7 @@ pub(crate) mod owned_parity_consumer {
         authorize_staged_multipart_part, authorize_write_etag_condition,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
-    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
+    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry_for_view};
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_context::RequestContext;
     pub(crate) use super::super::request_markers::{
@@ -2691,8 +2691,7 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 // reading it with the other (rustfs/backlog#2745). The byte goldens in
 // `crates/ecstore/tests/bucket_config_goldens.rs` pin both codecs to the same
 // bytes for every family, so each direction is lossless for every document
-// either side produces. Tagging converts field by field because it carries no
-// XML of its own on this path. DELETE BY T4.1 (rustfs/backlog#2783) with the
+// either side produces. DELETE BY T4.1 (rustfs/backlog#2783) with the
 // rest of the legacy edge.
 /// Reads the persisted shape of a request configuration through the legacy writer.
 ///
@@ -2731,42 +2730,8 @@ where
 }
 
 #[cfg(test)]
-fn tags_from_s3s(tags: Vec<s3s::dto::Tag>) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
-    tags.into_iter()
-        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
-            key: tag.key,
-            value: tag.value,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn tags_to_s3s(tags: Vec<rustfs_gateway_types::cors_tagging::PersistedTag>) -> Vec<s3s::dto::Tag> {
-    tags.into_iter()
-        .map(|tag| s3s::dto::Tag {
-            key: tag.key,
-            value: tag.value,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn tagging_from_s3s(value: &s3s::dto::Tagging) -> rustfs_gateway_types::cors_tagging::PersistedTagging {
-    rustfs_gateway_types::cors_tagging::PersistedTagging {
-        tag_set: tags_from_s3s(value.tag_set.clone()),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn tagging_to_s3s(value: &rustfs_gateway_types::cors_tagging::PersistedTagging) -> s3s::dto::Tagging {
-    s3s::dto::Tagging {
-        tag_set: tags_to_s3s(value.tag_set.clone()),
-    }
-}
-
-#[cfg(test)]
 mod bucket_config_compat_tests {
-    use super::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
+    use super::{persisted_from_s3s, persisted_to_s3s};
     use rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration, PersistedObjectLockConfiguration, PersistedVersioningConfiguration,
@@ -2777,7 +2742,6 @@ mod bucket_config_compat_tests {
         ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ServerSideEncryption, ServerSideEncryptionByDefault,
         ServerSideEncryptionConfiguration, ServerSideEncryptionRule, VersioningConfiguration, WebsiteConfiguration,
     };
-    use s3s::dto::{Tag, Tagging};
 
     #[test]
     fn versioning_round_trips_including_the_minio_extensions() {
@@ -2872,16 +2836,18 @@ mod bucket_config_compat_tests {
 
     #[test]
     fn tagging_keeps_keyless_tags() {
-        let tagging = Tagging {
-            tag_set: vec![
-                Tag {
-                    key: Some("k".to_owned()),
-                    value: Some("v".to_owned()),
-                },
-                Tag { key: None, value: None },
-            ],
-        };
-        assert_eq!(tagging_to_s3s(&tagging_from_s3s(&tagging)), tagging);
+        use rustfs_gateway_types::persistence::{parse_tagging_dto, serialize_tagging_dto};
+
+        let xml = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag><Tag></Tag></TagSet></Tagging>";
+        let tagging = parse_tagging_dto(xml).expect("read stored tags");
+        let pairs: Vec<_> = tagging
+            .tag_set
+            .iter()
+            .map(|tag| (tag.key.as_deref(), tag.value.as_deref()))
+            .collect();
+        assert_eq!(pairs, [(Some("k"), Some("v")), (None, None)]);
+        let stored = rustfs_gateway_types::cors_tagging::parse_tagging(&serialize_tagging_dto(&tagging)).expect("read back tags");
+        assert_eq!(stored, rustfs_gateway_types::cors_tagging::parse_tagging(xml).unwrap());
     }
 }
 

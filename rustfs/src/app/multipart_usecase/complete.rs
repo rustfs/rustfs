@@ -802,11 +802,14 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::app::object::DefaultObjectUsecase;
     use crate::app::storage_api::s3::dto::{
         ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedPart, CreateMultipartUploadInput, ETag, ServerSideEncryption,
         StreamingBlob, UploadPartInput,
     };
     use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::etag_to_s3s;
+    use rustfs_gateway_types::dto::HeadObjectInput;
+    use rustfs_gateway_types::{BucketName, ObjectKey, SseCustomerKey};
 
     fn upload_metadata_with_checksum_type(recorded: &str) -> HashMap<String, String> {
         HashMap::from([(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(), recorded.to_string())])
@@ -1451,26 +1454,30 @@ mod tests {
                             response.checksum_sha256.as_deref().expect("completed checksum")
                         )));
                     }
-                    let etag = etag_to_s3s(&response.e_tag.expect("completed encrypted object ETag"));
+                    let etag = response.e_tag.expect("completed encrypted object ETag");
                     let version_id = response.version_id.expect("completed object version");
                     assert_ne!(version_id, "null");
-                    assert_multipart_etag_listings(&bucket, key, &etag, &version_id).await;
-                    let head = crate::app::test_seams::head_object_method_only(
-                        &crate::app::object::DefaultObjectUsecase::from_global(),
-                        crate::app::storage_api::s3::dto::HeadObjectInput {
-                            bucket: bucket.clone(),
-                            key: key.to_string(),
+                    assert_multipart_etag_listings(&bucket, key, &etag_to_s3s(&etag), &version_id).await;
+                    let head = crate::app::test_seams::head_object_gateway(
+                        &DefaultObjectUsecase::from_global(),
+                        owned_envelope(Method::HEAD),
+                        HeadObjectInput {
+                            bucket: BucketName::new(bucket.clone()).expect("test bucket name"),
+                            key: ObjectKey::new(key).expect("test object key"),
                             version_id: Some(version_id.clone()),
-                            sse_customer_algorithm: Some("AES256".to_string()),
-                            sse_customer_key: Some(customer_key.to_string()),
+                            sse_customer_algorithm: Some("AES256".to_owned()),
+                            sse_customer_key: Some(SseCustomerKey::new(customer_key.to_string())),
                             sse_customer_key_md5: Some(customer_md5.to_string()),
                             ..Default::default()
                         },
                     )
                     .await
-                    .expect("authorized HEAD of completed encrypted version");
-                    assert_eq!(head.output.e_tag, Some(etag));
-                    assert_eq!(head.output.version_id, Some(version_id));
+                    .expect("authorized HEAD of completed encrypted version")
+                    .output;
+                    let head_etag = head.etag.expect("completed version has an ETag");
+                    assert_eq!(head_etag.opaque, etag.opaque_tag());
+                    assert_eq!(head_etag.weak, etag.is_weak());
+                    assert_eq!(head.dto.version_id, Some(version_id));
                 } else {
                     assert_eq!(
                         result
@@ -1716,15 +1723,16 @@ mod tests {
                     }
                 }
                 .expect("complete and replay KMS multipart upload");
-                let etag = etag_to_s3s(&response.e_tag.expect("KMS completed ETag"));
+                let etag = response.e_tag.expect("KMS completed ETag");
                 let version_id = response.version_id.expect("KMS completed version");
                 assert_ne!(version_id, "null");
-                assert_multipart_etag_listings(&bucket, key, &etag, &version_id).await;
-                let head = crate::app::test_seams::head_object_method_only(
-                    &crate::app::object::DefaultObjectUsecase::from_global(),
-                    crate::app::storage_api::s3::dto::HeadObjectInput {
-                        bucket: bucket.clone(),
-                        key: key.to_string(),
+                assert_multipart_etag_listings(&bucket, key, &etag_to_s3s(&etag), &version_id).await;
+                let head = crate::app::test_seams::head_object_gateway(
+                    &DefaultObjectUsecase::from_global(),
+                    owned_envelope(Method::HEAD),
+                    HeadObjectInput {
+                        bucket: BucketName::new(bucket.clone()).expect("test bucket name"),
+                        key: ObjectKey::new(key).expect("test object key"),
                         version_id: Some(version_id.clone()),
                         ..Default::default()
                     },
@@ -1732,10 +1740,12 @@ mod tests {
                 .await
                 .expect("HEAD of completed KMS version")
                 .output;
-                assert_eq!(head.e_tag, Some(etag));
-                assert_eq!(head.version_id, Some(version_id));
-                assert_eq!(head.server_side_encryption.as_ref().map(|value| value.as_str()), Some("aws:kms"));
-                assert_eq!(head.ssekms_key_id.as_deref(), Some(kms_key.key_id.as_str()));
+                let head_etag = head.etag.expect("completed version has an ETag");
+                assert_eq!(head_etag.opaque, etag.opaque_tag());
+                assert_eq!(head_etag.weak, etag.is_weak());
+                assert_eq!(head.dto.version_id, Some(version_id));
+                assert_eq!(head.dto.server_side_encryption.as_ref().map(|value| value.as_str()), Some("aws:kms"));
+                assert_eq!(head.dto.ssekms_key_id.as_deref(), Some(kms_key.key_id.as_str()));
             }
             manager.stop().await.expect("stop local KMS");
         });

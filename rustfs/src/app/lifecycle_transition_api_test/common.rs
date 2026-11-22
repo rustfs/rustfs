@@ -294,20 +294,6 @@ pub(super) fn request_envelope(method: Method, headers: HeaderMap) -> crate::app
     )
 }
 
-pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
-        method,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
 pub(super) async fn read_object_bytes(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> Vec<u8> {
     let mut reader = (**ecstore)
         .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())

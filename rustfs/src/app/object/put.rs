@@ -146,11 +146,13 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
 ///
 /// Applies to `PutObject` and `UploadPart`. A negative or unknown length is
 /// left to the caller's existing validation.
-pub(crate) fn reject_oversize_single_upload(size: i64) -> S3Result<()> {
+pub(crate) fn reject_oversize_single_upload(size: i64) -> rustfs_s3_types::S3Result<()> {
+    use rustfs_s3_types::{S3Error, S3ErrorCode};
+
     if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
         return Err(S3Error::with_message(
             S3ErrorCode::EntityTooLarge,
-            ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge),
+            ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
         ));
     }
     Ok(())
@@ -5724,10 +5726,7 @@ mod oversize_single_upload_tests {
         assert!(reject_oversize_single_upload(-1).is_ok(), "unknown length is left to later validation");
 
         let err = reject_oversize_single_upload(ceiling + 1).expect_err("one byte over must be rejected");
-        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
-        assert_eq!(
-            err.message(),
-            Some(ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge).as_str())
-        );
+        assert_eq!(err.code(), &OwnedS3ErrorCode::EntityTooLarge);
+        assert_eq!(err.message(), Some("Your proposed upload exceeds the maximum allowed object size."));
     }
 }

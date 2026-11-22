@@ -62,6 +62,17 @@ pub(crate) async fn head_object_method_only(
     Ok(response)
 }
 
+/// Runs a gateway HEAD input through the production field projection.
+#[cfg(test)]
+pub(crate) async fn head_object_gateway(
+    usecase: &DefaultObjectUsecase,
+    envelope: crate::app::RequestEnvelope,
+    input: rustfs_gateway_types::dto::HeadObjectInput,
+) -> rustfs_s3_types::S3Result<crate::app::Answered<crate::app::object_usecase::HeadObjectOutputFacts>> {
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
+    head_object_fields(usecase, envelope, input.into()).await
+}
+
 /// Calls `DefaultObjectUsecase::execute_head_object_fields` with owned inputs.
 pub(crate) async fn head_object_fields(
     usecase: &DefaultObjectUsecase,

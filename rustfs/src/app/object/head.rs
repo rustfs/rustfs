@@ -93,6 +93,23 @@ pub(crate) struct HeadObjectFields {
     pub(crate) sse_customer_key_md5: Option<String>,
 }
 
+impl From<gateway_dto::HeadObjectInput> for HeadObjectFields {
+    fn from(input: gateway_dto::HeadObjectInput) -> Self {
+        Self {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            version_id: input.version_id,
+            part_number: input.part_number,
+            range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
+                RangeParse::One(range) => Some(range),
+                _ => None,
+            }),
+            sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
 /// Whether the caller asked for the tag set itself (`x-amz-tagging-directive: ACCESS`).
 fn tagging_directive_is_access(headers: &http::HeaderMap) -> bool {
     headers
@@ -444,22 +461,7 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: gateway_dto::HeadObjectInput,
     ) -> S3Result<Answered<HeadObjectOutputFacts>> {
-        self.execute_head_object_fields(
-            envelope,
-            HeadObjectFields {
-                bucket: input.bucket.as_str().to_owned(),
-                key: input.key.as_str().to_owned(),
-                version_id: input.version_id,
-                part_number: input.part_number,
-                range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
-                    RangeParse::One(range) => Some(range),
-                    _ => None,
-                }),
-                sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
-                sse_customer_key_md5: input.sse_customer_key_md5,
-            },
-        )
-        .await
+        self.execute_head_object_fields(envelope, input.into()).await
     }
 
     #[instrument(level = "debug", skip(self, req, input))]
