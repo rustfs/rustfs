@@ -285,7 +285,7 @@ impl Operation for AccountInfoHandler {
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
-                let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+                let bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
@@ -298,9 +298,17 @@ impl Operation for AccountInfoHandler {
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
                 };
-                apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
                 account_info.buckets.push(bucket_info);
             }
+        }
+
+        let allowed = account_info.buckets.iter().map(|bucket| bucket.name.clone()).collect();
+        let measured =
+            crate::admin::storage_api::data_usage::verified_account_bucket_usage(store, data_usage_info.buckets_usage, allowed)
+                .await;
+        for bucket in &mut account_info.buckets {
+            let usage = measured.get(&bucket.name);
+            apply_usage_to_bucket_access_info(bucket, usage);
         }
 
         let data = serde_json::to_vec(&AccountInfoResponse {

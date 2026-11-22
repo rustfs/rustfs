@@ -34,6 +34,35 @@ pub(crate) async fn get_object(
     Ok(response)
 }
 
+/// [`get_object`] for a fixture that sets nothing but `GET /`.
+///
+/// `build_request` leaves the URI, headers, and extensions empty, so this envelope matches that request.
+#[cfg(test)]
+pub(crate) async fn get_object_method_only(
+    usecase: &DefaultObjectUsecase,
+    input: GetObjectInput,
+) -> S3Result<S3Response<GetObjectOutput>> {
+    use crate::app::object_usecase::GetObjectFields;
+    use crate::app::{Answered, RequestEnvelope};
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+    let envelope = RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        http::Extensions::new(),
+    );
+    let Answered { output, status, headers } = get_object_fields(usecase, envelope, GetObjectFields::from_s3s(input)).await?;
+    let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
+    response.status = status;
+    response.headers = headers;
+    Ok(response)
+}
+
 /// Calls `DefaultObjectUsecase::execute_get_object_fields` with owned inputs.
 pub(crate) async fn get_object_fields(
     usecase: &DefaultObjectUsecase,

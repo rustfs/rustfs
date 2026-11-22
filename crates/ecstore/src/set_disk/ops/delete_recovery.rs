@@ -17,8 +17,8 @@
 
 use crate::disk::error::{DiskError, Result, RpcStatusError};
 use crate::disk::{
-    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryAction, DeleteRecoveryInspection, DeleteRecoveryState, DeleteTransactionId,
-    DiskAPI, DiskStore,
+    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryAction, DeleteRecoveryInspection, DeleteRecoveryJournal, DeleteRecoveryState,
+    DeleteRecoveryVersionIdentity, DeleteTransactionId, DiskAPI, DiskStore,
 };
 use crate::error::StorageError;
 use crate::set_disk::SetDisks;
@@ -204,14 +204,37 @@ pub(in crate::set_disk) fn unsupported_recovery(error: &DiskError) -> bool {
             .is_some_and(|status| status.status().code() == tonic::Code::Unimplemented))
 }
 
-/// Set authority needs generation identities, not the potentially large
-/// per-version apply requests carried by returning-drive adoption.
 struct DecisionEvidence {
     transaction: Uuid,
     deleted_versions: HashSet<Uuid>,
-    original_versions: HashSet<crate::disk::DeleteRecoveryVersionIdentity>,
+    original_null_versions: HashSet<DeleteRecoveryVersionIdentity>,
     predecessors: HashSet<Uuid>,
     target_absent: bool,
+}
+
+impl From<&DeleteRecoveryJournal> for DecisionEvidence {
+    fn from(journal: &DeleteRecoveryJournal) -> Self {
+        let deleted_versions: HashSet<_> = journal.deleted_versions.iter().copied().collect();
+        // Only the null version can be reused for a different generation.
+        // Adjacent transactions deleting unique version IDs need no identity index.
+        let original_null_versions = if deleted_versions.contains(&Uuid::nil()) {
+            journal
+                .original_versions
+                .iter()
+                .filter(|source| source.version_id.is_none_or(|id| id.is_nil()))
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        Self {
+            transaction: journal.transaction,
+            deleted_versions,
+            original_null_versions,
+            predecessors: journal.predecessors.iter().copied().collect(),
+            target_absent: journal.target_digest.is_none(),
+        }
+    }
 }
 
 fn receipt(state: DeleteRecoveryState) -> bool {
@@ -1038,13 +1061,7 @@ impl SetDisks {
             .flatten()
             .filter(|state| receipt(state.state))
             .filter_map(|state| state.journal.as_ref())
-            .map(|journal| DecisionEvidence {
-                transaction: journal.transaction,
-                deleted_versions: journal.deleted_versions.iter().copied().collect(),
-                original_versions: journal.original_versions.iter().cloned().collect(),
-                predecessors: journal.predecessors.iter().copied().collect(),
-                target_absent: journal.target_digest.is_none(),
-            })
+            .map(DecisionEvidence::from)
             .collect::<Vec<_>>();
         let mut unresolved = false;
         let mut mutated = false;
@@ -1100,49 +1117,43 @@ impl SetDisks {
                 .iter()
                 .filter(|state| receipt(state.state))
                 .filter_map(|state| state.journal.as_ref())
-                .max_by_key(|journal| !journal.requests.is_empty())
-                .cloned();
+                .max_by_key(|journal| !journal.requests.is_empty());
+            let finished =
+                |copy: &DeleteRecoveryInspection| copy.state == DeleteRecoveryState::CommitFinished && copy.commit_data_safe;
+            if authority.is_some() && copies.iter().all(finished) {
+                // Neither settlement phase writes. The sibling inspections
+                // remain valid under the same key fence.
+                summary.committed += 1;
+                continue;
+            }
             let prepared = copies.iter().find_map(|state| state.journal.as_ref());
-            let covered = prepared
-                .filter(|journal| !journal.deleted_versions.is_empty())
-                .is_some_and(|journal| {
-                    authorities.iter().any(|authority| {
-                        journal.deleted_versions.iter().all(|version| {
-                            authority.deleted_versions.contains(version)
-                                && (!version.is_nil()
-                                    || journal
-                                        .original_versions
-                                        .iter()
-                                        .filter(|source| source.version_id.is_none_or(|id| id.is_nil()))
-                                        .all(|source| authority.original_versions.contains(source))
-                                    || (authority.predecessors.contains(&journal.transaction)
-                                        && journal.target_digest.is_none()
-                                        && authority.target_absent
-                                        && copies.iter().all(|copy| {
-                                            copy.current_digest.is_none() || copy.current_versions == journal.original_versions
-                                        })))
+            let can_finish = authority.is_some()
+                || fresh_absence_decision
+                || prepared
+                    .filter(|journal| !journal.deleted_versions.is_empty())
+                    .is_some_and(|journal| {
+                        authorities.iter().any(|authority| {
+                            journal.deleted_versions.iter().all(|version| {
+                                authority.deleted_versions.contains(version)
+                                    && (!version.is_nil()
+                                        || journal
+                                            .original_versions
+                                            .iter()
+                                            .filter(|source| source.version_id.is_none_or(|id| id.is_nil()))
+                                            .all(|source| authority.original_null_versions.contains(source))
+                                        || (authority.predecessors.contains(&journal.transaction)
+                                            && journal.target_digest.is_none()
+                                            && authority.target_absent
+                                            && copies.iter().all(|copy| {
+                                                copy.current_digest.is_none()
+                                                    || copy.current_versions == journal.original_versions
+                                            })))
+                            })
                         })
-                    })
-                });
-            let original_quorum = prepared.is_some_and(|journal| {
-                copies
-                    .iter()
-                    .filter(|copy| copy.current_versions == journal.original_versions)
-                    .count()
-                    > self.set_drive_count / 2
-            });
-            let all_decisions_precede = !authorities.is_empty()
-                && authorities.iter().all(|authority| {
-                    copies
-                        .iter()
-                        .filter_map(|copy| copy.journal.as_ref())
-                        .any(|journal| journal.predecessors.contains(&authority.transaction))
-                });
-            if authority.is_some() || covered || fresh_absence_decision {
+                    });
+            if can_finish {
                 let certified_same_transaction = authority.is_some();
-                let reference = authority
-                    .or_else(|| copies.iter().find_map(|state| state.journal.clone()))
-                    .ok_or(DiskError::FileCorrupt)?;
+                let reference = authority.or(prepared).ok_or(DiskError::FileCorrupt)?;
                 if dry_run {
                     if copies.iter().any(|copy| {
                         if certified_same_transaction
@@ -1152,7 +1163,7 @@ impl SetDisks {
                         {
                             copy.journal
                                 .as_ref()
-                                .is_none_or(|local| !local.matches_prepared_authority(&reference))
+                                .is_none_or(|local| !local.matches_prepared_authority(reference))
                         } else if copy.state == DeleteRecoveryState::Absent {
                             copy.current_digest.is_some() && !reference.matches_adoption_source(&copy.current_versions)
                         } else {
@@ -1165,6 +1176,14 @@ impl SetDisks {
                     }
                     continue;
                 }
+                let needs_adoption = |copy: &DeleteRecoveryInspection| {
+                    copy.state == DeleteRecoveryState::Absent
+                        || (certified_same_transaction
+                            && copy.state == DeleteRecoveryState::NewPrepared
+                            && copy.current_digest.is_none()
+                            && !copy.commit_data_safe)
+                };
+                let adoption_source = copies.iter().any(needs_adoption).then(|| reference.clone());
                 mutated = true;
                 let mut pending = settle_group(
                     &disks,
@@ -1174,20 +1193,12 @@ impl SetDisks {
                         if receipt(copy.state) && copy.commit_data_safe {
                             return None;
                         }
-                        Some(
-                            if copy.state == DeleteRecoveryState::Absent
-                                || (certified_same_transaction
-                                    && copy.state == DeleteRecoveryState::NewPrepared
-                                    && copy.current_digest.is_none()
-                                    && !copy.commit_data_safe)
-                            {
-                                DeleteRecoveryAction::AdoptCommit {
-                                    authority: Box::new(reference.clone()),
-                                }
-                            } else {
-                                DeleteRecoveryAction::PublishCommit
+                        Some(match adoption_source.as_ref().filter(|_| needs_adoption(copy)) {
+                            Some(authority) => DeleteRecoveryAction::AdoptCommit {
+                                authority: Box::new(authority.clone()),
                             },
-                        )
+                            None => DeleteRecoveryAction::PublishCommit,
+                        })
                     },
                     can_commit,
                     RecoveryWorkScope {
@@ -1202,10 +1213,7 @@ impl SetDisks {
                         &disks,
                         bucket,
                         copies,
-                        |copy| {
-                            (copy.state != DeleteRecoveryState::CommitFinished || !copy.commit_data_safe)
-                                .then_some(DeleteRecoveryAction::FinishCommit)
-                        },
+                        |copy| (!finished(copy)).then_some(DeleteRecoveryAction::FinishCommit),
                         can_commit,
                         RecoveryWorkScope {
                             namespace_owner: namespace_owner.as_ref(),
@@ -1224,7 +1232,21 @@ impl SetDisks {
             } else {
                 // A sibling decision or foreign generation can supersede this
                 // snapshot. Never guess by restoring the whole old backup.
-                if (!authorities.is_empty() && !original_quorum && !all_decisions_precede)
+                let conflicts_with_decision = !authorities.is_empty()
+                    && !prepared.is_some_and(|journal| {
+                        copies
+                            .iter()
+                            .filter(|copy| copy.current_versions == journal.original_versions)
+                            .count()
+                            > self.set_drive_count / 2
+                    })
+                    && !authorities.iter().all(|authority| {
+                        copies
+                            .iter()
+                            .filter_map(|copy| copy.journal.as_ref())
+                            .any(|journal| journal.predecessors.contains(&authority.transaction))
+                    });
+                if conflicts_with_decision
                     || copies
                         .iter()
                         .any(|state| state.state != DeleteRecoveryState::Absent && !state.rollback_data_complete)
@@ -3736,6 +3758,128 @@ mod tests {
                 .await
                 .expect("settled receipts must not block removal of the empty bucket");
         }
+    }
+
+    #[test]
+    fn delete_recovery_decision_indexes_only_null_generation_evidence() {
+        let mut current = DeleteRecoveryVersionIdentity {
+            version_id: None,
+            mod_time: None,
+            data_dir: Some(Uuid::from_u128(1)),
+            deleted: false,
+            metadata_digest: [0; 32],
+        };
+        let null_without_id = current.clone();
+        current.version_id = Some(Uuid::nil());
+        current.data_dir = Some(Uuid::from_u128(2));
+        let mut original_versions: Vec<_> = (1..=8_192)
+            .map(|id| DeleteRecoveryVersionIdentity {
+                version_id: Some(Uuid::from_u128(id)),
+                ..current.clone()
+            })
+            .collect();
+        original_versions.extend([null_without_id.clone(), current.clone()]);
+        let mut journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".to_owned(),
+            object: "object".to_owned(),
+            transaction: Uuid::from_u128(20_000),
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: vec![Uuid::from_u128(1)],
+            requests: Vec::new(),
+            original_versions,
+            predecessors: Vec::new(),
+        };
+        let versioned = DecisionEvidence::from(&journal);
+        assert!(versioned.original_null_versions.is_empty());
+        assert!(versioned.deleted_versions.contains(&Uuid::from_u128(1)));
+
+        journal.deleted_versions.push(Uuid::nil());
+        let mixed = DecisionEvidence::from(&journal);
+        assert_eq!(mixed.original_null_versions, HashSet::from([null_without_id, current.clone()]));
+        current.metadata_digest = [1; 32];
+        assert!(
+            !mixed.original_null_versions.contains(&current),
+            "reusing the null version ID cannot authorize a different generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_finished_receipts_do_not_rescan_blocked_siblings() {
+        let bucket = "recover-finished-before-legacy";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let first = put(&store, bucket, &[11; 4096], true).await.expect("first version");
+        let second = put(&store, bucket, &[12; 4096], true).await.expect("second version");
+        let survivor = put(&store, bucket, &[13; 4096], true).await.expect("surviving version");
+        for (id, version) in [(10, first), (20, second)] {
+            let transaction = applied_at(&store, &disks, bucket, Some(version), disks.len(), Uuid::from_u128(id)).await;
+            for disk in &disks {
+                publish(disk, bucket, transaction).await;
+                let state = disk
+                    .inspect_delete_transaction(bucket, "object", transaction)
+                    .await
+                    .expect("certified transaction");
+                let finished = disk
+                    .settle_delete_transaction(
+                        bucket,
+                        "object",
+                        transaction,
+                        state.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await
+                    .expect("finish certified transaction before coordinator retry");
+                assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+            }
+        }
+        let legacy = Uuid::from_u128(30);
+        for dir in &dirs {
+            let data = dir.path().join(bucket).join("object").join(Uuid::from_u128(40).to_string());
+            tokio::fs::create_dir(&data).await.expect("legacy data directory");
+            tokio::fs::write(data.join(format!("reserve-delete-data.{legacy}")), [])
+                .await
+                .expect("legacy reservation without a decision");
+        }
+
+        // Admit enough work for complete discovery and exactly one inspection
+        // per transaction and drive. No-op settlement must fit this budget.
+        let mut entries = 0;
+        for disk in &disks {
+            let page = disk
+                .discover_delete_transactions_bounded(bucket, "object", 4096)
+                .await
+                .expect("inspect bounded discovery cost");
+            assert!(page.complete);
+            assert_eq!(page.transactions.len(), 3);
+            entries += page.visited;
+            for id in page.transactions {
+                let cost = disk
+                    .inspect_delete_transaction_bounded(bucket, "object", id.transaction, 4096)
+                    .await
+                    .expect("inspect bounded evidence cost");
+                entries += cost.visited;
+            }
+        }
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        let mut context = DeleteRecoveryContext::new(Some(incarnation), &|| true);
+        context.work_budget = Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::new(entries)));
+        let report = store.pools[0].disk_set[0]
+            .recover_delete_object(bucket, "object", context)
+            .await
+            .expect("finished receipts must not invalidate sibling inspections");
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.legacy_ambiguous, 1);
+        for disk in &disks {
+            let page = disk
+                .discover_delete_transactions(bucket, Some("object"), None, 128)
+                .await
+                .expect("unresolved key still retains its evidence");
+            assert_eq!(page.transactions.len(), 3, "the key-wide GC barrier keeps certified receipts");
+        }
+        assert_eq!(body(&store, bucket, Some(survivor)).await, vec![13; 4096]);
     }
 
     #[tokio::test]
