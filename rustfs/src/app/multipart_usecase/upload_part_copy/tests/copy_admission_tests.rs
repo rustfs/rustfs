@@ -345,17 +345,39 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                 .upload_id(upload.upload_id.clone())
                 .build()
                 .expect("range request");
-            let response = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT))).await;
+            let response = Box::pin(usecase.execute_upload_part_copy_with_audit(
+                owned_envelope(Method::PUT),
+                UploadPartCopyWriteInput {
+                    target: UploadPartTarget::Legacy {
+                        bucket: input.bucket,
+                        key: input.key,
+                        upload_id: input.upload_id,
+                    },
+                    part_number: input.part_number,
+                    copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+                    copy_source_range: input.copy_source_range,
+                    copy_source_if_match: input.copy_source_if_match.map(&condition),
+                    copy_source_if_none_match: input.copy_source_if_none_match.map(&condition),
+                    sse_customer_algorithm: input.sse_customer_algorithm,
+                    sse_customer_key: input.sse_customer_key,
+                    sse_customer_key_md5: input.sse_customer_key_md5,
+                    copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+                    copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+                    copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+                },
+            ))
+            .await;
             assert_eq!(
                 manager.put_object_admission_snapshot().active,
                 Some(0),
                 "copy releases its permit on every outcome"
             );
             if capped {
-                assert_eq!(
-                    response.expect_err("range exceeds destination size limit").code(),
-                    &S3ErrorCode::EntityTooLarge
-                );
+                let error = match response {
+                    Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                    Ok(_) => panic!("range exceeds destination size limit"),
+                };
+                assert_eq!(error.code(), &S3ErrorCode::EntityTooLarge);
                 let parts = store
                     .list_object_parts(&bucket, "object", &upload.upload_id, None, 1000, &ObjectOptions::default())
                     .await
@@ -366,16 +388,16 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                     .await
                     .expect("abort capped session");
             } else {
-                let copied = response.expect("range copy after failed request released its source and permit");
+                let copied = match response {
+                    Ok(output) => output,
+                    Err(error) => panic!("range copy after failed request released its source and permit: {error:?}"),
+                };
                 let etag = copied
-                    .output
-                    .copy_part_result
-                    .expect("range result")
                     .e_tag
-                    .expect("range ETag")
-                    .value()
-                    .trim_matches('"')
-                    .to_owned();
+                    .as_deref()
+                    .map(crate::storage::storage_api::to_s3s_xml_etag)
+                    .expect("range ETag");
+                let etag = etag.value().trim_matches('"').to_owned();
                 Arc::clone(&store)
                     .complete_multipart_upload(
                         &bucket,
