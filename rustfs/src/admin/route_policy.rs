@@ -307,6 +307,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Delete,
+        "/rustfs/admin/v3/target/{target_type}/{target_name}",
+        SET_BUCKET_TARGET,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
         "/rustfs/admin/v3/target/{target_type}/{target_name}/reset",
         SET_BUCKET_TARGET,
         RouteRiskLevel::High,
@@ -824,6 +830,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/remove",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/remove-v2",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/site-replication/remove-v2/capabilities",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/peer/remove-v2",
         SITE_REPLICATION_REMOVE,
         RouteRiskLevel::High,
     ),

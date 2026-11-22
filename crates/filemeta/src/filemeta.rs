@@ -366,10 +366,6 @@ impl FileMeta {
         Ok(Self::find_inline_data_slice(inline_data, version_id)?.map(<[u8]>::to_vec))
     }
 
-    fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
-        Self::find_inline_data_in_slice(self.data.as_slice(), version_id)
-    }
-
     // Find version
     pub fn find_version(&self, vid: Option<Uuid>) -> Result<(usize, FileMetaVersion)> {
         let vid = vid.unwrap_or_default();

@@ -42,7 +42,6 @@ use crate::app::runtime_sources::current_tier_config_handle;
 use crate::app::storage_api::s3::S3ErrorCode;
 use bytes::Bytes;
 use futures::FutureExt;
-use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_gateway_types::dto::Status;
@@ -57,7 +56,6 @@ use rustfs_utils::path::encode_dir_object;
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
-    convert::Infallible,
     env, fs as stdfs,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -78,12 +76,3 @@ mod object_lock;
 mod put;
 mod restore;
 mod transition;
-
-/// PutObject through its test seam, from a test's s3s fixture request.
-async fn put_through_seam(
-    usecase: &DefaultObjectUsecase,
-    req: S3Request<PutObjectInput>,
-) -> rustfs_s3_types::S3Result<crate::app::object_usecase::PutObjectWriteOutput> {
-    let (envelope, input) = crate::app::object_usecase::PutObjectWriteInput::from_test_request(req);
-    crate::app::test_seams::put_object(usecase, envelope, input).await
-}

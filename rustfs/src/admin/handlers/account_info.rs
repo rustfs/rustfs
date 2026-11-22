@@ -20,9 +20,7 @@ use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::admin::storage_api::data_usage::{
-    apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached, load_bucket_scan_progress_for_admin,
-};
+use crate::admin::storage_api::data_usage::{load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
@@ -316,14 +314,13 @@ impl Operation for AccountInfoHandler {
         // process-local absolute counters to cluster-wide bucket totals.
         // This path never triggers a live full-version listing
         // (rustfs/backlog#1306); freshness is owned by the scanner.
-        let mut data_usage_info = map_data_usage_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
-        apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
+        let data_usage_info = map_data_usage_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
         account_info.usage_snapshot_converged = data_usage_info.usage_snapshot_converged;
 
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
-                let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+                let bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
@@ -336,7 +333,6 @@ impl Operation for AccountInfoHandler {
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
                 };
-                apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
                 account_info.buckets.push(bucket_info);
             }
         }
@@ -346,8 +342,15 @@ impl Operation for AccountInfoHandler {
             .iter()
             .map(|bucket| bucket.name.clone())
             .collect::<Vec<_>>();
-        let mut progress = load_bucket_scan_progress_for_admin(store, &visible_buckets, &data_usage_info).await;
+        let mut progress = load_bucket_scan_progress_for_admin(store.clone(), &visible_buckets, &data_usage_info).await;
+        let measured = crate::admin::storage_api::data_usage::verified_account_bucket_usage(
+            store,
+            data_usage_info.buckets_usage,
+            visible_buckets,
+        )
+        .await;
         for bucket in &mut account_info.buckets {
+            apply_usage_to_bucket_access_info(bucket, measured.get(&bucket.name));
             bucket.scan_progress = progress.remove(&bucket.name).map(bucket_scan_progress_response);
         }
 

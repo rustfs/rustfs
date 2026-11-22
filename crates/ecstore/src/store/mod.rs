@@ -410,7 +410,7 @@ async fn enqueue_transition_after_write(
             // transition/expiry already ran for the original commit; the scanner
             // still sees the object if that commit never reached this hook.
             if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_transition_immediate(&oi, src.clone(), opts.expected_bucket_incarnation_id).await;
                 // Immediate expiry needs the bucket incarnation under the
                 // metadata-transaction lock; a lockless cache PUT leaves expiry
                 // to the scanner.

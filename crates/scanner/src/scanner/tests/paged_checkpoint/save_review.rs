@@ -139,6 +139,87 @@ async fn indefinite_partial_checkpoints_keep_unreachable_bytes_bounded() {
     );
 }
 
+async fn reopen_checkpoint_store(store: &MemoryConfigStore) -> Arc<MemoryConfigStore> {
+    let reopened = Arc::new(MemoryConfigStore::default());
+    *reopened.objects.lock().await = store.objects.lock().await.clone();
+    *reopened.revisions.lock().await = store.revisions.lock().await.clone();
+    *reopened.put_counts.lock().await = store.put_counts.lock().await.clone();
+    reopened
+}
+
+#[tokio::test]
+async fn abandoned_checkpoint_generation_is_reclaimed_after_an_inline_commit() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let main = memory_config_key(RUSTFS_META_BUCKET, &format!("{BUCKET_META_PREFIX}/{NAME}"));
+    let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+        .await
+        .expect("empty store");
+    let mut committed = empty_bucket_checkpoint();
+    committed
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("commit small checkpoint");
+
+    let before = layout(&store).await;
+    let revisions = DataUsageCache::read_revisions(store.clone(), NAME)
+        .await
+        .expect("inline revision");
+    store.fail_puts_from.lock().await.insert(main.clone(), before[&main].0 + 1);
+    seeded()
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect_err("interrupt the root commit after staging the large checkpoint");
+
+    let staged: Vec<_> = layout(&store)
+        .await
+        .into_keys()
+        .filter(|path| path.contains(".bin.pages/") && !before.contains_key(path))
+        .collect();
+    assert!(staged.len() > 1, "the interrupted commit must have written pages");
+    assert_eq!(
+        DataUsageCache::read_revisions(store.clone(), NAME)
+            .await
+            .expect("roots remain readable"),
+        revisions
+    );
+
+    // Preserve durable objects while dropping the interrupted writer's receipts.
+    let store = reopen_checkpoint_store(&store).await;
+    store.fail_prefix_deletes.store(true, Ordering::Relaxed);
+    committed.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 1,
+            size: 17,
+            ..Default::default()
+        },
+    );
+    committed
+        .save_with_revisions_for_epoch(store.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("publish the different inline checkpoint despite interrupted cleanup");
+    let interrupted_cleanup = layout(&store).await;
+    assert!(staged.iter().all(|path| interrupted_cleanup.contains_key(path)));
+
+    // A second restart leaves only the new root's durable cleanup record.
+    let restarted = reopen_checkpoint_store(&store).await;
+    let mut restored = DataUsageCache::default();
+    let revisions = restored
+        .load_with_revisions(restarted.clone(), NAME)
+        .await
+        .expect("restore the committed inline checkpoint");
+    assert_eq!(restored.checked_flatten("bucket").expect("inline totals").size, 17);
+    restored
+        .save_with_revisions_for_epoch(restarted.clone(), NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("reclaim the abandoned generation after restart");
+    let after = layout(&restarted).await;
+    assert!(staged.iter().all(|path| !after.contains_key(path)), "abandoned pages leaked");
+    restored.load(restarted, NAME).await.expect("load after reclaim");
+    assert_eq!(restored.checked_flatten("bucket").expect("retained inline totals").size, 17);
+}
+
 enum BackupDamage {
     Missing,
     Corrupt,

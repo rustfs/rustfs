@@ -542,8 +542,8 @@ mod deadlock_request_guard_tests {
     }
 }
 
-pub(super) async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
-    enqueue_transition_immediate(obj_info, src).await;
+pub(super) async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc, incarnation: Option<uuid::Uuid>) {
+    enqueue_transition_immediate(obj_info, src, incarnation).await;
 }
 
 /// Inject additional-checksum response headers (XXHash3/64/128, SHA-512) that s3s

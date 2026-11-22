@@ -1259,6 +1259,40 @@ async fn recovered_replacement_never_uses_a_fresh_resume_disk() {
 }
 
 #[tokio::test]
+async fn automatic_replacement_does_not_format_a_mount_outside_its_execution_lease() {
+    let temp = TempDir::new().expect("resume disk directory");
+    let disk = make_resume_disk(&temp).await;
+    let leased = replacement_identity("replacement-a", "device-a", "mount-a");
+    let remounted = replacement_identity("replacement-a", "device-a", "mount-b");
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![remounted.clone()], vec![remounted]])),
+        replacement_execution_fixture: Mutex::new(Some(crate::heal::storage::ReplacementExecution::for_test(
+            Vec::new(),
+            vec![leased.clone()],
+        ))),
+        resume_disk: Mutex::new(Some(disk.clone())),
+        ..Default::default()
+    });
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    let task = HealTask::from_request(request, storage.clone());
+
+    let error = task.execute().await.expect_err("a remount must be rejected before format");
+    assert!(error.to_string().contains("changed during format"), "{error}");
+    assert!(storage.replacement_format_calls.lock().unwrap().is_empty());
+
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("durable intent should identify the leased target")
+        .get_state()
+        .await;
+    assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+    assert_eq!(state.replacement_target_identities, vec![leased]);
+}
+
+#[tokio::test]
 async fn automatic_replacement_rejects_a_new_identity_after_format() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let disk = make_resume_disk(&temp).await;
@@ -1267,11 +1301,7 @@ async fn automatic_replacement_rejects_a_new_identity_after_format() {
     let storage = Arc::new(MockStorage {
         bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
-        replacement_target_identity_sequences: Mutex::new(VecDeque::from([
-            vec![first_identity.clone()],
-            vec![first_identity.clone()],
-            vec![second_identity],
-        ])),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![first_identity.clone()], vec![second_identity]])),
         resume_disk: Mutex::new(Some(disk.clone())),
         ..Default::default()
     });

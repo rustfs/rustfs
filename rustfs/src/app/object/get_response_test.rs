@@ -543,8 +543,18 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
         .build()
         .unwrap();
     {
-        let (envelope, input) =
-            crate::app::object_usecase::PutObjectWriteInput::from_test_request(build_request(input, Method::PUT));
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let input = crate::app::object_usecase::PutObjectWriteInput::from_legacy(input, None);
         crate::app::test_seams::put_object(usecase, envelope, input)
     }
     .await

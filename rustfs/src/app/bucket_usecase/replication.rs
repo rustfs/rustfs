@@ -232,6 +232,10 @@ impl DefaultBucketUsecase {
             S3Operation::DeleteBucketReplication,
             StatusCode::OK,
             |envelope| async move {
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
                 let (site_peers, contract) = prepare.await?;
                 self.delete_bucket_replication(envelope, bucket, site_peers, contract).await
             },
@@ -371,6 +375,10 @@ impl DefaultBucketUsecase {
             S3Operation::PutBucketReplication,
             StatusCode::OK,
             |envelope| async move {
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
                 let (replication_configuration, site_peers, contract) = prepare.await?;
                 self.put_bucket_replication(envelope, bucket, replication_configuration, site_peers, contract)
                     .await

@@ -21,8 +21,9 @@ use crate::app::object_meta::ObjectMetaUsecase;
 use crate::app::object_meta::torrent::execute_get_object_torrent;
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::object_meta::{
-    RequestedObjectLegalHold, RequestedObjectLockRetention, RequestedObjectTags, authorize_object_tagging_request,
-    authorize_put_object_legal_hold, authorize_put_object_retention, authorize_put_object_tagging,
+    RequestedObjectLegalHold, RequestedObjectLockRetention, RequestedObjectTags, authorize_delete_object_tagging,
+    authorize_object_tagging_request, authorize_put_object_acl, authorize_put_object_legal_hold, authorize_put_object_retention,
+    authorize_put_object_tagging,
 };
 use crate::storage_api::server::http::access::authorize_object_request;
 use rustfs_gateway::{Req, Resp, dto};
@@ -91,8 +92,11 @@ impl Served for dto::PutObjectAcl {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let input = request.input();
-        let object = (&input.bucket, &input.key, input.version_id.as_deref());
-        authorize_object(envelope, object, S3Action::PutObjectAclAction).await
+        let server = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
+        authorize_put_object_acl(envelope, &server, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref()).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -164,7 +168,11 @@ impl Served for dto::DeleteObjectTagging {
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let input = request.input();
         let (bucket, key, version_id) = (input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref());
-        authorize_object_tagging_request(envelope, bucket, key, version_id, S3Action::DeleteObjectTaggingAction).await
+        let server = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
+        authorize_delete_object_tagging(envelope, &server, bucket, key, version_id).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -189,7 +197,19 @@ impl Served for dto::PutObjectTagging {
                 .filter_map(|tag| Some((tag.key.clone()?, tag.value.clone()?)))
                 .collect(),
         );
-        authorize_put_object_tagging(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref(), tags).await
+        let server = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
+        authorize_put_object_tagging(
+            envelope,
+            &server,
+            input.bucket.as_str(),
+            input.key.as_str(),
+            input.version_id.as_deref(),
+            tags,
+        )
+        .await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {

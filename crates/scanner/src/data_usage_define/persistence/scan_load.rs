@@ -109,7 +109,10 @@ impl DataUsageCache {
         tokio::select! {
             biased;
             _ = ctx.cancelled() => Ok(None),
-            result = self.load_for_scan_window(store, name, budget) => result,
+            result = crate::storage_api::ecstore_with_background_disk_io(
+                ctx.clone(),
+                self.load_for_scan_window(store, name, budget),
+            ) => result,
         }
     }
 
