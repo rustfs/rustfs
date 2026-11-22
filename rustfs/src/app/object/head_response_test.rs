@@ -27,33 +27,38 @@ fn head_stored_etag_facts_and_legacy_projection_preserve_spelling() {
 
 #[test]
 fn head_stored_etag_facts_preserve_spelling() {
-    for raw in [
-        "abc",
-        "\"abc\"",
-        "W/\"abc\"",
-        "W/\"\"",
-        "\"\"",
-        "",
-        "*",
-        " abc ",
-        "abc_def",
-        "a&b",
-        "\"a&b\"",
-        "\"a b\"",
-        "\"a\\b\"",
-        "\"a\"b\"",
-        "w/\"abc\"",
-        "\"abc",
-        "W/abc",
-        "a\rb",
-        "a\nb",
-        "a\0b",
-        "é",
+    for (raw, opaque, weak) in [
+        ("abc", "abc", false),
+        ("\"abc\"", "abc", false),
+        ("W/\"abc\"", "abc", true),
+        ("W/\"\"", "", true),
+        ("\"\"", "", false),
+        ("", "", false),
+        ("*", "*", false),
+        (" abc ", " abc ", false),
+        ("abc_def", "abc_def", false),
+        ("a&b", "a&b", false),
+        ("\"a&b\"", "a&b", false),
+        ("\"a b\"", "a b", false),
+        ("\"a\\b\"", "a\\b", false),
+        ("\"a\"b\"", "a\"b", false),
+        ("w/\"abc\"", "w/\"abc\"", false),
+        ("\"abc", "\"abc", false),
+        ("W/abc", "W/abc", false),
+        ("a\rb", "a\rb", false),
+        ("a\nb", "a\nb", false),
+        ("a\0b", "a\0b", false),
+        ("é", "é", false),
+        ("6af8d12c0c74b78094884349f3c8a079", "6af8d12c0c74b78094884349f3c8a079", false),
+        ("\"6af8d12c0c74b78094884349f3c8a079\"", "6af8d12c0c74b78094884349f3c8a079", false),
+        ("W/\"6af8d12c0c74b78094884349f3c8a079\"", "6af8d12c0c74b78094884349f3c8a079", true),
+        ("\"incomplete", "\"incomplete", false),
+        ("incomplete\"", "incomplete\"", false),
+        ("W/\"incomplete", "incomplete", true),
     ] {
-        let expected = to_s3s_etag(raw);
         let fact = ResponseEtag::from_stored(raw);
-        assert_eq!(fact.opaque, expected.value(), "{raw:?}");
-        assert_eq!(fact.weak, expected.as_weak().is_some(), "{raw:?}");
+        assert_eq!(fact.opaque, opaque, "{raw:?}");
+        assert_eq!(fact.weak, weak, "{raw:?}");
     }
 }
 

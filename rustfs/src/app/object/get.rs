@@ -5789,7 +5789,10 @@ mod on_demand_migration_tests {
         let (mut output, backfill) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
         assert_eq!(backfill, None, "inline objects are stored by the tee, not queued");
         assert_eq!(output.content_length, Some(data.len() as i64));
-        assert_eq!(output.e_tag, Some(to_s3s_etag(source_head(&data).etag.as_deref().unwrap())));
+        assert_eq!(
+            output.e_tag.as_ref().and_then(|tag| tag.as_strong()),
+            Some("b79ea70797fef4f144daad8687c5a2fd")
+        );
         assert_eq!(
             output.content_type.as_ref().map(|v| v.to_string()),
             Some("application/octet-stream".to_string())

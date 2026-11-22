@@ -94,8 +94,6 @@ use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cache_hook;
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
-#[cfg(test)]
-use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,

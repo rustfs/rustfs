@@ -148,12 +148,7 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
             Some(0),
             "success releases the copy permit"
         );
-        let etag = copied
-            .e_tag
-            .as_deref()
-            .map(crate::storage::storage_api::to_s3s_xml_etag)
-            .expect("copy ETag");
-        let etag = etag.value().trim_matches('"').to_owned();
+        let etag = copied.e_tag.expect("copy ETag");
         Arc::clone(&store)
             .complete_multipart_upload(
                 &bucket,
@@ -412,12 +407,7 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                     Ok(output) => output,
                     Err(error) => panic!("range copy after failed request released its source and permit: {error:?}"),
                 };
-                let etag = copied
-                    .e_tag
-                    .as_deref()
-                    .map(crate::storage::storage_api::to_s3s_xml_etag)
-                    .expect("range ETag");
-                let etag = etag.value().trim_matches('"').to_owned();
+                let etag = copied.e_tag.expect("range ETag");
                 Arc::clone(&store)
                     .complete_multipart_upload(
                         &bucket,

@@ -117,7 +117,7 @@ pub(crate) fn owner() -> Owner {
 /// The entity tag the store holds, as an answer carries it: every answer that carries a stored tag
 /// converts it here, and none drops, rewrites or refuses one.
 ///
-/// It reads the stored spelling exactly as the legacy edge always has (`to_s3s_etag`): `W/"…"` is
+/// It reads the stored spelling exactly as the legacy edge always has: `W/"…"` is
 /// a weak tag and one surrounding quote pair is the store's spelling of a strong one; the tag
 /// inside is kept byte for byte, so the legacy stack's answer does not change. A weak tag whose
 /// inside the gateway's reader refuses or rewrites cannot stay weak (the gateway has no lossless
@@ -323,31 +323,30 @@ mod tests {
     /// Stored tag spellings retain their expected forms across conversions and renderers.
     #[test]
     fn a_stored_tag_is_answered_as_main_answers_it_on_both_edges() {
-        use crate::app::storage_api::object_usecase::object_utils::to_s3s_etag;
         use rustfs_gateway_types::EtagRender;
         use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::etag_to_s3s;
 
-        // Stored spelling, legacy header, gateway header, and XML text.
-        let rows: [(&str, &str, &str, &str); 11] = [
-            ("abc", r#""abc""#, r#""abc""#, r#""abc""#),
-            (r#""abc""#, r#""abc""#, r#""abc""#, r#""abc""#),
-            (r#"W/"abc""#, r#"W/"abc""#, r#"W/"abc""#, r#""abc""#),
-            ("abc-3", r#""abc-3""#, r#""abc-3""#, r#""abc-3""#),
-            (r#""""#, r#""""#, r#""""#, r#""""#),
-            ("", r#""""#, r#""""#, r#""""#),
-            ("W/abc", r#""W/abc""#, r#""W/abc""#, r#""W/abc""#),
-            ("a&b", r#""a&b""#, r#""a&b""#, r#""a&b""#),
-            (r#""abc"#, r#"""abc""#, r#""\"abc""#, r#"""abc""#),
-            (r#"""abc"""#, r#"""abc"""#, r#""\"abc\"""#, r#"""abc"""#),
-            (r#"w/"abc""#, r#""w/"abc"""#, r#""w/\"abc\"""#, r#""w/"abc"""#),
+        // Stored spelling, opaque value, weakness, legacy header, gateway header, and XML text.
+        let rows = [
+            ("abc", "abc", false, r#""abc""#, r#""abc""#, r#""abc""#),
+            (r#""abc""#, "abc", false, r#""abc""#, r#""abc""#, r#""abc""#),
+            (r#"W/"abc""#, "abc", true, r#"W/"abc""#, r#"W/"abc""#, r#""abc""#),
+            ("abc-3", "abc-3", false, r#""abc-3""#, r#""abc-3""#, r#""abc-3""#),
+            (r#""""#, "", false, r#""""#, r#""""#, r#""""#),
+            ("", "", false, r#""""#, r#""""#, r#""""#),
+            ("W/abc", "W/abc", false, r#""W/abc""#, r#""W/abc""#, r#""W/abc""#),
+            ("a&b", "a&b", false, r#""a&b""#, r#""a&b""#, r#""a&b""#),
+            (r#""abc"#, "\"abc", false, r#"""abc""#, r#""\"abc""#, r#"""abc""#),
+            (r#"""abc"""#, "\"abc\"", false, r#"""abc"""#, r#""\"abc\"""#, r#"""abc"""#),
+            (r#"w/"abc""#, "w/\"abc\"", false, r#""w/"abc"""#, r#""w/\"abc\"""#, r#""w/"abc"""#),
         ];
         // Every row is checked before the test fails, so one run names every row that differs.
         let mut differing = Vec::new();
-        for (stored, main_header, gateway_header, xml) in rows {
+        for (stored, opaque, weak, main_header, gateway_header, xml) in rows {
             let etag = stored_etag(stored);
-            let legacy = to_s3s_etag(stored);
+            let legacy = etag_to_s3s(&etag);
             let answered = (
-                etag_to_s3s(&etag) == legacy,
+                legacy.value() == opaque && legacy.as_weak().is_some() == weak,
                 legacy.to_http_header().is_ok_and(|header| header == main_header),
                 etag.render(EtagRender::HeaderQuoted) == gateway_header,
                 etag.render(EtagRender::XmlQuoted) == xml,
