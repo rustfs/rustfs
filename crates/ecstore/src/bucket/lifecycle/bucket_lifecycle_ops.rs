@@ -9278,6 +9278,60 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn successful_recovered_transition_keeps_unknown_notification_origin_unbound() {
+        use super::metadata_boundary::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::services::event_notification::test_recorder;
+        use crate::services::tier::test_util::register_mock_tier;
+        use rustfs_s3_types::EventName;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("recovered-notify-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create transition bucket");
+        let mut reader = PutObjReader::from_vec(b"transition payload".to_vec());
+        store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("seed transition object");
+        let object_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read transition object");
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&store.tier_config_mgr(), &tier).await;
+        test_recorder::install();
+
+        let (origin, result) = super::transition_object(
+            store,
+            &object_info,
+            super::LcAuditEvent::new(
+                lifecycle::Event {
+                    action: IlmAction::TransitionAction,
+                    storage_class: tier,
+                    ..Default::default()
+                },
+                LcEventSrc::Scanner,
+            ),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "recovered transition should complete: {result:?}");
+        assert_eq!(origin, None);
+
+        let events = test_recorder::recorded_for_bucket(&bucket);
+        let transition = events
+            .iter()
+            .find(|event| event.event_name == EventName::LifecycleTransition.as_str())
+            .expect("successful transition should emit its native lifecycle event");
+        assert_eq!(transition.bucket_incarnation_id, None);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn scanner_transition_enqueue_reports_full_queue() {
         let state = TransitionState::new_with_capacity(1);
         let object = ObjectInfo {
