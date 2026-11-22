@@ -804,8 +804,8 @@ mod tests {
     use super::*;
     use crate::app::object::DefaultObjectUsecase;
     use crate::app::storage_api::s3::dto::{
-        ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedPart, CreateMultipartUploadInput, ETag, ServerSideEncryption,
-        StreamingBlob, UploadPartInput,
+        ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedPart, CreateMultipartUploadInput, ETag, StreamingBlob,
+        UploadPartInput,
     };
     use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::etag_to_s3s;
     use rustfs_gateway_types::dto::HeadObjectInput;
@@ -1570,6 +1570,7 @@ mod tests {
     fn kms_multipart_completion_and_replay_preserve_etag_in_versioned_listings() {
         crate::app::gating_test_env::run_large_stack_test("kms-multipart-listing-etag", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_gateway_types::dto as gateway_dto;
             use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
 
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
@@ -1607,20 +1608,20 @@ mod tests {
                 .await
                 .expect("create versioned Object Lock bucket");
             let key = "kms-encrypted";
-            let enc_cfg = crate::app::storage_api::s3::dto::ServerSideEncryptionConfiguration {
-                rules: vec![crate::app::storage_api::s3::dto::ServerSideEncryptionRule {
-                    apply_server_side_encryption_by_default: Some(
-                        crate::app::storage_api::s3::dto::ServerSideEncryptionByDefault {
-                            sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            kms_master_key_id: Some(kms_key.key_id.clone()),
-                        },
-                    ),
+            let enc_cfg = gateway_dto::ServerSideEncryptionConfiguration {
+                rules: vec![gateway_dto::ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(gateway_dto::ServerSideEncryptionByDefault {
+                        sse_algorithm: gateway_dto::SseAlgorithm::AWS_KMS,
+                        kms_master_key_id: Some(kms_key.key_id.clone()),
+                    }),
                     ..Default::default()
                 }],
             };
-            let prepared = crate::storage::persisted_from_s3s(&enc_cfg).map_err(Into::into);
+            let xml =
+                rustfs_gateway_types::persistence::serialize_bucket_encryption_dto(&enc_cfg).expect("encode bucket SSE-KMS");
+            let prepared = rustfs_gateway_types::persistence::parse_bucket_encryption(&xml).expect("parse bucket SSE-KMS");
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
-                .execute_put_bucket_encryption(super::super::test_support::owned_envelope(Method::PUT), &bucket, prepared)
+                .execute_put_bucket_encryption(owned_envelope(Method::PUT), &bucket, Ok(prepared))
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();

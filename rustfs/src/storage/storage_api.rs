@@ -2687,33 +2687,6 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
     ecstore_data_usage::init_compression_total_memory_from_backend(store).await
 }
 
-// Bucket configurations cross the legacy S3 edge by writing one codec's XML and
-// reading it with the other (rustfs/backlog#2745). The byte goldens in
-// `crates/ecstore/tests/bucket_config_goldens.rs` pin both codecs to the same
-// bytes for every family, so each direction is lossless for every document
-// either side produces. DELETE BY T4.1 (rustfs/backlog#2783) with the
-// rest of the legacy edge.
-/// Reads the persisted shape of a request configuration through the legacy writer.
-///
-/// A document the legacy edge accepted but the persisted reader refuses is
-/// answered as `MalformedXML`, the code the old codec used for its own refusals.
-#[cfg(test)]
-pub(crate) fn persisted_from_s3s<S, T>(value: &S) -> s3s::S3Result<T>
-where
-    S: s3s::xml::Serialize,
-    T: ecstore_bucket::utils::BucketConfigXml,
-{
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = s3s::xml::Serializer::new(&mut buf);
-        value
-            .serialize(&mut ser)
-            .map_err(|err| s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, err.to_string()))?;
-    }
-    ecstore_bucket::utils::deserialize::<T>(&buf)
-        .map_err(|err| s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, err.to_string()))
-}
-
 #[cfg(test)]
 mod bucket_config_compat_tests {
     use crate::app::dto_values::stored_config;
