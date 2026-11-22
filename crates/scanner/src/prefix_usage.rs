@@ -376,6 +376,8 @@ mod tests {
             let PrefixUsageLookup::Compute(new) = lookup_or_reserve(&key) else {
                 panic!("expected replacement")
             };
+            // A late old result must not claim the replacement's still-computing slot.
+            store_cached(&key, &old, std::sync::Arc::new(response("alpha")));
             let expected = std::sync::Arc::new(response("alpha"));
             store_cached(&key, &new, expected.clone());
             store_cached(&key, &old, std::sync::Arc::new(response("alpha")));
