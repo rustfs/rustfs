@@ -1628,22 +1628,22 @@ mod tests {
                 .expect("create KMS multipart upload");
             let upload_id = created.upload_id;
             assert!(!upload_id.is_empty(), "KMS upload id");
-            let part = usecase
-                .execute_upload_part(build_request(
-                    UploadPartInput {
-                        bucket: bucket.clone(),
-                        key: key.to_string(),
-                        upload_id: upload_id.clone(),
-                        part_number: 1,
-                        content_length: Some(3),
-                        body: Some(StreamingBlob::from(Bytes::from_static(b"abc"))),
-                        ..Default::default()
-                    },
-                    Method::PUT,
-                ))
+            let input = UploadPartInput {
+                bucket: bucket.clone(),
+                key: key.to_string(),
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                content_length: Some(3),
+                body: Some(StreamingBlob::from(Bytes::from_static(b"abc"))),
+                ..Default::default()
+            };
+            let output = usecase
+                .execute_upload_part_with_audit(
+                    owned_envelope(Method::PUT),
+                    super::super::UploadPartWriteInput::from_legacy(input, None),
+                )
                 .await
-                .expect("upload encrypted KMS part")
-                .output;
+                .expect("upload encrypted KMS part");
             let complete = CompleteMultipartUploadInput {
                 bucket: bucket.clone(),
                 key: key.to_string(),
@@ -1651,7 +1651,9 @@ mod tests {
                 multipart_upload: Some(CompletedMultipartUpload {
                     parts: Some(vec![CompletedPart {
                         part_number: Some(1),
-                        e_tag: part.e_tag,
+                        e_tag: output
+                            .e_tag
+                            .map(|tag| crate::app::storage_api::test::object_utils::to_s3s_etag(&tag)),
                         ..Default::default()
                     }]),
                 }),
