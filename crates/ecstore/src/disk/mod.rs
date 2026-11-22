@@ -121,6 +121,7 @@ use sha2::Digest as _;
 use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Independent admission and physical ownership for one disk rename.
@@ -1467,6 +1468,15 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.runtime_state(),
             Disk::Remote(remote_disk) => remote_disk.runtime_state(),
+        }
+    }
+
+    /// Observe a local wrapper's retirement. Remote handles have their own RPC lifecycle.
+    /// Cancelling the returned child token does not retire the underlying wrapper.
+    pub fn local_retirement_token(&self) -> Option<CancellationToken> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.retirement_token()),
+            Disk::Remote(_) => None,
         }
     }
 

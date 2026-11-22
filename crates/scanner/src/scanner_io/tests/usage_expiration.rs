@@ -61,6 +61,7 @@ async fn disk_scan_withdraws_persisted_lifecycle_policy() {
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
+                    local_stop: None,
                 },
             )
             .await
