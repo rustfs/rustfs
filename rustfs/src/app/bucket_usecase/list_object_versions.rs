@@ -159,7 +159,7 @@ fn list_object_versions_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use rustfs_gateway_types::BucketName;
     use rustfs_s3_types::S3ErrorCode;
 
@@ -319,7 +319,7 @@ mod tests {
         };
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_list_object_versions(RequestEnvelope::from_s3s(&build_request((), http::Method::GET)), input)
+            .execute_list_object_versions(owned_envelope(http::Method::GET), input)
             .await
             .expect_err("a negative page size");
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
@@ -333,7 +333,7 @@ mod tests {
         };
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_list_object_versions(RequestEnvelope::from_s3s(&build_request((), http::Method::GET)), input)
+            .execute_list_object_versions(owned_envelope(http::Method::GET), input)
             .await
             .expect_err("no store");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);

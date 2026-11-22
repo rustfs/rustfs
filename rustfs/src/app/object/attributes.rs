@@ -258,8 +258,17 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
         };
-        let request = build_request((), http::Method::GET);
-        let envelope = RequestEnvelope::from_s3s(&request);
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
         let error = DefaultObjectUsecase::without_context()
             .execute_get_object_attributes(envelope, fields)
             .await
