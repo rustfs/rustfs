@@ -22,6 +22,10 @@ use rustfs_utils::path::path_join_buf;
 use time::OffsetDateTime;
 
 use super::replication_error_boundary::{Error, Result};
+#[cfg(test)]
+pub(crate) use crate::bucket::metadata_sys::{
+    bucket_metadata_sys_of, init_bucket_metadata_sys, set_bucket_metadata_in, test_support,
+};
 
 pub(crate) type ReplicationInstanceContext = InstanceContext;
 

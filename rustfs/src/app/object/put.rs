@@ -599,7 +599,20 @@ where
     Ok(std::io::Cursor::new(buf))
 }
 
-async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> rustfs_s3_types::S3Result<ChunkedBytesReader>
+// Frames retained by an eager reader or cache may outlive the next RDMA reservation.
+fn retained_put_frame(frame: Bytes, release_staging: bool) -> Bytes {
+    if release_staging {
+        Bytes::copy_from_slice(&frame)
+    } else {
+        frame
+    }
+}
+
+async fn read_zero_copy_put_body_exact<S, E>(
+    mut body: S,
+    size: usize,
+    registered_body: bool,
+) -> rustfs_s3_types::S3Result<ChunkedBytesReader>
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
     E: Into<StdError>,
@@ -621,7 +634,8 @@ where
 
         rustfs_io_metrics::record_zero_copy_buffer_operation("put_chunk", chunk.len());
         filled += chunk.len();
-        chunks.push(chunk);
+        let release_staging = registered_body && chunk.len() < size;
+        chunks.push(retained_put_frame(chunk, release_staging));
     }
 
     while let Some(chunk) = body.next().await {
@@ -1042,6 +1056,7 @@ pub(super) enum PutObjectOrigin<'a> {
     S3 {
         req: &'a RequestEnvelope,
         event_name: EventName,
+        registered_body: bool,
     },
     /// A trusted in-process caller writing on the server's behalf. There is no
     /// request and no credential: managed-SSE authorization treats the write
@@ -1415,12 +1430,8 @@ impl DefaultObjectUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match super::cuobject::rdma_token_for_request(envelope.headers()) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                // Zero-copy only when the body cannot outlive the request in the
-                // object data cache (fill-on-put keeps it).
-                let zero_copy =
-                    !i64::try_from(token.buffer_len).is_ok_and(|size| put_body_may_fill_cache(&self.object_data_cache(), size));
-                let (body, total) = super::cuobject::rdma_put_body(&bucket, &key, &token, zero_copy)?;
-                let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                let total = i64::try_from(token.buffer_len).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                let (body, _) = super::cuobject::rdma_put_body(&bucket, &key, &token)?;
                 (Some(body), Some(total), Some(total))
             }
             _ => (body, content_length, None),
@@ -1491,6 +1502,7 @@ impl DefaultObjectUsecase {
             origin: PutObjectOrigin::S3 {
                 req: &envelope,
                 event_name,
+                registered_body: rdma_put.is_some(),
             },
         };
         #[cfg_attr(
@@ -1498,8 +1510,6 @@ impl DefaultObjectUsecase {
             allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
         )]
         let mut committed = self.put_object_core(write, body, input.frame_trailers, start_time).await?;
-        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
-        let _ = rdma_put;
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         if let Some(moved) = rdma_put {
             committed
@@ -1973,11 +1983,18 @@ impl DefaultObjectUsecase {
         let fill_on_put_collector =
             put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers);
         let reader_prepare_stage_start = put_stage_metrics_enabled.then(Instant::now);
+        let registered_body = matches!(
+            origin,
+            PutObjectOrigin::S3 {
+                registered_body: true,
+                ..
+            }
+        );
         let mut reader = if should_compress {
             let compressed_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
-                StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
             );
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
@@ -2007,7 +2024,7 @@ impl DefaultObjectUsecase {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
                 let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                let eager_body = read_zero_copy_put_body_exact(body, body_size as usize).await?;
+                let eager_body = read_zero_copy_put_body_exact(body, body_size as usize, registered_body).await?;
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_body_eager_read_zero_copy", eager_read_stage_start);
                 rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
@@ -2026,7 +2043,7 @@ impl DefaultObjectUsecase {
                     // for ≤4KiB is negligible cost.
                     let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_direct(
-                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                        upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                     )
                     .await?;
@@ -2054,7 +2071,7 @@ impl DefaultObjectUsecase {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_pooled(
-                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                        upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                         pool.as_ref(),
                     )
@@ -2084,19 +2101,16 @@ impl DefaultObjectUsecase {
             } else {
                 let streaming_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let collector = fill_on_put_collector.clone();
-                let body = tokio::io::BufReader::with_capacity(
-                    buffer_size,
-                    StreamReader::new(body.map(move |f| {
-                        let f = f.map_err(s3s_body_error_to_io);
-                        if let (Some(collector), Ok(frame)) = (&collector, &f) {
-                            collector
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push(frame.clone());
-                        }
-                        f
-                    })),
-                );
+                let body = upload_frame_reader(body.map(move |f| {
+                    let f = f.map_err(s3s_body_error_to_io);
+                    if let (Some(collector), Ok(frame)) = (&collector, &f) {
+                        collector
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(retained_put_frame(frame.clone(), registered_body));
+                    }
+                    f
+                }));
                 let reader = HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
                     .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -2122,7 +2136,7 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
         let (mut completion, request_context) = match &origin {
-            PutObjectOrigin::S3 { req, event_name } => (
+            PutObjectOrigin::S3 { req, event_name, .. } => (
                 PutObjectCompletion::S3(OperationHelper::from_view(&req.audit_view(), *event_name, S3Operation::PutObject)),
                 req.request_context().cloned(),
             ),
@@ -2142,6 +2156,7 @@ impl DefaultObjectUsecase {
                         &key,
                         principal_id,
                     )
+                    .map(|event| event.with_bucket_incarnation(opts.expected_bucket_incarnation_id))
                 });
                 (PutObjectCompletion::Internal(event.flatten().map(Box::new)), Some(request_context))
             }
@@ -2407,7 +2422,7 @@ impl DefaultObjectUsecase {
 
                 let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let transition_enqueue_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject, opts.expected_bucket_incarnation_id).await;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_post_store_transition_enqueue",
                     transition_enqueue_stage_start,
@@ -2468,7 +2483,7 @@ impl DefaultObjectUsecase {
 
                 if dsc.replicate_any() {
                     let replication_schedule_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                    schedule_object_replication(obj_info.clone(), store, dsc, opts.expected_bucket_incarnation_id).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_post_store_replication_schedule",
                         replication_schedule_stage_start,
@@ -3246,9 +3261,8 @@ mod tests {
             .build()
             .expect("metadata GET input must build");
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let metadata_get = tokio::spawn(async move {
-            crate::app::test_seams::get_object(&metadata_usecase, build_request(metadata_input, Method::GET)).await
-        });
+        let metadata_get =
+            tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&metadata_usecase, metadata_input).await });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
             .expect("GET must enter the bucket metadata stage");
@@ -3276,10 +3290,7 @@ mod tests {
             .build()
             .expect("GET input must build");
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get =
-            tokio::spawn(
-                async move { crate::app::test_seams::get_object(&get_usecase, build_request(get_input, Method::GET)).await },
-            );
+        let get = tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&get_usecase, get_input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -3813,6 +3824,40 @@ mod tests {
         assert!(!small_eager);
     }
 
+    #[tokio::test]
+    async fn eager_rdma_reader_releases_each_multi_frame_owner_before_polling_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Frame(Arc<AtomicUsize>);
+        impl AsRef<[u8]> for Frame {
+            fn as_ref(&self) -> &[u8] {
+                b"abcd"
+            }
+        }
+        impl Drop for Frame {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicUsize::new(0));
+        let body = futures::stream::iter((0..3).map(|i| {
+            assert_eq!(released.load(Ordering::SeqCst), i);
+            Ok::<_, std::io::Error>(Bytes::from_owner(Frame(released.clone())))
+        }));
+        let _reader = read_zero_copy_put_body_exact(body, 12, true).await.unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 3);
+
+        let body = futures::stream::once(std::future::ready(Ok::<_, std::io::Error>(Bytes::from_owner(Frame(released.clone())))));
+        let reader = read_zero_copy_put_body_exact(body, 4, true).await.unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 3);
+        drop(reader);
+        assert_eq!(released.load(Ordering::SeqCst), 4);
+
+        let frame = Bytes::from_owner(Frame(released.clone()));
+        let cached = retained_put_frame(frame, true);
+        assert_eq!(released.load(Ordering::SeqCst), 5);
+        assert_eq!(cached.as_ref(), b"abcd");
+    }
+
     #[test]
     fn should_use_zero_copy_eager_put_path_allows_large_plain_objects_within_cap() {
         let headers = HeaderMap::new();
@@ -3883,7 +3928,7 @@ mod tests {
     async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
         let body = futures::stream::iter(vec![Err::<Bytes, UploadStreamError>(UploadStreamError::Sha256Mismatch)]);
 
-        let error = match read_zero_copy_put_body_exact(body, 1).await {
+        let error = match read_zero_copy_put_body_exact(body, 1, false).await {
             Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
             Err(error) => error,
         };
@@ -3937,7 +3982,7 @@ mod tests {
         let pool = BytesPool::with_config(BytesPoolConfig::default());
         assert_producer_failure(read_small_put_body_exact_pooled(stream_reader(), 2, &pool).await, "pooled");
         let zero_copy = futures::stream::iter([Ok(Bytes::from_static(b"a")), Err(producer_error())]);
-        assert_producer_failure(read_zero_copy_put_body_exact(zero_copy, 2).await, "zero-copy");
+        assert_producer_failure(read_zero_copy_put_body_exact(zero_copy, 2, false).await, "zero-copy");
     }
 
     struct FragmentedBody {
@@ -4335,7 +4380,7 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"world")),
         ]);
 
-        let mut reader = read_zero_copy_put_body_exact(body, 11)
+        let mut reader = read_zero_copy_put_body_exact(body, 11, false)
             .await
             .expect("zero-copy eager body read should succeed");
         let mut out = Vec::new();
@@ -4354,7 +4399,7 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"!")),
         ]);
 
-        let err = match read_zero_copy_put_body_exact(body, 5).await {
+        let err = match read_zero_copy_put_body_exact(body, 5, false).await {
             Ok(_) => panic!("extra bytes should fail"),
             Err(err) => err,
         };

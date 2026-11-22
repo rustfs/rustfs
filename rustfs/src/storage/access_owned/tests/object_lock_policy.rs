@@ -526,8 +526,10 @@ async fn tagging_policy_checks_xml_body() {
             .header("x-amz-tagging", "classification=secret&spoofed=yes")
             .build();
         // The XML tag set `classification=public`, as the edge decodes it.
+        let server = ServerContextSlot::new();
         let _ = authorize_put_object_tagging(
             &mut req,
+            &server,
             "bucket",
             "object",
             version,

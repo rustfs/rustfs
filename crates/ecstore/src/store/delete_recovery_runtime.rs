@@ -19,6 +19,7 @@
 use super::ECStore;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::{DeleteRecoveryCursor, DiskAPI, DiskStore};
+use crate::error::StorageError;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,6 +42,8 @@ const EVENT_DELETE_RECOVERY_STATUS: &str = "delete_recovery_status";
 const KEYS_PER_PASS: usize = 16;
 const RECOVERY_CONCURRENCY: usize = 4;
 const INTERVAL: Duration = Duration::from_secs(1);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const INVENTORY_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
 const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -60,6 +63,7 @@ pub(crate) struct DeleteRecoveryTicket {
     key: Arc<DeleteRecoveryKey>,
     generation: Uuid,
     admission: Option<Arc<AdmissionGuard>>,
+    retry: Option<RetrySchedule>,
 }
 
 #[derive(Debug)]
@@ -82,10 +86,40 @@ impl Drop for AdmissionGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetrySchedule {
+    ready_at: Instant,
+    delay: Duration,
+}
+
+impl RetrySchedule {
+    fn after_failure(previous: Option<Self>, now: Instant) -> Self {
+        let delay = previous.map_or(INITIAL_RETRY_DELAY, |retry| (retry.delay * 2).clamp(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY));
+        Self {
+            ready_at: now + delay,
+            delay,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingHint {
+    generation: Uuid,
+    queue_generation: Uuid,
+    kind: PendingHintKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingHintKind {
+    Foreground,
+    Discovered,
+    Retry(RetrySchedule),
+}
+
 #[derive(Debug)]
 struct HintState {
-    pending: HashMap<Arc<DeleteRecoveryKey>, (Uuid, Uuid, bool)>,
-    order: VecDeque<DeleteRecoveryTicket>,
+    pending: HashMap<Arc<DeleteRecoveryKey>, PendingHint>,
+    order: VecDeque<(Arc<DeleteRecoveryKey>, Uuid)>,
     rescan: Option<Uuid>,
     started: HashSet<Uuid>,
     #[cfg(test)]
@@ -93,6 +127,18 @@ struct HintState {
 }
 
 impl HintState {
+    fn enqueue(&mut self, key: Arc<DeleteRecoveryKey>, generation: Uuid, kind: PendingHintKind) {
+        self.pending.insert(
+            key.clone(),
+            PendingHint {
+                generation,
+                queue_generation: generation,
+                kind,
+            },
+        );
+        self.order.push_back((key, generation));
+    }
+
     fn compact_order(&mut self, capacity: usize) {
         // Twice the pending capacity guarantees at least capacity completed
         // entries between compactions, even with a full retry backlog. This
@@ -106,7 +152,7 @@ impl HintState {
             self.compaction_visits += self.order.len();
         }
         let Self { pending, order, .. } = self;
-        order.retain(|ticket| pending.get(&ticket.key).is_some_and(|entry| entry.1 == ticket.generation));
+        order.retain(|(key, generation)| pending.get(key).is_some_and(|entry| entry.queue_generation == *generation));
     }
 }
 
@@ -142,32 +188,28 @@ impl DeleteRecoveryHints {
         let key = Arc::new(key);
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = Uuid::new_v4();
-        if let Some((current, _, _)) = state.pending.get_mut(&key) {
-            *current = generation;
+        if let Some(entry) = state.pending.get_mut(&key) {
+            entry.generation = generation;
+            entry.kind = PendingHintKind::Foreground;
         } else {
             if state.pending.len() >= self.capacity {
                 // Durable evidence remains the authority. Rotate the oldest
                 // hint so permanently blocked keys cannot exclude later raw
                 // discoveries forever; the next scan revisits evicted keys.
-                while let Some(oldest) = state.order.pop_front() {
+                while let Some((oldest, generation)) = state.order.pop_front() {
                     if state
                         .pending
-                        .get(&oldest.key)
-                        .is_some_and(|entry| entry.1 == oldest.generation)
+                        .get(&oldest)
+                        .is_some_and(|entry| entry.queue_generation == generation)
                     {
-                        state.pending.remove(&oldest.key);
+                        state.pending.remove(&oldest);
                         break;
                     }
                 }
                 state.rescan = Some(Uuid::new_v4());
             }
             state.compact_order(self.capacity);
-            state.pending.insert(key.clone(), (generation, generation, false));
-            state.order.push_back(DeleteRecoveryTicket {
-                key: key.clone(),
-                generation,
-                admission: None,
-            });
+            state.enqueue(key.clone(), generation, PendingHintKind::Foreground);
         }
         Some(DeleteRecoveryTicket {
             admission: Some(Arc::new(AdmissionGuard {
@@ -177,6 +219,7 @@ impl DeleteRecoveryHints {
             })),
             key,
             generation,
+            retry: None,
         })
     }
 
@@ -188,28 +231,21 @@ impl DeleteRecoveryHints {
         if state.pending.len() >= self.capacity {
             // Only previously attempted work may yield its slot. Unattempted
             // keys apply backpressure so a fast scan cannot overwrite them.
-            let retried = state.order.iter().position(|ticket| {
+            let retried = state.order.iter().position(|(queued, generation)| {
                 state
                     .pending
-                    .get(&ticket.key)
-                    .is_some_and(|entry| entry.1 == ticket.generation && entry.2)
+                    .get(queued)
+                    .is_some_and(|entry| entry.queue_generation == *generation && matches!(entry.kind, PendingHintKind::Retry(_)))
             });
             let Some(index) = retried else { return false };
-            if let Some(oldest) = state.order.remove(index) {
-                state.pending.remove(&oldest.key);
+            if let Some((oldest, _)) = state.order.remove(index) {
+                state.pending.remove(&oldest);
             }
             // This durable key has already been attempted. The hourly sweep
             // revisits it; immediate rescans would loop on permanent failures.
         }
         state.compact_order(self.capacity);
-        let key = Arc::new(key);
-        let generation = Uuid::new_v4();
-        state.pending.insert(key.clone(), (generation, generation, false));
-        state.order.push_back(DeleteRecoveryTicket {
-            key,
-            generation,
-            admission: None,
-        });
+        state.enqueue(Arc::new(key), Uuid::new_v4(), PendingHintKind::Discovered);
         true
     }
 
@@ -221,33 +257,36 @@ impl DeleteRecoveryHints {
         if state
             .pending
             .get(&ticket.key)
-            .is_some_and(|entry| entry.0 == ticket.generation)
+            .is_some_and(|entry| entry.generation == ticket.generation)
         {
             state.pending.remove(&ticket.key);
         }
     }
 
-    fn take_available(&self, active: &HashSet<Arc<DeleteRecoveryKey>>) -> Option<DeleteRecoveryTicket> {
+    fn take_available(&self, active: &HashSet<Arc<DeleteRecoveryKey>>, now: Instant) -> Option<DeleteRecoveryTicket> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let queued = state.order.len();
         for _ in 0..queued {
-            let ticket = state.order.pop_front()?;
-            if let Some(&(generation, slot, _)) = state.pending.get(&ticket.key)
-                && slot == ticket.generation
-            {
-                if active.contains(&ticket.key) {
-                    // Preserve a newer hint while this key still owns a slot.
-                    // Other keys can proceed without waiting on its lock.
-                    state.order.push_back(ticket);
-                    continue;
-                }
-                state.pending.remove(&ticket.key);
-                return Some(DeleteRecoveryTicket {
-                    key: ticket.key,
-                    generation,
-                    admission: None,
-                });
+            let (key, slot) = state.order.pop_front()?;
+            let Some(entry) = state.pending.get(&key).filter(|entry| entry.queue_generation == slot) else {
+                continue;
+            };
+            let retry = match entry.kind {
+                PendingHintKind::Retry(retry) => Some(retry),
+                PendingHintKind::Discovered | PendingHintKind::Foreground => None,
+            };
+            if retry.is_some_and(|retry| retry.ready_at > now) || active.contains(&key) {
+                state.order.push_back((key, slot));
+                continue;
             }
+            let ticket = DeleteRecoveryTicket {
+                generation: entry.generation,
+                admission: None,
+                retry,
+                key,
+            };
+            state.pending.remove(&ticket.key);
+            return Some(ticket);
         }
         None
     }
@@ -255,24 +294,38 @@ impl DeleteRecoveryHints {
     #[cfg(test)]
     fn take(&self, limit: usize) -> Vec<DeleteRecoveryTicket> {
         let active = HashSet::new();
-        std::iter::from_fn(|| self.take_available(&active)).take(limit).collect()
+        std::iter::from_fn(|| self.take_available(&active, Instant::now()))
+            .take(limit)
+            .collect()
     }
 
-    fn retry(&self, ticket: DeleteRecoveryTicket) {
+    fn retry(&self, ticket: DeleteRecoveryTicket, retry: RetrySchedule) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.pending.contains_key(&ticket.key) {
+        if let Some(entry) = state.pending.get_mut(&ticket.key) {
+            // Discovery can see the same journal while replay is in flight.
+            // Keep its queue slot, but only new foreground work resets backoff.
+            if matches!(entry.kind, PendingHintKind::Discovered) {
+                entry.kind = PendingHintKind::Retry(retry);
+            }
+            return;
+        }
+        if state.pending.len() >= self.capacity {
+            // Attempted work yields to new admissions and the periodic durable sweep.
             return;
         }
         state.compact_order(self.capacity);
-        if state.pending.len() >= self.capacity {
-            // Previously attempted work yields to admitted keys until the
-            // periodic sweep. Foreground admission retains its own rescan guard.
-            return;
-        }
-        state
-            .pending
-            .insert(ticket.key.clone(), (ticket.generation, ticket.generation, true));
-        state.order.push_back(ticket);
+        state.enqueue(ticket.key, ticket.generation, PendingHintKind::Retry(retry));
+    }
+
+    #[cfg(test)]
+    fn retry_now(&self, ticket: DeleteRecoveryTicket) {
+        self.retry(
+            ticket,
+            RetrySchedule {
+                ready_at: Instant::now(),
+                delay: Duration::ZERO,
+            },
+        );
     }
 
     #[cfg(test)]
@@ -642,7 +695,12 @@ impl<'a> RecoveryWork<'a> {
             && Instant::now() < self.deadline
             && !self.cancel.is_cancelled()
         {
-            let Some(ticket) = self.store.ctx.delete_recovery_hints().take_available(&self.active) else {
+            let Some(ticket) = self
+                .store
+                .ctx
+                .delete_recovery_hints()
+                .take_available(&self.active, Instant::now())
+            else {
                 break;
             };
             self.active.insert(ticket.key.clone());
@@ -688,15 +746,32 @@ async fn recover_hint(
         ) => Some(result),
     };
     let mut failures = RecoveryFailures::default();
-    if !matches!(outcome, Some(Ok(_))) {
-        match outcome {
-            Some(Err(crate::error::StorageError::ErasureReadQuorum)) => failures.pending = 1,
-            Some(Err(crate::error::StorageError::SlowDown)) => failures.blocked = 1,
-            Some(Err(crate::error::StorageError::FileCorrupt)) => failures.corrupt = 1,
-            Some(Err(_)) => failures.failed = 1,
-            _ => {}
+    let now = Instant::now();
+    let retry = match outcome {
+        Some(Ok(_)) => None,
+        Some(Err(StorageError::ErasureReadQuorum)) => {
+            failures.pending = 1;
+            // Check returning participants on the normal maintenance cadence.
+            Some(RetrySchedule {
+                ready_at: now + INTERVAL,
+                delay: INTERVAL,
+            })
         }
-        store.ctx.delete_recovery_hints().retry(ticket);
+        Some(Err(error)) => {
+            match error {
+                StorageError::SlowDown => failures.blocked = 1,
+                StorageError::FileCorrupt => failures.corrupt = 1,
+                _ => failures.failed = 1,
+            }
+            Some(RetrySchedule::after_failure(ticket.retry, now))
+        }
+        None => Some(ticket.retry.unwrap_or(RetrySchedule {
+            ready_at: now,
+            delay: Duration::ZERO,
+        })),
+    };
+    if let Some(retry) = retry {
+        store.ctx.delete_recovery_hints().retry(ticket, retry);
     }
     (key, failures)
 }
@@ -826,7 +901,7 @@ mod tests {
         assert_eq!(taken[0].generation, newer.generation);
         let latest = hints.register(key("a")).expect("hint during recovery");
         hints.ack(&taken[0]);
-        hints.retry(taken.into_iter().next().expect("selected ticket"));
+        hints.retry_now(taken.into_iter().next().expect("selected ticket"));
         let pending = hints.take(2);
         assert_eq!(pending[0].key.object, "b");
         assert_eq!(pending[1].generation, latest.generation, "old recovery cannot replace a newer hint");
@@ -865,7 +940,7 @@ mod tests {
         assert!(hints.state.lock().expect("hint state").order.len() <= 2);
         let mut tickets = hints.take(2);
         assert_eq!(tickets.len(), 2);
-        hints.retry(tickets.remove(0));
+        hints.retry_now(tickets.remove(0));
         assert_eq!(hints.take(2).len(), 1, "failed work survives an empty queue");
     }
 
@@ -877,16 +952,46 @@ mod tests {
         let active = HashSet::from([admitted.key.clone()]);
         let newer = hints.register(key("active")).expect("new foreground generation");
         hints.register(key("later")).expect("independent key");
-        let later = hints.take_available(&active).expect("skip the active key");
+        let later = hints.take_available(&active, Instant::now()).expect("skip the active key");
         assert_eq!(later.key.object, "later");
-        assert!(hints.take_available(&active).is_none(), "a newer generation cannot occupy a second slot");
+        assert!(
+            hints.take_available(&active, Instant::now()).is_none(),
+            "a newer generation cannot occupy a second slot"
+        );
         hints.ack(&original);
-        hints.retry(admitted);
+        hints.retry_now(admitted);
         assert!(hints.is_pending(&key("active")), "old success or cancellation cannot clear newer work");
         let next = hints
-            .take_available(&HashSet::new())
+            .take_available(&HashSet::new(), Instant::now())
             .expect("active key becomes eligible after completion");
         assert_eq!(next.generation, newer.generation, "retry cannot overwrite the foreground generation");
+    }
+
+    #[test]
+    fn delete_recovery_backoff_survives_rediscovery_and_resets_for_foreground_work() {
+        let hints = DeleteRecoveryHints::with_capacity(2);
+        let active = HashSet::new();
+        let key = key("blocked");
+        let mut now = Instant::now();
+        assert!(hints.register_discovered(key.clone()));
+        let mut ticket = hints.take_available(&active, now).expect("discovery is immediately eligible");
+        for seconds in [5, 10, 20, 40, 80, 160, 300, 300] {
+            assert!(hints.register_discovered(key.clone()), "discovery arrives during replay");
+            let retry = RetrySchedule::after_failure(ticket.retry, now);
+            hints.retry(ticket, retry);
+            assert!(hints.register_discovered(key.clone()), "discovery also sees the queued retry");
+            now += Duration::from_secs(seconds);
+            assert!(hints.take_available(&active, now - Duration::from_nanos(1)).is_none());
+            ticket = hints.take_available(&active, now).expect("admit at the retry deadline");
+        }
+        let retry = RetrySchedule::after_failure(ticket.retry, now);
+        hints.retry(ticket, retry);
+        let foreground = hints.register(key).expect("foreground request during backoff");
+        let ticket = hints
+            .take_available(&active, now)
+            .expect("admit new foreground work promptly");
+        assert_eq!(ticket.generation, foreground.generation);
+        assert!(ticket.retry.is_none());
     }
 
     #[test]
@@ -925,7 +1030,7 @@ mod tests {
         hints.register(key("blocked-a")).expect("first blocked key");
         hints.register(key("blocked-b")).expect("second blocked key");
         for ticket in hints.take(2) {
-            hints.retry(ticket);
+            hints.retry_now(ticket);
         }
         hints
             .register(key("healthy-later"))
@@ -1118,7 +1223,8 @@ mod tests {
         publish_one(&disks[0], bucket, transaction).await;
         let set = &store.pools[0].disk_set[0];
         let offline = set.disks.write().await[3].take();
-        pass.run(&store, &CancellationToken::new()).await;
+        let cancel = CancellationToken::new();
+        assert_eq!(recover_hints(&store, &cancel).await.pending, 1, "the participant is required");
         assert_eq!(
             store
                 .ctx
@@ -1131,7 +1237,10 @@ mod tests {
             1
         );
         set.disks.write().await[3] = offline;
-        pass.run(&store, &CancellationToken::new()).await;
+        tokio::time::pause();
+        tokio::time::advance(INTERVAL).await;
+        tokio::time::resume();
+        pass.run(&store, &cancel).await;
         assert!(
             store.ctx.delete_recovery_hints().take(1).is_empty(),
             "returning participant releases retained work"
@@ -1184,7 +1293,7 @@ mod tests {
             assert!(hints.register_discovered(key(&format!("blocked-{index}"))));
         }
         for ticket in hints.take(KEYS_PER_PASS) {
-            hints.retry(ticket);
+            hints.retry_now(ticket);
         }
         for index in 0..KEYS_PER_PASS {
             assert!(
@@ -1194,7 +1303,7 @@ mod tests {
         }
         let in_flight = hints.take(1).pop().expect("one admitted recovery attempt");
         assert!(hints.register_discovered(key("arrived-during-recovery")));
-        hints.retry(in_flight);
+        hints.retry_now(in_flight);
         let mut pass = RecoveryPass {
             next_inventory: Some(Instant::now() + ANTI_ENTROPY_INTERVAL),
             scan_generation: Some(scanning),
@@ -1219,6 +1328,65 @@ mod tests {
         assert_ne!(foreground, scanning);
         hints.ack_rescan(scanning);
         assert_eq!(hints.rescan(), Some(foreground), "an older scan cannot clear a foreground obligation");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_blocked_legacy_key_backs_off_without_delaying_other_keys() {
+        let bucket = "runtime-legacy-backoff";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let transaction = Uuid::new_v4();
+        for disk in &disks {
+            disk.delete_version(
+                bucket,
+                "object",
+                FileInfo {
+                    name: "object".to_owned(),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("leave an undecided historical delete");
+        }
+        let backups: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                dir.path()
+                    .join(bucket)
+                    .join("object")
+                    .join(transaction.to_string())
+                    .join("xl.meta.bkp")
+            })
+            .collect();
+        let before: Vec<_> = backups
+            .iter()
+            .map(|path| std::fs::read(path).expect("read original evidence"))
+            .collect();
+        register(&store, bucket).await;
+        let cancel = CancellationToken::new();
+        assert_eq!(recover_hints(&store, &cancel).await.blocked, 1);
+        let hints = store.ctx.delete_recovery_hints();
+        let healthy = DeleteRecoveryKey {
+            object: "absent-key".to_owned(),
+            bucket: bucket.to_owned(),
+            incarnation: Some(store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity")),
+            ..key("absent-key")
+        };
+        assert!(hints.register_discovered(healthy.clone()));
+        assert_eq!(
+            recover_hints(&store, &cancel).await.blocked,
+            0,
+            "do not re-inspect a blocked key on the next pass"
+        );
+        assert!(!hints.is_pending(&healthy), "the independent key still settles promptly");
+        assert_eq!(hints.pending_len(), 1, "the blocked key remains eligible for a later retry");
+        for (path, bytes) in backups.iter().zip(before) {
+            assert_eq!(std::fs::read(path).expect("retained historical evidence"), bytes);
+        }
     }
 
     #[tokio::test]
@@ -1413,7 +1581,10 @@ mod tests {
                 .find(|(key, _)| key.object == format!("waiting-{index}"))
                 .expect("unattempted key remains queued")
                 .1;
-            assert!(!queued.2, "budget exhaustion must not grant discovery permission to evict untouched work");
+            assert!(
+                matches!(queued.kind, PendingHintKind::Foreground),
+                "budget exhaustion must not grant discovery permission to evict untouched work"
+            );
         }
     }
 
@@ -1434,7 +1605,7 @@ mod tests {
                 for ticket in hints.take(KEYS_PER_PASS) {
                     let index: usize = ticket.key.object.parse().expect("numeric test key");
                     if index % 1_024 < KEYS_PER_PASS {
-                        hints.retry(ticket);
+                        hints.retry_now(ticket);
                     } else {
                         recovered.insert(index);
                     }

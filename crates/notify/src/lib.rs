@@ -26,7 +26,6 @@ pub mod factory;
 mod global;
 pub mod integration;
 mod lifecycle;
-mod notification_system_subscriber;
 pub mod notifier;
 mod pipeline;
 pub mod registry;
@@ -49,7 +48,7 @@ pub use global::{
 pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
 pub use lifecycle::{NotificationLifecycleTransition, NotificationRuntimeState};
 pub use pipeline::{LiveEventHistory, NotifyEventBridge, NotifyPipeline};
-pub use rule_engine::NotifyRuleEngine;
+pub use rule_engine::{NotifyRuleEngine, bucket_removed_targets_from_metadata};
 pub use rules::BucketNotificationConfig;
 pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;

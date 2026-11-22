@@ -17,7 +17,6 @@ use crate::{
     bucket_config_manager::NotifyBucketConfigManager,
     config_manager::NotifyConfigManager,
     integration::NotificationMetrics,
-    notification_system_subscriber::NotificationSystemSubscriberView,
     notifier::{EventNotifier, SharedNotifyTargetList},
     pipeline::{LiveEventHistory, NotifyPipeline},
     registry::TargetRegistry,
@@ -52,7 +51,6 @@ impl NotifyServices {
         stream_cancellers: Arc<RwLock<ReplayWorkerManager>>,
         concurrency_limiter: Arc<Semaphore>,
         metrics: Arc<NotificationMetrics>,
-        subscriber_view: Arc<NotificationSystemSubscriberView>,
         live_event_sender: broadcast::Sender<Arc<Event>>,
         live_event_history: Arc<RwLock<LiveEventHistory>>,
     ) -> Self {
@@ -65,7 +63,7 @@ impl NotifyServices {
             metrics.clone(),
         );
         let config_manager = NotifyConfigManager::new(config, registry, rule_engine.clone(), runtime_facade.clone());
-        let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), rule_engine, subscriber_view);
+        let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), rule_engine);
         let pipeline = NotifyPipeline::new(notifier, live_event_sender, live_event_history);
         let status_view = NotifyStatusView::new(metrics);
 
@@ -84,8 +82,8 @@ impl NotifyServices {
 mod tests {
     use super::NotifyServices;
     use crate::{
-        integration::NotificationMetrics, notification_system_subscriber::NotificationSystemSubscriberView,
-        notifier::EventNotifier, pipeline::LiveEventHistory, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
+        integration::NotificationMetrics, notifier::EventNotifier, pipeline::LiveEventHistory, registry::TargetRegistry,
+        rule_engine::NotifyRuleEngine,
     };
     use rustfs_config::server_config::Config;
     use rustfs_targets::ReplayWorkerManager;
@@ -102,7 +100,6 @@ mod tests {
         let config = Arc::new(RwLock::new(Config::default()));
         let stream_cancellers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
         let concurrency_limiter = Arc::new(Semaphore::new(4));
-        let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
         let (live_event_sender, _) = broadcast::channel(16);
         let live_event_history = Arc::new(RwLock::new(LiveEventHistory::default()));
 
@@ -115,7 +112,6 @@ mod tests {
             stream_cancellers,
             concurrency_limiter,
             metrics,
-            subscriber_view,
             live_event_sender,
             live_event_history,
         );

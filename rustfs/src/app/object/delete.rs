@@ -944,6 +944,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
         apply_bucket_generation_guard(&envelope, &bucket, &mut storage_delete_opts)?;
+        let incarnation_id = storage_delete_opts.expected_bucket_incarnation_id;
         let storage_started = std::time::Instant::now();
         let (dobjs, errs, accounting) = store
             .delete_objects_with_tier_delete_journal_and_accounting(&bucket, object_to_delete.clone(), storage_delete_opts)
@@ -1095,8 +1096,13 @@ impl DefaultObjectUsecase {
             let bucket_for_replication = bucket.clone();
             let replication_task = tokio::spawn(async move {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-                schedule_replication_deletes(replication_deletes, bucket_for_replication, REPLICATE_INCOMING_DELETE.to_string())
-                    .await;
+                schedule_replication_deletes(
+                    replication_deletes,
+                    bucket_for_replication,
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                    incarnation_id,
+                )
+                .await;
             });
             // The spawned task owns every locally committed delete. Dropping the
             // join handle on request cancellation therefore cannot lose the tail.
@@ -1157,6 +1163,7 @@ impl DefaultObjectUsecase {
                             ..Default::default()
                         },
                     )
+                    .bucket_incarnation_id(incarnation_id)
                     .version_id(version_id.unwrap_or_default())
                     .req_params(req_params.clone())
                     .resp_elements(resp_elements.clone())
@@ -1497,6 +1504,7 @@ impl DefaultObjectUsecase {
                     },
                     bucket.clone(),
                     REPLICATE_INCOMING_DELETE.to_string(),
+                    opts.expected_bucket_incarnation_id,
                 )
                 .await;
             } else if replicate_force_delete {
@@ -1519,7 +1527,13 @@ impl DefaultObjectUsecase {
                 ) {
                     set_deleted_object_replication_state(&mut delete_object, &replication_state);
                 }
-                schedule_replication_delete(delete_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
+                schedule_replication_delete(
+                    delete_object,
+                    bucket.clone(),
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                    opts.expected_bucket_incarnation_id,
+                )
+                .await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
@@ -1600,7 +1614,13 @@ impl DefaultObjectUsecase {
                 set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
                 enrich_delete_replication_state_if_needed(&delete_config_snapshot, &mut deleted_object, replication_state_source);
             }
-            schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
+            schedule_replication_delete(
+                deleted_object,
+                bucket.clone(),
+                REPLICATE_INCOMING_DELETE.to_string(),
+                opts.expected_bucket_incarnation_id,
+            )
+            .await;
         }
 
         let delete_marker = obj_info.delete_marker;
@@ -2268,10 +2288,10 @@ mod tests {
                             .version_id(requested_version)
                             .build()
                             .expect("HEAD request");
-                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("marker GET");
-                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
                             .await
                             .expect_err("marker HEAD");
                         for (method, error) in [("GET", get_error), ("HEAD", head_error)] {
@@ -2318,7 +2338,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical GET request");
-                    let response = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                    let response = crate::app::test_seams::get_object_method_only(&usecase, get)
                         .await
                         .expect("historical GET");
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
@@ -2334,7 +2354,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical HEAD request");
-                    let response = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                    let response = crate::app::test_seams::head_object_method_only(&usecase, head)
                         .await
                         .expect("historical HEAD");
                     assert_eq!(response.output.content_length, Some(i64::try_from(payload.len()).unwrap()));
@@ -2354,10 +2374,10 @@ mod tests {
                             .version_id(version)
                             .build()
                             .expect("missing HEAD request");
-                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("missing GET");
-                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
                             .await
                             .expect_err("missing HEAD");
                         for error in [get_error, head_error] {
@@ -2452,7 +2472,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let get_err = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
+                    let get_err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
                         .await
                         .expect_err("GET of a marker remains forbidden");
                     assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2462,7 +2482,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let head_err = Box::pin(crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD)))
+                    let head_err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, head))
                         .await
                         .expect_err("HEAD of a marker remains forbidden");
                     assert_eq!(head_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2538,7 +2558,7 @@ mod tests {
                         .version_id(Some(marker_id))
                         .build()
                         .unwrap();
-                    let missing = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(removed, Method::GET)))
+                    let missing = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, removed))
                         .await
                         .expect_err("the marker version must actually be gone");
                     assert_eq!(
@@ -2551,7 +2571,7 @@ mod tests {
                         .key(key.to_string())
                         .build()
                         .unwrap();
-                    let response = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
+                    let response = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
                         .await
                         .expect("GET restores the historical payload");
                     let mut body = response.output.body.expect("GET body");
