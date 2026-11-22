@@ -15,8 +15,6 @@
 //! The authorization shapes one migration batch owns (rustfs/backlog#2765), one file per batch so
 //! parallel batches edit disjoint files. Shapes several batches share stay in `storage/access.rs`.
 
-pub(crate) mod bucket_access;
-pub(crate) mod bucket_configs;
 pub(crate) mod bucket_core;
 pub(crate) mod bucket_replication_lifecycle;
 pub(crate) mod listing_multipart;

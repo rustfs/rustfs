@@ -1727,9 +1727,7 @@ mod tests {
     }
 
     async fn http_xml_error(error: S3Error) -> (StatusCode, String) {
-        let response = s3s::S3Error::from(error)
-            .to_http_response()
-            .expect("S3 error should serialize to HTTP");
+        let response = error.to_http_response().expect("S3 error should serialize to HTTP");
         let status = response.status();
         let body = http_body_util::BodyExt::collect(response.into_body())
             .await

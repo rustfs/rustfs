@@ -56,9 +56,9 @@ use crate::runtime_sources::{
     current_deployment_id, current_endpoints_handle, current_iam_handle, current_object_store_handle, current_region,
 };
 use crate::storage_api::site_replication::s3::{
-    Body, PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
+    PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
     PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
-    PersistedSourceSelectionCriteria, S3Response, Status, VersioningConfiguration,
+    PersistedSourceSelectionCriteria, Status, VersioningConfiguration,
 };
 #[cfg(test)]
 use crate::storage_api::site_replication::save_config as save_admin_config;
@@ -135,15 +135,15 @@ pub(crate) const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
 
 pub(crate) const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
 
-/// Layer-local mirror of `crate::admin::utils::json_response` (the repair
+/// Layer-local mirror of `crate::admin::utils::owned_json_response` (the repair
 /// executor answers the admin HTTP surface but must not import upward from
-/// the infra layer).
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
+/// the infra layer). The tuple is status, headers, and body.
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<(StatusCode, HeaderMap, rustfs_s3_types::Body)> {
     let data = serde_json::to_vec(value)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
+    Ok((status, headers, rustfs_s3_types::Body::from(data)))
 }
 
 // The admin layer's runtime-source wrappers apply fallbacks on top of
