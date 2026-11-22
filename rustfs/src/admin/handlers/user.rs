@@ -743,6 +743,11 @@ impl Operation for ExportIam {
                         .list_policies("")
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                    let policies = policies
+                        .into_iter()
+                        .map(|(name, policy)| policy.to_export_value().map(|document| (name, document)))
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                     let json_str = serde_json::to_vec(&policies)
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                     zip_writer
@@ -825,7 +830,9 @@ impl Operation for ExportIam {
                             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
                         let police_json = if let Some(police) = police {
-                            serde_json::to_string(&police)
+                            police
+                                .to_export_value()
+                                .and_then(|document| serde_json::to_string(&document))
                                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
                         } else {
                             "null".to_string()

@@ -2288,10 +2288,10 @@ mod tests {
                             .version_id(requested_version)
                             .build()
                             .expect("HEAD request");
-                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("marker GET");
-                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
                             .await
                             .expect_err("marker HEAD");
                         for (method, error) in [("GET", get_error), ("HEAD", head_error)] {
@@ -2338,7 +2338,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical GET request");
-                    let response = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                    let response = crate::app::test_seams::get_object_method_only(&usecase, get)
                         .await
                         .expect("historical GET");
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
@@ -2354,7 +2354,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical HEAD request");
-                    let response = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                    let response = crate::app::test_seams::head_object_method_only(&usecase, head)
                         .await
                         .expect("historical HEAD");
                     assert_eq!(response.output.content_length, Some(i64::try_from(payload.len()).unwrap()));
@@ -2374,10 +2374,10 @@ mod tests {
                             .version_id(version)
                             .build()
                             .expect("missing HEAD request");
-                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("missing GET");
-                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
                             .await
                             .expect_err("missing HEAD");
                         for error in [get_error, head_error] {
@@ -2472,7 +2472,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let get_err = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
+                    let get_err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
                         .await
                         .expect_err("GET of a marker remains forbidden");
                     assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2482,7 +2482,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let head_err = Box::pin(crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD)))
+                    let head_err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, head))
                         .await
                         .expect_err("HEAD of a marker remains forbidden");
                     assert_eq!(head_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2558,7 +2558,7 @@ mod tests {
                         .version_id(Some(marker_id))
                         .build()
                         .unwrap();
-                    let missing = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(removed, Method::GET)))
+                    let missing = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, removed))
                         .await
                         .expect_err("the marker version must actually be gone");
                     assert_eq!(
@@ -2571,7 +2571,7 @@ mod tests {
                         .key(key.to_string())
                         .build()
                         .unwrap();
-                    let response = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
+                    let response = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
                         .await
                         .expect("GET restores the historical payload");
                     let mut body = response.output.body.expect("GET body");
@@ -2873,6 +2873,42 @@ mod tests {
         assert_eq!(delete_entry_response_version_id(None, true, Some(Uuid::nil()), true), None);
     }
 
+    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
+    fn method_only_delete_envelope(method: Method) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        )
+    }
+
+    async fn delete_object_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: DeleteObjectInput,
+    ) -> crate::app::storage_api::s3::S3Result<gateway_dto::DeleteObjectOutput> {
+        usecase
+            .execute_delete_object_fields(method_only_delete_envelope(Method::DELETE), input.bucket, input.key, input.version_id)
+            .await
+            .map_err(s3s::S3Error::from)
+    }
+
+    async fn delete_objects_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: DeleteObjectsInput,
+    ) -> crate::app::storage_api::s3::S3Result<S3Response<DeleteObjectsOutput>> {
+        let output = usecase
+            .execute_delete_objects(method_only_delete_envelope(Method::POST), input.into())
+            .await
+            .map_err(s3s::S3Error::from)?;
+        Ok(S3Response::new(output.into()))
+    }
+
     #[tokio::test]
     async fn execute_delete_object_rejects_invalid_object_key() {
         let input = DeleteObjectInput::builder()
@@ -2881,10 +2917,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::DELETE);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_delete_object_from_s3s(req)).await.unwrap_err();
+        let err = Box::pin(delete_object_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2952,10 +2987,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_objects_from_s3s(req).await.unwrap_err();
+        let err = delete_objects_method_only(&usecase, input).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2974,10 +3008,9 @@ mod tests {
             .build()
             .expect("delete objects input should build");
 
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_objects_from_s3s(req).await.unwrap_err();
+        let err = delete_objects_method_only(&usecase, input).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2996,10 +3029,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_objects_from_s3s(req).await.unwrap_err();
+        let err = delete_objects_method_only(&usecase, input).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(err.message(), Some("Not init"));
     }
@@ -3109,8 +3141,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let err = DefaultObjectUsecase::without_context()
-            .execute_delete_object_from_s3s(build_request(input, Method::DELETE))
+        let err = delete_object_method_only(&DefaultObjectUsecase::without_context(), input)
             .await
             .expect_err("an uninitialized store should be reported after non-force admission");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);

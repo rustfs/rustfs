@@ -117,9 +117,9 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
-const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
+pub(super) const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+pub(super) const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+pub(super) const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
 const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_compensation";
 const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
 const METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL: &str = "rustfs_stale_multipart_cleanup_blocked_total";
@@ -3093,6 +3093,7 @@ async fn recover_configured_tier_free_versions(
             next_object_marker: None,
             scanned_entries: 0,
             buckets_scanned: 0,
+            unreadable_objects: 0,
             truncated: false,
         });
     }
@@ -3232,6 +3233,7 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
                     scanned = stats.scanned,
                     scanned_entries = stats.scanned_entries,
                     buckets_scanned = stats.buckets_scanned,
+                    unreadable_objects = stats.unreadable_objects,
                     enqueued = stats.enqueued,
                     failed = stats.failed,
                     truncated = stats.truncated,
@@ -6659,6 +6661,7 @@ mod tests {
             next_object_marker: truncated.then(|| "object".to_string()),
             scanned_entries: 1,
             buckets_scanned: 1,
+            unreadable_objects: 0,
             truncated,
         }
     }
@@ -15173,6 +15176,37 @@ mod tests {
         }
     }
 
+    async fn seed_corrupt_free_version(disk_paths: &[PathBuf], bucket: &str, object: &str) -> Vec<u8> {
+        use rustfs_utils::http::metadata_compat::{SUFFIX_TRANSITIONED_VERSION_STATE, insert_bytes};
+
+        seed_recoverable_free_version(disk_paths, bucket, object, None, None).await;
+        let path = PathBuf::from(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let original = fs::read(disk_paths[0].join(&path))
+            .await
+            .expect("read the seeded free version");
+        let mut metadata = FileMeta::load(&original).expect("load the seeded metadata");
+        let mut version = metadata.versions[0].parse_version_meta().expect("decode the seeded version");
+        let marker = version.delete_marker.as_mut().expect("the free version is a delete marker");
+        insert_bytes(&mut marker.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, b"invalid".to_vec());
+        metadata.versions[0] = version
+            .try_into()
+            .expect("encode the malformed marker with a consistent header");
+        let encoded = metadata.marshal_msg().expect("encode the metadata with a valid checksum");
+        let reloaded = FileMeta::load(&encoded).expect("the metadata envelope must remain readable");
+        assert_eq!(
+            reloaded
+                .get_file_info_versions(bucket, object, false)
+                .expect_err("decoding the marker must fail"),
+            rustfs_filemeta::Error::FileCorrupt
+        );
+        for disk in disk_paths {
+            fs::write(disk.join(&path), &encoded)
+                .await
+                .expect("persist the same malformed marker on every disk");
+        }
+        encoded
+    }
+
     async fn remove_seeded_free_version(disk_paths: &[PathBuf], bucket: &str, object: &str) {
         for disk_path in disk_paths {
             fs::remove_dir_all(disk_path.join(bucket).join(object))
@@ -15245,6 +15279,7 @@ mod tests {
                 next_object_marker: None,
                 scanned_entries: 0,
                 buckets_scanned: 0,
+                unreadable_objects: 0,
                 truncated: false,
             }
         );
@@ -15441,12 +15476,14 @@ mod tests {
         );
         assert_eq!(check.reasons.len(), 1);
         assert_eq!(check.reasons[0].kind, crate::services::tier::tier::TierDeletionReasonKind::CleanupPending);
+        seed_corrupt_free_version(&disks, &bucket, "corrupt").await;
         let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
             .await
             .expect("retry should enqueue durable cleanup");
         assert_eq!(report.status, TierCleanupRetryStatus::Accepted);
         assert_eq!(report.enqueued, 1);
         assert_eq!(report.failed, 0);
+        assert_eq!(report.unreadable_objects, 1);
         let rx = Arc::clone(&state.read().await.tasks_rx[0]);
         let task = rx.lock().await.try_recv().expect("cleanup was queued").expect("queue item");
         let task = task
@@ -15466,21 +15503,27 @@ mod tests {
         let other = retry_tier_free_version_cleanup(api.clone(), "OTHER")
             .await
             .expect("other tier retry should be bounded");
+        assert_eq!(other.status, TierCleanupRetryStatus::Accepted);
         assert_eq!(other.enqueued, 0, "retry must not enqueue a different tier's marker");
+        assert_eq!(other.failed, 0);
+        let json = serde_json::to_value(&other).expect("serialize the public retry report");
+        assert_eq!(json["unreadableObjects"], 1, "unreadable keys cannot be attributed to a tier");
         assert!(rx.lock().await.try_recv().is_err());
-        api.tier_config_mgr()
-            .write()
-            .await
-            .remove("OTHER", true)
-            .await
-            .expect("remove other mock tier");
         reset_runtime_expiry_state(&api).await;
         let failed = retry_tier_free_version_cleanup(api.clone(), "WARM")
             .await
             .expect("queue failure remains retryable");
         assert_eq!(failed.failed, 1);
         assert_eq!(failed.enqueued, 0);
+        assert_eq!(failed.unreadable_objects, 1);
         assert_eq!(crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await, 1);
+        remove_seeded_free_version(&disks, &bucket, "corrupt").await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("OTHER", true)
+            .await
+            .expect("remove other mock tier");
         remove_seeded_free_version(&disks, &bucket, "owned").await;
         api.tier_config_mgr()
             .write()
@@ -15698,6 +15741,121 @@ mod tests {
             .await
             .expect("empty recovery test bucket should be removed");
         reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_enqueues_past_a_corrupt_free_version() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let prefix = format!("zzzz-recovery-corrupt-{}", Uuid::new_v4().simple());
+        let first_bucket = format!("{prefix}-a");
+        let second_bucket = format!("{prefix}-b");
+        for bucket in [&first_bucket, &second_bucket] {
+            create_test_bucket(&ecstore, bucket).await;
+        }
+        let healthy = [
+            (first_bucket.as_str(), "a"),
+            (first_bucket.as_str(), "c"),
+            (second_bucket.as_str(), "d"),
+        ];
+        for (bucket, object) in healthy {
+            seed_recoverable_free_version(&disk_paths, bucket, object, None, None).await;
+        }
+        let corrupt = seed_corrupt_free_version(&disk_paths, &first_bucket, "b").await;
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, healthy.len()).await;
+
+        let stats = recover_tier_free_versions_with_cancel(
+            Arc::clone(&ecstore),
+            healthy.len() + 1,
+            Some(first_bucket.clone()),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a corrupt free version must not discard other recovery candidates");
+        assert!(!stats.truncated);
+        assert_eq!(stats.enqueued, healthy.len());
+        let receiver = Arc::clone(&state.read().await.tasks_rx[0]);
+        let mut receiver = receiver.lock().await;
+        for (bucket, object) in healthy {
+            let task = receiver
+                .try_recv()
+                .expect("receive a healthy cleanup task")
+                .expect("the queue carries a task");
+            let task = task
+                .as_any()
+                .downcast_ref::<FreeVersionTask>()
+                .expect("a free-version cleanup task");
+            assert_eq!((task.0.bucket.as_str(), task.0.name.as_str()), (bucket, object));
+        }
+        drop(receiver);
+        reset_runtime_expiry_state(&ecstore).await;
+        for disk in &disk_paths {
+            let stored = fs::read(disk.join(&first_bucket).join("b").join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("discovery must preserve the unreadable marker");
+            assert_eq!(stored, corrupt);
+        }
+        for (bucket, object) in healthy.into_iter().chain([(first_bucket.as_str(), "b")]) {
+            remove_seeded_free_version(&disk_paths, bucket, object).await;
+        }
+        for bucket in [&first_bucket, &second_bucket] {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("delete the empty test bucket");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_counts_a_corrupt_boundary_once_per_sweep() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("zzzz-recovery-boundary-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_corrupt_free_version(&disk_paths, &bucket, "b").await;
+        seed_recoverable_free_version(&disk_paths, &bucket, "c", None, None).await;
+        let page_from = |marker| {
+            list_tier_free_versions_with_budget(
+                Arc::clone(&ecstore),
+                2,
+                Some(bucket.clone()),
+                marker,
+                CancellationToken::new(),
+                RecoveryWorkBudget {
+                    max_objects: 1,
+                    max_buckets: 1,
+                },
+            )
+        };
+
+        let first = page_from(None)
+            .await
+            .expect("the unreadable key should consume the first page");
+        assert!(first.items.is_empty());
+        assert_eq!(first.unreadable_objects, 1);
+        assert!(first.truncated);
+        assert_eq!(first.next_bucket_marker.as_deref(), Some(bucket.as_str()));
+        assert_eq!(first.next_object_marker.as_deref(), Some("b"));
+
+        let second = page_from(first.next_object_marker)
+            .await
+            .expect("resume past the unreadable boundary");
+        assert_eq!(second.unreadable_objects, 0);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].name, "c");
+
+        let next_sweep = page_from(None).await.expect("a later sweep must revisit the unreadable key");
+        assert_eq!(next_sweep.unreadable_objects, 1);
+        assert_eq!(next_sweep.next_object_marker.as_deref(), Some("b"));
+
+        for object in ["b", "c"] {
+            remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the empty test bucket");
     }
 
     #[tokio::test]

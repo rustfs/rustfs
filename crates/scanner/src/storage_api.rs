@@ -425,6 +425,8 @@ pub(crate) mod scan {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
     #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::HEALING_MARKER_PATH;
+    #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::new_global_notification_sys;
 }
 
