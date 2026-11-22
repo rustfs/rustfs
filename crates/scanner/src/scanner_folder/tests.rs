@@ -405,6 +405,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
         directory_checkpoints: HashMap::new(),
+        size_ledger_index: SizeLedgerIndex::default(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -763,6 +764,64 @@ async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
     scanner.apply_size_reconciliation(&resolved);
     scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
+}
+
+#[tokio::test]
+async fn size_ledger_tracks_only_outstanding_scopes_and_preserves_eviction_order_after_restart() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, root);
+    let now = FolderScanner::now_secs();
+    for i in 0..=MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET {
+        let key = format!("v{i:05}");
+        scanner.new_cache.info.size_reconciliation.insert(
+            key.clone(),
+            SizeReconciliationEntry {
+                key,
+                bucket: "bucket".to_owned(),
+                object: format!("object-{i}"),
+                first_seen: now,
+                ..Default::default()
+            },
+        );
+    }
+    let records = &mut scanner.new_cache.info.size_reconciliation;
+    scanner.size_ledger_index = SizeLedgerIndex::from_persisted(records, now);
+    assert_eq!(records.len(), MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET);
+    assert!(!records.contains_key("v00000"), "ties must evict the lexicographically first key");
+    for n in 0..1000 {
+        let mut summary = SizeSummary::default();
+        summary.record_reconciliation_scope("bucket", &format!("healthy-{n}"));
+        scanner.apply_size_reconciliation(&summary);
+    }
+    assert!(
+        scanner.pending_size_reconciliation_scopes.is_empty(),
+        "unrelated healthy paths must not accumulate"
+    );
+    let mut resolved = SizeSummary::default();
+    resolved.record_reconciliation_scope("bucket", "object-10");
+    resolved.size_reconciliation_truncated = true;
+    scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
+    assert!(scanner.new_cache.info.size_reconciliation.contains_key("v00010"));
+    resolved.size_reconciliation_truncated = false;
+    scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
+    let records = &mut scanner.new_cache.info.size_reconciliation;
+    assert!(!records.contains_key("v00010"));
+    assert_eq!(
+        scanner.size_ledger_index.bytes,
+        records.values().map(size_reconciliation_entry_bytes).sum::<usize>()
+    );
+    scanner
+        .size_ledger_index
+        .prune(records, now + MAX_SIZE_RECONCILIATION_AGE_SECS);
+    assert_eq!(records.len(), MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET - 1);
+    scanner
+        .size_ledger_index
+        .prune(records, now + MAX_SIZE_RECONCILIATION_AGE_SECS + 1);
+    assert!(records.is_empty());
+    assert!(scanner.size_ledger_index.by_scope.is_empty());
+    assert_eq!(scanner.size_ledger_index.bytes, 0);
 }
 
 #[test]

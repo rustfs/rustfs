@@ -867,6 +867,7 @@ pub struct FolderScanner {
     coverage_gap: bool,
     raw_enumeration_progress: Vec<RawEnumerationProgress>,
     directory_checkpoints: HashMap<String, HashMap<String, directory_cursor::Saved>>,
+    size_ledger_index: SizeLedgerIndex,
     pending_size_reconciliation_keys: HashSet<String>,
     pending_size_reconciliation_scopes: HashSet<String>,
     pending_size_reconciliation_truncated: bool,
@@ -1018,43 +1019,6 @@ fn size_reconciliation_entry_bytes(entry: &SizeReconciliationEntry) -> usize {
 
 fn size_reconciliation_scope_key(bucket: &str, object: &str) -> String {
     format!("{}:{}|{}:{}", bucket.len(), bucket, object.len(), object)
-}
-
-fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
-    info.size_reconciliation.retain(|key, entry| {
-        if entry.first_seen == 0 || entry.first_seen > now {
-            entry.first_seen = now;
-        }
-        key == &entry.key
-            && entry.key.len() <= 4096
-            && entry.bucket.len() <= 512
-            && entry.object.len() <= 512
-            && entry.version_id.as_deref().is_none_or(|value| value.len() <= 64)
-            && entry.generation.as_deref().is_none_or(|value| value.len() <= 64)
-            && entry.reason.len() <= 64
-            && now.saturating_sub(entry.first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
-    });
-
-    while info.size_reconciliation.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
-        || info
-            .size_reconciliation
-            .values()
-            .map(size_reconciliation_entry_bytes)
-            .sum::<usize>()
-            > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
-    {
-        let oldest = info
-            .size_reconciliation
-            .iter()
-            .min_by(|(left_key, left), (right_key, right)| {
-                left.first_seen.cmp(&right.first_seen).then_with(|| left_key.cmp(right_key))
-            })
-            .map(|(key, _)| clone_cache_value(key));
-        let Some(oldest) = oldest else {
-            break;
-        };
-        info.size_reconciliation.remove(&oldest);
-    }
 }
 
 async fn wait_for_scanner_io<T>(ctx: &CancellationToken, wait: impl std::future::Future<Output = T>) -> Result<T, ScannerError> {
@@ -1316,36 +1280,40 @@ impl FolderScanner {
     /// scanner cache is the durable boundary; progress updates contain only
     /// usage totals and never own a copy of the reconciliation ledger.
     fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
-        let now = Self::now_secs();
-        self.pending_size_reconciliation_keys
-            .extend(summary.size_reconciliation.iter().map(|entry| clone_cache_value(&entry.key)));
-        self.pending_size_reconciliation_scopes.extend(
-            summary
-                .reconciliation_scopes
-                .iter()
-                .map(|scope| size_reconciliation_scope_key(&scope.bucket, &scope.object)),
-        );
         self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
+        if summary.size_reconciliation.is_empty() && self.size_ledger_index.by_scope.is_empty() {
+            return;
+        }
 
-        let info = &mut self.new_cache.info;
+        let now = Self::now_secs();
+        let records = &mut self.new_cache.info.size_reconciliation;
         for incoming in &summary.size_reconciliation {
-            if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
-                existing.reason = clone_cache_value(&incoming.reason);
+            if !SizeLedgerIndex::valid(incoming) {
+                continue;
+            }
+            self.pending_size_reconciliation_keys.insert(incoming.key.clone());
+            if let Some(existing) = records.get_mut(&incoming.key) {
+                self.size_ledger_index.bytes -= size_reconciliation_entry_bytes(existing);
+                existing.reason.clone_from(&incoming.reason);
                 existing.physical_size = incoming.physical_size;
-                existing.generation = clone_cache_value(&incoming.generation);
-                existing.version_id = clone_cache_value(&incoming.version_id);
+                existing.generation.clone_from(&incoming.generation);
+                existing.version_id.clone_from(&incoming.version_id);
                 existing.attempts = existing.attempts.saturating_add(1);
-                continue;
+                self.size_ledger_index.bytes += size_reconciliation_entry_bytes(existing);
+            } else {
+                let mut entry = incoming.clone();
+                entry.first_seen = now;
+                entry.attempts = 1;
+                self.size_ledger_index.add(&entry);
+                records.insert(entry.key.clone(), entry);
             }
+        }
 
-            if size_reconciliation_entry_bytes(incoming) > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET {
-                continue;
+        for scope in &summary.reconciliation_scopes {
+            let scope = size_reconciliation_scope_key(&scope.bucket, &scope.object);
+            if self.size_ledger_index.by_scope.contains_key(&scope) {
+                self.pending_size_reconciliation_scopes.insert(scope);
             }
-
-            let mut entry = clone_cache_value(incoming);
-            entry.first_seen = now;
-            entry.attempts = 1;
-            info.size_reconciliation.insert(clone_cache_value(&entry.key), entry);
         }
     }
 
@@ -1353,15 +1321,28 @@ impl FolderScanner {
         let now = Self::now_secs();
         let current_keys = std::mem::take(&mut self.pending_size_reconciliation_keys);
         let scopes = std::mem::take(&mut self.pending_size_reconciliation_scopes);
-        let truncated = std::mem::replace(&mut self.pending_size_reconciliation_truncated, false);
-
-        let info = &mut self.new_cache.info;
+        let truncated = std::mem::take(&mut self.pending_size_reconciliation_truncated);
+        let records = &mut self.new_cache.info.size_reconciliation;
         if !truncated {
-            info.size_reconciliation.retain(|key, entry| {
-                !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
-            });
+            for scope in scopes {
+                if let Some(keys) = self.size_ledger_index.by_scope.get_mut(&scope) {
+                    keys.retain(|key| {
+                        if current_keys.contains(key) {
+                            return true;
+                        }
+                        if let Some(entry) = records.remove(key) {
+                            self.size_ledger_index.bytes -= size_reconciliation_entry_bytes(&entry);
+                            self.size_ledger_index.by_age.remove(&(entry.first_seen, entry.key));
+                        }
+                        false
+                    });
+                    if keys.is_empty() {
+                        self.size_ledger_index.by_scope.remove(&scope);
+                    }
+                }
+            }
         }
-        prune_size_reconciliation(info, now);
+        self.size_ledger_index.prune(records, now);
     }
 
     fn record_scan_resume_hint(&mut self, folder: &str) {
@@ -4036,6 +4017,7 @@ pub(crate) async fn scan_data_folder_scoped(
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
         directory_checkpoints,
+        size_ledger_index: SizeLedgerIndex::default(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -4050,7 +4032,7 @@ pub(crate) async fn scan_data_folder_scoped(
     };
 
     let now = FolderScanner::now_secs();
-    prune_size_reconciliation(&mut scanner.new_cache.info, now);
+    scanner.size_ledger_index = SizeLedgerIndex::from_persisted(&mut scanner.new_cache.info.size_reconciliation, now);
 
     // Check if context is cancelled
     if ctx.is_cancelled() && scanner.local_stop.as_ref().is_none_or(|stop| stop.reason().is_none()) {

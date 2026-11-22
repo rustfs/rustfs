@@ -15,6 +15,81 @@
 /// to this hint cache, never to a committed durable repair obligation.
 use super::*;
 
+/// Transient indexes over the bucket's persisted unknown-size records. Folder completion
+/// touches refreshed objects and the oldest debt, including when the namespace is very wide.
+#[derive(Default)]
+pub(super) struct SizeLedgerIndex {
+    pub(super) by_scope: HashMap<String, HashSet<String>>,
+    pub(super) by_age: std::collections::BTreeSet<(u64, String)>,
+    pub(super) bytes: usize,
+}
+
+impl SizeLedgerIndex {
+    pub(super) fn valid(entry: &SizeReconciliationEntry) -> bool {
+        entry.key.len() <= 4096
+            && entry.bucket.len() <= 512
+            && entry.object.len() <= 512
+            && entry.version_id.as_deref().is_none_or(|v| v.len() <= 64)
+            && entry.generation.as_deref().is_none_or(|v| v.len() <= 64)
+            && entry.reason.len() <= 64
+    }
+
+    pub(super) fn from_persisted(records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) -> Self {
+        let mut index = Self::default();
+        for (key, mut entry) in std::mem::take(records) {
+            if key != entry.key || !Self::valid(&entry) {
+                continue;
+            }
+            if entry.first_seen == 0 || entry.first_seen > now {
+                entry.first_seen = now;
+            }
+            if now.saturating_sub(entry.first_seen) > MAX_SIZE_RECONCILIATION_AGE_SECS {
+                continue;
+            }
+            index.add(&entry);
+            records.insert(key, entry);
+            if records.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
+                || index.bytes > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
+            {
+                index.prune(records, now);
+            }
+        }
+        index
+    }
+
+    pub(super) fn add(&mut self, entry: &SizeReconciliationEntry) {
+        self.bytes += size_reconciliation_entry_bytes(entry);
+        self.by_age.insert((entry.first_seen, entry.key.clone()));
+        self.by_scope
+            .entry(size_reconciliation_scope_key(&entry.bucket, &entry.object))
+            .or_default()
+            .insert(entry.key.clone());
+    }
+
+    pub(super) fn prune(&mut self, records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) {
+        while let Some((first_seen, _)) = self.by_age.first() {
+            if now.saturating_sub(*first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
+                && records.len() <= MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
+                && self.bytes <= MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
+            {
+                break;
+            }
+            if let Some((_, key)) = self.by_age.pop_first()
+                && let Some(entry) = records.remove(&key)
+            {
+                self.bytes -= size_reconciliation_entry_bytes(&entry);
+                let scope = size_reconciliation_scope_key(&entry.bucket, &entry.object);
+                if let Some(keys) = self.by_scope.get_mut(&scope) {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        self.by_scope.remove(&scope);
+                    }
+                }
+            }
+        }
+    }
+}
+
 const PENDING_HEAL_RETRY_BASE_SECS: u64 = 15 * 60;
 const PENDING_HEAL_RETRY_CAP_SECS: u64 = 6 * 60 * 60;
 
