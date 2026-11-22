@@ -167,6 +167,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         route(Method::POST, "/"),
         admin_route(Method::GET, "/v3/is-admin"),
         admin_route(Method::GET, "/v3/accountinfo"),
+        admin_route(Method::POST, "/v4/account/permissions"),
         admin_route(Method::GET, "/v3/account/info"),
         admin_route(Method::POST, "/v3/account/password"),
         admin_route(Method::GET, "/v3/list-users"),
@@ -211,6 +212,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/idp/builtin/policy-entities"),
         admin_route(Method::GET, "/v3/target/list"),
         admin_route_sample(Method::PUT, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
+        admin_route_sample(Method::DELETE, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
         admin_route_sample(
             Method::DELETE,
             "/v3/target/{target_type}/{target_name}/reset",
@@ -250,6 +252,14 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/background-heal/status"),
         admin_route(Method::GET, "/v4/heal/mrf/responsibilities"),
         admin_route(Method::POST, "/v4/heal/mrf/responsibilities/actions"),
+        admin_route(Method::GET, "/v4/heal/mrf/cluster"),
+        admin_route(Method::GET, "/v4/heal/mrf/cluster/responsibilities"),
+        admin_route_sample(
+            Method::GET,
+            "/v4/heal/mrf/cluster/responsibilities/{node_id}/{id}",
+            "/v4/heal/mrf/cluster/responsibilities/node/00000000-0000-4000-8000-000000000001",
+        ),
+        admin_route(Method::POST, "/v4/heal/mrf/cluster/responsibilities/actions"),
         admin_route(Method::GET, "/v4/heal/replacement-recovery"),
         admin_route(Method::GET, "/v3/tier"),
         admin_route(Method::GET, "/v3/tier-stats"),
@@ -422,6 +432,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/cancel-job"),
         admin_route(Method::PUT, "/v3/site-replication/add"),
         admin_route(Method::PUT, "/v3/site-replication/remove"),
+        admin_route(Method::PUT, "/v3/site-replication/remove-v2"),
+        admin_route(Method::GET, "/v3/site-replication/remove-v2/capabilities"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/remove-v2"),
         admin_route(Method::GET, "/v3/site-replication/info"),
         admin_route(Method::GET, "/v3/site-replication/metainfo"),
         admin_route(Method::GET, "/v3/site-replication/status"),
@@ -1046,6 +1059,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+    assert_route(&router, Method::POST, &admin_path("/v4/account/permissions"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));
@@ -1474,6 +1488,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::DELETE, &admin_path("/v3/cancel-job"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove-v2"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/remove-v2/capabilities"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove-v2"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/metainfo"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));

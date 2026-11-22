@@ -8,7 +8,7 @@ use super::storage_api::select_object::{
     validate_ssec_for_read,
 };
 use crate::app::runtime_sources::current_s3select_db;
-use crate::app::select_request::select_input_from_s3s;
+use crate::app::{Answered, RequestEnvelope};
 use crate::error::ApiError;
 use bytes::{Bytes, BytesMut};
 use datafusion::arrow::{
@@ -27,19 +27,22 @@ use datafusion::common::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode, header::RANGE};
+use rustfs_gateway_types::dto::{
+    ContinuationEvent, EndEvent, Progress, ProgressEvent, RecordsEvent,
+    SelectObjectContentEventStream as SelectObjectContentEvent, SelectObjectContentOutput, Stats, StatsEvent,
+};
+use rustfs_gateway_types::{SelectEventError, SelectEventStream};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use rustfs_s3select_api::request::{
+    CompressionType, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType,
+    OutputSerialization, QuoteFields, SelectObjectContentInput, SelectObjectContentRequest,
+};
 use rustfs_s3select_api::{
     QueryError, SelectError, SelectInputMetrics,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, is_noop_scan_range, validate_scan_range_bounds},
     query::{Context, Query},
 };
 use rustfs_s3select_query::instance::s3_select_query_timeout;
-use s3s::dto::{
-    CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
-    JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
-    SelectObjectContentEventStream, SelectObjectContentInput, SelectObjectContentOutput, SelectObjectContentRequest, Stats,
-    StatsEvent,
-};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use std::{
     fmt,
     future::poll_fn,
@@ -86,8 +89,8 @@ struct SelectValidation {
 
 #[derive(Clone, Debug)]
 enum SelectOutputFormat {
-    Csv(CSVOutput),
-    Json(JSONOutput),
+    Csv(CsvOutput),
+    Json(JsonOutput),
 }
 
 enum SelectProducerOutcome {
@@ -116,27 +119,24 @@ impl SelectSnapshotFence for Arc<StorageSelectObjectSnapshot> {
     }
 }
 
-pub async fn execute_select_object_content(
-    req: S3Request<SelectObjectContentInput>,
-) -> S3Result<S3Response<SelectObjectContentOutput>> {
-    let read_principal = SseKmsPrincipal::from_request(&req);
-    let mut input = req.input;
-    let validation = validate_select_request(&req.headers, &mut input)?;
+pub(super) async fn execute_select_object_content(
+    envelope: RequestEnvelope,
+    mut input: SelectObjectContentInput,
+) -> S3Result<Answered<SelectObjectContentOutput>> {
+    let read_principal = SseKmsPrincipal::from_request(&envelope);
+    let validation = validate_select_request(envelope.headers(), &mut input)?;
     log_select_request_summary(&input, &validation);
     let query_timeout = s3_select_query_timeout();
     let query_deadline = Instant::now() + query_timeout;
-    let engine_input = Arc::new(select_input_from_s3s(input.clone()).map_err(|err| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("convert the SelectObjectContent request: {err}"))
-    })?);
     let input = Arc::new(input);
-    let db = timeout_at(query_deadline, current_s3select_db((*engine_input).clone(), false))
+    let db = timeout_at(query_deadline, current_s3select_db((*input).clone(), false))
         .await
         .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))?
         .map_err(map_query_error_to_s3)?;
     let admission = db.try_reserve_query().map_err(map_query_error_to_s3)?;
     let (snapshot, response_headers) = timeout_at(
         query_deadline,
-        prepare_select_object_snapshot(&req.headers, &input, read_principal.as_ref()),
+        prepare_select_object_snapshot(envelope.headers(), &input, read_principal.as_ref()),
     )
     .await
     .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))??;
@@ -146,8 +146,13 @@ pub async fn execute_select_object_content(
         return Err(map_select_error_to_s3(&SelectError::TruncatedInput));
     }
     let snapshot = Arc::new(snapshot);
-    let query =
-        Query::new_with_snapshot(Context { input: engine_input }, input.request.expression.clone(), Arc::clone(&snapshot));
+    let query = Query::new_with_snapshot(
+        Context {
+            input: Arc::clone(&input),
+        },
+        input.request.expression.clone(),
+        Arc::clone(&snapshot),
+    );
     let query_handle = timeout_at(query_deadline, db.execute_admitted(&query, admission))
         .await
         .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))?
@@ -167,10 +172,6 @@ pub async fn execute_select_object_content(
         .clone()
         .try_reserve_owned()
         .map_err(|_| map_select_error_to_s3(&SelectError::InternalError))?;
-    let mut response = S3Response::new(SelectObjectContentOutput {
-        payload: Some(SelectObjectContentEventStream::new(ReceiverStream::new(rx))),
-    });
-    response.headers = response_headers;
     spawn_traced(async move {
         send_select_events_until_deadline(
             output,
@@ -188,7 +189,19 @@ pub async fn execute_select_object_content(
         .await;
     });
 
-    Ok(response)
+    Ok(Answered {
+        output: select_output(rx),
+        status: None,
+        headers: response_headers,
+    })
+}
+
+fn select_output(rx: mpsc::Receiver<S3Result<SelectObjectContentEvent>>) -> SelectObjectContentOutput {
+    let events = ReceiverStream::new(rx)
+        .map(|item| item.map_err(|error| SelectEventError::new(error.code().as_str(), error.message().unwrap_or_default())));
+    SelectObjectContentOutput {
+        payload: Some(SelectEventStream::new(events)),
+    }
 }
 
 async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
@@ -604,20 +617,20 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     if input.request.expression.len() > MAX_SELECT_EXPRESSION_BYTES {
         return Err(S3Error::new(S3ErrorCode::ExpressionTooLong));
     }
-    let Some(expression_type) = canonical_enum(input.request.expression_type.as_str(), &[ExpressionType::SQL]) else {
+    if !input
+        .request
+        .expression_type
+        .as_str()
+        .eq_ignore_ascii_case(ExpressionType::SQL.as_str())
+    {
         return Err(S3Error::new(S3ErrorCode::InvalidExpressionType));
-    };
-    input.request.expression_type = ExpressionType::from_static(expression_type);
+    }
+    input.request.expression_type = ExpressionType::SQL;
 
     normalize_input_serialization(&mut input.request.input_serialization)?;
     let compressed_input = is_compressed_input(&input.request.input_serialization);
     if compressed_input
-        && input.request.scan_range.as_ref().is_some_and(|range| {
-            is_noop_scan_range(&rustfs_s3select_api::request::ScanRange {
-                start: range.start,
-                end: range.end,
-            })
-        })
+        && input.request.scan_range.as_ref().is_some_and(is_noop_scan_range)
         && !input
             .request
             .input_serialization
@@ -656,16 +669,15 @@ fn is_compressed_input(input: &InputSerialization) -> bool {
     input
         .compression_type
         .as_ref()
-        .is_some_and(|compression| compression.as_str() != CompressionType::NONE)
+        .is_some_and(|compression| *compression != CompressionType::NONE)
 }
 
 /// Matches an S3 enum value in any ASCII case, as MinIO does, and returns the
 /// canonical spelling that downstream code compares against.
-fn canonical_enum(value: &str, allowed: &[&'static str]) -> Option<&'static str> {
+fn canonical_enum<T>(value: &T, allowed: impl IntoIterator<Item = T>, as_str: impl Fn(&T) -> &str) -> Option<T> {
     allowed
-        .iter()
-        .copied()
-        .find(|candidate| candidate.eq_ignore_ascii_case(value))
+        .into_iter()
+        .find(|candidate| as_str(candidate).eq_ignore_ascii_case(as_str(value)))
 }
 
 fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()> {
@@ -680,8 +692,9 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
 
     if let Some(compression) = input.compression_type.as_mut() {
         let Some(canonical) = canonical_enum(
-            compression.as_str(),
-            &[CompressionType::NONE, CompressionType::GZIP, CompressionType::BZIP2],
+            compression,
+            [CompressionType::NONE, CompressionType::GZIP, CompressionType::BZIP2],
+            CompressionType::as_str,
         ) else {
             return Err(map_select_error_to_s3(&SelectError::InvalidCompressionFormat));
         };
@@ -691,26 +704,23 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
                 INVALID_REQUEST_PARAMETER_MESSAGE,
             ));
         }
-        *compression = CompressionType::from_static(canonical);
+        *compression = canonical;
     }
-    input
-        .compression_type
-        .get_or_insert_with(|| CompressionType::from_static(CompressionType::NONE));
+    input.compression_type.get_or_insert(CompressionType::NONE);
 
     if let Some(csv) = input.csv.as_mut() {
-        let file_header_info = csv
-            .file_header_info
-            .get_or_insert_with(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+        let file_header_info = csv.file_header_info.get_or_insert(FileHeaderInfo::NONE);
         let Some(canonical) = canonical_enum(
-            file_header_info.as_str(),
-            &[FileHeaderInfo::NONE, FileHeaderInfo::USE, FileHeaderInfo::IGNORE],
+            file_header_info,
+            [FileHeaderInfo::NONE, FileHeaderInfo::USE, FileHeaderInfo::IGNORE],
+            FileHeaderInfo::as_str,
         ) else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidFileHeaderInfo,
                 "The FileHeaderInfo value is not valid. Only NONE, USE, and IGNORE are supported.",
             ));
         };
-        *file_header_info = FileHeaderInfo::from_static(canonical);
+        *file_header_info = canonical;
         validate_single_byte(csv.comments.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_character(csv.quote_character.as_deref())?;
         validate_single_character(csv.quote_escape_character.as_deref())?;
@@ -719,11 +729,11 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
     }
 
     if let Some(json) = input.json.as_mut() {
-        let json_type = json.type_.get_or_insert_with(|| JSONType::from_static(JSONType::LINES));
-        let Some(canonical) = canonical_enum(json_type.as_str(), &[JSONType::DOCUMENT, JSONType::LINES]) else {
+        let json_type = json.r#type.get_or_insert(JsonType::LINES);
+        let Some(canonical) = canonical_enum(json_type, [JsonType::DOCUMENT, JsonType::LINES], JsonType::as_str) else {
             return Err(S3Error::new(S3ErrorCode::InvalidJsonType));
         };
-        *json_type = JSONType::from_static(canonical);
+        *json_type = canonical;
     }
 
     Ok(())
@@ -744,10 +754,11 @@ fn normalize_output_serialization(output: &mut OutputSerialization) -> S3Result<
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_output_record_delimiter(csv.record_delimiter.as_deref())?;
         if let Some(quote_fields) = csv.quote_fields.as_mut() {
-            let Some(canonical) = canonical_enum(quote_fields.as_str(), &[QuoteFields::ALWAYS, QuoteFields::ASNEEDED]) else {
+            let Some(canonical) = canonical_enum(quote_fields, [QuoteFields::ALWAYS, QuoteFields::ASNEEDED], QuoteFields::as_str)
+            else {
                 return Err(S3Error::new(S3ErrorCode::InvalidQuoteFields));
             };
-            *quote_fields = QuoteFields::from_static(canonical);
+            *quote_fields = canonical;
         }
         return Ok(SelectOutputFormat::Csv(csv.clone()));
     }
@@ -941,7 +952,7 @@ impl SelectOutputEncoder {
 }
 
 #[cfg(test)]
-fn encode_csv_batch(batch: &RecordBatch, config: &CSVOutput, buffer: &mut BytesMut) -> S3Result<()> {
+fn encode_csv_batch(batch: &RecordBatch, config: &CsvOutput, buffer: &mut BytesMut) -> S3Result<()> {
     if encode_csv_batch_limited(batch, 0..batch.num_rows(), config, buffer, usize::MAX)? == batch.num_rows() {
         Ok(())
     } else {
@@ -952,7 +963,7 @@ fn encode_csv_batch(batch: &RecordBatch, config: &CSVOutput, buffer: &mut BytesM
 fn encode_csv_batch_limited(
     batch: &RecordBatch,
     rows: Range<usize>,
-    config: &CSVOutput,
+    config: &CsvOutput,
     buffer: &mut BytesMut,
     max_bytes: usize,
 ) -> S3Result<usize> {
@@ -965,7 +976,7 @@ fn encode_csv_batch_limited(
     let quote_all = config
         .quote_fields
         .as_ref()
-        .is_some_and(|quote_fields| quote_fields.as_str() == QuoteFields::ALWAYS);
+        .is_some_and(|quote_fields| *quote_fields == QuoteFields::ALWAYS);
     let mut output = LimitedBytesWriter::new(buffer, max_bytes);
     let mut field = BoundedText::default();
     let mut encoded_rows = 0;
@@ -1431,7 +1442,7 @@ fn write_limited(output: &mut LimitedBytesWriter<'_>, bytes: &[u8]) -> bool {
     output.write_all(bytes).is_ok()
 }
 
-fn json_record_delimiter(config: &JSONOutput) -> &[u8] {
+fn json_record_delimiter(config: &JsonOutput) -> &[u8] {
     if let Some(delimiter) = config.record_delimiter.as_deref() {
         delimiter.as_bytes()
     } else {
@@ -1440,7 +1451,7 @@ fn json_record_delimiter(config: &JSONOutput) -> &[u8] {
 }
 
 #[cfg(test)]
-fn encode_json_batch(batch: &RecordBatch, config: &JSONOutput, buffer: &mut BytesMut) -> S3Result<()> {
+fn encode_json_batch(batch: &RecordBatch, config: &JsonOutput, buffer: &mut BytesMut) -> S3Result<()> {
     if encode_json_batch_limited(batch, 0..batch.num_rows(), config, buffer, usize::MAX)? == batch.num_rows() {
         Ok(())
     } else {
@@ -1451,7 +1462,7 @@ fn encode_json_batch(batch: &RecordBatch, config: &JSONOutput, buffer: &mut Byte
 fn encode_json_batch_limited(
     batch: &RecordBatch,
     rows: Range<usize>,
-    config: &JSONOutput,
+    config: &JsonOutput,
     buffer: &mut BytesMut,
     max_bytes: usize,
 ) -> S3Result<usize> {
@@ -1653,10 +1664,8 @@ fn select_query_timeout_error(seconds: u64) -> S3Error {
     map_query_error_to_s3(SelectError::QueryTimeout { seconds }.into())
 }
 
-fn is_json_document(json: &JSONInput) -> bool {
-    json.type_
-        .as_ref()
-        .is_some_and(|json_type| json_type.as_str() == JSONType::DOCUMENT)
+fn is_json_document(json: &JsonInput) -> bool {
+    json.r#type.as_ref().is_some_and(|json_type| *json_type == JsonType::DOCUMENT)
 }
 
 #[cfg(test)]
@@ -1677,8 +1686,9 @@ mod tests {
         physical_plan::stream::RecordBatchStreamAdapter,
         sql::sqlparser::parser::ParserError,
     };
+    use rustfs_gateway_types::compat::s3s_5761ddfe::select::output_to_s3s;
+    use rustfs_s3select_api::request::{CsvInput, ParquetInput, ScanRange};
     use rustfs_test_utils::TestECStoreEnv;
-    use s3s::dto::{CSVInput, ParquetInput, ScanRange};
 
     fn event_stream_headers(mut bytes: &[u8]) -> Vec<Vec<(String, String)>> {
         let mut messages = Vec::new();
@@ -1817,18 +1827,18 @@ mod tests {
             let mut input = base_input();
             input.bucket = bucket.clone();
             input.key = "input.csv".to_owned();
-            let request = S3Request {
-                input,
-                method: http::Method::POST,
-                uri: format!("/{bucket}/input.csv?select&select-type=2").parse().expect("URI"),
-                headers: HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
-            let response = execute_select_object_content(request)
+            let envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: http::Method::POST,
+                    uri: format!("/{bucket}/input.csv?select&select-type=2").parse().expect("URI"),
+                    headers: HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                http::Extensions::new(),
+            );
+            let response = execute_select_object_content(envelope, input)
                 .await
                 .expect("start actual SELECT response");
             // Keep the response alive without polling its event stream. The
@@ -1875,15 +1885,15 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM s3object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
+                    csv: Some(CsvInput::default()),
                     compression_type: None,
                     json: None,
                     parquet: None,
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     json: None,
                 },
                 request_progress: None,
@@ -1894,7 +1904,7 @@ mod tests {
 
     fn csv_validation() -> SelectValidation {
         SelectValidation {
-            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            output_format: SelectOutputFormat::Csv(CsvOutput::default()),
             progress_enabled: false,
             reports_input_metrics: true,
         }
@@ -2062,9 +2072,7 @@ mod tests {
                 StatusCode::BAD_REQUEST,
             ),
             (
-                SelectError::InvalidCompressionFormatForObject {
-                    compression: CompressionType::GZIP,
-                },
+                SelectError::InvalidCompressionFormatForObject { compression: "GZIP" },
                 S3ErrorCode::InvalidCompressionFormat,
                 StatusCode::BAD_REQUEST,
             ),
@@ -2279,7 +2287,7 @@ mod tests {
         let values = builder.finish();
         let schema = Arc::new(Schema::new(vec![Field::new("value", values.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows =
@@ -2298,7 +2306,7 @@ mod tests {
         let values = DictionaryArray::<Int32Type>::try_new(keys, dictionary).expect("test dictionary should be valid");
         let schema = Arc::new(Schema::new(vec![Field::new("value", values.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer).expect("referenced empty values should batch");
@@ -2318,7 +2326,7 @@ mod tests {
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), dictionary).expect("test dictionary should be valid");
         let schema = Arc::new(Schema::new(vec![Field::new("value", values.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows =
@@ -2334,7 +2342,7 @@ mod tests {
         let values = StringArray::from(vec!["x"; row_count]);
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows =
@@ -2350,7 +2358,7 @@ mod tests {
         let values = ListArray::from_iter_primitive::<Int32Type, _, _>([Some([Some(1)]), Some([Some(2)])]);
         let schema = Arc::new(Schema::new(vec![Field::new("items", values.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer).expect("small nested JSON rows should encode");
@@ -2371,7 +2379,7 @@ mod tests {
         let values = builder.finish();
         let schema = Arc::new(Schema::new(vec![Field::new("items", values.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer).expect("the complete first row should encode");
@@ -2393,7 +2401,7 @@ mod tests {
         let values = StringArray::from(vec!["ok", quoted.as_str()]);
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
         let mut buffer = BytesMut::new();
 
         let encoded_rows =
@@ -2413,7 +2421,7 @@ mod tests {
         ]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(values), Arc::new(nested)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
         let mut buffer = BytesMut::from(b"staged\n".as_slice());
 
         let error = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer)
@@ -2434,7 +2442,7 @@ mod tests {
         let values = builder.finish();
         let schema = Arc::new(Schema::new(vec![Field::new("items", values.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         let error = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer)
@@ -2472,7 +2480,7 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(profile), Arc::new(labels), Arc::new(dictionary), Arc::new(run)])
             .expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         assert_eq!(
@@ -2490,7 +2498,7 @@ mod tests {
         let values = NullArray::new(1);
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Null, true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         assert_eq!(
@@ -2507,7 +2515,7 @@ mod tests {
         let values = DictionaryArray::<Int32Type>::try_new(keys, dictionary).expect("test dictionary should be valid");
         let schema = Arc::new(Schema::new(vec![Field::new("value", values.data_type().clone(), true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         assert_eq!(
@@ -2523,7 +2531,7 @@ mod tests {
             .expect("test dictionary should be valid");
         let schema = Arc::new(Schema::new(vec![Field::new("value", values.data_type().clone(), true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         assert_eq!(
@@ -2539,7 +2547,7 @@ mod tests {
         let values = NullArray::new(1);
         let schema = Arc::new(Schema::new(vec![Field::new(field_name, DataType::Null, true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         let error = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer)
@@ -2556,7 +2564,7 @@ mod tests {
         let values = StructArray::new_null(vec![child].into(), 1);
         let schema = Arc::new(Schema::new(vec![Field::new("nested", values.data_type().clone(), true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         assert_eq!(
@@ -2572,7 +2580,7 @@ mod tests {
         let values = StringArray::from(vec!["a", "b"]);
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput {
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput {
             record_delimiter: Some(delimiter.clone()),
         }));
         let mut buffer = BytesMut::new();
@@ -2589,7 +2597,7 @@ mod tests {
         let values = StringArray::from(vec![value.as_str()]);
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
         let mut buffer = BytesMut::new();
 
         let error =
@@ -2610,7 +2618,7 @@ mod tests {
             .map(|_| Arc::clone(&values) as datafusion::arrow::array::ArrayRef)
             .collect::<Vec<_>>();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("test record batch should be valid");
-        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+        let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
         let mut buffer = BytesMut::new();
 
         let error = encode_batch_turn(&mut encoder, &batch, 0, &mut buffer)
@@ -2627,7 +2635,7 @@ mod tests {
             let values = StringArray::from(vec![value.as_str()]);
             let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CSVOutput::default()));
+            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Csv(CsvOutput::default()));
             let mut buffer = BytesMut::new();
 
             if excess == 0 {
@@ -2653,7 +2661,7 @@ mod tests {
             let values = StringArray::from(vec![value.as_str()]);
             let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
             let mut buffer = BytesMut::new();
 
             if excess == 0 {
@@ -2681,7 +2689,7 @@ mod tests {
             let values = BinaryArray::from(vec![value.as_slice()]);
             let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Binary, false)]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
             let mut buffer = BytesMut::new();
 
             if excess == 0 {
@@ -2715,7 +2723,7 @@ mod tests {
             let values = StringArray::from(vec![value.as_str()]);
             let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("test record batch should be valid");
-            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JSONOutput::default()));
+            let mut encoder = SelectOutputEncoder::new(SelectOutputFormat::Json(JsonOutput::default()));
             let mut buffer = BytesMut::new();
 
             if excess == 0 {
@@ -3108,7 +3116,10 @@ mod tests {
         let (producer, rx, lease_released) = spawn_test_producer(output, 4);
         producer.await.expect("producer should finish successfully");
 
-        let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+        let mut byte_stream = output_to_s3s(select_output(rx))
+            .payload
+            .expect("Select stream")
+            .into_byte_stream();
         let mut encoded = Vec::new();
         while let Some(chunk) = byte_stream.next().await {
             encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
@@ -3234,7 +3245,10 @@ mod tests {
             let (producer, rx, lease_released) = spawn_test_producer(output, 2);
             producer.await.expect("producer should emit the terminal Select error");
 
-            let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+            let mut byte_stream = output_to_s3s(select_output(rx))
+                .payload
+                .expect("Select stream")
+                .into_byte_stream();
             let mut encoded = Vec::new();
             while let Some(chunk) = byte_stream.next().await {
                 encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
@@ -3278,7 +3292,7 @@ mod tests {
         assert!(sql_body.contains("<Message>"));
 
         let mut input = base_input();
-        input.request.input_serialization.compression_type = Some(CompressionType::from_static("SNAPPY"));
+        input.request.input_serialization.compression_type = Some(CompressionType::custom("SNAPPY"));
         let compression_error =
             validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown compression must fail before streaming");
         let (compression_status, compression_body) = http_xml_error(compression_error).await;
@@ -3314,7 +3328,10 @@ mod tests {
             .await
             .expect("producer should emit records followed by the terminal error");
 
-        let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+        let mut byte_stream = output_to_s3s(select_output(rx))
+            .payload
+            .expect("Select stream")
+            .into_byte_stream();
         let mut encoded = Vec::new();
         while let Some(chunk) = byte_stream.next().await {
             encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
@@ -3378,39 +3395,45 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn producer_drops_query_stream_and_snapshot_lease_when_receiver_closes() {
-        let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
-        let output = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::new(Schema::empty()),
-            futures::stream::once(async move {
-                let _stream_dropped = stream_dropped_tx;
-                futures::future::pending::<Result<RecordBatch, DataFusionError>>().await
-            }),
-        ));
-        let (event_channel, rx) = test_event_channel(2);
-        let (lease, lease_released) = lease_drop_signal();
-        let producer = send_select_events_until_deadline(
-            output,
-            event_channel,
-            csv_validation(),
-            Arc::new(SelectInputMetrics::default()),
-            Instant::now() + Duration::from_secs(300),
-            300,
-            lease,
-        );
-        tokio::pin!(producer);
+        for legacy in [false, true] {
+            let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
+            let output = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures::stream::once(async move {
+                    let _stream_dropped = stream_dropped_tx;
+                    futures::future::pending::<Result<RecordBatch, DataFusionError>>().await
+                }),
+            ));
+            let (event_channel, rx) = test_event_channel(2);
+            let (lease, lease_released) = lease_drop_signal();
+            let producer = send_select_events_until_deadline(
+                output,
+                event_channel,
+                csv_validation(),
+                Arc::new(SelectInputMetrics::default()),
+                Instant::now() + Duration::from_secs(300),
+                300,
+                lease,
+            );
+            tokio::pin!(producer);
 
-        assert!(futures::poll!(producer.as_mut()).is_pending());
-        drop(rx);
+            assert!(futures::poll!(producer.as_mut()).is_pending());
+            if legacy {
+                drop(output_to_s3s(select_output(rx)));
+            } else {
+                drop(select_output(rx));
+            }
 
-        assert!(
-            futures::poll!(producer.as_mut()).is_ready(),
-            "producer should observe the closed receiver"
-        );
-        assert!(
-            stream_dropped_rx.await.is_err(),
-            "query stream should be dropped when the receiver closes"
-        );
-        assert!(lease_released.await.is_ok(), "receiver close should release the snapshot lease");
+            assert!(
+                futures::poll!(producer.as_mut()).is_ready(),
+                "producer should observe the closed receiver"
+            );
+            assert!(
+                stream_dropped_rx.await.is_err(),
+                "query stream should be dropped when the receiver closes"
+            );
+            assert!(lease_released.await.is_ok(), "receiver close should release the snapshot lease");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -3535,26 +3558,17 @@ mod tests {
                 .input_serialization
                 .csv
                 .as_ref()
-                .and_then(|csv| csv.file_header_info.as_ref())
-                .map(|value| value.as_str()),
-            Some(FileHeaderInfo::NONE)
+                .and_then(|csv| csv.file_header_info.as_ref()),
+            Some(&FileHeaderInfo::NONE)
         );
-        assert_eq!(
-            input
-                .request
-                .input_serialization
-                .compression_type
-                .as_ref()
-                .map(|value| value.as_str()),
-            Some(CompressionType::NONE)
-        );
+        assert_eq!(input.request.input_serialization.compression_type.as_ref(), Some(&CompressionType::NONE));
     }
 
     #[test]
     fn validate_preserves_supported_compression_for_csv_and_json_lines() {
         for compression in [CompressionType::GZIP, CompressionType::BZIP2] {
             let mut csv_input = base_input();
-            csv_input.request.input_serialization.compression_type = Some(CompressionType::from_static(compression));
+            csv_input.request.input_serialization.compression_type = Some(compression.clone());
             validate_select_request(&HeaderMap::new(), &mut csv_input).expect("compressed CSV should be accepted");
             assert_eq!(
                 csv_input
@@ -3563,15 +3577,15 @@ mod tests {
                     .compression_type
                     .as_ref()
                     .map(|value| value.as_str()),
-                Some(compression)
+                Some(compression.as_str())
             );
 
             let mut json_input = base_input();
             json_input.request.input_serialization.csv = None;
-            json_input.request.input_serialization.json = Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::LINES)),
+            json_input.request.input_serialization.json = Some(JsonInput {
+                r#type: Some(JsonType::LINES),
             });
-            json_input.request.input_serialization.compression_type = Some(CompressionType::from_static(compression));
+            json_input.request.input_serialization.compression_type = Some(compression.clone());
             validate_select_request(&HeaderMap::new(), &mut json_input).expect("compressed JSON LINES should be accepted");
             assert_eq!(
                 json_input
@@ -3580,7 +3594,7 @@ mod tests {
                     .compression_type
                     .as_ref()
                     .map(|value| value.as_str()),
-                Some(compression)
+                Some(compression.as_str())
             );
         }
     }
@@ -3590,7 +3604,7 @@ mod tests {
         let mut input = base_input();
         input.request.input_serialization.csv = None;
         input.request.input_serialization.parquet = Some(ParquetInput {});
-        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        input.request.input_serialization.compression_type = Some(CompressionType::GZIP);
 
         let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("compressed Parquet must fail");
 
@@ -3601,7 +3615,7 @@ mod tests {
     #[test]
     fn validate_normalizes_noop_compressed_scan_range_and_rejects_real_ranges() {
         let mut noop = base_input();
-        noop.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        noop.request.input_serialization.compression_type = Some(CompressionType::GZIP);
         noop.request.scan_range = Some(ScanRange {
             start: Some(0),
             end: None,
@@ -3610,7 +3624,7 @@ mod tests {
         assert!(noop.request.scan_range.is_none());
 
         let mut ranged = base_input();
-        ranged.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        ranged.request.input_serialization.compression_type = Some(CompressionType::GZIP);
         ranged.request.scan_range = Some(ScanRange {
             start: Some(1),
             end: None,
@@ -3622,7 +3636,7 @@ mod tests {
         assert_eq!(error.message(), Some("Scan range queries are not supported on this type of object."));
 
         let mut malformed = base_input();
-        malformed.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        malformed.request.input_serialization.compression_type = Some(CompressionType::GZIP);
         malformed.request.scan_range = Some(ScanRange {
             start: Some(10),
             end: Some(1),
@@ -3683,7 +3697,7 @@ mod tests {
                     .as_mut()
                     .expect("CSV input")
                     .allow_quoted_record_delimiter = Some(true);
-                input.request.input_serialization.compression_type = Some(CompressionType::from_static(compression));
+                input.request.input_serialization.compression_type = Some(compression.clone());
                 input.request.scan_range = Some(range);
                 let error = validate_select_request(&HeaderMap::new(), &mut input)
                     .expect_err("quoted record delimiters cannot be combined with ScanRange");
@@ -3725,7 +3739,7 @@ mod tests {
             .csv
             .as_mut()
             .expect("base input should use CSV")
-            .file_header_info = Some(FileHeaderInfo::from_static("INVALID"));
+            .file_header_info = Some(FileHeaderInfo::custom("INVALID"));
 
         let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown header mode must fail");
 
@@ -3740,8 +3754,8 @@ mod tests {
     fn json_input(json_type: &str) -> SelectObjectContentInput {
         let mut input = base_input();
         input.request.input_serialization.csv = None;
-        input.request.input_serialization.json = Some(JSONInput {
-            type_: Some(JSONType::from(json_type.to_string())),
+        input.request.input_serialization.json = Some(JsonInput {
+            r#type: Some(JsonType::custom(json_type.to_string())),
         });
         input
     }
@@ -3754,7 +3768,7 @@ mod tests {
             ("none", CompressionType::NONE),
         ] {
             let mut input = base_input();
-            input.request.input_serialization.compression_type = Some(CompressionType::from(value.to_string()));
+            input.request.input_serialization.compression_type = Some(CompressionType::custom(value.to_string()));
             validate_select_request(&HeaderMap::new(), &mut input).expect("CompressionType should match any case");
             assert_eq!(
                 input
@@ -3763,11 +3777,11 @@ mod tests {
                     .compression_type
                     .as_ref()
                     .map(|v| v.as_str()),
-                Some(expected)
+                Some(expected.as_str())
             );
         }
 
-        for (value, expected) in [("lines", JSONType::LINES), ("Document", JSONType::DOCUMENT)] {
+        for (value, expected) in [("lines", JsonType::LINES), ("Document", JsonType::DOCUMENT)] {
             let mut input = json_input(value);
             validate_select_request(&HeaderMap::new(), &mut input).expect("JSON Type should match any case");
             let json_type = input
@@ -3775,8 +3789,8 @@ mod tests {
                 .input_serialization
                 .json
                 .as_ref()
-                .and_then(|json| json.type_.as_ref());
-            assert_eq!(json_type.map(|v| v.as_str()), Some(expected));
+                .and_then(|json| json.r#type.as_ref());
+            assert_eq!(json_type.map(|v| v.as_str()), Some(expected.as_str()));
         }
         let mut input = json_input("document");
         validate_select_request(&HeaderMap::new(), &mut input).expect("lowercase DOCUMENT should be accepted");
@@ -3794,10 +3808,10 @@ mod tests {
                 .csv
                 .as_mut()
                 .expect("base input should use CSV")
-                .file_header_info = Some(FileHeaderInfo::from(value.to_string()));
+                .file_header_info = Some(FileHeaderInfo::custom(value.to_string()));
             validate_select_request(&HeaderMap::new(), &mut input).expect("FileHeaderInfo should match any case");
             let csv = input.request.input_serialization.csv.as_ref().expect("CSV input");
-            assert_eq!(csv.file_header_info.as_ref().map(|v| v.as_str()), Some(expected));
+            assert_eq!(csv.file_header_info.as_ref().map(|v| v.as_str()), Some(expected.as_str()));
         }
 
         for (value, expected) in [("always", QuoteFields::ALWAYS), ("AsNeeded", QuoteFields::ASNEEDED)] {
@@ -3808,25 +3822,25 @@ mod tests {
                 .csv
                 .as_mut()
                 .expect("base output should use CSV")
-                .quote_fields = Some(QuoteFields::from(value.to_string()));
+                .quote_fields = Some(QuoteFields::custom(value.to_string()));
             let validation = validate_select_request(&HeaderMap::new(), &mut input).expect("QuoteFields should match any case");
             let SelectOutputFormat::Csv(csv) = validation.output_format else {
                 panic!("CSV output expected");
             };
-            assert_eq!(csv.quote_fields.as_ref().map(|v| v.as_str()), Some(expected));
+            assert_eq!(csv.quote_fields.as_ref().map(|v| v.as_str()), Some(expected.as_str()));
         }
 
         let mut input = base_input();
-        input.request.expression_type = ExpressionType::from("sql".to_string());
+        input.request.expression_type = ExpressionType::custom("sql".to_string());
         validate_select_request(&HeaderMap::new(), &mut input).expect("ExpressionType should match any case");
-        assert_eq!(input.request.expression_type.as_str(), ExpressionType::SQL);
+        assert_eq!(input.request.expression_type, ExpressionType::SQL);
     }
 
     #[test]
     fn validate_still_rejects_unknown_enum_values_in_any_case() {
         for value in ["gzipx", "snappy", " GZIP"] {
             let mut input = base_input();
-            input.request.input_serialization.compression_type = Some(CompressionType::from(value.to_string()));
+            input.request.input_serialization.compression_type = Some(CompressionType::custom(value.to_string()));
             let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown compression must fail");
             assert_eq!(error.code(), &S3ErrorCode::InvalidCompressionFormat, "{value}");
         }
@@ -3842,7 +3856,7 @@ mod tests {
             .csv
             .as_mut()
             .expect("base input should use CSV")
-            .file_header_info = Some(FileHeaderInfo::from("used".to_string()));
+            .file_header_info = Some(FileHeaderInfo::custom("used".to_string()));
         let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown header mode must fail");
         assert_eq!(error.code(), &S3ErrorCode::InvalidFileHeaderInfo);
 
@@ -3853,12 +3867,12 @@ mod tests {
             .csv
             .as_mut()
             .expect("base output should use CSV")
-            .quote_fields = Some(QuoteFields::from("never".to_string()));
+            .quote_fields = Some(QuoteFields::custom("never".to_string()));
         let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown QuoteFields must fail");
         assert_eq!(error.code(), &S3ErrorCode::InvalidQuoteFields);
 
         let mut input = base_input();
-        input.request.expression_type = ExpressionType::from("sqlite".to_string());
+        input.request.expression_type = ExpressionType::custom("sqlite".to_string());
         let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown ExpressionType must fail");
         assert_eq!(error.code(), &S3ErrorCode::InvalidExpressionType);
     }
@@ -3989,7 +4003,7 @@ mod tests {
             writer.finish().expect("Arrow JSON reference should finish");
         }
         let mut actual = BytesMut::new();
-        encode_json_batch(&batch, &JSONOutput::default(), &mut actual).expect("S3 Select JSON should encode");
+        encode_json_batch(&batch, &JsonOutput::default(), &mut actual).expect("S3 Select JSON should encode");
         assert_eq!(actual.as_ref(), expected.as_slice(), "type: {}", batch.column(0).data_type());
     }
 
@@ -4010,7 +4024,7 @@ mod tests {
         .unwrap();
 
         let mut bytes = BytesMut::new();
-        encode_json_batch(&batch, &JSONOutput::default(), &mut bytes).unwrap();
+        encode_json_batch(&batch, &JsonOutput::default(), &mut bytes).unwrap();
         assert_eq!(bytes.as_ref(), b"{\"name\":\"a\"}\n{\"name\":\"b\"}\n");
     }
 
@@ -4033,7 +4047,7 @@ mod tests {
         let mut bytes = BytesMut::new();
         encode_json_batch(
             &batch,
-            &JSONOutput {
+            &JsonOutput {
                 record_delimiter: Some("|".to_string()),
             },
             &mut bytes,
@@ -4088,7 +4102,7 @@ mod tests {
         let mut bytes = BytesMut::new();
         encode_csv_batch(
             &batch,
-            &CSVOutput {
+            &CsvOutput {
                 field_delimiter: Some("|".to_string()),
                 record_delimiter: Some("\r\n".to_string()),
                 ..Default::default()
@@ -4108,9 +4122,9 @@ mod tests {
 
         encode_csv_batch(
             &batch,
-            &CSVOutput {
+            &CsvOutput {
                 quote_escape_character: Some("\\".to_string()),
-                quote_fields: Some(QuoteFields::from_static(QuoteFields::ASNEEDED)),
+                quote_fields: Some(QuoteFields::ASNEEDED),
                 record_delimiter: Some("|".to_string()),
                 ..Default::default()
             },
@@ -4140,10 +4154,10 @@ mod tests {
 
         encode_csv_batch(
             &batch,
-            &CSVOutput {
+            &CsvOutput {
                 quote_character: Some("'".to_string()),
                 quote_escape_character: Some("\\".to_string()),
-                quote_fields: Some(QuoteFields::from_static(QuoteFields::ALWAYS)),
+                quote_fields: Some(QuoteFields::ALWAYS),
                 record_delimiter: Some("|".to_string()),
                 ..Default::default()
             },
@@ -4214,7 +4228,10 @@ mod tests {
             .expect("test channel should accept Records");
         drop(tx);
 
-        let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+        let mut byte_stream = output_to_s3s(select_output(rx))
+            .payload
+            .expect("Select stream")
+            .into_byte_stream();
         let mut encoded = Vec::new();
         while let Some(chunk) = byte_stream.next().await {
             encoded.extend_from_slice(&chunk.expect("Records event should serialize"));
@@ -4235,8 +4252,8 @@ mod tests {
         let mut input = base_input();
         input.request.input_serialization = InputSerialization {
             csv: None,
-            json: Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            json: Some(JsonInput {
+                r#type: Some(JsonType::DOCUMENT),
             }),
             parquet: None,
             compression_type: None,
@@ -4256,8 +4273,8 @@ mod tests {
         let mut input = base_input();
         input.request.input_serialization = InputSerialization {
             csv: None,
-            json: Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::LINES)),
+            json: Some(JsonInput {
+                r#type: Some(JsonType::LINES),
             }),
             parquet: None,
             compression_type: None,

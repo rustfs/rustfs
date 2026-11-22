@@ -1029,3 +1029,229 @@ mod native_abort_closure_tests {
         include!("multipart_initial_probe_tests.rs");
     }
 }
+
+mod abort_owner_tests {
+    use super::*;
+    use crate::storage_api_contracts::multipart::{MultipartAbortAuthorization, MultipartOwner};
+
+    #[test]
+    fn recorded_multipart_owner_requires_unambiguous_metadata_for_the_selected_namespace() {
+        const BUCKET: &str = "abort-owner";
+        const ENCODED: &str = "directory__XLDIR__";
+        const RUSTFS: &str = RUSTFS_MULTIPART_BUCKET_KEY;
+        const MINIO: &str = "x-minio-internal-multipart-bucket";
+        const RUSTFS_OBJECT: &str = RUSTFS_MULTIPART_OBJECT_KEY;
+        const MINIO_OBJECT: &str = "x-minio-internal-multipart-object";
+
+        let expected = MultipartOwner {
+            bucket: BUCKET.to_owned(),
+            object: "directory/".to_owned(),
+        };
+        let rustfs = [(RUSTFS, BUCKET), (RUSTFS_OBJECT, ENCODED)];
+        let minio = [(MINIO, BUCKET), (MINIO_OBJECT, ENCODED)];
+        for fields in [rustfs.to_vec(), minio.to_vec(), [rustfs, minio].concat()] {
+            let metadata = fields
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect();
+            assert_eq!(recorded_multipart_owner(&metadata, BUCKET, ENCODED), Some(expected.clone()));
+        }
+        for fields in [
+            vec![(RUSTFS, BUCKET)],
+            vec![(RUSTFS_OBJECT, ENCODED)],
+            vec![(RUSTFS, ""), (RUSTFS_OBJECT, ENCODED)],
+            vec![(RUSTFS, BUCKET), (RUSTFS_OBJECT, "")],
+            vec![(RUSTFS, "foreign"), (RUSTFS_OBJECT, ENCODED)],
+            vec![(RUSTFS, BUCKET), (RUSTFS_OBJECT, "directory/")],
+            [rustfs, [(MINIO, "foreign"), (MINIO_OBJECT, ENCODED)]].concat(),
+            [rustfs, [(MINIO, BUCKET), ("X-MINIO-INTERNAL-MULTIPART-OBJECT", "other")]].concat(),
+        ] {
+            let metadata = fields
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(recorded_multipart_owner(&metadata, BUCKET, ENCODED), None, "{fields:?}");
+        }
+    }
+
+    struct AbortGate {
+        expected: Option<MultipartOwner>,
+        accepted: bool,
+        calls: AtomicUsize,
+    }
+
+    impl MultipartAbortAuthorization for AbortGate {
+        type Error = StorageError;
+
+        fn authorize(&self, owner: Option<&MultipartOwner>) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(owner, self.expected.as_ref(), "gate sees the actual selected upload owner");
+            if self.accepted {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidUploadID(String::new(), String::new(), String::new()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_owner_callback_controls_physical_deletion() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "abort-locked-owner";
+        let key = "staged-object";
+        make_bucket_on_all(&disks, bucket).await;
+        let (id, _) = stage_upload_with_create_opts(&set, bucket, key, b"staged part", &ObjectOptions::default()).await;
+        let path = SetDisks::get_upload_id_dir(bucket, key, &id);
+        let (fi, _) = set
+            .check_upload_id_exists(bucket, key, &id, true)
+            .await
+            .expect("staged upload");
+        let part = format!("{path}/{}/part.1", fi.data_dir.expect("staged data directory"));
+        let expected = MultipartOwner {
+            bucket: bucket.to_owned(),
+            object: key.to_owned(),
+        };
+        let mut before = Vec::new();
+        for disk in &disks {
+            before.push(
+                disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &part)
+                    .await
+                    .expect("staged shard"),
+            );
+        }
+        let rejected = Arc::new(AbortGate {
+            expected: Some(expected.clone()),
+            accepted: false,
+            calls: AtomicUsize::new(0),
+        });
+        let opts = ObjectOptions {
+            multipart_abort_authorization: Some(rejected.clone()),
+            ..Default::default()
+        };
+        let result = set.abort_multipart_upload(bucket, key, &id, &opts).await;
+        for (disk, staged) in disks.iter().zip(before) {
+            let after = disk
+                .read_all(RUSTFS_META_MULTIPART_BUCKET, &part)
+                .await
+                .expect("denied Abort preserves the shard");
+            assert_eq!(staged, after);
+        }
+        assert!(matches!(result, Err(StorageError::InvalidUploadID(..))));
+        assert_eq!(rejected.calls.load(Ordering::Relaxed), 1);
+
+        let allowed = Arc::new(AbortGate {
+            expected: Some(expected),
+            accepted: true,
+            calls: AtomicUsize::new(0),
+        });
+        let opts = ObjectOptions {
+            multipart_abort_authorization: Some(allowed.clone()),
+            ..Default::default()
+        };
+        set.abort_multipart_upload(bucket, key, &id, &opts)
+            .await
+            .expect("owner permits Abort");
+        assert_eq!(allowed.calls.load(Ordering::Relaxed), 1);
+        for disk in &disks {
+            assert!(matches!(
+                disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &part).await,
+                Err(DiskError::FileNotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_owner_comes_from_the_selected_metadata_on_all_disks() {
+        use rustfs_utils::http::{get_str, remove_str};
+
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "abort-owner-metadata";
+        make_bucket_on_all(&disks, bucket).await;
+        for (key, bucket_fields, object_fields, accepted) in [
+            ("rustfs", [Some(bucket), None], [Some("rustfs"), None], true),
+            ("minio", [None, Some(bucket)], [None, Some("minio")], true),
+            ("matching", [Some(bucket), Some(bucket)], [Some("matching"), Some("matching")], true),
+            ("empty", [Some(bucket), Some(bucket)], [Some("empty"), Some("")], false),
+            ("missing", [None, None], [Some("missing"), None], false),
+            ("foreign-bucket", [Some("foreign"), None], [Some("foreign-bucket"), None], false),
+            ("foreign-key", [Some(bucket), None], [Some("unrelated"), None], false),
+            ("conflict", [Some(bucket), Some("foreign")], [Some("conflict"), Some("conflict")], false),
+        ] {
+            let (id, _) = stage_upload_with_create_opts(&set, bucket, key, b"staged shard data", &ObjectOptions::default()).await;
+            let path = SetDisks::get_upload_id_dir(bucket, key, &id);
+            pin_historical_unmarked_upload(&disks, bucket, &path).await;
+            let mut part_path = None;
+            let mut staged = Vec::new();
+            let fields = [
+                (RUSTFS_MULTIPART_BUCKET_KEY, bucket_fields[0]),
+                ("x-minio-internal-multipart-bucket", bucket_fields[1]),
+                (RUSTFS_MULTIPART_OBJECT_KEY, object_fields[0]),
+                ("x-minio-internal-multipart-object", object_fields[1]),
+            ];
+            for disk in &disks {
+                let mut head = disk
+                    .read_version("", RUSTFS_META_MULTIPART_BUCKET, &path, "", &ReadOptions::default())
+                    .await
+                    .expect("read the staged metadata on each disk");
+                let part = part_path.get_or_insert_with(|| format!("{path}/{}/part.1", head.data_dir.expect("part directory")));
+                staged.push(
+                    disk.read_all(RUSTFS_META_MULTIPART_BUCKET, part)
+                        .await
+                        .expect("read staged part before Abort"),
+                );
+                assert_eq!(get_str(&head.metadata, "multipart-bucket").as_deref(), Some(bucket));
+                remove_str(&mut head.metadata, "multipart-bucket");
+                remove_str(&mut head.metadata, "multipart-object");
+                for (name, value) in fields {
+                    if let Some(value) = value {
+                        head.metadata.insert(name.to_owned(), value.to_owned());
+                    }
+                }
+                disk.write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, head)
+                    .await
+                    .expect("write the test owner on each disk");
+                let persisted = disk
+                    .read_version("", RUSTFS_META_MULTIPART_BUCKET, &path, "", &ReadOptions::default())
+                    .await
+                    .expect("verify the actual persisted metadata");
+                for (name, value) in fields {
+                    assert_eq!(persisted.metadata.get(name).map(String::as_str), value);
+                }
+            }
+            let gate = Arc::new(AbortGate {
+                expected: accepted.then(|| MultipartOwner {
+                    bucket: bucket.to_owned(),
+                    object: key.to_owned(),
+                }),
+                accepted,
+                calls: AtomicUsize::new(0),
+            });
+            let opts = ObjectOptions {
+                multipart_abort_authorization: Some(gate.clone()),
+                ..Default::default()
+            };
+            let result = set.abort_multipart_upload(bucket, key, &id, &opts).await;
+            for (disk, previous) in disks.iter().zip(staged) {
+                let after = disk
+                    .read_all(RUSTFS_META_MULTIPART_BUCKET, part_path.as_deref().expect("part path"))
+                    .await;
+                if accepted {
+                    assert!(matches!(after, Err(DiskError::FileNotFound)), "{key}: authorized data removed");
+                } else {
+                    assert_eq!(after.expect("refused Abort preserves the staged part"), previous, "{key}");
+                }
+            }
+            let calls = gate.calls.load(Ordering::Relaxed);
+            if accepted {
+                assert_eq!(calls, 1, "{key}");
+                result.expect("Abort with agreeing persisted owner");
+            } else {
+                assert!(result.is_err(), "{key}: invalid metadata must not authorize Abort");
+                if key == "empty" {
+                    // The existing source inspection refuses this head before selecting an owner.
+                    assert_eq!(calls, 0, "malformed physical owner was refused before the callback");
+                }
+            }
+        }
+    }
+}

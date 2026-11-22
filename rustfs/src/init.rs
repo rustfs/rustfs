@@ -19,7 +19,6 @@ use crate::server::ShutdownHandle;
 use crate::server::runtime_sources::current_notify_interface;
 use crate::storage_api::error::{StorageError, is_unreadable_config_error};
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
-use crate::storage_api::startup::init::notification_config_to_s3s;
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
@@ -56,7 +55,7 @@ type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
 
 #[instrument]
 pub fn print_server_info() {
-    let current_year = jiff::Zoned::now().year();
+    let current_year = jiff::ZonedDateTime::now().year();
     info!(
         target: "rustfs::init",
         event = "server_identity",
@@ -165,12 +164,12 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 }
 
 fn notification_config_to_event_rules(
-    cfg: &s3s::dto::NotificationConfiguration,
+    cfg: rustfs_gateway_types::persistence::PersistedNotificationConfiguration,
 ) -> Result<Vec<NotificationEventRule>, TargetIDError> {
     let mut event_rules = Vec::new();
-    process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)?;
-    process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)?;
-    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)?;
+    process_queue_configurations(&mut event_rules, cfg.queue_configurations, arn_to_target_id)?;
+    process_topic_configurations(&mut event_rules, cfg.topic_configurations, arn_to_target_id)?;
+    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations, arn_to_target_id)?;
     Ok(event_rules)
 }
 
@@ -180,7 +179,7 @@ enum BucketNotificationLookup {
     Configured(rustfs_gateway_types::persistence::PersistedNotificationConfiguration),
     Missing,
     /// Stored bytes cannot be parsed. Deterministic, so a retry cannot help,
-    /// and reading it as missing would clear the bucket's rules.
+    /// and registration must not treat it as a readable empty configuration.
     Unreadable,
 }
 
@@ -199,7 +198,7 @@ fn classify_bucket_notification_lookup(
                 subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                 bucket = %bucket,
                 error = %err,
-                "Bucket notification configuration is unreadable; leaving its rules unchanged"
+                "Bucket notification configuration is unreadable; skipping rule registration"
             );
             Ok(BucketNotificationLookup::Unreadable)
         }
@@ -209,14 +208,14 @@ fn classify_bucket_notification_lookup(
     }
 }
 
-/// Apply one bucket's persisted notification rules. An unreadable config is
-/// isolated to its bucket: it neither aborts setup for the other buckets nor
-/// clears the bucket's rules as if it had none.
-async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
+/// Validate one bucket's persisted notification rules. An unreadable config is
+/// isolated to its bucket and does not abort setup for the other buckets.
+/// Metadata-bound server dispatch independently suppresses external delivery
+/// for unreadable snapshots rather than retaining an old subscription.
+async fn validate_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
     match classify_bucket_notification_lookup(bucket, get_bucket_notification_config(bucket).await)? {
         BucketNotificationLookup::Unreadable => Ok(false),
         BucketNotificationLookup::Configured(cfg) => {
-            let cfg = notification_config_to_s3s(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
             info!(
                 target: "rustfs::init",
                 event = "notification_config_loaded",
@@ -230,9 +229,9 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
             );
 
             let event_rules =
-                notification_config_to_event_rules(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
+                notification_config_to_event_rules(cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
             current_notify_interface()
-                .add_event_specific_rules(bucket, region, &event_rules)
+                .validate_event_specific_rules(bucket, region, &event_rules)
                 .await?;
             Ok(true)
         }
@@ -245,15 +244,15 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
                 bucket = %bucket,
                 "Bucket notification configuration not found"
             );
-            current_notify_interface().clear_bucket_notification_rules(bucket).await?;
             Ok(false)
         }
     }
 }
 
-/// Add existing bucket notification configurations to the global notifier system.
+/// Validate existing bucket notification configurations against the global notifier system.
 /// This function retrieves notification configurations for each bucket
-/// and registers the corresponding event rules with the notifier system.
+/// and validates the corresponding event rules with the notifier system.
+/// Store-owned metadata snapshots independently control rule publication and withdrawal.
 ///  It processes queue, topic, and lambda configurations and maps them to event rules.
 ///  # Arguments
 /// * `buckets` - A vector of bucket names to process
@@ -261,7 +260,7 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
     let region = notification_region();
     for bucket in buckets.iter() {
-        if let Err(err) = apply_bucket_notification_configuration(bucket, region.as_str()).await {
+        if let Err(err) = validate_bucket_notification_configuration(bucket, region.as_str()).await {
             let err = s3_error!(InternalError, "Failed to add rules: {err}");
             error!(
                 target: "rustfs::init",
@@ -291,7 +290,7 @@ pub(crate) async fn reconcile_persisted_bucket_notification_configurations(
     let mut configured_bucket_count = 0;
 
     for bucket in bucket_infos {
-        if apply_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
+        if validate_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
             configured_bucket_count += 1;
         }
     }
@@ -928,8 +927,7 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
 
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub(crate) fn protocol_storage_client_for_server(server_ctx: Arc<ServerContextSlot>) -> ProtocolStorageClient {
-    let fs = crate::storage_api::startup::init::ecfs::FS::with_server_ctx(server_ctx);
-    ProtocolStorageClient::new(fs)
+    ProtocolStorageClient::new(server_ctx)
 }
 
 /// Initialize the FTP system
@@ -1430,10 +1428,11 @@ mod tests {
     use crate::config::{BufferConfig, WorkloadProfile};
     use crate::storage_api::error::{StorageError, UnreadableBucketConfig};
     use rustfs_config::KI_B;
-    use rustfs_s3_types::EventName;
-    use s3s::dto::{
-        FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter,
+    use rustfs_gateway_types::persistence::{
+        PersistedFilterRule, PersistedNotificationConfiguration, PersistedNotificationConfigurationFilter,
+        PersistedQueueConfiguration, PersistedS3KeyFilter,
     };
+    use rustfs_s3_types::EventName;
 
     /// rustfs/backlog#1734: an unreadable notification config is isolated to
     /// its bucket. It must not abort setup for every other bucket (a storage
@@ -1491,19 +1490,19 @@ mod tests {
 
     #[test]
     fn notification_config_to_event_rules_preserves_target_and_filters() {
-        let cfg = NotificationConfiguration {
-            queue_configurations: Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:Put".to_string().into()],
+        let cfg = PersistedNotificationConfiguration {
+            queue_configurations: Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:Put".to_owned()],
                 queue_arn: "arn:rustfs:sqs:us-east-1:rustfs_to_activemq:mqtt".to_string(),
-                filter: Some(NotificationConfigurationFilter {
-                    key: Some(S3KeyFilter {
+                filter: Some(PersistedNotificationConfigurationFilter {
+                    key: Some(PersistedS3KeyFilter {
                         filter_rules: Some(vec![
-                            FilterRule {
-                                name: Some(FilterRuleName::from_static(FilterRuleName::PREFIX)),
+                            PersistedFilterRule {
+                                name: Some("prefix".to_owned()),
                                 value: Some("uploads/".to_string()),
                             },
-                            FilterRule {
-                                name: Some(FilterRuleName::from_static(FilterRuleName::SUFFIX)),
+                            PersistedFilterRule {
+                                name: Some("suffix".to_owned()),
                                 value: Some(".json".to_string()),
                             },
                         ]),
@@ -1516,7 +1515,7 @@ mod tests {
             event_bridge_configuration: None,
         };
 
-        let rules = notification_config_to_event_rules(&cfg).expect("valid notification config should map to event rules");
+        let rules = notification_config_to_event_rules(cfg).expect("valid notification config should map to event rules");
 
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].0, vec![EventName::ObjectCreatedPut]);
@@ -1529,9 +1528,9 @@ mod tests {
 
     #[test]
     fn notification_config_to_event_rules_rejects_invalid_arn() {
-        let cfg = NotificationConfiguration {
-            queue_configurations: Some(vec![QueueConfiguration {
-                events: vec!["s3:ObjectCreated:Put".to_string().into()],
+        let cfg = PersistedNotificationConfiguration {
+            queue_configurations: Some(vec![PersistedQueueConfiguration {
+                events: vec!["s3:ObjectCreated:Put".to_owned()],
                 queue_arn: "arn:aws:sqs:us-east-1:rustfs_to_activemq:mqtt".to_string(),
                 filter: None,
                 id: None,
@@ -1541,7 +1540,7 @@ mod tests {
             event_bridge_configuration: None,
         };
 
-        let err = notification_config_to_event_rules(&cfg).expect_err("invalid ARN partition must fail");
+        let err = notification_config_to_event_rules(cfg).expect_err("invalid ARN partition must fail");
 
         assert!(err.to_string().contains("Invalid ARN"), "unexpected error: {err}");
     }

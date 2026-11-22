@@ -79,18 +79,6 @@ pub async fn validate_event_specific_rules(
     notifier_global::validate_event_specific_rules(bucket_name, region, event_rules).await
 }
 
-pub async fn add_event_specific_rules(
-    bucket_name: &str,
-    region: &str,
-    event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
-) -> Result<(), NotificationError> {
-    notifier_global::add_event_specific_rules(bucket_name, region, event_rules).await
-}
-
-pub async fn clear_bucket_notification_rules(bucket_name: &str) -> Result<(), NotificationError> {
-    notifier_global::clear_bucket_notification_rules(bucket_name).await
-}
-
 pub fn notification_system() -> Option<Arc<NotificationSys>> {
     get_global_notification_sys()
 }
@@ -166,7 +154,7 @@ pub fn action_credentials() -> Option<Credentials> {
     get_global_action_cred()
 }
 
-pub fn region() -> Option<s3s::region::Region> {
+pub fn region() -> Option<rustfs_s3_types::Region> {
     get_global_region()
 }
 

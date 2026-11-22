@@ -332,9 +332,9 @@ pub enum S3Action {
     ListenBucketNotificationAction,
     #[strum(serialize = "s3:ListMultipartUploadParts")]
     ListMultipartUploadPartsAction,
-    #[strum(serialize = "s3:PutBucketLifecycle")]
+    #[strum(to_string = "s3:PutBucketLifecycle", serialize = "s3:PutLifecycleConfiguration")]
     PutBucketLifecycleAction,
-    #[strum(serialize = "s3:GetBucketLifecycle")]
+    #[strum(to_string = "s3:GetBucketLifecycle", serialize = "s3:GetLifecycleConfiguration")]
     GetBucketLifecycleAction,
     #[strum(serialize = "s3:PutBucketLogging")]
     PutBucketLoggingAction,
@@ -465,12 +465,18 @@ pub enum AdminAction {
     ServiceFreezeAdminAction,
     #[strum(serialize = "admin:ConfigUpdate")]
     ConfigUpdateAdminAction,
+    #[strum(serialize = "admin:ManageOpenIDConfig")]
+    ManageOpenIDConfigAdminAction,
     #[strum(serialize = "admin:TLSCertificatePublish")]
     TLSCertificatePublishAdminAction,
     #[strum(serialize = "admin:TLSCertificateStatus")]
     TLSCertificateStatusAdminAction,
     #[strum(serialize = "admin:CreateUser")]
     CreateUserAdminAction,
+    #[strum(serialize = "admin:ChangeOwnPassword")]
+    ChangeOwnPasswordAdminAction,
+    #[strum(serialize = "admin:ManageOwnMFA")]
+    ManageOwnMFAAdminAction,
     #[strum(serialize = "admin:DeleteUser")]
     DeleteUserAdminAction,
     #[strum(serialize = "admin:ListUsers")]
@@ -495,6 +501,8 @@ pub enum AdminAction {
     SiteReplicationOperationAction,
     #[strum(serialize = "admin:CreateServiceAccount")]
     CreateServiceAccountAdminAction,
+    #[strum(serialize = "admin:CreateServiceAccountForUser")]
+    CreateServiceAccountForUserAdminAction,
     #[strum(serialize = "admin:UpdateServiceAccount")]
     UpdateServiceAccountAdminAction,
     #[strum(serialize = "admin:RemoveServiceAccount")]
@@ -690,9 +698,12 @@ impl AdminAction {
                 | AdminAction::ServiceStopAdminAction
                 | AdminAction::ServiceFreezeAdminAction
                 | AdminAction::ConfigUpdateAdminAction
+                | AdminAction::ManageOpenIDConfigAdminAction
                 | AdminAction::TLSCertificatePublishAdminAction
                 | AdminAction::TLSCertificateStatusAdminAction
                 | AdminAction::CreateUserAdminAction
+                | AdminAction::ChangeOwnPasswordAdminAction
+                | AdminAction::ManageOwnMFAAdminAction
                 | AdminAction::DeleteUserAdminAction
                 | AdminAction::ListUsersAdminAction
                 | AdminAction::EnableUserAdminAction
@@ -705,6 +716,7 @@ impl AdminAction {
                 | AdminAction::SiteReplicationInfoAction
                 | AdminAction::SiteReplicationOperationAction
                 | AdminAction::CreateServiceAccountAdminAction
+                | AdminAction::CreateServiceAccountForUserAdminAction
                 | AdminAction::UpdateServiceAccountAdminAction
                 | AdminAction::RemoveServiceAccountAdminAction
                 | AdminAction::ListServiceAccountsAdminAction
@@ -1023,6 +1035,14 @@ mod tests {
         assert!(all_admin.is_match(&Action::AdminAction(set_action)));
         assert!(all_admin.is_match(&Action::AdminAction(get_action)));
         assert!(!Action::AdminAction(get_action).is_match(&Action::AdminAction(set_action)));
+    }
+
+    #[test]
+    fn oidc_config_action_is_separate_from_general_config_writes() {
+        let oidc = Action::try_from("admin:ManageOpenIDConfig").expect("parse OIDC management permission");
+        assert!(!Action::AdminAction(AdminAction::ConfigUpdateAdminAction).is_match(&oidc));
+        assert!(Action::AdminAction(AdminAction::AllAdminActions).is_match(&oidc));
+        assert!(AdminAction::ManageOpenIDConfigAdminAction.is_valid());
     }
 
     #[test]

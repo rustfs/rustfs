@@ -68,7 +68,7 @@ fn completed_outcome(
     sources: &HashSet<DataUsageCacheSource>,
     outcome: Outcome,
     plan_complete: bool,
-    budget_elapsed: bool,
+    owner_cancelled: bool,
 ) {
     let scope = ScannerSnapshotScope {
         sources,
@@ -82,7 +82,9 @@ fn completed_outcome(
         },
     };
     assert_one_outcome(Kind::Completed, outcome, || {
-        completed_usage_candidate(caches, &scope, &[], plan_complete, budget_elapsed, false)
+        let candidate = completed_usage_candidate(caches, &scope, &[], plan_complete, owner_cancelled);
+        assert_eq!(candidate.as_ref().err().copied().unwrap_or(Outcome::Accepted), outcome);
+        candidate.ok()
     });
 }
 

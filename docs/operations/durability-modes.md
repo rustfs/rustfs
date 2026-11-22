@@ -1,11 +1,11 @@
 # Durability modes (drive sync tiers)
 
-**Use this when:** choosing or debugging the fsync tier (`strict|relaxed|none|legacy-off`) for a deployment or a single bucket, or changing any write-path sync behaviour.
+**Use this when:** choosing or debugging the fsync tier (`strict|file-sync|relaxed|none|legacy-off`) for a deployment or a single bucket, or changing any write-path sync behaviour.
 **Source of truth:** `crates/ecstore/src/disk/local.rs` (`ENV_RUSTFS_DURABILITY_MODE`, `ENV_RUSTFS_DRIVE_SYNC_ENABLE`, mode resolution and per-write-point sync decisions), `crates/ecstore/src/bucket/durability.rs` (`ENV_NEW_BUCKET_DURABILITY_MODE`, per-bucket override), `rustfs/src/admin/handlers/durability.rs` (admin API), `crates/ecstore/src/bucket/metadata_sys.rs` (`BUCKET_METADATA_REFRESH_INTERVAL`).
 
 RustFS lets operators choose how much fsync work runs on the object write
 path. The default (`strict`) preserves the fully synced behavior RustFS has
-always shipped. `relaxed` and `none` are **opt-in** trades of power-loss
+always shipped. `file-sync`, `relaxed`, and `none` are **opt-in** trades of power-loss
 durability for latency/IOPS. Newly created buckets inherit the process-wide
 mode unless `RUSTFS_NEW_BUCKET_DURABILITY_MODE` explicitly sets an override.
 
@@ -13,13 +13,13 @@ mode unless `RUSTFS_NEW_BUCKET_DURABILITY_MODE` explicitly sets an override.
 
 ```bash
 # New tiered switch (wins when set to a valid value)
-RUSTFS_DURABILITY_MODE=strict|relaxed|none   # default: strict
+RUSTFS_DURABILITY_MODE=strict|file-sync|relaxed|none   # default: strict
 
 # Legacy binary switch (kept for compatibility, superseded by the above)
 RUSTFS_DRIVE_SYNC_ENABLE=true|false          # default: true
 
 # Tier seeded into a NEWLY CREATED bucket's own override (see "New-bucket default")
-RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed|strict|none|inherit   # default: inherit process mode
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=file-sync|relaxed|strict|none|inherit   # default: inherit process mode
 ```
 
 Resolution rules:
@@ -29,7 +29,7 @@ Resolution rules:
 | unset | unset | `strict` (default) |
 | unset | `true` | `strict` |
 | unset | `false` | `legacy-off` (the historical "everything off" semantics) |
-| `strict` / `relaxed` / `none` | anything | the named mode |
+| `strict` / `file-sync` / `relaxed` / `none` | anything | the named mode |
 | invalid value | any | logged warning, falls back to the legacy switch, then the default |
 
 Values are case-insensitive and whitespace-tolerant. The mode is resolved
@@ -43,19 +43,21 @@ through `RUSTFS_DRIVE_SYNC_ENABLE=false` so that existing deployments keep
 their exact current behavior. It is deprecated and will be retained for at
 least one major version.
 
+Do not set the process-wide `file-sync` value until every node runs a version that recognizes it. An older node treats the value as invalid and falls back to its legacy switch. Prefer the fail-closed bucket override during a rolling upgrade, and keep `RUSTFS_NEW_BUCKET_DURABILITY_MODE=inherit` until the fleet upgrade is complete.
+
 ## What each mode fsyncs
 
 Write points on the object path and how each mode treats them:
 
-| Write point | `strict` | `relaxed` | `none` | `legacy-off` |
-| --- | --- | --- | --- | --- |
-| Erasure shard files (fdatasync before the commit rename) | yes | **yes** | no | no |
-| Multipart part payload (fdatasync before `rename_part` commit) | yes | **yes** | no | no |
-| xl.meta contents (tmp write before the commit rename) | yes | no | no | no |
-| Inline objects (data embedded in xl.meta) | yes | no | no | no |
-| Old-metadata rollback backups | yes | no | no | no |
-| Directory entries of commit renames (fsync of the parent dir) | yes | no | no | no |
-| System-critical writes (see pinning below) | yes | yes (pinned) | yes (pinned) | **no** |
+| Write point | `strict` | `file-sync` | `relaxed` | `none` | `legacy-off` |
+| --- | --- | --- | --- | --- | --- |
+| Erasure shard files (fdatasync before the commit rename) | yes | **yes** | **yes** | no | no |
+| Multipart part payload (fdatasync before `rename_part` commit) | yes | **yes** | **yes** | no | no |
+| xl.meta contents (tmp write before the commit rename) | yes | **yes** | no | no | no |
+| Inline objects (data embedded in xl.meta) | yes | **yes** | no | no | no |
+| Recovery journals, witnesses, and rollback state | yes | **yes** | no | no | no |
+| Ordinary commit and new ancestor directory entries | yes | no | no | no | no |
+| System-critical writes (see pinning below) | yes | yes (pinned) | yes (pinned) | yes (pinned) | **no** |
 
 ## Power-loss guarantees, honestly stated
 
@@ -65,6 +67,8 @@ individual drive before the 200 OK: payload bytes, xl.meta, rollback backups,
 and the directory entries of the commit renames are all fsynced. A whole-node
 (or whole-cluster) power failure does not lose acknowledged data. This is the
 current mainline behavior, unchanged.
+
+**`file-sync`.** Payload files and final xl.meta file contents are synchronized before acknowledgement, including inline object data, while ordinary commit rename and newly created ancestor directory entries are not individually fsynced. Recovery journals, multipart transaction witnesses, rollback state, and system-critical namespaces retain strict barriers. After sudden power loss, synchronized inode contents are protected, but a recently acknowledged fresh object name can disappear and an overwrite can revert to the previous namespace state. This matches MinIO's default object-path boundary more closely than `relaxed`, but it does not provide the complete per-drive acknowledgement guarantee of `strict`.
 
 **`relaxed`.** Payload bytes of non-inline objects and multipart parts are
 fdatasynced to the device before the acknowledgement, but the metadata
@@ -77,10 +81,7 @@ failure:
   xl.meta bytes nor the rename's directory entry are synced, the commit
   itself can vanish; surviving shard bytes become unreferenced orphans on
   that drive.
-- **Inline (small) objects receive no per-object fsync at all** in this mode:
-  their data lives inside xl.meta, and xl.meta is not synced. This matches
-  MinIO's default posture (no per-object fsync) but means small objects have
-  the widest loss window.
+- **Inline (small) objects receive no per-object fsync at all** in this mode: their data lives inside xl.meta, and xl.meta is not synced. This is weaker than MinIO's default object path, which synchronizes final xl.meta file contents while ordinarily omitting a per-object parent-directory fsync. Small objects therefore have the widest loss window under RustFS relaxed.
 - Durability of acknowledged writes therefore rests on **erasure-coded
   redundancy across other nodes** plus the unclean-shutdown heal converging
   the affected drive afterwards.
@@ -90,6 +91,32 @@ Deployment rule for `relaxed`: only multi-node clusters whose nodes sit in
 power simultaneously, `relaxed` can lose recently acknowledged objects
 cluster-wide. Single-node
 deployments must stay on `strict`.
+
+## Small-object I/O profile
+
+Small-object cost scales with object count, key depth, and the selected durability mode. Each inline object retains its own object directory and `xl.meta`, which contains both metadata and inline payload. Non-inline objects also have a data directory and shard files. Compression can reduce stored bytes while retaining this per-object namespace. The default single-drive inline admission budget is 128 KiB per shard. Versioned writes use a smaller budget. Explicit storage-class configuration, stream transformations, the single-erasure-block bound, and the erasure layout affect admission. See `StorageClassConfig::should_inline` in `crates/ecstore/src/config/storageclass.rs` and its PUT caller in `crates/ecstore/src/set_disk/ops/object.rs`.
+
+The following application-level synchronization budget covers a successful ordinary Linux inline commit to a fresh key in an existing bucket. It assumes directory group commit is disabled and excludes multipart, healing, system metadata, retries, and background work. Let `d` be the number of prefix components before the final key component, so `object` has `d = 0` and `a/b/object` has `d = 2`.
+
+| Write shape | Metadata file synchronization | Directory synchronization |
+| --- | --- | --- |
+| Fresh inline key, `strict` | One metadata `sync_data`, including inline payload | One object-directory sync plus one per ancestor through the bucket, totaling `d + 2` |
+| Fresh inline key, `file-sync` | One metadata `sync_data`, including inline payload | Zero ordinary commit-directory syncs |
+| Fresh inline key, `relaxed` or `none` | Zero | Zero ordinary commit-directory syncs |
+
+Linux stages ordinary inline metadata in a flat temporary file and publishes it by rename. The temporary name is removed by publication, so synchronizing that temporary directory entry would add work without protecting the acknowledged object. Strict mode synchronizes the final object directory and its ancestors. Even an existing shared prefix can have been created by another writer whose directory synchronization is still pending. Keeping the ancestor barriers protects that concurrent creation case. `rename_data_fresh_inline_sync_budget` tests exercise the real disk commit and pin the directory-call budget for flat and nested keys.
+
+Overwrites and versioned writes can retain predecessor metadata for rollback and add backup, recovery, and cleanup work. Non-inline writes also synchronize shard contents under `strict`, `file-sync`, and `relaxed`. Their budgets depend on object shape and recovery state. A normal inline GET reads `xl.meta`. Non-inline GET also reads the required shard data and verifies integrity. Delete work depends on versioning, delete markers, retained versions, recovery state, and deferred trash cleanup. LIST, scanner, and heal perform additional directory and metadata reads, and repairs can perform writes. Measure each workload separately.
+
+All metadata commit paths share the same recovery-aware object-directory policy. Publishing a persistent rollback directory requires synchronizing its entry in the object directory, including under `file-sync` and when replacing an inline object with an external-data object. The backup directory itself also remains synchronized. These barriers preserve the recovery source for a failed multi-drive publication.
+
+A fresh inline `file-sync` commit can finish writing, synchronizing, and publishing metadata within its preparation task even when directory grouping is enabled. The sync-budget regression checks two disk-local queue submissions on Linux and one on macOS for that path. macOS also performs separate Tokio filesystem preparation. Persistent rollback publication and strict directory grouping retain their respective synchronization and scheduling requirements.
+
+Application synchronization counts and device IOPS measure different layers. Filesystem journals, page-cache hits, writeback, request merging, and device behavior determine the physical operations and latency. For a reproducible profile, record the exact server revision, effective bucket durability mode, storage-class configuration, object-size distribution, key depth, versioning, concurrency, filesystem, and physical device mapping. Use an isolated test bucket with separate fresh-key PUT, overwrite, GET, and DELETE phases. Collect a background-only interval as well as each foreground interval, keeping scanner and heal state explicit. Pair application syscall traces with device telemetry over the same interval, then normalize counts by completed requests.
+
+On Linux, an instrumented run can use `strace -f -c -p <pid> -e trace=openat,openat2,close,newfstatat,fstat,statx,getdents64,mkdir,mkdirat,rmdir,rename,renameat,renameat2,unlink,unlinkat,read,pread64,write,pwrite64,fsync,fdatasync` together with `iostat -x 1`. Tracing adds overhead and includes other server activity, so retain an untraced run for latency and throughput comparison. The [scanner benchmark runbook](scanner-benchmark-runbook.md) covers background-pressure measurement.
+
+Server-side packing of multiple S3 keys into shared containers requires a persistent index, atomic publication, per-key version/delete semantics, garbage collection, and heal/recovery support. These requirements also apply when compacting historical objects. Current inline storage keeps each object's directory and metadata entry independently addressable.
 
 ## Recovery from corrupt object metadata
 
@@ -147,7 +174,7 @@ points, so no restart is needed.
 ```bash
 # Set an override (admin credentials, ConfigUpdateAdminAction)
 curl -X PUT "http://<host>/rustfs/admin/v3/bucket-durability/<bucket>" \
-     -d '{"mode":"relaxed"}'   # strict | relaxed | none
+     -d '{"mode":"file-sync"}'   # strict | file-sync | relaxed | none
 
 # Read it back ("mode": null means the bucket inherits the global mode)
 curl "http://<host>/rustfs/admin/v3/bucket-durability/<bucket>"
@@ -163,8 +190,8 @@ configuration plane.
 
 A newly created bucket inherits the process-wide mode by default. On an
 otherwise unconfigured deployment this means `strict`. Operators can explicitly
-set `RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed` to seed a relaxed override into
-new buckets, or choose `strict`, `none`, or `inherit`. A non-strict override is
+set `RUSTFS_NEW_BUCKET_DURABILITY_MODE=file-sync` to seed a file-sync override into
+new buckets, or choose `strict`, `relaxed`, `none`, or `inherit`. A non-strict override is
 logged when the bucket is created; an explicitly non-strict process-wide mode
 is warned at startup. Relaxed remains appropriate only for the multi-node,
 independent-power-domain deployment described above.
@@ -184,6 +211,7 @@ The seeded tier is controlled by an env var read once per bucket creation
 
 ```bash
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed   # explicitly seed `relaxed`
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=file-sync # explicitly seed `file-sync`
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict    # seed `strict` instead
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=none      # seed `none` instead
 RUSTFS_NEW_BUCKET_DURABILITY_MODE=inherit   # seed nothing: follow the global mode
@@ -238,6 +266,8 @@ Until a peer has reloaded the metadata, its writes use the previous tier.
 This is the same eventual-consistency window every other bucket config
 (policy, quota, versioning) already has.
 
+`file-sync` overrides use a backward-compatible fail-closed encoding: the stored JSON carries `mode: strict` plus a `file_sync` marker. Nodes that understand the marker apply `file-sync`; older nodes ignore the marker and apply the stronger `strict` mode. Roll back by setting the bucket to `strict` or clearing the override before downgrading if inheriting the process mode is intended.
+
 ### Power-loss guarantees
 
 Identical to the corresponding global tier, scoped to the bucket. In
@@ -248,10 +278,7 @@ bucket on power failure.
 
 ## Performance expectations
 
-Measure `relaxed` on the target platform (Linux ext4/xfs) before relying on a
-number. Throughput deltas measured with sync fully **off** (`none` or
-`legacy-off`) do not transfer: `relaxed` keeps the per-shard fdatasync, so its
-gain is necessarily smaller. Do not use `none` numbers to size `relaxed`.
+Measure `file-sync` and `relaxed` independently on the target platform (Linux ext4/xfs) before relying on a number. Throughput deltas measured with sync fully **off** (`none` or `legacy-off`) do not transfer: `file-sync` keeps payload and metadata-file synchronization, while `relaxed` keeps payload synchronization. Do not use `none` numbers to size either tier.
 
 ## Related Recovery Guides
 

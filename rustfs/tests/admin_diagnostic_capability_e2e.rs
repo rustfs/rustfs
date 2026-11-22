@@ -15,9 +15,13 @@ use hmac::{Hmac, KeyInit, Mac};
 use reqwest::{Client, Method, Response};
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{fmt::Write as _, time::Duration};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const DEVNULL_PATH: &str = "/rustfs/admin/v3/speedtest/client/devnull";
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
@@ -128,7 +132,7 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
         &client,
         &endpoint,
         Method::POST,
-        "/rustfs/admin/v3/speedtest/client/devnull",
+        DEVNULL_PATH,
         server.access_key(),
         server.secret_key(),
         b"bounded",
@@ -140,11 +144,64 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
     assert_eq!(value["measured"], true);
     assert_eq!(value["rx_bytes"], 7);
 
-    let oversized = signed_admin_request(
+    // Exercise the largest declared body allowed by the legacy claimed-route profile.
+    let payload = Bytes::from(vec![b'x'; 1024 * 1024]);
+    let size = payload.len();
+    let response = signed_admin_request(
+        &client,
+        &endpoint,
+        Method::POST,
+        "/minio/admin/v3/speedtest/client/devnull",
+        server.access_key(),
+        server.secret_key(),
+        &sha256_hex(&payload),
+    )
+    .body(payload)
+    .send()
+    .await
+    .expect("signed streaming upload through the MinIO alias");
+    let status = response.status();
+    let body = response.text().await.expect("streaming response");
+    assert!(status.is_success(), "unexpected upload status {status}: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("streaming upload JSON");
+    assert_eq!(value["rx_bytes"], size);
+
+    let anonymous = client
+        .post(format!("{endpoint}/rustfs/admin/v3/speedtest/client/devnull"))
+        .header("content-length", 1)
+        .body(reqwest::Body::wrap_stream(stream::pending::<Result<Bytes, std::io::Error>>()))
+        .send()
+        .await
+        .expect("anonymous upload must be rejected before reading the body");
+    assert_eq!(anonymous.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let bad_digest = signed_admin_request(
         &client,
         &endpoint,
         Method::POST,
         "/rustfs/admin/v3/speedtest/client/devnull",
+        server.access_key(),
+        server.secret_key(),
+        &sha256_hex(b"y"),
+    )
+    .body("x")
+    .send()
+    .await
+    .expect("mismatched body must receive a response");
+    assert_eq!(bad_digest.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        bad_digest
+            .text()
+            .await
+            .expect("digest error body")
+            .contains("XAmzContentSHA256Mismatch")
+    );
+
+    let oversized = signed_admin_request(
+        &client,
+        &endpoint,
+        Method::POST,
+        DEVNULL_PATH,
         server.access_key(),
         server.secret_key(),
         &sha256_hex(b""),
@@ -163,60 +220,55 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
             .contains("EntityTooLarge")
     );
 
-    let stalled_client = Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .expect("stalled HTTP client");
-    let mut stalled = Vec::new();
-    for _ in 0..4 {
-        let client = stalled_client.clone();
-        let endpoint = endpoint.clone();
-        let access_key = server.access_key().to_string();
-        let secret_key = server.secret_key().to_string();
-        stalled.push(tokio::spawn(async move {
-            signed_admin_request(
-                &client,
-                &endpoint,
-                Method::POST,
-                "/rustfs/admin/v3/speedtest/client/devnull",
-                &access_key,
-                &secret_key,
-                &sha256_hex(b"x"),
-            )
-            .header("content-length", 1)
-            .body(reqwest::Body::wrap_stream(stream::pending::<Result<Bytes, std::io::Error>>()))
-            .send()
-            .await
-        }));
+    let request = signed_admin_request(
+        &client,
+        &endpoint,
+        Method::POST,
+        DEVNULL_PATH,
+        server.access_key(),
+        server.secret_key(),
+        &sha256_hex(b"xy"),
+    )
+    .build()
+    .expect("signed stalled upload headers");
+    let mut head = format!("POST {DEVNULL_PATH} HTTP/1.1\r\nContent-Length: 2\r\nExpect: 100-continue\r\n");
+    for (name, value) in request.headers() {
+        write!(head, "{name}: {}\r\n", value.to_str().expect("ASCII signing header")).expect("write request head");
     }
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let probe = signed_bytes_request(
-                &client,
-                &endpoint,
-                Method::POST,
-                "/rustfs/admin/v3/speedtest/client/devnull",
-                server.access_key(),
-                server.secret_key(),
-                b"x",
-            )
-            .await;
-            let status = probe.status();
-            let body = probe.text().await.expect("admission probe body");
-            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                assert!(body.contains("SlowDown"));
-                break;
-            }
-            assert!(status.is_success(), "unexpected admission probe status {status}: {body}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    head.push_str("\r\n");
+
+    let stalled = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stalled = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let socket = TcpStream::connect(("127.0.0.1", port)).await.expect("connect stalled upload");
+            let mut socket = BufReader::new(socket);
+            socket.write_all(head.as_bytes()).await.expect("send stalled upload headers");
+            // HTTP/1.1 sends Continue when the server polls the body. The streamed handler
+            // acquires a permit before that poll, so the probe cannot take a slot mid-setup.
+            let mut status = String::new();
+            socket.read_line(&mut status).await.expect("read stalled upload status");
+            assert_eq!(status, "HTTP/1.1 100 Continue\r\n");
+            socket.write_all(b"x").await.expect("send partial upload body");
+            stalled.push(socket);
         }
+        stalled
     })
     .await
-    .expect("stalled requests must occupy every admission slot");
-    for request in stalled {
-        request.abort();
-    }
+    .expect("stalled requests must begin reading their bodies");
+
+    let probe = signed_bytes_request(
+        &client,
+        &endpoint,
+        Method::POST,
+        DEVNULL_PATH,
+        server.access_key(),
+        server.secret_key(),
+        b"x",
+    )
+    .await;
+    assert_eq!(probe.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(probe.text().await.expect("admission probe body").contains("SlowDown"));
+    drop(stalled);
 
     let netperf = signed_bytes_request(
         &client,

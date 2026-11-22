@@ -19,6 +19,7 @@ use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_types::EventName;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt::Formatter;
 use std::future::Future;
@@ -673,8 +674,8 @@ pub(crate) fn queue_store_subdir_name(target_type: &str, target_id: &str) -> Str
 /// Decodes a form-urlencoded object name to its original form.
 ///
 /// This function properly handles form-urlencoded strings where spaces are
-/// represented as `+` symbols. It first replaces `+` with spaces, then
-/// performs standard percent-decoding.
+/// represented as `+` symbols. Percent-encoded plus signs (`%2B`) remain
+/// literal plus signs, and percent escapes are decoded once.
 ///
 /// # Arguments
 /// * `encoded` - The form-urlencoded string to decode
@@ -691,17 +692,37 @@ pub(crate) fn queue_store_subdir_name(target_type: &str, target_id: &str) -> Str
 /// assert_eq!(decoded, "greeting file (2).csv");
 /// ```
 pub fn decode_object_name(encoded: &str) -> Result<String, TargetError> {
-    let replaced = encoded.replace("+", " ");
-    urlencoding::decode(&replaced)
-        .map(|s| s.into_owned())
-        .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))
+    decode_object_name_cow(encoded).map(Cow::into_owned)
+}
+
+fn decode_object_name_cow(encoded: &str) -> Result<Cow<'_, str>, TargetError> {
+    let form = if encoded.contains('+') {
+        Cow::Owned(encoded.replace('+', " "))
+    } else {
+        Cow::Borrowed(encoded)
+    };
+    let decoded =
+        urlencoding::decode(&form).map_err(|err| TargetError::Encoding(format!("Failed to decode object key: {err}")))?;
+    Ok(match decoded {
+        Cow::Borrowed(_) => form,
+        Cow::Owned(name) => Cow::Owned(name),
+    })
+}
+
+pub(crate) fn build_event_key(bucket: &str, encoded_object: &str) -> Result<String, TargetError> {
+    let object = decode_object_name_cow(encoded_object)?;
+    let mut key = String::with_capacity(bucket.len() + 1 + object.len());
+    key.push_str(bucket);
+    key.push('/');
+    key.push_str(&object);
+    Ok(key)
 }
 
 pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError>
 where
     E: PluginEvent,
 {
-    build_queued_payload_with_records(event, vec![event.data.clone()])
+    build_queued_payload_with_records(event, vec![&event.data])
 }
 
 pub(crate) fn build_queued_payload_with_records<E, R>(
@@ -712,8 +733,7 @@ where
     E: PluginEvent,
     R: Serialize,
 {
-    let object_name = decode_object_name(&event.object_name)?;
-    let key = format!("{}/{}", event.bucket_name, object_name);
+    let key = build_event_key(&event.bucket_name, &event.object_name)?;
 
     let log = TargetLog {
         event_name: event.event_name,
@@ -1212,6 +1232,80 @@ mod tests {
         assert_eq!(decoded.meta.object_name, meta.object_name);
         assert_eq!(decoded.meta.content_type, meta.content_type);
         assert_eq!(decoded.body, br#"{"ok":true}"#);
+    }
+
+    fn assert_object_name_matches_legacy_decoder(encoded: &str) {
+        let form = encoded.replace('+', " ");
+        match urlencoding::decode(&form) {
+            Ok(expected) => {
+                assert_eq!(decode_object_name(encoded).expect("object should decode"), expected, "input: {encoded:?}");
+                let key = build_event_key("bucket%2F+", encoded).expect("event key should build");
+                assert_eq!(key, format!("bucket%2F+/{expected}"), "input: {encoded:?}");
+            }
+            Err(_) => {
+                assert!(matches!(decode_object_name(encoded), Err(TargetError::Encoding(_))), "input: {encoded:?}");
+                assert!(
+                    matches!(build_event_key("bucket", encoded), Err(TargetError::Encoding(_))),
+                    "input: {encoded:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn object_name_decoder_preserves_legacy_escape_and_utf8_semantics() {
+        for first in 0u8..=127 {
+            for second in 0u8..=127 {
+                let encoded = format!("prefix+%{}{}%2B%252F/目录", char::from(first), char::from(second));
+                assert_object_name_matches_legacy_decoder(&encoded);
+            }
+        }
+        for byte in 0u8..=255 {
+            assert_object_name_matches_legacy_decoder(&format!("prefix/%{byte:02X}+suffix"));
+        }
+        for encoded in [
+            "",
+            "plain.txt",
+            "目录/文件.txt",
+            "a&b=c?#.txt",
+            "%",
+            "%2",
+            "%GG",
+            "%2B",
+            "%252B",
+            "%252F",
+            "%+1",
+            "%1+",
+            "%%32",
+            "%2%32",
+            "+++",
+            "%00",
+            "%C3%A9",
+            "%E7%9B%AE%E5%BD%95",
+            "%F0%9F%98%80",
+            "%C0%AF",
+            "%ED%A0%80",
+            "%F4%90%80%80",
+            "%C3",
+            "%C3+%A9",
+        ] {
+            assert_object_name_matches_legacy_decoder(encoded);
+        }
+    }
+
+    #[test]
+    fn object_name_decoder_borrows_plain_names() {
+        let plain = "directory/file.txt";
+        let decoded = decode_object_name_cow(plain).expect("plain name should decode");
+        assert!(matches!(decoded, Cow::Borrowed(_)));
+        assert_eq!(decoded.as_ptr(), plain.as_ptr());
+        for (encoded, expected) in [("red+flower.jpg", "red flower.jpg"), ("a%2Bb", "a+b"), ("a%2Bb+c", "a+b c")] {
+            let decoded = decode_object_name_cow(encoded).expect("encoded name should decode");
+            assert!(matches!(decoded, Cow::Owned(_)));
+            assert_eq!(decoded, expected);
+        }
+        let key = build_event_key("test-bucket", "directory%2Ffile.txt").expect("event key should build");
+        assert_eq!(key, "test-bucket/directory/file.txt");
     }
 
     #[test]

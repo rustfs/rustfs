@@ -9,9 +9,9 @@
 # Adding a target is one more [[targets]] table, for example:
 #
 #   [[targets]]
-#   name = "candidate-gateway"
+#   name = "candidate-tuned"
 #   binary = "candidate"
-#   env = { RUSTFS_S3_STACK = "gateway" }
+#   env = { RUSTFS_EXAMPLE_SETTING = "on" }
 
 schema = 1
 

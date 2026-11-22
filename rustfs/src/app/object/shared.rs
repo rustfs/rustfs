@@ -15,10 +15,11 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    ChecksumAlgorithm, ChecksumType, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
-    ObjectLockRetentionMode, Range, SSEKMSKeyId, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
-};
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
+use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, Timestamp, TimestampFormat};
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode};
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
@@ -26,6 +27,30 @@ use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy,
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
 pub(super) type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+pub(super) async fn read_answer<T>(
+    bucket: &str,
+    method: &http::Method,
+    headers: &HeaderMap,
+    output: T,
+) -> crate::app::Answered<T> {
+    let mut answer = crate::app::Answered::new(output);
+    if headers.contains_key(http::header::ORIGIN)
+        && let Some(cors) = crate::app::storage_api::object_usecase::head_cors_headers(bucket, method, headers).await
+    {
+        answer.headers = cors;
+    }
+    answer
+}
+
+pub(super) fn complete_read<T>(helper: OperationHelper, result: &rustfs_s3_types::S3Result<crate::app::Answered<T>>) {
+    let headers = HeaderMap::new();
+    let (status, headers) = match result {
+        Ok(answer) => (answer.status.unwrap_or(StatusCode::OK), &answer.headers),
+        Err(_) => (StatusCode::OK, &headers),
+    };
+    let _ = helper.complete_owned(result, status, headers);
+}
 
 pub(crate) fn s3s_body_error_to_io(err: StdError) -> io::Error {
     io::Error::other(err)
@@ -142,52 +167,24 @@ pub(super) fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Resu
     }
 }
 
-/// Losslessly convert an s3s [`Range`] into the internal [`HTTPRangeSpec`].
-///
-/// Shared by GET and HEAD so both apply identical range semantics. s3s parses
-/// `first`/`last` as `u64`, but its own parser already rejects any value greater
-/// than `i64::MAX`, so the int branch is a checked cast that never truncates.
-///
-/// The suffix length, however, is an unchecked `u64`. A naive `length as i64`
-/// truncates deterministically: `bytes=-18446744073709551615` wraps to `-1` and
-/// is then read as "last 1 byte", and `bytes=-0` yields a 0-length 206 instead
-/// of a 416. This function instead mirrors s3s [`Range::check`] semantics:
-///   * a zero-length suffix is rejected with `InvalidRange` (416), matching AWS
-///     S3 and MinIO;
-///   * a suffix larger than `i64::MAX` is clamped to `i64::MAX`. Object sizes in
-///     this system are bounded by `i64::MAX`, so such a suffix always covers the
-///     whole object, and [`HTTPRangeSpec::get_length`] clamps it to the real
-///     size once the object is known.
-pub(super) fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
-    match range {
-        Range::Int { first, last } => {
-            let start = i64::try_from(first).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
-            let end = match last {
-                Some(last) => {
-                    i64::try_from(last).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?
-                }
-                None => -1,
-            };
-            Ok(HTTPRangeSpec {
-                is_suffix_length: false,
-                start,
-                end,
-            })
+/// Converts a native range to storage's signed range representation.
+/// Zero suffixes are unsatisfiable; suffixes larger than `i64::MAX` cover the whole object.
+pub(super) fn byte_range_to_http_range_spec(range: rustfs_gateway_types::ByteRange) -> rustfs_s3_types::S3Result<HTTPRangeSpec> {
+    use rustfs_gateway_types::ByteRange;
+    let (start, end, suffix) = match range {
+        ByteRange::FromTo { first, last } => (first, Some(last), false),
+        ByteRange::From { first } => (first, None, false),
+        ByteRange::Suffix { length: 0 } => {
+            return Err(rustfs_s3_types::s3_error!(InvalidRange, "The requested range is not satisfiable"));
         }
-        Range::Suffix { length } => {
-            if length == 0 {
-                return Err(s3_error!(InvalidRange, "The requested range is not satisfiable"));
-            }
-            // Clamp to i64::MAX: any suffix >= object size returns the whole
-            // object, and object sizes never exceed i64::MAX.
-            let start = i64::try_from(length).unwrap_or(i64::MAX);
-            Ok(HTTPRangeSpec {
-                is_suffix_length: true,
-                start,
-                end: -1,
-            })
-        }
-    }
+        ByteRange::Suffix { length } => (length.min(i64::MAX as u64), None, true),
+    };
+    let invalid = || rustfs_s3_types::s3_error!(InvalidRange, "The requested range is not satisfiable");
+    Ok(HTTPRangeSpec {
+        is_suffix_length: suffix,
+        start: i64::try_from(start).map_err(|_| invalid())?,
+        end: end.map(i64::try_from).transpose().map_err(|_| invalid())?.unwrap_or(-1),
+    })
 }
 
 /// True when the request body actually arrived chunk-framed on the wire, i.e. the payload was
@@ -285,7 +282,7 @@ pub(super) fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
     has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
 }
 
-pub(super) async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
+pub(crate) async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
     table_catalog::validate_bucket_object_mutation(bucket, key)
         .await
         .map_err(|_| s3_error!(InvalidRequest, "{}", table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE))
@@ -347,10 +344,10 @@ pub(super) fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
 /// them to the returned pair.
 pub(super) fn resolve_bucket_default_sse(
     bucket_sse_config: Option<&ServerSideEncryptionConfiguration>,
-    requested_sse: Option<ServerSideEncryption>,
-    requested_kms_key_id: Option<SSEKMSKeyId>,
+    requested_sse: Option<String>,
+    requested_kms_key_id: Option<String>,
     has_explicit_ssec: bool,
-) -> (Option<ServerSideEncryption>, Option<SSEKMSKeyId>) {
+) -> (Option<String>, Option<String>) {
     let bucket_default = || {
         if has_explicit_ssec {
             return None;
@@ -545,8 +542,8 @@ mod deadlock_request_guard_tests {
     }
 }
 
-pub(super) async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
-    enqueue_transition_immediate(obj_info, src).await;
+pub(super) async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc, incarnation: Option<uuid::Uuid>) {
+    enqueue_transition_immediate(obj_info, src, incarnation).await;
 }
 
 /// Inject additional-checksum response headers (XXHash3/64/128, SHA-512) that s3s
@@ -611,28 +608,25 @@ pub(crate) fn additional_checksum_echo_pairs(want: &Option<rustfs_rio::Checksum>
 }
 
 /// Extract trailing-header checksum values, overriding the corresponding input fields.
-pub(super) fn apply_trailing_checksums(
+pub(super) fn apply_trailing_checksums_native(
     algorithm: Option<&str>,
-    trailing_headers: &Option<s3s::TrailingHeaders>,
+    trailing_headers: &Option<rustfs_rio::SharedTrailerSource>,
     checksums: &mut PutObjectChecksums,
 ) {
     let Some(alg) = algorithm else { return };
-    let Some(checksum_str) = trailing_headers.as_ref().and_then(|trailer| {
-        let key = match alg {
-            ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-            ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-            ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-            ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-            ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-            _ => return None,
-        };
-        trailer.read(|headers| {
-            headers
-                .get(key.unwrap_or_default())
-                .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-        })
-    }) else {
-        return;
+    let Some(trailer) = trailing_headers.as_ref() else { return };
+    let key = match alg {
+        ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+        ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+        ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+        ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+        ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+        _ => return,
+    };
+    let checksum_str = match trailer.lookup(key.unwrap_or_default()) {
+        rustfs_rio::TrailerValue::Pending => return,
+        rustfs_rio::TrailerValue::Missing => None,
+        rustfs_rio::TrailerValue::Present(value) => Some(value),
     };
 
     match alg {
@@ -655,7 +649,7 @@ pub(crate) struct ResponseChecksums {
     pub(crate) sha1: Option<String>,
     pub(crate) sha256: Option<String>,
     pub(crate) crc64nvme: Option<String>,
-    pub(crate) checksum_type: Option<ChecksumType>,
+    pub(crate) checksum_type: Option<String>,
     pub(crate) extra: Vec<(&'static str, String)>,
 }
 
@@ -670,7 +664,7 @@ where
     let mut c = ResponseChecksums::default();
     for (key, checksum) in pairs {
         if key == AMZ_CHECKSUM_TYPE {
-            c.checksum_type = Some(ChecksumType::from(checksum));
+            c.checksum_type = Some(checksum);
             continue;
         }
         let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
@@ -688,7 +682,7 @@ where
         }
     }
     if is_multipart && c.checksum_type.is_none() {
-        c.checksum_type = Some(ChecksumType::from("COMPOSITE".to_string()));
+        c.checksum_type = Some("COMPOSITE".to_string());
     }
     c
 }
@@ -804,7 +798,7 @@ pub(super) fn apply_standard_object_metadata(
     Ok(())
 }
 
-pub(super) fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
+pub(super) fn response_storage_class_name(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<String> {
     let stored_class = info
         .storage_class
         .as_deref()
@@ -814,14 +808,14 @@ pub(super) fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<Strin
     .then_some(info.transitioned_object.tier.as_str());
     let effective_class = storageclass::effective_class(stored_class, transitioned_tier);
 
-    (effective_class != storageclass::STANDARD).then(|| StorageClass::from(effective_class.to_string()))
+    (effective_class != storageclass::STANDARD).then(|| effective_class.to_string())
 }
 
 pub(super) fn response_storage_class_for_object_attributes(
     info: &ObjectInfo,
     metadata: &HashMap<String, String>,
     requested: bool,
-) -> Option<StorageClass> {
+) -> Option<String> {
     if !requested {
         return None;
     }
@@ -834,9 +828,7 @@ pub(super) fn response_storage_class_for_object_attributes(
         && !info.transitioned_object.tier.is_empty())
     .then_some(info.transitioned_object.tier.as_str());
 
-    Some(StorageClass::from(
-        storageclass::effective_class(stored_class, transitioned_tier).to_string(),
-    ))
+    Some(storageclass::effective_class(stored_class, transitioned_tier).to_string())
 }
 
 // Shared across Object Lock validation paths to keep the client-facing
@@ -844,22 +836,41 @@ pub(super) fn response_storage_class_for_object_attributes(
 pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
-pub(crate) fn build_put_like_object_lock_metadata(
+#[cfg(test)]
+fn build_put_like_object_lock_metadata(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
     object_lock_mode: Option<ObjectLockMode>,
     object_lock_retain_until_date: Option<Timestamp>,
 ) -> S3Result<Option<HashMap<String, String>>> {
+    build_put_like_object_lock_metadata_native(
+        bucket,
+        object_lock_config_state,
+        object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+        object_lock_mode.map(|value| value.as_str().to_owned()),
+        object_lock_retain_until_date.map(time::OffsetDateTime::from),
+    )
+}
+
+pub(crate) fn build_put_like_object_lock_metadata_native(
+    bucket: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
+    object_lock_legal_hold_status: Option<String>,
+    object_lock_mode: Option<String>,
+    object_lock_retain_until_date: Option<time::OffsetDateTime>,
+) -> S3Result<Option<HashMap<String, String>>> {
     if object_lock_legal_hold_status.is_none() && object_lock_mode.is_none() && object_lock_retain_until_date.is_none() {
         return Ok(None);
     }
 
     let retention = match (object_lock_mode, object_lock_retain_until_date) {
-        (Some(mode), Some(retain_until_date)) => Some(ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
-            retain_until_date: Some(retain_until_date),
-        }),
+        (Some(mode), Some(retain_until_date)) => {
+            Some(crate::app::storage_api::object_usecase::access::RequestedObjectLockRetention {
+                mode: Some(mode),
+                retain_until: Some(retain_until_date),
+            })
+        }
         (Some(_), None) | (None, Some(_)) => {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -871,10 +882,11 @@ pub(crate) fn build_put_like_object_lock_metadata(
 
     validate_bucket_object_lock_enabled_state(bucket, object_lock_config_state)?;
 
-    let mut eval_metadata = parse_object_lock_retention(retention)?;
-    eval_metadata.extend(parse_object_lock_legal_hold(
-        object_lock_legal_hold_status.map(|status| ObjectLockLegalHold { status: Some(status) }),
-    )?);
+    let mut eval_metadata = parse_object_lock_retention_native(retention)?;
+    eval_metadata
+        .extend(parse_object_lock_legal_hold_native(object_lock_legal_hold_status.map(|status| {
+            crate::app::storage_api::object_usecase::access::RequestedObjectLegalHold(Some(status))
+        }))?);
 
     if eval_metadata.is_empty() {
         return Ok(None);
@@ -1018,12 +1030,6 @@ pub(in crate::app) fn object_lock_checks_required_for_state(state: &metadata_sys
 pub(crate) const ON_DEMAND_MIGRATION_HEADER: http::HeaderName = http::HeaderName::from_static("x-rustfs-on-demand-migration");
 pub(crate) const ON_DEMAND_MIGRATION_SOURCE: HeaderValue = HeaderValue::from_static("source");
 
-/// Response header marking a `ListObjectsV2` that could not consult the source
-/// and was answered from local state alone (rustfs/backlog#2164).
-pub(crate) const ON_DEMAND_MIGRATION_LIST_HEADER: http::HeaderName =
-    http::HeaderName::from_static("x-rustfs-on-demand-migration-list");
-pub(crate) const ON_DEMAND_MIGRATION_LIST_LOCAL_ONLY: HeaderValue = HeaderValue::from_static("local_only");
-
 /// Custom S3 error code for a source failure surfaced under
 /// `policy.source_error = propagate`; carried on HTTP 424.
 pub(crate) const ODM_SOURCE_UNAVAILABLE_CODE: &str = "SourceUnavailable";
@@ -1097,12 +1103,6 @@ pub(crate) fn mark_on_demand_migration_response(headers: &mut HeaderMap) {
     headers.insert(ON_DEMAND_MIGRATION_HEADER, ON_DEMAND_MIGRATION_SOURCE);
 }
 
-/// Marks a merged listing that fell back to local state because the source
-/// could not be consulted (rustfs/backlog#2164).
-pub(crate) fn mark_on_demand_migration_list_local_only(headers: &mut HeaderMap) {
-    headers.insert(ON_DEMAND_MIGRATION_LIST_HEADER, ON_DEMAND_MIGRATION_LIST_LOCAL_ONLY);
-}
-
 /// Evaluates the request's conditional headers (`If-Match`, `If-None-Match`,
 /// `If-Modified-Since`, `If-Unmodified-Since`) against the source's view of
 /// the object, with the same S3 semantics the local path applies to
@@ -1136,19 +1136,16 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
         user_defined: metadata.into(),
         ..Default::default()
     };
-    check_preconditions(headers, &info)
+    Ok(check_preconditions(headers, &info)?)
 }
 
 /// S3 documents write-side `If-None-Match` only as `*` (create-only).
 /// Reject unsupported ETag comparisons with 501 NotImplemented.
 /// Treating it as an ETag comparison would let a write overwrite an existing key
 /// while still satisfying a policy that requires `s3:if-none-match`.
-pub(crate) fn reject_non_wildcard_write_if_none_match(
-    if_none_match: Option<&s3s::dto::ETagCondition>,
-    headers: &HeaderMap,
-) -> S3Result<()> {
+pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bool, headers: &HeaderMap) -> S3Result<()> {
     // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
-    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_)))
+    if specific_if_none_match
         || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
             value.to_str().map_or(true, |value| {
                 let value = value.trim();
@@ -1164,7 +1161,6 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::ETag;
     use http::{HeaderMap, HeaderValue};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
@@ -1174,12 +1170,8 @@ mod tests {
     #[test]
     fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
         let headers = HeaderMap::new();
-        assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok());
-        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers).is_ok());
-
-        let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
-        let err =
-            reject_non_wildcard_write_if_none_match(Some(&etag), &headers).expect_err("an ETag If-None-Match must be rejected");
+        assert!(reject_non_wildcard_write_if_none_match(false, &headers).is_ok());
+        let err = reject_non_wildcard_write_if_none_match(true, &headers).expect_err("an ETag If-None-Match must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
         assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
         assert_eq!(
@@ -1193,12 +1185,12 @@ mod tests {
         for value in ["*", " * ", "", " "] {
             let mut headers = HeaderMap::new();
             headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
-            assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok(), "{value:?}");
+            assert!(reject_non_wildcard_write_if_none_match(false, &headers).is_ok(), "{value:?}");
         }
         for value in ["\"different-etag\"", "W/\"weak-etag\"", "unquoted-etag"] {
             let mut headers = HeaderMap::new();
             headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
-            let err = reject_non_wildcard_write_if_none_match(None, &headers)
+            let err = reject_non_wildcard_write_if_none_match(false, &headers)
                 .expect_err("header-only ETag precondition must be rejected");
             assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
         }
@@ -1213,7 +1205,7 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.append(http::header::IF_NONE_MATCH, http::HeaderValue::from_static("*"));
             headers.append(http::header::IF_NONE_MATCH, value);
-            let err = reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers)
+            let err = reject_non_wildcard_write_if_none_match(false, &headers)
                 .expect_err("a form wildcard must not hide an unsupported raw HTTP precondition");
             assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
         }
@@ -1356,7 +1348,7 @@ mod tests {
     }
 
     // classify_response_checksums is the single point that splits decrypted checksum
-    // pairs into the five s3s-typed fields and the additional-algorithm `extra`
+    // pairs into the five named checksum fields and the additional-algorithm `extra`
     // headers, replacing five copies of the loop. Lock its behaviour (#1252).
     #[test]
     fn classify_response_checksums_splits_typed_and_extra() {
@@ -1404,11 +1396,64 @@ mod tests {
         assert!(c.extra.is_empty() && c.crc32.is_none());
 
         let c = classify_response_checksums(vec![("CRC32".to_string(), "AAAAAA==-2".to_string())], true);
-        assert_eq!(c.checksum_type.as_ref().map(ChecksumType::as_str), Some("COMPOSITE"));
+        assert_eq!(c.checksum_type.as_deref(), Some("COMPOSITE"));
 
         // Empty input yields an all-default result.
         let c = classify_response_checksums(Vec::<(String, String)>::new(), false);
         assert!(c.crc32.is_none() && c.extra.is_empty() && c.checksum_type.is_none());
+    }
+
+    #[test]
+    fn checksum_type_metadata_keeps_unknown_and_empty_values() {
+        for (value, multipart) in [("UNKNOWN-TYPE", false), ("", true), (" mIxEd ", true)] {
+            let classified = classify_response_checksums(vec![(AMZ_CHECKSUM_TYPE.to_owned(), value.to_owned())], multipart);
+            assert_eq!(classified.checksum_type.as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn native_range_core_preserves_boundaries() {
+        use rustfs_gateway_types::ByteRange;
+        for (range, expected) in [
+            (ByteRange::From { first: 0 }, (false, 0, -1)),
+            (
+                ByteRange::FromTo {
+                    first: 0,
+                    last: i64::MAX as u64,
+                },
+                (false, 0, i64::MAX),
+            ),
+            (ByteRange::Suffix { length: u64::MAX }, (true, i64::MAX, -1)),
+        ] {
+            let actual = byte_range_to_http_range_spec(range).unwrap();
+            assert_eq!((actual.is_suffix_length, actual.start, actual.end), expected);
+        }
+        native_range_core_rejects_invalid_boundaries();
+    }
+
+    #[test]
+    fn native_range_core_rejects_invalid_boundaries() {
+        use rustfs_gateway_types::ByteRange;
+        for range in [
+            ByteRange::Suffix { length: 0 },
+            ByteRange::From {
+                first: i64::MAX as u64 + 1,
+            },
+            ByteRange::From { first: u64::MAX },
+            ByteRange::FromTo {
+                first: 0,
+                last: i64::MAX as u64 + 1,
+            },
+            ByteRange::FromTo {
+                first: 0,
+                last: u64::MAX,
+            },
+        ] {
+            assert_eq!(
+                byte_range_to_http_range_spec(range).unwrap_err().code(),
+                &rustfs_s3_types::S3ErrorCode::InvalidRange
+            );
+        }
     }
 
     // additional_checksum_echo_pairs derives the PutObject/UploadPart response echo for
@@ -1503,12 +1548,12 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(
             Some(&config),
-            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            Some(SSEKMSKeyId::from("request-key".to_string())),
+            Some(String::from(ServerSideEncryption::AES256)),
+            Some("request-key".to_string()),
             false,
         );
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
     }
 
@@ -1516,14 +1561,10 @@ mod tests {
     fn resolve_bucket_default_sse_does_not_inherit_a_kms_key_for_an_explicit_sse_s3_request() {
         let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
 
-        let (sse, kms_key_id) = resolve_bucket_default_sse(
-            Some(&config),
-            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            None,
-            false,
-        );
+        let (sse, kms_key_id) =
+            resolve_bucket_default_sse(Some(&config), Some(String::from(ServerSideEncryption::AES256)), None, false);
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
         assert!(kms_key_id.is_none(), "an SSE-S3 request must not inherit the bucket KMS key");
     }
 
@@ -1533,7 +1574,7 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AWS_KMS));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AWS_KMS));
         assert_eq!(kms_key_id.as_deref(), Some("bucket-key"));
     }
 
@@ -1547,7 +1588,7 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
         assert!(kms_key_id.is_none());
     }
 
@@ -1831,7 +1872,7 @@ mod tests {
             user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
-        assert!(response_storage_class(&standard_info, &metadata).is_none());
+        assert!(response_storage_class_name(&standard_info, &metadata).is_none());
 
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
@@ -1841,7 +1882,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            response_storage_class(&label_only_info, &metadata).is_none(),
+            response_storage_class_name(&label_only_info, &metadata).is_none(),
             "historical STANDARD_IA labels must report the effective implicit STANDARD layout"
         );
 
@@ -1850,25 +1891,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            response_storage_class(&rrs_info, &HashMap::new())
-                .as_ref()
-                .map(StorageClass::as_str),
+            response_storage_class_name(&rrs_info, &HashMap::new()).as_deref(),
             Some(storageclass::RRS)
         );
 
         let mut transitioned_info = label_only_info;
         transitioned_info.transitioned_object.tier = "WARM-TIER".to_string();
         assert!(
-            response_storage_class(&transitioned_info, &metadata).is_none(),
+            response_storage_class_name(&transitioned_info, &metadata).is_none(),
             "a tier name without a completed transition must not override the effective local class"
         );
         transitioned_info.transitioned_object.status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
-        assert_eq!(
-            response_storage_class(&transitioned_info, &metadata)
-                .as_ref()
-                .map(StorageClass::as_str),
-            Some("WARM-TIER")
-        );
+        assert_eq!(response_storage_class_name(&transitioned_info, &metadata).as_deref(), Some("WARM-TIER"));
 
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD.to_string());
@@ -1878,7 +1912,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            response_storage_class(&standard_metadata_info, &metadata).is_none(),
+            response_storage_class_name(&standard_metadata_info, &metadata).is_none(),
             "STANDARD must be omitted even when it only arrives via metadata fallback"
         );
     }
@@ -1893,9 +1927,7 @@ mod tests {
         };
 
         assert_eq!(
-            response_storage_class_for_object_attributes(&info, &metadata, true)
-                .as_ref()
-                .map(StorageClass::as_str),
+            response_storage_class_for_object_attributes(&info, &metadata, true).as_deref(),
             Some(storageclass::STANDARD)
         );
 
@@ -1904,9 +1936,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            response_storage_class_for_object_attributes(&legacy_info, &HashMap::new(), true)
-                .as_ref()
-                .map(StorageClass::as_str),
+            response_storage_class_for_object_attributes(&legacy_info, &HashMap::new(), true).as_deref(),
             Some(storageclass::STANDARD)
         );
     }
@@ -2035,7 +2065,7 @@ mod tests {
 
     const I64_MAX_AS_U64: u64 = i64::MAX as u64;
 
-    /// The conversion itself: s3s `Range` (u64) -> internal `HTTPRangeSpec`
+    /// The conversion itself: native `ByteRange` (u64) -> internal `HTTPRangeSpec`
     /// (i64). This directly guards the suffix truncation fix. Reverting to
     /// `length as i64` regresses the zero-suffix, `i64::MAX + 1` and `u64::MAX`
     /// rows below.
@@ -2043,10 +2073,10 @@ mod tests {
     fn range_to_http_range_spec_is_lossless() {
         // Zero-length suffix (`bytes=-0`) is unsatisfiable -> InvalidRange (416),
         // never a 0-length 206.
-        let zero_suffix = range_to_http_range_spec(Range::Suffix { length: 0 });
+        let zero_suffix = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::Suffix { length: 0 });
         assert_eq!(
             zero_suffix.as_ref().err().map(|e| e.code()),
-            Some(&S3ErrorCode::InvalidRange),
+            Some(&rustfs_s3_types::S3ErrorCode::InvalidRange),
             "bytes=-0 must map to InvalidRange (416)"
         );
 
@@ -2059,7 +2089,7 @@ mod tests {
             (u64::MAX, i64::MAX),           // was -1 under `as i64` -> read as "last 1 byte"
         ];
         for (length, expected_start) in suffix_cases {
-            let spec = range_to_http_range_spec(Range::Suffix { length })
+            let spec = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::Suffix { length })
                 .unwrap_or_else(|_| panic!("suffix {length} must convert losslessly"));
             assert!(spec.is_suffix_length, "suffix {length} must stay a suffix spec");
             assert_eq!(spec.start, expected_start, "suffix {length} start");
@@ -2068,20 +2098,18 @@ mod tests {
 
         // Int ranges: s3s already rejects first/last > i64::MAX, so the checked
         // cast never truncates. first-last and open-ended must not regress.
-        let int_first_last = range_to_http_range_spec(Range::Int {
-            first: 10,
-            last: Some(20),
-        })
-        .expect("first-last converts");
+        let int_first_last = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::FromTo { first: 10, last: 20 })
+            .expect("first-last converts");
         assert!(!int_first_last.is_suffix_length);
         assert_eq!((int_first_last.start, int_first_last.end), (10, 20));
 
-        let int_open = range_to_http_range_spec(Range::Int { first: 5, last: None }).expect("open-ended converts");
+        let int_open =
+            byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::From { first: 5 }).expect("open-ended converts");
         assert_eq!((int_open.start, int_open.end), (5, -1));
 
-        let int_max = range_to_http_range_spec(Range::Int {
+        let int_max = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::FromTo {
             first: I64_MAX_AS_U64,
-            last: Some(I64_MAX_AS_U64),
+            last: I64_MAX_AS_U64,
         })
         .expect("i64::MAX int converts");
         assert_eq!((int_max.start, int_max.end), (i64::MAX, i64::MAX));
@@ -2101,8 +2129,8 @@ mod tests {
             Unsatisfiable,
         }
 
-        fn derive(range: Range, size: i64) -> Outcome {
-            let spec = match range_to_http_range_spec(range) {
+        fn derive(range: rustfs_gateway_types::ByteRange, size: i64) -> Outcome {
+            let spec = match byte_range_to_http_range_spec(range) {
                 Ok(spec) => spec,
                 Err(_) => return Outcome::Unsatisfiable,
             };
@@ -2115,7 +2143,7 @@ mod tests {
             }
         }
 
-        let suffix = |length: u64| Range::Suffix { length };
+        let suffix = |length: u64| rustfs_gateway_types::ByteRange::Suffix { length };
 
         // size, range, expected
         let normal = 100_i64;
@@ -2140,15 +2168,12 @@ mod tests {
             // Normal first-last and open-ended int ranges must not regress.
             (
                 normal,
-                Range::Int {
-                    first: 10,
-                    last: Some(19),
-                },
+                rustfs_gateway_types::ByteRange::FromTo { first: 10, last: 19 },
                 Outcome::Partial(10, 10, "bytes 10-19/100".into()),
             ),
             (
                 normal,
-                Range::Int { first: 90, last: None },
+                rustfs_gateway_types::ByteRange::From { first: 90 },
                 Outcome::Partial(90, 10, "bytes 90-99/100".into()),
             ),
         ];

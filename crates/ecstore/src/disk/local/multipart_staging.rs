@@ -221,6 +221,22 @@ impl MultipartSourceAdmission {
         super::multipart_source_state::validate_source_mutation(&self.source, &self.base, &self.publication_root, self.initial)
             .map_err(std::io::Error::other)
     }
+
+    pub(super) fn validate_part_settlement(&self, transaction: &Path) -> std::io::Result<bool> {
+        match self.validate() {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                // A cached parent FD can still name the transaction after Abort
+                // moved its upload to trash. With SourceRW held, an absent
+                // canonical transaction is already settled. Resolve beneath the
+                // publication root so aliases and access errors remain failures.
+                match os::pin_multipart_source_directory(transaction, &self.base, &self.publication_root) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    _ => Err(error),
+                }
+            }
+        }
+    }
 }
 
 /// The retirement record is native-only, even through raw file RPCs.
@@ -304,7 +320,9 @@ impl Drop for MultipartCommitStaging {
 impl LocalDisk {
     pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
         let root = upload_scope_root(upload_or_part_path, part_path);
-        let Ok(source) = self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
+        // Advisory skip-recovery probe: only keys ACTIVE_MULTIPART_SOURCE_HEADS and
+        // checks the cached xl.meta stamp; mutating stages re-validate via multipart_source_admission.
+        let Ok(source) = self.io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
             return false;
         };
         super::multipart_source_state::has_clean_active_multipart_source(&source)
@@ -326,6 +344,38 @@ impl LocalDisk {
             base: self.io_root().to_path_buf(),
             publication_root: self.publication_root.clone(),
             initial,
+        }))
+    }
+
+    /// Constructs `MultipartSourceAdmission` for a part path after the caller has
+    /// already validated `(volume, path)` via `io_get_bucket_and_object_path`.
+    pub(super) fn multipart_source_admission_after_validated_part_path(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Result<Option<MultipartSourceAdmission>> {
+        reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
+        if volume != RUSTFS_META_MULTIPART_BUCKET {
+            return Ok(None);
+        }
+        let scope = upload_scope_root(path, true);
+        let trimmed = path.trim_end_matches('/');
+        let source =
+            if !scope.is_empty() && (trimmed == scope || trimmed.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))) {
+                let open_path = self.io_get_object_open_path(volume, scope)?;
+                #[cfg(debug_assertions)]
+                if let Ok(full_path) = self.io_get_object_path(volume, scope) {
+                    debug_assert_eq!(open_path, full_path);
+                }
+                open_path
+            } else {
+                self.io_get_object_path(volume, scope)?
+            };
+        Ok(Some(MultipartSourceAdmission {
+            source,
+            base: self.io_root().to_path_buf(),
+            publication_root: self.publication_root.clone(),
+            initial: false,
         }))
     }
 
@@ -1272,6 +1322,39 @@ mod tests {
         assert!(!directory.exists(), "a per-upload safety guard must not strand empty hash directories");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multipart_source_settlement_admission_distinguishes_absence_from_aliases() {
+        let (root, disk, info, _) = fixture().await;
+        let part = format!("upload/{}/part.1", info.data_dir.expect("fixture data directory"));
+        let transaction = disk
+            .io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &crate::disk::part_transaction_path(&part))
+            .expect("canonical transaction path");
+        let admission = disk
+            .multipart_source_admission(RUSTFS_META_MULTIPART_BUCKET, &part, true, false)
+            .expect("canonical source admission")
+            .expect("multipart admission");
+        std::fs::remove_file(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join("upload/xl.meta"))
+            .expect("retire the source head");
+        assert!(admission.validate().is_err(), "the closed source must reject mutations");
+        std::fs::create_dir_all(&transaction).expect("an existing transaction under the closed source");
+        assert!(
+            admission.validate_part_settlement(&transaction).is_err(),
+            "an existing transaction still requires active-source authority"
+        );
+        std::fs::remove_dir(&transaction).expect("remove only the fixture transaction");
+        assert!(
+            !admission
+                .validate_part_settlement(&transaction)
+                .expect("an absent transaction is already settled")
+        );
+        std::os::unix::fs::symlink(root.path().join("absent"), &transaction).expect("inject a dangling transaction alias");
+        assert!(
+            admission.validate_part_settlement(&transaction).is_err(),
+            "a dangling alias must retain the source admission failure"
+        );
+    }
+
     #[tokio::test]
     async fn multipart_source_active_head_cache_populates_and_invalidates_across_part_and_delete_paths() {
         use crate::disk::{DiskAPI as _, PartTransactionAction, ReadOptions};
@@ -1398,6 +1481,39 @@ mod tests {
                 .await,
             Err(DiskError::FileNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn multipart_source_admission_after_validated_part_path_matches_full_admission() {
+        let (_root, disk, _, _) = fixture().await;
+        let sha_upload = format!("{}/{}/{}/part.1", "a".repeat(64), Uuid::new_v4(), Uuid::new_v4());
+        let fixture_upload = format!("upload/{}/part.1", Uuid::new_v4());
+        let direct_part = format!("{}/part.1", Uuid::new_v4());
+        for path in [&sha_upload, &fixture_upload, &direct_part] {
+            let (_, _) = disk
+                .io_get_bucket_and_object_path(RUSTFS_META_MULTIPART_BUCKET, path)
+                .expect("validated part path");
+            let fast = disk
+                .multipart_source_admission_after_validated_part_path(RUSTFS_META_MULTIPART_BUCKET, path)
+                .expect("fast admission")
+                .expect("multipart admission present");
+            let full = disk
+                .multipart_source_admission(RUSTFS_META_MULTIPART_BUCKET, path, true, false)
+                .expect("full admission")
+                .expect("multipart admission present");
+            assert_eq!(fast.source(), full.source());
+        }
+        assert!(
+            disk.multipart_source_admission_after_validated_part_path("bucket", "object/part.1")
+                .expect("non-multipart volume")
+                .is_none()
+        );
+        for noncanonical in ["a/../b/part.1", "a//b/part.1", "/a/b/part.1"] {
+            assert!(matches!(
+                disk.multipart_source_admission_after_validated_part_path(RUSTFS_META_MULTIPART_BUCKET, noncanonical),
+                Err(DiskError::ConditionalDeleteConflict)
+            ));
+        }
     }
 
     #[cfg(not(windows))]

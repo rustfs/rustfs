@@ -190,6 +190,7 @@ impl TestPki {
 enum Reply {
     Json(StatusCode, Value),
     DelayedClose(Duration),
+    WithholdResponse,
     RateLimited(&'static str),
     UnauthorizedAfterCredential {
         path: std::path::PathBuf,
@@ -414,6 +415,7 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
                                     .body(Full::new(Bytes::new()))
                                     .expect("response"))
                             }
+                            Reply::WithholdResponse => std::future::pending().await,
                             Reply::RateLimited(retry_after) => Ok(Response::builder()
                                 .status(StatusCode::TOO_MANY_REQUESTS)
                                 .header("content-type", "application/json")
@@ -1163,7 +1165,7 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
     let retries = server(
         &pki,
         vec![
-            Reply::DelayedClose(Duration::from_millis(200)),
+            Reply::WithholdResponse,
             Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
             Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
             Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
@@ -1172,7 +1174,7 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
         ],
     )
     .await;
-    let retry_client = client(&retries, &pki, Duration::from_millis(80));
+    let retry_client = client(&retries, &pki, Duration::from_secs(2));
     let due = registered.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS;
     let (first, second) = tokio::join!(
         retry_client.rotate_if_due(&identity_store, &credential_store, due),

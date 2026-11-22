@@ -30,6 +30,7 @@ checked_files=(
   "rustfs/src/admin/handlers/kms_keys.rs"
   "rustfs/src/admin/handlers/kms_key_lifecycle.rs"
   "rustfs/src/admin/handlers/site_replication.rs"
+  "rustfs/src/admin/handlers/site_replication/removal.rs"
   "rustfs/src/site_replication/mod.rs"
   "rustfs/src/site_replication/identity.rs"
   "rustfs/src/site_replication/state_lock.rs"
@@ -1091,7 +1092,7 @@ trace_hot_spans=(
   # directly (backlog#1821). Sets and SetDisks no longer paginate; ECStore is
   # the only listing entry point.
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
-  "rustfs/src/app/object:execute_get_object"
+  "rustfs/src/app/object:execute_get_object_fields"
 )
 
 # A hot span in a file that is due for a mechanical split (rustfs/backlog#2765)

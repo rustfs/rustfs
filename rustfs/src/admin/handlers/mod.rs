@@ -15,6 +15,7 @@
 pub mod account;
 pub(crate) mod account_audit;
 pub mod account_info;
+pub mod account_permissions;
 pub mod audit;
 mod audit_runtime_config;
 pub mod batch_job;
@@ -258,7 +259,7 @@ mod tests {
     }
 
     // Note: Testing the actual async handler implementations requires:
-    // 1. S3Request setup with proper headers, URI, and credentials
+    // 1. Owned admin request setup with proper headers, URI, and credentials
     // 2. Global object store initialization
     // 3. IAM system initialization
     // 4. Mock or real backend services

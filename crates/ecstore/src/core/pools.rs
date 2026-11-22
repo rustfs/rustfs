@@ -6400,7 +6400,7 @@ pub(crate) struct PoolMetaWriteState {
     pool_meta_absent: bool,
     bootstrap_authority: PoolMetaBootstrapAuthority,
     /// First-hand bootstrap authority this process holds for each pool
-    /// (index = pool index): `Fresh` only for pools it formatted itself,
+    /// (index = pool index): `Fresh` for pools it formatted or resumed from a complete durable plan,
     /// `LegacyAdoption` only for pools whose migration it verified. Empty when
     /// the caller tracks deployment-wide authority only.
     pool_bootstrap_authorities: Vec<PoolMetaBootstrapAuthority>,
@@ -6478,8 +6478,7 @@ impl PoolMetaWriteState {
     }
 
     /// Startup state for a process that loaded every pool format itself and
-    /// remembers, per pool, whether it created (or adopted) that pool
-    /// first-hand. Deployment-wide authority is the conjunction across pools:
+    /// remembers, per pool, whether it created, durably resumed, or adopted that pool. Deployment-wide authority is the conjunction across pools:
     /// any pool this process merely read yields `None`, exactly as before.
     pub(crate) fn for_startup_with_pool_bootstrap_authorities(
         cluster_id: uuid::Uuid,
@@ -6510,7 +6509,7 @@ impl PoolMetaWriteState {
             .is_some_and(|authority| authority.is_proven())
     }
 
-    /// Pools this process formatted or adopted first-hand during this startup.
+    /// Pools this process formatted, durably resumed, or adopted during startup.
     pub(crate) fn attested_pool_indices(&self) -> Vec<usize> {
         self.pool_bootstrap_authorities
             .iter()
@@ -6527,7 +6526,7 @@ impl PoolMetaWriteState {
     /// [`PoolMetaIdentityWriteScope::Pools`]), so a complete, agreeing pending
     /// set proves that every pool joined this bootstrap fresh. A missing,
     /// corrupt, or disagreeing replica keeps the writer fail-closed, and a
-    /// restart without first-hand proof never reopens bootstrap on its own.
+    /// restart requires a complete durable format plan to recover creator proof.
     fn pending_identity_attested_by_every_pool(&self) -> bool {
         self.elected_bootstrap_writer == Some(true)
             && self.pool_bootstrap_authority_proven(0)
@@ -6757,6 +6756,27 @@ impl PoolMetaWriteState {
 
     pub(crate) fn identity_requires_repair(&self) -> bool {
         self.expected_cluster_id.is_some() && (self.identity_needs_repair || self.identity_initialized != Some(true))
+    }
+
+    /// A committed predecessor authorizes repairing an established identity
+    /// before the next metadata write. A pending fresh identity must remain
+    /// pending until its initial metadata commit is recoverable.
+    pub(crate) fn startup_identity_precedes_metadata_write(&self) -> bool {
+        !self.pool_meta_absent && !self.identity_is_pending()
+    }
+
+    pub(crate) fn ensure_startup_identity_initialized(&self) -> Result<()> {
+        if self.expected_cluster_id.is_none()
+            || (self.identity_initialized == Some(true)
+                && !self.identity_needs_repair
+                && !self.identity_replicas_missing
+                && !self.identity_replicas_invalid)
+        {
+            return Ok(());
+        }
+        Err(Error::other(
+            "pool metadata bootstrap pending: waiting for the elected writer to initialize the identity on every pool",
+        ))
     }
 
     pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
@@ -10146,6 +10166,8 @@ impl PoolMeta {
         self.save_for_startup_observing(pools, &mut write_state).await.map(|_| ())
     }
 
+    /// Commits a complete startup snapshot while leaving identity finalization
+    /// to the caller, after durable format-bootstrap authority is retired.
     pub(crate) async fn save_for_startup_observing<S>(
         &self,
         pools: Vec<Arc<S>>,
@@ -10160,6 +10182,8 @@ impl PoolMeta {
         Ok(outcome.into_committed())
     }
 
+    /// Commits a complete startup snapshot under the writer fence. The caller
+    /// retires format-bootstrap authority before finalizing initialized identity.
     pub(crate) async fn save_for_startup_guarded<S>(
         &self,
         pools: Vec<Arc<S>>,
@@ -10362,7 +10386,10 @@ impl PoolMeta {
                     selection.revision.epoch, identity.epoch
                 )));
             }
-            if !selection.absent && write_state.identity_requires_repair() {
+            // Full-snapshot saves belong to startup. Their caller retires
+            // durable format authority before publishing initialized identity.
+            // Runtime scoped saves retain their existing identity repair.
+            if indices.is_some() && !selection.absent && write_state.identity_requires_repair() {
                 let initialized = write_state.identity_initialized != Some(false) || selection.revision.is_generation_protocol();
                 persist_pool_meta_identity(
                     pools.clone(),
@@ -10640,7 +10667,10 @@ impl PoolMeta {
             confirmed
         };
         if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
-            persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm).await?;
+            if indices.is_some() {
+                persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm)
+                    .await?;
+            }
             #[cfg(feature = "e2e-test-hooks")]
             startup_cas_test_observe(serde_json::json!({
                 "kind": "confirmed", "object": POOL_META_NAME,
@@ -12348,6 +12378,7 @@ struct DecommissionCapacityLockOrderBarrierState {
     external_heal_target_lock_attempted: tokio::sync::Notify,
     target_gate_retry_entered: tokio::sync::Notify,
     target_gate_retry_entries: AtomicUsize,
+    target_gate_retry_pause: std::sync::OnceLock<tokio::sync::Semaphore>,
     target_gate_inline_retry_entered: tokio::sync::Notify,
     target_gate_inline_retry_entries: AtomicUsize,
     target_gate_exact_reloads: AtomicUsize,
@@ -12395,6 +12426,7 @@ impl DecommissionCapacityLockOrderBarrier {
             external_heal_target_lock_attempted: tokio::sync::Notify::new(),
             target_gate_retry_entered: tokio::sync::Notify::new(),
             target_gate_retry_entries: AtomicUsize::new(0),
+            target_gate_retry_pause: std::sync::OnceLock::new(),
             target_gate_inline_retry_entered: tokio::sync::Notify::new(),
             target_gate_inline_retry_entries: AtomicUsize::new(0),
             target_gate_exact_reloads: AtomicUsize::new(0),
@@ -12488,6 +12520,13 @@ impl DecommissionCapacityLockOrderBarrier {
         })
         .await
         .expect("decommission entries should observe target gate contention");
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn pause_target_gate_retries(&self) -> &tokio::sync::Semaphore {
+        self.state
+            .target_gate_retry_pause
+            .get_or_init(|| tokio::sync::Semaphore::new(0))
     }
 
     #[cfg(feature = "test-util")]
@@ -12600,6 +12639,9 @@ impl DecommissionCapacityLockOrderBarrier {
 #[cfg(test)]
 impl Drop for DecommissionCapacityLockOrderBarrier {
     fn drop(&mut self) {
+        if let Some(pause) = self.state.target_gate_retry_pause.get() {
+            pause.close();
+        }
         self.state.owner_release.notify_one();
         self.state.external_object_capacity_probe_release.notify_one();
         self.state.external_object_commit_phase_release.notify_one();
@@ -12728,7 +12770,7 @@ async fn pause_decommission_cancel_target_timeout(store_id: uuid::Uuid) {
 }
 
 #[cfg(test)]
-fn notify_decommission_target_gate_retry(store_id: uuid::Uuid) {
+async fn observe_decommission_target_gate_retry(store_id: uuid::Uuid) {
     let barrier = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -12739,6 +12781,11 @@ fn notify_decommission_target_gate_retry(store_id: uuid::Uuid) {
     if let Some(barrier) = barrier {
         barrier.target_gate_retry_entries.fetch_add(1, Ordering::AcqRel);
         barrier.target_gate_retry_entered.notify_one();
+        if let Some(pause) = barrier.target_gate_retry_pause.get()
+            && let Ok(permit) = pause.acquire().await
+        {
+            permit.forget();
+        }
     }
 }
 
@@ -17608,7 +17655,7 @@ impl ECStore {
         target_busy_attempt: usize,
     ) -> Result<Option<DecommissionCapacityTargetPermit>> {
         #[cfg(test)]
-        notify_decommission_target_gate_retry(self.id);
+        observe_decommission_target_gate_retry(self.id).await;
         let mut wait_attempt = target_busy_attempt;
         let target_guard = loop {
             let retry_delay =

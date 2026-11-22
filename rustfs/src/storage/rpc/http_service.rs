@@ -19,9 +19,9 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
     PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
-    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
-    sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
-    with_rpc_background_request,
+    find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
+    sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+    verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io, with_rpc_background_request,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -74,16 +74,19 @@ const MIGRATING_META_BUCKET: &str = ".minio.sys";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 const RPC_OPERATION_UNKNOWN: &str = "unknown";
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+use crate::storage::storage_api::rpc_consumer::nixl_read::{READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH};
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
 const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
+const NS_SCANNER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 static NS_SCANNER_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
-static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
-static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
+pub(super) static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+pub(super) static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
@@ -391,6 +394,9 @@ struct NsScannerCapabilityQuery {
     #[serde(rename = "ns_scanner_tier_registry_generation")]
     ns_scanner_tier_registry_generation: Option<bool>,
     ns_scanner_checkpoint_coverage: Option<bool>,
+    ns_scanner_durable_progress: Option<bool>,
+    ns_scanner_complete_observation: Option<bool>,
+    ns_scanner_usage_watch: Option<bool>,
 }
 
 fn verify_ns_scanner_body_digest(query: &NsScannerQuery, body: &[u8]) -> bool {
@@ -426,15 +432,15 @@ fn validate_walk_dir_completion_request(query: &WalkDirQuery, body: &[u8]) -> Op
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-struct PutFileQuery {
-    disk: String,
-    volume: String,
-    path: String,
-    append: bool,
-    size: i64,
-    put_file_auth: Option<String>,
-    put_file_nonce: Option<uuid::Uuid>,
-    put_file_server_epoch: Option<uuid::Uuid>,
+pub(super) struct PutFileQuery {
+    pub(super) disk: String,
+    pub(super) volume: String,
+    pub(super) path: String,
+    pub(super) append: bool,
+    pub(super) size: i64,
+    pub(super) put_file_auth: Option<String>,
+    pub(super) put_file_nonce: Option<uuid::Uuid>,
+    pub(super) put_file_server_epoch: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -467,7 +473,7 @@ fn put_file_server_epoch_matches(query: &PutFileQuery) -> bool {
     query.put_file_server_epoch == Some(*PUT_FILE_CAPABILITY_SERVER_EPOCH)
 }
 
-fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
+pub(super) fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
     if put_file_server_epoch_matches(query) {
         return true;
     }
@@ -562,6 +568,10 @@ async fn handle_internode_rpc(
                 None => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
             },
             (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
+            (Method::GET, READ_FILE_NIXL_PATH) => super::nixl_read::handle_read_file_nixl(req).await,
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
+            (Method::PUT, WRITE_FILE_NIXL_PATH) => super::nixl_read::handle_write_file_nixl(req).await,
             (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
             (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
                 Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
@@ -569,6 +579,9 @@ async fn handle_internode_rpc(
                         challenge,
                         query.ns_scanner_tier_registry_generation == Some(true),
                         query.ns_scanner_checkpoint_coverage == Some(true),
+                        query.ns_scanner_durable_progress == Some(true),
+                        query.ns_scanner_complete_observation == Some(true),
+                        query.ns_scanner_usage_watch == Some(true),
                     ),
                     Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
                 },
@@ -630,6 +643,10 @@ fn emit_internode_rpc_telemetry(started_at: Instant, status: StatusCode) {
 fn internode_http_operation(path: &str) -> Option<&'static str> {
     match path {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
+        READ_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
+        WRITE_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
@@ -650,13 +667,18 @@ fn ns_scanner_capability_response(
     challenge: uuid::Uuid,
     include_tier_registry_generation: bool,
     include_checkpoint_coverage: bool,
+    include_durable_progress: bool,
+    include_complete_observation: bool,
+    include_usage_watch: bool,
 ) -> Response<Body> {
     let server_epoch = *NS_SCANNER_SERVER_EPOCH;
-    let proof = match sign_ns_scanner_capability_with_checkpoint_coverage(
+    let proof = match sign_ns_scanner_capability_with_usage_capabilities(
         challenge,
         server_epoch,
         include_tier_registry_generation,
         include_checkpoint_coverage,
+        include_durable_progress,
+        include_complete_observation,
     ) {
         Ok(proof) => proof,
         Err(err) => {
@@ -676,12 +698,27 @@ fn ns_scanner_capability_response(
             return response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner RPC authentication is unavailable");
         }
     };
+    let usage_watch_proof = match include_usage_watch
+        .then(|| sign_ns_scanner_usage_watch_capability(challenge, server_epoch))
+        .transpose()
+    {
+        Ok(proof) => proof,
+        Err(_) => {
+            return response_with_status(
+                StatusCode::UPGRADE_REQUIRED,
+                "namespace scanner usage watch authentication is unavailable",
+            );
+        }
+    };
     let body = match rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
         version: NS_SCANNER_PROTOCOL_VERSION,
         server_epoch,
         proof,
         supports_tier_registry_generation: include_tier_registry_generation.then_some(true),
         supports_checkpoint_coverage: include_checkpoint_coverage.then_some(true),
+        supports_durable_progress: include_durable_progress.then_some(true),
+        supports_complete_observation: include_complete_observation.then_some(true),
+        usage_watch_proof,
     }) {
         Ok(body) => body,
         Err(err) => {
@@ -1162,7 +1199,7 @@ fn legacy_meta_alias_can_retry(error: &DiskError, volume: &str) -> bool {
     matches!(error, DiskError::FileNotFound | DiskError::VolumeNotFound) && legacy_meta_bucket_alias(volume).is_some()
 }
 
-async fn read_file_stream_with_legacy_meta_fallback(
+pub(super) async fn read_file_stream_with_legacy_meta_fallback(
     disk: &DiskStore,
     volume: &str,
     path: &str,
@@ -1220,9 +1257,12 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::CONFLICT, "namespace scanner server epoch is stale");
     }
-    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
-        Ok(disk) => disk,
-        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    let disk = match tokio::time::timeout(NS_SCANNER_PREFLIGHT_TIMEOUT, find_local_disk_by_ref_for_scanner_rpc(&query.disk)).await
+    {
+        Ok(Ok(disk)) => disk,
+        Ok(Err(_)) | Err(_) => {
+            return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred");
+        }
     };
     let Some(disk) = disk else {
         warn!(
@@ -1688,7 +1728,7 @@ async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> 
     .map_err(Into::into)
 }
 
-fn write_authenticated_put_file<S, E>(
+pub(super) fn write_authenticated_put_file<S, E>(
     disk: &DiskStore,
     body: S,
     query: &PutFileQuery,
@@ -2864,7 +2904,7 @@ mod tests {
         let _ = rustfs_credentials::set_global_rpc_secret("checkpoint-capability-server-test-secret".to_string());
         for (tier, coverage) in [(false, false), (true, false), (true, true)] {
             let challenge = uuid::Uuid::new_v4();
-            let response = super::ns_scanner_capability_response(challenge, tier, coverage);
+            let response = super::ns_scanner_capability_response(challenge, tier, coverage, false, false, false);
             assert_eq!(response.status(), StatusCode::OK);
             let body = http_body_util::BodyExt::collect(response.into_body())
                 .await
@@ -2892,6 +2932,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn namespace_scanner_usage_capabilities_are_emitted_only_when_requested() {
+        let _ = rustfs_credentials::set_global_rpc_secret("usage-capability-server-test-secret".to_string());
+        for progress in [false, true] {
+            for observation in [false, true] {
+                let challenge = uuid::Uuid::new_v4();
+                let response = super::ns_scanner_capability_response(challenge, true, true, progress, observation, false);
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let capability: NsScannerCapabilityResponse = rmp_serde::from_slice(&body).expect("response");
+                crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_capability_with_usage_capabilities(
+                    challenge,
+                    capability.server_epoch,
+                    &capability.proof,
+                    true,
+                    true,
+                    progress,
+                    observation,
+                )
+                .expect("exact authenticated scope");
+                assert_eq!(capability.supports_durable_progress, progress.then_some(true));
+                assert_eq!(capability.supports_complete_observation, observation.then_some(true));
+            }
+        }
+    }
+
     #[test]
     fn namespace_scanner_capability_response_support_is_optional_for_old_peers() {
         #[derive(serde::Deserialize)]
@@ -2908,6 +2977,9 @@ mod tests {
             proof: vec![1, 2, 3],
             supports_tier_registry_generation: None,
             supports_checkpoint_coverage: None,
+            supports_durable_progress: None,
+            supports_complete_observation: None,
+            usage_watch_proof: None,
         })
         .expect("old response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&old).expect("old response should decode");
@@ -2925,6 +2997,9 @@ mod tests {
             proof: vec![1, 2, 3],
             supports_tier_registry_generation: Some(true),
             supports_checkpoint_coverage: None,
+            supports_durable_progress: None,
+            supports_complete_observation: None,
+            usage_watch_proof: None,
         })
         .expect("new response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&current).expect("new response should decode");
@@ -4293,11 +4368,11 @@ mod tests {
             ("put_file", Box::new(move || put_file_capability_response(challenge))),
             (
                 "ns_scanner",
-                Box::new(move || super::ns_scanner_capability_response(challenge, false, false)),
+                Box::new(move || super::ns_scanner_capability_response(challenge, false, false, false, false, false)),
             ),
             (
                 "ns_scanner with tier generation",
-                Box::new(move || super::ns_scanner_capability_response(challenge, true, false)),
+                Box::new(move || super::ns_scanner_capability_response(challenge, true, false, false, false, false)),
             ),
         ];
         for (name, build) in builders {

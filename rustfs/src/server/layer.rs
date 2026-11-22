@@ -358,7 +358,7 @@ fn telemetry_operation(operation: rustfs_s3_ops::S3Operation) -> Option<Telemetr
     use rustfs_s3_ops::S3Operation;
     match operation {
         S3Operation::GetObject => Some(TelemetryTraceOperation::GetObject),
-        S3Operation::PutObject => Some(TelemetryTraceOperation::PutObject),
+        S3Operation::PutObject | S3Operation::PostObject => Some(TelemetryTraceOperation::PutObject),
         S3Operation::HeadObject => Some(TelemetryTraceOperation::HeadObject),
         S3Operation::ListObjects | S3Operation::ListObjectsV2 => Some(TelemetryTraceOperation::ListObjects),
         _ => None,
@@ -447,6 +447,7 @@ fn foreground_class(operation: Option<rustfs_s3_ops::S3Operation>) -> Foreground
         Some(S3Operation::GetObject | S3Operation::SelectObjectContent) => ForegroundClass::Read,
         Some(
             S3Operation::PutObject
+            | S3Operation::PostObject
             | S3Operation::CopyObject
             | S3Operation::UploadPart
             | S3Operation::UploadPartCopy
@@ -1857,24 +1858,11 @@ pub(in crate::server) mod tests {
         let prefix = crate::server::console_prefix();
         let console_uri = format!("{prefix}/index.html").parse().expect("console URI");
         assert!(is_empty_body_console_path(&Method::GET, &console_uri));
-        let request = HttpRequest::builder()
-            .uri(format!("{prefix}/index.html?attributes"))
-            .body(())
-            .expect("console attributes request");
-        assert!(!is_object_attributes_request(&request));
-        let s3_request = HttpRequest::builder()
-            .uri("/bucket/object?attributes")
-            .body(())
-            .expect("S3 attributes request");
-        assert!(is_object_attributes_request(&s3_request));
     }
 
     use super::*;
     use crate::server::CONSOLE_PREFIX;
-    use crate::server::legacy_compat::{
-        IcebergRestErrorCompatLayer, MAX_XML_COMPAT_BODY_BYTES, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer,
-        is_empty_body_console_path, is_object_attributes_request,
-    };
+    use crate::server::legacy_compat::{IcebergRestErrorCompatLayer, MAX_XML_COMPAT_BODY_BYTES, is_empty_body_console_path};
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::Empty;
@@ -3989,23 +3977,18 @@ pub(in crate::server) mod tests {
             }
         }
         for length in [None, Some(MAX_XML_COMPAT_BODY_BYTES + 1)] {
-            for (layer, path, status) in [
-                (0, "/bucket/object", StatusCode::FORBIDDEN),
-                (1, "/iceberg/v1/warehouse/namespaces/ns/tables/table", StatusCode::FORBIDDEN),
-                (2, "/bucket/object?attributes", StatusCode::OK),
-            ] {
+            for (path, status) in [("/iceberg/v1/warehouse/namespaces/ns/tables/table", StatusCode::FORBIDDEN)] {
                 let inner = StreamingXmlResponse { length, status };
                 let request = Request::builder()
                     .method(Method::GET)
                     .uri(path)
                     .body(())
                     .expect("XML request");
-                let response = match layer {
-                    0 => S3ErrorMessageCompatLayer.layer(inner).call(request).await,
-                    1 => IcebergRestErrorCompatLayer.layer(inner).call(request).await,
-                    _ => ObjectAttributesEtagFixLayer.layer(inner).call(request).await,
-                }
-                .expect("stream passed through");
+                let response = IcebergRestErrorCompatLayer
+                    .layer(inner)
+                    .call(request)
+                    .await
+                    .expect("stream passed through");
                 assert_eq!(response.status(), status);
                 assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
             }

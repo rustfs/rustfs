@@ -160,6 +160,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
                     ScannerMaintenanceFeatures::default(),
                     None,
                     runtime.startup_token(),
+                    &mut None,
                 ),
             )
             .await
@@ -740,6 +741,7 @@ async fn scanner_recovery_intent_startup_rejects_corrupt_pending_record() {
     save_config(store.clone(), &path, b"{corrupt".to_vec())
         .await
         .expect("corrupt intent payload should persist");
+    crate::scanner_io::tests::wait_for_namespace_commit_tails(store.as_ref()).await;
 
     let restarted = restart_scanner_cycle_store_from(&store).await;
     let error = scanner_usage_recovery_intents_for_startup(&CancellationToken::new(), restarted)

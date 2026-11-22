@@ -103,8 +103,11 @@ fn use_bytesmut_ingest() -> bool {
 }
 
 fn small_ingest_capacity(erasure: &Erasure, size_hint: usize) -> usize {
-    let data_len = size_hint.min(erasure.block_size);
-    erasure.encoded_capacity_for_data_len(data_len).min(erasure.block_size)
+    if size_hint <= erasure.block_size {
+        erasure.encoded_capacity_for_data_len(size_hint)
+    } else {
+        erasure.block_size
+    }
 }
 
 /// Keeps the encoder producer scoped to its parent future. Tokio detaches a
@@ -653,6 +656,36 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
+    pub(crate) async fn finish_and_shutdown(&mut self, total: usize) -> std::io::Result<()> {
+        let mut prewritten = Vec::new();
+        if let Some(integrity) = self.integrity.as_deref_mut() {
+            let prepared = integrity.prepare(total).await?;
+            if let Some(idx_bytes) = prepared.memory_bytes() {
+                let idx_name = prepared.part.file_name();
+                prewritten.resize(self.writers.len(), false);
+                for (index, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter()).enumerate() {
+                    if err.is_none()
+                        && let Some(writer) = writer_opt.as_mut()
+                    {
+                        prewritten[index] = writer.set_pending_integrity_index(&idx_name, idx_bytes.clone());
+                    }
+                }
+            }
+        }
+        self.shutdown().await?;
+        if let Some(integrity) = self.integrity.take()
+            && !prewritten.is_empty()
+        {
+            for (index, slot) in prewritten.iter_mut().enumerate() {
+                if self.errs[index].is_some() || self.writers[index].is_none() {
+                    *slot = false;
+                }
+            }
+            integrity.set_prewritten_disks(prewritten);
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         crate::hp_guard!("MultiWriter::shutdown");
         let budget = self.next_progress_budget();
@@ -866,7 +899,7 @@ impl Erasure {
         let mut mw = MultiWriter::new(writers, write_policy);
         mw.integrity = integrity;
         mw.write_block(&block).await?;
-        mw.shutdown().await?;
+        mw.finish_and_shutdown(total).await?;
         Ok((reader, total))
     }
 
@@ -1086,7 +1119,7 @@ impl Erasure {
 
         let (reader, total) = task.join().await??;
         let shutdown_stage_start = stage_timer_if_enabled();
-        writers.shutdown().await?;
+        writers.finish_and_shutdown(total).await?;
         record_internal_stage_if_enabled("erasure_encode_shutdown", shutdown_stage_start);
         Ok((reader, total))
     }
@@ -1232,7 +1265,7 @@ impl Erasure {
 
         let (reader, total) = task.join().await??;
         let shutdown_stage_start = stage_timer_if_enabled();
-        writers.shutdown().await?;
+        writers.finish_and_shutdown(total).await?;
         record_internal_stage_if_enabled("erasure_encode_batched_shutdown", shutdown_stage_start);
         Ok((reader, total))
     }
@@ -3492,12 +3525,24 @@ mod tests {
         assert_eq!(small_ingest_capacity(&erasure, 0), 0);
         assert_eq!(small_ingest_capacity(&erasure, 4 * 1024), 6 * 1024);
         assert_eq!(small_ingest_capacity(&erasure, 16 * 1024), 24 * 1024);
+        assert_eq!(
+            small_ingest_capacity(&erasure, 1024 * 1024),
+            erasure.encoded_capacity_for_data_len(1024 * 1024)
+        );
         assert_eq!(small_ingest_capacity(&erasure, usize::MAX), 1024 * 1024);
 
         let legacy = Erasure::new_with_options(4, 2, 1024 * 1024, true);
         assert_eq!(small_ingest_capacity(&legacy, 4 * 1024), 6 * 1024);
+        assert_eq!(
+            small_ingest_capacity(&legacy, 1024 * 1024),
+            legacy.encoded_capacity_for_data_len(1024 * 1024)
+        );
 
         let high_parity = Erasure::new(4, 12, 1024 * 1024);
+        assert_eq!(
+            small_ingest_capacity(&high_parity, 1024 * 1024),
+            high_parity.encoded_capacity_for_data_len(1024 * 1024)
+        );
         assert_eq!(small_ingest_capacity(&high_parity, usize::MAX), 1024 * 1024);
     }
 

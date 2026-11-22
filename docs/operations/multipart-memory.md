@@ -29,7 +29,15 @@ Use rustfs_memory_allocator_malloc_requested_bytes only when rustfs_memory_alloc
 
 A previously published gauge can remain visible after a statistic becomes unavailable. Filter it by the availability metric. The malloc_requested_total_bytes metric is cumulative allocation activity and can grow indefinitely in a healthy process. Do not use its slope as evidence of retained memory.
 
+The `rustfs_memory_allocator_allocated_bytes` gauge reports the allocator's `allocated.current` block accounting when `rustfs_memory_allocator_allocated_bytes_available` is one. It includes size-class rounding and can lag page or thread statistics merges. Availability means the field was present and valid, not that accounting was enabled. This observation is distinct from live requested bytes, committed bytes and RSS; zero or a change alone does not prove a drained heap or a leak.
+
 When live requested bytes are unavailable, capture a supported heap profile or allocation/free trace. Preserve attribution to allocation stacks and lifetime; committed bytes and RSS alone cannot establish a leak. Other raw allocator statistics, including page accounting, depend on the allocator build and are not interchangeable with live application bytes.
+
+### Diagnostic allocator and runtime metrics
+
+Build with `--features diagnostic-allocator-live` to count live requested bytes for Rust allocations routed through the binary's MiMalloc `GlobalAlloc` wrapper. Read `rustfs_memory_allocator_rust_global_requested_live_bytes` together with `rustfs_memory_allocator_rust_global_requested_live_bytes_available`. Availability is `1` for this feature on non-Windows builds when the `hotpath` and `hotpath-alloc` combination is inactive. Direct native allocations are outside this counter. The wrapper records successful allocations, zeroed allocations, reallocations, and frees using allocation-free atomic updates. Per-allocation accounting adds overhead, so collect diagnostic and throughput measurements in separate runs.
+
+The memory sampler also exports `rustfs_runtime_worker_threads`. With `RUSTFLAGS="--cfg tokio_unstable"`, it exports serving-runtime blocking-thread total, idle, and active gauges under `rustfs_runtime_blocking_threads_*`, with `rustfs_runtime_blocking_pool_metrics_available = 1`. An ordinary build reports availability `0`. These metrics describe the serving runtime; isolated disk fsync and cleanup runtimes have their own execution ownership. Enable the allocator feature separately when both views are needed. Tokio's `tokio_unstable` configuration uses the stable compiler and opts into Tokio's unstable telemetry API.
 
 ### Linux transparent huge pages
 

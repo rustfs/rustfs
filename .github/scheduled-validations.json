@@ -297,6 +297,34 @@
       "alert_contract": "scheduled-validation"
     },
     {
+      "workflow": ".github/workflows/rdma-feature-check.yml",
+      "name": "S3-over-RDMA feature check",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "37 5 * * 1"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "rdma-feature-check.yml",
+      "disposition": "compiles the nixl feature and runs rustfs-nixl unit tests on Linux; the feature is off in every other build",
+      "failure_owner": "workflow",
+      "origin": "added",
+      "alert_contract": "scheduled-validation"
+    },
+    {
       "workflow": ".github/workflows/rustfs-validation-sweep.yml",
       "name": "RustFS Validation Sweep",
       "roles": [
@@ -494,6 +522,30 @@
       "disposition": "retained independent entry",
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/agent-v1-protocol-regression.yml",
+      "name": "Agent v1 protocol regression",
+      "roles": [
+        "pr",
+        "push",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "push",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "agent-v1-protocol-regression.yml",
+      "disposition": "validates Agent v1 schemas and fixture integrity",
+      "monitor_reason": "Runs on changes to the Agent v1 contract and on request.",
+      "origin": "added"
     },
     {
       "workflow": ".github/workflows/connect-diagnostic-schedule-acceptance.yml",
@@ -786,7 +838,7 @@
       "monitor": "workflow",
       "max_age_hours": 36,
       "result_owner": "dual-stack-nightly.yml",
-      "disposition": "both-stack JUnit diff of the two profiles only ci.yml runs; the gateway legs are report-only until T2.10",
+      "disposition": "nightly run of the two e2e profiles only ci.yml runs, on the gateway stack, with the JUnit reports retained for 30 days",
       "failure_owner": "watchdog",
       "origin": "added"
     },

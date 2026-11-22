@@ -519,8 +519,14 @@ pub(crate) fn replacement_target_identities_match(
     expected: &[ReplacementTargetIdentity],
     actual: &[ReplacementTargetIdentity],
 ) -> bool {
-    let mut expected = expected.to_vec();
-    let mut actual = actual.to_vec();
+    if expected == actual {
+        return true;
+    }
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let mut expected: Vec<_> = expected.iter().collect();
+    let mut actual: Vec<_> = actual.iter().collect();
     expected.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     actual.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     expected == actual

@@ -2651,7 +2651,7 @@ impl Erasure {
                     if initial_result.is_some() {
                         outcome = (&mut fallback).await;
                         drop(fallback);
-                        selected_data = (outcome.written == length).then_some((ShardBuf::from(fallback_data), 0));
+                        selected_data = (outcome.written == length).then_some((fallback_data.into(), 0));
                     } else {
                         let race = tokio::select! {
                             biased;
@@ -2667,13 +2667,13 @@ impl Erasure {
                                 repair.observe(&[Some(error)]);
                                 outcome = (&mut fallback).await;
                                 drop(fallback);
-                                selected_data = (outcome.written == length).then_some((ShardBuf::from(fallback_data), 0));
+                                selected_data = (outcome.written == length).then_some((fallback_data.into(), 0));
                             }
                             Err(fallback_outcome) => {
                                 drop(fallback);
                                 if fallback_outcome.written == length {
                                     outcome = fallback_outcome;
-                                    selected_data = Some((ShardBuf::from(fallback_data), 0));
+                                    selected_data = Some((fallback_data.into(), 0));
                                 } else {
                                     // A failed alternative quorum must not vote
                                     // away a still-pending healthy target.

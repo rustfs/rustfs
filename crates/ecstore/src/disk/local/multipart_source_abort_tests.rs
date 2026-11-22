@@ -125,6 +125,80 @@ async fn commit_actual_abort(fixture: &Fixture, certificate: &MultipartAbortCert
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_abort_late_part_settlement_preserves_the_retired_tree() {
+    use crate::disk::{PartTransactionAction, RUSTFS_META_TMP_BUCKET};
+
+    let fixture = heap_native(Fixture::new).await;
+    let disk = &fixture.disks[0];
+    for volume in [RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET] {
+        match disk.make_volume(volume).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(error) => panic!("prepare the part/retirement volume: {error}"),
+        }
+    }
+    let snapshot = heap_native(|| fixture.snapshot(0)).await;
+    let destination = format!("{}/{}/part.1", fixture.path, snapshot.lineage.original_data_dir);
+    let body = bytes::Bytes::from_static(b"replacement shard");
+    let part = ObjectPartInfo {
+        number: 1,
+        size: body.len(),
+        actual_size: i64::try_from(body.len()).expect("fixture shard size fits i64"),
+        etag: "replacement".to_owned(),
+        ..Default::default()
+    };
+    let metadata = bytes::Bytes::from(part.marshal_msg().expect("part transaction metadata"));
+    disk.write_all(RUSTFS_META_TMP_BUCKET, "late-settle/part.1", body)
+        .await
+        .expect("stage the replacement shard");
+    disk.prepare_part_transaction(
+        RUSTFS_META_TMP_BUCKET,
+        "late-settle/part.1",
+        RUSTFS_META_MULTIPART_BUCKET,
+        &destination,
+        metadata.clone(),
+    )
+    .await
+    .expect("prepare the replacement transaction");
+    disk.rename_part(
+        RUSTFS_META_TMP_BUCKET,
+        "late-settle/part.1",
+        RUSTFS_META_MULTIPART_BUCKET,
+        &destination,
+        metadata,
+    )
+    .await
+    .expect("publish the replacement before retaining its settlement");
+    let transaction = disk
+        .io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, &crate::disk::part_transaction_path(&destination))
+        .expect("published transaction cache key");
+    assert!(
+        crate::disk::local::PUBLISHED_PART_TXN_RECEIPTS
+            .with_get(&transaction, |receipt| receipt.txn_parent_fd.is_some())
+            .unwrap_or(false),
+        "the real part APIs must retain their pinned transaction parent"
+    );
+
+    let certificate = heap_native(|| prepare_actual_abort(&fixture)).await;
+    heap_native(|| commit_actual_abort(&fixture, &certificate)).await;
+    disk.recover_multipart_source(fixture.request(MultipartSourceOperation::DeleteAborted {
+        expected: heap_native(|| fixture.snapshot(0)).await,
+        certificate,
+    }))
+    .await
+    .expect("retire the actual upload into its ordinary trash tree");
+    assert!(!source_root(&fixture, 0).exists());
+    let trash = disk.root.join(RUSTFS_META_TMP_DELETED_BUCKET);
+    let before = exact_tree(&trash);
+    assert!(!before.is_empty(), "retirement must retain the real transaction in trash");
+    disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &destination, PartTransactionAction::Commit)
+        .await
+        .expect("an absent canonical transaction is already settled");
+    assert!(!source_root(&fixture, 0).exists(), "late settlement must not recreate the upload");
+    assert_eq!(exact_tree(&trash), before, "late settlement must preserve the exact retired bytes");
+}
+
 async fn assert_generic_deletes_preserve_source(fixture: &Fixture, slot: usize) {
     let before = exact_tree(&source_root(fixture, slot));
     let disk = &fixture.disks[slot];

@@ -43,6 +43,7 @@ const LOG_COMPONENT_CONNECT: &str = "connect";
 const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
 
 pub(crate) struct StartupServiceRuntime {
+    pub(crate) table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
     pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
     pub(crate) oidc_recovery: Option<AbortOnDropHandle<()>>,
     pub(crate) optional_runtimes: OptionalRuntimeServices,
@@ -54,6 +55,7 @@ pub(crate) struct StartupServiceRuntime {
 }
 
 pub(crate) struct EmbeddedStartupServiceRuntime {
+    pub(crate) table_rename_recovery: crate::table_catalog::CatalogBackgroundTask,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
 }
 
@@ -67,12 +69,15 @@ pub(crate) async fn init_embedded_startup_runtime_services(
 ) -> Result<EmbeddedStartupServiceRuntime> {
     init_embedded_optional_service_runtime(config, store.clone()).await;
     let buckets = init_embedded_bucket_metadata_runtime(store.clone(), &ctx).await?;
-    let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness, server_ctx)
+    let iam_bootstrap = init_embedded_iam_runtime(store, ctx.clone(), readiness, server_ctx.clone())
         .await
         .map_err(|err| std::io::Error::other(format!("IAM bootstrap setup: {err}")))?;
     init_embedded_notification_runtime(endpoint_pools, buckets).await;
 
-    Ok(EmbeddedStartupServiceRuntime { iam_bootstrap })
+    Ok(EmbeddedStartupServiceRuntime {
+        iam_bootstrap,
+        table_rename_recovery: crate::table_catalog::spawn_table_rename_recovery(server_ctx, &ctx),
+    })
 }
 
 pub(crate) async fn init_startup_runtime_services(
@@ -121,11 +126,12 @@ pub(crate) async fn init_startup_runtime_services(
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
     let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
 
-    let table_maintenance =
-        maintenance_config.map(|config| crate::table_catalog::PeriodicMaintenanceRuntime::spawn(config, server_ctx, &ctx));
+    let table_maintenance = maintenance_config
+        .map(|config| crate::table_catalog::PeriodicMaintenanceRuntime::spawn(config, server_ctx.clone(), &ctx));
 
     Ok(StartupServiceRuntime {
         table_maintenance,
+        table_rename_recovery: Some(crate::table_catalog::spawn_table_rename_recovery(server_ctx, &ctx)),
         oidc_recovery,
         optional_runtimes,
         heartbeat,

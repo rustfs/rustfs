@@ -45,19 +45,12 @@ use handlers::{
     user,
 };
 use router::{AdminOperation, S3Router};
-use s3s::route::S3Route;
 
-/// Create admin router
-///
-/// # Arguments
-/// * `console_enabled` - Whether the console is enabled
-///
-/// # Returns
-/// An instance of S3Route for admin operations
-pub fn make_admin_route(
+/// Builds the control-plane router and binds it to this server.
+pub(crate) fn make_admin_router(
     console_enabled: bool,
     server_ctx: std::sync::Arc<crate::admin::runtime_sources::ServerContextSlot>,
-) -> std::io::Result<impl S3Route> {
+) -> std::io::Result<S3Router<AdminOperation>> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
     r.set_server_ctx(server_ctx);
     register_admin_routes(&mut r)?;
@@ -71,6 +64,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     handlers::plugin_attempt::register_plugin_attempt_route(r)?;
 
     account::register_account_route(r)?;
+    handlers::account_permissions::register_account_permissions_route(r)?;
     mfa::register_mfa_route(r)?;
     user::register_user_route(r)?;
     system::register_system_route(r)?;

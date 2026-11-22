@@ -46,6 +46,8 @@ pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
 pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
 pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_COMPLETE_OBSERVATION_QUERY: &str = "ns_scanner_complete_observation";
+pub const NS_SCANNER_DURABLE_PROGRESS_QUERY: &str = "ns_scanner_durable_progress";
 pub const NS_SCANNER_CHECKPOINT_COVERAGE_QUERY: &str = "ns_scanner_checkpoint_coverage";
 pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
@@ -56,7 +58,10 @@ pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
 /// a scanner must not use it as a publication proof because terminal movement
 /// state is not authenticated by that version.
 pub const SCANNER_ACTIVITY_V6_PROTOCOL_VERSION: u32 = 6;
-pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 7;
+/// Authenticates terminal movement state, but carries no checkpoint continuity.
+pub const SCANNER_ACTIVITY_V7_PROTOCOL_VERSION: u32 = 7;
+/// Authenticates read-only checkpoint continuity separately from the RPC epoch.
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 8;
 pub const SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION: u32 = 2;
 pub const SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES: usize = 32;
 pub const SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES: usize = SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES;
@@ -72,6 +77,22 @@ pub struct NsScannerCapabilityResponse {
     pub supports_tier_registry_generation: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_checkpoint_coverage: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_durable_progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_complete_observation: Option<bool>,
+    /// Independent challenge-bound capability; omitted for older strict readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_watch_proof: Option<Vec<u8>>,
+}
+
+/// Authenticated scanner capabilities for one peer startup epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NsScannerCapabilities {
+    pub server_epoch: uuid::Uuid,
+    pub supports_durable_progress: bool,
+    pub supports_complete_observation: bool,
+    pub supports_usage_watch: bool,
 }
 
 pub mod admin;
@@ -91,7 +112,7 @@ pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOption
 pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};
 pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
-pub use multipart::{MultipartCompletionAuthorization, MultipartUploadInspection};
+pub use multipart::{MultipartAbortAuthorization, MultipartCompletionAuthorization, MultipartOwner, MultipartUploadInspection};
 pub use object::AuthoritativeListOperations;
 pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;

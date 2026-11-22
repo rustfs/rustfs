@@ -13,41 +13,21 @@
 // limitations under the License.
 
 use percent_encoding::percent_decode_str;
-use s3s::dto::{Tag, TaggingDirective};
-use s3s::{S3Error, S3ErrorCode, S3Result};
+use rustfs_gateway_types::cors_tagging::PersistedTag;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use url::form_urlencoded;
 
-use crate::storage::storage_api::encode_tags;
+use crate::storage::storage_api::ecstore_bucket::{metadata::validate_tag_set_entries, tagging::encode_tags};
 
 fn invalid_tag_error(message: &str) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidTag, message.to_string())
 }
 
-/// The storage validators read the persisted tag shape.
-fn persisted_tags(tag_set: &[Tag]) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
-    tag_set
-        .iter()
-        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
-            key: tag.key.clone(),
-            value: tag.value.clone(),
-        })
-        .collect()
-}
-
-pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
+fn validate_object_tag_set(tag_set: &[PersistedTag]) -> S3Result<()> {
     if tag_set.len() > 10 {
         return Err(invalid_tag_error("Cannot have more than 10 tags per object"));
     }
-    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(&persisted_tags(tag_set))
-        .map_err(invalid_tag_error)
-}
-
-pub(crate) fn validate_bucket_tag_set(tag_set: &[Tag]) -> S3Result<()> {
-    if tag_set.len() > crate::storage::storage_api::ecstore_bucket::metadata::MAX_BUCKET_TAGS {
-        return Err(invalid_tag_error("Cannot have more than 50 tags per bucket"));
-    }
-    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(&persisted_tags(tag_set))
-        .map_err(invalid_tag_error)
+    validate_tag_set_entries(tag_set).map_err(invalid_tag_error)
 }
 
 fn validate_tag_component_encoding(component: &str) -> S3Result<()> {
@@ -70,7 +50,7 @@ fn validate_tag_component_encoding(component: &str) -> S3Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_object_tag_header(tagging: &str) -> S3Result<Vec<Tag>> {
+pub(crate) fn parse_object_tag_header(tagging: &str) -> S3Result<Vec<PersistedTag>> {
     let mut tag_set = Vec::with_capacity(10);
     for pair in tagging.split('&').filter(|pair| !pair.is_empty()) {
         if tag_set.len() == 10 {
@@ -82,7 +62,7 @@ pub(crate) fn parse_object_tag_header(tagging: &str) -> S3Result<Vec<Tag>> {
         validate_tag_component_encoding(value)?;
         let mut parsed = form_urlencoded::parse(pair.as_bytes());
         if let Some((key, value)) = parsed.next() {
-            tag_set.push(Tag {
+            tag_set.push(PersistedTag {
                 key: Some(key.into_owned()),
                 value: Some(value.into_owned()),
             });
@@ -97,12 +77,9 @@ pub(crate) fn parse_copy_object_tags(tagging: &str) -> S3Result<String> {
     parse_object_tag_header(tagging).map(encode_tags)
 }
 
-pub(crate) fn resolve_copy_object_tags(
-    tagging: Option<&str>,
-    tagging_directive: Option<&TaggingDirective>,
-) -> S3Result<Option<String>> {
-    match tagging_directive.map(TaggingDirective::as_str) {
-        None | Some(TaggingDirective::COPY) => {
+pub(crate) fn resolve_copy_object_tags(tagging: Option<&str>, tagging_directive: Option<&str>) -> S3Result<Option<String>> {
+    match tagging_directive {
+        None | Some("COPY") => {
             if tagging.is_some() {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidRequest,
@@ -111,7 +88,7 @@ pub(crate) fn resolve_copy_object_tags(
             }
             Ok(None)
         }
-        Some(TaggingDirective::REPLACE) => parse_copy_object_tags(tagging.unwrap_or_default()).map(Some),
+        Some("REPLACE") => parse_copy_object_tags(tagging.unwrap_or_default()).map(Some),
         Some(_) => Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "The TaggingDirective header is invalid".to_string(),
@@ -122,11 +99,11 @@ pub(crate) fn resolve_copy_object_tags(
 #[cfg(test)]
 mod tests {
     use super::{parse_copy_object_tags, resolve_copy_object_tags, validate_object_tag_set};
-    use s3s::S3ErrorCode;
-    use s3s::dto::{Tag, TaggingDirective};
+    use rustfs_gateway_types::cors_tagging::PersistedTag;
+    use rustfs_s3_types::S3ErrorCode;
 
-    fn tag(key: Option<&str>, value: Option<&str>) -> Tag {
-        Tag {
+    fn tag(key: Option<&str>, value: Option<&str>) -> PersistedTag {
+        PersistedTag {
             key: key.map(ToOwned::to_owned),
             value: value.map(ToOwned::to_owned),
         }
@@ -141,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_validate_object_tag_set_rejects_more_than_ten_tags() {
-        let tag_set: Vec<Tag> = (0..11).map(|i| tag(Some(&format!("k{i}")), Some(&format!("v{i}")))).collect();
+        let tag_set: Vec<PersistedTag> = (0..11).map(|i| tag(Some(&format!("k{i}")), Some(&format!("v{i}")))).collect();
 
         let err = validate_object_tag_set(&tag_set).expect_err("tag set with more than ten tags must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::InvalidTag);
@@ -273,23 +250,21 @@ mod tests {
             resolve_copy_object_tags(None, None).expect("default directive should preserve source tags"),
             None
         );
-        let copy = TaggingDirective::from_static(TaggingDirective::COPY);
         assert_eq!(
-            resolve_copy_object_tags(None, Some(&copy)).expect("COPY directive should preserve source tags"),
+            resolve_copy_object_tags(None, Some("COPY")).expect("COPY directive should preserve source tags"),
             None
         );
     }
 
     #[test]
     fn test_resolve_copy_object_tags_replaces_with_exact_requested_set() {
-        let replace = TaggingDirective::from_static(TaggingDirective::REPLACE);
         assert_eq!(
-            resolve_copy_object_tags(Some("project=rustfs"), Some(&replace))
+            resolve_copy_object_tags(Some("project=rustfs"), Some("REPLACE"))
                 .expect("REPLACE directive should accept a valid tag set"),
             Some("project=rustfs".to_string())
         );
         assert_eq!(
-            resolve_copy_object_tags(None, Some(&replace)).expect("REPLACE without Tagging should clear tags"),
+            resolve_copy_object_tags(None, Some("REPLACE")).expect("REPLACE without Tagging should clear tags"),
             Some(String::new())
         );
     }
@@ -300,8 +275,7 @@ mod tests {
             .expect_err("a Tagging header without REPLACE must not be silently discarded");
         assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
 
-        let unknown = TaggingDirective::from_static("UNKNOWN");
-        let err = resolve_copy_object_tags(None, Some(&unknown)).expect_err("an unknown tagging directive must fail");
+        let err = resolve_copy_object_tags(None, Some("UNKNOWN")).expect_err("an unknown tagging directive must fail");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 }

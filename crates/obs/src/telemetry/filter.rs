@@ -24,7 +24,11 @@ use tracing_subscriber::{
     filter::{FilterFn, LevelFilter, filter_fn},
 };
 
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+use super::http2_ping::HYPER_HTTP2_CLIENT_TARGET;
+
 pub const HTTP_SERVER_LOG_TARGET: &str = "rustfs::server::http";
+const S3_DEPENDENCY_TARGETS: [&str; 2] = ["s3s", "rustfs_gateway"];
 
 /// Pyroscope emits raw reqwest errors from its background session manager.
 /// Those errors can include the configured endpoint, so they must never reach
@@ -41,12 +45,13 @@ pub(super) fn pyroscope_log_filter() -> FilterFn {
     filter_fn(allows_non_pyroscope_dependency_event)
 }
 
-/// s3s verbose events include response bodies and expected signatures. Keep
-/// diagnostics spans, but never let these events reach logs or OTLP exporters.
-pub(super) fn s3s_log_filter() -> FilterFn {
+/// Keep verbose protocol events out of logs and OTLP while preserving diagnostic spans.
+pub(super) fn s3_dependency_log_filter() -> FilterFn {
     filter_fn(|metadata| {
         !(metadata.is_event()
-            && (metadata.target() == "s3s" || metadata.target().starts_with("s3s::"))
+            && S3_DEPENDENCY_TARGETS
+                .iter()
+                .any(|target| directive_applies_to_target(target, metadata.target()))
             && *metadata.level() > tracing::Level::INFO)
     })
 }
@@ -57,7 +62,9 @@ pub(super) fn s3s_log_filter() -> FilterFn {
 /// `RUST_LOG` environment variable takes precedence over `logger_level`.
 /// For non-verbose levels (`info`, `warn`, `error`), noisy dependency targets
 /// are automatically suppressed based on the effective log configuration.
-/// Transport internals are disabled, while `s3s` remains visible at WARN.
+/// Transport internals are disabled, while S3 protocol warnings remain visible. The
+/// diagnostic HTTP/2 PING feature adds back only Hyper's client target at DEBUG
+/// so its exact keepalive timeout event reaches the metrics layer.
 ///
 /// # Arguments
 /// * `logger_level` - The desired log level string (e.g., `"info"`, `"debug"`).
@@ -174,33 +181,14 @@ fn effective_level_for_target<'a>(rust_log: &'a str, target: &str) -> Option<&'a
     best_match.map(|(_, _, level)| level)
 }
 
-fn should_demote_http_request_logs(logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
+fn should_demote_target(target: &str, logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
     if let Some(level) = default_level {
         let level = level.trim().to_ascii_lowercase();
         return matches!(level.as_str(), "info" | "warn");
     }
 
     if let Some(rust_log) = rust_log {
-        if let Some(level) = effective_level_for_target(rust_log, HTTP_SERVER_LOG_TARGET) {
-            let level = level.trim().to_ascii_lowercase();
-            return matches!(level.as_str(), "info" | "warn");
-        }
-
-        return false;
-    }
-
-    let level = logger_level.trim().to_ascii_lowercase();
-    matches!(level.as_str(), "info" | "warn")
-}
-
-fn should_demote_s3s_logs(logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
-    if let Some(level) = default_level {
-        let level = level.trim().to_ascii_lowercase();
-        return matches!(level.as_str(), "info" | "warn");
-    }
-
-    if let Some(rust_log) = rust_log {
-        if let Some(level) = effective_level_for_target(rust_log, "s3s") {
+        if let Some(level) = effective_level_for_target(rust_log, target) {
             let level = level.trim().to_ascii_lowercase();
             return matches!(level.as_str(), "info" | "warn");
         }
@@ -254,17 +242,16 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
             ("tower", LevelFilter::OFF),
         ];
 
-        if should_demote_http_request_logs(logger_level, default_level, rust_log_env.as_deref()) {
+        if should_demote_target(HTTP_SERVER_LOG_TARGET, logger_level, default_level, rust_log_env.as_deref()) {
             // HTTP request logs are demoted to WARN to reduce volume in production,
             // but only when the effective log level is not stricter than WARN.
             directives.push((HTTP_SERVER_LOG_TARGET, LevelFilter::WARN));
         }
 
-        if should_demote_s3s_logs(logger_level, default_level, rust_log_env.as_deref()) {
-            // s3s instruments each authentication request through multiple
-            // nested INFO spans. Keep warnings and errors in normal production
-            // logs without promoting it when the effective base is stricter.
-            directives.push(("s3s", LevelFilter::WARN));
+        for target in S3_DEPENDENCY_TARGETS {
+            if should_demote_target(target, logger_level, default_level, rust_log_env.as_deref()) {
+                directives.push((target, LevelFilter::WARN));
+            }
         }
 
         for (crate_name, level) in directives {
@@ -292,6 +279,14 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
                 }
             }
         }
+    }
+
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    {
+        let directive = format!("{HYPER_HTTP2_CLIENT_TARGET}=debug")
+            .parse()
+            .expect("static Hyper HTTP/2 PING tracing directive must parse");
+        filter = filter.add_directive(directive);
     }
 
     filter
@@ -350,14 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn s3s_filter_blocks_credentials_despite_explicit_verbose_directives() {
+    fn s3_dependency_filter_blocks_verbose_events_despite_explicit_directives() {
         use tracing_subscriber::prelude::*;
         for directive in ["trace", concat!("trace,", "s3s::service=trace,", "s3s::ops::signature=debug")] {
             let writer = SharedWriter::default();
             let captured = Arc::clone(&writer.0);
             let subscriber = tracing_subscriber::registry()
                 .with(EnvFilter::new(directive))
-                .with(s3s_log_filter())
+                .with(s3_dependency_log_filter())
                 .with(
                     tracing_subscriber::fmt::layer()
                         .without_time()
@@ -371,6 +366,10 @@ mod tests {
                 tracing::debug!(target: "s3s::service", response = "secret-response", "response dump");
                 tracing::trace!(target: "s3s", response = "secret-trace", "response dump");
                 tracing::debug!(target: "s3s::ops::signature", expected = "secret-signature", "signature mismatch");
+                tracing::debug!(target: "rustfs_gateway::service", "secret-gateway-debug");
+                tracing::trace!(target: "rustfs_gateway", "secret-gateway-trace");
+                tracing::info!(target: "rustfs_gateway::service", "visible-gateway-info");
+                tracing::debug!(target: "rustfs_gateway_other", "visible-gateway-neighbor");
                 tracing::info!(target: "s3s::service", "visible-info");
                 tracing::warn!(target: "s3s::service", "visible-warning");
                 tracing::debug!(target: "rustfs", "visible-rustfs-debug");
@@ -380,6 +379,8 @@ mod tests {
             assert!(!output.contains("secret"), "{output}");
             for expected in [
                 "safe-operation-span",
+                "visible-gateway-info",
+                "visible-gateway-neighbor",
                 "visible-info",
                 "visible-warning",
                 "visible-rustfs-debug",
@@ -432,22 +433,29 @@ mod tests {
 
     #[test]
     fn test_should_demote_http_request_logs() {
-        assert!(should_demote_http_request_logs("info", None, None));
-        assert!(should_demote_http_request_logs("warn", None, None));
-        assert!(!should_demote_http_request_logs("error", None, None));
-        assert!(!should_demote_http_request_logs("off", None, None));
-        assert!(!should_demote_http_request_logs("info", None, Some("ERROR")));
-        assert!(should_demote_http_request_logs("error", None, Some("WARN")));
-        assert!(!should_demote_http_request_logs("info", None, Some("foo=warn")));
-        assert!(!should_demote_http_request_logs("info", None, Some("rustfs=error")));
-        assert!(!should_demote_http_request_logs("info", None, Some("rustfs::server=error")));
-        assert!(!should_demote_http_request_logs("info", None, Some(&http_log_directive("error"))));
-        assert!(!should_demote_http_request_logs(
+        assert!(should_demote_target(HTTP_SERVER_LOG_TARGET, "info", None, None));
+        assert!(should_demote_target(HTTP_SERVER_LOG_TARGET, "warn", None, None));
+        assert!(!should_demote_target(HTTP_SERVER_LOG_TARGET, "error", None, None));
+        assert!(!should_demote_target(HTTP_SERVER_LOG_TARGET, "off", None, None));
+        assert!(!should_demote_target(HTTP_SERVER_LOG_TARGET, "info", None, Some("ERROR")));
+        assert!(should_demote_target(HTTP_SERVER_LOG_TARGET, "error", None, Some("WARN")));
+        assert!(!should_demote_target(HTTP_SERVER_LOG_TARGET, "info", None, Some("foo=warn")));
+        assert!(!should_demote_target(HTTP_SERVER_LOG_TARGET, "info", None, Some("rustfs=error")));
+        assert!(!should_demote_target(HTTP_SERVER_LOG_TARGET, "info", None, Some("rustfs::server=error")));
+        assert!(!should_demote_target(
+            HTTP_SERVER_LOG_TARGET,
+            "info",
+            None,
+            Some(&http_log_directive("error"))
+        ));
+        assert!(!should_demote_target(
+            HTTP_SERVER_LOG_TARGET,
             "info",
             None,
             Some(&format!("WARN,{}", http_log_directive("error")))
         ));
-        assert!(should_demote_http_request_logs(
+        assert!(should_demote_target(
+            HTTP_SERVER_LOG_TARGET,
             "error",
             None,
             Some(&format!("WARN,{}", http_log_directive("warn")))
@@ -456,15 +464,15 @@ mod tests {
 
     #[test]
     fn test_should_demote_s3s_logs() {
-        assert!(should_demote_s3s_logs("info", None, None));
-        assert!(should_demote_s3s_logs("warn", None, None));
-        assert!(!should_demote_s3s_logs("error", None, None));
-        assert!(!should_demote_s3s_logs("off", None, None));
-        assert!(!should_demote_s3s_logs("info", None, Some("ERROR")));
-        assert!(should_demote_s3s_logs("error", None, Some("WARN")));
-        assert!(!should_demote_s3s_logs("info", None, Some("foo=warn")));
-        assert!(!should_demote_s3s_logs("info", None, Some("s3s=error")));
-        assert!(should_demote_s3s_logs("error", None, Some("WARN,s3s=warn")));
+        assert!(should_demote_target("s3s", "info", None, None));
+        assert!(should_demote_target("s3s", "warn", None, None));
+        assert!(!should_demote_target("s3s", "error", None, None));
+        assert!(!should_demote_target("s3s", "off", None, None));
+        assert!(!should_demote_target("s3s", "info", None, Some("ERROR")));
+        assert!(should_demote_target("s3s", "error", None, Some("WARN")));
+        assert!(!should_demote_target("s3s", "info", None, Some("foo=warn")));
+        assert!(!should_demote_target("s3s", "info", None, Some("s3s=error")));
+        assert!(should_demote_target("s3s", "error", None, Some("WARN,s3s=warn")));
     }
 
     #[test]
@@ -606,10 +614,14 @@ mod tests {
             let output = capture_with_filter(build_env_filter("info", None), || {
                 tracing::info!(target: "s3s::auth", "s3s info must be suppressed");
                 tracing::warn!(target: "s3s::auth", "s3s warning must remain");
+                tracing::info!(target: "rustfs_gateway::service", "gateway info must be suppressed");
+                tracing::warn!(target: "rustfs_gateway::service", "gateway warning must remain");
             });
 
             assert!(!output.contains("s3s info must be suppressed"), "{output}");
             assert!(output.contains("s3s warning must remain"), "{output}");
+            assert!(!output.contains("gateway info must be suppressed"), "{output}");
+            assert!(output.contains("gateway warning must remain"), "{output}");
         });
     }
 

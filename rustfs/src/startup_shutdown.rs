@@ -225,7 +225,7 @@ where
         Ok(()) => true,
         Err(error) => error
             .get_ref()
-            .and_then(|error| error.downcast_ref::<MaintenanceShutdownFailure>())
+            .and_then(|error| error.downcast_ref::<CatalogShutdownFailure>())
             .is_some_and(|failure| failure.joined),
     };
     if !maintenance_retired || !front_result.producers_retired() {
@@ -380,13 +380,13 @@ impl CapacityShutdownReport {
 }
 
 #[derive(Debug)]
-struct MaintenanceShutdownFailure {
+struct CatalogShutdownFailure {
     timed_out: bool,
     joined: bool,
     join_error: Option<tokio::task::JoinError>,
 }
 
-impl std::fmt::Display for MaintenanceShutdownFailure {
+impl std::fmt::Display for CatalogShutdownFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match &self.join_error {
             Some(error) => join_failure_reason(error),
@@ -394,21 +394,21 @@ impl std::fmt::Display for MaintenanceShutdownFailure {
             None => "actual join unconfirmed",
         };
         if self.timed_out {
-            write!(f, "maintenance shutdown exceeded its original deadline: {reason}")
+            write!(f, "catalog background shutdown exceeded its original deadline: {reason}")
         } else {
-            write!(f, "maintenance shutdown failed: {reason}")
+            write!(f, "catalog background shutdown failed: {reason}")
         }
     }
 }
 
-impl std::error::Error for MaintenanceShutdownFailure {
+impl std::error::Error for CatalogShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.join_error.as_ref().map(|error| error as _)
     }
 }
 
-pub(crate) async fn stop_table_maintenance(
-    runtime: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
+pub(crate) async fn stop_catalog_background_task(
+    runtime: Option<crate::table_catalog::CatalogBackgroundTask>,
 ) -> std::io::Result<()> {
     let Some(mut runtime) = runtime else {
         return Ok(());
@@ -434,7 +434,7 @@ pub(crate) async fn stop_table_maintenance(
         } else {
             std::io::ErrorKind::Other
         },
-        MaintenanceShutdownFailure {
+        CatalogShutdownFailure {
             timed_out,
             joined: observed_join.is_some(),
             join_error: observed_join.and_then(std::result::Result::err),
@@ -629,7 +629,10 @@ pub(crate) struct StartupShutdownServices {
     #[cfg(feature = "internode-transport")]
     pub(crate) peer_control: Option<std::sync::Arc<crate::storage_api::startup::storage::InstalledControlService>>,
     pub(crate) capacity: Option<CapacityBackgroundTasks>,
+    pub(crate) table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
     pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
+    pub(crate) scanner_cleanup: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) store: std::sync::Arc<crate::storage_api::startup::storage::ECStore>,
 }
 
 pub(crate) async fn run_startup_shutdown_sequence(
@@ -646,6 +649,9 @@ pub(crate) async fn run_startup_shutdown_sequence(
         peer_control,
         capacity: capacity_tasks,
         table_maintenance,
+        scanner_cleanup,
+        store,
+        table_rename_recovery,
     } = background_tasks;
     ctx.cancel();
 
@@ -847,16 +853,46 @@ pub(crate) async fn run_startup_shutdown_sequence(
     )
     .await;
     let front_result = front_failures;
-    let maintenance_result = stop_table_maintenance(table_maintenance).await;
+    let (maintenance_result, recovery_result) = tokio::join!(
+        stop_catalog_background_task(table_maintenance),
+        stop_catalog_background_task(table_rename_recovery),
+    );
+    let maintenance_result = maintenance_result.and(recovery_result);
+    let scanner_stopped = match scanner_cleanup {
+        Some(cleanup) => crate::startup_lifecycle::wait_for_scanner_cleanup(cleanup).await,
+        None => true,
+    };
     // Unknown front leaves cannot authorize the downstream fence. A retired HTTP
     // scope may finish cleanup after a late/failed receipt, while its marker stays dirty.
     finish_detached_mutations_and_clear_unclean_shutdown_markers(
-        heal_handoff_complete && capacity_report.allows_marker_clear(),
+        heal_handoff_complete && scanner_stopped && capacity_report.allows_marker_clear(),
         &maintenance_result,
         &front_result,
         DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
         wait_for_detached_mutations,
-        rustfs_heal::heal::clear_unclean_shutdown_markers(),
+        async {
+            if rustfs_utils::get_env_bool(rustfs_config::ENV_SCANNER_READ_ONLY_HANDOFF, false)
+                && store.scanner_namespace_mutation_generation() == 0
+                && rustfs_scanner::scanner_process_was_read_only()
+            {
+                let owner = rustfs_common::get_global_local_node_name().await;
+                if let Err(error) =
+                    rustfs_heal::heal::save_read_only_scanner_handoff(&owner, rustfs_scanner::scanner_checkpoint_instance_id())
+                        .await
+                {
+                    warn!(
+                        event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                        component = LOG_COMPONENT_MAIN,
+                        subsystem = LOG_SUBSYSTEM_STARTUP,
+                        state = "scanner_handoff_failed",
+                        error = %error,
+                        "Scanner shutdown receipt was not saved"
+                    );
+                }
+            } else {
+                rustfs_heal::heal::clear_unclean_shutdown_markers().await;
+            }
+        },
     )
     .await;
     state_manager.update(ServiceState::Stopped);
@@ -933,7 +969,15 @@ pub(crate) fn signal_embedded_startup_shutdown(shutdown_handle: &ShutdownHandle,
     ctx.cancel();
 }
 
-async fn release_embedded_runtime_after_drain(mut runtime_owner: Option<EmbeddedRuntimeOwner>) {
+async fn release_embedded_runtime_after_drain(
+    mut runtime_owner: Option<EmbeddedRuntimeOwner>,
+    table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
+) {
+    if let Err(error) = stop_catalog_background_task(table_rename_recovery).await {
+        warn!(component = LOG_COMPONENT_EMBEDDED, subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED, service = "table_rename_recovery", error = %error,
+            "Embedded shutdown cleanup failed");
+    }
     if let Some(runtime_owner) = runtime_owner.as_mut()
         && let Some(cleanup) = runtime_owner.release()
     {
@@ -947,6 +991,7 @@ pub(crate) fn run_embedded_server_drop_cleanup(
     shutdown_handle: &mut Option<ShutdownHandle>,
     temp_dir: &mut Option<PathBuf>,
     runtime_owner: Option<EmbeddedRuntimeOwner>,
+    table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
 ) {
     ctx.cancel();
     if let Some(shutdown_handle) = shutdown_handle.as_ref() {
@@ -958,7 +1003,7 @@ pub(crate) fn run_embedded_server_drop_cleanup(
     runtime.spawn(finish_embedded_server_cleanup(
         shutdown_handle,
         temp_dir,
-        release_embedded_runtime_after_drain(runtime_owner),
+        release_embedded_runtime_after_drain(runtime_owner, table_rename_recovery),
     ));
 }
 
@@ -993,6 +1038,7 @@ pub(crate) async fn run_embedded_server_shutdown(
     shutdown_handle: &mut Option<ShutdownHandle>,
     temp_dir: &mut Option<PathBuf>,
     runtime_owner: Option<EmbeddedRuntimeOwner>,
+    table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
 ) {
     info!(
         target: "rustfs::embedded",
@@ -1012,7 +1058,7 @@ pub(crate) async fn run_embedded_server_shutdown(
     let cleanup_task = runtime.spawn(finish_embedded_server_cleanup(
         shutdown_handle.take(),
         temp_dir.take(),
-        release_embedded_runtime_after_drain(runtime_owner),
+        release_embedded_runtime_after_drain(runtime_owner, table_rename_recovery),
     ));
     if let Err(err) = cleanup_task.await {
         warn!(
@@ -1322,17 +1368,17 @@ mod tests {
         let task = tokio::spawn(async { panic!("expected maintenance marker fixture failure") });
         let join_error = task.await.expect_err("actual task should fail");
         for failure in [
-            super::MaintenanceShutdownFailure {
+            super::CatalogShutdownFailure {
                 timed_out: true,
                 joined: true,
                 join_error: None,
             },
-            super::MaintenanceShutdownFailure {
+            super::CatalogShutdownFailure {
                 timed_out: false,
                 joined: false,
                 join_error: None,
             },
-            super::MaintenanceShutdownFailure {
+            super::CatalogShutdownFailure {
                 timed_out: false,
                 joined: true,
                 join_error: Some(join_error),
@@ -1480,18 +1526,32 @@ mod tests {
         let temp_path = temp_dir.path().to_path_buf();
         let mut owned_temp_path = Some(temp_path.clone());
 
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (draining_tx, draining_rx) = tokio::sync::oneshot::channel();
+        let recovery = crate::table_catalog::CatalogBackgroundTask::start(&cancel_token, |stop| async move {
+            stop.cancelled().await;
+            let _ = draining_tx.send(());
+            let _ = release_rx.await;
+        });
         run_embedded_server_drop_cleanup(
             &tokio::runtime::Handle::current(),
             &cancel_token,
             &mut shutdown_handle,
             &mut owned_temp_path,
             None,
+            Some(recovery),
         );
 
         tokio::time::timeout(Duration::from_secs(1), observed_rx)
             .await
             .expect("drop cleanup should signal shutdown")
             .expect("shutdown signal should be delivered");
+        tokio::time::timeout(Duration::from_secs(1), draining_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(temp_path.exists(), "catalog publications retain the storage directory until drained");
+        release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while temp_path.exists() {
                 tokio::task::yield_now().await;

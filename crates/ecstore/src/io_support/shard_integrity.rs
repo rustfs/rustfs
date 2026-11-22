@@ -40,6 +40,7 @@ pub(crate) struct IntegrityBuilder {
     part: PartIntegrity,
     rows: Vec<u8>,
     spill: Option<tokio::fs::File>,
+    prepared: Option<Box<PreparedIntegrity>>,
 }
 
 impl IntegrityBuilder {
@@ -48,6 +49,7 @@ impl IntegrityBuilder {
             part: PartIntegrity::new(layout, number).map_err(|_| corrupt())?,
             rows: Vec::new(),
             spill: None,
+            prepared: None,
         })
     }
 
@@ -100,28 +102,47 @@ impl IntegrityBuilder {
         Ok(())
     }
 
-    async fn into_spool(self) -> io::Result<Spool> {
-        if let Some(mut file) = self.spill {
-            file.write_all(&self.rows).await?;
+    async fn take_spool(&mut self) -> io::Result<Spool> {
+        let rows = std::mem::take(&mut self.rows);
+        if let Some(mut file) = self.spill.take() {
+            file.write_all(&rows).await?;
             file.flush().await?;
             Ok(Spool::File(file.into_std().await))
         } else {
-            Ok(Spool::Memory(self.rows))
+            Ok(Spool::Memory(rows))
+        }
+    }
+
+    pub(crate) async fn prepare(&mut self, size: usize) -> io::Result<&mut PreparedIntegrity> {
+        if self.prepared.is_none() {
+            self.part.size = size.try_into().map_err(|_| corrupt())?;
+            self.part.validate().map_err(|_| corrupt())?;
+            let part = self.part.clone();
+            let rows = self.take_spool().await?;
+            let prepared = if part.stripes < 16 {
+                build_index(part, rows)?
+            } else {
+                tokio::task::spawn_blocking(move || build_index(part, rows))
+                    .await
+                    .map_err(io::Error::other)??
+            };
+            self.prepared = Some(Box::new(prepared));
+        }
+        self.prepared.as_deref_mut().ok_or_else(corrupt)
+    }
+
+    pub(crate) fn set_prewritten_disks(&mut self, prewritten_disks: Vec<bool>) {
+        if let Some(prepared) = self.prepared.as_deref_mut() {
+            prepared.set_prewritten_disks(prewritten_disks);
         }
     }
 
     pub(crate) async fn finish(mut self, size: usize) -> io::Result<PreparedIntegrity> {
-        self.part.size = size.try_into().map_err(|_| corrupt())?;
-        self.part.validate().map_err(|_| corrupt())?;
-        let part = self.part.clone();
-        let rows = self.into_spool().await?;
-        if part.stripes < 16 {
-            build_index(part, rows)
-        } else {
-            tokio::task::spawn_blocking(move || build_index(part, rows))
-                .await
-                .map_err(io::Error::other)?
+        if let Some(prepared) = self.prepared {
+            return Ok(*prepared);
         }
+        self.prepare(size).await?;
+        self.prepared.map(|p| *p).ok_or_else(corrupt)
     }
 }
 
@@ -213,12 +234,17 @@ fn build_index(mut part: PartIntegrity, mut rows: Spool) -> io::Result<PreparedI
             position >>= 1;
         }
     }
-    Ok(PreparedIntegrity { part, index })
+    Ok(PreparedIntegrity {
+        part,
+        index,
+        prewritten_disks: Vec::new(),
+    })
 }
 
 pub(crate) struct PreparedIntegrity {
     pub(crate) part: PartIntegrity,
     index: Spool,
+    prewritten_disks: Vec<bool>,
 }
 
 impl PreparedIntegrity {
@@ -227,16 +253,30 @@ impl PreparedIntegrity {
             part: proof.part.clone(),
             rows: proof.part.index_header().to_vec(),
             spill: None,
+            prepared: None,
         };
         for stripe in 0..proof.part.stripes {
             builder.append(&proof.record(stripe).await?).await?;
         }
-        let index = builder.into_spool().await?;
+        let index = builder.take_spool().await?;
         Ok(Self {
             part: proof.part.clone(),
             index,
+            prewritten_disks: Vec::new(),
         })
     }
+
+    pub(crate) fn memory_bytes(&self) -> Option<Bytes> {
+        match &self.index {
+            Spool::Memory(bytes) => Some(Bytes::copy_from_slice(bytes)),
+            Spool::File(_) => None,
+        }
+    }
+
+    pub(crate) fn set_prewritten_disks(&mut self, prewritten_disks: Vec<bool>) {
+        self.prewritten_disks = prewritten_disks;
+    }
+
     pub(crate) fn inline_bytes(&self) -> io::Result<Bytes> {
         match &self.index {
             Spool::Memory(bytes) if bytes.len() <= MAX_INLINE_PROOF_BYTES => Ok(Bytes::copy_from_slice(bytes)),
@@ -267,11 +307,23 @@ impl PreparedIntegrity {
         let path = format!("{directory}/{}", self.part.file_name());
         let mut file = match self.index {
             Spool::Memory(bytes) => {
+                if disks
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, disk)| disk.is_none() || self.prewritten_disks.get(idx).copied().unwrap_or(false))
+                {
+                    return Ok(self.part);
+                }
                 let payload = Bytes::from(bytes);
-                futures::future::join_all(disks.iter_mut().map(|disk_opt| {
+                let prewritten_disks = &self.prewritten_disks;
+                futures::future::join_all(disks.iter_mut().enumerate().map(|(idx, disk_opt)| {
                     let path = &path;
                     let payload = payload.clone();
+                    let already_written = prewritten_disks.get(idx).copied().unwrap_or(false);
                     async move {
+                        if already_written {
+                            return;
+                        }
                         let Some(disk) = disk_opt.as_ref() else {
                             return;
                         };

@@ -217,7 +217,7 @@ mod tests {
 
         // Create an invalid JWT to generate a JWT error
         let invalid_token = "invalid.jwt.token";
-        let key = DecodingKey::from_secret(b"secret");
+        let key = DecodingKey::from_secret(b"secret").expect("construct test JWT key");
         let validation = Validation::new(Algorithm::HS256);
 
         let jwt_result = decode::<Claims>(invalid_token, &key, &validation);

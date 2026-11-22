@@ -27,12 +27,11 @@ documentation = "https://docs.rs/rustfs-replication/latest/rustfs_replication/"
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath", "hotpath/tokio"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath = []
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
 
 [dependencies]
-hotpath.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 byteorder.workspace = true
 regex.workspace = true

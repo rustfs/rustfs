@@ -614,7 +614,7 @@ fn veeam_sosapi_http_contract() {
     crate::app::gating_test_env::run_large_stack_test("veeam-sosapi-http", || async {
         temp_env::async_with_vars([(rustfs_config::ENV_VEEAM_SOSAPI_ENABLE, None::<&str>)], async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
-            use crate::app::storage_api::s3::{Body, S3ServiceBuilder, SimpleAuth};
+            use std::time::Duration;
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
             use crate::app::storage_api::test::contract::list::ListOperations as _;
             use crate::app::storage_api::test::contract::object::ObjectOperations as _;
@@ -626,17 +626,18 @@ fn veeam_sosapi_http_contract() {
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
-            assert!(slot.install(context));
-            let fs = super::super::FS::with_server_ctx(slot);
-            let owner = S3ServiceBuilder::new(fs.clone()).build();
-            let mut anonymous_builder = S3ServiceBuilder::new(fs.clone());
-            anonymous_builder.set_auth(SimpleAuth::from_single("test-access", "test-secret"));
-            anonymous_builder.set_access(fs.clone());
-            let anonymous = anonymous_builder.build();
-            let mut bad_auth_builder = S3ServiceBuilder::new(fs.clone());
-            bad_auth_builder.set_auth(SimpleAuth::from_single("test-access", "test-secret"));
-            bad_auth_builder.set_access(fs);
-            let bad_auth = bad_auth_builder.build();
+            assert!(slot.install(Arc::clone(&context)));
+            let gateway = crate::server::gateway_stack::TestGateway::over(&context, slot);
+            struct Owner<'a>(&'a crate::server::gateway_stack::TestGateway);
+            impl Owner<'_> {
+                async fn call(
+                    &self,
+                    (method, uri, headers, body): (Method, String, Vec<(&'static str, String)>, Bytes),
+                ) -> Result<http::Response<rustfs_gateway::Body>, std::convert::Infallible> {
+                    self.0.signed(method, &uri, headers, body).await
+                }
+            }
+            let owner = Owner(&gateway);
 
             let bucket = format!("veeam-sosapi-{}", super::super::Uuid::new_v4());
             store
@@ -644,19 +645,8 @@ fn veeam_sosapi_http_contract() {
                 .await
                 .expect("create sosapi bucket");
 
-            let owner_call = |method: Method, uri: String, headers: Vec<(&str, String)>, body: Bytes| {
-                let mut builder = http::Request::builder().method(method).uri(uri).header("host", "localhost");
-                for (name, value) in headers {
-                    builder = builder.header(name, value);
-                }
-                builder
-                    .extension(crate::storage::access::ReqInfo {
-                        cred: Some(rustfs_credentials::Credentials::default()),
-                        is_owner: true,
-                        ..Default::default()
-                    })
-                    .body(Body::from(body))
-                    .expect("HTTP request")
+            let owner_call = |method: Method, uri: String, headers: Vec<(&'static str, String)>, body: Bytes| {
+                (method, uri, headers, body)
             };
 
             let system_uri = format!("/{bucket}/{SYSTEM_KEY}");
@@ -1143,17 +1133,16 @@ fn veeam_sosapi_http_contract() {
                 .expect("list versions");
             assert!(versions.objects.is_empty());
 
-            let anon = anonymous
+            let anon = gateway
                 .call(
                     http::Request::builder()
                         .method(Method::GET)
                         .uri(system_uri.clone())
                         .header("host", "localhost")
-                        .body(Body::empty())
+                        .body(rustfs_gateway::Body::empty())
                         .expect("anon request"),
                 )
-                .await
-                .expect("anonymous GET");
+                .await;
             let anon_status = anon.status();
             let anon_body = BodyExt::collect(anon.into_body()).await.expect("anon body").to_bytes();
             let anon_xml = String::from_utf8_lossy(&anon_body);
@@ -1163,7 +1152,7 @@ fn veeam_sosapi_http_contract() {
             let now = OffsetDateTime::now_utc();
             let scope_date = format!("{:04}{:02}{:02}", now.year(), u8::from(now.month()), now.day());
             let amz_date = format!("{scope_date}T{:02}{:02}{:02}Z", now.hour(), now.minute(), now.second());
-            let bad = bad_auth
+            let bad = gateway
                 .call(
                     http::Request::builder()
                         .method(Method::GET)
@@ -1177,11 +1166,10 @@ fn veeam_sosapi_http_contract() {
                                 "AWS4-HMAC-SHA256 Credential=bad/{scope_date}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
                             ),
                         )
-                        .body(Body::empty())
+                        .body(rustfs_gateway::Body::empty())
                         .expect("bad auth request"),
                 )
-                .await
-                .expect("bad auth GET");
+                .await;
             let bad_status = bad.status();
             let bad_body = BodyExt::collect(bad.into_body()).await.expect("bad body").to_bytes();
             let bad_xml = String::from_utf8_lossy(&bad_body);

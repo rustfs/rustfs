@@ -32,7 +32,7 @@
 //! `odm-source-etag`.
 
 use super::*;
-use crate::app::storage_api::s3::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 
 use crate::app::storage_api::multipart_usecase::contract::multipart::CompletePart;
 use crate::on_demand_migration::{
@@ -308,7 +308,6 @@ mod tests {
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
     use crate::on_demand_migration::{PullFailureReason, SourceSse};
-    use http::Method;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
@@ -426,9 +425,7 @@ mod tests {
             .key(key.to_string())
             .build()
             .expect("GET input must build");
-        let req = build_request(input, Method::GET);
-        let mut response = DefaultObjectUsecase::from_global()
-            .execute_get_object(req)
+        let mut response = crate::app::test_seams::get_object_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect("app-layer GET must succeed");
         let mut body = response.output.body.take().expect("GET response must include a body");

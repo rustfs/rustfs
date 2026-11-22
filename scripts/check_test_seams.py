@@ -48,12 +48,14 @@ class Seam:
     seam_file: str
     owners: tuple[str, ...]  # files that own the operation; each must exist
     owner_dirs: tuple[str, ...] = ()  # directories a split of an owner file may create
+    entry_method: str | None = None  # a raw-fields body shared by both production edges
 
 
 SEAMS = {
     "execute_get_object": Seam(
         batch="C",
         seam_file="rustfs/src/app/test_seams/get_object.rs",
+        entry_method="execute_get_object_fields",
         owners=(
             "rustfs/src/app/object/get.rs",
             "rustfs/src/app/object/head.rs",
@@ -64,6 +66,7 @@ SEAMS = {
     "execute_head_object": Seam(
         batch="C",
         seam_file="rustfs/src/app/test_seams/head_object.rs",
+        entry_method="execute_head_object_fields",
         owners=(
             "rustfs/src/app/object/get.rs",
             "rustfs/src/app/object/head.rs",
@@ -76,19 +79,22 @@ SEAMS = {
         # P2 splits bucket_usecase.rs into bucket_usecase/*.rs; narrow this to the listing file once it exists.
         owner_dirs=("rustfs/src/app/bucket_usecase/",),
     ),
-    "execute_put_object": Seam(
+    "execute_put_object_owned": Seam(
         batch="D",
         seam_file="rustfs/src/app/test_seams/put_object.rs",
         owners=(
             "rustfs/src/app/object/put.rs",
             "rustfs/src/app/lifecycle_transition_api_test/put.rs",
         ),
+        # PostObject reaches the PutObject use case; its body tests are PutObject's own.
+        owner_dirs=("rustfs/src/app/object/post_body/",),
     ),
 }
 
 CFG_TEST = re.compile(r"#!?\[\s*cfg\s*\(\s*(?:all\s*\(\s*)?test\b")
 TEST_ATTR = re.compile(r"#\[\s*(?:tokio::)?test\b")
-CALL = re.compile(r"\.\s*(execute_get_object|execute_head_object|execute_list_objects_v2|execute_put_object)\s*\(")
+METHOD_SEAMS = {name: seam for method, seam in SEAMS.items() for name in {method, seam.entry_method or method}}
+CALL = re.compile(r"\.\s*(" + "|".join(re.escape(name) for name in sorted(METHOD_SEAMS)) + r")\s*\(")
 CHAR_LITERAL = re.compile(r"'(?:\\(?:[nrt\\0'\"]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\})|[^\\'\n])'")
 RAW_STRING = re.compile(r'b?r(#*)"')
 
@@ -328,9 +334,12 @@ def check(root: Path, files: list[str] | None = None) -> list[str]:
         else:
             text = seam_path.read_text()
             mask = code_mask(text)
-            calls = [m for m in CALL.finditer(text) if mask[m.start()] and m.group(1) == method]
+            entry = seam.entry_method or method
+            calls = [m for m in CALL.finditer(text) if mask[m.start()] and m.group(1) == entry]
             if len(calls) != 1:
-                errors.append(f"{seam.seam_file}: must call {method} exactly once, found {len(calls)}")
+                errors.append(f"{seam.seam_file}: must call {entry} exactly once, found {len(calls)}")
+            if entry != method and any(mask[m.start()] and m.group(1) == method for m in CALL.finditer(text)):
+                errors.append(f"{seam.seam_file}: must not call {method}; call {entry} instead")
         for owner in seam.owners:
             if not (root / owner).is_file():
                 errors.append(f"{owner}: owner file of {method} is missing; update SEAMS in {Path(__file__).name}")
@@ -347,7 +356,7 @@ def check(root: Path, files: list[str] | None = None) -> list[str]:
         regions = test_regions(text, mask)
         for match in calls:
             method = match.group(1)
-            seam = SEAMS[method]
+            seam = METHOD_SEAMS[method]
             if path == seam.seam_file or path in seam.owners or path.startswith(seam.owner_dirs or ("\0",)):
                 continue
             if whole_file or any(start <= match.start() < end for start, end in regions):
@@ -386,10 +395,10 @@ def main(argv: list[str]) -> int:
 
 
 SEAM_BODY = {
-    "execute_get_object": "pub(crate) fn get_object(u: &U, r: R) -> F { u.execute_get_object(r) }\n",
-    "execute_head_object": "pub(crate) fn head_object(u: &U, r: R) -> F { u.execute_head_object(r) }\n",
+    "execute_get_object": "pub(crate) fn get_object(u: &U, r: R) -> F { u.execute_get_object_fields(r) }\n",
+    "execute_head_object": "pub(crate) fn head_object(u: &U, r: R) -> F { u.execute_head_object_fields(r) }\n",
     "execute_list_objects_v2": "pub(crate) fn list_objects_v2(u: &U, r: R) -> F { u.execute_list_objects_v2(r) }\n",
-    "execute_put_object": "pub(crate) fn put_object(u: &U, f: &Fs, r: R) -> F { u.execute_put_object(f, r) }\n",
+    "execute_put_object_owned": "pub(crate) fn put_object(u: &U, f: &Fs, r: R) -> F { u.execute_put_object_owned(f, r) }\n",
 }
 
 
@@ -426,6 +435,64 @@ class SelfTest(unittest.TestCase):
     def run_check(self) -> list[str]:
         return check(self.root, sorted(p for p in self.files if p.endswith(".rs")))
 
+    def test_external_get_fields_call_fails(self):
+        self.write("rustfs/src/app/storage.rs", "#[cfg(test)] fn t() { u.execute_get_object_fields(r); }")
+        self.assertRegex(" ".join(self.run_check()), "test calls execute_get_object_fields directly")
+
+    def test_get_fields_seam_missing_call_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() {}")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 0")
+
+    def test_get_fields_seam_duplicate_call_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() { u.execute_get_object_fields(r); u.execute_get_object_fields(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 2")
+
+    def test_get_seam_wrapper_instead_of_fields_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() { u.execute_get_object(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 0")
+
+    def test_get_seam_both_entries_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() { u.execute_get_object_fields(r); u.execute_get_object(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must not call execute_get_object")
+
+    def test_commented_and_quoted_get_fields_calls_do_not_count(self):
+        self.write(SEAMS["execute_get_object"].seam_file, 'fn get_object() { let s = "u.execute_get_object_fields(r)"; /* u.execute_get_object_fields(r); */ }')
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 0")
+
+    def test_get_owners_can_call_both_entries(self):
+        self.write("rustfs/src/app/object/get.rs", "#[cfg(test)] fn t() { u.execute_get_object(r); u.execute_get_object_fields(r); }")
+        self.assertEqual(self.run_check(), [])
+
+    # -- negative cases: each must fail --
+
+    def test_external_head_fields_call_fails(self):
+        self.write("rustfs/src/app/storage.rs", "#[cfg(test)] fn t() { u.execute_head_object_fields(r); }")
+        self.assertRegex(" ".join(self.run_check()), "test calls execute_head_object_fields directly")
+
+    def test_head_fields_seam_missing_call_fails(self):
+        self.write(SEAMS["execute_head_object"].seam_file, "fn head_object() {}")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_head_object_fields exactly once, found 0")
+
+    def test_head_fields_seam_duplicate_call_fails(self):
+        self.write(SEAMS["execute_head_object"].seam_file, "fn head_object() { u.execute_head_object_fields(r); u.execute_head_object_fields(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_head_object_fields exactly once, found 2")
+
+    def test_head_seam_wrapper_instead_of_fields_fails(self):
+        self.write(SEAMS["execute_head_object"].seam_file, "fn head_object() { u.execute_head_object(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_head_object_fields exactly once, found 0")
+
+    def test_head_seam_both_entries_fails(self):
+        self.write(SEAMS["execute_head_object"].seam_file, "fn head_object() { u.execute_head_object_fields(r); u.execute_head_object(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must not call execute_head_object")
+
+    def test_commented_and_quoted_head_fields_calls_do_not_count(self):
+        self.write(SEAMS["execute_head_object"].seam_file, 'fn head_object() { let s = "u.execute_head_object_fields(r)"; /* u.execute_head_object_fields(r); */ }')
+        self.assertRegex(" ".join(self.run_check()), "must call execute_head_object_fields exactly once, found 0")
+
+    def test_head_owners_can_call_both_entries(self):
+        self.write("rustfs/src/app/object/head.rs", "#[cfg(test)] fn t() { u.execute_head_object(r); u.execute_head_object_fields(r); }")
+        self.assertEqual(self.run_check(), [])
+
     # -- negative cases: each must fail --
 
     def test_direct_call_in_cfg_test_module_of_non_owner_fails(self):
@@ -441,7 +508,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(len(self.run_check()), 1)
 
     def test_file_declared_under_cfg_test_fails(self):
-        self.write("rustfs/src/app/gating_test.rs", "fn t() { u.execute_put_object(&fs, r); }\n")
+        self.write("rustfs/src/app/gating_test.rs", "fn t() { u.execute_put_object_owned(&fs, r); }\n")
         self.assertEqual(len(self.run_check()), 1)
 
     def test_file_whose_ancestor_is_cfg_test_fails(self):
@@ -450,7 +517,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(len(self.run_check()), 1)
 
     def test_put_from_non_owner_lifecycle_file_fails(self):
-        self.write("rustfs/src/app/lifecycle_transition_api_test/delete.rs", "#[test]\nfn t() { u.execute_put_object(&fs, r); }\n")
+        self.write("rustfs/src/app/lifecycle_transition_api_test/delete.rs", "#[test]\nfn t() { u.execute_put_object_owned(&fs, r); }\n")
         self.write("rustfs/src/app/mod.rs", self.files["rustfs/src/app/mod.rs"].replace("mod lifecycle", "#[cfg(test)]\nmod lifecycle"))
         self.assertEqual(len(self.run_check()), 1)
 
@@ -468,14 +535,14 @@ class SelfTest(unittest.TestCase):
         self.assertRegex(" ".join(self.run_check()), "seam for execute_get_object is missing")
 
     def test_seam_that_stopped_wrapping_fails(self):
-        self.write(SEAMS["execute_put_object"].seam_file, "pub(crate) fn put_object() { todo!() }\n")
-        self.assertRegex(" ".join(self.run_check()), "must call execute_put_object exactly once, found 0")
+        self.write(SEAMS["execute_put_object_owned"].seam_file, "pub(crate) fn put_object() { todo!() }\n")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_put_object_owned exactly once, found 0")
 
     def test_missing_owner_file_fails(self):
-        owner = SEAMS["execute_put_object"].owners[0]
+        owner = SEAMS["execute_put_object_owned"].owners[0]
         (self.root / owner).unlink()
         del self.files[owner]
-        self.assertRegex(" ".join(self.run_check()), "owner file of execute_put_object is missing")
+        self.assertRegex(" ".join(self.run_check()), "owner file of execute_put_object_owned is missing")
 
     def test_undeclared_file_with_direct_call_fails_loudly(self):
         self.write("rustfs/src/app/orphan.rs", "fn t() { u.execute_get_object(r); }\n")
@@ -496,7 +563,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(self.run_check(), [])
 
     def test_owner_test_and_production_calls_pass(self):
-        self.write("rustfs/src/app/object/put.rs", "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() { u.execute_put_object(&fs, r); }\n}\n")
+        self.write("rustfs/src/app/object/put.rs", "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() { u.execute_put_object_owned(&fs, r); }\n}\n")
         self.assertEqual(self.run_check(), [])
 
     def path_module(self, attributes: str = "", body: str = "fn prod() { u.execute_get_object(r); }\n"):

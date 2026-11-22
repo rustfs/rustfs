@@ -17,6 +17,7 @@ use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
+use crate::storage_api_contracts::multipart::MultipartOwner;
 use crate::storage_api_contracts::object::ObjectOperations as _;
 use futures::{StreamExt, stream};
 use rustfs_utils::path::encode_dir_object_ref;
@@ -845,6 +846,95 @@ impl ECStore {
         .await
     }
 
+    /// Observe active upload metadata and its recorded owner from the same storage snapshot.
+    ///
+    /// A missing or inconsistent recorded owner is returned as `None`. This observation
+    /// does not reserve the upload or authorize a later write. The lookup is read-only;
+    /// cancellation leaves storage unchanged, and callers may retry.
+    ///
+    /// The caller must retain any supplied lifecycle guard. With `opts.no_lock`, the
+    /// caller is responsible for the upload lock normally held during the observation.
+    ///
+    /// # Errors
+    /// Preserves argument, bucket lifetime, access, lock, I/O and quorum errors from
+    /// the ordinary active-upload lookup.
+    pub async fn lookup_multipart_part_binding(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(MultipartInfo, Option<MultipartOwner>)> {
+        check_list_parts_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        // Lock order: bucket lifecycle before the selected set's upload lock.
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        if self.single_pool() {
+            return self.pools[0]
+                .get_disks_by_key(object)
+                .lookup_multipart_part_binding(bucket, object, upload_id, &opts)
+                .await;
+        }
+
+        for pool_idx in self.existing_multipart_pool_order().await {
+            match self.pools[pool_idx]
+                .get_disks_by_key(object)
+                .lookup_multipart_part_binding(bucket, object, upload_id, &opts)
+                .await
+            {
+                Ok(binding) => return Ok(binding),
+                Err(err) if is_err_invalid_upload_id(&err) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    }
+
+    /// Observe an upload's original namespace without recovering or acknowledging it.
+    ///
+    /// Only ordinary active metadata is returned for application preflight. This
+    /// observation grants no right to publish; completion revalidates under its locks.
+    /// Cancellation leaves storage unchanged, and callers may retry this lookup.
+    ///
+    /// # Errors
+    /// Preserves argument, bucket lifetime, access, I/O and quorum errors. Fallback
+    /// discovery runs only after every ordinary probe reports InvalidUploadID.
+    pub async fn lookup_multipart_completion_binding(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<Option<crate::object_api::MultipartCompletionBinding>> {
+        check_list_parts_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let order = if self.single_pool() {
+            vec![0]
+        } else {
+            self.existing_multipart_pool_order().await
+        };
+        for &index in &order {
+            match self.pools[index].get_multipart_info(bucket, object, upload_id, &opts).await {
+                Ok(info) => return Ok(Some(crate::object_api::MultipartCompletionBinding::active(info))),
+                Err(error) if is_err_invalid_upload_id(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for index in order {
+            if let Some(binding) = self.pools[index]
+                .get_disks_by_key(object)
+                .lookup_recorded_multipart_completion(bucket, object, upload_id, &opts)
+                .await?
+            {
+                return Ok(Some(binding));
+            }
+        }
+        Ok(None)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_get_multipart_info(
         &self,
@@ -922,7 +1012,8 @@ impl ECStore {
         bucket_lifecycle_guard: Option<super::BucketIncarnationFenceGuard>,
     ) -> Result<()> {
         let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
-        if self.ctx.lock_manager().is_disabled() {
+        // Without upload metadata this path has no recorded owner to authorize.
+        if opts.multipart_abort_authorization.is_some() || self.ctx.lock_manager().is_disabled() {
             return Err(invalid_upload());
         }
         let Some(bucket_lifecycle_guard) = bucket_lifecycle_guard else {
@@ -1207,6 +1298,7 @@ impl ECStore {
         lookup_opts.no_lock = true;
         let oi = if require_all_pools {
             lookup_opts.metadata_cache_safe = false;
+            lookup_opts.metadata_cache_fence_proof = None;
             lookup_opts.suppress_read_repair = true;
             // Only completion uses this branch, after validating bucket and object.
             let encoded_object = encode_dir_object_ref(object);
@@ -1576,6 +1668,62 @@ mod tests {
                 .await
                 .expect("old bucket incarnations must not affect placement")
         );
+
+        let directory = "binding directory/";
+        let encoded = encode_dir_object(directory);
+        let upload = store.pools[1]
+            .new_multipart_upload(bucket, &encoded, &opts)
+            .await
+            .expect("create directory upload in second pool");
+        let object_lock = store
+            .handle_new_ns_lock(bucket, &encoded)
+            .await
+            .expect("create object namespace lock");
+        let _object_writer = object_lock
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("hold the object write lock");
+        let (info, owner) = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.lookup_multipart_part_binding(bucket, directory, &upload.upload_id, &opts),
+        )
+        .await
+        .expect("binding must not acquire the object lock")
+        .expect("find the directory upload in the second pool");
+        assert_eq!((info.bucket.as_str(), info.object.as_str()), (bucket, directory));
+        assert_eq!(info.upload_id, upload.upload_id);
+        let owner = owner.expect("owner from the active upload");
+        assert_eq!((owner.bucket.as_str(), owner.object.as_str()), (bucket, directory));
+
+        let mut lost_opts = opts.clone();
+        lost_opts.bucket_lifecycle_lock_fence = Some(crate::object_api::NamespaceLockFence::lost_for_test());
+        assert!(matches!(
+            store.pools[1]
+                .get_disks_by_key(&encoded)
+                .lookup_multipart_part_binding(bucket, &encoded, &upload.upload_id, &lost_opts)
+                .await,
+            Err(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
+        let mut stale_opts = opts.clone();
+        stale_opts.expected_bucket_incarnation_id = Some(Uuid::new_v4());
+        assert!(matches!(
+            store
+                .lookup_multipart_part_binding(bucket, directory, &upload.upload_id, &stale_opts)
+                .await,
+            Err(StorageError::BucketNotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .lookup_multipart_part_binding(bucket, directory, "/invalid", &opts)
+                .await,
+            Err(StorageError::MalformedUploadID(_))
+        ));
+        assert!(matches!(
+            store
+                .lookup_multipart_part_binding(bucket, "different/", &upload.upload_id, &opts)
+                .await,
+            Err(StorageError::InvalidUploadID(..))
+        ));
         cancel.cancel();
     }
 

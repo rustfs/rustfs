@@ -188,6 +188,13 @@ validate_args() {
     fi
   fi
   if [[ "$TOOL" == "warp" ]]; then
+    case "$WARP_MODE" in
+      mixed|get|put) ;;
+      *)
+        echo "ERROR: --warp-mode must be mixed, get, or put" >&2
+        exit 1
+        ;;
+    esac
     local warp_host
     warp_host="$(normalize_warp_host "$ENDPOINT")"
     if [[ -z "$warp_host" ]]; then
@@ -224,9 +231,35 @@ extract_value() {
 collect_metrics() {
   local log_file="$1"
   local throughput reqps latency
-  throughput="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(GiB/s|MiB/s|MB/s|KB/s))' "$log_file")"
-  reqps="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(req/s|ops/s|requests/s))' "$log_file")"
-  latency="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(ms|us|µs|s))(\\s*(avg|mean))?' "$log_file")"
+  if [[ "$TOOL" == "warp" ]]; then
+    awk '
+      /^Report: PUT[.]/ { in_put = 1; next }
+      in_put && /^Report:/ { in_put = 0 }
+      in_put && /^[[:space:]]*\* Average:/ {
+        line = $0
+        sub(/^[[:space:]]*\* Average:[[:space:]]*/, "", line)
+        split(line, values, /,[[:space:]]*/)
+        throughput = values[1]
+        reqps = values[2]
+      }
+      in_put && /^[[:space:]]*\* Reqs: Avg:/ {
+        line = $0
+        sub(/^[[:space:]]*\* Reqs: Avg:[[:space:]]*/, "", line)
+        split(line, values, /,[[:space:]]*/)
+        latency = values[1]
+      }
+      END {
+        throughput = throughput == "" ? "N/A" : throughput
+        reqps = reqps == "" ? "N/A" : reqps
+        latency = latency == "" ? "N/A" : latency
+        printf "%s,%s,%s\n", throughput, reqps, latency
+      }
+    ' "$log_file"
+    return
+  fi
+  throughput="$(extract_value '([0-9]+(\.[0-9]+)?\s*(GiB/s|MiB/s|MB/s|KB/s))' "$log_file")"
+  reqps="$(extract_value '([0-9]+(\.[0-9]+)?\s*(req/s|ops/s|requests/s))' "$log_file")"
+  latency="$(extract_value '([0-9]+(\.[0-9]+)?\s*(ms|us|µs|s))(\s*(avg|mean))?' "$log_file")"
   echo "${throughput:-N/A},${reqps:-N/A},${latency:-N/A}"
 }
 

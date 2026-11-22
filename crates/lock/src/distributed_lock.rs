@@ -16,7 +16,7 @@ use crate::{
     ObjectKey,
     client::{BatchAcquireOutcome, LockCleanupOutcome, LockClient},
     error::{LockError, Result},
-    types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
+    types::{CacheFenceProof, CacheFenceStamp, LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
 use futures::{
     future::join_all,
@@ -56,6 +56,8 @@ const DEFERRED_UNLOCK_BACKOFF: [Duration; 5] = [
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 // Bound a peer's contention wait without discarding slow responses to that wait.
 const LOCK_PEER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+// A retrying writer must keep its queue position through longer reader holds.
+const LOCK_PEER_WRITER_RETRY_TIMEOUT: Duration = LOCK_PEER_ACQUIRE_TIMEOUT.saturating_mul(2);
 const LOCK_ACQUIRE_SPARE_HEDGES: usize = 1;
 const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
 const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
@@ -356,6 +358,7 @@ struct HeldLockEntry {
     lock_id: LockId,
     client: Arc<dyn LockClient>,
     valid_until: Instant,
+    cache_fence_stamp: Option<CacheFenceStamp>,
 }
 
 impl HeldLockEntry {
@@ -451,6 +454,7 @@ pub struct DistributedLockGuard {
     refresh_task: Option<JoinHandle<()>>,
     /// Lock-loss signal, shared with the heartbeat task.
     lock_lost: Arc<LockLostSignal>,
+    cache_fence_proof: Option<CacheFenceProof>,
 }
 
 impl DistributedLockGuard {
@@ -462,6 +466,15 @@ impl DistributedLockGuard {
     /// - `heartbeat`: lease TTL, optional renewal cadence, quorum, and diagnostics.
     fn new(lock_id: LockId, entries: Vec<HeldLockEntry>, lock_type: LockType, heartbeat: LockHeartbeatConfig) -> Self {
         record_lock_held_acquire(lock_type);
+        let cache_fence_proof = (lock_type == LockType::Shared)
+            .then(|| {
+                CacheFenceProof::from_grants(
+                    &heartbeat.resource,
+                    entries.iter().filter_map(|entry| entry.cache_fence_stamp),
+                    heartbeat.refresh_quorum,
+                )
+            })
+            .flatten();
         let lock_lost = Arc::new(LockLostSignal::default());
         match Self::quorum_valid_until(&entries, heartbeat.refresh_quorum) {
             Some(valid_until) => lock_lost.set_valid_until(valid_until),
@@ -482,6 +495,7 @@ impl DistributedLockGuard {
             disarmed: false,
             refresh_task,
             lock_lost,
+            cache_fence_proof,
         }
     }
 
@@ -603,6 +617,12 @@ impl DistributedLockGuard {
     /// Actual granted peer identities, which may differ from the logical guard ID.
     pub fn granted_lock_ids(&self) -> impl Iterator<Item = &LockId> {
         self.entries.iter().map(|entry| &entry.lock_id)
+    }
+
+    /// Read-quorum cache-fence proof carried by this guard, when every required
+    /// voter supplied one valid, distinct stamp.
+    pub fn cache_fence_proof(&self) -> Option<&CacheFenceProof> {
+        self.cache_fence_proof.as_ref()
     }
 
     /// Whether the guard's heartbeat has observed a refresh-quorum loss.
@@ -909,6 +929,22 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
+    /// Acquire a shared guard and request cache-fence stamps from capable voters.
+    #[hotpath::measure]
+    pub async fn rlock_guard_with_cache_fence(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Result<Option<DistributedLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Shared, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .request_cache_fence_stamp();
+        self.acquire_guard(&req).await
+    }
+
     /// Acquire independent exclusive locks with one sub-batch per peer and round.
     /// A successful key starts its heartbeat immediately. Only completed, explicitly
     /// retryable attempts whose grants have been cleaned may enter another round.
@@ -996,7 +1032,7 @@ impl DistributedLock {
             }
             attempt = attempt.saturating_add(1);
             let round_started = Instant::now();
-            let wait = self.peer_acquire_timeout(deadline.saturating_duration_since(round_started));
+            let wait = self.peer_acquire_timeout(deadline.saturating_duration_since(round_started), LOCK_PEER_ACQUIRE_TIMEOUT);
             let round_deadline = round_started.checked_add(wait).unwrap_or(round_started).min(deadline);
             let requests: Vec<_> = resources
                 .iter()
@@ -1111,11 +1147,12 @@ impl DistributedLock {
                     pending_by_key[key][reply.peer_index] = false;
                     let outcome = normalized_batch_outcome(request, outcomes.next());
                     match outcome {
-                        BatchAcquireOutcome::Granted { .. } => {
+                        BatchAcquireOutcome::Granted { cache_fence_stamp, .. } => {
                             let entry = HeldLockEntry {
                                 lock_id: request.lock_id.clone(),
                                 client: client.clone(),
                                 valid_until,
+                                cache_fence_stamp,
                             };
                             if results[key].is_some() {
                                 redundant.push(entry.release_entry());
@@ -1371,11 +1408,11 @@ impl DistributedLock {
         Duration::from_nanos(rng.random_range(lower_nanos..=upper_nanos))
     }
 
-    fn peer_acquire_timeout(&self, remaining: Duration) -> Duration {
+    fn peer_acquire_timeout(&self, remaining: Duration, peer_wait_limit: Duration) -> Duration {
         if self.clients.len() <= 1 {
             remaining
         } else {
-            remaining.min(LOCK_PEER_ACQUIRE_TIMEOUT)
+            remaining.min(peer_wait_limit)
         }
     }
 
@@ -1475,6 +1512,7 @@ impl DistributedLock {
                             lock_id: request.lock_id.clone(),
                             client: client.clone(),
                             valid_until: reply.started,
+                            cache_fence_stamp: None,
                         };
                         let completed = completed.clone();
                         // Each task owns its grant before the drain next awaits.
@@ -1836,7 +1874,14 @@ impl DistributedLock {
 
             let remaining = request.acquire_timeout - elapsed;
             let mut attempt_request = request.clone();
-            attempt_request.acquire_timeout = self.peer_acquire_timeout(remaining);
+            // Only retryable contention reaches another round. Give later writer
+            // attempts enough queue time to outlast readers that entered the gap.
+            let peer_wait_limit = if request.lock_type == LockType::Exclusive && attempt > 1 {
+                LOCK_PEER_WRITER_RETRY_TIMEOUT
+            } else {
+                LOCK_PEER_ACQUIRE_TIMEOUT
+            };
+            attempt_request.acquire_timeout = self.peer_acquire_timeout(remaining, peer_wait_limit);
             attempt_request.lock_id = LockId::new_unique(&request.resource);
 
             // A peer may grant promptly but deliver its response after its local
@@ -2040,6 +2085,7 @@ impl DistributedLock {
             match join_result {
                 Ok((idx, Ok(resp))) => {
                     if resp.success {
+                        let cache_fence_stamp = resp.cache_fence_stamp;
                         let lock_id = resp
                             .lock_info
                             .as_ref()
@@ -2051,6 +2097,7 @@ impl DistributedLock {
                                 lock_id,
                                 client: client.clone(),
                                 valid_until: grant_valid_until,
+                                cache_fence_stamp,
                             });
                         } else {
                             tracing::warn!("Missing lock client at index {} while recording success", idx);
@@ -2316,8 +2363,9 @@ mod batch_retry_tests;
 mod tests {
     use super::{
         BatchLockPeerDiagnostics, DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
-        LOCK_ACQUIRE_SPARE_HEDGES, LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS,
-        UNLOCK_RETRY_BACKOFF, is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
+        LOCK_ACQUIRE_SPARE_HEDGES, LOCK_PEER_ACQUIRE_TIMEOUT, LOCK_PEER_WRITER_RETRY_TIMEOUT, LockAcquireFailureKind,
+        LockLostSignal, UNLOCK_RETRY_ATTEMPTS, UNLOCK_RETRY_BACKOFF, is_definitive_lock_contention, is_remote_lock_rpc_failure,
+        should_warn_lock_failure,
     };
     use crate::{
         GlobalLockManager, LocalClient, LockCleanupOutcome, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats,
@@ -2340,6 +2388,118 @@ mod tests {
         SlowAlive(Duration), // Ok(true)  after a delayed response
         NotFound,            // Ok(false) remote already lost the lock (reclaimed / never held)
         RpcError,            // Err        RPC jitter
+    }
+
+    #[derive(Debug)]
+    struct LegacyProofClient {
+        inner: LocalClient,
+    }
+
+    impl LegacyProofClient {
+        fn new() -> Self {
+            Self {
+                inner: LocalClient::with_manager(Arc::new(GlobalLockManager::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for LegacyProofClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            let mut response = self.inner.acquire_lock(request).await?;
+            response.cache_fence_stamp = None;
+            Ok(response)
+        }
+
+        async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.inner.release(lock_id).await
+        }
+
+        async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.inner.refresh(lock_id).await
+        }
+
+        async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.inner.force_release(lock_id).await
+        }
+
+        async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            self.inner.check_status(lock_id).await
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            self.inner.get_stats().await
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            self.inner.close().await
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            true
+        }
+    }
+
+    fn stamped_voters(count: usize) -> Vec<Arc<dyn LockClient>> {
+        (0..count)
+            .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn LockClient>)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shared_guard_exposes_complete_cache_fence_quorum_proof() {
+        let lock = DistributedLock::new("cache-proof".to_owned(), stamped_voters(3), 2);
+        let resource = ObjectKey::new("bucket", "object");
+        let read = LockRequest::new(resource.clone(), LockType::Shared, "reader").request_cache_fence_stamp();
+        let mut first = lock
+            .acquire_guard(&read)
+            .await
+            .expect("read quorum acquisition")
+            .expect("read quorum guard");
+        let before = first.cache_fence_proof().expect("all new voters provide proof").clone();
+        assert_eq!(before.stamps().len(), 2);
+        assert!(first.release());
+
+        let write = LockRequest::new(resource.clone(), LockType::Exclusive, "writer");
+        let mut writer = lock
+            .acquire_guard(&write)
+            .await
+            .expect("write quorum acquisition")
+            .expect("write quorum guard");
+        assert!(writer.cache_fence_proof().is_none(), "write guards never authorize cache hits");
+        assert!(writer.release());
+
+        let mut second = lock
+            .acquire_guard(&read)
+            .await
+            .expect("second read quorum acquisition")
+            .expect("second read quorum guard");
+        let after = second.cache_fence_proof().expect("second read proof");
+        assert_ne!(&before, after, "an intervening write quorum must change every later read proof");
+        assert!(second.release());
+    }
+
+    #[tokio::test]
+    async fn shared_guard_with_legacy_quorum_keeps_lock_but_withholds_proof() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            Arc::new(LegacyProofClient::new()),
+            Arc::new(LegacyProofClient::new()),
+            Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))),
+        ];
+        let lock = DistributedLock::new("mixed-cache-proof".to_owned(), clients, 2);
+        let read = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Shared, "reader").request_cache_fence_stamp();
+        let mut guard = lock
+            .acquire_guard(&read)
+            .await
+            .expect("mixed read quorum acquisition")
+            .expect("mixed read quorum guard remains available");
+        assert!(guard.cache_fence_proof().is_none(), "legacy voters fail closed only for cache proof");
+        assert!(!guard.is_lock_lost(), "missing proof must not weaken the acquired lock");
+        assert!(guard.release());
     }
 
     struct ConstantRng(u64);
@@ -3292,11 +3452,11 @@ mod tests {
 
     #[derive(Debug)]
     struct TimeoutRecordingClient {
-        seen_timeouts: Arc<Mutex<Vec<Duration>>>,
+        seen_timeouts: Arc<Mutex<Vec<(LockId, tokio::time::Instant, Duration)>>>,
     }
 
     impl TimeoutRecordingClient {
-        fn new(seen_timeouts: Arc<Mutex<Vec<Duration>>>) -> Self {
+        fn new(seen_timeouts: Arc<Mutex<Vec<(LockId, tokio::time::Instant, Duration)>>>) -> Self {
             Self { seen_timeouts }
         }
 
@@ -3308,7 +3468,11 @@ mod tests {
     #[async_trait::async_trait]
     impl LockClient for TimeoutRecordingClient {
         async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
-            self.seen_timeouts.lock().unwrap().push(request.acquire_timeout);
+            self.seen_timeouts.lock().expect("record peer contention waits").push((
+                request.lock_id.clone(),
+                tokio::time::Instant::now(),
+                request.acquire_timeout,
+            ));
             Ok(LockResponse::failure("Lock acquisition timeout", Duration::ZERO))
         }
 
@@ -4026,25 +4190,45 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn acquire_guard_bounds_peer_contention_wait() {
-        let seen_timeouts = Arc::new(Mutex::new(Vec::new()));
-        let clients: Vec<Arc<dyn LockClient>> = (0..4)
-            .map(|_| TimeoutRecordingClient::new(seen_timeouts.clone()).into_client())
-            .collect();
-        let lock = DistributedLock::new("test".to_string(), clients, 3);
-        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_millis(1500));
+        for lock_type in [LockType::Exclusive, LockType::Shared] {
+            let seen_timeouts = Arc::new(Mutex::new(Vec::new()));
+            let clients: Vec<Arc<dyn LockClient>> = (0..4)
+                .map(|_| TimeoutRecordingClient::new(seen_timeouts.clone()).into_client())
+                .collect();
+            let lock = DistributedLock::new("test".to_string(), clients, 3);
+            let request = LockRequest::new(ObjectKey::new("bucket", "object"), lock_type, "owner")
+                .with_acquire_timeout(Duration::from_secs(5));
+            let started = tokio::time::Instant::now();
 
-        let result = lock.acquire_guard(&request).await;
+            let result = lock.acquire_guard(&request).await;
 
-        assert_matches!(result, Ok(None));
-        let seen_timeouts = seen_timeouts.lock().unwrap();
-        assert!(!seen_timeouts.is_empty(), "expected lock clients to observe acquire timeouts");
-        assert!(
-            seen_timeouts.iter().all(|timeout| *timeout <= LOCK_PEER_ACQUIRE_TIMEOUT),
-            "peer contention waits should be bounded by {LOCK_PEER_ACQUIRE_TIMEOUT:?}, saw {seen_timeouts:?}"
-        );
+            assert_matches!(result, Ok(None));
+            assert_eq!(started.elapsed(), request.acquire_timeout, "contention must respect the caller deadline");
+            let seen_timeouts = seen_timeouts.lock().expect("observed peer contention waits");
+            assert!(!seen_timeouts.is_empty(), "expected lock clients to observe acquire timeouts");
+            let first_round_id = &seen_timeouts[0].0;
+            for (id, dispatched, timeout) in seen_timeouts.iter() {
+                let limit = if lock_type == LockType::Exclusive && id != first_round_id {
+                    LOCK_PEER_WRITER_RETRY_TIMEOUT
+                } else {
+                    LOCK_PEER_ACQUIRE_TIMEOUT
+                };
+                assert!(*timeout <= limit, "{lock_type:?} peer wait must respect its round limit");
+                let remaining = request.acquire_timeout.saturating_sub(dispatched.duration_since(started));
+                assert!(*timeout <= remaining, "a peer wait must fit the caller's remaining budget");
+            }
+            assert_eq!(seen_timeouts[0].2, LOCK_PEER_ACQUIRE_TIMEOUT, "the first probe must retain its limit");
+            if lock_type == LockType::Exclusive {
+                assert!(
+                    seen_timeouts
+                        .iter()
+                        .any(|(_, _, timeout)| *timeout == LOCK_PEER_WRITER_RETRY_TIMEOUT),
+                    "a contended writer must receive the longer retry wait"
+                );
+            }
+        }
     }
 
     async fn wait_for_acquisition_cleanup(clients: &[Arc<SequencedClient>]) {
@@ -4696,6 +4880,7 @@ mod tests {
             error: None,
             wait_time: Duration::ZERO,
             position_in_queue: None,
+            cache_fence_stamp: None,
         };
         let responses = Ok(vec![
             success.clone(),

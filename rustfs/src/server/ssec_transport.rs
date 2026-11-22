@@ -101,7 +101,7 @@ pub(crate) fn is_secure_transport(connection_is_tls: bool, client_info: Option<&
         .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
 }
 
-fn require_tls() -> bool {
+pub(crate) fn require_tls() -> bool {
     rustfs_utils::get_env_bool(ENV_SSE_C_REQUIRE_TLS, DEFAULT_SSE_C_REQUIRE_TLS)
 }
 

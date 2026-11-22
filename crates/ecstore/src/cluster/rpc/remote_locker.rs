@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
 use rustfs_lock::{
-    BatchAcquireOutcome, LockCleanupOutcome, LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus,
-    LockType, Result,
+    BatchAcquireOutcome, CacheFenceStamp, LockCleanupOutcome, LockClient, LockError, LockInfo, LockRequest, LockResponse,
+    LockStats, LockStatus, LockType, Result,
     types::{LockId, LockMetadata, LockPriority},
 };
 use rustfs_protos::proto_gen::node_service::{
@@ -29,7 +29,7 @@ use rustfs_protos::proto_gen::node_service::{
     LockAcquireStatus, LockReleaseStatus, PingRequest,
 };
 use rustfs_protos::{
-    ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
+    ChannelRebuildReason, ConnectionEvictionLogLevel, evict_failed_connection_with_reason, models::PingBodyBuilder,
     proto_gen::node_service::node_service_client::NodeServiceClient,
 };
 use std::collections::HashMap;
@@ -50,6 +50,10 @@ const LOG_SUBSYSTEM_REMOTE_LOCK: &str = "remote_lock";
 
 fn attach_lock_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(request: &mut Request<T>) -> std::io::Result<()> {
     set_tonic_rolling_mutation_body_digest(request)
+}
+
+fn decode_cache_fence_stamp(encoded: Option<&Bytes>) -> Option<CacheFenceStamp> {
+    encoded.and_then(|encoded| CacheFenceStamp::decode(encoded).ok())
 }
 
 /// Work to run if an RPC completes after its caller stops waiting.
@@ -324,6 +328,7 @@ fn batch_acquire_outcome(lock_id: &LockId, lock_type: LockType, result: Option<&
         return BatchAcquireOutcome::Granted {
             lock_info,
             wait_time: Duration::ZERO,
+            cache_fence_stamp: decode_cache_fence_stamp(result.cache_fence_stamp.as_ref()),
         };
     }
     if result.lock_info.is_some() {
@@ -452,6 +457,7 @@ impl RemoteClient {
             deadlock_detection: false,
             suppress_contention_logs: false,
             refresh_interval: None,
+            cache_fence_stamp_requested: false,
         }
     }
 
@@ -498,7 +504,7 @@ impl RemoteClient {
                 ))
     }
 
-    async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
+    async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str, trigger: EvictionTrigger) {
         let log_level = if Self::is_scanner_leader_lock(resource_summary) {
             debug!(
                 addr = %self.addr,
@@ -518,7 +524,11 @@ impl RemoteClient {
             );
             ConnectionEvictionLogLevel::Warn
         };
-        evict_failed_connection_with_log_level(&self.addr, log_level).await;
+        let rebuild_reason = match trigger {
+            EvictionTrigger::Timeout => ChannelRebuildReason::LockTimeout,
+            EvictionTrigger::Transport => ChannelRebuildReason::LockTransport,
+        };
+        evict_failed_connection_with_reason(&self.addr, rebuild_reason, log_level).await;
     }
 
     fn summarize_resources(requests: &[LockRequest]) -> String {
@@ -772,7 +782,7 @@ impl RemoteClient {
         });
         if verdict == EvictionVerdict::Evict {
             rustfs_io_metrics::lock_metrics::record_remote_lock_channel_eviction(&self.addr, trigger.as_str());
-            self.evict_connection(op, reason, resource_summary).await;
+            self.evict_connection(op, reason, resource_summary, trigger).await;
             return;
         }
         rustfs_io_metrics::lock_metrics::record_remote_lock_channel_eviction_suppressed(&self.addr, verdict.as_str());
@@ -1569,10 +1579,11 @@ impl LockClient for RemoteClient {
 
         // Check if the lock acquisition was successful
         if resp.success {
-            Ok(LockResponse::success(
-                Self::build_lock_info(request, resp.lock_info),
-                std::time::Duration::ZERO,
-            ))
+            let lock_info = Self::build_lock_info(request, resp.lock_info);
+            match decode_cache_fence_stamp(resp.cache_fence_stamp.as_ref()) {
+                Some(stamp) => Ok(LockResponse::success_with_cache_fence_stamp(lock_info, std::time::Duration::ZERO, stamp)),
+                None => Ok(LockResponse::success(lock_info, std::time::Duration::ZERO)),
+            }
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
@@ -1590,12 +1601,19 @@ impl LockClient for RemoteClient {
             .iter()
             .zip(outcomes)
             .map(|(request, outcome)| match outcome {
-                BatchAcquireOutcome::Granted { lock_info, wait_time } => LockResponse::success(
-                    lock_info
-                        .map(|info| *info)
-                        .unwrap_or_else(|| Self::build_lock_info(request, None)),
+                BatchAcquireOutcome::Granted {
+                    lock_info,
                     wait_time,
-                ),
+                    cache_fence_stamp,
+                } => {
+                    let lock_info = lock_info
+                        .map(|info| *info)
+                        .unwrap_or_else(|| Self::build_lock_info(request, None));
+                    match cache_fence_stamp {
+                        Some(stamp) => LockResponse::success_with_cache_fence_stamp(lock_info, wait_time, stamp),
+                        None => LockResponse::success(lock_info, wait_time),
+                    }
+                }
                 BatchAcquireOutcome::Ambiguous {
                     error: error @ LockError::Timeout { .. },
                     ..
@@ -2361,6 +2379,38 @@ mod tests {
             );
         }
         assert!(matches!(classify(None), BatchAcquireOutcome::Ambiguous { .. }));
+    }
+
+    #[test]
+    fn cache_fence_stamp_decoder_accepts_current_wire_shape_and_rejects_malformed_values() {
+        let mut encoded = Vec::with_capacity(27);
+        encoded.push(1);
+        encoded.extend_from_slice(uuid::Uuid::from_u128(7).as_bytes());
+        encoded.extend_from_slice(&17_u16.to_le_bytes());
+        encoded.extend_from_slice(&42_u64.to_le_bytes());
+        let encoded = Bytes::from(encoded);
+
+        let stamp = decode_cache_fence_stamp(Some(&encoded)).expect("current stamp wire shape");
+        assert_eq!(stamp.voter_boot_id(), uuid::Uuid::from_u128(7));
+        assert_eq!(stamp.shard_index(), 17);
+        assert_eq!(stamp.generation(), 42);
+        assert!(decode_cache_fence_stamp(None).is_none(), "legacy responses remain valid without proof");
+        assert!(decode_cache_fence_stamp(Some(&Bytes::from_static(b"malformed"))).is_none());
+
+        let request = test_lock_request(Duration::from_secs(30));
+        let result = GenerallyLockResult {
+            success: true,
+            cache_fence_stamp: Some(encoded),
+            ..Default::default()
+        };
+        let BatchAcquireOutcome::Granted {
+            cache_fence_stamp: Some(batch_stamp),
+            ..
+        } = batch_acquire_outcome(&request.lock_id, request.lock_type, Some(&result))
+        else {
+            panic!("valid batch grant must retain its cache-fence stamp");
+        };
+        assert_eq!(batch_stamp, stamp);
     }
 
     #[tokio::test(start_paused = true)]

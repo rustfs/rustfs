@@ -582,6 +582,7 @@ pub(crate) struct PeerAdminRequest<'a> {
     connection: &'a PeerConnection,
     path: &'a str,
     access_key: &'a str,
+    session_token: &'a str,
     method: Method,
     client: Option<&'a reqwest::Client>,
 }
@@ -592,6 +593,7 @@ impl<'a> PeerAdminRequest<'a> {
             connection,
             path,
             access_key,
+            session_token: "",
             method: Method::PUT,
             client: None,
         }
@@ -602,6 +604,11 @@ impl<'a> PeerAdminRequest<'a> {
             method: Method::GET,
             ..Self::put(connection, path, access_key)
         }
+    }
+
+    pub(crate) fn with_session_token(mut self, session_token: &'a str) -> Self {
+        self.session_token = session_token;
+        self
     }
 
     pub(crate) fn post(connection: &'a PeerConnection, path: &'a str, access_key: &'a str) -> Self {
@@ -668,12 +675,12 @@ impl<'a> PeerAdminRequest<'a> {
         }
         let signed = sign_v4(
             request
-                .body(Body::empty())
+                .body(rustfs_s3_types::Body::empty())
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
             payload.as_ref().map(|(payload, _)| payload.len() as i64).unwrap_or(0),
             self.access_key,
             secret_key,
-            "",
+            self.session_token,
             current_region()
                 .map(|region| region.to_string())
                 .as_deref()
@@ -749,6 +756,7 @@ impl<'a> PeerAdminRequest<'a> {
             connection: self.connection,
             path: self.path,
             access_key: self.access_key,
+            session_token: self.session_token,
             method: self.method.clone(),
             client: Some(&client),
         };
@@ -975,6 +983,52 @@ mod tests {
     #[test]
     fn test_summarize_peer_error_detail_passes_short_details_through() {
         assert_eq!(summarize_peer_error_detail("  short error  "), "short error");
+    }
+
+    #[tokio::test]
+    async fn peer_capability_request_signs_the_admin_session_token() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listen for peer probe");
+        let endpoint = format!("http://{}", listener.local_addr().expect("listener address"));
+        let connection = PeerConnection {
+            endpoint: Url::parse(&endpoint).expect("valid local test URL"),
+            skip_tls_verify: false,
+            ca_cert_pem: String::new(),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().expect("build loopback client");
+        let request = PeerAdminRequest::get(&connection, "/capabilities?local=true", "test-access-key")
+            .with_session_token("test-session-token")
+            .with_client(&client);
+        let peer = async {
+            let (socket, _) = listener.accept().await.expect("accept peer probe");
+            let mut socket = BufReader::new(socket);
+            let mut saw_token = false;
+            let mut signed_token = false;
+            loop {
+                let mut line = String::new();
+                let read = socket.read_line(&mut line).await.expect("read peer header");
+                if read == 0 || line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                saw_token |= lower.trim_end() == "x-amz-security-token: test-session-token";
+                signed_token |= lower.starts_with("authorization:") && lower.contains("x-amz-security-token");
+            }
+            socket
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("respond to peer probe");
+            assert!(saw_token && signed_token, "the capability request must carry and sign the session token");
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(request.send_get("test-secret-key"), peer) })
+                .await
+                .expect("peer probe should finish");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

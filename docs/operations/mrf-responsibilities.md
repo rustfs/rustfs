@@ -1,8 +1,33 @@
 # Retained MRF responsibilities
 
-**Use this when:** a legacy partial-write responsibility has no source bucket identity, or the MRF controller reports an unreadable checkpoint.
+**Use this when:** inspecting cluster MRF responsibilities, resolving an unverified legacy responsibility, or recovering an unreadable checkpoint.
 
 **Source of truth:** `crates/heal/src/heal/mrf_queue.rs` (`read_replay_source`, `MrfRuntime::flush`), `crates/heal/src/heal/mrf_queue/partial_write.rs` (`probe_unknown_generation`, `list_unverified_legacy`), and `rustfs/src/admin/handlers/heal.rs` (`MrfLegacyResponsibilitiesHandler`).
+
+## Cluster inspection and disposition
+
+Use a signed admin client with `admin:Heal`. The cluster routes are rooted at `/rustfs/admin/v4/heal/mrf/cluster`; the existing node-local endpoints remain available. The [management contract](../architecture/mrf-management-contract.md) defines observation and durability boundaries.
+
+| Method and suffix | Purpose |
+|---|---|
+| `GET` at the root path, without a trailing slash | Cached per-node summary; `limit` is 1–32 |
+| `GET /responsibilities` | Bounded parked-responsibility pages; `limit` is 1–256 |
+| `GET /responsibilities/{node_id}/{id}` | Observe one retained ID, including a source-bound `active` responsibility |
+| `POST /responsibilities/actions` | Route an explicit refresh, recheck, or risk acceptance to its owning node |
+
+Follow `nextCursor` from the same endpoint until absent and preserve `topologyFingerprint`, node outcomes, and observation timestamps. Cursors cannot be reused across summary and responsibility endpoints or across a topology change. `pageComplete` describes only the current page; it does not certify the entire cluster. A summary uses the consumer's last sample, so retain `sampledAtMs` when comparing observations. Summary and list requests have a five-second deadline; a summary page contacts at most four nodes concurrently and a list page visits at most four nodes.
+
+Treat `unsupported`, `unavailable`, `timed_out`, `budget_exceeded`, `invalid_peer_response`, and node errors as gaps in observation. They must not be converted to zero responsibilities. A `busy` node has exhausted query admission; back off rather than issuing parallel page scans. A `budget_exceeded` node has not started and remains in the continuation. After a topology-change error, restart observation and correlate retained IDs without mixing old and new page completeness.
+
+An action body has a topology-derived `nodeId` and a `request` object. Refresh needs `action: "refresh"` and `responsibilityId`; use the latest observed `expectedBucketIncarnationId` when known. Recheck additionally requires a known current incarnation, and the owner validates whether the source identity permits retry. Risk acceptance uses `action: "acceptUnverifiedRisk"`, the same ID/incarnation preconditions, `acknowledgeUnverifiedDataRisk: true`, explicit boolean `acknowledgeUnknownSourceIncarnation` and `acknowledgeBucketIncarnationMismatch`, a nonempty `reason` and `reference`, and a stable non-nil UUID `requestId`. The server supplies the authenticated operator identity.
+
+Read the returned per-node outcome before treating an action as acknowledged. Successful action replies retain the durable responsibility and explicitly report `dataVerified: false`. A timeout is ambiguous: observe the same ID on the same node before retrying, and retain the original risk-acceptance request ID. Disappearance from a parked list can mean the entry became `active`; disappearance from a single-ID lookup is not a verification receipt.
+
+## Relating MRF to integrity audit
+
+Use [bounded integrity audit](shard-integrity-audit.md) when independent expected SHA256 evidence exists for supported object versions. Preserve the audit job ID and per-item result alongside the node/responsibility ID and bucket incarnation. A stored checksum supports consistency with that metadata; it does not establish external historical provenance. An audit does not remove MRF responsibility or authorize risk acceptance automatically.
+
+If no eligible expected digest exists, report the content as unverified and retain the responsibility. Protected migration and protected new writes are separate operator decisions with separate compatibility gates. A successful protected copy does not rewrite the historical source, transfer its responsibility, or enable protection for the fleet.
 
 ## Unknown bucket identity
 
@@ -24,7 +49,7 @@ An explicit refresh distinguishes a successful lookup with no identity from a lo
 
 A committed lifecycle companion with an unknown state, unsupported version, invalid contents, mismatched owner/sequence, conflicting replicas, or no readable replica must not be treated as an absent legacy companion. A genuinely absent companion remains compatible with older snapshots.
 
-If replay cannot read the committed owner, the consumer retains the original payloads, manifests, lifecycle companions, and compatibility mirrors. It rejects durable admission, lifecycle queries/actions, snapshot publication, and cleanup. It also stops object dispatch. The read failure is sticky for that process: restore a compatible reader or repair the storage fault, then restart and inspect the retained files again.
+If replay cannot read the committed owner, the consumer retains the original payloads, manifests, lifecycle companions, and compatibility mirrors. It rejects durable admission, responsibility listing/lookup/actions, snapshot publication, and cleanup. It also stops object dispatch. A cluster summary can expose `checkpointReadable: false`; it does not turn retained or unavailable counts into a healthy page. The read failure is sticky for that process: restore a compatible reader or repair the storage fault, then restart and inspect the retained files again.
 
 Do not delete a companion, journal, or commit manifest to clear this condition. An empty API response would be misleading; the API returns service unavailable while the owner is unreadable.
 

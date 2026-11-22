@@ -28,7 +28,7 @@ pub mod diagnostic {
 }
 
 pub mod admin {
-    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
+    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info, get_server_info_with_inventory};
 }
 
 pub mod bitrot {
@@ -72,10 +72,11 @@ pub mod bucket {
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
                 ManualTransitionRunReport, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
-                apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
-                enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
-                enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
+                apply_transition_rule, apply_transition_rule_with_incarnation, enqueue_expiry_for_existing_objects,
+                enqueue_transition_for_existing_objects, enqueue_transition_for_existing_objects_scoped,
+                enqueue_transition_for_existing_objects_scoped_with_cancel, enqueue_transition_immediate,
+                expire_transitioned_object, get_global_expiry_state, get_global_transition_state, init_background_expiry,
+                lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
                 run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
@@ -208,7 +209,8 @@ pub mod bucket {
 
     pub mod durability {
         pub use crate::bucket::durability::{
-            BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED, BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
+            BUCKET_DURABILITY_MODE_FILE_SYNC, BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED,
+            BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
         };
     }
 
@@ -347,7 +349,7 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args, check_object_args,
             check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
             has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };
@@ -392,7 +394,8 @@ pub mod cluster {
 
 pub mod compression {
     pub use crate::io_support::compress::{
-        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled, is_multipart_disk_compression_enabled,
+        DISK_COMPRESSION_EXCLUDED_CONTENT_TYPES, MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled,
+        is_multipart_disk_compression_enabled,
     };
 }
 
@@ -452,13 +455,13 @@ pub mod data_usage {
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
         invalidate_data_usage_snapshot_cache, live_bucket_usage_computations, load_admin_data_usage_from_backend_cached,
-        load_bucket_usage_from_backend_cached, load_compression_total_from_memory, load_data_usage_from_backend,
-        load_data_usage_from_backend_cached, quota_object_size, record_bucket_delete_marker_memory,
+        load_admin_data_usage_with_memory_overlay, load_bucket_usage_from_backend_cached, load_compression_total_from_memory,
+        load_data_usage_from_backend, load_data_usage_from_backend_cached, quota_object_size, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
-        store_data_usage_in_backend,
+        store_data_usage_in_backend, verified_account_bucket_usage,
     };
     pub use crate::data_usage::{get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline};
 }
@@ -467,6 +470,7 @@ pub mod disk {
     pub use crate::cluster::rpc::background_pipe::{BackgroundPipeReader, BackgroundPipeWriter, background_pipe};
     pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
     pub use crate::disk::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION;
+    pub use crate::disk::ReplacementMount;
     pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     #[cfg(feature = "test-util")]
@@ -501,8 +505,8 @@ pub mod disk {
         PoolMetaNativeInspection, PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
         QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
-        validate_batch_read_version_item_count,
+        UNCLEAN_SHUTDOWN_MARKER_PATH, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
+        validate_batch_read_version_item_count, validate_format_control_path,
     };
     pub use crate::disk::{
         BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler,
@@ -564,6 +568,10 @@ pub mod runtime {
         boot_time, bucket_monitor, deployment_id, endpoint_pools, expiry_state_handle, first_cluster_node_is_local,
         global_lock_client, global_lock_clients, global_tier_config_mgr, local_disk_map_read, object_store_handle, region,
         rustfs_port, setup_is_dist_erasure, setup_is_erasure, setup_is_erasure_sd, transition_state_handle,
+    };
+    pub use crate::runtime::usage_watch::{
+        SCANNER_USAGE_WATCH_COVERAGE_VERSION, SCANNER_USAGE_WATCH_LEASE_MS, ScannerUsageWatchKnown, ScannerUsageWatchObservation,
+        ScannerUsageWatchRequest,
     };
 }
 
@@ -659,6 +667,25 @@ pub mod rio {
 }
 
 pub mod rpc {
+    #[cfg(all(feature = "test-util", feature = "internode-transport"))]
+    pub mod test_util {
+        /// Build a remote disk using a controlled transport and no health monitor.
+        ///
+        /// # Errors
+        /// Returns the normal remote-disk construction error for the supplied endpoint.
+        pub async fn remote_disk_with_transport(
+            endpoint: &crate::layout::endpoint::Endpoint,
+            transport: std::sync::Arc<dyn super::InternodeDataTransport>,
+        ) -> crate::disk::error::Result<crate::disk::DiskStore> {
+            let options = crate::disk::DiskOption {
+                cleanup: false,
+                health_check: false,
+            };
+            let disk = crate::cluster::rpc::remote_disk::RemoteDisk::new(endpoint, &options, transport).await?;
+            Ok(std::sync::Arc::new(crate::disk::Disk::Remote(Box::new(disk))))
+        }
+    }
+
     #[cfg(feature = "internode-transport")]
     pub use crate::cluster::rpc::http_auth::ExternalStreamAuth;
     pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
@@ -667,6 +694,15 @@ pub mod rpc {
         InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
         ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
     };
+    /// Internode shard reads over NIXL: the receive-pool seam the binary fills
+    /// and the wire names its serving handler shares with the transport.
+    pub mod nixl {
+        pub use crate::cluster::rpc::nixl_internode::{
+            NIXL_AGENT_QUERY, NIXL_BUFFER_QUERY, NIXL_BUFFERS_QUERY, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER,
+            NIXL_METADATA_SHA256_QUERY, NIXL_NONCE_QUERY, NixlRecvBuffer, NixlRecvPool, READ_FILE_NIXL_PATH,
+            WRITE_FILE_NIXL_PATH, install_nixl_recv_pool,
+        };
+    }
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
@@ -678,13 +714,17 @@ pub mod rpc {
         gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
         node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
         rpc_auth_is_resource_exhausted, rpc_background_admission, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
-        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_tier_registry_generation,
-        sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
-        verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer, verify_put_file_capability,
-        verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,
-        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
+        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_durable_progress,
+        sign_ns_scanner_capability_with_tier_registry_generation, sign_ns_scanner_capability_with_usage_capabilities,
+        sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_boot_epoch_response_headers_with_msgpack_capability,
+        tonic_msgpack_manifest_capability_requested, tonic_rpc_auth_failure_reason, verify_ns_scanner_capability,
+        verify_ns_scanner_capability_with_checkpoint_coverage, verify_ns_scanner_capability_with_durable_progress,
+        verify_ns_scanner_capability_with_tier_registry_generation, verify_ns_scanner_capability_with_usage_capabilities,
+        verify_ns_scanner_usage_watch_capability, verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature,
+        verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+        verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 
@@ -731,8 +771,8 @@ pub mod storage {
     pub use crate::store::external_rpc_disk;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,
-        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc,
+        init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
         prewarm_local_disk_id_map_with_instance_ctx,
     };
     pub use crate::store::{HealObjectAbsenceProof, HealObjectStorageResult};

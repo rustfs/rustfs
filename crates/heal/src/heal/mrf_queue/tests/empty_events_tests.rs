@@ -492,6 +492,7 @@ fn empty_events_real_consumer_stop_retains_unresolved_journal() {
                     after: None,
                     limit: 10,
                     response,
+                    _permit: crate::heal::mrf_queue::management::read_permit().expect("MRF management read permit"),
                 })
                 .await
                 .expect("query the actual consumer");

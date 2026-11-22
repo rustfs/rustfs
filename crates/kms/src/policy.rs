@@ -489,6 +489,134 @@ fn equal_jitter(rng: &mut impl RngExt, cap: Duration) -> Duration {
     half + Duration::from_nanos(rng.random_range(0..=spread))
 }
 
+/// Base pause before re-reading a record whose previous read may have been
+/// answered by a replica that lags a recent write; doubles per repeat. Unit
+/// tests shrink it so exhausted-budget cases stay fast.
+const STALE_READ_BASE_BACKOFF: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 50 });
+
+/// Upper bound for a single pause before such a re-read.
+const STALE_READ_MAX_BACKOFF: Duration = Duration::from_millis(if cfg!(test) { 4 } else { 400 });
+
+/// Pause before re-reading a record after a read that may have been stale.
+///
+/// Used between attempts of a check-and-set read-modify-write cycle and when
+/// re-reading a record this client has just created. A backend that answers
+/// reads from a replica (a Vault performance standby, an OpenBao standby)
+/// keeps returning the older state for a short while after a write, so an
+/// immediate re-read observes the same snapshot. `completed_attempts` is the
+/// number of reads already made; the pause is jittered so two contending
+/// writers do not stay in step.
+pub(crate) async fn stale_read_backoff(completed_attempts: u32) {
+    let doublings = completed_attempts.saturating_sub(1).min(31);
+    let cap = STALE_READ_BASE_BACKOFF
+        .saturating_mul(1u32 << doublings)
+        .min(STALE_READ_MAX_BACKOFF);
+    let pause = equal_jitter(&mut rand::rng(), cap);
+    tokio::time::sleep(pause).await;
+}
+
+/// How long after its own write a client refuses to accept a read that does
+/// not reflect it. Long enough to cover a replica catching up with the write,
+/// short enough that the bookkeeping never outlives the lag it covers.
+const OWN_WRITE_READ_GRACE: Duration = Duration::from_secs(5);
+
+/// Bound on the records tracked for [`OWN_WRITE_READ_GRACE`]; writes beyond it
+/// evict the oldest entry, which only forfeits the re-read for that record.
+const OWN_WRITE_TRACKED_RECORDS: u64 = 1024;
+
+/// Reads attempted for a record this client just wrote before a result that
+/// does not reflect the write is returned as is.
+const OWN_WRITE_READ_ATTEMPTS: u32 = 5;
+
+/// The last thing this client did to a stored record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnWrite {
+    /// Wrote it, acknowledged as this version of the record.
+    Version(u32),
+    /// Deleted it.
+    Deleted,
+}
+
+/// Read-your-writes for one client against a store whose reads may lag.
+///
+/// A backend that answers reads from a replica acknowledges a write and may
+/// then, for a short while, answer a read of the same record with the state
+/// from before it. This remembers what the client itself last did to each
+/// record and re-reads while an answer is older than that.
+///
+/// It never changes what a read returns in the end: once the attempts are
+/// spent the last answer is returned as is, so a record another client has
+/// since replaced or removed costs a bounded delay, not an error. It also
+/// covers this client only. Another client reading the same replica has no
+/// such knowledge and observes the earlier state until the replica catches up.
+pub(crate) struct OwnWrites {
+    recent: moka::future::Cache<String, OwnWrite>,
+}
+
+impl OwnWrites {
+    pub(crate) fn new() -> Self {
+        Self {
+            recent: moka::future::Cache::builder()
+                .max_capacity(OWN_WRITE_TRACKED_RECORDS)
+                .time_to_live(OWN_WRITE_READ_GRACE)
+                .build(),
+        }
+    }
+
+    /// Record an acknowledged write of `record` as `version`.
+    ///
+    /// The remembered version never moves backwards: two writes of one record
+    /// by this client can have their acknowledgements processed out of order,
+    /// and the lower one must not replace the higher. A write that follows
+    /// this client's own delete starts a new record, whose versions count from
+    /// the beginning again, so it replaces the delete marker as is.
+    pub(crate) async fn wrote(&self, record: &str, version: u32) {
+        self.recent
+            .entry_by_ref(record)
+            .and_upsert_with(|current| {
+                let newest = match current.map(|entry| entry.into_value()) {
+                    Some(OwnWrite::Version(remembered)) => remembered.max(version),
+                    Some(OwnWrite::Deleted) | None => version,
+                };
+                std::future::ready(OwnWrite::Version(newest))
+            })
+            .await;
+    }
+
+    /// Record an acknowledged delete of `record`.
+    pub(crate) async fn deleted(&self, record: &str) {
+        self.recent.insert(record.to_string(), OwnWrite::Deleted).await;
+    }
+
+    /// Run `read`, repeating it while `predates` says the answer is older than
+    /// this client's own last write of `record`. A record this client has not
+    /// written within the grace period is read exactly once.
+    pub(crate) async fn read<T, F, Fut>(
+        &self,
+        record: &str,
+        mut read: F,
+        predates: impl Fn(&Result<T>, OwnWrite) -> bool,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let Some(own) = self.recent.get(record).await else {
+            return read().await;
+        };
+        let mut attempt = 1;
+        loop {
+            let result = read().await;
+            if attempt >= OWN_WRITE_READ_ATTEMPTS || !predates(&result, own) {
+                return result;
+            }
+            tracing::debug!(record, attempt, "KMS backend read predates this client's own write; re-reading");
+            stale_read_backoff(attempt).await;
+            attempt += 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metrics
 //
@@ -986,6 +1114,98 @@ mod tests {
                 attempt == DEFAULT_CIRCUIT_FAILURE_THRESHOLD
             );
         }
+    }
+
+    /// Scripted answers for one record, counting how often it was read.
+    async fn read_scripted(own: &OwnWrites, answers: &[Option<u32>]) -> (Option<u32>, usize) {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let answer = own
+            .read(
+                "record",
+                || async {
+                    let index = reads.fetch_add(1, Ordering::SeqCst).min(answers.len() - 1);
+                    Ok(answers[index])
+                },
+                |result, own| match (result, own) {
+                    (Ok(Some(version)), OwnWrite::Version(written)) => *version < written,
+                    (Ok(None), OwnWrite::Version(_)) | (Ok(Some(_)), OwnWrite::Deleted) => true,
+                    _ => false,
+                },
+            )
+            .await
+            .expect("scripted reads never fail");
+        (answer, reads.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_reads_an_unwritten_record_once() {
+        let own = OwnWrites::new();
+        assert_eq!(read_scripted(&own, &[None, Some(1)]).await, (None, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_rereads_until_the_written_version_is_served() {
+        let own = OwnWrites::new();
+        own.wrote("record", 2).await;
+        assert_eq!(read_scripted(&own, &[None, Some(1), Some(2)]).await, (Some(2), 3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_rereads_until_a_deleted_record_is_gone() {
+        let own = OwnWrites::new();
+        own.wrote("record", 2).await;
+        own.deleted("record").await;
+        assert_eq!(read_scripted(&own, &[Some(2), None]).await, (None, 2));
+    }
+
+    /// Acknowledgements of two writes can be processed in the reverse of the
+    /// order the writes landed in; the earlier version must not become the
+    /// floor again.
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_keeps_the_highest_version_when_acknowledgements_arrive_out_of_order() {
+        let own = OwnWrites::new();
+        own.wrote("record", 3).await;
+        own.wrote("record", 2).await;
+        assert_eq!(read_scripted(&own, &[Some(2), Some(3)]).await, (Some(3), 2));
+    }
+
+    /// A record this client deleted and then created again counts its versions
+    /// from the beginning, so the first version of the new record is current.
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_restarts_the_version_floor_after_its_own_delete() {
+        let own = OwnWrites::new();
+        own.wrote("record", 7).await;
+        own.deleted("record").await;
+        own.wrote("record", 1).await;
+        assert_eq!(read_scripted(&own, &[Some(1)]).await, (Some(1), 1));
+    }
+
+    /// A record another client replaced is still returned, after a bounded
+    /// number of reads: the bookkeeping delays an answer, it never fails one.
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_returns_the_last_answer_once_the_attempts_are_spent() {
+        let own = OwnWrites::new();
+        own.wrote("record", 7).await;
+        assert_eq!(read_scripted(&own, &[Some(1)]).await, (Some(1), OWN_WRITE_READ_ATTEMPTS as usize));
+    }
+
+    /// The pause between check-and-set attempts grows with the attempts
+    /// already lost and stays within `[cap / 2, cap]`.
+    #[tokio::test(start_paused = true)]
+    async fn stale_read_backoff_grows_and_stays_within_its_cap() {
+        let mut previous_cap = Duration::ZERO;
+        for completed in 1..=6u32 {
+            let cap = STALE_READ_BASE_BACKOFF
+                .saturating_mul(1 << (completed - 1))
+                .min(STALE_READ_MAX_BACKOFF);
+            let started = tokio::time::Instant::now();
+            stale_read_backoff(completed).await;
+            let waited = started.elapsed();
+            assert!(waited >= cap / 2 && waited <= cap, "attempt {completed}: waited {waited:?}, cap {cap:?}");
+            assert!(cap >= previous_cap, "the cap never shrinks");
+            previous_cap = cap;
+        }
+        assert_eq!(previous_cap, STALE_READ_MAX_BACKOFF, "the cap is reached within the attempt budget");
     }
 
     #[tokio::test(start_paused = true)]

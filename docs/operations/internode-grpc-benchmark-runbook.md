@@ -60,6 +60,7 @@ Run **before** at the baseline column and **after** at the enabled column, every
 | P1 isolation | `RUSTFS_INTERNODE_CHANNEL_ISOLATION` | `false` (default) | `true` |
 | P1 bulk pool | `RUSTFS_INTERNODE_BULK_CHANNELS` | unset | `2` |
 | P2 msgpack-only | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` | both `false` (default) | per the convergence runbook |
+| P2 per-peer msgpack | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY` | both `false` (default) | both `true`, fleet confirmation `false`, stable direct/affine peer connections only |
 | P3 prewarm | `RUSTFS_INTERNODE_PREWARM` | `false` (default) | `true` |
 | P3 offline bypass | `RUSTFS_INTERNODE_OFFLINE_BYPASS` | `false` (default) | `true` |
 | P3 reprobe / threshold | `RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS` / `RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD` | defaults | defaults (`DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS`, `DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD`) |
@@ -72,6 +73,8 @@ All names are defined in `crates/io-metrics/src/internode_metrics.rs`.
 
 Explicit channel dial metrics start after endpoint settings validate and cover TLS configuration, waiting for its blocking task, and connection establishment. Each completed or cancelled attempt records one result. TLS configuration errors and acquisition cancellation contribute to `rustfs_system_network_internode_dial_errors_total`. Only connection failures follow the existing peer-unreachable classification. Cache hits reuse the existing channel, and coalesced callers share the dial owner's result. Tonic's internal TCP reconnects and HTTP/2 PING outcomes require their own transport observations.
 
+Internode clients retain up to 8,192 locally reset streams per connection so late responses to cancelled quorum reads can be ignored. The locked HTTP/2 library's one-second retention period and 1,024 local protocol-error reset limit remain unchanged. This increases bounded transport bookkeeping on both shared and bulk channels; measure memory alongside cancellation and GOAWAY counts. Responses arriving after expiration or beyond the retention capacity can still consume the error budget. This client-side setting requires no wire-format migration; rollback restores the previous capacity.
+
 | Metric | Stage signal |
 | --- | --- |
 | `rustfs_system_network_internode_operation_duration_ms{operation,backend}` | control-plane RTT (P0), lock/bulk latency (P1), first-op latency (P3) |
@@ -81,6 +84,11 @@ Explicit channel dial metrics start after endpoint settings validate and cover T
 | `rustfs_system_network_internode_operation_payload_bytes` | payload size distribution (P0/P1 sizing) |
 | `rustfs_system_network_internode_operation_large_payloads_total` | large unary RPCs sharing a channel (P1 target) |
 | `rustfs_system_network_internode_dial_avg_time_nanos`, `rustfs_system_network_internode_dial_errors_total` | connect cost and failures (P3) |
+| `rustfs_system_network_internode_channel_rebuild_attempts_total{class,reason,outcome}` | explicit RustFS cache rebuild attempts after a bounded eviction reason |
+| `rustfs_system_network_internode_http2_ping_timeouts_total` | exact Hyper keepalive PING ACK timeouts in diagnostic builds; generic closes and RPC errors do not contribute |
+| `rustfs_system_network_internode_bulk_body_{waiters,active}` | work waiting for or holding complete bulk-unary admission |
+| `rustfs_system_network_internode_bulk_body_wait_duration_ms` | time spent before a complete bulk-unary attempt enters tonic |
+| `rustfs_system_network_internode_bulk_body_admissions_total{outcome}` | admitted attempts and waits cancelled by an outer deadline |
 | `rustfs_system_network_internode_msgpack_json_decode_total{direction,message,codec}`, `..._msgpack_json_fallback_total`, `..._msgpack_json_decode_error_total` | P2 gate inputs |
 | `rustfs_cluster_servers_offline_total` | offline detection correctness (P3 bypass) |
 | lock p99 (lock metrics, needs `RUSTFS_OBJECT_LOCK_DIAG_ENABLE=true`) | P1 head-of-line-blocking win |
@@ -99,10 +107,27 @@ P1 phase files clear bulk-specific overrides so an isolation experiment inherits
 | `RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE` | Inherit `RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE` | Bulk response receive credit per connection, bytes |
 | `RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT` | `64` | Active tonic transport response futures per bulk channel; minimum 1 |
 | `RUSTFS_INTERNODE_BULK_BUFFER_SIZE` | `1024` | Pending tonic service buffer capacity per bulk channel; minimum 1 |
+| `RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT` | `0` | Complete bulk-unary attempts per peer, held through response decoding and validation; `0` disables the additional gate |
+| `RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS` | `1000` | Local wait budget before returning `DiskOngoingReq`; minimum 1 ms |
 
 Zero receive-window values select the linked library default. In the locked Hyper 1.12 client this is 2 MiB per stream and 5 MiB per connection, while RustFS explicitly defaults to 1 MiB and 2 MiB. Record which policy the experiment actually selects. Values above the HTTP/2 31-bit limit fail channel acquisition with an invalid-input error. Change connection receive credit first, then stream credit only when measured bandwidth-delay product and resource budgets justify it. For example, compare the default 2 MiB connection window with `RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE=8388608`, holding other settings fixed. Request-upload flow control is configured by the receiving server. Keep server-wide window changes in a separate experiment.
 
 Bulk selection advances independently for each peer. Cursor bookkeeping caches up to 512 peer addresses. Each entry keeps four immutable slot keys so common bulk pools borrow their cache keys on hits. Larger pools construct the remaining slot keys on demand with the same cache identity. Replacing an entry restarts its selection sequence while established channels keep their existing cache keys. HTTPS cache hits share the TLS-generation read lock, with generation validation retained before handoff. Connection misses still coalesce under the existing per-key dial lock.
+
+The complete-body gate is per peer and applies to every RPC routed through the bulk client, including recovery inventories. Acquire it before the existing remote-operation deadline so queued work does not occupy tonic's transport queue or mark a healthy peer faulty. Its own bounded wait returns `DiskOngoingReq`. The permit remains owned by the caller through protobuf body decoding and application response validation. It does not reduce memory already owned by a queued WriteAll caller. Start with an explicit value such as `32`, check waiters, active work, p99 and memory, and keep the value and wait timeout identical across all nodes in one cell.
+
+The body limit is read when remote-disk handles are built and therefore requires a process restart. The per-peer registry retains weak entries and uses one conservative shared overflow gate only if more than 512 peer identities remain live. Values above Tokio's semaphore capacity fail startup instead of being truncated.
+
+Explicit rebuild reasons are `rpc_failure`, `operation_timeout`, `transport_failure`, `lock_timeout`, `lock_transport`, `peer_probe`, `tls_generation_changed`, and `manual`; unexpected inputs collapse to `unknown`. Outcomes are `connected` and `failed_or_cancelled`; `connected` means a replacement passed TLS-generation validation and was published or observed in the cache. A transport connection rejected during publication counts as `failed_or_cancelled` and retries under the same pending reason. Concurrent cache hits atomically consume the successful reason once. One eviction can schedule control and bulk rebuilds independently, and every failed attempt remains visible until a replacement is published. These metrics do not claim that tonic's private reconnect loop was observed.
+
+The locked tonic/Hyper public API does not expose HTTP/2 PING ACK timeout outcomes. A default-off diagnostic build can enable Hyper's exact internal timeout event and the RustFS counter without adding a second timer or changing reconnect behavior:
+
+```bash
+RUSTFLAGS="--cfg hyper_unstable_tracing" \
+  cargo build -p rustfs --features diagnostic-internode-http2-ping
+```
+
+The build scripts reject the feature when the required cfg is missing. The subscriber enables only Hyper's HTTP/2 client debug target and counts the exact `connection keep-alive timed out` event. Other low-frequency debug events from that target can also reach configured diagnostic log/export sinks, but generic connection errors, TCP closure, GOAWAY and RPC timeouts are not classified as PING failures. The feature is diagnostic-only because Hyper documents its tracing event contract as unstable; ordinary builds do not enable the dependency feature or pay its tracing cost. Tonic-internal reconnects without a RustFS cache eviction remain separate from explicit rebuild attempts. A stable production-default metric still requires an upstream typed observer.
 
 Custom-CA channels use tonic's endpoint URI handling for certificate names and SNI, including IPv6 literals. The regression suite exercises real control and bulk TLS connections to IPv6 loopback and verifies that a trusted certificate for a different host is rejected.
 
@@ -204,6 +229,27 @@ For aligned observation windows, supply distinct, initially absent `start_marker
 Every offered Ping is recorded, including schedule drops, deadlines and errors. Compute offered-load latency from `completed_ns - scheduled_ns`, RPC/acquisition time from `completed_ns - dispatched_ns` when dispatched, and dispatch lag from their difference. These are monotonic offsets from `start_unix_ns`. Record the control count, `errors`, `bulk_coverage_verified` and exit status before calculating quantiles. Any failure, payload mismatch, schedule drop or absent validated bulk coverage prevents attribution; selecting only successful samples would hide overload. Bulk payload bytes count only validated replies completed within the offering interval, with one response payload per RPC, not TCP/TLS wire bytes. The production remote-disk path retains its existing idempotent-read retry policy, so preserve per-attempt server/error counters too; zero final method errors alone does not prove no underlying retry occurred.
 
 Use identical probe source and settings on the two frozen library revisions, in separate Cargo targets, and record the harness overlay and binary identity independently from the already-built clean server binaries. Qualify repeated A cells and then A1/B1/B2/A2 before expanding to coalescing, isolation, pool or window experiments. A successful local mock regression verifies the probe's calling and accounting boundaries; acceptance against the actual authenticated four-node services is still required.
+
+### Timeout-boundary evidence
+
+Use `scripts/check_internode_rpc_timeout_boundary.py` after a task-owned fault injector has recorded three independent probe reports: a stall whose measured duration remains below the declared RPC timeout, a stall whose requested and measured durations both exceed it, and a no-fault recovery run. The gate does not inject faults, deploy services or infer a timeout from wall-clock labels; the manifest references separate measured fault receipts and the raw reports.
+
+```json
+{
+  "schema": 1,
+  "scope": "internode-rpc-timeout-boundary",
+  "rpc_timeout_ms": 10000,
+  "under_budget": {"fault_receipt": "under-fault.json", "report": "under.json"},
+  "over_budget": {"fault_receipt": "over-fault.json", "report": "over.json"},
+  "recovery": {"report": "recovery.json"}
+}
+```
+
+```bash
+python3 scripts/check_internode_rpc_timeout_boundary.py --manifest /path/to/manifest.json --out /path/to/verification.json
+```
+
+Each fault receipt is a bounded JSON object containing a non-empty `target`, `requested_stall_ms` and `actual_stall_ms`. Exit 0 requires complete bulk coverage, exact offered-control coverage, no errors below the timeout, at least one `deadline` above it, and a zero-error recovery report. `schedule_drop` and `rpc_error` never substitute for the expected deadline. Exit 1 means structurally complete evidence did not satisfy the boundary; exit 2 means the evidence is invalid. The verifier binds all reports and fault receipts by SHA-256, rejects path escape/reuse and refuses to overwrite or alias raw evidence. Deployment ownership, actual fault delivery, phase-scoped telemetry and performance attribution remain separate gates.
 
 ## Acceptance gates
 

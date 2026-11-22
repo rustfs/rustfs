@@ -16,38 +16,98 @@
 
 use super::veeam_sosapi;
 use super::*;
-use crate::app::storage_api::object_usecase::access::replication_proxy_allowed;
-use crate::app::storage_api::s3::dto::{
-    ChecksumType, ContentType, ETag, HeadObjectInput, HeadObjectOutput, SSECustomerAlgorithm, ServerSideEncryption, StorageClass,
-    Timestamp,
-};
+
+use crate::app::dto_values::{stored_etag, timestamp};
 use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use crate::app::{Answered, RequestEnvelope};
+use rustfs_gateway_types::ByteRange;
+use rustfs_gateway_types::RangeParse;
+use rustfs_gateway_types::dto as gateway_dto;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+
 use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
 };
 
-async fn head_metadata_action_allowed(req: &S3Request<HeadObjectInput>, action: S3Action) -> S3Result<bool> {
-    let Ok(info) = req_info_ref(req) else {
+/// The DTO holds ordinary fields; ETag remains a native fact until either edge encodes it.
+#[derive(Debug)]
+pub(crate) struct HeadObjectOutputFacts {
+    pub(crate) dto: gateway_dto::HeadObjectOutput,
+    pub(crate) etag: Option<ResponseEtag>,
+}
+
+/// Stored spellings may be weak, empty, or unencodable as an HTTP header.
+/// Neither normalization nor header validation may erase that fact before the response edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResponseEtag {
+    pub(crate) opaque: String,
+    pub(crate) weak: bool,
+}
+
+impl ResponseEtag {
+    pub(crate) fn to_http_header(&self) -> Result<http::HeaderValue, http::header::InvalidHeaderValue> {
+        let prefix = if self.weak { "W/" } else { "" };
+        http::HeaderValue::from_str(&format!("{prefix}\"{}\"", self.opaque))
+    }
+
+    pub(super) fn from_stored(value: &str) -> Self {
+        let weak = value.starts_with("W/\"");
+        let etag = stored_etag(value);
+        Self {
+            opaque: etag.opaque_tag().to_owned(),
+            weak,
+        }
+    }
+
+    pub(super) fn from_proxy(value: &str) -> Option<Self> {
+        let (opaque, weak) = if let Some(rest) = value.strip_prefix("W/\"") {
+            (rest.strip_suffix('"')?, true)
+        } else if let Some(rest) = value.strip_prefix('"') {
+            (rest.strip_suffix('"')?, false)
+        } else {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+                return None;
+            }
+            (value, false)
+        };
+        opaque
+            .bytes()
+            .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte))
+            .then(|| Self {
+                opaque: opaque.to_owned(),
+                weak,
+            })
+    }
+}
+
+/// Raw decoded fields preserve legacy validation order, including keys below the wire floor.
+/// No Debug implementation: the customer key is bearer material.
+#[derive(Clone)]
+pub(crate) struct HeadObjectFields {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) version_id: Option<String>,
+    pub(crate) part_number: Option<i32>,
+    pub(crate) range: Option<ByteRange>,
+    pub(crate) sse_customer_key: Option<String>,
+    pub(crate) sse_customer_key_md5: Option<String>,
+}
+
+/// Whether the caller asked for the tag set itself (`x-amz-tagging-directive: ACCESS`).
+fn tagging_directive_is_access(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"ACCESS"))
+}
+
+async fn head_metadata_action_allowed(req: &RequestEnvelope, action: S3Action) -> S3Result<bool> {
+    // Metadata permissions still bind the owner when a policy explicitly denies them.
+    let mut probe = req.fork_for_authorization();
+    let Some(info) = probe.req_info_mut() else {
         return Ok(false);
     };
-    // No owner shortcut: an explicit bucket-policy Deny on these metadata
-    // actions binds the owner too (see `owner_can_bypass_policy_deny`).
-    let mut info = info.clone();
     info.suppress_denial_log = true;
     info.suppress_denial_audit = true;
-    let mut probe = S3Request {
-        input: (),
-        method: req.method.clone(),
-        uri: req.uri.clone(),
-        headers: req.headers.clone(),
-        extensions: req.extensions.clone(),
-        credentials: req.credentials.clone(),
-        region: req.region.clone(),
-        service: req.service.clone(),
-        trailing_headers: req.trailing_headers.clone(),
-    };
-    probe.extensions.insert(info);
     match authorize_request(&mut probe, Action::S3Action(action)).await {
         Ok(()) => Ok(true),
         Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
@@ -93,7 +153,7 @@ pub(super) fn odm_head_verdict(lookup: OdmLookup, miss: OdmLocalMiss) -> OdmHead
     let stats = state.stats();
     let unavailable = |error| {
         stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
-        OdmHeadVerdict::Fail(odm_source_error_response(policy, odm_state_error_class(error)))
+        OdmHeadVerdict::Fail(odm_source_error_response(policy, odm_state_error_class(error)).into())
     };
     match &lookup {
         OdmLookup::NegativeCached { .. } => {
@@ -121,27 +181,30 @@ pub(super) fn odm_head_verdict(lookup: OdmLookup, miss: OdmLocalMiss) -> OdmHead
     }
 }
 
-/// Maps the source's HEAD onto the s3s output. Only what the source can
+/// Maps the source's HEAD onto the owned output. Only what the source can
 /// vouch for is returned: the ETag and Last-Modified are the source's (the
 /// object is not local yet), no version id, no SSE headers and no storage
 /// class are reported.
-pub(super) fn odm_head_output(head: SourceHead) -> S3Result<HeadObjectOutput> {
+pub(super) fn odm_head_output(head: SourceHead) -> S3Result<HeadObjectOutputFacts> {
     let content_length = i64::try_from(head.size)
         .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "source object size exceeds the content-length range"))?;
-    Ok(HeadObjectOutput {
+    let dto = gateway_dto::HeadObjectOutput {
         content_length: Some(content_length),
-        content_type: head.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+        content_type: head.content_type,
         content_encoding: head.content_encoding,
         content_disposition: head.content_disposition,
         content_language: head.content_language,
         cache_control: head.cache_control,
-        expires: head.expires,
+        expires: head.expires.map(Into::into),
         accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
-        e_tag: head.etag.as_deref().map(to_s3s_etag),
-        last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
-        metadata: (!head.user_metadata.is_empty()).then_some(head.user_metadata),
+        last_modified: head.last_modified.map(OffsetDateTime::from).map(timestamp),
+        metadata: head.user_metadata.into_iter().collect(),
         website_redirect_location: head.website_redirect_location,
         ..Default::default()
+    };
+    Ok(HeadObjectOutputFacts {
+        dto,
+        etag: head.etag.as_deref().map(ResponseEtag::from_stored),
     })
 }
 
@@ -152,7 +215,7 @@ pub(super) async fn odm_head_from_source<S: OdmHeadSource>(
     state: &BucketOdmState,
     source: &S,
     key: &str,
-) -> S3Result<HeadObjectOutput> {
+) -> S3Result<HeadObjectOutputFacts> {
     let started = Instant::now();
     let result = source.head_object(key).await;
     state.observe_source(started.elapsed(), key, result.as_ref().err());
@@ -168,11 +231,11 @@ pub(super) async fn odm_head_from_source<S: OdmHeadSource>(
         }
         Err(err @ SourceError::Unsupported(_)) => {
             stats.record_request(OdmOp::Head, OdmOutcome::Unsupported);
-            Err(odm_source_unavailable_error(err.class_label()))
+            Err(odm_source_unavailable_error(err.class_label()).into())
         }
         Err(err) => {
             stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
-            Err(odm_source_error_response(&state.config().policy, err.class_label()))
+            Err(odm_source_error_response(&state.config().policy, err.class_label()).into())
         }
     }
 }
@@ -183,13 +246,13 @@ impl DefaultObjectUsecase {
     /// `None` means the runtime does not intervene and the caller keeps its
     /// original 404. The source answer is never written back or queued.
     async fn on_demand_migration_head(
-        req: &S3Request<HeadObjectInput>,
+        req: &RequestEnvelope,
         store: &ECStore,
         bucket: &str,
         key: &str,
         opts: &ObjectOptions,
         miss: OdmLocalMiss,
-    ) -> Option<S3Result<HeadObjectOutput>> {
+    ) -> Option<S3Result<HeadObjectOutputFacts>> {
         if !odm_request_may_consult_source(opts) {
             return None;
         }
@@ -228,37 +291,37 @@ impl DefaultObjectUsecase {
     }
 
     async fn finish_on_demand_migration_head(
-        req: &S3Request<HeadObjectInput>,
+        req: &RequestEnvelope,
         bucket: &str,
         helper: OperationHelper,
-        output: HeadObjectOutput,
-    ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let mut response = wrap_response_with_cors(bucket, &req.method, &req.headers, output).await;
+        output: HeadObjectOutputFacts,
+    ) -> S3Result<Answered<HeadObjectOutputFacts>> {
+        let mut response = read_answer(bucket, req.method(), req.headers(), output).await;
         mark_on_demand_migration_response(&mut response.headers);
         let result = Ok(response);
-        let _ = helper.complete(&result);
+        complete_read(helper, &result);
         result
     }
 
     /// Serve a HEAD whose local lookup failed with not-found by proxying to
     /// the bucket's replication targets (MinIO `proxyHeadToRepTarget`).
     async fn proxy_head_object_to_replication_targets(
-        req: &S3Request<HeadObjectInput>,
+        req: &RequestEnvelope,
         bucket: &str,
         key: &str,
         opts: &ObjectOptions,
-    ) -> Option<HeadObjectOutput> {
+        part_number: Option<i32>,
+    ) -> Option<HeadObjectOutputFacts> {
         let targets = get_read_proxy_targets(bucket, key, opts).await;
         if targets.is_empty() {
             return None;
         }
-        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let extra_headers = Self::proxy_read_passthrough_headers(req.headers());
         let range = req
-            .headers
+            .headers()
             .get(http::header::RANGE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let part_number = req.input.part_number;
 
         for target in targets {
             match target
@@ -276,7 +339,7 @@ impl DefaultObjectUsecase {
                     // MinIO-aligned accounting: one total per proxy attempt,
                     // one failed when no target served it.
                     record_replication_proxy(bucket, "HeadObject", false).await;
-                    return Some(Self::proxy_sdk_head_output_to_s3s(remote));
+                    return Some(Self::proxy_sdk_head_output(remote));
                 }
                 Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
                     debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
@@ -290,38 +353,39 @@ impl DefaultObjectUsecase {
         None
     }
 
-    /// Translate a proxied SDK HEAD response into the s3s output.
+    /// Translate a proxied SDK HEAD response into the owned output.
     ///
     /// Known gaps: the SDK's HeadObjectOutput does not model 206/Content-Range
     /// for a ranged HEAD (the SDK exposes no content_range member on HEAD),
-    /// and s3s' typed HeadObjectOutput has no tag_count field (the local path
+    /// and the typed HeadObjectOutput has no tag_count field (the local path
     /// injects x-amz-tagging-count as a raw header) — both are dropped for
     /// proxied HEADs.
-    fn proxy_sdk_head_output_to_s3s(remote: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> HeadObjectOutput {
-        HeadObjectOutput {
+    fn proxy_sdk_head_output(remote: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> HeadObjectOutputFacts {
+        let dto = gateway_dto::HeadObjectOutput {
             content_length: remote.content_length,
-            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_type: remote.content_type,
             content_encoding: remote.content_encoding,
             content_disposition: remote.content_disposition,
             content_language: remote.content_language,
             cache_control: remote.cache_control,
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
-            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
             last_modified: remote
                 .last_modified
                 .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
-                .map(Timestamp::from),
-            metadata: remote.metadata,
+                .map(timestamp),
+            metadata: remote.metadata.unwrap_or_default().into_iter().collect(),
             version_id: remote.version_id,
             server_side_encryption: remote
                 .server_side_encryption
-                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+                .map(|sse| gateway_dto::ServerSideEncryption::custom(sse.as_str().to_string())),
             sse_customer_algorithm: remote.sse_customer_algorithm,
             sse_customer_key_md5: remote.sse_customer_key_md5,
             ssekms_key_id: remote.ssekms_key_id,
             parts_count: remote.parts_count,
-            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
-            expiration: remote.expiration,
+            storage_class: remote
+                .storage_class
+                .map(|sc| gateway_dto::StorageClass::custom(sc.as_str().to_string())),
+            expiration: remote.expiration.map(Into::into),
             restore: remote.restore,
             website_redirect_location: remote.website_redirect_location,
             checksum_crc32: remote.checksum_crc32,
@@ -329,34 +393,41 @@ impl DefaultObjectUsecase {
             checksum_crc64nvme: remote.checksum_crc64_nvme,
             checksum_sha1: remote.checksum_sha1,
             checksum_sha256: remote.checksum_sha256,
-            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            checksum_type: remote
+                .checksum_type
+                .map(|ct| gateway_dto::ChecksumType::custom(ct.as_str().to_string())),
             ..Default::default()
+        };
+        HeadObjectOutputFacts {
+            dto,
+            etag: remote.e_tag.as_deref().and_then(ResponseEtag::from_proxy),
         }
     }
 
     async fn serve_veeam_sosapi_head(
         &self,
-        req: &S3Request<HeadObjectInput>,
+        req: &RequestEnvelope,
+        bucket: &str,
         store: &Arc<ECStore>,
         kind: veeam_sosapi::SosapiKind,
         part_number: Option<usize>,
         range: Option<&HTTPRangeSpec>,
-    ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let representation =
-            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
-        let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
-            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
+    ) -> S3Result<Answered<HeadObjectOutputFacts>> {
+        let representation = veeam_sosapi::read_representation(store, bucket, kind, req.headers(), part_number, range).await?;
+        let content_type = veeam_sosapi::CONTENT_TYPE.to_owned();
         let content_range = representation.content_range;
-        let output = HeadObjectOutput {
+        let dto = gateway_dto::HeadObjectOutput {
             content_length: Some(representation.content_length),
             content_type: Some(content_type),
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
-            last_modified: Some(Timestamp::from(representation.last_modified)),
-            e_tag: Some(to_s3s_etag(&representation.etag_hex)),
+            last_modified: Some(timestamp(representation.last_modified)),
             ..Default::default()
         };
-        let mut response = wrap_response_with_cors(&req.input.bucket, &req.method, &req.headers, output).await;
-        inject_accept_ranges_header(&mut response.headers);
+        let output = HeadObjectOutputFacts {
+            dto,
+            etag: Some(ResponseEtag::from_stored(&representation.etag_hex)),
+        };
+        let mut response = read_answer(bucket, req.method(), req.headers(), output).await;
         if let Some(content_range) = content_range {
             response.headers.insert(
                 http::header::CONTENT_RANGE,
@@ -368,29 +439,55 @@ impl DefaultObjectUsecase {
         Ok(response)
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_head_object(&self, mut req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+    pub(crate) async fn execute_head_object(
+        &self,
+        envelope: RequestEnvelope,
+        input: gateway_dto::HeadObjectInput,
+    ) -> S3Result<Answered<HeadObjectOutputFacts>> {
+        self.execute_head_object_fields(
+            envelope,
+            HeadObjectFields {
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                version_id: input.version_id,
+                part_number: input.part_number,
+                range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
+                    RangeParse::One(range) => Some(range),
+                    _ => None,
+                }),
+                sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+                sse_customer_key_md5: input.sse_customer_key_md5,
+            },
+        )
+        .await
+    }
+
+    #[instrument(level = "debug", skip(self, req, input))]
+    pub(crate) async fn execute_head_object_fields(
+        &self,
+        mut req: RequestEnvelope,
+        input: HeadObjectFields,
+    ) -> S3Result<Answered<HeadObjectOutputFacts>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject).suppress_event();
-        // mc get 2
-        let HeadObjectInput {
+        let mut helper = OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedHead, S3Operation::HeadObject)
+            .suppress_event();
+        let HeadObjectFields {
             bucket,
             key,
             version_id,
             part_number,
             range,
             ..
-        } = req.input.clone();
-
+        } = input.clone();
         // Validate object key
         validate_object_key(&key, "HEAD")?;
         // Parse part number from Option<i32> to Option<usize> with validation
         let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
 
-        let rs = range.map(range_to_http_range_spec).transpose()?;
+        let rs = range.map(byte_range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
@@ -410,14 +507,14 @@ impl DefaultObjectUsecase {
             && let Some(kind) = veeam_sosapi::handled_kind(&key)
         {
             let response = self
-                .serve_veeam_sosapi_head(&req, &store, kind, part_number, rs.as_ref())
+                .serve_veeam_sosapi_head(&req, &bucket, &store, kind, part_number, rs.as_ref())
                 .await?;
             let result = Ok(response);
-            let _ = helper.complete(&result);
+            complete_read(helper, &result);
             return result;
         }
 
-        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, req.headers())
             .await
             .map_err(ApiError::from)?;
         if is_lockless_cache_bucket(&bucket) {
@@ -453,14 +550,13 @@ impl DefaultObjectUsecase {
                     // Active-active replication lag window: an object missing
                     // locally may still be served by proxying the HEAD to a
                     // replication target (backlog#1675 P1-5).
-                    if replication_proxy_allowed(&req.extensions)
-                        && let Some(output) = Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts).await
+                    if req.object_tag_conditions().is_none()
+                        && let Some(output) =
+                            Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts, input.part_number).await
                     {
-                        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                        let response = read_answer(&bucket, req.method(), req.headers(), output).await;
                         let result = Ok(response);
-                        let _ = helper
-                            .version_id(req.input.version_id.clone().unwrap_or_default())
-                            .complete(&result);
+                        complete_read(helper.version_id(input.version_id.clone().unwrap_or_default()), &result);
                         return result;
                     }
                     if let Some(miss) = odm_miss
@@ -473,12 +569,15 @@ impl DefaultObjectUsecase {
                         &bucket,
                         &key,
                         &opts,
-                        S3Error::new(S3ErrorCode::NoSuchKey),
+                        S3Error::new(S3ErrorCode::NoSuchKey).into(),
                     )
-                    .await);
+                    .await
+                    .into());
                 }
                 // Other errors, such as insufficient permissions, still return the original error
-                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into()).await);
+                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into())
+                    .await
+                    .into());
             }
         };
         if info.delete_marker {
@@ -490,35 +589,32 @@ impl DefaultObjectUsecase {
                 {
                     return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                 }
-                return Err(with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey), &info, None));
+                return Err(with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey).into(), &info, None).into());
             }
             return Err(with_delete_marker_read_headers(
-                S3Error::new(S3ErrorCode::MethodNotAllowed),
+                S3Error::new(S3ErrorCode::MethodNotAllowed).into(),
                 &info,
                 opts.version_id.as_deref(),
-            ));
+            )
+            .into());
         }
         // An authorized replication convergence check only needs etag/size/mtime
         // to compare source and replica; it holds no customer key, so the SSE-C
         // read validation is skipped for it (and only it).
         let replication_check = replication_request_authorized(&req)
-            && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true");
+            && get_header(req.headers(), SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true");
         if !replication_check {
-            validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+            validate_sse_headers_for_read(&info.user_defined, req.headers())?;
 
             // Validate SSE-C: if the object was encrypted with a customer-provided key,
             // the caller must supply the matching key even for HEAD requests (per S3 spec).
-            validate_ssec_for_read(
-                &info.user_defined,
-                req.input.sse_customer_key.as_ref(),
-                req.input.sse_customer_key_md5.as_ref(),
-            )?;
+            validate_ssec_for_read(&info.user_defined, input.sse_customer_key.as_ref(), input.sse_customer_key_md5.as_ref())?;
         }
 
-        let conditions = check_preconditions(&req.headers, &info);
+        let conditions = check_preconditions(req.headers(), &info);
         if conditions.is_err() && !replication_check {
             let principal = SseKmsPrincipal::from_request(&req);
-            crate::storage::sse::validate_conditional_read(&bucket, &key, &info.user_defined, &req.headers, principal.as_ref())
+            crate::storage::sse::validate_conditional_read(&bucket, &key, &info.user_defined, req.headers(), principal.as_ref())
                 .await?;
         }
         conditions?;
@@ -528,21 +624,8 @@ impl DefaultObjectUsecase {
         // Clone ObjectInfo for event notification only when an event will
         // actually be built — the clone is expensive for multipart objects.
         let event_info = helper.wants_object_info().then(|| info.clone());
-        let content_type = {
-            if let Some(content_type) = &info.content_type {
-                match ContentType::from_str(content_type) {
-                    Ok(res) => Some(res),
-                    Err(err) => {
-                        error!(content_type = %content_type, error = ?err, "Archive content-type parse failed");
-                        //
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
-        let last_modified = info.mod_time.map(Timestamp::from);
+        let content_type = info.content_type.clone();
+        let last_modified = info.mod_time.map(timestamp);
 
         let content_length = info.get_actual_size().map_err(|e| {
             error!(error = %e, "Failed to resolve actual object size");
@@ -550,16 +633,14 @@ impl DefaultObjectUsecase {
         })?;
 
         let metadata_map = info.user_defined.clone();
-        let sse_customer_algorithm = metadata_map
-            .get("x-amz-server-side-encryption-customer-algorithm")
-            .map(|v| SSECustomerAlgorithm::from(v.clone()));
+        let sse_customer_algorithm = metadata_map.get("x-amz-server-side-encryption-customer-algorithm").cloned();
         let server_side_encryption = metadata_map
             .get("x-amz-server-side-encryption")
             .filter(|_| sse_customer_algorithm.is_none())
-            .map(|v| ServerSideEncryption::from(v.clone()));
+            .map(|v| gateway_dto::ServerSideEncryption::custom(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
-        let storage_class = response_storage_class(&info, &metadata_map);
+        let storage_class = response_storage_class_name(&info, &metadata_map);
         // checksum: classify once; additional algorithms (XXHash3/64/128, SHA-512, MD5)
         // land in `extra` and are emitted as raw headers below (s3s has no typed field).
         let ResponseChecksums {
@@ -570,12 +651,12 @@ impl DefaultObjectUsecase {
             crc64nvme: checksum_crc64nvme,
             checksum_type,
             extra: extra_checksum_headers,
-        } = if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
+        } = if let Some(checksum_mode) = req.headers().get(AMZ_CHECKSUM_MODE)
             && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
             && rs.is_none()
         {
             let (checksums, is_multipart) = info
-                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                .decrypt_checksums(opts.part_number.unwrap_or(0), req.headers())
                 .map_err(ApiError::from)?;
             classify_response_checksums(checksums, is_multipart)
         } else {
@@ -589,8 +670,7 @@ impl DefaultObjectUsecase {
         let website_redirect_location = metadata_map.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned();
         let expires = info
             .expires
-            .map(Timestamp::from)
-            .map(|expires| format_expires_header(&expires))
+            .map(|expires| expires.format(RFC1123).map_err(S3Error::internal_error))
             .transpose()?;
 
         // Calculate tag count from user_tags already in ObjectInfo
@@ -602,7 +682,7 @@ impl DefaultObjectUsecase {
             0
         };
         let effective_ec_block_size = info.effective_ec_block_size();
-        let output = HeadObjectOutput {
+        let dto = gateway_dto::HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
             content_encoding: info.content_encoding.clone(),
@@ -611,10 +691,12 @@ impl DefaultObjectUsecase {
             content_language,
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             website_redirect_location,
-            expires,
+            expires: expires.map(Into::into),
             last_modified,
-            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&metadata_map),
+            metadata: filter_object_metadata(&metadata_map)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             version_id: s3_response_version_id(info.version_id),
             server_side_encryption,
             sse_customer_algorithm,
@@ -625,20 +707,21 @@ impl DefaultObjectUsecase {
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
-            checksum_type,
-            storage_class,
+            checksum_type: checksum_type.map(gateway_dto::ChecksumType::custom),
+            storage_class: storage_class.map(gateway_dto::StorageClass::custom),
             // x-amz-restore from object metadata
-            restore: metadata_map.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
-                let rs = parse_restore_obj_status(v).ok()?;
-                Some(rs.to_string2())
-            }),
+            restore: None,
             // x-amz-expiration from lifecycle prediction
-            expiration: expiration_header,
+            expiration: expiration_header.map(Into::into),
             // metadata: object_metadata,
             ..Default::default()
         };
+        let output = HeadObjectOutputFacts {
+            dto,
+            etag: info.etag.as_deref().map(ResponseEtag::from_stored),
+        };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
+        let version_id = input.version_id.clone().unwrap_or_default();
         if let Some(event_info) = event_info {
             helper = helper.object(event_info);
         }
@@ -646,11 +729,11 @@ impl DefaultObjectUsecase {
 
         // NOTE ON CORS:
         // Bucket-level CORS headers are intentionally applied only for object retrieval
-        // operations (GET/HEAD) via `wrap_response_with_cors`. Other S3 operations that
+        // operations (GET/HEAD) via `read_answer`. Other S3 operations that
         // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
         // CORS layer instead. In case both are applicable, this bucket-level CORS logic
         // takes precedence for these read operations.
-        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+        let mut response = read_answer(&bucket, req.method(), req.headers(), output).await;
 
         // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
         // carry on the typed HeadObjectOutput (#1257).
@@ -663,7 +746,7 @@ impl DefaultObjectUsecase {
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
-        let tagging_action = if req.input.version_id.is_some() {
+        let tagging_action = if input.version_id.is_some() {
             S3Action::GetObjectVersionTaggingAction
         } else {
             S3Action::GetObjectTaggingAction
@@ -674,6 +757,16 @@ impl DefaultObjectUsecase {
                 response.headers.insert(header_name, header_value);
             } else {
                 warn!("Failed to parse x-amz-tagging-count header; skipping");
+            }
+            // MinIO `x-amz-tagging-directive: ACCESS`: a replication source
+            // compares the replica's tag set, which the count cannot express.
+            // Gated by the same authorization as the count above.
+            if tagging_directive_is_access(req.headers())
+                && let Ok(header_value) = HeaderValue::from_str(&info.user_tags)
+            {
+                response
+                    .headers
+                    .insert(http::HeaderName::from_static(rustfs_utils::http::AMZ_OBJECT_TAGGING_LOWER), header_value);
             }
         }
         let retention_allowed = replication_check
@@ -755,7 +848,7 @@ impl DefaultObjectUsecase {
         }
 
         let result = Ok(response);
-        let _ = helper.complete(&result);
+        complete_read(helper, &result);
 
         result
     }
@@ -765,6 +858,7 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use crate::app::storage_api::s3::dto::Range;
+    use crate::app::storage_api::s3::{S3Request, dto::HeadObjectInput};
     use crate::on_demand_migration::{
         BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
         Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,
@@ -894,34 +988,45 @@ mod tests {
     #[test]
     fn odm_head_output_maps_source_fields_and_hides_local_only_headers() {
         let output = odm_head_output(source_head()).expect("source HEAD maps");
-        assert_eq!(output.content_length, Some(1234));
-        assert_eq!(output.content_type.as_ref().map(|v| v.to_string()), Some("text/plain".to_string()));
-        assert_eq!(output.content_encoding.as_deref(), Some("gzip"));
-        assert_eq!(output.content_disposition.as_deref(), Some("attachment; filename=\"a.txt\""));
-        assert_eq!(output.content_language.as_deref(), Some("en"));
-        assert_eq!(output.cache_control.as_deref(), Some("max-age=60"));
-        assert_eq!(output.expires.as_deref(), Some("Thu, 01 Jan 2026 00:00:00 GMT"));
-        assert_eq!(output.accept_ranges.as_deref(), Some("bytes"));
+        assert_eq!(output.dto.content_length, Some(1234));
+        assert_eq!(output.dto.content_type.as_ref().map(|v| v.to_string()), Some("text/plain".to_string()));
+        assert_eq!(output.dto.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(output.dto.content_disposition.as_deref(), Some("attachment; filename=\"a.txt\""));
+        assert_eq!(output.dto.content_language.as_deref(), Some("en"));
+        assert_eq!(output.dto.cache_control.as_deref(), Some("max-age=60"));
         assert_eq!(
-            output.e_tag,
-            Some(ETag::Strong("d41d8cd98f00b204e9800998ecf8427e-3".to_string())),
+            output.dto.expires.as_ref().map(|value| value.as_str()),
+            Some("Thu, 01 Jan 2026 00:00:00 GMT")
+        );
+        assert_eq!(output.dto.accept_ranges.as_deref(), Some("bytes"));
+        assert_eq!(
+            output.etag,
+            Some(ResponseEtag {
+                opaque: "d41d8cd98f00b204e9800998ecf8427e-3".to_owned(),
+                weak: false
+            }),
             "the source ETag is returned as-is"
         );
-        let last_modified: OffsetDateTime = output.last_modified.expect("source Last-Modified is returned").into();
+        let last_modified =
+            OffsetDateTime::from_unix_timestamp(output.dto.last_modified.expect("source Last-Modified is returned").secs())
+                .unwrap();
         assert_eq!(last_modified.unix_timestamp(), 1_445_412_480);
-        assert_eq!(output.metadata, Some(HashMap::from([("owner".to_string(), "alice".to_string())])));
-        assert_eq!(output.version_id, None, "no x-amz-version-id for a source answer");
-        assert_eq!(output.server_side_encryption, None);
-        assert_eq!(output.ssekms_key_id, None);
-        assert_eq!(output.sse_customer_algorithm, None);
-        assert_eq!(output.storage_class, None);
-        assert_eq!(output.replication_status, None);
+        assert_eq!(
+            output.dto.metadata,
+            std::collections::BTreeMap::from([("owner".to_string(), "alice".to_string())])
+        );
+        assert_eq!(output.dto.version_id, None, "no x-amz-version-id for a source answer");
+        assert_eq!(output.dto.server_side_encryption, None);
+        assert_eq!(output.dto.ssekms_key_id, None);
+        assert_eq!(output.dto.sse_customer_algorithm, None);
+        assert_eq!(output.dto.storage_class, None);
+        assert_eq!(output.dto.replication_status, None);
 
         let bare = odm_head_output(SourceHead::default()).expect("empty source HEAD maps");
-        assert_eq!(bare.content_length, Some(0));
-        assert_eq!(bare.e_tag, None);
-        assert_eq!(bare.metadata, None, "no metadata header family for an empty map");
-        assert_eq!(bare.last_modified, None);
+        assert_eq!(bare.dto.content_length, Some(0));
+        assert_eq!(bare.etag, None);
+        assert!(bare.dto.metadata.is_empty(), "no metadata header family for an empty map");
+        assert_eq!(bare.dto.last_modified, None);
     }
 
     #[tokio::test]
@@ -931,7 +1036,7 @@ mod tests {
         let source = ScriptedSource::new(vec![Ok(source_head())]);
 
         let output = odm_head_from_source(&state, &source, "k").await.expect("source hit");
-        assert_eq!(output.content_length, Some(1234));
+        assert_eq!(output.dto.content_length, Some(1234));
         assert_eq!(source.calls(), 1);
         assert_eq!(head_count(&state, OdmOutcome::SourceHit), 1);
         let snapshot = state.stats().snapshot(state.breaker().state());
@@ -953,12 +1058,12 @@ mod tests {
         let source = ScriptedSource::new(vec![Err(SourceError::NotFound)]);
 
         let err = odm_head_from_source(&state, &source, "gone").await.expect_err("source 404");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::SourceMiss), 1);
 
         // The second HEAD stops at the negative cache: no source call.
         let err = fail(&sys, "b", "gone", OdmLocalMiss::NotFound);
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::NegativeCached), 1);
         assert_eq!(source.calls(), 1);
         assert!(
@@ -1009,7 +1114,7 @@ mod tests {
         let hidden = consult(&hidden_sys, "h", "k");
         let source = ScriptedSource::new(vec![Err(SourceError::ServerError(503))]);
         let err = odm_head_from_source(&hidden, &source, "k").await.expect_err("503 hidden");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&hidden, OdmOutcome::SourceError), 1);
 
         // Consecutive scoring failures open the breaker; later HEADs stop
@@ -1028,7 +1133,7 @@ mod tests {
         }
         assert_eq!(state.breaker().state(), BreakerState::Open);
         let err = fail(&breaker_sys, "c", "k", OdmLocalMiss::NotFound);
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::BreakerOpen), 1);
         assert_eq!(
             source.calls(),
@@ -1069,7 +1174,7 @@ mod tests {
         )
         .await;
         let err = fail(&sys, "b", "k", OdmLocalMiss::NotFound);
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         let state = sys.state("b").expect("configured");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 1);
         assert_eq!(state.stats().snapshot(state.breaker().state()).source_latency.count, 0);
@@ -1115,17 +1220,20 @@ mod tests {
         cfg.policy.source_error = SourceErrorPolicy::NotFound;
         sys.apply("b", Some(&cfg)).await;
         let err = fail(&sys, "b", "k", OdmLocalMiss::NotFound);
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.code().as_str(), "NoSuchKey");
     }
 
-    fn head_input(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
-        let input = HeadObjectInput::builder()
+    fn head_object_input(bucket: &str, key: &str, version_id: Option<String>) -> HeadObjectInput {
+        HeadObjectInput::builder()
             .bucket(bucket.to_string())
             .key(key.to_string())
             .version_id(version_id)
             .build()
-            .unwrap();
-        build_request(input, Method::HEAD)
+            .unwrap()
+    }
+
+    pub(super) fn head_input(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
+        build_request(head_object_input(bucket, key, version_id), Method::HEAD)
     }
 
     #[test]
@@ -1134,15 +1242,13 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("head-metadata-permissions", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
             use crate::app::storage_api::test::ReqInfo;
-            use crate::app::storage_api::test::S3Access as _;
+            use crate::app::storage_api::test::authorize_head_object;
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-            use crate::app::storage_api::test::ecfs::FS;
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let fs = FS::with_server_ctx(slot.clone());
             let usecase = DefaultObjectUsecase::with_context(Some(context));
             let bucket = format!("head-metadata-{}", Uuid::new_v4().simple());
             store
@@ -1196,17 +1302,27 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                for version in [None, object.version_id.map(|version| version.to_string())] {
-                    let mut req = head_input(&bucket, "protected", version);
+                let version_id = object.version_id.map(|version| version.to_string());
+                for (version, tagging_directive) in [(None, false), (None, true), (version_id, true)] {
+                    let mut req = head_input(&bucket, "protected", version.clone());
+                    if tagging_directive {
+                        req.headers
+                            .insert(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER, HeaderValue::from_static("ACCESS"));
+                    }
                     req.extensions.insert(ReqInfo::default());
                     req.extensions.insert(slot.clone());
                     if replica {
                         req.headers
                             .insert("x-rustfs-source-replication-check", HeaderValue::from_static("true"));
                     }
-                    fs.head_object(&mut req).await.expect("ordinary HEAD read is permitted");
-                    let response = Box::pin(usecase.execute_head_object(req)).await.expect("HEAD succeeds");
-                    assert_eq!(response.output.content_length, Some(4));
+                    let mut envelope = RequestEnvelope::from_s3s(&req);
+                    authorize_head_object(&slot, &mut envelope, &bucket, "protected", version.as_deref())
+                        .await
+                        .expect("ordinary HEAD read is permitted");
+                    let response = Box::pin(usecase.execute_head_object_fields(envelope, HeadObjectFields::from_s3s(req.input)))
+                        .await
+                        .expect("HEAD succeeds");
+                    assert_eq!(response.output.dto.content_length, Some(4));
                     for header in [
                         AMZ_TAG_COUNT,
                         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -1219,6 +1335,17 @@ mod tests {
                             "header {header}"
                         );
                     }
+                    // The tag set is returned only on request, under the same
+                    // authorization as the tag count.
+                    assert_eq!(
+                        response
+                            .headers
+                            .get(rustfs_utils::http::AMZ_OBJECT_TAGGING_LOWER)
+                            .map(HeaderValue::as_bytes),
+                        (tagging_directive && (replica || (grant && !explicit_deny)))
+                            .then_some(b"classification=secret".as_slice()),
+                        "tag set header, directive {tagging_directive}"
+                    );
                 }
             }
         });
@@ -1286,33 +1413,44 @@ mod tests {
         let state = sys.state(&bucket).expect("bucket runtime installed");
 
         // Local hit: served locally, the runtime is never entered.
-        let response = Box::pin(usecase.execute_head_object(head_input(&bucket, "present", None)))
-            .await
-            .expect("local object is served");
+        let response = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect("local object is served");
         assert_eq!(response.output.content_length, Some(7));
         assert!(response.headers.get(ON_DEMAND_MIGRATION_HEADER).is_none());
         assert_no_head_traffic(&state);
 
         // HEAD ?versionId on a missing object never consults the runtime.
-        let err = Box::pin(usecase.execute_head_object(head_input(&bucket, "missing", Some(Uuid::new_v4().to_string()))))
-            .await
-            .expect_err("missing version");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "missing", Some(Uuid::new_v4().to_string())),
+        ))
+        .await
+        .expect_err("missing version");
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_no_head_traffic(&state);
 
         // The anti-loop marker (any value) keeps the answer local.
         let mut req = head_input(&bucket, "missing", None);
         req.headers
             .insert("x-minio-source-proxy-request", HeaderValue::from_static("false"));
-        let err = Box::pin(usecase.execute_head_object(req)).await.expect_err("missing object");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        let err = Box::pin(crate::app::test_seams::head_object(&usecase, req))
+            .await
+            .expect_err("missing object");
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_no_head_traffic(&state);
 
         // A plain miss reaches the runtime; local_only answers 404 there.
-        let err = Box::pin(usecase.execute_head_object(head_input(&bucket, "missing", None)))
-            .await
-            .expect_err("missing object");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 1);
 
         // Latest delete marker: respected by default, a miss once overridden.
@@ -1327,10 +1465,13 @@ mod tests {
             )
             .await
             .expect("write delete marker");
-        let err = Box::pin(usecase.execute_head_object(head_input(&bucket, "present", None)))
-            .await
-            .expect_err("delete marker hides the object");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect_err("delete marker hides the object");
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(
             head_count(&state, OdmOutcome::Filtered),
             1,
@@ -1344,10 +1485,13 @@ mod tests {
             Some(&cfg),
         )
         .await;
-        let err = Box::pin(usecase.execute_head_object(head_input(&bucket, "present", None)))
-            .await
-            .expect_err("local_only still answers 404");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect_err("local_only still answers 404");
+        assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 2, "overridden delete marker is a miss");
 
         // A bucket without a runtime keeps the plain 404.
@@ -1357,10 +1501,13 @@ mod tests {
             .await
             .expect("create plain bucket");
         assert!(sys.state(&plain).is_none());
-        let err = Box::pin(usecase.execute_head_object(head_input(&plain, "missing", None)))
-            .await
-            .expect_err("missing object");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&plain, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
+        assert_eq!(err.code().as_str(), "NoSuchKey");
 
         sys.remove(&bucket);
     }
@@ -1375,10 +1522,15 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::HEAD);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_head_object(req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidArgument");
     }
 }
+
+#[cfg(test)]
+#[path = "head_response_test.rs"]
+mod response_tests;

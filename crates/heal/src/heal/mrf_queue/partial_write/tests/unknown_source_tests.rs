@@ -179,7 +179,7 @@ async fn unknown_source_deleted_bucket_probes_preserve_errors_and_bound_retries(
         assert_eq!(row.bucket_incarnation_id, None);
         assert_eq!(row.source_bucket_incarnation_id, None);
         assert_eq!(
-            row.last_identity_probe_result,
+            row.last_identity_probe_result.as_deref(),
             Some(if matches!(outcome, Lookup::Identity(None)) {
                 "unresolved"
             } else {

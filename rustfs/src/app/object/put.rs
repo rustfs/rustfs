@@ -14,18 +14,19 @@
 
 //! PutObject write path: body admission, eager commit, zero-copy tuning.
 
+use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
+use super::request_body::UploadChunks;
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    CacheControl, ContentDisposition, ContentEncoding, ContentLanguage, ContentType, ObjectLockLegalHoldStatus, ObjectLockMode,
-    PutObjectInput, PutObjectOutput, SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId, ServerSideEncryption, StorageClass,
-    StreamingBlob, TaggingHeader, Timestamp, WebsiteRedirectLocation,
-};
+use crate::app::RequestEnvelope;
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
 use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError, s3_error};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use futures::FutureExt;
+use rustfs_gateway_stream::Body as NativeBody;
+use rustfs_rio::SharedTrailerSource;
 
-use crate::app::trailer_adapter::trailer_source;
-use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
+use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
 use http::HeaderName;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
@@ -149,7 +150,7 @@ pub(crate) fn reject_oversize_single_upload(size: i64) -> S3Result<()> {
     if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
         return Err(S3Error::with_message(
             S3ErrorCode::EntityTooLarge,
-            ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+            ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge),
         ));
     }
     Ok(())
@@ -168,14 +169,14 @@ pub(crate) fn put_object_body_read_timeout() -> Duration {
 
 /// Enforces a maximum size on the decoded request entity while preserving the
 /// streaming behavior of the underlying S3 body.
-struct MaxContentLengthStream {
-    inner: StreamingBlob,
+struct MaxContentLengthStream<S> {
+    inner: S,
     limit: u64,
     received: u64,
     exceeded: bool,
 }
 
-impl Stream for MaxContentLengthStream {
+impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for MaxContentLengthStream<S> {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -207,7 +208,7 @@ impl Stream for MaxContentLengthStream {
     }
 }
 
-impl ByteStream for MaxContentLengthStream {
+impl<S: ByteStream<Item = Result<Bytes, StdError>> + Unpin> ByteStream for MaxContentLengthStream<S> {
     fn remaining_length(&self) -> RemainingLength {
         let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
         let inner = self.inner.remaining_length();
@@ -541,7 +542,7 @@ fn select_put_path_with_concurrency(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-pub(super) async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
+pub(super) async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> rustfs_s3_types::S3Result<()>
 where
     R: AsyncRead + Unpin,
     B: bytes::BufMut,
@@ -554,7 +555,7 @@ where
             .await
             .map_err(ApiError::from)?;
         if read == 0 {
-            return Err(s3_error!(IncompleteBody));
+            return Err(rustfs_s3_types::s3_error!(IncompleteBody));
         }
         filled += read;
     }
@@ -564,13 +565,17 @@ where
         .await
         .map_err(ApiError::from)?;
     if extra_read != 0 {
-        return Err(s3_error!(UnexpectedContent));
+        return Err(rustfs_s3_types::s3_error!(UnexpectedContent));
     }
 
     Ok(())
 }
 
-async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+async fn read_small_put_body_exact_pooled<R>(
+    mut body: R,
+    size: usize,
+    pool: &BytesPool,
+) -> rustfs_s3_types::S3Result<PooledBuffer>
 where
     R: AsyncRead + Unpin,
 {
@@ -585,7 +590,7 @@ where
 /// Read small PUT body into a directly-allocated buffer, bypassing BytesPool.
 /// Used for objects ≤4KiB where pool contention under high concurrency
 /// outweighs the allocation cost.
-async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Result<std::io::Cursor<Vec<u8>>>
+async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> rustfs_s3_types::S3Result<std::io::Cursor<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -594,7 +599,20 @@ where
     Ok(std::io::Cursor::new(buf))
 }
 
-async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
+// Frames retained by an eager reader or cache may outlive the next RDMA reservation.
+fn retained_put_frame(frame: Bytes, release_staging: bool) -> Bytes {
+    if release_staging {
+        Bytes::copy_from_slice(&frame)
+    } else {
+        frame
+    }
+}
+
+async fn read_zero_copy_put_body_exact<S, E>(
+    mut body: S,
+    size: usize,
+    registered_body: bool,
+) -> rustfs_s3_types::S3Result<ChunkedBytesReader>
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
     E: Into<StdError>,
@@ -604,25 +622,26 @@ where
 
     while filled < size {
         let Some(chunk) = body.next().await else {
-            return Err(s3_error!(IncompleteBody));
+            return Err(rustfs_s3_types::s3_error!(IncompleteBody));
         };
         let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if chunk.is_empty() {
             continue;
         }
         if filled.saturating_add(chunk.len()) > size {
-            return Err(s3_error!(UnexpectedContent));
+            return Err(rustfs_s3_types::s3_error!(UnexpectedContent));
         }
 
         rustfs_io_metrics::record_zero_copy_buffer_operation("put_chunk", chunk.len());
         filled += chunk.len();
-        chunks.push(chunk);
+        let release_staging = registered_body && chunk.len() < size;
+        chunks.push(retained_put_frame(chunk, release_staging));
     }
 
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if !chunk.is_empty() {
-            return Err(s3_error!(UnexpectedContent));
+            return Err(rustfs_s3_types::s3_error!(UnexpectedContent));
         }
     }
 
@@ -732,21 +751,23 @@ async fn wait_for_put_post_store_test_hook(bucket: &str) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn apply_put_request_metadata(
+pub(super) fn apply_put_request_metadata_native(
     metadata: &mut HashMap<String, String>,
     headers: &HeaderMap,
     object_name: &str,
-    cache_control: Option<CacheControl>,
-    content_disposition: Option<ContentDisposition>,
-    content_encoding: Option<ContentEncoding>,
-    content_language: Option<ContentLanguage>,
-    content_type: Option<ContentType>,
-    expires: Option<String>,
-    website_redirect_location: Option<WebsiteRedirectLocation>,
-    tagging: Option<TaggingHeader>,
-    storage_class: Option<StorageClass>,
+    content: PutObjectContentInput,
 ) -> S3Result<()> {
+    let PutObjectContentInput {
+        cache_control,
+        content_disposition,
+        content_encoding,
+        content_language,
+        content_type,
+        expires,
+        website_redirect_location,
+        tagging,
+        storage_class,
+    } = content;
     namespace_reserved_user_metadata(metadata);
     let expires = parse_expires_header(expires.as_deref())?;
     apply_standard_object_metadata(
@@ -851,15 +872,15 @@ fn ec_block_size_hint_write_eligible(
         && !shard_integrity_rollout
 }
 
-pub(super) fn apply_put_request_object_lock_opts(
+pub(super) fn apply_put_request_object_lock_opts_native(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
-    object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
-    object_lock_mode: Option<ObjectLockMode>,
-    object_lock_retain_until_date: Option<Timestamp>,
+    object_lock_legal_hold_status: Option<String>,
+    object_lock_mode: Option<String>,
+    object_lock_retain_until_date: Option<time::OffsetDateTime>,
     opts: &mut ObjectOptions,
 ) -> S3Result<()> {
-    if let Some(eval_metadata) = build_put_like_object_lock_metadata(
+    if let Some(eval_metadata) = build_put_like_object_lock_metadata_native(
         bucket,
         object_lock_config_state,
         object_lock_legal_hold_status,
@@ -969,52 +990,52 @@ async fn fill_object_data_cache_after_put(
     debug!(bucket, key, size = info.size, ?result, "fill-on-put");
 }
 
-pub(super) fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
+pub(super) fn is_sse_kms_requested(input: &PutObjectWriteInput, headers: &HeaderMap) -> bool {
     input
         .server_side_encryption
         .as_ref()
-        .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+        .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case("aws:kms"))
         || input.ssekms_key_id.is_some()
         || headers
             .get(AMZ_SERVER_SIDE_ENCRYPTION)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("aws:kms"))
         || headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)
 }
 
-fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
+fn is_post_object_sse_kms_requested(input: &PutObjectWriteInput, headers: &HeaderMap) -> bool {
     is_sse_kms_requested(input, headers)
 }
 
 /// Standard content headers and the tagging / storage-class values of a PUT
-/// that become object metadata through [`apply_put_request_metadata`].
+/// that become object metadata through [`apply_put_request_metadata_native`].
 pub(super) struct PutObjectContentInput {
-    pub(super) cache_control: Option<CacheControl>,
-    pub(super) content_disposition: Option<ContentDisposition>,
-    pub(super) content_encoding: Option<ContentEncoding>,
-    pub(super) content_language: Option<ContentLanguage>,
-    pub(super) content_type: Option<ContentType>,
+    pub(super) cache_control: Option<String>,
+    pub(super) content_disposition: Option<String>,
+    pub(super) content_encoding: Option<String>,
+    pub(super) content_language: Option<String>,
+    pub(super) content_type: Option<String>,
     pub(super) expires: Option<String>,
-    pub(super) website_redirect_location: Option<WebsiteRedirectLocation>,
-    pub(super) tagging: Option<TaggingHeader>,
-    pub(super) storage_class: Option<StorageClass>,
+    pub(super) website_redirect_location: Option<String>,
+    pub(super) tagging: Option<String>,
+    pub(super) storage_class: Option<String>,
 }
 
 /// Encryption inputs of a PUT after the S3 input/header merge.
 pub(super) struct PutObjectSseInput {
-    pub(super) server_side_encryption: Option<ServerSideEncryption>,
-    pub(super) ssekms_key_id: Option<SSEKMSKeyId>,
-    pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
-    pub(super) sse_customer_key: Option<s3s::dto::SSECustomerKey>,
-    pub(super) sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub(super) server_side_encryption: Option<String>,
+    pub(super) ssekms_key_id: Option<String>,
+    pub(super) sse_customer_algorithm: Option<String>,
+    pub(super) sse_customer_key: Option<String>,
+    pub(super) sse_customer_key_md5: Option<String>,
 }
 
 /// Explicit Object Lock values of a PUT; all `None` means the bucket default
 /// retention decides.
 pub(super) struct PutObjectLockInput {
-    pub(super) legal_hold_status: Option<ObjectLockLegalHoldStatus>,
-    pub(super) mode: Option<ObjectLockMode>,
-    pub(super) retain_until_date: Option<Timestamp>,
+    pub(super) legal_hold_status: Option<String>,
+    pub(super) mode: Option<String>,
+    pub(super) retain_until_date: Option<time::OffsetDateTime>,
 }
 
 /// Expected body MD5 as the caller carries it. It is decoded at the same
@@ -1033,8 +1054,9 @@ pub(super) enum PutObjectOrigin<'a> {
     /// audit/notification chain and the bucket-generation guard installed by
     /// the access layer all come from the request.
     S3 {
-        req: &'a S3Request<PutObjectInput>,
+        req: &'a RequestEnvelope,
         event_name: EventName,
+        registered_body: bool,
     },
     /// A trusted in-process caller writing on the server's behalf. There is no
     /// request and no credential: managed-SSE authorization treats the write
@@ -1059,7 +1081,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1118,8 +1140,11 @@ pub(super) struct PutObjectWriteRequest<'a> {
     pub(super) inbound_replication_put: bool,
     /// Request headers, or the object's content headers for an internal write.
     pub(super) headers: &'a HeaderMap,
+    pub(super) metadata_headers: &'a HeaderMap,
+    pub(super) checksum_headers: &'a HeaderMap,
     pub(super) query: Option<&'a str>,
-    pub(super) trailing_headers: Option<s3s::TrailingHeaders>,
+    pub(super) trailing_headers: Option<SharedTrailerSource>,
+    pub(super) max_content_length: Option<u64>,
     pub(super) version_id: Option<String>,
     pub(super) sse: PutObjectSseInput,
     /// User metadata keyed the way s3s delivers it (`x-amz-meta-` stripped).
@@ -1160,12 +1185,14 @@ impl PutObjectCompletion {
         }
     }
 
-    fn complete<T>(self, result: &S3Result<S3Response<T>>) -> Self {
+    fn complete<T>(self, result: &rustfs_s3_types::S3Result<T>, status: http::StatusCode, headers: &HeaderMap) -> Self {
         match self {
-            Self::S3(helper) => Self::S3(helper.complete(result)),
+            Self::S3(helper) => Self::S3(helper.complete_owned(result, status, headers)),
             Self::Internal(event) => {
-                if let Some(event) = event {
-                    event.complete(result);
+                if result.is_ok()
+                    && let Some(event) = event
+                {
+                    event.publish(headers);
                 }
                 Self::Internal(None)
             }
@@ -1174,9 +1201,9 @@ impl PutObjectCompletion {
 }
 
 /// Record the failed completion and hand the error back to the caller.
-fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
-    let result: S3Result<S3Response<()>> = Err(err);
-    let _ = completion.complete(&result);
+fn fail_put_object(completion: PutObjectCompletion, err: rustfs_s3_types::S3Error) -> rustfs_s3_types::S3Error {
+    let result: rustfs_s3_types::S3Result<()> = Err(err);
+    let _ = completion.complete(&result, http::StatusCode::OK, &HeaderMap::new());
     match result {
         Err(err) => err,
         Ok(_) => unreachable!("failed PutObject completion carries an error"),
@@ -1187,10 +1214,10 @@ fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
 pub(super) struct PutObjectCommitted {
     pub(super) obj_info: ObjectInfo,
     pub(super) put_versioned: bool,
-    pub(super) effective_sse: Option<ServerSideEncryption>,
-    pub(super) effective_kms_key_id: Option<SSEKMSKeyId>,
-    pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
-    pub(super) sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub(super) effective_sse: Option<String>,
+    pub(super) effective_kms_key_id: Option<String>,
+    pub(super) sse_customer_algorithm: Option<String>,
+    pub(super) sse_customer_key_md5: Option<String>,
     pub(super) put_extra_checksum_headers: Vec<(&'static str, String)>,
     pub(super) ec_block_size_hint_outcome: EcBlockSizeHintOutcome,
     completion: Option<PutObjectCompletion>,
@@ -1207,9 +1234,9 @@ pub(super) struct PutObjectCommitted {
 impl PutObjectCommitted {
     /// Publish the audit entry / creation event for `result`, record the
     /// request-level PutObject metrics and release the request guard.
-    pub(super) fn finish<T>(mut self, result: &S3Result<S3Response<T>>) {
+    pub(super) fn finish<T>(mut self, result: &rustfs_s3_types::S3Result<T>, status: http::StatusCode, headers: &HeaderMap) {
         if let Some(completion) = self.completion.take() {
-            let _ = completion.complete(result);
+            let _ = completion.complete(result, status, headers);
         }
     }
 }
@@ -1219,8 +1246,8 @@ impl Drop for PutObjectCommitted {
         // This value exists only after the owned storage operation succeeds.
         // A lost HTTP receiver must not discard the committed write's event.
         if let Some(completion) = self.completion.take() {
-            let result = Ok(S3Response::new(()));
-            let _ = completion.complete(&result);
+            let result = Ok(());
+            let _ = completion.complete(&result, http::StatusCode::OK, &HeaderMap::new());
         }
         rustfs_io_metrics::record_put_object(
             self.start_time.elapsed().as_millis() as f64,
@@ -1248,32 +1275,35 @@ impl DefaultObjectUsecase {
         size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
     }
 
-    fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
-        if req.extensions.get::<PostObjectRequestMarker>().is_some() {
+    fn put_object_execution_context(req: &RequestEnvelope) -> (EventName, QuotaOperation, &'static str) {
+        if req.post_object().is_some() {
             (put_event_name_for_post_object(true), QuotaOperation::PostObject, "POST")
         } else {
             (put_event_name_for_post_object(false), QuotaOperation::PutObject, "PUT")
         }
     }
 
-    #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
-    pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        self.execute_put_object_boxed(_fs, req).await
+    #[hotpath::measure(
+        impl_type = "DefaultObjectUsecase",
+        future = true,
+        label = "rustfs::app::object::put::DefaultObjectUsecase::execute_put_object"
+    )]
+    pub(crate) async fn execute_put_object_owned(
+        &self,
+        envelope: RequestEnvelope,
+        input: PutObjectWriteInput,
+    ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        Box::pin(self.execute_put_object_inner(envelope, input)).await
     }
 
-    fn execute_put_object_boxed<'a>(
-        &'a self,
-        _fs: &'a FS,
-        req: S3Request<PutObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<PutObjectOutput>>> + Send + 'a {
-        Box::pin(self.execute_put_object_inner(_fs, req))
-    }
-
-    async fn execute_put_object_inner(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+    async fn execute_put_object_inner(
+        &self,
+        envelope: RequestEnvelope,
+        input: PutObjectWriteInput,
+    ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        use rustfs_s3_types::{S3Error, S3ErrorCode};
         let start_time = std::time::Instant::now();
         let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
-        let mut req = req;
 
         let request_shape_stage_start = put_stage_metrics_enabled.then(Instant::now);
 
@@ -1285,54 +1315,58 @@ impl DefaultObjectUsecase {
         // this use case runs. Attribute that already-paid request prefix from
         // the request context without adding per-request work when stage
         // metrics are disabled.
-        if put_stage_metrics_enabled && let Some(context) = req.extensions.get::<request_context::RequestContext>() {
+        if put_stage_metrics_enabled && let Some(context) = envelope.request_context() {
             rustfs_io_metrics::record_put_object_stage_duration(
                 "request_ingress_to_context",
                 context.start_time.elapsed().as_secs_f64() * 1000.0,
             );
         }
 
-        let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
+        let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&envelope);
         let max_content_length = parse_presigned_put_max_content_length(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+            envelope.headers(),
+            envelope.uri().query(),
+            envelope.verified_presigned().is_some(),
         )?;
-        if req.extensions.get::<PostObjectRequestMarker>().is_some() && is_post_object_sse_kms_requested(&req.input, &req.headers)
-        {
-            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
+        if envelope.post_object().is_some() && is_post_object_sse_kms_requested(&input, envelope.headers()) {
+            return Err(rustfs_s3_types::s3_error!(
+                NotImplemented,
+                "SSE-KMS is not supported for POST object uploads"
+            ));
         }
-        if let Some(ref storage_class) = req.input.storage_class
+        if let Some(ref storage_class) = input.storage_class
             && !is_valid_storage_class(storage_class.as_str())
         {
-            return Err(s3_error!(InvalidStorageClass));
+            return Err(rustfs_s3_types::s3_error!(InvalidStorageClass));
         }
-        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref(), &req.headers)?;
+        reject_non_wildcard_write_if_none_match(input.specific_if_none_match, envelope.headers())?;
         // An authorized inbound replication PUT must store the replica verbatim.
         // Legacy snowball-extracted members may still carry the auto-extract
         // metadata, which replication replays as a header. Do not interpret that
         // historical user metadata as a request to untar the member again.
-        let inbound_replication_put = replication_request_authorized(&req)
-            && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
-        if max_content_length.is_some() && is_put_object_extract_requested(&req.headers) {
+        let inbound_replication_put = replication_request_authorized(&envelope)
+            && get_header(envelope.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+        if max_content_length.is_some() && is_put_object_extract_requested(envelope.headers()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
             ));
         }
-        reject_veeam_sosapi_mutation(|| self.object_store(), req.input.bucket.as_str(), req.input.key.as_str()).await?;
-        if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
-            return Box::pin(self.execute_put_object_extract(req)).await;
+        reject_veeam_sosapi_mutation(|| self.object_store(), input.bucket.as_str(), input.key.as_str()).await?;
+        if is_put_object_extract_requested(envelope.headers()) && !inbound_replication_put {
+            return Box::pin(self.execute_put_object_extract_owned(envelope, input)).await;
         }
         // SSE-C ciphertext passthrough (authorized replication only): the body
         // is already ciphertext and must be stored verbatim — no compression,
         // no bucket-default encryption.
         let ciphertext_passthrough =
-            inbound_replication_put && rustfs_utils::http::ssec_transport_to_stored_metadata(&req.headers).is_some();
+            inbound_replication_put && rustfs_utils::http::ssec_transport_to_stored_metadata(envelope.headers()).is_some();
 
-        let input = std::mem::take(&mut req.input);
+        let trailing_headers = input.trailing_headers.clone();
+        let metadata_headers = input.metadata_headers.as_ref().unwrap_or_else(|| envelope.headers());
+        let checksum_headers = input.checksum_headers.as_ref().unwrap_or_else(|| envelope.headers());
 
-        let PutObjectInput {
+        let PutObjectWriteInput {
             body,
             bucket,
             cache_control,
@@ -1363,20 +1397,20 @@ impl DefaultObjectUsecase {
         // POST form uploads share the storage path but are a distinct S3
         // operation.  The V1 hint is defined for direct PutObject only, so a
         // POST field remains ordinary user metadata and never selects layout.
-        let ec_block_size_hint = if req.extensions.get::<PostObjectRequestMarker>().is_some() {
+        let ec_block_size_hint = if envelope.post_object().is_some() {
             None
         } else {
-            extract_ec_block_size_hint(&req.headers, metadata.as_ref())?
+            extract_ec_block_size_hint(envelope.headers(), metadata.as_ref())?
         };
 
         // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
-        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
+        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
         let sse_customer_key = sse_customer_key.or(h_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
         // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
-        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
 
         // Validate object key
         validate_new_object_key(&key, request_method_name)?;
@@ -1385,25 +1419,31 @@ impl DefaultObjectUsecase {
         // Validate archive content encoding (reject when strict mode is enabled)
         validate_archive_content_encoding(
             &key,
-            req.headers.get("content-type").and_then(|value| value.to_str().ok()),
-            req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
+            metadata_headers.get("content-type").and_then(|value| value.to_str().ok()),
+            metadata_headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_request_shape", request_shape_stage_start);
 
-        let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
-
-        let body = match max_content_length {
-            Some(limit) => StreamingBlob::new(MaxContentLengthStream {
-                inner: body,
-                limit,
-                received: 0,
-                exceeded: false,
-            }),
-            None => body,
+        // cuObject S3-over-RDMA PUT: an empty HTTP body plus `x-amz-rdma-token`
+        // means the bytes are read from the client's registered buffer; the
+        // token's buffer length is the object length.
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        let (body, content_length, rdma_put) = match super::cuobject::rdma_token_for_request(envelope.headers()) {
+            Some(token) if content_length.unwrap_or(0) == 0 => {
+                let total = i64::try_from(token.buffer_len).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                let (body, _) = super::cuobject::rdma_put_body(&bucket, &key, &token)?;
+                (Some(body), Some(total), Some(total))
+            }
+            _ => (body, content_length, None),
+        };
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let rdma_put: Option<i64> = None;
+        let Some(body) = body else {
+            return Err(rustfs_s3_types::s3_error!(IncompleteBody));
         };
 
         // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
-        let size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
+        let size = resolve_put_object_authoritative_size(envelope.headers(), content_length)?;
 
         // The streaming-body limit (s3s `put_object_max_size`) only fires once the
         // client has already streamed 5 GiB. The declared length is authoritative,
@@ -1424,9 +1464,12 @@ impl DefaultObjectUsecase {
             quota_operation,
             ciphertext_passthrough,
             inbound_replication_put,
-            headers: &req.headers,
-            query: req.uri.query(),
-            trailing_headers: req.trailing_headers.clone(),
+            headers: envelope.headers(),
+            metadata_headers,
+            checksum_headers,
+            query: envelope.uri().query(),
+            trailing_headers: trailing_headers.clone(),
+            max_content_length,
             version_id,
             sse: PutObjectSseInput {
                 server_side_encryption,
@@ -1456,14 +1499,31 @@ impl DefaultObjectUsecase {
             },
             content_md5: content_md5.map(PutObjectContentMd5::Base64),
             preserve_etag: None,
-            origin: PutObjectOrigin::S3 { req: &req, event_name },
+            origin: PutObjectOrigin::S3 {
+                req: &envelope,
+                event_name,
+                registered_body: rdma_put.is_some(),
+            },
         };
-        let committed = self.put_object_core(write, body, start_time).await?;
+        #[cfg_attr(
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
+        let mut committed = self.put_object_core(write, body, input.frame_trailers, start_time).await?;
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        if let Some(moved) = rdma_put {
+            committed
+                .put_extra_checksum_headers
+                .push((crate::app::object::cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
+            committed
+                .put_extra_checksum_headers
+                .push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+        }
 
         let raw_version = s3_response_version_id(committed.obj_info.version_id);
         let put_version = if committed.put_versioned { raw_version } else { None };
 
-        let e_tag = committed.obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
+        let e_tag = committed.obj_info.etag.clone();
 
         let expiration = resolve_put_object_expiration(&bucket, &committed.obj_info).await;
 
@@ -1474,13 +1534,9 @@ impl DefaultObjectUsecase {
             sha256: input.checksum_sha256,
             crc64nvme: input.checksum_crc64nvme,
         };
-        apply_trailing_checksums(
-            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
-            &req.trailing_headers,
-            &mut checksums,
-        );
+        apply_trailing_checksums_native(input.checksum_algorithm.as_deref(), &trailing_headers, &mut checksums);
 
-        let output = PutObjectOutput {
+        let mut output = PutObjectWriteOutput {
             e_tag,
             server_side_encryption: committed
                 .effective_sse
@@ -1503,28 +1559,29 @@ impl DefaultObjectUsecase {
         // is decided by s3s PostObject serializer (success_action_status / redirect semantics).
 
         let response_build_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let mut response = S3Response::new(output);
         // Echo XXHash3/64/128 / SHA-512 checksums that s3s PutObjectOutput has no typed
         // field for (#1256).
-        inject_additional_checksum_headers(&mut response.headers, &committed.put_extra_checksum_headers);
+        inject_additional_checksum_headers(&mut output.headers, &committed.put_extra_checksum_headers);
         if let Some(block_size) = committed.obj_info.effective_ec_block_size()
             && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
         {
-            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+            output.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
         }
         if let Some(status) = committed.ec_block_size_hint_outcome.status_header() {
-            response
+            output
                 .headers
                 .insert(EC_BLOCK_SIZE_HINT_STATUS_HEADER, HeaderValue::from_static(status));
         }
         if let Some(reason) = committed.ec_block_size_hint_outcome.reason_header() {
-            response
+            output
                 .headers
                 .insert(EC_BLOCK_SIZE_HINT_REASON_HEADER, HeaderValue::from_static(reason));
         }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_response_build", response_build_stage_start);
-        let result = Ok(response);
-        committed.finish(&result);
+        let status = output.status.unwrap_or(http::StatusCode::OK);
+        let headers = output.headers.clone();
+        let result = Ok(output);
+        committed.finish(&result, status, &headers);
 
         result
     }
@@ -1538,9 +1595,11 @@ impl DefaultObjectUsecase {
     pub(super) async fn put_object_core(
         &self,
         write: PutObjectWriteRequest<'_>,
-        body: StreamingBlob,
+        body: NativeBody,
+        frame_trailers: Option<Arc<super::native_body::FrameTrailers>>,
         start_time: Instant,
-    ) -> S3Result<PutObjectCommitted> {
+    ) -> rustfs_s3_types::S3Result<PutObjectCommitted> {
+        use rustfs_s3_types::{S3Error, S3ErrorCode};
         let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
         let PutObjectWriteRequest {
             bucket,
@@ -1550,8 +1609,11 @@ impl DefaultObjectUsecase {
             ciphertext_passthrough,
             inbound_replication_put,
             headers,
+            metadata_headers,
+            checksum_headers,
             query,
             trailing_headers,
+            max_content_length,
             version_id,
             sse,
             user_metadata,
@@ -1563,6 +1625,16 @@ impl DefaultObjectUsecase {
             preserve_etag,
             mut origin,
         } = write;
+        let (chunks, _) = super::native_body::BodyChunks::with_trailers(body, frame_trailers);
+        let body: UploadChunks = match max_content_length {
+            Some(limit) => Box::new(MaxContentLengthStream {
+                inner: chunks,
+                limit,
+                received: 0,
+                exceeded: false,
+            }),
+            None => Box::new(chunks),
+        };
         // Objects without Content-MD5 take the bucket's ETag algorithm.
         let etag_algorithm = if bucket_uses_xxh3_etag(&bucket) {
             EtagAlgorithm::Xxh3
@@ -1582,15 +1654,14 @@ impl DefaultObjectUsecase {
         let (body, progress_control) = match &origin {
             PutObjectOrigin::S3 { req, .. } => {
                 let request_id = req
-                    .extensions
-                    .get::<request_context::RequestContext>()
+                    .request_context()
                     .map(|context| context.request_id.as_str())
                     .unwrap_or_default();
-                let (body, control) = if let Some(control) = req.extensions.get::<super::request_body::BodyReadControl>() {
+                let (body, control) = if let Some(control) = req.body_read_control() {
                     control.activate_upload(put_object_body_read_timeout(), &bucket, &key, request_id, size.max(0) as u64);
                     (body, control.clone())
                 } else {
-                    super::request_body::guard_upload_progress(
+                    super::request_body::guard_native_upload_progress(
                         body,
                         put_object_body_read_timeout(),
                         &bucket,
@@ -1599,7 +1670,7 @@ impl DefaultObjectUsecase {
                         size.max(0) as u64,
                     )
                 };
-                (super::request_body::demand_upload_body(body, control.clone()), Some(control))
+                (super::request_body::demand_native_upload(body, control.clone()), Some(control))
             }
             PutObjectOrigin::Internal { .. } => (body, None),
         };
@@ -1627,7 +1698,7 @@ impl DefaultObjectUsecase {
 
         let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
-            is_disk_compressible(headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
+            is_disk_compressible(metadata_headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
 
         // Resolve the store through the request-bound server context
         // (backlog#1052 S6), not the process-global handle, so an embedded
@@ -1644,7 +1715,7 @@ impl DefaultObjectUsecase {
         let put_admission = match get_concurrency_manager()
             .admit_put_object(size)
             .await
-            .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
+            .map_err(|_| rustfs_s3_types::s3_error!(InternalError, "foreground write admission closed"))?
         {
             ForegroundWriteAdmission::Disabled => None,
             ForegroundWriteAdmission::Admitted(permit) => {
@@ -1653,7 +1724,7 @@ impl DefaultObjectUsecase {
             }
             ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
-                return Err(s3_error!(
+                return Err(rustfs_s3_types::s3_error!(
                     SlowDown,
                     "foreground write concurrency limit reached, please reduce your request rate"
                 ));
@@ -1745,7 +1816,7 @@ impl DefaultObjectUsecase {
 
         // Validate SSE-C headers early: reject partial/invalid combinations per S3 spec
         validate_sse_headers_for_write(
-            effective_sse.as_ref(),
+            effective_sse.as_deref(),
             effective_kms_key_id.as_ref(),
             extract_ssekms_context_from_headers(headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
@@ -1761,20 +1832,7 @@ impl DefaultObjectUsecase {
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
-        apply_put_request_metadata(
-            &mut metadata,
-            headers,
-            &key,
-            content.cache_control,
-            content.content_disposition,
-            content.content_encoding,
-            content.content_language,
-            content.content_type,
-            content.expires,
-            content.website_redirect_location,
-            content.tagging,
-            content.storage_class,
-        )?;
+        apply_put_request_metadata_native(&mut metadata, metadata_headers, &key, content)?;
         apply_bucket_default_lock_retention(
             &bucket,
             &object_lock_config_state,
@@ -1811,7 +1869,7 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("app_put_opts_build", put_opts_stage_start);
         origin.apply_bucket_generation_guard(&bucket, &mut opts)?;
         origin.add_lock_loss_fence(&mut opts);
-        apply_put_request_object_lock_opts(
+        apply_put_request_object_lock_opts_native(
             &bucket,
             &object_lock_config_state,
             object_lock.legal_hold_status,
@@ -1925,11 +1983,18 @@ impl DefaultObjectUsecase {
         let fill_on_put_collector =
             put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers);
         let reader_prepare_stage_start = put_stage_metrics_enabled.then(Instant::now);
+        let registered_body = matches!(
+            origin,
+            PutObjectOrigin::S3 {
+                registered_body: true,
+                ..
+            }
+        );
         let mut reader = if should_compress {
             let compressed_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
-                StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
             );
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
@@ -1939,7 +2004,7 @@ impl DefaultObjectUsecase {
                 HashReader::from_stream_with_etag(body, size, size, md5hex.take(), sha256hex.take(), false, etag_algorithm)
                     .map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
+            if let Err(err) = hrd.add_checksum(checksum_headers, trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1959,7 +2024,7 @@ impl DefaultObjectUsecase {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
                 let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                let eager_body = read_zero_copy_put_body_exact(body, body_size as usize).await?;
+                let eager_body = read_zero_copy_put_body_exact(body, body_size as usize, registered_body).await?;
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_body_eager_read_zero_copy", eager_read_stage_start);
                 rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
@@ -1978,7 +2043,7 @@ impl DefaultObjectUsecase {
                     // for ≤4KiB is negligible cost.
                     let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_direct(
-                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                        upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                     )
                     .await?;
@@ -2006,7 +2071,7 @@ impl DefaultObjectUsecase {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_pooled(
-                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                        upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                         pool.as_ref(),
                     )
@@ -2036,19 +2101,16 @@ impl DefaultObjectUsecase {
             } else {
                 let streaming_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let collector = fill_on_put_collector.clone();
-                let body = tokio::io::BufReader::with_capacity(
-                    buffer_size,
-                    StreamReader::new(body.map(move |f| {
-                        let f = f.map_err(s3s_body_error_to_io);
-                        if let (Some(collector), Ok(frame)) = (&collector, &f) {
-                            collector
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push(frame.clone());
-                        }
-                        f
-                    })),
-                );
+                let body = upload_frame_reader(body.map(move |f| {
+                    let f = f.map_err(s3s_body_error_to_io);
+                    if let (Some(collector), Ok(frame)) = (&collector, &f) {
+                        collector
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(retained_put_frame(frame.clone(), registered_body));
+                    }
+                    f
+                }));
                 let reader = HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
                     .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -2062,7 +2124,7 @@ impl DefaultObjectUsecase {
 
         if size >= 0 {
             let checksum_setup_stage_start = put_stage_metrics_enabled.then(Instant::now);
-            if let Err(err) = reader.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
+            if let Err(err) = reader.add_checksum(checksum_headers, trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -2074,9 +2136,9 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
         let (mut completion, request_context) = match &origin {
-            PutObjectOrigin::S3 { req, event_name } => (
-                PutObjectCompletion::S3(OperationHelper::new(req, *event_name, S3Operation::PutObject)),
-                req.extensions.get::<request_context::RequestContext>().cloned(),
+            PutObjectOrigin::S3 { req, event_name, .. } => (
+                PutObjectCompletion::S3(OperationHelper::from_view(&req.audit_view(), *event_name, S3Operation::PutObject)),
+                req.request_context().cloned(),
             ),
             PutObjectOrigin::Internal {
                 principal_id,
@@ -2094,6 +2156,7 @@ impl DefaultObjectUsecase {
                         &key,
                         principal_id,
                     )
+                    .map(|event| event.with_bucket_incarnation(opts.expected_bucket_incarnation_id))
                 });
                 (PutObjectCompletion::Internal(event.flatten().map(Box::new)), Some(request_context))
             }
@@ -2211,7 +2274,11 @@ impl DefaultObjectUsecase {
         if dsc.replicate_any() {
             opts.drop_lockless_cache_write();
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::ZonedDateTime::now().to_string(),
+            );
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_REPLICATION_STATUS,
@@ -2355,7 +2422,7 @@ impl DefaultObjectUsecase {
 
                 let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let transition_enqueue_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject, opts.expected_bucket_incarnation_id).await;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_post_store_transition_enqueue",
                     transition_enqueue_stage_start,
@@ -2416,7 +2483,7 @@ impl DefaultObjectUsecase {
 
                 if dsc.replicate_any() {
                     let replication_schedule_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                    schedule_object_replication(obj_info.clone(), store, dsc, opts.expected_bucket_incarnation_id).await;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_post_store_replication_schedule",
                         replication_schedule_stage_start,
@@ -2454,7 +2521,12 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
             put_commit_future,
         );
+        let commit_owner_submit_started = rustfs_io_metrics::put_stage_timer();
         let put_commit = spawn_traced_join(async move {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START,
+                commit_owner_submit_started,
+            );
             let commit_stage_start = put_stage_metrics_enabled.then(Instant::now);
             let result = std::panic::AssertUnwindSafe(put_commit_future).catch_unwind().await;
             rustfs_io_metrics::record_put_object_stage_duration_from("store_commit", commit_stage_start);
@@ -2468,7 +2540,7 @@ impl DefaultObjectUsecase {
                     put_request_guard.finish_err();
                     return Err(fail_put_object(
                         completion,
-                        s3_error!(InternalError, "put object commit owner task panicked"),
+                        rustfs_s3_types::s3_error!(InternalError, "put object commit owner task panicked"),
                     ));
                 }
             };
@@ -2503,7 +2575,7 @@ impl DefaultObjectUsecase {
         } else {
             put_commit.await
         };
-        result.map_err(|_| s3_error!(InternalError, "put object commit owner task failed"))?
+        result.map_err(|_| rustfs_s3_types::s3_error!(InternalError, "put object commit owner task failed"))?
     }
 }
 
@@ -2548,6 +2620,53 @@ mod tests {
     use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput, ObjectLockRetentionMode};
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
+    use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
+
+    /// PutObject through the owned entry point the gateway handler calls, its error in the s3s
+    /// form these tests compare.
+    async fn put_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
+        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
+        Box::pin(usecase.execute_put_object_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+    }
+
+    /// As [`put_owned`], through the archive-extraction entry point.
+    async fn put_extract_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
+        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
+        Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
+            .await
+            .map_err(S3Error::from)
+    }
+
+    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
+    fn method_only_put_envelope() -> crate::app::RequestEnvelope {
+        crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        )
+    }
+
+    async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
+        let input = PutObjectWriteInput::from_legacy(input, None);
+        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
+            .await
+            .map_err(S3Error::from)
+    }
+
+    async fn put_extract_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
+        let input = PutObjectWriteInput::from_legacy(input, None);
+        Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input))
+            .await
+            .map_err(S3Error::from)
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -2570,10 +2689,9 @@ mod tests {
             .build()
             .expect("PUT completion request");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let fs = FS::new();
         let (response, observed) = PUT_STORAGE_TEST_COMPLETION
             .scope(std::cell::Cell::new(None), async {
-                let response = Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT))).await;
+                let response = Box::pin(put_method_only(&usecase, input)).await;
                 (response, PUT_STORAGE_TEST_COMPLETION.with(std::cell::Cell::get))
             })
             .await;
@@ -2584,6 +2702,101 @@ mod tests {
             .await
             .expect("acknowledged PUT metadata remains readable");
         assert_eq!(object.size, i64::try_from(payload.len()).expect("small payload length"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    /// The PutObject use cases count nothing: the gateway's dispatch counts each request once before
+    /// the use case runs (`GatewayBackend::serve`), so a count here would count it twice.
+    fn owned_put_entry_points_never_count_the_operation() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+        fn put_count(snapshotter: &Snapshotter, total: &mut u64) -> u64 {
+            // DebuggingRecorder drains counters on each snapshot.
+            *total += snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(key, _, _, value)| {
+                    if key.key().name() == "rustfs_s3_operations_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "op" && label.value() == S3Operation::PutObject.as_str())
+                    {
+                        match value {
+                            DebugValue::Counter(count) => Some(count),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .sum::<u64>();
+            *total
+        }
+
+        fn official_count() -> u64 {
+            rustfs_io_metrics::s3_op_metrics_snapshot()
+                .into_iter()
+                .find(|row| row.op == S3Operation::PutObject.as_str())
+                .map_or(0, |row| row.total)
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (store, context) = runtime.block_on(Box::pin(real_store_test_context()));
+        let bucket = format!("put-count-{}", Uuid::new_v4());
+        runtime
+            .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
+            .expect("count test bucket");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let input = |invalid_class: bool| PutObjectInput {
+            bucket: bucket.clone(),
+            key: "counted".to_owned(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
+            content_length: Some(5),
+            storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
+            ..Default::default()
+        };
+        let baseline = official_count();
+        let mut observed = 0;
+        metrics::with_local_recorder(&recorder, || {
+            drop(put_method_only(&usecase, input(false)));
+            assert_eq!(put_count(&snapshotter, &mut observed), 0, "constructing a future does not count a PUT");
+            assert_eq!(official_count() - baseline, 0, "official operation total");
+            let error = runtime
+                .block_on(Box::pin(put_method_only(&usecase, input(true))))
+                .expect_err("invalid class");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidStorageClass);
+            assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count a refused PUT");
+            assert_eq!(official_count() - baseline, 0, "official operation total");
+            runtime
+                .block_on(Box::pin(put_method_only(&usecase, input(false))))
+                .expect("successful PUT");
+            assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count an accepted PUT");
+            assert_eq!(official_count() - baseline, 0, "official operation total");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: "archive.tar".to_owned(),
+                ..Default::default()
+            };
+            let error = runtime
+                .block_on(Box::pin(put_extract_method_only(&usecase, input)))
+                .expect_err("missing archive body");
+            assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
+            assert_eq!(
+                put_count(&snapshotter, &mut observed),
+                0,
+                "the archive use case does not count a refused PUT"
+            );
+            assert_eq!(official_count() - baseline, 0, "official operation total");
+        });
     }
 
     #[test]
@@ -2615,13 +2828,16 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let mut request = S3HttpRequestGuard::new("PUT");
         let error = metrics::with_local_recorder(&recorder, || {
-            let fs = FS::new();
             let mut future = Box::pin(PUT_STORAGE_TEST_FAILURE.scope(
                 (
                     PutStorageTestStage::Commit,
                     StorageError::Lock(LockError::timeout("private-bucket/private-key", Duration::from_secs(5))),
                 ),
-                Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT))),
+                // The gateway's dispatch names the operation before the use case runs.
+                Box::pin(async {
+                    rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                    put_method_only(&usecase, input).await
+                }),
             ));
             runtime.block_on(std::future::poll_fn(|cx| {
                 request.in_scope(|| std::future::Future::poll(future.as_mut(), cx))
@@ -2629,6 +2845,21 @@ mod tests {
         })
         .expect_err("lock failure must reject the PUT");
         assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(matches!(
+            error.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::Lock(_))
+        ));
+        let headers = error.headers().expect("lock refusal carries retry advice");
+        assert_eq!(
+            headers.get("x-rustfs-error-cause"),
+            Some(&HeaderValue::from_static("namespace_lock_timeout"))
+        );
+        assert_eq!(headers.get(http::header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/xml"))
+        );
 
         let rows = snapshotter.snapshot().into_vec();
         let (key, _, _, value) = rows
@@ -2687,7 +2918,7 @@ mod tests {
                 let err = PUT_STORAGE_TEST_FAILURE
                     .scope(
                         (stage, StorageError::InsufficientReadQuorum("bucket".into(), "object".into())),
-                        usecase.execute_put_object(&FS::new(), req),
+                        put_owned(&usecase, req),
                     )
                     .await
                     .expect_err("read quorum failure must refuse the upload");
@@ -2745,9 +2976,8 @@ mod tests {
                 .content_length(Some(14))
                 .build()
                 .expect("capacity PUT input must build");
-            let request = build_request(input, Method::PUT);
             let error = PUT_STORAGE_TEST_FAILURE
-                .scope((PutStorageTestStage::Commit, failure), usecase.execute_put_object(&FS::new(), request))
+                .scope((PutStorageTestStage::Commit, failure), put_method_only(&usecase, input))
                 .await
                 .expect_err("capacity refusal must fail PUT");
             assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
@@ -2774,13 +3004,13 @@ mod tests {
 
     #[test]
     fn failed_put_completion_keeps_write_safe_quorum_code() {
-        let error = || S3Error::from(ApiError::from(StorageError::ErasureReadQuorum));
+        let error = || rustfs_s3_types::S3Error::from(ApiError::from(StorageError::ErasureReadQuorum));
         let err = fail_put_object(PutObjectCompletion::S3(OperationHelper::Disabled), error());
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
         // Internal completions share the write-safe default; SlowDownRead is GET-only.
         let internal = fail_put_object(PutObjectCompletion::Internal(None), error());
-        assert_eq!(internal.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(internal.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
     }
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
@@ -2906,19 +3136,21 @@ mod tests {
     fn put_request_user_metadata_cannot_suppress_bucket_default_retention() {
         let mut metadata =
             HashMap::from([(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::GOVERNANCE.to_string())]);
-        apply_put_request_metadata(
+        apply_put_request_metadata_native(
             &mut metadata,
             &HeaderMap::new(),
             "object",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            PutObjectContentInput {
+                cache_control: None,
+                content_disposition: None,
+                content_encoding: None,
+                content_language: None,
+                content_type: None,
+                expires: None,
+                website_redirect_location: None,
+                tagging: None,
+                storage_class: None,
+            },
         )
         .unwrap();
 
@@ -3029,9 +3261,8 @@ mod tests {
             .build()
             .expect("metadata GET input must build");
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let metadata_get = tokio::spawn(async move {
-            crate::app::test_seams::get_object(&metadata_usecase, build_request(metadata_input, Method::GET)).await
-        });
+        let metadata_get =
+            tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&metadata_usecase, metadata_input).await });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
             .expect("GET must enter the bucket metadata stage");
@@ -3059,10 +3290,7 @@ mod tests {
             .build()
             .expect("GET input must build");
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get =
-            tokio::spawn(
-                async move { crate::app::test_seams::get_object(&get_usecase, build_request(get_input, Method::GET)).await },
-            );
+        let get = tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&get_usecase, get_input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -3099,11 +3327,7 @@ mod tests {
             .build()
             .expect("PUT input must build");
         let put_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let put = tokio::spawn(async move {
-            put_usecase
-                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
-                .await
-        });
+        let put = tokio::spawn(async move { put_method_only(&put_usecase, put_input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.snapshot().write_stalled {
                 tokio::task::yield_now().await;
@@ -3163,7 +3387,7 @@ mod tests {
         let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let mut request = build_request(put_input, Method::PUT);
         request.uri = format!("/{bucket}/{object}").parse().expect("PUT URI");
-        let put = tokio::spawn(async move { put_usecase.execute_put_object(&FS::new(), request).await });
+        let put = tokio::spawn(async move { put_owned(&put_usecase, request).await });
 
         tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
             .await
@@ -3206,8 +3430,7 @@ mod tests {
             .expect("normal PUT");
         let mut normal_request = build_request(normal_input, Method::PUT);
         normal_request.uri = format!("/{bucket}/normal.bin").parse().expect("URI");
-        DefaultObjectUsecase::with_context(Some(context))
-            .execute_put_object(&FS::new(), normal_request)
+        put_owned(&DefaultObjectUsecase::with_context(Some(context)), normal_request)
             .await
             .expect("normal response completion");
         let audits = probe.audits.lock().expect("audits");
@@ -3244,8 +3467,7 @@ mod tests {
         let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let mut extra_body_request = build_request(extra_body_input, Method::PUT);
         extra_body_request.headers = streaming_headers(Some("0"));
-        let extra_body_err = extra_body_usecase
-            .execute_put_object(&FS::new(), extra_body_request)
+        let extra_body_err = put_owned(&extra_body_usecase, extra_body_request)
             .await
             .expect_err("decoded zero-byte PUT with body data must fail");
         assert_eq!(extra_body_err.code(), &S3ErrorCode::UnexpectedContent);
@@ -3281,7 +3503,7 @@ mod tests {
         let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let mut zero_request = build_request(zero_input, Method::PUT);
         zero_request.headers = streaming_headers(Some("0"));
-        let zero_put = tokio::spawn(async move { zero_usecase.execute_put_object(&FS::new(), zero_request).await });
+        let zero_put = tokio::spawn(async move { put_owned(&zero_usecase, zero_request).await });
 
         tokio::time::timeout(Duration::from_secs(30), body_polled_rx)
             .await
@@ -3333,11 +3555,7 @@ mod tests {
             .build()
             .expect("zero-copy PUT input must build");
         let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let zero_copy_put = tokio::spawn(async move {
-            zero_copy_usecase
-                .execute_put_object(&FS::new(), build_request(zero_copy_input, Method::PUT))
-                .await
-        });
+        let zero_copy_put = tokio::spawn(async move { put_method_only(&zero_copy_usecase, zero_copy_input).await });
 
         tokio::time::timeout(Duration::from_secs(30), async {
             while !object_traffic_health.snapshot().write_stalled {
@@ -3606,6 +3824,40 @@ mod tests {
         assert!(!small_eager);
     }
 
+    #[tokio::test]
+    async fn eager_rdma_reader_releases_each_multi_frame_owner_before_polling_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Frame(Arc<AtomicUsize>);
+        impl AsRef<[u8]> for Frame {
+            fn as_ref(&self) -> &[u8] {
+                b"abcd"
+            }
+        }
+        impl Drop for Frame {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicUsize::new(0));
+        let body = futures::stream::iter((0..3).map(|i| {
+            assert_eq!(released.load(Ordering::SeqCst), i);
+            Ok::<_, std::io::Error>(Bytes::from_owner(Frame(released.clone())))
+        }));
+        let _reader = read_zero_copy_put_body_exact(body, 12, true).await.unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 3);
+
+        let body = futures::stream::once(std::future::ready(Ok::<_, std::io::Error>(Bytes::from_owner(Frame(released.clone())))));
+        let reader = read_zero_copy_put_body_exact(body, 4, true).await.unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 3);
+        drop(reader);
+        assert_eq!(released.load(Ordering::SeqCst), 4);
+
+        let frame = Bytes::from_owner(Frame(released.clone()));
+        let cached = retained_put_frame(frame, true);
+        assert_eq!(released.load(Ordering::SeqCst), 5);
+        assert_eq!(cached.as_ref(), b"abcd");
+    }
+
     #[test]
     fn should_use_zero_copy_eager_put_path_allows_large_plain_objects_within_cap() {
         let headers = HeaderMap::new();
@@ -3676,12 +3928,61 @@ mod tests {
     async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
         let body = futures::stream::iter(vec![Err::<Bytes, UploadStreamError>(UploadStreamError::Sha256Mismatch)]);
 
-        let error = match read_zero_copy_put_body_exact(body, 1).await {
+        let error = match read_zero_copy_put_body_exact(body, 1, false).await {
             Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
             Err(error) => error,
         };
 
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
+    }
+
+    #[tokio::test]
+    async fn eager_put_readers_preserve_typed_producer_failure() {
+        use rustfs_gateway_stream::StreamError;
+        use rustfs_io_core::BytesPoolConfig;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("fixture producer failure")]
+        struct ProducerFailure;
+
+        fn producer_error() -> StreamError {
+            StreamError::upstream(Box::new(ProducerFailure))
+        }
+
+        fn assert_producer_failure<T>(result: Result<T, impl Into<rustfs_s3_types::S3Error>>, path: &str) {
+            let Err(error) = result else {
+                panic!("{path} accepted a producer error");
+            };
+            let error = error.into();
+            assert_eq!(error.code().as_str(), "InternalError", "{path}");
+            let mut cause = std::error::Error::source(&error);
+            let mut stream = false;
+            let mut producer = false;
+            for _ in 0..8 {
+                let Some(error) = cause else { break };
+                stream |= error.is::<StreamError>();
+                producer |= error.is::<ProducerFailure>();
+                cause = error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .map(|inner| inner as &dyn std::error::Error)
+                    .or_else(|| error.source());
+            }
+            assert!(stream, "{path} lost the typed stream error");
+            assert!(producer, "{path} lost the typed producer failure");
+        }
+
+        let stream_reader = || {
+            StreamReader::new(futures::stream::iter([
+                Ok(Bytes::from_static(b"a")),
+                Err(std::io::Error::other(producer_error())),
+            ]))
+        };
+        assert_producer_failure(read_small_put_body_exact_direct(stream_reader(), 2).await, "direct");
+        let pool = BytesPool::with_config(BytesPoolConfig::default());
+        assert_producer_failure(read_small_put_body_exact_pooled(stream_reader(), 2, &pool).await, "pooled");
+        let zero_copy = futures::stream::iter([Ok(Bytes::from_static(b"a")), Err(producer_error())]);
+        assert_producer_failure(read_zero_copy_put_body_exact(zero_copy, 2, false).await, "zero-copy");
     }
 
     struct FragmentedBody {
@@ -3750,7 +4051,7 @@ mod tests {
             let mut request = build_request(input, Method::PUT);
             request.extensions.insert(control.clone());
             let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-            let owner = tokio::spawn(async move { usecase.execute_put_object(&FS::new(), request).await });
+            let owner = tokio::spawn(async move { put_owned(&usecase, request).await });
             control.wait_until_pending_for_test().await;
             control.advance_wait_for_test(Duration::from_secs(60));
             sender.send(Ok(Frame::data(Bytes::new()))).unwrap();
@@ -3869,7 +4170,7 @@ mod tests {
             assert!(pool.try_acquire_buffer(8192).is_none());
         }
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(owner.await.err().expect("trickle must expire").code(), &S3ErrorCode::RequestTimeout);
+        assert_eq!(owner.await.err().expect("trickle must expire").code(), &OwnedS3ErrorCode::RequestTimeout);
         let healthy = read_small_put_body_exact_pooled(std::io::Cursor::new(vec![1; 8192]), 8192, &pool)
             .await
             .expect("timed-out buffer must be reusable");
@@ -3913,7 +4214,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::IncompleteBody);
     }
 
     #[tokio::test]
@@ -3926,7 +4227,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -3945,12 +4246,12 @@ mod tests {
         let short = read_small_put_body_exact_direct(std::io::Cursor::new(b"hell".to_vec()), 5)
             .await
             .expect_err("short direct body should fail");
-        assert_eq!(short.code(), &S3ErrorCode::IncompleteBody);
+        assert_eq!(short.code(), &OwnedS3ErrorCode::IncompleteBody);
 
         let extra = read_small_put_body_exact_direct(std::io::Cursor::new(b"hello!".to_vec()), 5)
             .await
             .expect_err("extra direct body should fail");
-        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(extra.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -3992,7 +4293,7 @@ mod tests {
         let extra = read_small_put_body_exact_direct(std::io::Cursor::new(vec![1u8]), 0)
             .await
             .expect_err("non-empty body declared as empty should fail");
-        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(extra.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -4017,7 +4318,7 @@ mod tests {
             .await
             .expect_err("a partial body followed by an I/O error must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::InternalError);
     }
 
     #[tokio::test]
@@ -4045,7 +4346,7 @@ mod tests {
         .await
         .expect_err("a fragmented body longer than declared must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -4079,7 +4380,7 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"world")),
         ]);
 
-        let mut reader = read_zero_copy_put_body_exact(body, 11)
+        let mut reader = read_zero_copy_put_body_exact(body, 11, false)
             .await
             .expect("zero-copy eager body read should succeed");
         let mut out = Vec::new();
@@ -4098,12 +4399,12 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"!")),
         ]);
 
-        let err = match read_zero_copy_put_body_exact(body, 5).await {
+        let err = match read_zero_copy_put_body_exact(body, 5, false).await {
             Ok(_) => panic!("extra bytes should fail"),
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -4132,6 +4433,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_object_metadata_cannot_dispatch_legacy_archive_extraction() {
+        let mut req = build_request(PutObjectInput::default(), Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        let err = Box::pin(put_extract_owned(&DefaultObjectUsecase::without_context(), req))
+            .await
+            .expect_err("a legacy form cannot authorize archive replay");
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
     async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
@@ -4144,10 +4455,44 @@ mod tests {
             .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"different-etag\""));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+        let err = Box::pin(put_owned(&usecase, req))
             .await
             .expect_err("POST header-only ETag precondition must fail before storage access");
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
+        for direct_extract in [false, true] {
+            let (body, polls) = PollCountingBody::streaming_blob();
+            let input = PutObjectInput::builder()
+                .bucket("test-bucket".to_owned())
+                .key("archive.tar".to_owned())
+                .body(Some(body))
+                .build()
+                .expect("archive input");
+            let mut request = build_request(input, Method::POST);
+            request.extensions.insert(PostObjectRequestMarker);
+            request.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            let mut envelope = RequestEnvelope::from_s3s(&request);
+            assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
+            envelope.mark_gateway_post();
+            assert!(envelope.fork_for_authorization().is_gateway_post());
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let usecase = DefaultObjectUsecase::without_context();
+            let result = if direct_extract {
+                Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await
+            } else {
+                Box::pin(usecase.execute_put_object_owned(envelope, input)).await
+            };
+            let error = result.expect_err("unbound gateway archive must be refused");
+            assert_eq!(error.code().as_str(), "NotImplemented", "direct={direct_extract}");
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "direct={direct_extract}: refused archive must not poll its body"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4163,9 +4508,8 @@ mod tests {
         req.extensions.insert(PostObjectRequestMarker);
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4182,9 +4526,8 @@ mod tests {
         req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4201,9 +4544,8 @@ mod tests {
         req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4222,11 +4564,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
         assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
     }
@@ -4262,9 +4602,8 @@ mod tests {
                 HeaderValue::from_str(&decoded.to_string()).unwrap(),
             );
             let usecase = DefaultObjectUsecase::without_context();
-            let fs = FS::new();
 
-            let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+            let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
             if expect_too_large {
                 assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "decoded {decoded}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
@@ -4292,9 +4631,8 @@ mod tests {
             .insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("aws:kms"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4312,9 +4650,8 @@ mod tests {
             .insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
 
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4327,11 +4664,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
-        let fs = FS::new();
 
-        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4553,13 +4888,12 @@ mod tests {
                 .expect("SSE-C PUT input must build");
 
             let usecase = DefaultObjectUsecase::from_global();
-            let response = usecase
-                .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+            let response = put_method_only(&usecase, input)
                 .await
                 .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
-            assert_eq!(response.output.server_side_encryption, None);
-            assert_eq!(response.output.sse_customer_algorithm.as_deref(), Some("AES256"));
-            assert_eq!(response.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            assert_eq!(response.server_side_encryption, None);
+            assert_eq!(response.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(response.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
 
             let encoded_key = base64_simd::STANDARD.encode_to_string(customer_key);
             let mut read_headers = HeaderMap::new();
@@ -4668,13 +5002,12 @@ mod tests {
         request
             .headers
             .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::access::ReqInfo {
+        request.extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
 
-        let err = DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), request)
+        let err = put_owned(&DefaultObjectUsecase::from_global(), request)
             .await
             .expect_err("quota-enabled ciphertext replication should fail at ingress");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -4724,8 +5057,7 @@ mod tests {
             .build()
             .expect("legacy quota PUT input should build");
 
-        let err = DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+        let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect_err("4 GiB used plus a 2 GiB PUT must exceed a 5 GiB legacy quota");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -4771,8 +5103,7 @@ mod tests {
             .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
             .build()
             .expect("PUT input should build");
-        DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+        put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect("a ledger-admitted bucket must accept a write without scanner usage");
 
@@ -4784,8 +5115,7 @@ mod tests {
             .content_length(Some(i64::try_from(too_large.len()).expect("test payload length must fit i64")))
             .build()
             .expect("PUT input should build");
-        let err = DefaultObjectUsecase::from_global()
-            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+        let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect_err("the ledger must still reject a write above the quota limit");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -5188,7 +5518,7 @@ mod tests {
             .expect("PUT input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+        let err = Box::pin(put_method_only(&usecase, input))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the write");
 
@@ -5233,9 +5563,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             request.in_scope(|| {
                 runtime.block_on(async {
-                    Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
-                        .await
-                        .expect("S3 PUT must commit");
+                    Box::pin(put_method_only(&usecase, input)).await.expect("S3 PUT must commit");
                     assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
                     assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
                 })
@@ -5300,7 +5628,7 @@ mod tests {
             .expect("PUT input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+        Box::pin(put_method_only(&usecase, input))
             .await
             .expect("a bucket without default encryption must still accept a plaintext write");
 
@@ -5346,7 +5674,7 @@ mod tests {
         req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+        let err = Box::pin(put_owned(&usecase, req))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
 
@@ -5406,7 +5734,7 @@ mod oversize_single_upload_tests {
         assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
         assert_eq!(
             err.message(),
-            Some(ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge).as_str())
+            Some(ApiError::error_code_to_message(&rustfs_s3_types::S3ErrorCode::EntityTooLarge).as_str())
         );
     }
 }

@@ -58,7 +58,7 @@ impl From<Region> for legacy_s3s::region::Region {
     fn from(region: Region) -> Self {
         match Self::new(region.into_boxed_str()) {
             Ok(region) => region,
-            Err(invalid) => unreachable!("rustfs_s3_types::Region and s3s::region::Region share one grammar: {invalid}"),
+            Err(invalid) => unreachable!("rustfs_s3_types::Region and the legacy region type share one grammar: {invalid}"),
         }
     }
 }
@@ -67,7 +67,7 @@ impl From<legacy_s3s::region::Region> for Region {
     fn from(region: legacy_s3s::region::Region) -> Self {
         match Self::new(region.into_boxed_str()) {
             Ok(region) => region,
-            Err(invalid) => unreachable!("s3s::region::Region and rustfs_s3_types::Region share one grammar: {invalid}"),
+            Err(invalid) => unreachable!("the legacy region type and rustfs_s3_types::Region share one grammar: {invalid}"),
         }
     }
 }
@@ -104,7 +104,16 @@ impl From<legacy_s3s::S3ErrorCode> for S3ErrorCode {
 impl From<S3Error> for legacy_s3s::S3Error {
     fn from(error: S3Error) -> Self {
         let parts = error.into_parts();
-        let mut out = Self::new(parts.code.into());
+        let code: legacy_s3s::S3ErrorCode = parts.code.into();
+        // An s3s error that crossed into this type earlier travels whole inside its cause
+        // (`LegacyCause`); crossing back hands that error on, so its typed cause is the cause
+        // again and not a wrapper a caller cannot downcast.
+        let (mut out, source) = match parts.source.map(|source| source.downcast::<LegacyCause>()) {
+            Some(Ok(cause)) if cause.0.code() == &code => (cause.0, None),
+            Some(Ok(cause)) => (Self::new(code), Some(cause as Box<dyn std::error::Error + Send + Sync>)),
+            Some(Err(source)) => (Self::new(code), Some(source)),
+            None => (Self::new(code), None),
+        };
         if let Some(message) = parts.message {
             out.set_message(message);
         }
@@ -114,13 +123,23 @@ impl From<S3Error> for legacy_s3s::S3Error {
         if let Some(status) = parts.status {
             out.set_status_code(status);
         }
-        if let Some(source) = parts.source {
+        if let Some(source) = source {
             out.set_source(source);
         }
         if let Some(headers) = parts.headers {
             out.set_headers(headers);
         }
         out
+    }
+}
+
+impl S3Error {
+    /// The pinned legacy serializer's XML response. Call sites stay on this type.
+    /// DELETE BY T4.2 with the rest of this file.
+    pub fn to_http_response(self) -> Result<http::Response<crate::Body>, Self> {
+        let response = legacy_s3s::S3Error::from(self).to_http_response().map_err(Self::from)?;
+        let (parts, body) = response.into_parts();
+        Ok(http::Response::from_parts(parts, crate::Body::from(body)))
     }
 }
 
@@ -155,10 +174,10 @@ impl From<legacy_s3s::S3Error> for S3Error {
 /// reference only, so the whole error travels inside and this wrapper presents
 /// the cause's own text and chain, as if the cause itself had been moved.
 #[derive(Debug)]
-struct LegacyCause(legacy_s3s::S3Error);
+pub(super) struct LegacyCause(legacy_s3s::S3Error);
 
 impl LegacyCause {
-    fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+    pub(super) fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
         self.0.source()
     }
 }
@@ -227,6 +246,25 @@ mod tests {
         assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
         assert_eq!(oracle("TierNotFound").status_code(), None);
         assert_eq!(S3ErrorCode::Custom("TierNotFound".into()).status_code(), None);
+    }
+
+    #[test]
+    fn every_code_matches_the_s3s_default_message() {
+        let mut mismatches = Vec::new();
+        for code in S3ErrorCode::NAMED {
+            let legacy = oracle(code.as_str()).default_message();
+            if legacy.is_none() {
+                mismatches.push(format!("{code}: s3s has no default message"));
+            }
+            if code.default_message() != legacy {
+                mismatches.push(format!("{code}: s3s {legacy:?}, ours {:?}", code.default_message()));
+            }
+        }
+        assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+        for custom in ["TierNotFound", "NoSuchKey", ""] {
+            assert_eq!(legacy_s3s::S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+            assert_eq!(S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+        }
     }
 
     #[test]
@@ -338,6 +376,54 @@ mod tests {
             assert_eq!(crossed.message(), native.message(), "{code}");
             assert_eq!(crossed.status_code(), native.status_code(), "{code}");
         }
+    }
+
+    /// An s3s error that crosses to ours and back keeps its typed cause, so a caller downcasting
+    /// the cause after an owned use case finds the storage error it found before; what our side
+    /// changed is applied, and what it left alone is exactly the original's. Re-coded on our side,
+    /// it keeps only the cause's text: the original error no longer answers.
+    #[test]
+    fn a_round_trip_hands_the_typed_cause_back_unless_the_code_changed() {
+        let mut legacy = legacy_s3s::S3Error::with_message(legacy_s3s::S3ErrorCode::ServiceUnavailable, "retry");
+        legacy.set_source(Box::new(io::Error::other("read quorum")));
+
+        let mut ours: S3Error = legacy.into();
+        assert!(ours.source().is_some_and(|cause| cause.is::<io::Error>()));
+        assert!(std::error::Error::source(&ours).is_some_and(|cause| cause.is::<io::Error>()));
+        ours.set_message("retry later".to_owned());
+        let back: legacy_s3s::S3Error = ours.into();
+        assert_eq!(back.code(), &legacy_s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(back.message(), Some("retry later"));
+        let cause = back.source().expect("the cause survives");
+        assert_eq!(cause.downcast_ref::<io::Error>().map(ToString::to_string).as_deref(), Some("read quorum"));
+
+        let mut original = legacy_s3s::S3Error::with_message(legacy_s3s::S3ErrorCode::SlowDown, "slow");
+        original.set_status_code(StatusCode::TOO_MANY_REQUESTS);
+        original.set_source(Box::new(io::Error::other("throttled")));
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("1"));
+        original.set_headers(headers.clone());
+        let untouched: legacy_s3s::S3Error = S3Error::from(original).into();
+        assert_eq!(untouched.code(), &legacy_s3s::S3ErrorCode::SlowDown);
+        assert_eq!(untouched.message(), Some("slow"));
+        assert_eq!(untouched.status_code(), Some(StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(untouched.headers(), Some(&headers));
+        assert!(
+            untouched
+                .source()
+                .is_some_and(|cause| cause.downcast_ref::<io::Error>().is_some())
+        );
+
+        let mut legacy = legacy_s3s::S3Error::new(legacy_s3s::S3ErrorCode::ServiceUnavailable);
+        legacy.set_source(Box::new(io::Error::other("read quorum")));
+        let ours: S3Error = legacy.into();
+        let mut recoded = S3Error::new(S3ErrorCode::InternalError);
+        recoded.set_source(ours.into_parts().source.expect("the crossed cause"));
+        let recoded: legacy_s3s::S3Error = recoded.into();
+        assert_eq!(recoded.code(), &legacy_s3s::S3ErrorCode::InternalError);
+        let cause = recoded.source().expect("the cause's text survives");
+        assert!(cause.downcast_ref::<io::Error>().is_none());
+        assert_eq!(cause.to_string(), "read quorum");
     }
 
     #[test]

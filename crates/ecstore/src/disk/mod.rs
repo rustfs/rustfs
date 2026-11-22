@@ -30,6 +30,7 @@ pub mod local;
 pub mod multipart_index;
 pub mod multipart_source;
 pub mod os;
+mod usage_watch;
 
 pub(crate) use io_admission::memory as background_memory;
 pub(crate) use io_admission::remote as remote_io_admission;
@@ -44,7 +45,7 @@ pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFile
 pub(crate) use io_admission::{DiskIoClass, test_resource_units};
 pub(crate) use io_admission::{
     PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,
-    with_optional_disk_io_context, with_optional_resource_unit,
+    with_detached_disk_io_context, with_optional_disk_io_context, with_optional_resource_unit,
 };
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
@@ -58,9 +59,26 @@ pub const BUCKET_META_PREFIX: &str = "buckets";
 /// a user bucket of the same name, so bucket deletion must leave it in place.
 pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
+pub(crate) const FORMAT_BOOTSTRAP_FILE: &str = "format.json.bootstrap";
+pub(crate) const FORMAT_BOOTSTRAP_DONE_FILE: &str = "format.json.bootstrap.done";
+
+/// Validate an internal format control filename for atomic publication.
+///
+/// # Errors
+/// Returns [`DiskError::MethodNotAllowed`] for every other path.
+pub fn validate_format_control_path(path: &str) -> Result<()> {
+    if matches!(path, FORMAT_CONFIG_FILE | FORMAT_BOOTSTRAP_FILE) {
+        Ok(())
+    } else {
+        Err(DiskError::MethodNotAllowed)
+    }
+}
+
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
+/// Boot-time crash fence and clean scanner continuity receipt.
+pub const UNCLEAN_SHUTDOWN_MARKER_PATH: &str = "unclean-shutdown";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 /// Original upload authority after it stops admitting active part mutations.
@@ -103,6 +121,7 @@ use sha2::Digest as _;
 use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Independent admission and physical ownership for one disk rename.
@@ -222,6 +241,14 @@ pub enum PoolMetaNativeRecoveryResponse {
 }
 
 pub type DiskStore = Arc<Disk>;
+
+/// Filesystem evidence for a replacement data directory on its expected mount.
+#[derive(Debug)]
+pub struct ReplacementMount {
+    pub canonical_path: PathBuf,
+    pub physical_device_ids: Vec<String>,
+    pub filesystem_identity: String,
+}
 
 pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
 impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
@@ -433,7 +460,14 @@ impl Disk {
         transaction: Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
-    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+    ) -> Result<
+        Option<(
+            DeleteRecoveryJournal,
+            bool,
+            bool,
+            Option<local::delete_recovery::LocalPublishedDeleteState>,
+        )>,
+    > {
         match self {
             Self::Local(disk) => {
                 disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner, work_budget)
@@ -443,6 +477,7 @@ impl Disk {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
         &self,
         volume: &str,
@@ -451,6 +486,7 @@ impl Disk {
         journal: &DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
+        published_state: Option<local::delete_recovery::LocalPublishedDeleteState>,
     ) -> Result<bool> {
         match self {
             Self::Local(disk) => {
@@ -461,6 +497,7 @@ impl Disk {
                     journal,
                     namespace_owner,
                     work_budget,
+                    published_state,
                 )
                 .await
             }
@@ -1170,6 +1207,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.write_format_control(path, data).await,
+            Disk::Remote(remote_disk) => remote_disk.write_format_control(path, data).await,
+        }
+    }
+
     async fn compare_and_update_file(
         &self,
         volume: &str,
@@ -1406,6 +1450,16 @@ impl Disk {
 }
 
 impl Disk {
+    /// The progress flag is derived from a verified capability scope.
+    pub async fn ns_scanner_progress_capability(
+        &self,
+    ) -> Result<Option<crate::storage_api_contracts::internode::NsScannerCapabilities>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner_progress_capability().await,
+        }
+    }
+
     pub async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         match self {
             Disk::Local(_) => Ok(None),
@@ -1424,6 +1478,15 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.runtime_state(),
             Disk::Remote(remote_disk) => remote_disk.runtime_state(),
+        }
+    }
+
+    /// Observe a local wrapper's retirement. Remote handles have their own RPC lifecycle.
+    /// Cancelling the returned child token does not retire the underlying wrapper.
+    pub fn local_retirement_token(&self) -> Option<CancellationToken> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.retirement_token()),
+            Disk::Remote(_) => None,
         }
     }
 
@@ -1550,6 +1613,15 @@ impl Disk {
         }
     }
 
+    /// Observe the expected mount through the same local disk handle that will
+    /// execute recovery. Call from a blocking context.
+    pub fn replacement_mount(&self, mount_roots: &[PathBuf]) -> Option<ReplacementMount> {
+        match self {
+            Self::Local(disk) => disk.get_disk().replacement_mount(mount_roots),
+            Self::Remote(_) => None,
+        }
+    }
+
     pub async fn acquire_replacement_execution_lease(&self) -> Result<std::sync::Arc<local::ReplacementExecutionLease>> {
         match self {
             Self::Local(disk) => disk.get_disk().acquire_replacement_execution_lease().await,
@@ -1582,14 +1654,18 @@ pub(crate) async fn new_disk_for_instance(
     ep: &Endpoint,
     opt: &DiskOption,
 ) -> Result<DiskStore> {
-    new_disk_with_health_tracker(
+    let disk = new_disk_with_health_tracker(
         ep,
         opt,
         None,
         #[cfg(feature = "internode-transport")]
         Some(_instance),
     )
-    .await
+    .await?;
+    if let Disk::Local(wrapper) = disk.as_ref() {
+        wrapper.get_disk().usage_watch_binding.bind(&_instance.usage_watches);
+    }
+    Ok(disk)
 }
 
 pub(crate) async fn new_disk_with_health_tracker(
@@ -1905,6 +1981,21 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    /// Atomically publish a valid per-drive `FormatV3` control file in the system volume.
+    /// Deployment, topology and member UUID must agree with existing control records.
+    /// Pending intents admit equivalent plans, and retired intents reject bootstrap
+    /// republication. Success requires a durable replacement inode and parent entry.
+    /// Cancellation can leave the complete plan published. Retries revalidate the
+    /// plan under the per-disk owner before publishing it durably.
+    ///
+    /// # Errors
+    /// Returns [`DiskError::MethodNotAllowed`] for unsupported implementations,
+    /// paths or retired bootstrap intents, [`DiskError::CorruptedFormat`] for
+    /// invalid or conflicting plans, and an I/O error when publication or its
+    /// durability barrier fails.
+    async fn write_format_control(&self, _path: &str, _data: Bytes) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     /// Atomically replace or remove a small control file only when its current
     /// contents match `expected`. Implementations that cannot provide this
@@ -2860,6 +2951,26 @@ pub fn count_part_not_success(part_errs: &[usize]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_control_paths_are_fixed_system_leaf_names() {
+        for path in [super::FORMAT_CONFIG_FILE, super::FORMAT_BOOTSTRAP_FILE] {
+            super::validate_format_control_path(path).expect("allowed format control leaf");
+        }
+        for path in [
+            "",
+            "../format.json",
+            "format.json/",
+            ".rustfs.sys/format.json",
+            "format.json.bootstrap.done",
+            "pool.bin",
+        ] {
+            assert!(matches!(
+                super::validate_format_control_path(path),
+                Err(super::DiskError::MethodNotAllowed)
+            ));
+        }
+    }
+
     use super::*;
 
     #[test]

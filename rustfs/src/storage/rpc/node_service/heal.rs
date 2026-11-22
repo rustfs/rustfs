@@ -32,29 +32,12 @@ const NODE_REPLACEMENT_RECOVERY_STATUS_VERSION: u8 = 1;
 const NODE_REPLACEMENT_RECOVERY_STATUS_MAX_SIZE: usize = 64 * 1024;
 const HEAL_TOPOLOGY_FINGERPRINT_DOMAIN: &[u8] = b"rustfs-heal-topology-v1\0";
 
-fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Timestamp {
-    let seconds = timestamp.timestamp();
-    let nanoseconds = match i32::try_from(timestamp.timestamp_subsec_nanos()) {
-        Ok(nanoseconds) => nanoseconds,
-        Err(_) => {
-            return if seconds < 0 { Timestamp::MIN } else { Timestamp::MAX };
-        }
-    };
-
-    match Timestamp::new(seconds, nanoseconds) {
-        Ok(timestamp) => timestamp,
-        Err(_) => {
-            if seconds < 0 {
-                Timestamp::MIN
-            } else {
-                Timestamp::MAX
-            }
-        }
-    }
+fn chrono_to_jiff_timestamp(timestamp: Timestamp) -> Timestamp {
+    timestamp
 }
 
-fn jiff_to_chrono_datetime(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::from(timestamp))
+fn jiff_to_chrono_datetime(timestamp: Timestamp) -> Timestamp {
+    timestamp
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,7 +491,7 @@ mod tests {
         Endpoint,
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
-    use chrono::SecondsFormat;
+    use jiff::Timestamp;
     use rustfs_heal::{HealOperationsSnapshot, ReplacementRecoveryRecord, ReplacementRecoverySnapshot, ReplacementRecoveryState};
     use rustfs_scanner::scanner::BackgroundHealInfo;
 
@@ -823,13 +806,13 @@ mod tests {
         assert_eq!(
             info.bitrot_start_time
                 .expect("bitrot start time should be preserved")
-                .to_rfc3339_opts(SecondsFormat::Micros, true),
+                .strftime("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string(),
             "2023-11-14T22:13:20.123456Z"
         );
 
-        let started_at = chrono::DateTime::parse_from_rfc3339("2023-11-14T22:13:20.123456Z")
-            .expect("fixture timestamp should parse")
-            .with_timezone(&chrono::Utc);
+        let started_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.f%:z", "2023-11-14T22:13:20.123456+00:00")
+            .expect("fixture timestamp should parse");
         let snapshot = NodeHealStatusSnapshot::for_test(
             true,
             true,

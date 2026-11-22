@@ -18,6 +18,7 @@ use crate::storage::storage_api::ecstore_disk::{
     MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
     PoolMetaNativeRecoveryRequest as NativeRecoveryRequest, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
     RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, is_quota_mutation_fence_path, require_source_condition,
+    validate_format_control_path,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
@@ -31,6 +32,7 @@ use crate::storage::storage_api::{
     verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
+use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::InternodeRpcDurationGuard;
 use rustfs_io_metrics::internode_metrics::{
@@ -76,6 +78,21 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    fn object_requires_incarnation(&self, bucket: &str, object: &str) -> bool {
+        match self {
+            Self::Ready(store) => store.object_requires_incarnation(bucket, object),
+            Self::Bootstrap(_) | Self::Unbound => false,
+        }
+    }
+
+    async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: Bytes) -> Result<(), DiskError> {
+        match self {
+            Self::Ready(store) => store.write_local_format_control(disk_ref, path, data).await,
+            Self::Bootstrap(target) => target.write_local_format_control(disk_ref, path, data).await,
+            Self::Unbound => Err(DiskError::DiskNotFound),
+        }
+    }
+
     async fn recover_local_multipart_source(
         &self,
         disk_ref: &str,
@@ -234,6 +251,34 @@ fn decode_msgpack_or_json_with_source<T: DeserializeOwned>(
             Err(DiskError::other(format!("decode {value_name} failed: {err}")))
         }
     }
+}
+
+fn decode_delete_versions_request_versions(
+    request: &DeleteVersionsRequest,
+) -> std::result::Result<Vec<FileInfoVersions>, DiskError> {
+    if request.versions_bin.is_empty() {
+        let mut versions = Vec::with_capacity(request.versions.len());
+        for version in &request.versions {
+            versions.push(decode_msgpack_or_json(&[], version, "FileInfoVersions")?);
+        }
+        return Ok(versions);
+    }
+
+    // The binary list owns both the batch length and its entries. A legacy
+    // JSON list may be absent or stale, so it cannot repair a malformed item.
+    let mut versions = Vec::with_capacity(request.versions_bin.len());
+    for version in &request.versions_bin {
+        if version.is_empty() {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                "FileInfoVersions",
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            return Err(DiskError::other("empty FileInfoVersions msgpack item"));
+        }
+        versions.push(decode_msgpack_or_json(version, "", "FileInfoVersions")?);
+    }
+    Ok(versions)
 }
 
 fn encode_msgpack_with_capacity<T: serde::Serialize>(
@@ -459,6 +504,18 @@ fn decode_multipart_rename_request_file_info(binary: &[u8]) -> Result<DecodedRpc
             Err(error)
         }
     }
+}
+
+fn decode_batch_rename_file_info(binary: &[u8]) -> Result<FileInfo, DiskError> {
+    if binary.is_empty() || binary.len() > rustfs_protos::DEFAULT_GRPC_SERVER_MESSAGE_LEN {
+        return Err(DiskError::FileCorrupt);
+    }
+    let mut cursor = Cursor::new(binary);
+    let value = rmp_serde::from_read(&mut cursor).map_err(|_| DiskError::FileCorrupt)?;
+    if cursor.position() != u64::try_from(binary.len()).map_err(DiskError::other)? {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(value)
 }
 
 fn encode_rename_data_response_payloads(
@@ -958,21 +1015,17 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
-            let mut versions = Vec::with_capacity(request.versions.len());
-            for (index, version) in request.versions.iter().enumerate() {
-                let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
-                match decode_msgpack_or_json::<FileInfoVersions>(version_bin, version, "FileInfoVersions") {
-                    Ok(version) => versions.push(version),
-                    Err(err) => {
-                        return Ok(Response::new(DeleteVersionsResponse {
-                            success: false,
-                            errors: Vec::new(),
-                            error: Some(DiskError::other(format!("decode FileInfoVersions failed: {err}")).into()),
-                            item_errors: Vec::new(),
-                        }));
-                    }
-                };
-            }
+            let versions = match decode_delete_versions_request_versions(&request) {
+                Ok(versions) => versions,
+                Err(err) => {
+                    return Ok(Response::new(DeleteVersionsResponse {
+                        success: false,
+                        errors: Vec::new(),
+                        error: Some(err.into()),
+                        item_errors: Vec::new(),
+                    }));
+                }
+            };
             let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
                 Ok(opts) => opts,
                 Err(err) => {
@@ -2079,6 +2132,152 @@ impl NodeService {
         Ok(response)
     }
 
+    pub(super) async fn handle_rename_data_batch(
+        &self,
+        request: Request<RenameDataBatchRequest>,
+    ) -> Result<Response<super::ResponseStream<RenameDataBatchResult>>, Status> {
+        const MAX_BATCH_ITEMS: usize = 16;
+
+        if request.get_ref().items.is_empty() || request.get_ref().items.len() > MAX_BATCH_ITEMS {
+            return Err(Status::invalid_argument("rename batch item count must be between 1 and 16"));
+        }
+        let canonical_body = rustfs_protos::canonical_rename_data_batch_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("rename batch body length cannot be represented"))?;
+        let has_body_digest = request
+            .metadata()
+            .get("x-rustfs-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.is_empty() && value != "UNSIGNED-PAYLOAD");
+        if !has_body_digest {
+            return Err(Status::permission_denied("rename batch requires a body-bound digest"));
+        }
+        crate::storage::storage_api::verify_tonic_canonical_body_digest(&request, &canonical_body)
+            .map_err(|_| Status::permission_denied("rename batch requires body-bound authentication"))?;
+        let request = request.into_inner();
+        if request.src_volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(Status::invalid_argument("multipart source requires RenameMultipartData"));
+        }
+
+        let target = self.local_mutation_target();
+        if target.object_requires_incarnation(&request.dst_volume, &request.dst_path) {
+            return Err(Status::failed_precondition(
+                "incarnation-bound rename cannot use ordinary batch transport",
+            ));
+        }
+        let mut seen_indexes = 0_u16;
+        let mut prepared = Vec::with_capacity(request.items.len());
+        for item in request.items {
+            let item_index =
+                usize::try_from(item.item_index).map_err(|_| Status::invalid_argument("invalid rename batch item index"))?;
+            if item_index >= MAX_BATCH_ITEMS || seen_indexes & (1_u16 << item_index) != 0 {
+                return Err(Status::invalid_argument("rename batch item indexes must be unique and below 16"));
+            }
+            seen_indexes |= 1_u16 << item_index;
+            if item.disk.is_empty() || prepared.iter().any(|(_, disk, _)| disk == &item.disk) {
+                return Err(Status::invalid_argument("rename batch disk references must be non-empty and unique"));
+            }
+            let file_info = decode_batch_rename_file_info(&item.file_info_msgpack)
+                .map_err(|_| Status::invalid_argument("invalid rename batch FileInfo"))?;
+            if file_info.is_canonical_delete_marker() {
+                file_info
+                    .validate_for_metadata_read()
+                    .map_err(|_| Status::invalid_argument("invalid rename batch delete marker"))?;
+            } else {
+                file_info
+                    .validate_for_erasure_write()
+                    .map_err(|_| Status::invalid_argument("invalid rename batch FileInfo geometry"))?;
+            }
+            if rustfs_utils::http::metadata_compat::contains_key_str(&file_info.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX)
+                || rustfs_utils::http::metadata_compat::contains_key_str(
+                    &file_info.metadata,
+                    POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+            {
+                return Err(Status::invalid_argument("protected rename cannot use ordinary batch transport"));
+            }
+            prepared.push((item.item_index, item.disk, file_info));
+        }
+        let src_volume = Arc::<str>::from(request.src_volume);
+        let src_path = Arc::<str>::from(request.src_path);
+        let dst_volume = Arc::<str>::from(request.dst_volume);
+        let dst_path = Arc::<str>::from(request.dst_path);
+        let (tx, rx) = tokio::sync::mpsc::channel(prepared.len());
+        let prepared_items = prepared.len();
+        let resource_context = crate::storage::storage_api::RemoteBackgroundIo::take_current();
+        tokio::spawn(crate::storage::storage_api::with_remote_background_io(resource_context, async move {
+            let dispatch_started_at = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
+            let mut first_item_at = None;
+            let mut completed_items = 0usize;
+            let mut pending = FuturesUnordered::new();
+            for (item_index, disk, file_info) in prepared {
+                let target = target.clone();
+                let src_volume = Arc::clone(&src_volume);
+                let src_path = Arc::clone(&src_path);
+                let dst_volume = Arc::clone(&dst_volume);
+                let dst_path = Arc::clone(&dst_path);
+                pending.push(async move {
+                    let result = std::panic::AssertUnwindSafe(async {
+                        let result = target
+                            .rename_local_data(&disk, (&src_volume, &src_path), &file_info, (&dst_volume, &dst_path), None, None)
+                            .await;
+                        match result.and_then(|value| encode_msgpack_named(&value, "RenameDataResp")) {
+                            Ok(payload) => RenameDataBatchResult {
+                                item_index,
+                                success: true,
+                                error: None,
+                                rename_data_resp_msgpack: payload.into(),
+                            },
+                            Err(error) => RenameDataBatchResult {
+                                item_index,
+                                success: false,
+                                error: Some(error.into()),
+                                rename_data_resp_msgpack: Vec::new().into(),
+                            },
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    (item_index, result)
+                });
+            }
+            while let Some(outcome) = pending.next().await {
+                let (item_index, result) = outcome;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(_) => RenameDataBatchResult {
+                        item_index,
+                        success: false,
+                        error: Some(DiskError::Unexpected.into()),
+                        rename_data_resp_msgpack: Vec::new().into(),
+                    },
+                };
+                if let Some(dispatch_started_at) = dispatch_started_at {
+                    let completed_at = Instant::now();
+                    completed_items += 1;
+                    match first_item_at {
+                        Some(first_item_at) if completed_items == prepared_items => {
+                            rustfs_io_metrics::record_ecstore_rename_batch_server_first_to_last(
+                                completed_at.saturating_duration_since(first_item_at),
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            rustfs_io_metrics::record_ecstore_rename_batch_server_dispatch_to_first(
+                                completed_at.saturating_duration_since(dispatch_started_at),
+                            );
+                            first_item_at = Some(completed_at);
+                            if completed_items == prepared_items {
+                                rustfs_io_metrics::record_ecstore_rename_batch_server_first_to_last(std::time::Duration::ZERO);
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(Ok(response)).await;
+            }
+        }));
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
+    }
+
     pub(super) async fn handle_list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
@@ -2748,6 +2947,48 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_write_format_control(
+        &self,
+        request: Request<WriteFormatControlRequest>,
+    ) -> Result<Response<WriteAllResponse>, Status> {
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+        let canonical = rustfs_protos::canonical_write_format_control_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("format control request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("format control requires a signed canonical body"))?;
+        validate_format_control_path(&request.get_ref().path)
+            .map_err(|_| Status::invalid_argument("unsupported format control filename"))?;
+        let request = request.into_inner();
+        let metrics = runtime_sources::current_internode_metrics();
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            request.data.len(),
+        );
+        let target = self.local_mutation_target();
+        let result = target
+            .write_local_format_control(&request.disk, &request.path, request.data)
+            .await;
+        match result {
+            Ok(()) => Ok(Response::new(WriteAllResponse {
+                success: true,
+                error: None,
+            })),
+            Err(error) => {
+                metrics
+                    .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
+                Ok(Response::new(WriteAllResponse {
+                    success: false,
+                    error: Some(error.into()),
+                }))
+            }
+        }
+    }
+
     pub(super) async fn handle_compare_and_update_file(
         &self,
         request: Request<CompareAndUpdateFileRequest>,
@@ -2863,19 +3104,20 @@ impl NodeService {
 mod tests {
     use super::{
         DeleteOptions, INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-        InternodeRpcDurationGuard, compat_response_json, decode_msgpack_or_json, decode_multipart_rename_request_file_info,
-        decode_rename_data_request_file_info, encode_batch_read_version_response_payloads, encode_delete_versions_errors,
-        encode_file_info_msgpack, encode_msgpack, encode_msgpack_named, encode_read_multiple_response_payloads,
-        encode_rename_data_response_payloads, rejects_legacy_delete_transaction,
+        InternodeRpcDurationGuard, compat_response_json, decode_delete_versions_request_versions, decode_msgpack_or_json,
+        decode_multipart_rename_request_file_info, decode_rename_data_request_file_info,
+        encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
+        rejects_legacy_delete_transaction,
     };
     use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
-    use rustfs_filemeta::FileInfo;
+    use rustfs_filemeta::{FileInfo, FileInfoVersions};
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-    use rustfs_protos::proto_gen::node_service::ReadVersionRequest;
+    use rustfs_protos::proto_gen::node_service::{DeleteVersionsRequest, ReadVersionRequest};
     use serde::{Deserialize, Serialize};
     use serial_test::serial;
     use tonic::Request;
@@ -2885,6 +3127,118 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    fn delete_versions_group(name: &str) -> FileInfoVersions {
+        FileInfoVersions {
+            volume: "bucket".to_string(),
+            name: name.to_string(),
+            versions: vec![FileInfo {
+                name: name.to_string(),
+                version_id: Some(Uuid::from_u128(1)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delete_versions_msgpack_only_decodes_every_binary_item() {
+        let groups = [delete_versions_group("first"), delete_versions_group("second")];
+        let request = DeleteVersionsRequest {
+            versions_bin: groups
+                .iter()
+                .map(|group| {
+                    encode_msgpack_named(group, "FileInfoVersions")
+                        .expect("encode delete group")
+                        .into()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let decoded = decode_delete_versions_request_versions(&request).expect("decode msgpack-only batch");
+        assert_eq!(decoded.len(), groups.len());
+        for (actual, expected) in decoded.iter().zip(&groups) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.versions, expected.versions);
+        }
+    }
+
+    #[test]
+    fn delete_versions_msgpack_list_controls_length_and_values_with_legacy_json_present() {
+        for json_count in [0, 1, 2, 3] {
+            let request = DeleteVersionsRequest {
+                versions: vec!["invalid legacy JSON".to_string(); json_count],
+                versions_bin: ["first", "second"]
+                    .iter()
+                    .map(|name| {
+                        encode_msgpack_named(&delete_versions_group(name), "FileInfoVersions")
+                            .expect("encode binary delete group")
+                            .into()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+
+            let decoded = decode_delete_versions_request_versions(&request).expect("binary batch must take precedence");
+            assert_eq!(decoded.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        }
+    }
+
+    #[test]
+    fn delete_versions_json_only_preserves_legacy_batch() {
+        let groups = [delete_versions_group("first"), delete_versions_group("second")];
+        let request = DeleteVersionsRequest {
+            versions: groups
+                .iter()
+                .map(|group| serde_json::to_string(group).expect("encode legacy delete group"))
+                .collect(),
+            ..Default::default()
+        };
+
+        let decoded = decode_delete_versions_request_versions(&request).expect("decode legacy JSON batch");
+        assert_eq!(decoded.len(), groups.len());
+        for (actual, expected) in decoded.iter().zip(&groups) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.versions, expected.versions);
+        }
+    }
+
+    #[test]
+    fn delete_versions_invalid_binary_item_never_uses_valid_json() {
+        let json = serde_json::to_string(&delete_versions_group("legacy")).expect("encode legacy group");
+        for invalid in [bytes::Bytes::new(), bytes::Bytes::from_static(b"invalid-msgpack")] {
+            let request = DeleteVersionsRequest {
+                versions: vec![json.clone(), json.clone()],
+                versions_bin: vec![
+                    encode_msgpack_named(&delete_versions_group("first"), "FileInfoVersions")
+                        .expect("encode valid first group")
+                        .into(),
+                    invalid,
+                ],
+                ..Default::default()
+            };
+
+            assert!(
+                decode_delete_versions_request_versions(&request).is_err(),
+                "malformed binary batch must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_versions_invalid_json_only_batch_fails_and_empty_batch_stays_empty() {
+        let invalid = DeleteVersionsRequest {
+            versions: vec!["invalid JSON".to_string()],
+            ..Default::default()
+        };
+        assert!(decode_delete_versions_request_versions(&invalid).is_err());
+        assert!(
+            decode_delete_versions_request_versions(&DeleteVersionsRequest::default())
+                .expect("empty legacy batch")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3026,6 +3380,82 @@ mod tests {
                 other => panic!("duration metric must be a histogram, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn format_control_handler_metrics_count_admitted_payload_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_protos::proto_gen::node_service::WriteFormatControlRequest;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let enabled = rustfs_io_metrics::metrics_enabled();
+        rustfs_io_metrics::set_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("handler metrics runtime");
+            runtime.block_on(async {
+                let server = make_server();
+                let message = WriteFormatControlRequest {
+                    disk: "missing-format-target".into(),
+                    path: "format.json.bootstrap".into(),
+                    data: bytes::Bytes::from_static(b"format-plan"),
+                };
+                let mut request = Request::new(message.clone());
+                let canonical =
+                    rustfs_protos::canonical_write_format_control_request_body(request.get_ref()).expect("canonical control");
+                crate::storage::storage_api::set_tonic_canonical_body_digest(&mut request, &canonical).expect("control digest");
+                request
+                    .metadata_mut()
+                    .insert("x-rustfs-rpc-auth-version", "2".parse().expect("v2 header"));
+                let response = server
+                    .handle_write_format_control(request)
+                    .await
+                    .expect("typed target failure")
+                    .into_inner();
+                assert!(!response.success);
+                let error = server
+                    .handle_write_format_control(Request::new(message))
+                    .await
+                    .expect_err("unsigned control rejection");
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            });
+        });
+        rustfs_io_metrics::set_metrics_enabled(enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let value = |name: &str| {
+            &entries
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "grpc_write_all")
+                })
+                .expect("format-control handler metric")
+                .3
+        };
+        for (name, expected) in [
+            ("rustfs_system_network_internode_operation_requests_incoming_total", 1),
+            ("rustfs_system_network_internode_operation_recv_bytes_total", 11),
+            ("rustfs_system_network_internode_operation_errors_total", 1),
+        ] {
+            assert!(matches!(value(name), DebugValue::Counter(count) if *count == expected), "{name}");
+        }
+        assert!(
+            matches!(value("rustfs_system_network_internode_operation_server_duration_ms"), DebugValue::Histogram(samples) if samples.len() == 2)
+        );
+        assert!(
+            matches!(value("rustfs_system_network_internode_rpc_active"), DebugValue::Gauge(active) if active.into_inner() == 0.0)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(key, _, _, _)| key.key().name() != "rustfs_system_network_internode_operation_duration_ms")
+        );
     }
 
     #[test]

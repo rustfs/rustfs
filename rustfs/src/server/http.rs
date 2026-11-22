@@ -15,13 +15,10 @@
 // Import HTTP server components and compression configuration
 use crate::admin;
 use crate::app::object::request_body::{BodyReadControl, ObservedBody};
-use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
-#[cfg(feature = "gateway-stack")]
-use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_enabled_in_configuration};
-#[cfg(feature = "gateway-stack")]
-use crate::server::stack::{S3StackService, select_stack};
+use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_provider_in_configuration};
+use crate::server::stack::S3StackService;
 use crate::server::{
     Http12ShutdownOutcome, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
@@ -31,10 +28,10 @@ use crate::server::{
         RequestLoggingLayer, redact_sensitive_uri_query,
     },
     legacy_compat::{
-        BodylessStatusFixLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, S3ErrorMessageCompatLayer, SigV4HeaderGuardLayer,
-        StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
+        BodylessStatusFixLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer,
+        StsQueryApiCompatLayer,
     },
+    post_object_location::PostObjectLocationFixLayer,
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
@@ -52,7 +49,7 @@ use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::tonic_service::make_server_for_slot;
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-    tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
+    verify_tonic_rpc_signature_with_bootstrap,
 };
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
@@ -86,12 +83,7 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
-use s3s::{
-    config::{S3Config, StaticConfigProvider},
-    host::MultiDomain,
-    service::S3Service,
-    service::S3ServiceBuilder,
-};
+use s3s::host::MultiDomain;
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -117,7 +109,7 @@ use tower_http::trace::TraceLayer;
 #[cfg(feature = "http3")]
 type Http3CoreService = tower::util::BoxCloneService<
     HttpRequest<http3::RequestBody>,
-    Response<HybridBody<s3s::Body, http_body_util::Empty<Bytes>>>,
+    Response<HybridBody<EdgeBody, http_body_util::Empty<Bytes>>>,
     Box<dyn std::error::Error + Send + Sync>,
 >;
 
@@ -191,15 +183,6 @@ static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6
 static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
 
-fn rustfs_s3_config() -> S3Config {
-    let mut s3_config = S3Config::default();
-    s3_config.normalize_forward_slash_path = true;
-    s3_config.enable_sig_v2 = true;
-    s3_config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
-    s3_config.sig_v4_allowed_services.push("s3tables".to_string());
-    s3_config
-}
-
 fn s3_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
     if config.server_domains.is_empty() || config.console_enable {
         return Ok(None);
@@ -263,8 +246,6 @@ const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
 const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
 const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
 const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
-const EVENT_S3_STACK_ASSEMBLED: &str = "s3_stack_assembled";
-const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
 const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
 const EVENT_CONNECTION_CAP_STATE: &str = "connection_cap_state";
@@ -276,6 +257,7 @@ const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
 const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
 const HEAL_CONTROL_TONIC_RPC_PATH: &str = "/node_service.HealControlService/HealControl";
 const SCANNER_SCOPED_DIRTY_USAGE_ACK_TONIC_RPC_PATH: &str = "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck";
+const SCANNER_USAGE_WATCH_TONIC_RPC_PATH: &str = "/node_service.ScannerControlService/ScannerUsageWatch";
 const TIER_MUTATION_PREPARE_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/PrepareTierMutation";
 const TIER_MUTATION_COMMIT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/CommitTierMutation";
 const TIER_MUTATION_ABORT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/AbortTierMutation";
@@ -450,13 +432,21 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
+        let msgpack_manifest_capability_requested = storage::tonic_msgpack_manifest_capability_requested(req.headers());
         let response_headers = tonic_boot_epoch_challenge(req.headers())
             .ok()
             .flatten()
             .and_then(|challenge| {
                 storage::try_current_local_node_name()
                     .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
-                    .and_then(|audience| tonic_boot_epoch_response_headers(&audience, challenge).ok())
+                    .and_then(|audience| {
+                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
+                            &audience,
+                            challenge,
+                            msgpack_manifest_capability_requested,
+                        )
+                        .ok()
+                    })
             });
         let future = self.inner.call(req);
         Box::pin(async move {
@@ -1193,14 +1183,14 @@ impl<B> EarlyResponseBodyState<B> {
     }
 }
 
-/// Request body passed into s3s while retaining ownership of the raw transport
+/// Request body passed into the S3 stack while retaining ownership of the raw transport
 /// body if an operation returns before consuming it.
 ///
 /// Hyper closes the HTTP/1 read side as soon as an [`Incoming`] receiver is
 /// dropped before EOF. A streaming reverse proxy can still be writing at that
 /// point and turns the resulting `EPIPE` into a 502, hiding RustFS's actual S3
 /// error response. Moving the raw body back to the outer service keeps Hyper's
-/// receiver alive without running s3s payload hashing or signature transforms.
+/// receiver alive without running payload hashing or signature transforms.
 struct EarlyResponseBody<B>
 where
     B: http_body::Body<Data = Bytes> + Unpin,
@@ -1491,9 +1481,65 @@ where
     }
 }
 
-// Validate control-plane digests before s3s discards the serialized body.
+/// The error of the S3 service under the middleware.
+type EdgeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The body of the S3 service under the middleware: whatever the gateway, the native console or a
+/// refusal written in this file answers, behind one type the middleware is written against.
+pub(crate) struct EdgeBody(http_body_util::combinators::UnsyncBoxBody<Bytes, EdgeError>);
+
+impl EdgeBody {
+    fn new<B>(body: B) -> Self
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<EdgeError>,
+    {
+        use http_body_util::BodyExt;
+        Self(body.map_err(Into::into).boxed_unsync())
+    }
+}
+
+impl Default for EdgeBody {
+    fn default() -> Self {
+        Self::new(http_body_util::Empty::new())
+    }
+}
+
+impl From<Bytes> for EdgeBody {
+    fn from(bytes: Bytes) -> Self {
+        Self::new(http_body_util::Full::new(bytes))
+    }
+}
+
+impl From<rustfs_s3_types::Body> for EdgeBody {
+    fn from(body: rustfs_s3_types::Body) -> Self {
+        Self::new(body)
+    }
+}
+
+impl http_body::Body for EdgeBody {
+    type Data = Bytes;
+    type Error = EdgeError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.0).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.0.size_hint()
+    }
+}
+
+// Validate control-plane digests before the body reaches the stack.
 // Object uploads and multipart/form-data must retain their streaming readers.
-struct ControlRequestBody(s3s::Body);
+struct ControlRequestBody(EdgeBody);
 
 impl http_body::Body for ControlRequestBody {
     type Data = Bytes;
@@ -1517,34 +1563,25 @@ impl http_body::Body for ControlRequestBody {
     }
 }
 
-fn control_request_body(body: s3s::Body) -> ControlRequestBody {
+fn control_request_body(body: EdgeBody) -> ControlRequestBody {
     ControlRequestBody(body)
 }
 
-/// The S3 service mounted under the middleware. A build without the `gateway-stack` feature mounts
-/// the legacy service itself.
-#[cfg(not(feature = "gateway-stack"))]
-type S3EdgeService = S3Service;
+/// The S3 service mounted under the middleware: the gateway stack with its claimed-route hosts
+/// (`server/stack.rs`).
+type S3EdgeService = S3StackService<GatewayEdgeService, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
 
-/// The S3 service mounted under the middleware: the legacy stack or the gateway stack, selected at
-/// startup (`server/stack.rs`).
-#[cfg(feature = "gateway-stack")]
-type S3EdgeService = S3StackService<S3Service, GatewayEdgeService>;
-
-/// The gateway stack where the legacy service is mounted: the same response and error types, so
-/// the layers around it do not change with the stack.
-#[cfg(feature = "gateway-stack")]
+/// The gateway stack under the middleware, answering in the middleware's body and error types.
 #[derive(Clone)]
 struct GatewayEdgeService(GatewayStack);
 
-#[cfg(feature = "gateway-stack")]
 impl<B> Service<HttpRequest<B>> for GatewayEdgeService
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    type Response = Response<s3s::Body>;
-    type Error = s3s::HttpError;
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
@@ -1553,50 +1590,131 @@ where
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         let answer = self.0.call(request);
-        Box::pin(async move { Ok(answer.await.map(s3s::Body::http_body_unsync)) })
+        Box::pin(async move { Ok(answer.await.map(EdgeBody::new)) })
     }
 }
 
-/// Selects the S3 stack of this server, once. A gateway stack that cannot be assembled fails
-/// startup; the legacy stack is never started in its place.
-#[cfg(feature = "gateway-stack")]
-fn select_s3_stack(
+#[derive(Clone)]
+struct NativeConsoleEdgeService(axum::Router);
+
+impl NativeConsoleEdgeService {
+    fn for_config(config: &config::Config) -> Option<Self> {
+        config.console_enable.then(|| Self(admin::console::make_console_server()))
+    }
+}
+
+impl<B> Service<HttpRequest<B>> for NativeConsoleEdgeService
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let answer = self.0.call(request.map(axum::body::Body::new));
+        Box::pin(async move {
+            let response = match answer.await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            };
+            Ok(response.map(EdgeBody::new))
+        })
+    }
+}
+
+/// The website host on the gateway stack: the owned host RustFS serves on its website domains.
+#[derive(Clone)]
+struct NativeWebsiteEdgeService(Arc<crate::app::website::WebsiteHost>);
+
+impl NativeWebsiteEdgeService {
+    /// The website service and the requests it claims, when website domains are configured
+    /// (`website_host_domains`, which the console turns off).
+    fn claiming(website: Option<crate::app::website::WebsiteHost>) -> Option<(crate::server::stack::HostClaim, Self)> {
+        let host = Arc::new(website?);
+        let claims = Arc::clone(&host);
+        let claim: crate::server::stack::HostClaim =
+            Arc::new(move |uri: &http::Uri, headers: &http::HeaderMap| claims.claims(uri, headers));
+        Some((claim, Self(host)))
+    }
+}
+
+impl<B> Service<HttpRequest<B>> for NativeWebsiteEdgeService
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Response = Response<EdgeBody>;
+    type Error = EdgeError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let host = Arc::clone(&self.0);
+        // A website read has no body; it is dropped unread.
+        let (parts, _body) = request.into_parts();
+        Box::pin(async move {
+            let answer = host.answer(parts.method, parts.uri, parts.headers, parts.extensions).await;
+            Ok(answer.map(EdgeBody::new))
+        })
+    }
+}
+
+/// Assembles the S3 stack of this server, once. A stack that cannot be assembled fails startup.
+fn assemble_s3_stack(
     config: &config::Config,
-    legacy: S3Service,
-    assembly: impl FnOnce() -> GatewayAssembly,
+    website: Option<crate::app::website::WebsiteHost>,
+    assembly: GatewayAssembly,
 ) -> Result<S3EdgeService> {
-    let service = select_stack(config.s3_stack, legacy, || -> Result<GatewayEdgeService> {
-        let stack = GatewayStack::assemble(assembly()).map_err(Error::other)?;
-        Ok(GatewayEdgeService(stack))
-    })?;
-    info!(
-        event = EVENT_S3_STACK_ASSEMBLED,
-        component = LOG_COMPONENT_SERVER,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        s3_stack_assembled = service.assembled(),
-        "S3 stack assembled"
-    );
-    Ok(service)
+    let native_admin = GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?);
+    let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
+    let control_plane =
+        GatewayEdgeService(GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?);
+    let stack = GatewayStack::assemble(assembly).map_err(Error::other)?;
+    Ok(S3StackService::new(GatewayEdgeService(stack))
+        .with_native_console(NativeConsoleEdgeService::for_config(config))
+        .with_native_website(NativeWebsiteEdgeService::claiming(website))
+        .with_native_admin(Some(native_admin))
+        .with_control_plane(Some(control_plane)))
 }
 
 #[derive(Clone)]
 struct ControlBodyDigestService<S> {
     inner: S,
+    console_listener: bool,
     idle_timeout: Duration,
     total_timeout: Duration,
     max_body_size: usize,
     virtual_host: Option<Arc<MultiDomain>>,
 }
 
+/// The largest control-plane XML body read for digest validation: 20 MiB, the XML body limit
+/// the legacy s3s edge applied.
+const CONTROL_BODY_MAX_BYTES: usize = 20 * 1024 * 1024;
+
 impl<S> ControlBodyDigestService<S> {
     fn new(inner: S, idle_timeout: Duration) -> Self {
         Self {
             inner,
+            console_listener: false,
             idle_timeout,
             total_timeout: Duration::from_secs(30),
-            max_body_size: rustfs_s3_config().xml_max_body_size,
+            max_body_size: CONTROL_BODY_MAX_BYTES,
             virtual_host: None,
         }
+    }
+
+    fn with_console_listener(mut self, enabled: bool) -> Self {
+        self.console_listener = enabled;
+        self
     }
 
     fn with_virtual_host_domains(mut self, domains: Arc<[String]>) -> Self {
@@ -1710,11 +1828,11 @@ fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Optio
     None
 }
 
-fn control_body_digest_error(code: &'static str) -> Response<s3s::Body> {
+fn control_body_digest_error<R: From<Bytes>>(code: &'static str) -> Response<R> {
     // Only static protocol error codes reach this function; never reflect headers or bodies.
     let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>");
     let length = xml.len();
-    let mut response = Response::new(s3s::Body::from(xml));
+    let mut response = Response::new(R::from(Bytes::from(xml)));
     *response.status_mut() = http::StatusCode::BAD_REQUEST;
     response
         .headers_mut()
@@ -1723,18 +1841,11 @@ fn control_body_digest_error(code: &'static str) -> Response<s3s::Body> {
     response
 }
 
-const CONTROL_BODY_CHECKSUM_HEADERS: [&str; 10] = [
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-crc64nvme",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-sha512",
-    "x-amz-checksum-xxhash64",
-    "x-amz-checksum-xxhash3",
-    "x-amz-checksum-xxhash128",
-    "x-amz-checksum-md5",
-];
+fn control_body_checksum_headers() -> impl Iterator<Item = (&'static str, rustfs_rio::ChecksumType)> {
+    rustfs_rio::BASE_CHECKSUM_TYPES
+        .iter()
+        .filter_map(|&kind| kind.key().map(|name| (name, kind)))
+}
 
 fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result::Result<(), &'static str> {
     use md5::Digest;
@@ -1752,53 +1863,33 @@ fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result:
             return Err("BadDigest");
         }
     }
-    let mut checksums = s3s::checksum::ChecksumHasher {
-        crc32: headers.contains_key("x-amz-checksum-crc32").then(Default::default),
-        crc32c: headers.contains_key("x-amz-checksum-crc32c").then(Default::default),
-        crc64nvme: headers.contains_key("x-amz-checksum-crc64nvme").then(Default::default),
-        sha1: headers.contains_key("x-amz-checksum-sha1").then(Default::default),
-        sha256: headers.contains_key("x-amz-checksum-sha256").then(Default::default),
-        sha512: headers.contains_key("x-amz-checksum-sha512").then(Default::default),
-        xxhash64: headers.contains_key("x-amz-checksum-xxhash64").then(Default::default),
-        xxhash3: headers.contains_key("x-amz-checksum-xxhash3").then(Default::default),
-        xxhash128: headers.contains_key("x-amz-checksum-xxhash128").then(Default::default),
-        md5: headers.contains_key("x-amz-checksum-md5").then(Default::default),
-    };
-    checksums.update(bytes);
-    let checksums = checksums.finalize();
-    let computed = [
-        checksums.checksum_crc32,
-        checksums.checksum_crc32c,
-        checksums.checksum_crc64nvme,
-        checksums.checksum_sha1,
-        checksums.checksum_sha256,
-        checksums.checksum_sha512,
-        checksums.checksum_xxhash64,
-        checksums.checksum_xxhash3,
-        checksums.checksum_xxhash128,
-        checksums.checksum_md5,
-    ];
-    for (name, computed) in CONTROL_BODY_CHECKSUM_HEADERS.into_iter().zip(computed) {
-        if let Some(computed) = computed
-            && (headers.get_all(name).iter().count() != 1
-                || headers.get(name).map(HeaderValue::as_bytes) != Some(computed.as_bytes()))
-        {
+    for (name, kind) in control_body_checksum_headers() {
+        let mut values = headers.get_all(name).iter();
+        let Some(expected) = values.next() else {
+            continue;
+        };
+        if values.next().is_some() {
+            return Err("BadDigest");
+        }
+        let computed = rustfs_rio::Checksum::new_from_data(kind, bytes).ok_or("BadDigest")?;
+        if expected.as_bytes() != computed.encoded.as_bytes() {
             return Err("BadDigest");
         }
     }
     Ok(())
 }
 
-impl<S, B> Service<HttpRequest<B>> for ControlBodyDigestService<S>
+impl<S, B, R> Service<HttpRequest<B>> for ControlBodyDigestService<S>
 where
-    S: Service<HttpRequest<ControlRequestBody>, Response = Response<s3s::Body>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ControlRequestBody>, Response = Response<R>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Send + Sync + 'static,
     Box<dyn std::error::Error + Send + Sync>: From<B::Error>,
+    R: From<Bytes> + Default + Send + 'static,
 {
-    type Response = Response<s3s::Body>;
+    type Response = Response<R>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -1808,6 +1899,11 @@ where
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         use http_body_util::BodyExt;
+        if self.console_listener && !admin::router::console_listener_route(request.method(), request.uri(), request.headers()) {
+            let mut response = Response::new(R::default());
+            *response.status_mut() = http::StatusCode::NOT_FOUND;
+            return Box::pin(async move { Ok(response) });
+        }
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let required = control_body_digest_required(&request, self.virtual_host.as_deref());
@@ -1815,7 +1911,7 @@ where
         let total_timeout = self.total_timeout;
         let limit = self.max_body_size;
         Box::pin(async move {
-            let mut request = request.map(s3s::Body::http_body_unsync);
+            let mut request = request.map(EdgeBody::new);
             let Some(required) = required else {
                 return inner.call(request.map(control_request_body)).await;
             };
@@ -1825,7 +1921,7 @@ where
                 .is_some_and(|value| value.as_bytes().starts_with(b"AWS "))
                 || url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
                     .any(|(key, _)| key == "AWSAccessKeyId");
-            let has_checksum = CONTROL_BODY_CHECKSUM_HEADERS.iter().any(|name| headers.contains_key(*name));
+            let has_checksum = control_body_checksum_headers().any(|(name, _)| headers.contains_key(name));
             let has_md5 = headers.contains_key("content-md5");
             if required && !has_md5 && (sig_v2 || !has_checksum) {
                 return Ok(control_body_digest_error("MissingContentMD5"));
@@ -1889,7 +1985,7 @@ where
             if let Err(code) = verify_control_body_digest(request.headers(), &bytes) {
                 return Ok(control_body_digest_error(code));
             }
-            *request.body_mut() = s3s::Body::from(bytes);
+            *request.body_mut() = EdgeBody::from(bytes);
             inner.call(request.map(control_request_body)).await
         })
     }
@@ -1958,7 +2054,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
 macro_rules! external_service_stack {
     ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
      $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
-     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr, $vh_domain_hosts:expr) => {{
+     $compression_config:expr, $server_ctx:expr, $vh_domain_hosts:expr) => {{
         let remote_addr = $remote_addr;
         let trusted_proxy_layer = $trusted_proxy_layer;
         let is_console = $is_console;
@@ -1968,8 +2064,7 @@ macro_rules! external_service_stack {
         let keystone_auth = $keystone_auth;
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
-        let server_domains_configured = $server_domains_configured;
-        let vh_domain_hosts = $vh_domain_hosts;
+        let vh_domain_hosts: std::sync::Arc<[String]> = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -2086,17 +2181,13 @@ macro_rules! external_service_stack {
             .layer(RequestLoggingLayer)
             .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
             .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
-            .layer(S3ErrorMessageCompatLayer)
             .layer(IcebergRestErrorCompatLayer)
-            .layer(ObjectAttributesEtagFixLayer)
+            .layer(PostObjectLocationFixLayer::new(vh_domain_hosts.clone(), connection_is_tls))
             .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
             .layer(HeadRequestBodyFixLayer)
             .layer(PublicHealthEndpointLayer::new(server_ctx, readiness))
-            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-            .layer(DoubleSlashListBucketsCompatLayer)
-            .layer(SigV4HeaderGuardLayer)
             .service($service)
     }};
 }
@@ -2382,7 +2473,7 @@ async fn start_http_server_inner(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip_str}:{local_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{local_port}");
-    let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
+    let now_time = jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if config.console_enable {
         admin::console::init_console_cfg(local_ip, local_port);
         let console_prefix = crate::server::console_prefix();
@@ -2429,59 +2520,7 @@ async fn start_http_server_inner(
     // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
     let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
 
-    // Setup S3 service
-    // This project uses the S3S library to implement S3 services
-    let s3_service = {
-        // Bind the S3 service to this server's context slot (backlog#1052 S2)
-        // so request dispatch resolves the server's own store.
-        let admin_server_ctx = server_ctx.clone();
-        let store = storage::ecfs::FS::with_server_ctx(server_ctx.clone());
-        let mut b = S3ServiceBuilder::new(store.clone());
-
-        let access_key = config.access_key.clone();
-        let secret_key = config.secret_key.clone();
-        let metadata_route_host = host_domain_sets
-            .as_ref()
-            .map(MultiDomain::new)
-            .transpose()
-            .map_err(Error::other)?;
-        let website_host_sets = website_host_domains(config)?;
-        let website_route_domains = website_host_sets.unwrap_or_default();
-
-        b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
-        b.set_access(store);
-        b.set_route(storage::metadata_route::with_metadata_route(
-            admin::make_admin_route(config.console_enable, admin_server_ctx)?,
-            metadata_route_host,
-            website_route_domains,
-            protocol,
-            Arc::clone(&server_ctx),
-        ));
-
-        // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
-        // AWS S3 accepts keys such as "/foo/bar"; without this, requests like
-        // `PUT /bucket//foo/bar` are rejected downstream with InvalidArgument
-        // (ObjectNamePrefixAsSlash, issue #2427). MinIO collapses these slashes instead of preserving them,
-        // so `//foo/bar` is stored and served as `foo/bar`.
-        let s3_config = rustfs_s3_config();
-        b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
-
-        // Virtual-hosted-style requests are only set up for the S3 API listener when server domains are configured.
-        if let Some(domain_sets) = host_domain_sets {
-            info!(
-                event = EVENT_HTTP_HOST_ROUTING,
-                component = LOG_COMPONENT_SERVER,
-                subsystem = LOG_SUBSYSTEM_HTTP,
-                state = "enabled",
-                domain_count = domain_sets.len(),
-                domains = ?domain_sets,
-                "Virtual-hosted-style routing configured"
-            );
-            b.set_host(MultiDomain::new(&domain_sets).map_err(Error::other)?);
-        }
-
-        b.build()
-    };
+    let website_domains = website_host_domains(config)?.unwrap_or_default();
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -2571,24 +2610,26 @@ async fn start_http_server_inner(
         rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
         rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     ));
-    #[cfg(not(feature = "gateway-stack"))]
-    info!(
-        event = EVENT_S3_STACK_ASSEMBLED,
-        component = LOG_COMPONENT_SERVER,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        s3_stack_assembled = "legacy",
-        "S3 stack assembled"
-    );
-    #[cfg(feature = "gateway-stack")]
-    let s3_service = select_s3_stack(config, s3_service, || GatewayAssembly {
-        server_ctx: Arc::clone(&server_ctx),
-        root_access_key: config.access_key.clone(),
-        root_secret_key: config.secret_key.clone(),
-        region: config.region.clone(),
-        server_domains: vh_domain_hosts.to_vec(),
-        body_read_timeout: http_request_body_read_timeout,
-        keystone_enabled: keystone_enabled_in_configuration(),
-    })?;
+    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+    if keystone_config.enable {
+        crate::startup_auth::init_keystone_auth_once(keystone_config)
+            .await
+            .map_err(|error| Error::other(error.to_string()))?;
+    }
+    let website = crate::app::website::WebsiteHost::new(website_domains, protocol, Arc::clone(&server_ctx));
+    let s3_service = assemble_s3_stack(
+        config,
+        website,
+        GatewayAssembly {
+            server_ctx: Arc::clone(&server_ctx),
+            root_access_key: config.access_key.clone(),
+            root_secret_key: config.secret_key.clone(),
+            region: config.region.clone(),
+            server_domains: vh_domain_hosts.to_vec(),
+            body_read_timeout: http_request_body_read_timeout,
+            keystone_auth: keystone_provider_in_configuration().map_err(Error::other)?,
+        },
+    )?;
     #[cfg(feature = "http3")]
     let http3_server = if let Some(server_config) = http3_server_config {
         let h3_s3_service = s3_service.clone();
@@ -2598,7 +2639,6 @@ async fn start_http_server_inner(
         let h3_rate_limit = api_rate_limit_layer.clone();
         let h3_compression = compression_config.clone();
         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
-        let h3_domains_configured = !config.server_domains.is_empty();
         let h3_vh_domain_hosts = vh_domain_hosts.clone();
 
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
@@ -2610,13 +2650,9 @@ async fn start_http_server_inner(
             let service = SwiftService::new(true, None, service);
             let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
             let service = ServiceBuilder::new()
-                .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
-                    response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                .layer(tower::util::MapResponseLayer::new(|response: Response<EdgeBody>| {
+                    response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body })
                 }))
-                .service(service);
-            #[cfg(not(feature = "swift"))]
-            let service = ServiceBuilder::new()
-                .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
                 .service(service);
             let service = Http3CoreService::new(service);
             Http3ExternalService::new(external_service_stack!(
@@ -2630,7 +2666,6 @@ async fn start_http_server_inner(
                 h3_keystone.clone(),
                 h3_compression.clone(),
                 h3_server_ctx.clone(),
-                h3_domains_configured,
                 h3_vh_domain_hosts.clone()
             ))
         };
@@ -2674,7 +2709,6 @@ async fn start_http_server_inner(
     };
 
     let is_console = config.console_enable;
-    let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -2925,7 +2959,6 @@ async fn start_http_server_inner(
                 s3_service: s3_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
-                server_domains_configured,
                 vh_domain_hosts: vh_domain_hosts.clone(),
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
@@ -3034,8 +3067,6 @@ struct ConnectionContext {
     s3_service: S3EdgeService,
     compression_config: HttpCompressionConfig,
     is_console: bool,
-    /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
-    server_domains_configured: bool,
     /// Port-stripped virtual-hosted-style domains, for bucket-level CORS resolution.
     vh_domain_hosts: Arc<[String]>,
     readiness: Arc<GlobalReadiness>,
@@ -3170,7 +3201,6 @@ fn process_connection(
             s3_service,
             compression_config,
             is_console,
-            server_domains_configured,
             vh_domain_hosts,
             readiness,
             keystone_auth,
@@ -3228,9 +3258,10 @@ fn process_connection(
         );
 
         let http_service = ControlBodyDigestService::new(s3_service, request_body_idle_timeout)
+            .with_console_listener(is_console)
             .with_virtual_host_domains(vh_domain_hosts.clone());
         #[cfg(feature = "swift")]
-        let http_service = SwiftService::new(true, None, http_service);
+        let http_service = SwiftService::new(!is_console, None, http_service);
         let http_service =
             EarlyResponseBodyService::new(http_service, request_body_idle_timeout).with_task_owner(task_owner.clone());
         #[cfg(not(feature = "internode-transport"))]
@@ -3273,20 +3304,16 @@ fn process_connection(
         // 12. RequestLoggingLayer                    — single completion event per request
         // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
         // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
-        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 18. ConditionalCorsLayer                   — S3 API CORS
-        // 19. RedirectLayer                          — console redirect (conditional)
-        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
-        // 25. SigV4HeaderGuardLayer                  — GHSA-xm99/-g8w9 unsigned x-amz-* rules, ahead of s3s signature dispatch
+        // 15. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        //     PostObjectLocationFixLayer             — absolute, encoded POST Object Location
+        // 16. ConditionalCorsLayer                   — S3 API CORS
+        // 17. RedirectLayer                          — console redirect (conditional)
+        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 20. PublicHealthEndpointLayer              — handles public health before the stack
         // `tests::stack_census` pins this order against the real `external_service_stack!`
-        // expansion. Layers 5, 6, 15, 16, 17, 20, 21, 23, 24 and 25 patch s3s and live in
-        // `server::legacy_compat`; T2.12 (rustfs/backlog#2771) removes them.
+        // expansion. Layers 5, 6, 15, 18 and 19 live in `server::legacy_compat`;
+        // T2.12 (rustfs/backlog#2771) removes them.
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -3302,7 +3329,6 @@ fn process_connection(
                 keystone_auth.clone(),
                 compression_config.clone(),
                 server_ctx.clone(),
-                server_domains_configured,
                 vh_domain_hosts.clone()
             )
         };
@@ -3598,6 +3624,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .and_then(|suffix| suffix.strip_prefix('/'))
         .or_else(|| (target.uri.path() == HEAL_CONTROL_TONIC_RPC_PATH).then_some("HealControl"))
         .or_else(|| (target.uri.path() == SCANNER_SCOPED_DIRTY_USAGE_ACK_TONIC_RPC_PATH).then_some("ScannerScopedDirtyUsageAck"))
+        .or_else(|| (target.uri.path() == SCANNER_USAGE_WATCH_TONIC_RPC_PATH).then_some("ScannerUsageWatch"))
         .or_else(|| (target.uri.path() == TIER_MUTATION_PREPARE_TONIC_RPC_PATH).then_some("PrepareTierMutation"))
         .or_else(|| (target.uri.path() == TIER_MUTATION_COMMIT_TONIC_RPC_PATH).then_some("CommitTierMutation"))
         .or_else(|| (target.uri.path() == TIER_MUTATION_ABORT_TONIC_RPC_PATH).then_some("AbortTierMutation"))
@@ -3776,6 +3803,9 @@ mod tests {
 
     use super::*;
     use crate::server::compress::RequestPathCategory;
+    use s3s::config::{S3Config, StaticConfigProvider};
+    use s3s::service::{S3Service, S3ServiceBuilder};
+
     use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
     use bytes::Bytes;
     use http::Request as HttpRequest;
@@ -3798,6 +3828,15 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
     use tracing::Level;
+
+    fn rustfs_s3_config() -> S3Config {
+        let mut s3_config = S3Config::default();
+        s3_config.normalize_forward_slash_path = true;
+        s3_config.enable_sig_v2 = true;
+        s3_config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
+        s3_config.sig_v4_allowed_services.push("s3tables".to_string());
+        s3_config
+    }
 
     const DIGEST_DELETE_XML: &str = "<Delete><Object><Key>safe-object</Key></Object></Delete>";
 
@@ -4148,6 +4187,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_body_checksums_match_wire_values_for_all_algorithms() {
+        let body = b"123456789";
+        let vectors = [
+            ("x-amz-checksum-crc32", "y/Q5Jg=="),
+            ("x-amz-checksum-crc32c", "4waSgw=="),
+            ("x-amz-checksum-crc64nvme", "rosUhgp5mIg="),
+            ("x-amz-checksum-sha1", "98O8HYCOBHMq32eZZczDTKeuNEE="),
+            ("x-amz-checksum-sha256", "FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU="),
+            (
+                "x-amz-checksum-sha512",
+                "2eZ2LdHI6vbWGzxhkvxAjU1tXxF20MKRabwk5xw/J0rSf81YEbMT1oH35V7ALXPUmclUVba1u1A6z1dPuo/+hQ==",
+            ),
+            ("x-amz-checksum-xxhash64", "jLhB20DmroM="),
+            ("x-amz-checksum-xxhash3", "ctyxi2ehff8="),
+            ("x-amz-checksum-xxhash128", "MxGUd+3l3NXpcWQnaB1YYA=="),
+            ("x-amz-checksum-md5", "JfnnlDI7RTiF9RgfG2JNCw=="),
+        ];
+        let mut headers = HeaderMap::new();
+        for (name, value) in vectors {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        assert_eq!(verify_control_body_digest(&headers, body), Ok(()));
+        for (name, value) in vectors {
+            headers.insert(name, HeaderValue::from_static("mismatch"));
+            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "{name}");
+            headers.insert(name, HeaderValue::from_static(value));
+            headers.append(name, HeaderValue::from_static(value));
+            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "duplicate {name}");
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+    }
+
     fn digest_v4_request(checksum: &str) -> HttpRequest<s3s::Body> {
         use s3s_sigv4::{AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign};
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -4289,6 +4361,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn console_listener_isolates_object_routes() {
+        use tower::ServiceExt;
+        let inner = tower::service_fn(|_: HttpRequest<ControlRequestBody>| async {
+            Ok::<_, Infallible>(Response::new(s3s::Body::empty()))
+        });
+        let data = ControlBodyDigestService::new(inner, Duration::from_secs(1));
+        let console = data.clone().with_console_listener(true);
+        for (uri, expected) in [
+            ("/", StatusCode::NOT_FOUND),
+            ("/bucket/notes.txt", StatusCode::NOT_FOUND),
+            ("/bucket/notes.txt?response-content-type=text%2Fplain", StatusCode::NOT_FOUND),
+            ("/favicon.ico?events", StatusCode::NOT_FOUND),
+            ("/rustfs/admin/v3/info?lambdaArn=example", StatusCode::NOT_FOUND),
+            ("/favicon.ico", StatusCode::OK),
+            ("/rustfs/admin/v3/info", StatusCode::OK),
+        ] {
+            for signed in [false, true] {
+                let request = || {
+                    let mut req = HttpRequest::builder().uri(uri);
+                    if signed {
+                        req = req.header("authorization", "routing-test");
+                    }
+                    req.body(s3s::Body::empty()).unwrap()
+                };
+                assert_eq!(console.clone().oneshot(request()).await.unwrap().status(), expected, "{uri}");
+                assert_eq!(data.clone().oneshot(request()).await.unwrap().status(), StatusCode::OK, "{uri}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn control_body_digest_preserves_streaming_uploads_and_checks_config_md5() {
         use tower::ServiceExt;
         for (method, uri) in [
@@ -4372,6 +4475,1693 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
+    mod native_admin_tests {
+        use super::*;
+        use crate::runtime_sources::{AppContext, ServerContextSlot, publish_test_app_context};
+        use crate::server::gateway_handlers::test_support::{REQUEST_ID, Signed, signed_request_with_headers};
+        use rustfs_iam::store::UserType;
+        use rustfs_iam::store::{
+            Store as _,
+            object::{IAM_CONFIG_PREFIX, ObjectStore},
+        };
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+        use tower::ServiceExt as _;
+
+        const ROOT: &str = "rustfsgatewayroot";
+        const ROOT_SECRET: &str = "rustfs-gateway-root-secret";
+        const USER_SECRET: &str = "native-admin-user-secret";
+
+        #[path = "control_plane_tests.rs"]
+        mod control_plane_tests;
+        #[path = "metadata_route_parity_tests.rs"]
+        mod metadata_route_parity_tests;
+
+        struct UnusedS3;
+        #[async_trait::async_trait]
+        impl s3s::S3 for UnusedS3 {}
+
+        fn assembly(slot: Arc<ServerContextSlot>) -> GatewayAssembly {
+            GatewayAssembly {
+                server_ctx: slot,
+                root_access_key: ROOT.to_owned(),
+                root_secret_key: ROOT_SECRET.to_owned(),
+                region: Some("us-east-1".to_owned()),
+                server_domains: vec!["s3.example.test".to_owned()],
+                body_read_timeout: Duration::from_secs(300),
+                keystone_auth: None,
+            }
+        }
+
+        fn signed(path: &str, query: &str, host: &str, key: &str, secret: &str, form: Signed) -> HttpRequest<Empty<Bytes>> {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::HOST, host.parse().unwrap());
+            headers.insert("x-request-id", REQUEST_ID.parse().unwrap());
+            signed_request_with_headers(form, Method::GET, path, query, key, secret, headers)
+        }
+
+        async fn answer<S, B, R>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
+        where
+            S: Service<HttpRequest<B>, Response = Response<R>>,
+            S::Error: std::fmt::Debug,
+            R: http_body::Body<Data = Bytes>,
+            R::Error: std::fmt::Debug,
+        {
+            let service = tower::Layer::layer(&crate::server::layer::ExternalRequestContextLayer::new(false), service);
+            let response = service.oneshot(request).await.unwrap();
+            let (parts, body) = response.into_parts();
+            (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
+        }
+
+        fn refusal(body: &[u8]) -> (String, String) {
+            let text = std::str::from_utf8(body).unwrap();
+            let field = |name| {
+                let start = format!("<{name}>");
+                let end = format!("</{name}>");
+                text.split_once(&start)
+                    .and_then(|(_, value)| value.split_once(&end))
+                    .map(|(value, _)| value.to_owned())
+                    .unwrap_or_default()
+            };
+            (field("Code"), field("Message"))
+        }
+
+        #[test]
+        fn native_admin_signing_fixture_refuses_duplicate_query() {
+            let refused = match std::panic::catch_unwind(|| {
+                signed(
+                    "/rustfs/admin/v3/info",
+                    "lambdaArn=one&lambdaArn=two",
+                    "localhost",
+                    ROOT,
+                    ROOT_SECRET,
+                    Signed::Header,
+                )
+            }) {
+                Err(payload) => payload,
+                Ok(_) => panic!("the strict signer must refuse duplicate query keys"),
+            };
+            let message = refused
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| refused.downcast_ref::<&str>().copied());
+            assert!(
+                message.is_some_and(|message| message.contains("Canonical(AuthorizationHeaderMalformed)")),
+                "the fixture must fail on canonicalization"
+            );
+            let valid = signed("/rustfs/admin/v3/info", "lambdaArn=", "localhost", ROOT, ROOT_SECRET, Signed::Header);
+            assert_eq!(valid.uri().query(), Some("lambdaArn="));
+        }
+
+        async fn admin_fixture() -> (rustfs_test_utils::TestECStoreEnv, Arc<ServerContextSlot>, s3s::service::S3Service) {
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .prefix("native_admin_info")
+                .disk_count(1)
+                .init_bucket_metadata(false)
+                .build()
+                .await;
+            crate::admin::storage_api::runtime::bootstrap_ctx().set_endpoints(env.endpoint_pools.clone());
+            ObjectStore::new(env.ecstore.clone())
+                .save_iam_config(serde_json::json!({"version":1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                .await
+                .unwrap();
+            let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.unwrap();
+            for (key, action, denied, enabled, source_ip) in [
+                ("info-allowed", Some("admin:ServerInfo"), false, true, false),
+                ("info-no-policy", None, false, true, false),
+                ("info-unrelated", Some("admin:StorageInfo"), false, true, false),
+                ("info-denied", Some("admin:ServerInfo"), true, true, false),
+                ("info-disabled", Some("admin:ServerInfo"), false, false, false),
+                ("info-proxy", Some("admin:ServerInfo"), false, true, true),
+                ("storage-allowed", Some("admin:StorageInfo"), false, true, false),
+                ("storage-denied", Some("admin:StorageInfo"), true, true, false),
+                ("storage-proxy", Some("admin:StorageInfo"), false, true, true),
+                ("usage-allowed", Some("admin:DataUsageInfo"), false, true, false),
+                ("usage-denied", Some("admin:DataUsageInfo"), true, true, false),
+                ("list-allowed", Some("s3:ListBucket"), false, true, false),
+                ("list-denied", Some("s3:ListBucket"), true, true, false),
+            ] {
+                iam.create_user(
+                    key,
+                    &AddOrUpdateUserReq {
+                        secret_key: USER_SECRET.to_owned(),
+                        policy: None,
+                        status: if enabled {
+                            AccountStatus::Enabled
+                        } else {
+                            AccountStatus::Disabled
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+                if let Some(action) = action {
+                    let mut statement = serde_json::json!({"Effect":"Allow","Action":action});
+                    if action.starts_with("s3:") {
+                        statement["Resource"] = serde_json::json!("*");
+                    }
+                    if source_ip {
+                        statement["Condition"] = serde_json::json!({"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}});
+                    }
+                    let mut statements = vec![statement];
+                    if denied {
+                        statements.push(if action.starts_with("s3:") {
+                            serde_json::json!({"Effect":"Deny","Action":action,"Resource":"*"})
+                        } else {
+                            serde_json::json!({"Effect":"Deny","Action":action})
+                        });
+                    }
+                    let document = serde_json::json!({"Version":"2012-10-17","Statement":statements});
+                    iam.set_policy(key, Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap())
+                        .await
+                        .unwrap();
+                    iam.policy_db_set(key, UserType::Reg, false, key).await.unwrap();
+                }
+            }
+            let context = Arc::new(AppContext::with_default_interfaces(
+                env.ecstore.clone(),
+                iam,
+                Arc::new(rustfs_kms::KmsServiceManager::new()),
+            ));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: ROOT.to_owned(),
+                secret_key: ROOT_SECRET.to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context.clone());
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context));
+            let mut legacy = s3s::service::S3ServiceBuilder::new(UnusedS3);
+            legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
+            legacy.set_route(crate::admin::make_admin_router(false, slot.clone()).unwrap());
+            legacy.set_host(s3s::host::MultiDomain::new(["s3.example.test"]).unwrap());
+            let legacy = legacy.build();
+            (env, slot, legacy)
+        }
+
+        fn admin_wire_failures(response: &(StatusCode, HeaderMap, Bytes), label: &str) -> Vec<String> {
+            eprintln!(
+                "admin-wire {label}: status={} headers={:?} body={}",
+                response.0,
+                response.1,
+                String::from_utf8_lossy(&response.2)
+            );
+            let mut failures = Vec::new();
+            let content_type = if response.0.is_success() {
+                "application/json"
+            } else {
+                "application/xml"
+            };
+            if !response.1.get(http::header::CONTENT_TYPE).is_some_and(|v| v == content_type) {
+                failures.push(format!("{label}: content type"));
+            }
+            if !response.1.get("x-request-id").is_some_and(|v| v == REQUEST_ID) {
+                failures.push(format!("{label}: request id"));
+            }
+            if let Some(length) = response.1.get(http::header::CONTENT_LENGTH)
+                && length.to_str().ok().and_then(|v| v.parse::<usize>().ok()) != Some(response.2.len())
+            {
+                failures.push(format!("{label}: content length"));
+            }
+            failures
+        }
+
+        fn snapshot_error_xml(body: &[u8]) -> String {
+            let xml = std::str::from_utf8(body).unwrap();
+            let declaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+            match xml.strip_prefix(&format!("{declaration}\n")) {
+                Some(tail) => format!("{declaration}{tail}"),
+                None => xml.to_owned(),
+            }
+        }
+
+        async fn iceberg_answer<S, R>(
+            service: S,
+            request: HttpRequest<Empty<Bytes>>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value)
+        where
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<R>> + Clone + Send + 'static,
+            S::Error: std::fmt::Debug,
+            S::Future: Send + 'static,
+            R: http_body::Body<Data = Bytes> + Send + 'static,
+            R::Data: Send,
+            R::Error: std::fmt::Debug,
+        {
+            use crate::server::hybrid::HybridBody;
+            use tower::Layer as _;
+            let service = tower::service_fn(move |request| {
+                let service = service.clone();
+                async move {
+                    let response = service.oneshot(request).await.unwrap();
+                    let (parts, body) = response.into_parts();
+                    let bytes = body.collect().await.unwrap().to_bytes();
+                    Ok::<_, std::convert::Infallible>(Response::from_parts(
+                        parts,
+                        HybridBody::<Full<Bytes>, Empty<Bytes>>::Rest {
+                            rest_body: Full::from(bytes),
+                        },
+                    ))
+                }
+            });
+            let service = IcebergRestErrorCompatLayer.layer(service);
+            let service = crate::server::layer::ExternalRequestContextLayer::new(false).layer(service);
+            let response = service.oneshot(request).await.unwrap();
+            let (parts, body) = response.into_parts();
+            let bytes = body.collect().await.unwrap().to_bytes();
+            let json = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+            (parts.status, parts.headers, json)
+        }
+
+        // The strict gateway signer rejects duplicate query keys; sign this boundary probe independently.
+        fn iceberg_duplicate_query(path: &str, host: &str, key: &str, secret: &str) -> HttpRequest<Empty<Bytes>> {
+            use hmac::{Hmac, KeyInit as _, Mac as _};
+            use sha2::{Digest as _, Sha256};
+            fn mac(key: &[u8], value: &str) -> Vec<u8> {
+                let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+                mac.update(value.as_bytes());
+                mac.finalize().into_bytes().to_vec()
+            }
+            let mut request = signed(path, "warehouse=a", host, key, secret, Signed::Header);
+            let authorization = request.headers()[http::header::AUTHORIZATION].to_str().unwrap().to_owned();
+            let names = authorization
+                .split("SignedHeaders=")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap();
+            let headers = names
+                .split(';')
+                .map(|name| format!("{name}:{}\n", request.headers()[name].to_str().unwrap()))
+                .collect::<String>();
+            let date = request.headers()["x-amz-date"].to_str().unwrap();
+            let scope = format!("{}/us-east-1/s3/aws4_request", &date[..8]);
+            let canonical = format!("GET\n{path}\nwarehouse=a&warehouse=b\n{headers}\n{names}\nUNSIGNED-PAYLOAD");
+            let digest = Sha256::digest(canonical.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{digest}");
+            let day = mac(format!("AWS4{secret}").as_bytes(), &date[..8]);
+            let region = mac(&day, "us-east-1");
+            let service = mac(&region, "s3");
+            let signing_key = mac(&service, "aws4_request");
+            let signature = mac(&signing_key, &to_sign)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                format!("AWS4-HMAC-SHA256 Credential={key}/{scope}, SignedHeaders={names}, Signature={signature}")
+                    .parse()
+                    .unwrap(),
+            );
+            *request.uri_mut() = format!("{path}?warehouse=a&warehouse=b").parse().unwrap();
+            request
+        }
+
+        async fn iceberg_config_contract(native: bool) {
+            let mut failures = Vec::new();
+            macro_rules! check_eq {
+                ($left:expr, $right:expr $(,)?) => { check_eq!($left, $right, "line {}", line!()) };
+                ($left:expr, $right:expr, $($reason:tt)+) => {{
+                    let (left, right) = (&$left, &$right);
+                    if left != right { failures.push(format!("{}: left={left:?}, right={right:?}", format_args!($($reason)+))); }
+                }};
+            }
+            macro_rules! check {
+                ($condition:expr $(,)?) => { check!($condition, "line {}", line!()) };
+                ($condition:expr, $($reason:tt)+) => {{
+                    if !$condition { failures.push(format!($($reason)+)); }
+                }};
+            }
+            let calls = || crate::server::gateway_stack::CONFIG_HANDLER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let (_env, slot, legacy) = admin_fixture().await;
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.console_enable = false;
+            let edge = assemble_s3_stack(&config, None, assembly(slot.clone())).unwrap();
+            let native_service = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
+            let context = slot.installed_app_context().unwrap();
+            let expiration = chrono::Utc::now().timestamp() + 900;
+            let mut sessions = Vec::new();
+            for marker in [None, Some("rustfs:table-id")] {
+                let mut claims = std::collections::HashMap::from([
+                    ("exp".to_owned(), serde_json::json!(expiration)),
+                    ("parent".to_owned(), serde_json::json!(ROOT)),
+                ]);
+                if let Some(marker) = marker {
+                    claims.insert(marker.to_owned(), serde_json::json!("table-a"));
+                }
+                let mut credential = rustfs_policy::auth::get_new_credentials_with_metadata(&claims, ROOT_SECRET).unwrap();
+                credential.parent_user = ROOT.to_owned();
+                context
+                    .iam()
+                    .handle()
+                    .set_temp_user(&credential.access_key, &credential, None)
+                    .await
+                    .unwrap();
+                sessions.push(credential);
+            }
+            for path in ["/iceberg/v1/config", "/_iceberg/v1/config"] {
+                for host in ["localhost", "bucket.s3.example.test"] {
+                    for query in ["", "warehouse=warehouse-a"] {
+                        let request = || signed(path, query, host, ROOT, ROOT_SECRET, Signed::Header);
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        if native {
+                            check_eq!(calls() - before, 1, "successful config reaches the native handler");
+                        }
+                        check_eq!(old.0, StatusCode::OK, "{path}?{query} {host}: {old:?}");
+                        check_eq!(new.0, old.0);
+                        check_eq!(new.2, old.2, "complete config JSON");
+                        if native {
+                            let direct = iceberg_answer(native_service.clone(), request()).await;
+                            check_eq!(
+                                direct.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                                Some("application/json"),
+                                "direct native content type"
+                            );
+                            check_eq!(direct.0, old.0, "direct native handler status");
+                            check_eq!(direct.2, old.2, "direct native handler body");
+                        }
+                        check!(new.2["defaults"].is_object());
+                        check!(new.2["overrides"].is_object());
+                        check!(new.2["endpoints"].as_array().is_some_and(|rows| !rows.is_empty()));
+                        check!(new.2["admin_discovery"].is_object());
+                        if query.is_empty() {
+                            check!(new.2["defaults"].get("prefix").is_none());
+                        } else {
+                            check_eq!(new.2["defaults"]["prefix"], "warehouse-a");
+                        }
+                        eprintln!("iceberg config {path}?{query} {host}: {} {}", new.0, new.2);
+                    }
+                    for (key, secret, query, expected, handler_calls) in [
+                        (ROOT, ROOT_SECRET, "warehouse=", StatusCode::BAD_REQUEST, 1),
+                        (ROOT, "wrong-secret", "", StatusCode::FORBIDDEN, 0),
+                        ("info-no-policy", USER_SECRET, "", StatusCode::FORBIDDEN, 1),
+                        ("info-allowed", USER_SECRET, "", StatusCode::FORBIDDEN, 1),
+                        ("info-no-policy", USER_SECRET, "warehouse=", StatusCode::FORBIDDEN, 1),
+                    ] {
+                        let request = || signed(path, query, host, key, secret, Signed::Header);
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        if native {
+                            check_eq!(calls() - before, handler_calls, "refusal handler observation {key} {query}");
+                        }
+                        check_eq!(old.0, expected, "legacy {path}?{query}: {old:?}");
+                        check_eq!(new.0, old.0, "{path}?{query}: {new:?}");
+                        check_eq!(new.2, old.2, "complete error JSON {key} {query}");
+                        eprintln!("iceberg refusal {path}?{query} {host} {key}: {} {}", new.0, new.2);
+                    }
+                    for (key, secret, expected) in [
+                        (ROOT, ROOT_SECRET, StatusCode::BAD_REQUEST),
+                        ("info-no-policy", USER_SECRET, StatusCode::FORBIDDEN),
+                    ] {
+                        let request = || iceberg_duplicate_query(path, host, key, secret);
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        check_eq!(old.0, expected, "legacy signed duplicate {key}: {old:?}");
+                        check_eq!(
+                            old.2,
+                            serde_json::json!({"error": {
+                                "code": expected.as_u16(), "type": if key == ROOT { "BadRequestException" } else { "ForbiddenException" },
+                                "message": if key == ROOT { "warehouse query parameter must not be repeated" } else { "Access Denied" }
+                            }}),
+                            "legacy duplicate complete JSON {key}"
+                        );
+                        if native {
+                            // K-8: strict signature canonicalization rejects this exact duplicate before owned authorization.
+                            check_eq!(new.0, StatusCode::BAD_REQUEST, "native duplicate {key}");
+                            check_eq!(
+                                new.2,
+                                serde_json::json!({"error": {
+                                    "code": 400, "type": "BadRequestException",
+                                    "message": "The authorization header is malformed; the region is wrong."
+                                }}),
+                                "native duplicate complete JSON {key}"
+                            );
+                            check_eq!(calls() - before, 0, "duplicate query cannot reach the native handler");
+                        } else {
+                            check_eq!(new.2, old.2, "legacy duplicate repeat");
+                        }
+                        eprintln!(
+                            "iceberg signed duplicate {path} {host} {key}: legacy={} selected={} handler_delta={}",
+                            old.2,
+                            new.2,
+                            calls() - before
+                        );
+                    }
+                    for (index, credential) in sessions.iter().enumerate() {
+                        for query in ["", "warehouse="] {
+                            let request = || {
+                                let mut headers = HeaderMap::new();
+                                headers.insert(http::header::HOST, host.parse().unwrap());
+                                headers.insert("x-amz-security-token", credential.session_token.parse().unwrap());
+                                signed_request_with_headers(
+                                    Signed::Header,
+                                    Method::GET,
+                                    path,
+                                    query,
+                                    &credential.access_key,
+                                    &credential.secret_key,
+                                    headers,
+                                )
+                            };
+                            let old = iceberg_answer(legacy.clone(), request()).await;
+                            let before = calls();
+                            let new = if native {
+                                iceberg_answer(native_service.clone(), request()).await
+                            } else {
+                                iceberg_answer(legacy.clone(), request()).await
+                            };
+                            check_eq!(
+                                old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                                Some("application/json"),
+                                "legacy content type {path} {host}"
+                            );
+                            check_eq!(
+                                new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                                Some("application/json"),
+                                "selected content type {path} {host}"
+                            );
+                            if native {
+                                check_eq!(calls() - before, 1, "session reaches owned authorization");
+                            }
+                            let expected = if index == 1 {
+                                StatusCode::FORBIDDEN
+                            } else if query.is_empty() {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::BAD_REQUEST
+                            };
+                            check_eq!(old.0, expected, "legacy session {index} {query}: {old:?}");
+                            check_eq!(new.0, old.0, "native session {index} {query}: {new:?}");
+                            check_eq!(new.2, old.2, "session {index} complete JSON");
+                            eprintln!("iceberg session {index} {path}?{query} {host}: {} {}", new.0, new.2);
+                        }
+                    }
+                    for query in ["", "warehouse=", "warehouse=a&warehouse=b"] {
+                        let request = || {
+                            HttpRequest::builder()
+                                .uri(format!("{path}?{query}"))
+                                .header(http::header::HOST, host)
+                                .body(Empty::new())
+                                .unwrap()
+                        };
+                        let old = iceberg_answer(legacy.clone(), request()).await;
+                        let before = calls();
+                        let new = if native {
+                            iceberg_answer(edge.clone(), request()).await
+                        } else {
+                            iceberg_answer(legacy.clone(), request()).await
+                        };
+                        check_eq!(
+                            old.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "legacy content type {path} {host}"
+                        );
+                        check_eq!(
+                            new.1.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                            Some("application/json"),
+                            "selected content type {path} {host}"
+                        );
+                        if native {
+                            check_eq!(calls() - before, 0, "anonymous request never reaches handler");
+                        }
+                        check_eq!(old.0, StatusCode::FORBIDDEN);
+                        check_eq!(new.0, old.0);
+                        check_eq!(
+                            old.2,
+                            serde_json::json!({"error": {
+                                "code": 403, "type": "ForbiddenException", "message": "Signature is required"
+                            }}),
+                            "legacy anonymous complete JSON"
+                        );
+                        check_eq!(
+                            new.2,
+                            serde_json::json!({"error": {
+                                "code": 403, "type": "ForbiddenException",
+                                "message": if native { "the request is not allowed" } else { "Signature is required" }
+                            }}),
+                            "selected anonymous complete JSON"
+                        );
+                        eprintln!("iceberg unsigned {path}?{query} {host}: legacy={} selected={}", old.2, new.2);
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn iceberg_config_owned_legacy_baseline() {
+            iceberg_config_contract(false).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn iceberg_config_owned_native_contract() {
+            iceberg_config_contract(true).await;
+        }
+
+        const CATALOG_READS: [&str; 3] = ["/v3/datausageinfo", "/v4/plugins/catalog", "/v3/module-switches"];
+
+        // Each caller uses a fresh process because ECStore publishes once-only endpoint state.
+        async fn admin_reads_contract(use_native: bool, suffixes: &[&str]) {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.console_enable = false;
+            let edge = assemble_s3_stack(&config, None, assembly(slot)).unwrap();
+            let mut failures = Vec::new();
+            let mut check = |condition: bool, label: String| {
+                if !condition {
+                    failures.push(label);
+                }
+            };
+            for &suffix in suffixes {
+                for prefix in ["/rustfs/admin", "/minio/admin"] {
+                    let path = format!("{prefix}{suffix}");
+                    for host in ["localhost", "bucket.s3.example.test"] {
+                        let root =
+                            answer(legacy.clone(), signed(&path, "detail=a%2Fb", host, ROOT, ROOT_SECRET, Signed::Header)).await;
+                        check(root.0 == StatusCode::OK, format!("root {path} {host}: {} {:?}", root.0, refusal(&root.2)));
+                        let expected: serde_json::Value = serde_json::from_slice(&root.2).unwrap();
+                        eprintln!("catalog-baseline {path} {host}: status={} headers={:?} json={expected}", root.0, root.1);
+                        if suffix == "/v4/cluster/snapshot" {
+                            // This fixture has no scanner publications or deferred work; its event times are unset.
+                            let usage = &expected["snapshot"]["components"]["usage"];
+                            for field in [
+                                "last_dirty_mark_unix_secs",
+                                "last_dirty_clear_unix_secs",
+                                "last_usage_save_unix_secs",
+                                "last_durable_success_unix_secs",
+                                "last_publication_unix_secs",
+                                "last_deferred_unix_secs",
+                            ] {
+                                check(usage[field] == serde_json::json!(0), format!("{path}: unset event time {field}"));
+                            }
+                            check(
+                                usage.get("last_success_unix_secs") == Some(&serde_json::Value::Null),
+                                format!("{path}: no successful publication time"),
+                            );
+                            check(
+                                usage.get("deferred_age_secs") == Some(&serde_json::Value::Null),
+                                format!("{path}: no deferred age"),
+                            );
+                            // A writable metadata gate has no transition timestamp.
+                            let gate = &expected["snapshot"]["pool_meta_write_gate"];
+                            check(gate["state"] == "writable", format!("{path}: writable metadata gate"));
+                            check(gate.get("sinceUnixSecs").is_none(), format!("{path}: no metadata gate transition time"));
+                        }
+                        for key in [
+                            ROOT,
+                            "info-allowed",
+                            "usage-allowed",
+                            "list-allowed",
+                            "info-no-policy",
+                            "info-denied",
+                            "usage-denied",
+                            "list-denied",
+                            "storage-allowed",
+                        ] {
+                            let allowed = key == ROOT
+                                || if suffix == "/v3/datausageinfo" {
+                                    key == "usage-allowed" || key == "list-allowed"
+                                } else {
+                                    key == "info-allowed"
+                                };
+                            let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                            let request = || signed(&path, "detail=a%2Fb", host, key, secret, Signed::Header);
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            let label = format!("{key} {path} {host}");
+                            if matches!(suffix, "/v4/cluster/snapshot" | "/v4/extensions/catalog") {
+                                for failure in admin_wire_failures(&old, &format!("legacy {label}")) {
+                                    check(false, failure);
+                                }
+                                for failure in admin_wire_failures(&new, &format!("selected {label}")) {
+                                    check(false, failure);
+                                }
+                                if !allowed {
+                                    check(
+                                        snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
+                                        format!("{label}: complete refusal XML"),
+                                    );
+                                }
+                            }
+                            let status = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                            check(
+                                old.0 == status && new.0 == status,
+                                format!("{label}: status legacy={} selected={}", old.0, new.0),
+                            );
+                            if allowed && old.0 == status && new.0 == status {
+                                check(
+                                    old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE)
+                                        && new.1[http::header::CONTENT_TYPE] == "application/json",
+                                    format!("{label}: content type"),
+                                );
+                                check(new.1.get("x-request-id").is_some_and(|v| v == REQUEST_ID), format!("{label}: request id"));
+                                let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                                let new: serde_json::Value = serde_json::from_slice(&new.2).unwrap();
+                                check(
+                                    old == expected && new == expected,
+                                    format!("{label}: complete JSON old={old} new={new} root={expected}"),
+                                );
+                            } else if !allowed {
+                                check(
+                                    refusal(&old.2).0 == "AccessDenied" && refusal(&new.2) == refusal(&old.2),
+                                    format!("{label}: refusal"),
+                                );
+                            }
+                        }
+                        for (label, key, secret, anonymous, form, code) in [
+                            ("disabled", "info-disabled", USER_SECRET, false, Signed::Header, "InvalidAccessKeyId"),
+                            (
+                                "unknown",
+                                "missing-catalog-user",
+                                USER_SECRET,
+                                false,
+                                Signed::Header,
+                                "InvalidAccessKeyId",
+                            ),
+                            (
+                                "bad-signature",
+                                ROOT,
+                                "wrong-catalog-secret",
+                                false,
+                                Signed::Header,
+                                "SignatureDoesNotMatch",
+                            ),
+                            ("anonymous", ROOT, ROOT_SECRET, true, Signed::Header, "AccessDenied"),
+                            ("presigned", ROOT, ROOT_SECRET, false, Signed::Query, "AccessDenied"),
+                        ] {
+                            let request = || {
+                                if anonymous {
+                                    HttpRequest::builder()
+                                        .method(Method::GET)
+                                        .uri(&path)
+                                        .header("host", host)
+                                        .header("x-request-id", REQUEST_ID)
+                                        .body(Empty::new())
+                                        .unwrap()
+                                } else {
+                                    signed(&path, "", host, key, secret, form)
+                                }
+                            };
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            eprintln!(
+                                "catalog-compare {label} {path} {host}: legacy={} {:?}, selected={} {:?}",
+                                old.0,
+                                refusal(&old.2),
+                                new.0,
+                                refusal(&new.2)
+                            );
+                            if matches!(suffix, "/v4/cluster/snapshot" | "/v4/extensions/catalog") {
+                                for failure in admin_wire_failures(&old, &format!("legacy {label} {path} {host}")) {
+                                    check(false, failure);
+                                }
+                                for failure in admin_wire_failures(&new, &format!("selected {label} {path} {host}")) {
+                                    check(false, failure);
+                                }
+                                if use_native {
+                                    let expected_xml = if label == "presigned" {
+                                        check(
+                                            serde_json::from_slice::<serde_json::Value>(&old.2).unwrap() == expected,
+                                            format!("{path}: complete legacy presigned JSON"),
+                                        );
+                                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>the request is not allowed</Message></Error>".to_owned()
+                                    } else {
+                                        let old_xml = snapshot_error_xml(&old.2);
+                                        match label {
+                                            "anonymous" => old_xml.replacen("<Message>Signature is required</Message>", "<Message>the request is not allowed</Message>", 1),
+                                            "disabled" => old_xml.replacen("<Message>check key failed</Message>", "<Message>The Access Key Id you provided does not exist in our records.</Message>", 1),
+                                            _ => old_xml,
+                                        }
+                                    };
+                                    check(
+                                        snapshot_error_xml(&new.2) == expected_xml,
+                                        format!("{label} {path}: complete refusal XML"),
+                                    );
+                                } else if label != "presigned" {
+                                    check(
+                                        snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
+                                        format!("{label} {path}: complete baseline XML"),
+                                    );
+                                }
+                            }
+                            let legacy_status = if label == "presigned" {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::FORBIDDEN
+                            };
+                            check(old.0 == legacy_status, format!("{label} {path}: legacy status {}", old.0));
+                            if use_native {
+                                check(
+                                    new.0 == StatusCode::FORBIDDEN && refusal(&new.2).0 == code,
+                                    format!("{label} {path}: native status/code {} {:?}", new.0, refusal(&new.2)),
+                                );
+                                match label {
+                                    "disabled" | "anonymous" => {
+                                        let (old_message, new_message) = if label == "disabled" {
+                                            ("check key failed", "The Access Key Id you provided does not exist in our records.")
+                                        } else {
+                                            ("Signature is required", "the request is not allowed")
+                                        };
+                                        check(
+                                            refusal(&old.2) == (code.to_owned(), old_message.to_owned())
+                                                && refusal(&new.2) == (code.to_owned(), new_message.to_owned()),
+                                            format!("{label} {path} {host}: exact refusal messages"),
+                                        );
+                                    }
+                                    "presigned" => check(
+                                        refusal(&old.2) == (String::new(), String::new())
+                                            && refusal(&new.2)
+                                                == ("AccessDenied".to_owned(), "the request is not allowed".to_owned()),
+                                        format!("{label} {path} {host}: admin signature floor"),
+                                    ),
+                                    _ => check(refusal(&old.2) == refusal(&new.2), format!("{label} {path}: exact refusal")),
+                                }
+                            } else {
+                                check(
+                                    old.0 == new.0 && refusal(&old.2) == refusal(&new.2),
+                                    format!("{label} {path}: baseline repeat"),
+                                );
+                            }
+                        }
+                        for query in ["lambdaArn=arn", "lambdaArn=", "lambdaArn"] {
+                            let request = || signed(&path, query, host, ROOT, ROOT_SECRET, Signed::Header);
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            check(
+                                old.0 != StatusCode::OK && old.0 == new.0 && refusal(&old.2) == refusal(&new.2),
+                                format!("{path}?{query} {host}: lambda precedence"),
+                            );
+                        }
+                        for (method, tail) in [
+                            (Method::PUT, ""),
+                            (Method::POST, ""),
+                            (Method::HEAD, ""),
+                            (Method::GET, "/"),
+                            (Method::GET, "-neighbor"),
+                        ] {
+                            let target = format!("{path}{tail}");
+                            let request = || {
+                                let mut headers = HeaderMap::new();
+                                headers.insert(http::header::HOST, host.parse().unwrap());
+                                signed_request_with_headers(
+                                    Signed::Header,
+                                    method.clone(),
+                                    &target,
+                                    "",
+                                    ROOT,
+                                    ROOT_SECRET,
+                                    headers,
+                                )
+                            };
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            eprintln!(
+                                "catalog-neighbor {method} {target} {host}: legacy={} {:?}, selected={} {:?}",
+                                old.0,
+                                refusal(&old.2),
+                                new.0,
+                                refusal(&new.2)
+                            );
+                            // Adjacent routes now reach the control-plane host, whose error document
+                            // differs from legacy's only by the line break after the declaration.
+                            check(
+                                old.0 == new.0 && snapshot_error_xml(&old.2) == snapshot_error_xml(&new.2),
+                                format!("{method} {target} {host}: adjacent route"),
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_catalog_reads_legacy_baseline() {
+            admin_reads_contract(false, &CATALOG_READS).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_catalog_reads_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &CATALOG_READS).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_legacy_baseline() {
+            admin_reads_contract(false, &["/v4/extensions/catalog"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &["/v4/extensions/catalog"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_legacy_baseline() {
+            admin_reads_contract(false, &["/v4/cluster/snapshot"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &["/v4/cluster/snapshot"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_unsigned_before_body() {
+            admin_unsigned_before_body("/v4/cluster/snapshot").await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_unsigned_before_body() {
+            admin_unsigned_before_body("/v4/extensions/catalog").await;
+        }
+
+        async fn admin_unsigned_before_body(suffix: &str) {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot)).unwrap());
+            let payload = Bytes::from_static(b"admin body must remain unread");
+            let (sender, body, read, _dropped) = tracked_request_body();
+            sender.send(payload.clone()).unwrap();
+            drop(sender);
+            assert_eq!(body.collect().await.unwrap().to_bytes(), payload);
+            assert_eq!(read.load(Ordering::SeqCst), payload.len(), "body observer positive control");
+            for prefix in ["/rustfs/admin", "/minio/admin"] {
+                let path = format!("{prefix}{suffix}");
+                for host in ["localhost", "bucket.s3.example.test"] {
+                    let signed = answer(native.clone(), signed(&path, "", host, ROOT, ROOT_SECRET, Signed::Header)).await;
+                    assert_eq!(signed.0, StatusCode::OK, "signed handler control");
+                    let (sender, body, read, _dropped) = tracked_request_body();
+                    sender.send(payload.clone()).unwrap();
+                    drop(sender);
+                    let request = HttpRequest::builder()
+                        .uri(&path)
+                        .header("host", host)
+                        .header("x-request-id", REQUEST_ID)
+                        .body(body)
+                        .unwrap();
+                    let response = answer(native.clone(), request).await;
+                    let old = answer(
+                        legacy.clone(),
+                        HttpRequest::builder()
+                            .uri(&path)
+                            .header("host", host)
+                            .header("x-request-id", REQUEST_ID)
+                            .body(Empty::new())
+                            .unwrap(),
+                    )
+                    .await;
+                    assert!(admin_wire_failures(&old, "legacy unsigned body observer").is_empty());
+                    assert!(admin_wire_failures(&response, "native unsigned body observer").is_empty());
+                    assert_eq!(
+                        snapshot_error_xml(&response.2),
+                        snapshot_error_xml(&old.2).replacen(
+                            "<Message>Signature is required</Message>",
+                            "<Message>the request is not allowed</Message>",
+                            1
+                        )
+                    );
+                    eprintln!(
+                        "snapshot-unsigned {path} {host}: status={} headers={:?} body={}",
+                        response.0,
+                        response.1,
+                        String::from_utf8_lossy(&response.2)
+                    );
+                    assert_eq!(response.0, StatusCode::FORBIDDEN);
+                    assert_eq!(refusal(&response.2), ("AccessDenied".to_owned(), "the request is not allowed".to_owned()));
+                    assert_eq!(read.load(Ordering::SeqCst), 0, "unsigned body must remain unread");
+                }
+            }
+        }
+
+        const SYSTEM_READS: [(&str, &str); 3] = [
+            ("/v3/storageinfo", "storage"),
+            ("/v4/runtime/capabilities", "info"),
+            ("/v3/object-data-cache/stats", "info"),
+        ];
+
+        async fn owned_system_read(
+            path: &str,
+            key: &str,
+            secret: &str,
+        ) -> rustfs_s3_types::S3Result<(StatusCode, HeaderMap, Bytes)> {
+            use crate::admin::handlers::object_data_cache::ObjectDataCacheStatsHandler;
+            use crate::admin::handlers::system::{RuntimeCapabilitiesHandler, StorageInfoHandler};
+            use crate::admin::operation::{Operation as _, test_support::TestRequest};
+            let request = TestRequest::new(Method::GET, format!("{path}?detail=a%2Fb"))
+                .credentials(key, secret, None)
+                .build();
+            let response = if path.ends_with("/storageinfo") {
+                StorageInfoHandler {}.call(request, matchit::Params::new()).await?
+            } else if path.ends_with("/capabilities") {
+                RuntimeCapabilitiesHandler {}.call(request, matchit::Params::new()).await?
+            } else {
+                ObjectDataCacheStatsHandler {}.call(request, matchit::Params::new()).await?
+            };
+            let (status, headers, body) = response.into_parts();
+            Ok((status, headers, body.collect().await.unwrap().to_bytes()))
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_system_reads_owned_and_legacy_baseline() {
+            let (_env, _slot, legacy) = admin_fixture().await;
+            for (suffix, family) in SYSTEM_READS {
+                for prefix in ["/rustfs/admin", "/minio/admin"] {
+                    let path = format!("{prefix}{suffix}");
+                    for key in [
+                        ROOT,
+                        "info-allowed",
+                        "storage-allowed",
+                        "info-no-policy",
+                        "info-denied",
+                        "storage-denied",
+                    ] {
+                        let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                        let allowed = key == ROOT || key == format!("{family}-allowed");
+                        let old =
+                            answer(legacy.clone(), signed(&path, "detail=a%2Fb", "localhost", key, secret, Signed::Header)).await;
+                        let owned = owned_system_read(&path, key, secret).await;
+                        if allowed {
+                            assert_eq!(old.0, StatusCode::OK, "{key} {path}: {:?}", refusal(&old.2));
+                            let owned = owned.unwrap();
+                            assert_eq!(owned.0, old.0, "{key} {path}");
+                            assert_eq!(owned.1[http::header::CONTENT_TYPE], old.1[http::header::CONTENT_TYPE]);
+                            let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                            let owned: serde_json::Value = serde_json::from_slice(&owned.2).unwrap();
+                            assert_eq!(owned, old, "{key} {path}");
+                            if family == "storage" {
+                                assert_eq!(owned.get("info").is_some(), prefix == "/rustfs/admin");
+                                assert_eq!(owned.get("admin_discovery").is_some(), prefix == "/rustfs/admin");
+                            }
+                        } else {
+                            assert_eq!(old.0, StatusCode::FORBIDDEN, "{key} {path}");
+                            assert_eq!(refusal(&old.2).0, "AccessDenied", "{key} {path}");
+                            let error = owned.unwrap_err();
+                            assert_eq!(error.code().as_str(), "AccessDenied", "{key} {path}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_system_reads_real_signature_iam_and_wire() {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.console_enable = false;
+            let edge = assemble_s3_stack(&config, None, assembly(slot)).unwrap();
+            let mut failures = Vec::new();
+            let mut check = |condition: bool, label: String| {
+                if !condition {
+                    failures.push(label);
+                }
+            };
+            for (suffix, family) in SYSTEM_READS {
+                for prefix in ["/rustfs/admin", "/minio/admin"] {
+                    let path = format!("{prefix}{suffix}");
+                    for host in ["localhost", "bucket.s3.example.test"] {
+                        for key in [
+                            ROOT,
+                            "info-allowed",
+                            "storage-allowed",
+                            "info-no-policy",
+                            "info-denied",
+                            "storage-denied",
+                        ] {
+                            let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                            let allowed = key == ROOT || key == format!("{family}-allowed");
+                            let old =
+                                answer(legacy.clone(), signed(&path, "detail=a%2Fb", host, key, secret, Signed::Header)).await;
+                            let new =
+                                answer(edge.clone(), signed(&path, "detail=a%2Fb", host, key, secret, Signed::Header)).await;
+                            let label = format!("{key} {host} {path}");
+                            let expected = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                            check(
+                                old.0 == expected && new.0 == expected,
+                                format!("{label}: status legacy={} native={}", old.0, new.0),
+                            );
+                            if allowed && old.0 == expected && new.0 == expected {
+                                check(
+                                    old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE)
+                                        && new.1[http::header::CONTENT_TYPE] == "application/json",
+                                    format!("{label}: content type"),
+                                );
+                                check(
+                                    new.1.get("x-request-id").is_some_and(|value| value == REQUEST_ID),
+                                    format!("{label}: request id"),
+                                );
+                                let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                                let new: serde_json::Value = serde_json::from_slice(&new.2).unwrap();
+                                check(new == old, format!("{label}: complete JSON legacy={old} native={new}"));
+                                if family == "storage" {
+                                    check(
+                                        new.get("info").is_some() == (prefix == "/rustfs/admin")
+                                            && new.get("admin_discovery").is_some() == (prefix == "/rustfs/admin"),
+                                        format!("{label}: raw alias"),
+                                    );
+                                }
+                            } else if !allowed {
+                                check(
+                                    refusal(&old.2).0 == "AccessDenied" && refusal(&new.2) == refusal(&old.2),
+                                    format!("{label}: refusal"),
+                                );
+                            }
+                        }
+                        for (label, key, secret, anonymous, malformed, form, code) in [
+                            (
+                                "unknown",
+                                "missing-system-user",
+                                USER_SECRET,
+                                false,
+                                false,
+                                Signed::Header,
+                                "InvalidAccessKeyId",
+                            ),
+                            (
+                                "disabled",
+                                "info-disabled",
+                                USER_SECRET,
+                                false,
+                                false,
+                                Signed::Header,
+                                "InvalidAccessKeyId",
+                            ),
+                            (
+                                "bad-signature",
+                                ROOT,
+                                "wrong-system-secret",
+                                false,
+                                false,
+                                Signed::Header,
+                                "SignatureDoesNotMatch",
+                            ),
+                            ("anonymous", ROOT, ROOT_SECRET, true, false, Signed::Header, "AccessDenied"),
+                            ("malformed", ROOT, ROOT_SECRET, false, true, Signed::Header, "InvalidRequest"),
+                            ("presigned", ROOT, ROOT_SECRET, false, false, Signed::Query, "AccessDenied"),
+                        ] {
+                            let request = || {
+                                if anonymous || malformed {
+                                    let mut builder = HttpRequest::builder().method(Method::GET).uri(&path).header("host", host);
+                                    if malformed {
+                                        builder = builder.header("authorization", "invalid");
+                                    }
+                                    builder.body(Empty::new()).unwrap()
+                                } else {
+                                    signed(&path, "", host, key, secret, form)
+                                }
+                            };
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = answer(native.clone(), request()).await;
+                            eprintln!(
+                                "system-compare {label} {path} {host}: legacy={} {:?}, native={} {:?}",
+                                old.0,
+                                refusal(&old.2),
+                                new.0,
+                                refusal(&new.2)
+                            );
+                            check(
+                                new.0
+                                    == if malformed {
+                                        StatusCode::BAD_REQUEST
+                                    } else {
+                                        StatusCode::FORBIDDEN
+                                    },
+                                format!("{label} {path}: native status {}", new.0),
+                            );
+                            check(refusal(&new.2).0 == code, format!("{label} {path}: native code {:?}", refusal(&new.2)));
+                            let messages = match label {
+                                "disabled" => {
+                                    Some(("check key failed", "The Access Key Id you provided does not exist in our records."))
+                                }
+                                "anonymous" => Some(("Signature is required", "the request is not allowed")),
+                                _ => None,
+                            };
+                            if let Some((old_message, new_message)) = messages {
+                                check(
+                                    old.0 == StatusCode::FORBIDDEN
+                                        && new.0 == old.0
+                                        && refusal(&old.2) == (code.to_owned(), old_message.to_owned())
+                                        && refusal(&new.2) == (code.to_owned(), new_message.to_owned()),
+                                    format!("{label} {path} {host}: exact refusal messages"),
+                                );
+                            } else if label == "presigned" {
+                                check(
+                                    old.0 == StatusCode::OK
+                                        && refusal(&old.2) == (String::new(), String::new())
+                                        && refusal(&new.2)
+                                            == ("AccessDenied".to_owned(), "the request is not allowed".to_owned()),
+                                    format!("{label} {path} {host}: admin signature floor"),
+                                );
+                            } else {
+                                check(
+                                    new.0 == old.0 && refusal(&new.2) == refusal(&old.2),
+                                    format!("{label} {path}: legacy refusal"),
+                                );
+                            }
+                        }
+                    }
+                    for (client, peer, allowed) in [
+                        ("10.8.7.6:7890", "203.0.113.9:4567", true),
+                        ("203.0.113.9:7890", "10.8.7.6:4567", false),
+                    ] {
+                        let key = format!("{family}-proxy");
+                        let request = || {
+                            let mut request = signed(&path, "", "localhost", &key, USER_SECRET, Signed::Header);
+                            request.extensions_mut().insert(Some(RemoteAddr(peer.parse().unwrap())));
+                            request
+                                .extensions_mut()
+                                .insert(rustfs_trusted_proxies::ClientInfo::direct(client.parse().unwrap()));
+                            request
+                        };
+                        let old = answer(legacy.clone(), request()).await;
+                        let new = answer(native.clone(), request()).await;
+                        let expected = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                        check(
+                            old.0 == expected && new.0 == expected,
+                            format!("{path}: source IP {client} peer {peer}: legacy={} native={}", old.0, new.0),
+                        );
+                        if !allowed {
+                            check(refusal(&old.2) == refusal(&new.2), format!("{path}: source refusal"));
+                        }
+                    }
+                    for query in ["lambdaArn=arn", "lambdaArn=", "lambdaArn"] {
+                        let old = answer(
+                            legacy.clone(),
+                            signed(&path, query, "bucket.s3.example.test", ROOT, ROOT_SECRET, Signed::Header),
+                        )
+                        .await;
+                        let new = answer(
+                            edge.clone(),
+                            signed(&path, query, "bucket.s3.example.test", ROOT, ROOT_SECRET, Signed::Header),
+                        )
+                        .await;
+                        check(
+                            old.0 != StatusCode::OK && new.0 == old.0 && refusal(&new.2) == refusal(&old.2),
+                            format!("{path}?{query}: object lambda priority"),
+                        );
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_real_iam_and_legacy_contract() {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
+            let mut failures = Vec::new();
+            let mut check = |condition: bool, label: String| {
+                if !condition {
+                    failures.push(label);
+                }
+            };
+
+            // Obtain the legacy refusals through its actual authenticator and router.
+            for (label, key, secret, anonymous, malformed, expected_code) in [
+                ("no-policy", "info-no-policy", USER_SECRET, false, false, "AccessDenied"),
+                ("unrelated", "info-unrelated", USER_SECRET, false, false, "AccessDenied"),
+                ("explicit-deny", "info-denied", USER_SECRET, false, false, "AccessDenied"),
+                ("disabled", "info-disabled", USER_SECRET, false, false, "InvalidAccessKeyId"),
+                ("unknown", "info-unknown", USER_SECRET, false, false, "InvalidAccessKeyId"),
+                ("bad-signature", ROOT, "wrong-admin-secret", false, false, "SignatureDoesNotMatch"),
+                ("anonymous", ROOT, ROOT_SECRET, true, false, "AccessDenied"),
+                ("malformed", ROOT, ROOT_SECRET, false, true, "InvalidRequest"),
+            ] {
+                for path in ["/rustfs/admin/v3/info", "/minio/admin/v3/info"] {
+                    for host in ["localhost", "bucket.s3.example.test"] {
+                        let request = || {
+                            if anonymous || malformed {
+                                let mut builder = HttpRequest::builder()
+                                    .method(Method::GET)
+                                    .uri(path)
+                                    .header("host", host)
+                                    .header("x-request-id", REQUEST_ID);
+                                if malformed {
+                                    builder = builder.header("authorization", "invalid");
+                                }
+                                builder.body(Empty::new()).unwrap()
+                            } else {
+                                signed(path, "", host, key, secret, Signed::Header)
+                            }
+                        };
+                        let old = answer(legacy.clone(), request()).await;
+                        let new = answer(native.clone(), request()).await;
+                        let old_error = refusal(&old.2);
+                        let new_error = refusal(&new.2);
+                        eprintln!(
+                            "admin-compare {label} {host} {path}: legacy={} {:?}, native={} {:?}",
+                            old.0, old_error, new.0, new_error
+                        );
+                        check(old_error.0 == expected_code, format!("legacy {label}: {:?}", old_error));
+                        let native_message = match label {
+                            "disabled" => "The Access Key Id you provided does not exist in our records.",
+                            "anonymous" => "the request is not allowed",
+                            _ => old_error.1.as_str(),
+                        };
+                        if label == "disabled" {
+                            check(old_error.1 == "check key failed", "legacy disabled message".to_owned());
+                        }
+                        if label == "anonymous" {
+                            check(old_error.1 == "Signature is required", "legacy anonymous message".to_owned());
+                        }
+                        check(
+                            new.0 == old.0 && new_error.0 == old_error.0 && new_error.1 == native_message,
+                            format!(
+                                "refusal {label} {host} {path}: legacy={} {:?}, native={} {:?}",
+                                old.0, old_error, new.0, new_error
+                            ),
+                        );
+                    }
+                }
+            }
+
+            for key in [ROOT, "info-allowed"] {
+                let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                for path in ["/rustfs/admin/v3/info", "/minio/admin/v3/info"] {
+                    for host in ["localhost", "bucket.s3.example.test"] {
+                        for query in ["", "detail=1"] {
+                            let old = answer(legacy.clone(), signed(path, query, host, key, secret, Signed::Header)).await;
+                            let new = answer(native.clone(), signed(path, query, host, key, secret, Signed::Header)).await;
+                            let label = format!("success {key} {host} {path}?{query}");
+                            check(old.0 == StatusCode::OK, format!("{label}: legacy status {}", old.0));
+                            check(new.0 == StatusCode::OK, format!("{label}: native status {}", new.0));
+                            if old.0 != StatusCode::OK || new.0 != StatusCode::OK {
+                                continue;
+                            }
+                            check(
+                                new.1.get(http::header::CONTENT_TYPE) == old.1.get(http::header::CONTENT_TYPE)
+                                    && new.1[http::header::CONTENT_TYPE] == "application/json",
+                                format!("{label}: content type"),
+                            );
+                            check(
+                                old.1.get("x-request-id").is_some_and(|value| value == REQUEST_ID)
+                                    && new.1.get("x-request-id").is_some_and(|value| value == REQUEST_ID),
+                                format!("{label}: request id"),
+                            );
+                            let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                            let new: serde_json::Value = serde_json::from_slice(&new.2).unwrap();
+                            let minio = path.starts_with("/minio/");
+                            check(
+                                new.get("info").is_some() != minio && new.get("admin_discovery").is_some() != minio,
+                                format!("{label}: raw alias response shape"),
+                            );
+                            let old = if minio { &old } else { &old["info"] };
+                            let new = if minio { &new } else { &new["info"] };
+                            check(
+                                new["pools"].as_object().is_some_and(|pools| pools.contains_key("0")),
+                                format!("{label}: pool topology"),
+                            );
+                            check(
+                                old["pools"].as_object().map(|pools| pools.keys().collect::<Vec<_>>())
+                                    == new["pools"].as_object().map(|pools| pools.keys().collect::<Vec<_>>()),
+                                format!("{label}: legacy pool identities"),
+                            );
+                            // Pool identities are stable; uptime, usage and timestamps are not compared.
+                        }
+                    }
+                }
+            }
+            for (client, peer, allowed) in [
+                ("10.8.7.6:7890", "203.0.113.9:4567", true),
+                ("203.0.113.9:7890", "10.8.7.6:4567", false),
+            ] {
+                let request = || {
+                    let mut request = signed("/rustfs/admin/v3/info", "", "localhost", "info-proxy", USER_SECRET, Signed::Header);
+                    request.extensions_mut().insert(Some(RemoteAddr(peer.parse().unwrap())));
+                    request
+                        .extensions_mut()
+                        .insert(rustfs_trusted_proxies::ClientInfo::direct(client.parse().unwrap()));
+                    request
+                };
+                let old = answer(legacy.clone(), request()).await;
+                let new = answer(native.clone(), request()).await;
+                let expected = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                check(
+                    old.0 == expected && new.0 == expected,
+                    format!("source IP {client} vs peer {peer}: legacy={} native={}", old.0, new.0),
+                );
+                if !allowed {
+                    check(refusal(&new.2) == refusal(&old.2), "source IP refusal parity".to_owned());
+                }
+            }
+            let old = answer(
+                legacy.clone(),
+                signed("/rustfs/admin/v3/info", "", "localhost", ROOT, ROOT_SECRET, Signed::Query),
+            )
+            .await;
+            let new = answer(
+                native.clone(),
+                signed("/rustfs/admin/v3/info", "", "localhost", ROOT, ROOT_SECRET, Signed::Query),
+            )
+            .await;
+            eprintln!(
+                "admin-compare presigned: legacy={} {:?}, native={} {:?}",
+                old.0,
+                refusal(&old.2),
+                new.0,
+                refusal(&new.2)
+            );
+            check(old.0 == StatusCode::OK && new.0 == StatusCode::FORBIDDEN, "presigned floor".to_owned());
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.console_enable = false;
+            let edge = assemble_s3_stack(&config, None, assembly(slot)).unwrap();
+            let selected = answer(
+                edge.clone(),
+                signed(
+                    "/minio/admin/v3/info",
+                    "detail=1",
+                    "bucket.s3.example.test",
+                    ROOT,
+                    ROOT_SECRET,
+                    Signed::Header,
+                ),
+            )
+            .await;
+            check(
+                selected.0 == StatusCode::OK && selected.1.get("x-request-id").is_some_and(|value| value == REQUEST_ID),
+                "assembled edge reaches native admin".to_owned(),
+            );
+            for path in ["/rustfs/admin/v3/info", "/minio/admin/v3/info"] {
+                // Duplicate keys and malformed percent escapes cannot be signed by this fixture.
+                // Their routing exclusions are exercised by server/stack.rs.
+                for query in ["lambdaArn=arn", "lambdaArn=", "lambdaArn"] {
+                    let old = answer(
+                        legacy.clone(),
+                        signed(path, query, "bucket.s3.example.test", ROOT, ROOT_SECRET, Signed::Header),
+                    )
+                    .await;
+                    let new = answer(
+                        edge.clone(),
+                        signed(path, query, "bucket.s3.example.test", ROOT, ROOT_SECRET, Signed::Header),
+                    )
+                    .await;
+                    check(
+                        old.0 != StatusCode::OK && old.0 == new.0 && refusal(&old.2) == refusal(&new.2),
+                        format!(
+                            "object lambda priority {path}?{query}: legacy={} {:?} selected={} {:?}",
+                            old.0,
+                            refusal(&old.2),
+                            new.0,
+                            refusal(&new.2)
+                        ),
+                    );
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+    }
+
+    mod native_console_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        #[tokio::test]
+        async fn native_console_route_contract() {
+            use http_body_util::BodyExt;
+            let target = format!("{}/route-fixture.txt", crate::server::console_prefix());
+            let (service, calls) = edge(true);
+            let response = service.oneshot(console_request(Method::GET, &target, false)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers().get(http::header::CONTENT_TYPE).unwrap(), "text/plain");
+            assert_eq!(response.headers().get(http::header::CONTENT_LENGTH).unwrap(), "28");
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes().as_ref(),
+                b"console-route-static-content"
+            );
+            assert_eq!(counts(&calls), [0, 0, 1]);
+            public_static_uses_native_console_without_gateway_s3_calls().await;
+            neighboring_prefixes_admin_sts_s3_and_console_extension_queries_are_excluded().await;
+            disabled_console_keeps_static_requests_off_the_native_console().await;
+        }
+
+        fn console_request(method: Method, target: &str, malformed_auth: bool) -> HttpRequest<Empty<Bytes>> {
+            let mut builder = HttpRequest::builder().method(method).uri(target).header("host", "localhost");
+            if malformed_auth {
+                builder = builder.header(http::header::AUTHORIZATION, "invalid");
+            }
+            builder.body(Empty::new()).expect("static request")
+        }
+
+        fn static_console_cases() -> [(Method, String); 5] {
+            let prefix = crate::server::console_prefix();
+            [
+                (Method::GET, format!("{prefix}/index.html")),
+                (Method::HEAD, format!("{prefix}/index.html")),
+                (Method::OPTIONS, format!("{prefix}/index.html")),
+                (Method::GET, "/favicon.ico".to_owned()),
+                (Method::GET, format!("{prefix}/missing-static-file.js")),
+            ]
+        }
+
+        async fn static_response_body(response: Response<EdgeBody>, method: &Method, target: &str) -> Bytes {
+            use http_body_util::BodyExt;
+            let (fixture, content_type): (&[u8], &str) = if target == "/favicon.ico" {
+                (include_bytes!("../../tests/fixtures/native-console/favicon.ico"), "image/x-icon")
+            } else {
+                (include_bytes!("../../tests/fixtures/native-console/index.html"), "text/html")
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{method} {target}");
+            if method == Method::OPTIONS {
+                assert_eq!(
+                    response.headers().get("access-control-allow-methods").unwrap(),
+                    "GET,POST,PUT,DELETE,OPTIONS"
+                );
+                assert_eq!(response.headers().get("access-control-allow-headers").unwrap(), "*");
+                assert!(response.headers().get(http::header::CONTENT_TYPE).is_none());
+                assert!(response.headers().get(http::header::CONTENT_LENGTH).is_none());
+            } else {
+                assert_eq!(response.headers().get(http::header::CONTENT_TYPE).unwrap(), content_type);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(http::header::CONTENT_LENGTH)
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    fixture.len().to_string()
+                );
+            }
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let expected = if method == Method::HEAD || method == Method::OPTIONS {
+                b"".as_slice()
+            } else {
+                fixture
+            };
+            assert_eq!(body.as_ref(), expected, "{method} {target}");
+            body
+        }
+
+        type Probe = tower::util::BoxCloneService<HttpRequest<Empty<Bytes>>, Response<EdgeBody>, EdgeError>;
+
+        fn counted<S>(inner: S, calls: Arc<AtomicUsize>) -> Probe
+        where
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<EdgeBody>, Error = EdgeError> + Clone + Send + 'static,
+            S::Future: Send + 'static,
+        {
+            Probe::new(tower::service_fn(move |request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                inner.clone().oneshot(request)
+            }))
+        }
+
+        fn answering(status: StatusCode) -> Probe {
+            Probe::new(tower::service_fn(move |_| async move {
+                Ok::<_, EdgeError>(Response::builder().status(status).body(EdgeBody::default()).unwrap())
+            }))
+        }
+
+        /// The stack with probes for the control plane (`ACCEPTED`) and the gateway S3 service
+        /// (`IM_A_TEAPOT`); `calls` counts the control plane, the gateway and the native console.
+        fn edge(enabled: bool) -> (S3StackService<Probe, Probe>, [Arc<AtomicUsize>; 3]) {
+            let calls = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.console_enable = enabled;
+            let control_plane = counted(answering(StatusCode::ACCEPTED), calls[0].clone());
+            let gateway = counted(answering(StatusCode::IM_A_TEAPOT), calls[1].clone());
+            let console = NativeConsoleEdgeService::for_config(&config).map(|service| counted(service, calls[2].clone()));
+            let edge = S3StackService::new(gateway)
+                .with_native_console(console)
+                .with_control_plane(Some(control_plane));
+            (edge, calls)
+        }
+
+        fn counts(calls: &[Arc<AtomicUsize>; 3]) -> [usize; 3] {
+            std::array::from_fn(|i| calls[i].load(Ordering::SeqCst))
+        }
+
+        async fn public_static_uses_native_console_without_gateway_s3_calls() {
+            let (service, calls) = edge(true);
+            for malformed_auth in [false, true] {
+                for (method, target) in static_console_cases() {
+                    let actual = service
+                        .clone()
+                        .oneshot(console_request(method.clone(), &target, malformed_auth))
+                        .await
+                        .unwrap();
+                    static_response_body(actual, &method, &target).await;
+                }
+            }
+            let prefix = crate::server::console_prefix();
+            let extra = [
+                (Method::GET, "/apple-touch-icon.png".to_owned()),
+                (Method::GET, format!("{prefix}/index.html?events")),
+                (Method::HEAD, format!("{prefix}/index.html?lambdaArn=bad")),
+                (Method::GET, "/favicon.ico?lambdaArn=bad".to_owned()),
+            ];
+            for (method, target) in &extra {
+                let actual = service
+                    .clone()
+                    .oneshot(console_request(method.clone(), target, false))
+                    .await
+                    .unwrap();
+                assert_ne!(actual.status(), StatusCode::IM_A_TEAPOT, "{method} {target}");
+                assert_ne!(actual.status(), StatusCode::ACCEPTED, "{method} {target}");
+            }
+            assert_eq!(counts(&calls), [0, 0, static_console_cases().len() * 2 + extra.len()]);
+        }
+
+        async fn neighboring_prefixes_admin_sts_s3_and_console_extension_queries_are_excluded() {
+            let (service, calls) = edge(true);
+            let prefix = crate::server::console_prefix();
+            // (method, target, claimed by the control plane, STS form)
+            let cases = [
+                (Method::GET, format!("{prefix}x/index.html"), false, false),
+                (Method::GET, "/favicon.icox".to_owned(), false, false),
+                (Method::GET, "/apple-touch-icon.pngx".to_owned(), false, false),
+                (Method::GET, "/rustfs/administrator".to_owned(), false, false),
+                (Method::GET, "/bucket/key".to_owned(), false, false),
+                (Method::PUT, "/bucket/key".to_owned(), false, false),
+                (Method::POST, "/".to_owned(), false, false),
+                (Method::GET, "/rustfs/admin/v3/info".to_owned(), true, false),
+                (Method::GET, "/minio/admin/v3/info".to_owned(), true, false),
+                (Method::GET, "/iceberg/v1/config".to_owned(), true, false),
+                (Method::POST, "/".to_owned(), true, true),
+                (Method::GET, "/favicon.ico?events".to_owned(), true, false),
+                (Method::GET, "/favicon.ico?replication-metrics".to_owned(), true, false),
+                (Method::GET, format!("{prefix}/index.html?lambdaArn="), true, false),
+                (Method::GET, format!("{prefix}/index.html?lambdaArn=bad"), true, false),
+                (Method::GET, format!("{prefix}/index.html?lambdaArn=bad&lambdaArn=bad"), true, false),
+            ];
+            for (method, target, claimed, sts) in &cases {
+                for malformed_auth in [false, true] {
+                    let mut request = console_request(method.clone(), target, malformed_auth);
+                    if *sts {
+                        request.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+                        );
+                    }
+                    let actual = service.clone().oneshot(request).await.unwrap();
+                    let expected = if *claimed {
+                        StatusCode::ACCEPTED
+                    } else {
+                        StatusCode::IM_A_TEAPOT
+                    };
+                    assert_eq!(actual.status(), expected, "{method} {target} malformed={malformed_auth}");
+                }
+            }
+            let claimed = cases.iter().filter(|case| case.2).count();
+            assert_eq!(counts(&calls), [claimed * 2, (cases.len() - claimed) * 2, 0]);
+        }
+
+        async fn disabled_console_keeps_static_requests_off_the_native_console() {
+            let (service, calls) = edge(false);
+            let cases = static_console_cases();
+            for (method, target) in &cases {
+                for malformed_auth in [false, true] {
+                    service
+                        .clone()
+                        .oneshot(console_request(method.clone(), target, malformed_auth))
+                        .await
+                        .unwrap();
+                }
+            }
+            let [control_plane, gateway, console] = counts(&calls);
+            assert_eq!(console, 0);
+            assert_eq!(control_plane + gateway, cases.len() * 2);
+        }
+    }
+
     type RateLimitTestCore = tower::util::BoxCloneService<
         HttpRequest<s3s::Body>,
         Response<crate::server::hybrid::HybridBody<s3s::Body, Empty<Bytes>>>,
@@ -4414,7 +6204,6 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false,
             Arc::default()
         ))
     }
@@ -5388,6 +7177,41 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct ReadOneFrameThenRejectService;
+
+    impl<B> Service<HttpRequest<B>> for ReadOneFrameThenRejectService
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Send + 'static,
+    {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+            Box::pin(async move {
+                let mut body = Box::pin(req.into_body());
+                let Some(Ok(frame)) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await else {
+                    panic!("the request must deliver a body frame before the early response");
+                };
+                assert!(
+                    frame.into_data().is_ok_and(|bytes| !bytes.is_empty()),
+                    "the early response must follow a non-empty body frame"
+                );
+                drop(body);
+                Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Empty::new())
+                    .expect("response"))
+            })
+        }
+    }
+
     struct TransformCountingBody<B> {
         inner: B,
         polls: Arc<AtomicUsize>,
@@ -5808,45 +7632,64 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct UploadPartTimeoutS3 {
-        timeout: Duration,
-    }
+    /// UploadPart reading its whole body, as RustFS's handler reads one; HeadBucket answers at once.
+    struct UploadPartReader;
 
-    #[async_trait::async_trait]
-    impl s3s::S3 for UploadPartTimeoutS3 {
-        async fn upload_part(
+    impl rustfs_gateway::Handler<rustfs_gateway::dto::UploadPart> for UploadPartReader {
+        async fn call(
             &self,
-            req: s3s::S3Request<s3s::dto::UploadPartInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
+            request: rustfs_gateway::Req<rustfs_gateway::dto::UploadPart>,
+        ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::UploadPart> {
             use futures::StreamExt;
             use tokio_util::io::StreamReader;
 
-            let control = req
-                .extensions
-                .get::<BodyReadControl>()
-                .expect("HTTP route must install the control")
-                .clone();
-            control.activate(self.timeout, "bucket", "object", "request", 1024);
-            let body = req.input.body.expect("upload body");
-            let inner = rustfs_rio::wrap_reader(StreamReader::new(body.map(|item| item.map_err(std::io::Error::other))));
-            let mut reader = crate::app::object::request_body::DemandReader::new(inner, control);
+            let body = request.into_input().body.expect("upload body").into_body();
+            let (chunks, _) = crate::app::object::BodyChunks::with_trailers(body, None);
+            let mut reader = StreamReader::new(chunks.map(|item| item.map_err(std::io::Error::other)));
             reader
                 .read_to_end(&mut Vec::new())
                 .await
-                .map_err(|error| s3s::S3Error::from(crate::error::ApiError::from(error)))?;
-            Ok(s3s::S3Response::new(s3s::dto::UploadPartOutput::default()))
-        }
-
-        async fn head_bucket(
-            &self,
-            _req: s3s::S3Request<s3s::dto::HeadBucketInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadBucketOutput>> {
-            Ok(s3s::S3Response::new(s3s::dto::HeadBucketOutput::default()))
+                .map_err(|error| crate::server::gateway_handlers::handler_error(crate::error::ApiError::from(error).into()))?;
+            Ok(rustfs_gateway::Resp::new(Default::default()))
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    impl rustfs_gateway::Handler<rustfs_gateway::dto::HeadBucket> for UploadPartReader {
+        async fn call(
+            &self,
+            _request: rustfs_gateway::Req<rustfs_gateway::dto::HeadBucket>,
+        ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::HeadBucket> {
+            Ok(rustfs_gateway::Resp::new(Default::default()))
+        }
+    }
+
+    /// The gateway stack as production configures it, with `timeout` as its request-body idle
+    /// bound, serving [`UploadPartReader`] to every caller behind the host's early-response drain.
+    fn upload_part_timeout_edge(timeout: Duration, drain_timeout: Duration) -> EarlyResponseBodyService<GatewayEdgeService> {
+        let handler = Arc::new(UploadPartReader);
+        let stack = GatewayStack::assemble_serving(
+            GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsgatewayroot".to_owned(),
+                root_secret_key: "rustfs-gateway-root-secret".to_owned(),
+                region: None,
+                server_domains: Vec::new(),
+                body_read_timeout: timeout,
+                keystone_auth: None,
+            },
+            |builder| {
+                builder
+                    .register::<rustfs_gateway::dto::UploadPart, _>(Arc::clone(&handler))
+                    .register::<rustfs_gateway::dto::HeadBucket, _>(handler)
+            },
+        )
+        .expect("the gateway stack assembles");
+        EarlyResponseBodyService::new(GatewayEdgeService(stack), drain_timeout)
+    }
+
+    // Real time: the gateway times a request body out on its own clock, which a paused tokio
+    // clock does not drive.
+    #[tokio::test]
     async fn upload_part_timeout_preserves_http1_drain_and_http2_stream_drop() {
         for version in [Version::HTTP_11, Version::HTTP_2] {
             let (sender, body, bytes_polled, dropped) = tracked_request_body();
@@ -5854,22 +7697,22 @@ mod tests {
                 .version(version)
                 .method(Method::PUT)
                 .uri("/bucket/object?partNumber=1&uploadId=upload")
+                .header(http::header::HOST, "localhost")
                 .header(CONTENT_LENGTH, "1024")
                 .body(body)
                 .expect("upload request");
-            let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
-                timeout: Duration::from_secs(300),
-            })
-            .build();
-            let mut service = EarlyResponseBodyService::new(inner, Duration::from_secs(30));
+            let mut service = upload_part_timeout_edge(Duration::from_millis(200), Duration::from_secs(30));
             let mut call = Box::pin(service.call(request));
             assert!(futures::poll!(call.as_mut()).is_pending());
-            tokio::time::advance(Duration::from_secs(300)).await;
-            let response = call.await.expect("timeout response");
+            let response = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("the stalled body times out")
+                .expect("timeout response");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(response.headers().get(CONNECTION).is_some(), version == Version::HTTP_11);
             let xml = response.into_body().collect().await.expect("timeout XML").to_bytes();
-            assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+            let xml = String::from_utf8_lossy(&xml);
+            assert!(xml.contains("<Code>RequestTimeout</Code>"), "{xml}");
             if version == Version::HTTP_11 {
                 assert!(
                     !dropped.load(Ordering::Acquire),
@@ -5892,11 +7735,7 @@ mod tests {
     #[tokio::test]
     async fn upload_part_timeout_leaves_other_http2_streams_usable() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let inner = s3s::service::S3ServiceBuilder::new(UploadPartTimeoutS3 {
-            timeout: Duration::from_millis(500),
-        })
-        .build();
-        let service = EarlyResponseBodyService::new(inner, Duration::from_secs(1));
+        let service = upload_part_timeout_edge(Duration::from_millis(500), Duration::from_secs(1));
         let server = tokio::spawn(async move {
             hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection(TokioIo::new(server_io), TowerToHyperService::new(service))
@@ -5941,7 +7780,8 @@ mod tests {
             .expect("S3 response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let xml = response.into_body().collect().await.expect("timeout body").to_bytes();
-        assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
+        let xml = String::from_utf8_lossy(&xml);
+        assert!(xml.contains("<Code>RequestTimeout</Code>"), "{xml}");
         client.ready().await.expect("connection after failed stream");
         let (sender, body, _, _) = tracked_request_body();
         drop(sender);
@@ -5974,6 +7814,120 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    /// A body the gateway stack refuses unread is drained by `EarlyResponseBodyService` under the
+    /// configured idle bound, and zero leaves that drain unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn gateway_rejected_http1_body_uses_the_configured_drain_timeout() {
+        for timeout in [Duration::from_secs(1), Duration::ZERO] {
+            let stack = GatewayStack::assemble(GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsgatewayroot".to_owned(),
+                root_secret_key: "rustfs-gateway-root-secret".to_owned(),
+                region: None,
+                server_domains: Vec::new(),
+                body_read_timeout: timeout,
+                keystone_auth: None,
+            })
+            .expect("the gateway stack assembles");
+            let mut service = EarlyResponseBodyService::new(GatewayEdgeService(stack), timeout);
+            let (_sender, body, _bytes_polled, dropped) = tracked_request_body();
+            let request = HttpRequest::builder()
+                .method(Method::PUT)
+                .uri("/bucket/object")
+                .version(Version::HTTP_11)
+                .header(http::header::HOST, "localhost")
+                .header(http::header::AUTHORIZATION, "invalid")
+                .body(body)
+                .expect("request");
+
+            let response = service.call(request).await.expect("response");
+            assert!(response.status().is_client_error(), "{}", response.status());
+            assert_eq!(response.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+            tokio::task::yield_now().await;
+            assert!(!dropped.load(Ordering::Acquire), "the host drain must retain the stalled body");
+            let elapsed = if timeout.is_zero() { 301 } else { 2 };
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                dropped.load(Ordering::Acquire),
+                !timeout.is_zero(),
+                "the configured timeout must govern the host drain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn early_response_http1_closes_a_stalled_chunked_body_after_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("server accept");
+            let service = EarlyResponseBodyService::new(RejectWithoutReadingBodyService, Duration::from_millis(100));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+        });
+        let mut stream = TcpStream::connect(addr).await.expect("client connect");
+        stream
+            .write_all(
+                format!(
+                    "PUT /bucket/object HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send an incomplete chunked body");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the stalled connection must close")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("HTTP response is text");
+        assert!(response.contains("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"), "{response}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server connection must finish")
+            .expect("server task")
+            .expect("HTTP connection");
+    }
+
+    #[tokio::test]
+    async fn early_response_http1_closes_a_partially_read_stalled_chunked_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("server accept");
+            let service = EarlyResponseBodyService::new(ReadOneFrameThenRejectService, Duration::from_millis(100));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+        });
+        let mut stream = TcpStream::connect(addr).await.expect("client connect");
+        stream
+            .write_all(
+                format!(
+                    "PUT /bucket/object HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send an incomplete chunked body");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the stalled connection must close")
+            .expect("read response");
+        let response = String::from_utf8(response).expect("HTTP response is text");
+        assert!(response.contains("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"), "{response}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server connection must finish")
+            .expect("server task")
+            .expect("HTTP connection");
     }
 
     async fn assert_http1_early_response_accepts_streaming_body(expect_continue: bool) {
@@ -6351,6 +8305,62 @@ mod tests {
         assert_eq!(captured.uri.path(), expected_path);
         assert_eq!(captured.uri.authority().map(|authority| authority.as_str()), Some("node-a:9000"));
         assert_eq!(captured.method, Method::POST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_request_path_service_advertises_msgpack_capability_only_when_requested() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-msgpack-capability-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        rustfs_common::set_global_local_node_name(audience).await;
+        let challenge = uuid::Uuid::new_v4();
+
+        let response_for = |request_capability: bool| async move {
+            let mut request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/node_service.NodeService/Ping")
+                .body(())
+                .expect("capability request");
+            request.headers_mut().insert(
+                "x-rustfs-rpc-boot-epoch-challenge",
+                challenge.to_string().parse().expect("challenge header"),
+            );
+            if request_capability {
+                request.headers_mut().insert(
+                    "x-rustfs-rpc-msgpack-manifest-request",
+                    HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                );
+            }
+            RpcRequestPathService::new(RpcPathObserver)
+                .call(request)
+                .await
+                .expect("capability response")
+        };
+
+        let legacy = response_for(false).await;
+        assert!(!legacy.headers().contains_key("x-rustfs-rpc-msgpack-manifest-capability"));
+        assert!(
+            !legacy
+                .headers()
+                .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
+        );
+
+        let capable = response_for(true).await;
+        assert_eq!(
+            capable
+                .headers()
+                .get("x-rustfs-rpc-msgpack-manifest-capability")
+                .and_then(|value| value.to_str().ok()),
+            Some("msgpack-compat-manifest-v1")
+        );
+        assert!(
+            capable
+                .headers()
+                .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
+        );
+
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
     #[tokio::test]
@@ -7851,12 +9861,12 @@ mod tests {
                     assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
                     let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
                     if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body: s3s::Body::from(identity) }))
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body: EdgeBody::from(Bytes::from(identity)) }))
                 });
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
                     Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
-                    HttpCompressionConfig::default(), ServerContextSlot::new(), false, Arc::default()))
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), Arc::default()))
             }, 0, Duration::from_secs(1), receiver)?;
             let client_endpoint = client_endpoint(vec![cert])?;
             let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
@@ -7887,21 +9897,17 @@ mod tests {
         let (config, cert) = configs()?;
         let readiness = Arc::new(GlobalReadiness::new());
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-        let s3 = S3ServiceBuilder::new(UploadPartTimeoutS3 {
-            timeout: Duration::from_secs(1),
-        })
-        .build();
+        let edge = upload_part_timeout_edge(Duration::from_secs(1), Duration::from_secs(1));
         let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
         let (endpoint, task) = http3::spawn(
             config,
             "127.0.0.1:0".parse()?,
             move |peer| {
                 let inner = ServiceBuilder::new()
-                    .map_response(|response: Response<s3s::Body>| {
-                        response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                    .map_response(|response: Response<EdgeBody>| {
+                        response.map(|rest_body| HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body })
                     })
-                    .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
-                    .service(EarlyResponseBodyService::new(s3.clone(), Duration::from_secs(1)));
+                    .service(edge.clone());
                 let inner = Http3CoreService::new(inner);
                 Http3ExternalService::new(external_service_stack!(
                     inner,
@@ -7914,7 +9920,6 @@ mod tests {
                     None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
                     HttpCompressionConfig::default(),
                     ServerContextSlot::new(),
-                    false,
                     Arc::default()
                 ))
             },
@@ -8051,10 +10056,8 @@ mod tests {
     /// Optional layers (`option_layer`, `Either`) are listed because their type
     /// is part of the chain whether or not the layer is installed at runtime.
     /// The fixture's own inner service is not part of it. `legacy_compat` marks
-    /// the s3s patch layers that `server::legacy_compat` groups; T2.12
-    /// (rustfs/backlog#2771) reuses this test to prove which layers the gateway
-    /// stack keeps.
-    const EXTERNAL_STACK_CENSUS: [&str; 28] = [
+    /// the patch layers that `server::legacy_compat` still groups.
+    const EXTERNAL_STACK_CENSUS: [&str; 24] = [
         "AddExtension",                        // Option<RemoteAddr>
         "AddExtension",                        // SocketAddr (optional)
         "TrustedProxyMiddleware",              // TrustedProxyLayer (optional)
@@ -8072,17 +10075,13 @@ mod tests {
         "RequestLoggingService",               //
         "Compression",                         //
         "PathCategoryInjectionService",        // optional
-        "S3ErrorMessageCompatService",         // legacy_compat
         "IcebergRestErrorCompatService",       // legacy_compat
-        "ObjectAttributesEtagFixService",      // legacy_compat
+        "PostObjectLocationFixService",        // POST Object Location encoding
         "ConditionalCorsService",              //
         "RedirectService",                     // optional
         "BodylessStatusFixService",            // legacy_compat
         "HeadRequestBodyFixService",           // legacy_compat
         "PublicHealthEndpointService",         //
-        "VirtualHostStyleHintService",         // legacy_compat, optional
-        "DoubleSlashListBucketsCompatService", // legacy_compat
-        "SigV4HeaderGuardService",             // legacy_compat
     ];
 
     /// Walks a `type_name` string along its service chain: at every node the
@@ -8180,7 +10179,6 @@ mod tests {
             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
             HttpCompressionConfig::default(),
             ServerContextSlot::new(),
-            false,
             Arc::default()
         );
         fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}

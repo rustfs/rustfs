@@ -15,6 +15,7 @@
 use crate::data_usage_define::clone_cache_value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::sync::Arc;
 use thiserror::Error;
 
 mod writer;
@@ -58,7 +59,7 @@ pub struct RawEnumerationPage {
     parent: String,
     page_index: u64,
     entries_start: u64,
-    entries: Vec<String>,
+    entries: Arc<[String]>,
     terminal: bool,
     digest: [u8; 32],
 }
@@ -120,7 +121,39 @@ pub enum RawEnumerationPageIndexError {
     CorruptIndex,
 }
 
+/// Compact committed-page identity used only for fair scheduling receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct RawEnumerationDurableProgress {
+    pub(crate) parent: String,
+    page_entry_limit: usize,
+    generation: u64,
+    pages: Vec<([u8; 32], usize)>,
+}
+
+impl RawEnumerationDurableProgress {
+    pub(crate) fn committed_entries(&self) -> usize {
+        self.pages.iter().map(|(_, entries)| *entries).sum()
+    }
+
+    pub(crate) fn extends(&self, previous: &Self) -> bool {
+        self.parent == previous.parent
+            && self.page_entry_limit == previous.page_entry_limit
+            && self.generation >= previous.generation
+            && self.pages.starts_with(&previous.pages)
+    }
+}
+
 impl RawEnumerationPageIndex {
+    pub(crate) fn durable_progress(&self) -> Option<RawEnumerationDurableProgress> {
+        let RawEnumerationPageIndexState::Supported(inner) = &self.state else { return None };
+        Some(RawEnumerationDurableProgress {
+            parent: inner.parent.clone(),
+            page_entry_limit: inner.page_entry_limit,
+            generation: inner.generation,
+            pages: inner.pages.iter().map(|page| (page.digest, page.entries.len())).collect(),
+        })
+    }
+
     pub fn unsupported() -> Self {
         Self {
             state: RawEnumerationPageIndexState::Unsupported,
@@ -486,32 +519,26 @@ impl RawEnumerationPage {
     }
 
     fn new(parent: &str, building: RawEnumerationPageBuilder) -> Self {
-        let digest = raw_page_digest(parent, &building);
+        let digest = raw_page_digest(parent, building.page_index, building.entries_start, building.terminal, &building.entries);
         Self {
             version: RAW_PAGE_INDEX_VERSION,
             parent: clone_cache_value(parent),
             page_index: building.page_index,
             entries_start: building.entries_start,
-            entries: building.entries,
+            entries: building.entries.into(),
             terminal: building.terminal,
             digest,
         }
     }
 
     fn validate(&self, parent: &str, page_index: u64, entries_start: u64) -> Result<(), RawEnumerationPageIndexError> {
-        let builder = RawEnumerationPageBuilder {
-            page_index: self.page_index,
-            entries_start: self.entries_start,
-            entries: clone_cache_value(&self.entries),
-            terminal: self.terminal,
-        };
         if self.version != RAW_PAGE_INDEX_VERSION
             || self.parent != parent
             || self.page_index != page_index
             || self.entries_start != entries_start
             || self.entries.is_empty()
             || !entries_are_normalized(&self.entries)
-            || self.digest != raw_page_digest(parent, &builder)
+            || self.digest != raw_page_digest(parent, self.page_index, self.entries_start, self.terminal, &self.entries)
         {
             return Err(RawEnumerationPageIndexError::CorruptIndex);
         }
@@ -555,16 +582,16 @@ fn entry_sets_match(left: &[String], right: &[String]) -> bool {
     left.len() == right.len() && entries_contain_all(left, right)
 }
 
-fn raw_page_digest(parent: &str, building: &RawEnumerationPageBuilder) -> [u8; 32] {
+fn raw_page_digest(parent: &str, page_index: u64, entries_start: u64, terminal: bool, entries: &[String]) -> [u8; 32] {
     #[cfg(test)]
-    RAW_PAGE_DIGEST_ENTRIES.with(|count| count.set(count.get().saturating_add(building.entries.len())));
+    RAW_PAGE_DIGEST_ENTRIES.with(|count| count.set(count.get().saturating_add(entries.len())));
     let mut digest = Sha256::new();
     update_digest(&mut digest, b"version", &RAW_PAGE_INDEX_VERSION.to_le_bytes());
     update_digest(&mut digest, b"parent", parent.as_bytes());
-    update_digest(&mut digest, b"page_index", &building.page_index.to_le_bytes());
-    update_digest(&mut digest, b"entries_start", &building.entries_start.to_le_bytes());
-    update_digest(&mut digest, b"terminal", &[u8::from(building.terminal)]);
-    for entry in &building.entries {
+    update_digest(&mut digest, b"page_index", &page_index.to_le_bytes());
+    update_digest(&mut digest, b"entries_start", &entries_start.to_le_bytes());
+    update_digest(&mut digest, b"terminal", &[u8::from(terminal)]);
+    for entry in entries {
         update_digest(&mut digest, b"entry", entry.as_bytes());
     }
     digest.finalize().into()

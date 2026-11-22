@@ -39,7 +39,7 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3_dependency_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, open_rolling_appender, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
@@ -83,6 +83,11 @@ const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+// Keep millisecond resolution for fast requests and coarser buckets for long streams.
+const HTTP_SERVER_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.001, 0.002, 0.003, 0.005, 0.01, 0.025, 0.05, 0.25, 1.0, 5.0, 25.0, 120.0, 600.0, 2500.0, 10000.0,
+];
+
 const LOCAL_BATCH_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_io_get_object_local_batch_prepare_seconds",
     "rustfs_io_get_object_local_batch_stage_seconds",
@@ -107,6 +112,7 @@ const OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
 const INTERNODE_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_system_network_internode_operation_duration_ms",
     "rustfs_system_network_internode_operation_server_duration_ms",
+    "rustfs_system_network_internode_bulk_body_wait_duration_ms",
 ];
 // Internode instruments record milliseconds, including sub-millisecond control RPCs.
 const INTERNODE_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
@@ -311,8 +317,9 @@ pub(super) fn init_observability_http(
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
+        .with(super::http2_ping_timeout_layer())
         .with(pyroscope_log_filter())
-        .with(s3s_log_filter())
+        .with(s3_dependency_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer_opt)
         .with(stdout_layer_opt)
@@ -520,16 +527,15 @@ fn duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
 }
 
 fn duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
-    if LOCAL_BATCH_DURATION_HISTOGRAM_METRICS.contains(&name) {
-        Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS)
-    } else if GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name) {
-        Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS)
-    } else if OBJECT_LOCK_DURATION_HISTOGRAM_METRICS.contains(&name) {
-        Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS)
-    } else if INTERNODE_DURATION_HISTOGRAM_METRICS.contains(&name) {
-        Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS)
-    } else {
-        None
+    match name {
+        "rustfs_http_server_request_duration_seconds"
+        | "rustfs_http_server_response_body_chunk_latency_seconds"
+        | "rustfs_http_server_response_body_stream_duration_seconds" => Some(HTTP_SERVER_DURATION_HISTOGRAM_BUCKETS),
+        _ if LOCAL_BATCH_DURATION_HISTOGRAM_METRICS.contains(&name) => Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS),
+        _ if GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name) => Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS),
+        _ if OBJECT_LOCK_DURATION_HISTOGRAM_METRICS.contains(&name) => Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS),
+        _ if INTERNODE_DURATION_HISTOGRAM_METRICS.contains(&name) => Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS),
+        _ => None,
     }
 }
 
@@ -1154,9 +1160,77 @@ mod tests {
             "rustfs_io_get_object_local_batch_shards",
             "rustfs_object_lock_diag_slow_acquire_total",
             "rustfs_object_lock_diag_acquire_duration_seconds_bucket",
+            "rustfs_http_server_response_body_chunk_size_bytes",
         ] {
             assert!(duration_histogram_buckets(name).is_none());
         }
+    }
+
+    #[test]
+    fn http_server_duration_histograms_export_seconds_buckets() {
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let (provider, recorder) = Recorder::builder("http-server-duration-test")
+            .with_meter_provider(|builder| builder.with_reader(reader).with_view(duration_histogram_view))
+            .build();
+        let instruments = [
+            "rustfs_http_server_request_duration_seconds",
+            "rustfs_http_server_response_body_chunk_latency_seconds",
+            "rustfs_http_server_response_body_stream_duration_seconds",
+        ];
+        let observations = [
+            (0.00008, 0.0001),
+            (0.0024, 0.003),
+            (0.037, 0.05),
+            (42.0, 120.0),
+            (4000.0, 10000.0),
+            (12000.0, f64::INFINITY),
+        ];
+        metrics::with_local_recorder(&recorder, || {
+            for name in instruments {
+                let histogram = metrics::histogram!(name);
+                for (seconds, _) in observations {
+                    histogram.record(seconds);
+                }
+            }
+        });
+
+        provider.force_flush().expect("export HTTP duration observations");
+        let exported = exporter.get_finished_metrics().expect("read exported HTTP histograms");
+        let expected_sum = observations.iter().map(|(seconds, _)| seconds).sum::<f64>();
+        let expected_buckets = observations.map(|(_, bound)| (bound, 1));
+        for name in instruments {
+            let metric = exported
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .find(|metric| metric.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be exported"));
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("{name} must export as an f64 histogram");
+            };
+            let mut points = histogram.data_points();
+            let point = points.next().unwrap_or_else(|| panic!("{name} must export a point"));
+            assert!(points.next().is_none(), "{name} must export one point");
+            assert_eq!(point.count(), 6, "{name} must retain every observation");
+            assert!((point.sum() - expected_sum).abs() < 1e-9, "{name} must retain the sum in seconds");
+            assert_eq!(point.bucket_counts().count(), 17, "{name} must have 16 finite buckets and overflow");
+            let occupied: Vec<_> = point
+                .bounds()
+                .chain([f64::INFINITY])
+                .zip(point.bucket_counts())
+                .filter(|(_, count)| *count != 0)
+                .collect();
+            assert_eq!(occupied, expected_buckets, "{name}");
+        }
+        provider.shutdown().expect("stop HTTP histogram test provider");
     }
 
     #[test]
@@ -1181,6 +1255,7 @@ mod tests {
             (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[1], [0.002, 12.9, 31.0]),
             (INTERNODE_DURATION_HISTOGRAM_METRICS[0], [0.04, 3.2, 31000.0]),
             (INTERNODE_DURATION_HISTOGRAM_METRICS[1], [0.02, 1.2, 1300.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[2], [0.01, 4.2, 1200.0]),
         ] {
             let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
             for seconds in observations {
@@ -1200,6 +1275,7 @@ mod tests {
                 "rustfs_object_lock_diag_hold_duration_seconds" => [(0.002, 1), (15.0, 1), (60.0, 1)],
                 "rustfs_system_network_internode_operation_duration_ms" => [(0.05, 1), (4.0, 1), (60000.0, 1)],
                 "rustfs_system_network_internode_operation_server_duration_ms" => [(0.025, 1), (1.5, 1), (2500.0, 1)],
+                "rustfs_system_network_internode_bulk_body_wait_duration_ms" => [(0.01, 1), (5.0, 1), (2500.0, 1)],
                 _ => continue,
             };
             let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
@@ -1215,7 +1291,7 @@ mod tests {
             assert_eq!(occupied, expected, "seconds remain distinct at millisecond and long-hold scales");
             checked += 1;
         }
-        assert_eq!(checked, 4, "lock and internode duration histograms were exported");
+        assert_eq!(checked, 5, "lock and internode duration histograms were exported");
         provider.shutdown().expect("stop lock histogram test provider");
     }
 
@@ -1285,7 +1361,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(env_filter)
             .with(pyroscope_log_filter())
-            .with(s3s_log_filter())
+            .with(s3_dependency_log_filter())
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
@@ -1309,7 +1385,7 @@ mod tests {
             tracing_subscriber::registry()
                 .with(build_env_filter("info", None))
                 .with(pyroscope_log_filter())
-                .with(s3s_log_filter())
+                .with(s3_dependency_log_filter())
                 .with(tracing_subscriber::fmt::layer().with_ansi(false).without_time())
                 .try_init()
                 .expect("install isolated LogTracer subscriber");

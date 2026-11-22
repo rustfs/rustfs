@@ -120,9 +120,19 @@ impl FileMeta {
             return 0;
         };
 
+        if !self
+            .versions
+            .iter()
+            .any(|v| v.header.version_type == VersionType::Object && v.header.version_id != Some(vid))
+        {
+            return 0;
+        }
+
         if has_inline_data.unwrap_or_else(|| {
-            self.data.entries().unwrap_or_default() > 0
-                && self.find_inline_data_for_version(version_id).unwrap_or_default().is_some()
+            Self::find_inline_data_slice(self.data.as_slice(), version_id)
+                .ok()
+                .flatten()
+                .is_some()
         }) {
             return 0;
         }

@@ -55,6 +55,25 @@ pub(crate) async fn lifecycle_expiry_allowed(
         .table_bucket_enabled())
 }
 
+/// `get_expiry_configs_for_options` takes the lifecycle rules from this same
+/// cached entry and reads the bucket incarnation only to validate it, so a
+/// cached entry without any lifecycle document cannot produce an expiry.
+/// Uncached, fabricated and creation-pending buckets keep the full path.
+pub(crate) async fn cached_metadata_may_have_lifecycle(api: &crate::store::ECStore, bucket: &str) -> bool {
+    let Ok(sys) = metadata_sys::bucket_metadata_sys_of(&api.ctx) else {
+        return true;
+    };
+    let sys = sys.read().await.clone();
+    match sys.get(bucket).await {
+        Ok(metadata) => {
+            metadata.needs_bucket_creation_commit()
+                || metadata.lifecycle_config.is_some()
+                || !metadata.lifecycle_config_xml.is_empty()
+        }
+        Err(_) => true,
+    }
+}
+
 pub(crate) async fn get_expiry_configs(api: &crate::store::ECStore, bucket: &str) -> Result<LifecycleExpiryConfigs> {
     get_expiry_configs_for_options(api, bucket, &crate::object_api::ObjectOptions::default()).await
 }
@@ -104,6 +123,9 @@ pub(crate) async fn get_expiry_configs_for_options(
 pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
     metadata_sys::get_lifecycle_config(bucket).await
 }
+
+#[cfg(test)]
+pub(crate) use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support};
 
 #[cfg(test)]
 mod tests {

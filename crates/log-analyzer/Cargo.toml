@@ -34,13 +34,12 @@ path = "src/bin/la_dump_anchors.rs"
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath = []
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
 
 [dependencies]
-hotpath.workspace = true
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

@@ -22,17 +22,18 @@ const RESTORE_SUSPENDED_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 async fn suspend_test_bucket(bucket: &str) {
     DefaultBucketUsecase::from_global()
         .execute_put_bucket_versioning(
-            build_request(
-                PutBucketVersioningInput::builder()
-                    .bucket(bucket.to_string())
-                    .versioning_configuration(VersioningConfiguration {
-                        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
-                        ..Default::default()
-                    })
-                    .build()
-                    .expect("suspended versioning request should build"),
-                Method::PUT,
+            crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::PUT,
+                    uri: Uri::from_static("/"),
+                    headers: HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                Extensions::new(),
             ),
+            bucket,
             Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
                 status: Some("Suspended".to_owned()),
                 ..Default::default()

@@ -59,6 +59,7 @@ use std::sync::{
     LazyLock, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 /// Global switch for detailed per-stage PUT metrics (path label, stage durations).
 /// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
@@ -260,6 +261,7 @@ pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION: &str = "put_objec
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP: &str = "put_object_quota_begin_object_store_lookup";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD: &str = "put_object_quota_begin_context_build";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER: &str = "put_object_commit_submit_to_closure_enter";
+pub const PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START: &str = "app_put_commit_owner_submit_to_start";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT: &str = "put_object_commit_closure_enter_to_first_await";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL: &str = "put_object_commit_closure_total";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME: &str = "put_object_commit_before_rename";
@@ -359,6 +361,13 @@ pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL: &str = "set_disk_rename_disk_wait_local";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE: &str = "set_disk_rename_disk_wait_remote";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE: &str = "set_disk_rename_remote_client_prepare";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE: &str = "set_disk_rename_remote_client_json_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE: &str = "set_disk_rename_remote_client_msgpack_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES: &str = "set_disk_rename_remote_client_json_bytes";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES: &str = "set_disk_rename_remote_client_msgpack_bytes";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT: &str = "set_disk_rename_remote_client_get_client";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST: &str =
+    "set_disk_rename_remote_client_canonical_body_digest";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC: &str = "set_disk_rename_remote_client_rpc";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT: &str = "set_disk_rename_remote_client_rpc_await";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT: &str =
@@ -425,8 +434,10 @@ pub const PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR: &str = "lock_error";
 
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
+pub const PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED: &str = "grouped";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER: &str = "leader";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER: &str = "follower";
+pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT: &str = "follower_timeout";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS: &str = "enqueue_waiters";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES: &str = "enqueue_files";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS: &str = "batch_waiters";
@@ -439,6 +450,125 @@ pub const PUT_RENAME_QUORUM_FANOUT_STATE_PANIC: &str = "panic";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST: &str = "quorum_first";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL: &str = "quorum_tail";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR: &str = "error";
+pub const ECSTORE_RENAME_RPC_KIND_ORDINARY: &str = "ordinary";
+pub const ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE: &str = "quota_fence";
+pub const ECSTORE_RENAME_RPC_KIND_INCARNATION: &str = "incarnation";
+pub const ECSTORE_RENAME_RPC_KIND_MULTIPART: &str = "multipart";
+pub const ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE: &str = "scanner_lease";
+pub const ECSTORE_RENAME_RPC_KIND_POOL_META_CAS: &str = "pool_meta_cas";
+pub const ECSTORE_RENAME_RPC_KINDS: [&str; 6] = [
+    ECSTORE_RENAME_RPC_KIND_ORDINARY,
+    ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE,
+    ECSTORE_RENAME_RPC_KIND_INCARNATION,
+    ECSTORE_RENAME_RPC_KIND_MULTIPART,
+    ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE,
+    ECSTORE_RENAME_RPC_KIND_POOL_META_CAS,
+];
+pub const ECSTORE_RENAME_PEER_WIDTHS: [&str; 18] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "gt16",
+];
+pub const ECSTORE_RENAME_COVERAGE: [&str; 3] = ["none", "partial", "full"];
+pub const ECSTORE_RENAME_BATCH_EXECUTION: [&str; 10] = [
+    "planned_groups",
+    "planned_items",
+    "stream_groups",
+    "stream_items",
+    "completed_items",
+    "fallback_groups",
+    "fallback_items",
+    "not_dispatched_items",
+    "may_have_published_items",
+    "terminal_missing_items",
+];
+pub const ECSTORE_RENAME_ADMISSION: [&str; 10] = [
+    "unary_attempts",
+    "unary_items",
+    "unary_wait_ns_total",
+    "unary_wait_ns_max",
+    "unary_timeouts",
+    "batch_attempts",
+    "batch_items",
+    "batch_wait_ns_total",
+    "batch_wait_ns_max",
+    "batch_timeouts",
+];
+pub const ECSTORE_RENAME_QUARANTINE: [&str; 12] = [
+    "unary_events",
+    "unary_items",
+    "unary_hold_ns_total",
+    "unary_hold_ns_max",
+    "unary_released_items",
+    "unary_no_runtime_items",
+    "batch_events",
+    "batch_items",
+    "batch_hold_ns_total",
+    "batch_hold_ns_max",
+    "batch_released_items",
+    "batch_no_runtime_items",
+];
+pub const ECSTORE_RENAME_BATCH_TIMING: [&str; 4] = [
+    "client_stream_to_first",
+    "client_first_to_last",
+    "server_dispatch_to_first",
+    "server_first_to_last",
+];
+
+static ECSTORE_RENAME_RPC_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static ECSTORE_RENAME_REMOTE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static ECSTORE_RENAME_COVERAGE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static ECSTORE_RENAME_BATCH_EXECUTION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static ECSTORE_RENAME_ADMISSION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static ECSTORE_RENAME_QUARANTINE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static ECSTORE_RENAME_BATCH_TIMING_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ECSTORE_RENAME_BATCH_TIMING_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcstoreRenameDiagnosticsSnapshot {
+    pub rpc_counts: [u64; 6],
+    pub remote_width_counts: [u64; 18],
+    pub batchable_width_counts: [u64; 18],
+    pub coverage_counts: [u64; 3],
+    pub batch_execution_counts: [u64; 10],
+    pub admission_counts: [u64; 10],
+    pub quarantine_counts: [u64; 12],
+    pub batch_timing_counts: [u64; 4],
+    pub batch_timing_total_ns: [u64; 4],
+    pub batch_timing_max_ns: [u64; 4],
+}
+
+impl EcstoreRenameDiagnosticsSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.rpc_counts
+            .iter()
+            .chain(self.remote_width_counts.iter())
+            .chain(self.batchable_width_counts.iter())
+            .chain(self.coverage_counts.iter())
+            .chain(self.batch_execution_counts.iter())
+            .chain(self.admission_counts.iter())
+            .chain(self.quarantine_counts.iter())
+            .chain(self.batch_timing_counts.iter())
+            .chain(self.batch_timing_total_ns.iter())
+            .chain(self.batch_timing_max_ns.iter())
+            .all(|count| *count == 0)
+    }
+}
+
+pub fn snapshot_ecstore_rename_diagnostics() -> EcstoreRenameDiagnosticsSnapshot {
+    EcstoreRenameDiagnosticsSnapshot {
+        rpc_counts: std::array::from_fn(|index| ECSTORE_RENAME_RPC_COUNTS[index].load(Ordering::Relaxed)),
+        remote_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
+        batchable_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
+        coverage_counts: std::array::from_fn(|index| ECSTORE_RENAME_COVERAGE_COUNTS[index].load(Ordering::Relaxed)),
+        batch_execution_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].load(Ordering::Relaxed)),
+        admission_counts: std::array::from_fn(|index| ECSTORE_RENAME_ADMISSION_COUNTS[index].load(Ordering::Relaxed)),
+        quarantine_counts: std::array::from_fn(|index| ECSTORE_RENAME_QUARANTINE_COUNTS[index].load(Ordering::Relaxed)),
+        batch_timing_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_COUNTS[index].load(Ordering::Relaxed)),
+        batch_timing_total_ns: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS[index].load(Ordering::Relaxed)),
+        batch_timing_max_ns: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_MAX_NS[index].load(Ordering::Relaxed)),
+    }
+}
 
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
@@ -2579,6 +2709,14 @@ pub fn record_put_object_stage_count(stage: &'static str, count: u64) {
     counter!("rustfs_s3_put_object_stage_count", "stage" => stage).increment(count);
 }
 
+#[inline(always)]
+pub fn record_put_object_stage_bytes(stage: &'static str, bytes: usize) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_stage_bytes", "stage" => stage).record(bytes as f64);
+}
+
 #[derive(Default)]
 struct DiskFsyncWorkerMetricsState {
     workers: AtomicU64,
@@ -2792,6 +2930,189 @@ pub fn record_put_rename_quorum_wait_fanout(
     ] {
         histogram!("rustfs_s3_put_object_rename_quorum_wait_fanout_disks", "state" => state).record(put_stage_count_value(count));
     }
+}
+
+/// Records a rename RPC after its canonical request digest has been attached.
+///
+/// This uses the PUT-stage diagnostics switch because it is temporary hot-path
+/// evidence, but the metric is ECStore-scoped: scanner and pool metadata
+/// renames are not S3 PutObject operations.
+#[inline(always)]
+pub fn record_ecstore_rename_remote_rpc(kind: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let Some(index) = ECSTORE_RENAME_RPC_KINDS.iter().position(|candidate| *candidate == kind) else {
+        return;
+    };
+    ECSTORE_RENAME_RPC_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn rename_peer_width_index(width: usize) -> usize {
+    width.min(17)
+}
+
+/// Records the per-peer opportunity for a future body-bound rename batch.
+#[inline(always)]
+pub fn record_ecstore_rename_batch_candidate_peer(remote_disks: usize, batchable_disks: usize) {
+    if !put_stage_metrics_enabled() || remote_disks == 0 {
+        return;
+    }
+    ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[rename_peer_width_index(remote_disks)].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[rename_peer_width_index(batchable_disks)].fetch_add(1, Ordering::Relaxed);
+    let coverage_index = if batchable_disks == 0 {
+        0
+    } else if batchable_disks == remote_disks {
+        2
+    } else {
+        1
+    };
+    ECSTORE_RENAME_COVERAGE_COUNTS[coverage_index].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn record_ecstore_rename_batch_execution(index: usize, count: usize) {
+    if put_stage_metrics_enabled() {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_planned(items: usize) {
+    record_ecstore_rename_batch_execution(0, 1);
+    record_ecstore_rename_batch_execution(1, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_stream_started(items: usize) {
+    record_ecstore_rename_batch_execution(2, 1);
+    record_ecstore_rename_batch_execution(3, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_item_completed() {
+    record_ecstore_rename_batch_execution(4, 1);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_fallback(items: usize) {
+    record_ecstore_rename_batch_execution(5, 1);
+    record_ecstore_rename_batch_execution(6, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_not_dispatched(items: usize) {
+    record_ecstore_rename_batch_execution(7, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_may_have_published(items: usize) {
+    record_ecstore_rename_batch_execution(8, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_terminal_missing(items: usize) {
+    record_ecstore_rename_batch_execution(9, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_admission(batch: bool, items: usize, wait: Duration, timed_out: bool) {
+    if timed_out {
+        metrics::counter!(
+            "rustfs_ecstore_rename_admission_timeouts_total",
+            "mode" => if batch { "batch" } else { "unary" }
+        )
+        .increment(1);
+    }
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let base = usize::from(batch) * 5;
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    let wait_ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base + 1].fetch_add(items, Ordering::Relaxed);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base + 2].fetch_add(wait_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_ADMISSION_COUNTS[base + 3].fetch_max(wait_ns, Ordering::Relaxed);
+    if timed_out {
+        ECSTORE_RENAME_ADMISSION_COUNTS[base + 4].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_quarantine(batch: bool, items: usize, hold: Duration) {
+    let mode = if batch { "batch" } else { "unary" };
+    let active_items = f64::from(u32::try_from(items).unwrap_or(u32::MAX));
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_events_total", "mode" => mode).increment(1);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_items_total", "mode" => mode).increment(items);
+    metrics::gauge!("rustfs_ecstore_rename_quarantine_active_items", "mode" => mode).increment(active_items);
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let base = usize::from(batch) * 6;
+    let hold_ns = u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base + 1].fetch_add(items, Ordering::Relaxed);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base + 2].fetch_add(hold_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_QUARANTINE_COUNTS[base + 3].fetch_max(hold_ns, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_quarantine_released(batch: bool, items: usize) {
+    let mode = if batch { "batch" } else { "unary" };
+    let active_items = f64::from(u32::try_from(items).unwrap_or(u32::MAX));
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_released_items_total", "mode" => mode).increment(items);
+    metrics::gauge!("rustfs_ecstore_rename_quarantine_active_items", "mode" => mode).decrement(active_items);
+    if put_stage_metrics_enabled() {
+        let base = usize::from(batch) * 6;
+        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 4].fetch_add(items, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_quarantine_no_runtime(batch: bool, items: usize) {
+    let mode = if batch { "batch" } else { "unary" };
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_no_runtime_items_total", "mode" => mode).increment(items);
+    if put_stage_metrics_enabled() {
+        let base = usize::from(batch) * 6;
+        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 5].fetch_add(items, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn record_ecstore_rename_batch_timing(index: usize, duration: Duration) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let duration_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_BATCH_TIMING_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS[index].fetch_add(duration_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCH_TIMING_MAX_NS[index].fetch_max(duration_ns, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_client_stream_to_first(duration: Duration) {
+    record_ecstore_rename_batch_timing(0, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_client_first_to_last(duration: Duration) {
+    record_ecstore_rename_batch_timing(1, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_server_dispatch_to_first(duration: Duration) {
+    record_ecstore_rename_batch_timing(2, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_server_first_to_last(duration: Duration) {
+    record_ecstore_rename_batch_timing(3, duration);
 }
 
 /// Record generic internal operation stage duration (non-PUT paths).
@@ -3050,6 +3371,9 @@ pub struct AllocatorMemoryObservation {
     pub reserved_bytes: Option<u64>,
     pub committed_bytes: Option<u64>,
     pub page_committed_bytes: Option<u64>,
+    /// Allocator-reported block bytes, including size-class rounding and delayed statistics updates.
+    /// This is not live requested bytes or resident memory.
+    pub allocated_bytes: Option<u64>,
     pub malloc_requested_bytes: Option<u64>,
     pub malloc_requested_peak_bytes: Option<u64>,
     pub malloc_requested_total_bytes: Option<u64>,
@@ -3084,6 +3408,11 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
         .set(if observation.reserved_bytes.is_some() { 1.0 } else { 0.0 });
     gauge!("rustfs_memory_allocator_committed_bytes_available", "backend" => backend)
         .set(if observation.committed_bytes.is_some() { 1.0 } else { 0.0 });
+    gauge!("rustfs_memory_allocator_allocated_bytes_available", "backend" => backend)
+        .set(if observation.allocated_bytes.is_some() { 1.0 } else { 0.0 });
+    if let Some(allocated_bytes) = observation.allocated_bytes {
+        gauge!("rustfs_memory_allocator_allocated_bytes", "backend" => backend).set(allocated_bytes as f64);
+    }
     if let Some(reserved_bytes) = observation.reserved_bytes {
         gauge!("rustfs_memory_allocator_reserved_bytes", "backend" => backend).set(reserved_bytes as f64);
     }
@@ -3555,6 +3884,41 @@ mod tests {
                 Some(expected_availability),
             );
             assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), expected_value);
+        }
+    }
+
+    #[test]
+    fn allocator_block_bytes_preserve_decreases_missing_and_zero() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = [
+            (None, None, 0.0),
+            (Some(128), Some(128.0), 1.0),
+            (Some(64), Some(64.0), 1.0),
+            (None, Some(64.0), 0.0),
+            (Some(0), Some(0.0), 1.0),
+        ];
+        for (index, (_, expected, available)) in sequence.into_iter().enumerate() {
+            // Debugging snapshots consume values; replay each prefix before its only snapshot.
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                set_metrics_enabled(true);
+                for (current, ..) in sequence.iter().take(index + 1) {
+                    record_allocator_memory_observation(
+                        "mimalloc",
+                        AllocatorMemoryObservation {
+                            allocated_bytes: *current,
+                            ..Default::default()
+                        },
+                    );
+                }
+                set_metrics_enabled(false);
+            });
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_allocated_bytes_available"), Some(available));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_allocated_bytes"), expected);
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes_available"), Some(0.0));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), None);
         }
     }
 
@@ -4206,6 +4570,7 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD,
+            PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START,
             PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
@@ -4285,6 +4650,10 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
@@ -4343,6 +4712,7 @@ mod tests {
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY
                 || stage.starts_with("put_object_commit_ready_")
                 || stage.starts_with("put_object_quota_begin_")
+                || *stage == PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL
@@ -4359,6 +4729,14 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
         ];
         assert_eq!(count_stages.iter().copied().collect::<HashSet<_>>().len(), count_stages.len());
+        let byte_samples = [
+            (PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES, 0_usize),
+            (PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES, 17_usize),
+        ];
+        assert_eq!(
+            byte_samples.iter().map(|(stage, _)| *stage).collect::<HashSet<_>>().len(),
+            byte_samples.len()
+        );
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -4370,12 +4748,18 @@ mod tests {
             for stage in count_stages {
                 record_put_object_stage_count(stage, 1);
             }
+            for (stage, bytes) in byte_samples {
+                record_put_object_stage_bytes(stage, bytes + 1);
+            }
             set_put_stage_metrics_enabled(true);
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
             }
             for stage in count_stages {
                 record_put_object_stage_count(stage, 1);
+            }
+            for (stage, bytes) in byte_samples {
+                record_put_object_stage_bytes(stage, bytes);
             }
             set_put_stage_metrics_enabled(false);
         });
@@ -4385,6 +4769,25 @@ mod tests {
             counter_total(&rows, "rustfs_s3_put_object_stage_count"),
             Some(u64::try_from(count_stages.len()).expect("count stage length fits u64")),
         );
+        let recorded_bytes = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_bytes"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "stage")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(recorded_bytes.len(), byte_samples.len());
+        assert!(byte_samples.iter().all(|(stage, _)| recorded_bytes.contains(*stage)));
+        let mut byte_values = histogram_samples(&rows, "rustfs_s3_put_object_stage_bytes");
+        byte_values.sort_by(f64::total_cmp);
+        assert_eq!(byte_values, vec![0.0, 17.0]);
         let recorded = rows
             .into_iter()
             .filter(|(composite, _, _, _)| {
@@ -4546,13 +4949,16 @@ mod tests {
             set_put_stage_metrics_enabled(false);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, 2);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
             record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST, 3.0);
             record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
 
             set_put_stage_metrics_enabled(true);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL, 9);
+            record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED, 4);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER, 2.0);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES, 4);
@@ -4566,7 +4972,10 @@ mod tests {
         });
 
         let rows = snapshotter.snapshot().into_vec();
-        assert_eq!(histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"), vec![9.0]);
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"),
+            vec![4.0, 9.0]
+        );
         let batch_modes = rows
             .iter()
             .filter(|(composite, _, _, _)| {
@@ -4582,13 +4991,19 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<HashSet<_>>();
-        assert_eq!(batch_modes, HashSet::from([PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string()]));
+        assert_eq!(
+            batch_modes,
+            HashSet::from([
+                PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED.to_string(),
+                PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string(),
+            ])
+        );
 
         let quorum_samples = histogram_samples(&rows, "rustfs_s3_put_object_rename_quorum_wait_fanout_disks");
         assert_eq!(quorum_samples, vec![0.0, 1.0, 3.0, 3.0, 4.0]);
         assert_eq!(
             histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_wait_ms"),
-            vec![1.0, 2.0]
+            vec![1.0, 2.0, 3.0]
         );
         assert_eq!(
             histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_outstanding"),
@@ -4618,6 +5033,7 @@ mod tests {
             HashSet::from([
                 PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER.to_string(),
                 PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT.to_string(),
             ])
         );
         let group_outstanding_states = rows
@@ -4692,6 +5108,158 @@ mod tests {
                 PUT_RENAME_QUORUM_FANOUT_STATE_PANIC.to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn ecstore_rename_fault_metrics_remain_visible_without_stage_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
+            record_ecstore_rename_admission(false, 1, Duration::ZERO, true);
+            record_ecstore_rename_admission(true, 4, Duration::ZERO, true);
+            record_ecstore_rename_quarantine(false, 1, Duration::from_secs(1));
+            record_ecstore_rename_quarantine_released(false, 1);
+            record_ecstore_rename_quarantine(true, 3, Duration::from_secs(1));
+            record_ecstore_rename_quarantine_no_runtime(true, 3);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        let counter_by_mode = |name: &str, mode: &str| {
+            rows.iter()
+                .filter(|(composite, _, _, _)| {
+                    composite.kind() == MetricKind::Counter
+                        && composite.key().name() == name
+                        && composite
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "mode" && label.value() == mode)
+                })
+                .map(|(_, _, _, value)| match value {
+                    DebugValue::Counter(value) => *value,
+                    other => panic!("{name} is registered as a counter but holds {other:?}"),
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_admission_timeouts_total", "unary"), 1);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_admission_timeouts_total", "batch"), 1);
+        assert_eq!(counter_total(&rows, "rustfs_ecstore_rename_quarantine_events_total"), Some(2));
+        assert_eq!(counter_total(&rows, "rustfs_ecstore_rename_quarantine_items_total"), Some(4));
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_released_items_total", "unary"), 1);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_released_items_total", "batch"), 0);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_no_runtime_items_total", "unary"), 0);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_no_runtime_items_total", "batch"), 3);
+
+        let mut active_items = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Gauge && composite.key().name() == "rustfs_ecstore_rename_quarantine_active_items"
+            })
+            .map(|(composite, _, _, value)| {
+                let mode = composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "mode")
+                    .map(|label| label.value().to_string())
+                    .expect("rename quarantine gauge must carry the bounded mode label");
+                let DebugValue::Gauge(value) = value else {
+                    panic!("rename quarantine active items must be a gauge")
+                };
+                (mode, value.0)
+            })
+            .collect::<Vec<_>>();
+        active_items.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(active_items, vec![("batch".to_owned(), 3.0), ("unary".to_owned(), 0.0)]);
+
+        assert!(
+            rows.iter()
+                .filter(|(composite, _, _, _)| composite.key().name().starts_with("rustfs_ecstore_rename_"))
+                .flat_map(|(composite, _, _, _)| composite.key().labels())
+                .all(|label| label.key() == "mode" && matches!(label.value(), "batch" | "unary")),
+            "fault metrics must use only the bounded rename mode label"
+        );
+        set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn ecstore_rename_batch_candidate_metrics_are_gated_and_bounded() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        let disabled_before = snapshot_ecstore_rename_diagnostics();
+        record_ecstore_rename_remote_rpc(ECSTORE_RENAME_RPC_KIND_ORDINARY);
+        record_ecstore_rename_batch_candidate_peer(4, 4);
+        record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
+        record_ecstore_rename_quarantine(true, 4, Duration::from_nanos(30));
+        record_ecstore_rename_batch_client_stream_to_first(Duration::from_nanos(10));
+        assert_eq!(snapshot_ecstore_rename_diagnostics(), disabled_before);
+
+        set_put_stage_metrics_enabled(true);
+        let before = snapshot_ecstore_rename_diagnostics();
+        for kind in ECSTORE_RENAME_RPC_KINDS {
+            record_ecstore_rename_remote_rpc(kind);
+        }
+        record_ecstore_rename_batch_candidate_peer(4, 4);
+        record_ecstore_rename_batch_candidate_peer(4, 3);
+        record_ecstore_rename_batch_candidate_peer(4, 0);
+        record_ecstore_rename_batch_candidate_peer(20, 20);
+        record_ecstore_rename_batch_planned(4);
+        record_ecstore_rename_batch_stream_started(4);
+        record_ecstore_rename_batch_item_completed();
+        record_ecstore_rename_batch_fallback(3);
+        record_ecstore_rename_batch_not_dispatched(2);
+        record_ecstore_rename_batch_may_have_published(4);
+        record_ecstore_rename_batch_terminal_missing(1);
+        record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
+        record_ecstore_rename_admission(true, 4, Duration::from_nanos(20), true);
+        record_ecstore_rename_quarantine(true, 4, Duration::from_nanos(30));
+        record_ecstore_rename_quarantine_released(true, 3);
+        record_ecstore_rename_quarantine_no_runtime(true, 1);
+        record_ecstore_rename_batch_client_stream_to_first(Duration::from_nanos(10));
+        record_ecstore_rename_batch_client_first_to_last(Duration::from_nanos(20));
+        record_ecstore_rename_batch_server_dispatch_to_first(Duration::from_nanos(30));
+        record_ecstore_rename_batch_server_first_to_last(Duration::from_nanos(40));
+        set_put_stage_metrics_enabled(false);
+
+        let after = snapshot_ecstore_rename_diagnostics();
+        for index in 0..ECSTORE_RENAME_RPC_KINDS.len() {
+            assert_eq!(after.rpc_counts[index] - before.rpc_counts[index], 1);
+        }
+        assert_eq!(after.remote_width_counts[4] - before.remote_width_counts[4], 3);
+        assert_eq!(after.remote_width_counts[17] - before.remote_width_counts[17], 1);
+        assert_eq!(after.batchable_width_counts[0] - before.batchable_width_counts[0], 1);
+        assert_eq!(after.batchable_width_counts[3] - before.batchable_width_counts[3], 1);
+        assert_eq!(after.batchable_width_counts[4] - before.batchable_width_counts[4], 1);
+        assert_eq!(after.batchable_width_counts[17] - before.batchable_width_counts[17], 1);
+        assert_eq!(after.coverage_counts[0] - before.coverage_counts[0], 1);
+        assert_eq!(after.coverage_counts[1] - before.coverage_counts[1], 1);
+        assert_eq!(after.coverage_counts[2] - before.coverage_counts[2], 2);
+        assert_eq!(
+            std::array::from_fn::<_, 10, _>(|index| {
+                after.batch_execution_counts[index] - before.batch_execution_counts[index]
+            }),
+            [1, 4, 1, 4, 1, 1, 3, 2, 4, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 10, _>(|index| after.admission_counts[index] - before.admission_counts[index]),
+            [1, 1, 10, 10, 0, 1, 4, 20, 20, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 12, _>(|index| after.quarantine_counts[index] - before.quarantine_counts[index]),
+            [0, 0, 0, 0, 0, 0, 1, 4, 30, 30, 3, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|index| after.batch_timing_counts[index] - before.batch_timing_counts[index]),
+            [1, 1, 1, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|index| { after.batch_timing_total_ns[index] - before.batch_timing_total_ns[index] }),
+            [10, 20, 30, 40]
+        );
+        for (actual, expected) in after.batch_timing_max_ns.into_iter().zip([10, 20, 30, 40]) {
+            assert!(actual >= expected);
+        }
     }
 
     #[test]

@@ -15,17 +15,59 @@
 //! UploadPart.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    ChecksumAlgorithm, ServerSideEncryption, StreamingBlob, UploadPartInput, UploadPartOutput,
-};
-use crate::app::storage_api::s3::stream::ByteStream;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use crate::app::RequestEnvelope;
+use crate::app::object::request_body::{DemandReader, UploadChunks, guard_native_upload_progress};
+use crate::app::object::{BodyChunks, upload_frame_reader};
+use crate::app::storage_api::multipart_usecase::access::AuthorizationRequest;
+use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
+use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOwner;
+use http_body::Body as _;
+use rustfs_gateway_stream::Body;
+use rustfs_gateway_types::{RecordedUpload, resolve_upload_async};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
-fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&StreamingBlob>) -> rustfs_s3_types::S3Result<Option<i64>> {
+pub(super) struct PartUpload {
+    pub(super) owner: MultipartOwner,
+    pub(super) info: MultipartInfo,
+}
+
+impl RecordedUpload for PartUpload {
+    fn bucket(&self) -> &str {
+        &self.owner.bucket
+    }
+
+    fn key(&self) -> &str {
+        &self.owner.object
+    }
+}
+
+async fn lookup_part_upload(store: &ECStore, bucket: &str, key: &str, id: &str, opts: &ObjectOptions) -> S3Result<MultipartInfo> {
+    let result = store.get_multipart_info(bucket, key, id, opts).await;
+    result.map_err(multipart_upload_api_error)
+}
+
+pub(super) async fn lookup_recorded_part_upload(
+    store: &ECStore,
+    bucket: &str,
+    key: &str,
+    id: &str,
+    opts: &ObjectOptions,
+) -> S3Result<Option<PartUpload>> {
+    let result = store.lookup_multipart_part_binding(bucket, key, id, opts).await;
+    #[cfg(test)]
+    let result = tests::observe_lookup(result);
+    match result.map_err(multipart_upload_api_error) {
+        Ok((info, owner)) => Ok(owner.map(|owner| PartUpload { owner, info })),
+        Err(error) if error.code() == &S3ErrorCode::NoSuchUpload => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&Body>) -> rustfs_s3_types::S3Result<Option<i64>> {
     if let Some(length) = content_length {
         return Ok(Some(length));
     }
-    body.and_then(|body| body.remaining_length().exact())
+    body.and_then(|body| body.size_hint().exact())
         .map(i64::try_from)
         .transpose()
         .map_err(|_| rustfs_s3_types::s3_error!(UnexpectedContent))
@@ -59,28 +101,29 @@ fn passthrough_part_actual_size(headers: &HeaderMap) -> Option<i64> {
 
 // Hoisted values are signed query parameters, not HTTP headers. Normalize only
 // after access control has verified the presigned request.
-fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
-    if req.extensions.get::<VerifiedPresignedRequest>().is_none() {
+fn normalize_presigned_part_checksums(req: &mut RequestEnvelope, input: &mut UploadPartWriteInput) -> S3Result<()> {
+    if req.verified_presigned().is_none() {
         return Ok(());
     }
-    let Some(query) = req.uri.query() else {
+    let uri = req.uri().clone();
+    let Some(query) = uri.query() else {
         return Ok(());
     };
     let mut seen = std::collections::HashSet::new();
     for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let field = match name.as_ref() {
-            "x-amz-checksum-crc32" => Some(&mut req.input.checksum_crc32),
-            "x-amz-checksum-crc32c" => Some(&mut req.input.checksum_crc32c),
-            "x-amz-checksum-crc64nvme" => Some(&mut req.input.checksum_crc64nvme),
-            "x-amz-checksum-sha1" => Some(&mut req.input.checksum_sha1),
-            "x-amz-checksum-sha256" => Some(&mut req.input.checksum_sha256),
+            "x-amz-checksum-crc32" => Some(&mut input.checksum_crc32),
+            "x-amz-checksum-crc32c" => Some(&mut input.checksum_crc32c),
+            "x-amz-checksum-crc64nvme" => Some(&mut input.checksum_crc64nvme),
+            "x-amz-checksum-sha1" => Some(&mut input.checksum_sha1),
+            "x-amz-checksum-sha256" => Some(&mut input.checksum_sha256),
             "x-amz-sdk-checksum-algorithm" => None,
             _ => continue,
         };
         if !seen.insert(name.clone()) {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Duplicate checksum query parameter"));
         }
-        if let Some(header) = req.headers.get(name.as_ref())
+        if let Some(header) = req.headers().get(name.as_ref())
             && header.as_bytes() != value.as_bytes()
         {
             return Err(S3Error::with_message(
@@ -90,7 +133,7 @@ fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S
         }
         let header = http::HeaderValue::from_str(&value)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid checksum query parameter"))?;
-        req.headers.insert(
+        req.headers_mut().insert(
             http::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid checksum query parameter"))?,
             header,
@@ -98,50 +141,78 @@ fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S
         if let Some(field) = field {
             *field = Some(value.into_owned());
         } else {
-            req.input.checksum_algorithm = Some(ChecksumAlgorithm::from(value.into_owned()));
+            input.checksum_algorithm = Some(value.into_owned());
         }
     }
     Ok(())
 }
 
 impl DefaultMultipartUsecase {
-    #[instrument(level = "debug", skip(self, req))]
+    /// Records the gateway audit. The protocol client records its own projected response.
+    pub(crate) async fn execute_upload_part_with_audit(
+        &self,
+        envelope: RequestEnvelope,
+        input: UploadPartWriteInput,
+    ) -> S3Result<UploadPartWriteOutput> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::UploadPart, http::StatusCode::OK, |envelope| {
+            self.execute_upload_part_owned(envelope, input)
+        })
+        .await
+    }
+
+    #[instrument(name = "execute_upload_part", level = "debug", skip(self, req, input))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
-    pub async fn execute_upload_part(&self, mut req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+    pub(crate) async fn execute_upload_part_owned(
+        &self,
+        mut req: RequestEnvelope,
+        mut input: UploadPartWriteInput,
+    ) -> S3Result<UploadPartWriteOutput> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+            req.headers(),
+            req.uri().query(),
+            req.verified_sigv4().is_some(),
         )?;
         reject_presigned_put_max_content_length_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+            req.headers(),
+            req.uri().query(),
+            req.verified_presigned().is_some(),
         )?;
-        normalize_presigned_part_checksums(&mut req)?;
+        normalize_presigned_part_checksums(&mut req, &mut input)?;
+        let (bucket, key) = input.target.resource();
         let mut opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
+        apply_bucket_generation_guard(&req, bucket, &mut opts)?;
         let part_principal = SseKmsPrincipal::from_request(&req);
-        let input = req.input;
-        let UploadPartInput {
+        let UploadPartWriteInput {
             body,
-            bucket,
-            key,
-            upload_id,
+            frame_trailers,
+            trailing_headers,
             part_number,
             content_length,
             sse_customer_algorithm,
             sse_customer_key,
             sse_customer_key_md5,
-            // content_md5,
             ..
         } = input;
 
         let part_id = parse_upload_part_number(part_number)?;
 
-        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
-        validate_table_catalog_object_mutation(&bucket, &key).await?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), bucket, key).await?;
+        validate_table_catalog_object_mutation(bucket, key).await?;
 
+        // cuObject S3-over-RDMA UploadPart: an empty HTTP body plus
+        // `x-amz-rdma-token` means the part bytes are read from the client's
+        // registered buffer (see `object::cuobject::rdma_put_body`).
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(req.headers()) {
+            Some(token) if content_length.unwrap_or(0) == 0 => {
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(bucket, key, &token).map_err(S3Error::from)?;
+                let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                (Some(body), Some(total), Some(total))
+            }
+            _ => (body, content_length, None),
+        };
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let rdma_put: Option<i64> = None;
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
         if let Some(size) = size {
             reject_oversize_single_upload(size)?;
@@ -151,10 +222,26 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         let multipart_info_started = rustfs_io_metrics::put_stage_timer();
-        let fi = store
-            .get_multipart_info(&bucket, &key, &upload_id, &opts)
-            .await
-            .map_err(multipart_upload_api_error)?;
+        let (upload_id, fi) = match &input.target {
+            UploadPartTarget::Legacy { upload_id, .. } => {
+                let info = lookup_part_upload(&store, bucket, key, upload_id, &opts).await?;
+                (upload_id.clone(), info)
+            }
+            UploadPartTarget::Gateway {
+                bucket: bucket_name,
+                key: object_key,
+                upload_id,
+            } => {
+                let lookup_store = &store;
+                let lookup_opts = &opts;
+                let (id, upload) = resolve_upload_async(upload_id, bucket_name, object_key, |id| async move {
+                    lookup_recorded_part_upload(lookup_store, bucket, key, id, lookup_opts).await
+                })
+                .await?
+                .map_err(|rejection| S3Error::with_message(S3ErrorCode::NoSuchUpload, rejection.reason()))?;
+                (id.id().to_owned(), upload.info)
+            }
+        };
         rustfs_io_metrics::record_put_object_stage_duration_from("multipart_get_info", multipart_info_started);
         authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
@@ -183,37 +270,22 @@ impl DefaultMultipartUsecase {
                 ));
             }
         };
-        let request_id = req
-            .extensions
-            .get::<super::super::storage_api::multipart_usecase::request_context::RequestContext>()
-            .map(|ctx| ctx.request_id.as_str())
-            .unwrap_or_default();
+        let (chunks, _) = BodyChunks::with_trailers(body_stream, frame_trailers);
+        let body_stream: UploadChunks = Box::new(chunks);
+        let request_id = req.request_context().map(|ctx| ctx.request_id.as_str()).unwrap_or_default();
         let timeout = upload_part_body_read_timeout(put_object_body_read_timeout(), max_total_object_size.is_some());
-        let (body_stream, progress_control) =
-            if let Some(control) = req.extensions.get::<super::super::object::request_body::BodyReadControl>() {
-                control.activate_upload(timeout, &bucket, &key, request_id, size.max(0) as u64);
-                (body_stream, control.clone())
-            } else {
-                super::super::object::request_body::guard_upload_progress(
-                    body_stream,
-                    timeout,
-                    &bucket,
-                    &key,
-                    request_id,
-                    size.max(0) as u64,
-                )
-            };
+        let (body_stream, progress_control) = if let Some(control) = req.body_read_control() {
+            control.activate_upload(timeout, bucket, key, request_id, size.max(0) as u64);
+            (body_stream, control.clone())
+        } else {
+            guard_native_upload_progress(body_stream, timeout, bucket, key, request_id, size.max(0) as u64)
+        };
 
         let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
 
-        // Apply adaptive buffer sizing based on part size for optimal streaming performance.
-        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
-        // Buffer sizes range from 32KB to 4MB depending on part size and configured workload profile.
-        let buffer_size = get_buffer_size_opt_in(size);
-        let body = tokio::io::BufReader::with_capacity(
-            buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
-        );
+        // Stream directly from the chunked HTTP body stream; adaptive buffering is
+        // applied below only when disk compression is enabled.
+        let body = upload_frame_reader(body_stream.map(|f| f.map_err(s3s_body_error_to_io)));
 
         // An SSE-C passthrough session stores ciphertext parts verbatim: a
         // compression key restored on the session describes those stored
@@ -224,7 +296,7 @@ impl DefaultMultipartUsecase {
             && rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         let actual_size = if preserve_ciphertext {
-            passthrough_part_actual_size(&req.headers).unwrap_or(size)
+            passthrough_part_actual_size(req.headers()).unwrap_or(size)
         } else {
             size
         };
@@ -238,11 +310,13 @@ impl DefaultMultipartUsecase {
             None
         };
 
-        let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
+        let mut sha256hex = get_content_sha256_with_query(req.headers(), req.uri().query());
 
         let mut write_plan = WritePlan::new();
         let etag_algorithm = multipart_etag_algorithm(&fi.user_defined);
         let mut reader = if is_disk_compressed {
+            let buffer_size = get_buffer_size_opt_in(size);
+            let body = tokio::io::BufReader::with_capacity(buffer_size, body);
             let algorithm = CompressionAlgorithm::default();
             let mut hrd = HashReader::from_stream_with_etag(
                 body,
@@ -255,7 +329,7 @@ impl DefaultMultipartUsecase {
             )
             .map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
+            if let Err(err) = hrd.add_checksum(req.headers(), trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -267,7 +341,7 @@ impl DefaultMultipartUsecase {
                 .map_err(ApiError::from)?
         };
 
-        if let Err(err) = reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), size < 0) {
+        if let Err(err) = reader.add_checksum(req.headers(), trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
         }
         opts.want_checksum = reader.checksum();
@@ -281,16 +355,9 @@ impl DefaultMultipartUsecase {
         let (server_side_encryption, ssekms_key_id) = if has_ssec || preserve_ciphertext {
             (None, None)
         } else {
-            let sse = fi
-                .user_defined
-                .get("x-amz-server-side-encryption")
-                .map(|s| {
-                    ServerSideEncryption::from_str(s)
-                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
-                })
-                .transpose()?;
+            let sse = fi.user_defined.get("x-amz-server-side-encryption").cloned();
             let key_id = match sse.as_ref() {
-                Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => fi
+                Some(sse) if sse.as_str() == "aws:kms" => fi
                     .user_defined
                     .get("x-amz-server-side-encryption-aws-kms-key-id")
                     .map(|s| s.to_string()),
@@ -300,8 +367,8 @@ impl DefaultMultipartUsecase {
         };
         if !preserve_ciphertext {
             EncryptionRequest {
-                bucket: &bucket,
-                key: &key,
+                bucket,
+                key,
                 server_side_encryption: server_side_encryption.clone(),
                 ssekms_key_id: ssekms_key_id.clone(),
                 ssekms_context: None,
@@ -315,8 +382,8 @@ impl DefaultMultipartUsecase {
         }
         let (requested_sse, requested_kms_key_id) = if has_ssec {
             let ssec_material = sse_decryption(DecryptionRequest {
-                bucket: &bucket,
-                key: &key,
+                bucket,
+                key,
                 metadata: &fi.user_defined,
                 sse_customer_key: sse_customer_key.as_ref(),
                 sse_customer_key_md5: sse_customer_key_md5.as_ref(),
@@ -331,13 +398,14 @@ impl DefaultMultipartUsecase {
                 }
             };
             write_plan = write_plan.with_encryption(ssec_write);
-            (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
+            // An SSE-C part answers with its customer-key headers only.
+            (None, None)
         } else if let Some(server_side_encryption) = server_side_encryption {
             // Reuse the stored envelope after authorizing this caller against its
             // pinned destination key above.
             let managed_material = sse_decryption(DecryptionRequest {
-                bucket: &bucket,
-                key: &key,
+                bucket,
+                key,
                 metadata: &fi.user_defined,
                 sse_customer_key: None,
                 sse_customer_key_md5: None,
@@ -362,8 +430,7 @@ impl DefaultMultipartUsecase {
         {
             use rustfs_rio::HashReaderMut;
             let inner = reader.take_inner();
-            reader.inner =
-                rustfs_rio::boxed_reader(super::super::object::request_body::DemandReader::new(inner, progress_control));
+            reader.inner = rustfs_rio::boxed_reader(DemandReader::new(inner, progress_control));
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -378,7 +445,7 @@ impl DefaultMultipartUsecase {
         let _upload_part_admission = upload_part_admission;
         let store_write_started = rustfs_io_metrics::put_stage_timer();
         let result = store
-            .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
+            .put_object_part(bucket, key, &upload_id, part_id, &mut reader, &opts)
             .await;
         rustfs_io_metrics::record_put_object_stage_duration_from("multipart_store_write", store_write_started);
         drop(_upload_part_admission);
@@ -390,38 +457,44 @@ impl DefaultMultipartUsecase {
         let mut checksum_sha256 = input.checksum_sha256;
         let mut checksum_crc64nvme = input.checksum_crc64nvme;
 
-        if let Some(alg) = &input.checksum_algorithm
-            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
-                let key = match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-                    _ => return None,
-                };
-                trailer.read(|headers| {
-                    headers
-                        .get(key.unwrap_or_default())
-                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-                })
-            })
-        {
-            match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                _ => (),
+        if let (Some(algorithm), Some(trailers)) = (input.checksum_algorithm.as_deref(), trailing_headers) {
+            let echo = match algorithm {
+                "CRC32" => Some(("x-amz-checksum-crc32", &mut checksum_crc32)),
+                "CRC32C" => Some(("x-amz-checksum-crc32c", &mut checksum_crc32c)),
+                "SHA1" => Some(("x-amz-checksum-sha1", &mut checksum_sha1)),
+                "SHA256" => Some(("x-amz-checksum-sha256", &mut checksum_sha256)),
+                "CRC64NVME" => Some(("x-amz-checksum-crc64nvme", &mut checksum_crc64nvme)),
+                _ => None,
+            };
+            if let Some((name, field)) = echo {
+                match trailers.lookup(name) {
+                    rustfs_rio::TrailerValue::Present(value) => *field = Some(value),
+                    rustfs_rio::TrailerValue::Missing => *field = None,
+                    rustfs_rio::TrailerValue::Pending => {}
+                }
             }
         }
 
         // XXHash3/64/128 and SHA-512 have no typed UploadPartOutput field; echo the
         // server-computed part checksum as a raw response header (#1261).
-        let upload_part_extra_checksum_headers = crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg_attr(
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
+        let mut upload_part_extra_checksum_headers =
+            crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let _ = rdma_put;
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        if let Some(moved) = rdma_put {
+            upload_part_extra_checksum_headers.push((crate::app::object::cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
+            upload_part_extra_checksum_headers
+                .push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+        }
 
-        let output = UploadPartOutput {
+        let mut headers = HeaderMap::new();
+        crate::app::object_usecase::inject_additional_checksum_headers(&mut headers, &upload_part_extra_checksum_headers);
+        Ok(UploadPartWriteOutput {
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
@@ -431,15 +504,74 @@ impl DefaultMultipartUsecase {
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
-            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            ..Default::default()
-        };
+            e_tag: info.etag,
+            headers,
+        })
+    }
+}
 
-        let mut response = S3Response::new(output);
-        crate::app::object_usecase::inject_additional_checksum_headers(
-            &mut response.headers,
-            &upload_part_extra_checksum_headers,
-        );
+#[cfg(test)]
+impl UploadPartWriteInput {
+    pub(crate) fn from_legacy(
+        input: crate::app::storage_api::s3::dto::UploadPartInput,
+        trailers: Option<crate::app::storage_api::s3::TrailingHeaders>,
+    ) -> Self {
+        Self {
+            target: UploadPartTarget::Legacy {
+                bucket: input.bucket,
+                key: input.key,
+                upload_id: input.upload_id,
+            },
+            part_number: input.part_number,
+            content_length: input.content_length,
+            body: input.body.map(crate::app::object::legacy_put_body),
+            trailing_headers: crate::app::trailer_adapter::trailer_source(trailers),
+            frame_trailers: None,
+            content_md5: input.content_md5,
+            checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
+            checksum_crc32: input.checksum_crc32,
+            checksum_crc32c: input.checksum_crc32c,
+            checksum_crc64nvme: input.checksum_crc64nvme,
+            checksum_sha1: input.checksum_sha1,
+            checksum_sha256: input.checksum_sha256,
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
+#[cfg(test)]
+impl DefaultMultipartUsecase {
+    pub async fn execute_upload_part(
+        &self,
+        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::UploadPartInput>,
+    ) -> crate::app::storage_api::s3::S3Result<
+        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::UploadPartOutput>,
+    > {
+        use crate::app::storage_api::s3::{
+            S3Response,
+            dto::{ServerSideEncryption, UploadPartOutput},
+        };
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
+        let output = self.execute_upload_part_with_audit(envelope, input).await?;
+        let mut response = S3Response::new(UploadPartOutput {
+            e_tag: output
+                .e_tag
+                .map(|tag| crate::app::storage_api::test::object_utils::to_s3s_etag(&tag)),
+            checksum_crc32: output.checksum_crc32,
+            checksum_crc32c: output.checksum_crc32c,
+            checksum_crc64nvme: output.checksum_crc64nvme,
+            checksum_sha1: output.checksum_sha1,
+            checksum_sha256: output.checksum_sha256,
+            server_side_encryption: output.server_side_encryption.map(ServerSideEncryption::from),
+            ssekms_key_id: output.ssekms_key_id,
+            sse_customer_algorithm: output.sse_customer_algorithm,
+            sse_customer_key_md5: output.sse_customer_key_md5,
+            ..Default::default()
+        });
+        response.headers = output.headers;
         Ok(response)
     }
 }
@@ -448,12 +580,16 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::app::object::legacy_put_body;
+    use crate::app::storage_api::s3::S3ErrorCode as LegacyErrorCode;
+    use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+    use http::HeaderValue;
 
-    fn presigned_checksum_request(query: &str) -> S3Request<UploadPartInput> {
+    fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
         let mut req = build_request(UploadPartInput::default(), Method::PUT);
         req.uri = format!("/bucket/object?{query}").parse().unwrap();
         req.extensions.insert(VerifiedPresignedRequest);
-        req
+        (RequestEnvelope::from_s3s(&req), UploadPartWriteInput::from_legacy(req.input, None))
     }
 
     #[tokio::test]
@@ -463,15 +599,12 @@ mod tests {
         let query =
             "x-amz-checksum-sha256=ungWv48Bz%2BpBQUDeXa4iI7ADYaOWF3qctBD%2FYfIAFa0%3D&x-amz-sdk-checksum-algorithm=SHA256";
         for payload in [b"abc", b"abd"] {
-            let mut req = presigned_checksum_request(query);
-            normalize_presigned_part_checksums(&mut req).unwrap();
-            assert_eq!(req.input.checksum_sha256.as_deref(), Some(checksum));
-            assert_eq!(
-                req.input.checksum_algorithm.as_ref().map(|algorithm| algorithm.as_str()),
-                Some(ChecksumAlgorithm::SHA256)
-            );
+            let (mut req, mut input) = presigned_checksum_request(query);
+            normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
+            assert_eq!(input.checksum_sha256.as_deref(), Some(checksum));
+            assert_eq!(input.checksum_algorithm.as_deref(), Some("SHA256"));
             let mut reader = HashReader::from_stream(Cursor::new(payload), 3, 3, None, None, false).unwrap();
-            reader.add_checksum(&req.headers, None, false).unwrap();
+            reader.add_checksum(req.headers(), None, false).unwrap();
             assert_eq!(reader.content_crc_type(), Some(rustfs_rio::ChecksumType::SHA256));
             let mut bytes = Vec::new();
             let result = reader.read_to_end(&mut bytes).await;
@@ -488,11 +621,12 @@ mod tests {
 
     #[tokio::test]
     async fn normalize_presigned_part_checksums_accepts_sdk_crc32_default() {
-        let mut req = presigned_checksum_request("x-amz-checksum-crc32=y%2FQ5Jg%3D%3D&x-amz-sdk-checksum-algorithm=CRC32");
-        normalize_presigned_part_checksums(&mut req).unwrap();
-        assert_eq!(req.input.checksum_crc32.as_deref(), Some("y/Q5Jg=="));
+        let (mut req, mut input) =
+            presigned_checksum_request("x-amz-checksum-crc32=y%2FQ5Jg%3D%3D&x-amz-sdk-checksum-algorithm=CRC32");
+        normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
+        assert_eq!(input.checksum_crc32.as_deref(), Some("y/Q5Jg=="));
         let mut reader = HashReader::from_stream(Cursor::new(b"123456789"), 9, 9, None, None, false).unwrap();
-        reader.add_checksum(&req.headers, None, false).unwrap();
+        reader.add_checksum(req.headers(), None, false).unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"123456789");
@@ -505,44 +639,47 @@ mod tests {
             "x-amz-checksum-sha256=one&x-amz-checksum-sha256=two",
             "x-amz-sdk-checksum-algorithm=SHA256&x-amz-sdk-checksum-algorithm=CRC32",
         ] {
-            let mut req = presigned_checksum_request(query);
+            let (mut req, mut input) = presigned_checksum_request(query);
             assert_eq!(
-                *normalize_presigned_part_checksums(&mut req).unwrap_err().code(),
+                *normalize_presigned_part_checksums(&mut req, &mut input).unwrap_err().code(),
                 S3ErrorCode::InvalidRequest
             );
         }
-        let mut req = presigned_checksum_request("x-amz-checksum-sha256=one");
-        req.headers.insert("x-amz-checksum-sha256", HeaderValue::from_static("two"));
+        let (mut req, mut input) = presigned_checksum_request("x-amz-checksum-sha256=one");
+        req.headers_mut()
+            .insert("x-amz-checksum-sha256", HeaderValue::from_static("two"));
         assert_eq!(
-            *normalize_presigned_part_checksums(&mut req).unwrap_err().code(),
+            *normalize_presigned_part_checksums(&mut req, &mut input).unwrap_err().code(),
             S3ErrorCode::InvalidRequest
         );
     }
 
     #[test]
     fn normalize_presigned_part_checksums_preserves_headers_and_rejects_invalid_values() {
-        let mut req = presigned_checksum_request("partNumber=1&uploadId=test");
-        req.input.checksum_sha256 = Some("existing".to_owned());
-        req.headers
+        let (mut req, mut input) = presigned_checksum_request("partNumber=1&uploadId=test");
+        input.checksum_sha256 = Some("existing".to_owned());
+        req.headers_mut()
             .insert("x-amz-checksum-sha256", HeaderValue::from_static("existing"));
-        normalize_presigned_part_checksums(&mut req).unwrap();
-        assert_eq!(req.input.checksum_sha256.as_deref(), Some("existing"));
-        assert_eq!(req.headers["x-amz-checksum-sha256"], "existing");
+        normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
+        assert_eq!(input.checksum_sha256.as_deref(), Some("existing"));
+        assert_eq!(req.headers()["x-amz-checksum-sha256"], "existing");
 
-        let mut req = presigned_checksum_request("x-amz-checksum-sha256=%0D%0A");
+        let (mut req, mut input) = presigned_checksum_request("x-amz-checksum-sha256=%0D%0A");
         assert_eq!(
-            *normalize_presigned_part_checksums(&mut req).unwrap_err().code(),
+            *normalize_presigned_part_checksums(&mut req, &mut input).unwrap_err().code(),
             S3ErrorCode::InvalidArgument
         );
     }
 
     #[test]
     fn normalize_presigned_part_checksums_requires_verified_presign() {
-        let mut req = presigned_checksum_request("x-amz-checksum-sha256=one");
-        req.extensions.remove::<VerifiedPresignedRequest>();
-        normalize_presigned_part_checksums(&mut req).unwrap();
-        assert!(req.input.checksum_sha256.is_none());
-        assert!(req.headers.is_empty());
+        let mut legacy = build_request(UploadPartInput::default(), Method::PUT);
+        legacy.uri = "/bucket/object?x-amz-checksum-sha256=one".parse().unwrap();
+        let mut req = RequestEnvelope::from_s3s(&legacy);
+        let mut input = UploadPartWriteInput::from_legacy(legacy.input, None);
+        normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
+        assert!(input.checksum_sha256.is_none());
+        assert!(req.headers().is_empty());
     }
 
     #[test]
@@ -550,12 +687,15 @@ mod tests {
         let result: rustfs_s3_types::S3Result<Option<i64>> = resolve_upload_part_size(Some(5242880), None);
         assert_eq!(result.expect("DTO length"), Some(5242880));
         assert_eq!(resolve_upload_part_size(None, None).expect("unknown length"), None);
-        let body = StreamingBlob::from(Bytes::from_static(b"abc"));
+        let body = Body::from(Bytes::from_static(b"abc"));
         assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("exact bytes"), Some(3));
         assert_eq!(resolve_upload_part_size(Some(0), Some(&body)).expect("explicit length wins"), Some(0));
         let body = StreamingBlob::wrap(futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))]));
         assert_eq!(futures::Stream::size_hint(&body), (1, Some(1)), "the stream knows its item count");
-        assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("unknown byte length"), None);
+        assert_eq!(
+            resolve_upload_part_size(None, Some(&legacy_put_body(body))).expect("unknown byte length"),
+            None
+        );
     }
 
     #[test]
@@ -598,10 +738,14 @@ mod tests {
             .part_number(1)
             .build()
             .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let err = make_usecase().execute_upload_part(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+        let err = match make_usecase()
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+            .await
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("missing body must be rejected"),
+        };
+        assert_eq!(err.code(), &LegacyErrorCode::IncompleteBody);
     }
 
     /// issue #7596: a part whose declared length exceeds the 5 GiB
@@ -622,14 +766,18 @@ mod tests {
                 .content_length(Some(declared))
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            let err = match make_usecase()
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("declared part must be rejected"),
+            };
             if expect_too_large {
-                assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "declared {declared}");
+                assert_eq!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
             } else {
-                assert_ne!(err.code(), &S3ErrorCode::EntityTooLarge, "declared {declared} must pass admission");
+                assert_ne!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared} must pass admission");
             }
         }
     }
@@ -644,10 +792,14 @@ mod tests {
                 .part_number(part_number)
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
-            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            let err = match make_usecase()
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("invalid part number must be rejected"),
+            };
+            assert_eq!(err.code(), &LegacyErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
     }
@@ -714,9 +866,9 @@ mod tests {
                     assert_eq!(
                         error.code(),
                         &if capped || content_length.is_some() {
-                            S3ErrorCode::UnexpectedContent
+                            LegacyErrorCode::UnexpectedContent
                         } else {
-                            S3ErrorCode::MissingContentLength
+                            LegacyErrorCode::MissingContentLength
                         }
                     );
                     assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -776,7 +928,7 @@ mod tests {
         ));
         control.advance_wait_for_test(Duration::from_secs(60));
         sender.send(Ok(Frame::data(Bytes::from_static(b"x")))).unwrap();
-        assert_eq!(owner.await.unwrap().unwrap_err().code(), &S3ErrorCode::RequestTimeout);
+        assert_eq!(owner.await.unwrap().unwrap_err().code(), &LegacyErrorCode::RequestTimeout);
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
             ForegroundWriteAdmission::Admitted(_)
@@ -828,13 +980,18 @@ mod tests {
             .build()
             .expect("upload part input should build");
 
-        let err = usecase
-            .execute_upload_part(build_request(input, Method::PUT))
+        let err = match usecase
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
-            .expect_err("full foreground write admission should reject before body ingest");
-        assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("full foreground write admission should reject before body ingest"),
+        };
+        assert_eq!(err.code(), &LegacyErrorCode::SlowDown);
         drop(held);
     }
 
     mod body_read_tests;
+    mod claim_tests;
+    pub(super) use claim_tests::observe_lookup;
 }

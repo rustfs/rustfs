@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
-use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
-use crate::storage::access::ReqInfo;
+#[cfg(test)]
+use crate::shared_types::RemoteAddr;
+use crate::shared_types::convert_ecstore_object_info;
+use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -27,6 +29,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
+#[cfg(test)]
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::Action;
@@ -35,6 +38,7 @@ use rustfs_s3_types::EventName;
 use rustfs_targets::{extract_params_header, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
+#[cfg(test)]
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
@@ -42,11 +46,13 @@ use std::net::SocketAddr;
 use tokio::runtime::{Builder, Handle};
 
 /// Request type seen by the denial auditor, so `denial_audit` stays off the direct s3s surface.
+#[cfg(test)]
 pub(crate) type DenialRequest<T> = S3Request<T>;
 use tracing::{Instrument, info_span, warn};
 
 /// The request fields used to build an audit entry, shared by both request edges.
 pub(crate) struct AuditRequestView<'a> {
+    bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     headers: &'a HeaderMap,
     uri: &'a Uri,
     pub(crate) req_info: Option<&'a ReqInfo>,
@@ -56,8 +62,15 @@ pub(crate) struct AuditRequestView<'a> {
 }
 
 impl<'a> AuditRequestView<'a> {
+    #[cfg(test)]
     pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
         Self {
+            bucket_generation: super::authorization::PendingDeleteBucketGenerationGuard::resolve_generation(
+                req.extensions.get(),
+                req.extensions.get(),
+            )
+            .ok()
+            .flatten(),
             headers: &req.headers,
             uri: &req.uri,
             req_info: req.extensions.get::<ReqInfo>(),
@@ -78,8 +91,10 @@ impl<'a> AuditRequestView<'a> {
         client_info: Option<&'a ClientInfo>,
         remote_addr: Option<SocketAddr>,
         request_context: Option<&'a RequestContext>,
+        bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     ) -> Self {
         Self {
+            bucket_generation,
             headers,
             uri,
             req_info,
@@ -173,11 +188,7 @@ where
 }
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
-pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    event_resp_elements(&response.headers, request_id)
-}
-
-fn event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMap<String, String> {
+pub(crate) fn build_owned_event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMap<String, String> {
     let mut resp_elements = extract_params_header(response_headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
@@ -207,6 +218,7 @@ impl<'a> OperationOutcome<'a> {
         }
     }
 
+    #[cfg(test)]
     fn legacy<T>(result: &'a S3Result<S3Response<T>>) -> Self {
         match result {
             Ok(res) => Self::Success {
@@ -370,15 +382,15 @@ pub struct EnabledOperationHelper {
 }
 
 impl OperationHelper {
-    /// Create a new OperationHelper for S3 requests.
+    /// Builds the legacy request helper for audit and notification fixtures.
+    #[cfg(test)]
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
         record_s3_op(op);
         Self::from_view(&AuditRequestView::legacy(req), event, op)
     }
 
-    /// [`Self::new`] for a request whose audit facts an owned edge decoded
-    /// (`RequestEnvelope::audit_view`). It does not count the operation: the owned edge already
-    /// did, once, before calling the use case.
+    /// Builds the helper from the audit facts decoded by the operation edge.
+    /// The edge counts the operation before calling the use case.
     pub(crate) fn from_view(req: &AuditRequestView<'_>, event: EventName, op: S3Operation) -> Self {
         Self::build(req, event, op, false)
     }
@@ -387,8 +399,8 @@ impl OperationHelper {
     ///
     /// For operations that have no notification event of their own (`UploadPart`, the
     /// bucket configuration writes) or whose event is internal (`AbortMultipartUpload`).
-    /// Unlike `new` it does not call `record_s3_op`, so per-operation metrics stay as the
-    /// handlers already report them.
+    /// The handler records the per-operation metric.
+    #[cfg(test)]
     pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
         Self::audit_only_from_view(&AuditRequestView::legacy(req), op)
     }
@@ -499,7 +511,12 @@ impl OperationHelper {
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = if notify_enabled {
+            let incarnation_id = req
+                .bucket_generation
+                .filter(|guard| guard.bucket == bucket)
+                .map(|guard| guard.incarnation_id);
             let mut event_builder = EventArgsBuilder::new(event, bucket, convert_ecstore_object_info(event_object))
+                .bucket_incarnation_id(incarnation_id)
                 .host(get_request_host(req.headers))
                 .port(get_request_port(req.headers))
                 .user_agent(get_request_user_agent(req.headers))
@@ -547,6 +564,25 @@ impl OperationHelper {
             Self::Enabled(state) => state.event_builder.clone().map(|builder| builder.build()),
             Self::Disabled => None,
         }
+    }
+
+    pub(crate) fn with_bucket_incarnation_id(mut self, incarnation: Option<uuid::Uuid>) -> Self {
+        if let Self::Enabled(helper) = &mut self
+            && let Some(builder) = helper.event_builder.take()
+        {
+            helper.event_builder = Some(builder.bucket_incarnation_id(incarnation));
+        }
+        self
+    }
+
+    pub(crate) fn with_bucket_removed_targets(mut self, targets: rustfs_notify::rules::TargetIdSet) -> Self {
+        if let Self::Enabled(state) = &mut self {
+            state.event_builder = state
+                .event_builder
+                .take()
+                .map(|builder| builder.bucket_removed_targets(targets));
+        }
+        self
     }
 
     /// Sets the ObjectInfo for event notification.
@@ -598,6 +634,7 @@ impl OperationHelper {
     /// Complete operational details from S3 results.
     /// This method should be called immediately before the function returns.
     /// It consumes and prepares auxiliary structures for use during `drop`.
+    #[cfg(test)]
     pub fn complete<T>(self, result: &S3Result<S3Response<T>>) -> Self {
         self.complete_with(OperationOutcome::legacy(result))
     }
@@ -674,7 +711,8 @@ impl OperationHelper {
         if state.notify_enabled
             && let (Some(builder), OperationOutcome::Success { headers, .. }) = (state.event_builder.take(), outcome)
         {
-            state.event_builder = Some(builder.resp_elements(event_resp_elements(headers, &state.request_context.request_id)));
+            state.event_builder =
+                Some(builder.resp_elements(build_owned_event_resp_elements(headers, &state.request_context.request_id)));
         }
 
         self
@@ -690,11 +728,6 @@ impl OperationHelper {
 
     /// Returns the operation's canonical context, reading the ingress extension
     /// when the disabled fast path holds no request state.
-    pub(crate) fn request_context_or_from_request<T>(&self, req: &S3Request<T>) -> RequestContext {
-        self.request_context_or_from_view(&AuditRequestView::legacy(req))
-    }
-
-    /// [`Self::request_context_or_from_request`] for a request whose audit facts an owned edge decoded.
     pub(crate) fn request_context_or_from_view(&self, req: &AuditRequestView<'_>) -> RequestContext {
         match self {
             Self::Enabled(state) => state.request_context.clone(),
@@ -718,6 +751,7 @@ pub(crate) enum DenialScope {
 ///
 /// The entry carries the action that was denied and the internal denial reason, so an
 /// audit consumer can tell a refused request from a handler that never ran.
+#[cfg(test)]
 pub(crate) fn authorization_denial_entry<T>(
     req: &S3Request<T>,
     action: &Action,
@@ -780,6 +814,7 @@ pub(crate) fn authorization_denial_entry_for_view(
 ///
 /// The helper is built before the request is handed over so it sees the original headers
 /// and extensions, and it completes with the handler's result, so failed requests are audited too.
+#[cfg(test)]
 pub(crate) async fn audit_only_operation<I, O, F, Fut>(req: S3Request<I>, op: S3Operation, handler: F) -> S3Result<S3Response<O>>
 where
     I: Send + Sync,
@@ -862,7 +897,7 @@ impl Drop for OperationHelper {
 mod tests {
     use super::OperationHelper;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
-    use crate::storage::access::ReqInfo;
+    use crate::storage::req_info::ReqInfo;
     use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
@@ -1068,6 +1103,48 @@ mod tests {
             Some("s3:DeleteObject")
         );
         assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[test]
+    fn notification_view_uses_the_generation_validated_for_deferred_deletes() {
+        use crate::storage::authorization::{BucketGenerationGuard, PendingDeleteBucketGenerationGuard};
+
+        let ordinary = uuid::Uuid::new_v4();
+        let deleted = uuid::Uuid::new_v4();
+        let mut request = build_request((), Method::DELETE, "/bucket/object".parse().expect("delete URI"));
+        request.extensions.insert(BucketGenerationGuard {
+            bucket: "bucket".to_string(),
+            incarnation_id: ordinary,
+        });
+        request
+            .extensions
+            .insert(PendingDeleteBucketGenerationGuard::Ready(BucketGenerationGuard {
+                bucket: "bucket".to_string(),
+                incarnation_id: deleted,
+            }));
+        assert_eq!(
+            super::AuditRequestView::legacy(&request)
+                .bucket_generation
+                .map(|guard| guard.incarnation_id),
+            Some(deleted),
+            "delete notifications must use the deferred guard that storage validates"
+        );
+        request.extensions.insert(PendingDeleteBucketGenerationGuard::Failed {
+            code: rustfs_s3_types::S3ErrorCode::NoSuchBucket,
+            message: "bucket generation unavailable".to_string(),
+        });
+        assert!(
+            super::AuditRequestView::legacy(&request).bucket_generation.is_none(),
+            "a failed deferred capture must not fall back to another generation"
+        );
+        request.extensions.remove::<PendingDeleteBucketGenerationGuard>();
+        assert_eq!(
+            super::AuditRequestView::legacy(&request)
+                .bucket_generation
+                .map(|guard| guard.incarnation_id),
+            Some(ordinary),
+            "ordinary operations retain their original generation"
+        );
     }
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
@@ -1844,7 +1921,7 @@ mod tests {
                 });
 
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
-                let request_context = helper.request_context_or_from_request(&req);
+                let request_context = helper.request_context_or_from_view(&super::AuditRequestView::legacy(&req));
                 let request_id = request_context.request_id;
                 assert!(uuid::Uuid::parse_str(&request_id).is_ok());
                 let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
@@ -1892,7 +1969,12 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 assert!(matches!(&helper, OperationHelper::Disabled));
-                assert_eq!(helper.request_context_or_from_request(&req).request_id, "server-request-id");
+                assert_eq!(
+                    helper
+                        .request_context_or_from_view(&super::AuditRequestView::legacy(&req))
+                        .request_id,
+                    "server-request-id"
+                );
             },
         );
     }
@@ -1947,8 +2029,9 @@ mod tests {
                 // Drive the real data path: the principal built from this request is
                 // what carries the audit slot into the SSE code.
                 let metadata = unreadable_sse_kms_metadata();
+                let envelope = crate::app::RequestEnvelope::from_s3s(&req);
                 let principal =
-                    crate::storage::sse::SseKmsPrincipal::from_request(&req).expect("authenticated request has a principal");
+                    crate::storage::sse::SseKmsPrincipal::from_request(&envelope).expect("authenticated request has a principal");
                 crate::storage::sse::sse_decryption(crate::storage::sse::DecryptionRequest {
                     bucket: "finance",
                     key: "ledger.csv",

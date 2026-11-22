@@ -28,7 +28,6 @@ use super::storage_api::test::contract::{
     namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
-use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
 use super::storage_api::test::runtime::{
     MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,
@@ -43,7 +42,6 @@ use crate::app::runtime_sources::current_tier_config_handle;
 use crate::app::storage_api::s3::S3ErrorCode;
 use bytes::Bytes;
 use futures::FutureExt;
-use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_gateway_types::dto::Status;
@@ -58,7 +56,6 @@ use rustfs_utils::path::encode_dir_object;
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
-    convert::Infallible,
     env, fs as stdfs,
     path::PathBuf,
     sync::{Arc, OnceLock},

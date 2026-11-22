@@ -64,6 +64,15 @@ impl RawEnumerationPageWriter {
         })
     }
 
+    /// A parked native stream delivers the unread tail first. Incomplete
+    /// membership can immediately append that tail; terminal page verification
+    /// still requires observing the entire current directory.
+    pub(crate) fn continue_native_stream(&mut self) {
+        if !self.inner.complete && !self.inner.building.as_ref().is_some_and(|page| page.terminal) {
+            self.observations = self.revalidate_after_entries;
+        }
+    }
+
     pub(crate) fn indexed_entry_count(&self) -> usize {
         self.indexed.len()
     }

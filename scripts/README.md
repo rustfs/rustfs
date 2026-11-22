@@ -59,13 +59,9 @@ their issue closes.
 | `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
 | `junit_diff.py` | dev-tool | Case-by-case pass/fail/skip diff of two JUnit XML reports (reference vs candidate stack); exit 1 on any difference or stale `--allow` entry, 2 on unreadable input | `python3 scripts/junit_diff.py a.xml b.xml`; backlog T3.1 |
 | `test_junit_diff.py` | ci-gate | Contract tests and fixtures (`scripts/tests/junit_diff/`) for `junit_diff.py` | `make script-tests` |
-| `dual_stack.py` | ci-gate | The both-stack lanes: `stack` (which stack the servers' own start-up lines show), `preflight` (does the binary start on the gateway stack), `summary` (per-profile `junit_diff.py` and the dated summary) | `python3 scripts/dual_stack.py summary --help`; backlog T3.1 |
-| `test_dual_stack.py` | ci-gate | Contract tests for `dual_stack.py` | `make script-tests` |
-| `mint_stack_diff.py` | dev-tool | Mint gate: every case legacy passes passes on gateway and no new gateway failure; a side without a result never satisfies it | `python3 scripts/mint_stack_diff.py <legacy-leg-dir> <gateway-leg-dir>`; backlog T3.3 |
-| `test_mint_stack_diff.py` | ci-gate | Contract tests for `mint_stack_diff.py` | `make script-tests` |
-| `acceptance_lane.py` | ci-gate | Shared reader for the two gateway-acceptance checkers: the startup record, the stack the server's own log names, and recorded exit codes | imported by the two scripts below; tested by their `--self-test` |
-| `check_conformance_rulings.py` | ci-gate | Judges the gateway stack's conformance report against `.config/conformance-rulings.toml` (an unruled failure, a ruled case failing differently, a stale ruling, or a skip on the server's own answer fails), reports the legacy run as an unjudged reference, and diffs the two | `.github/workflows/gateway-acceptance.yml`; `make script-tests` (`--self-test`); backlog T3.4 |
-| `compat_matrix_report.py` | ci-gate | Judges one stack's gateway client matrix manifest and gates on every legacy `pass` cell passing on the gateway stack | `.github/workflows/gateway-acceptance.yml`; `make script-tests` (`--self-test`); backlog T3.5 |
+| `acceptance_lane.py` | ci-gate | Shared reader for the two gateway-acceptance checkers: the startup record and recorded exit codes | imported by the two scripts below; tested by their `--self-test` |
+| `check_conformance_rulings.py` | ci-gate | Judges the gateway conformance report against `.config/conformance-rulings.toml` (an unruled failure, a ruled case failing differently, a stale ruling, or a skip on the server's own answer fails) | `.github/workflows/gateway-acceptance.yml`; `make script-tests` (`--self-test`); backlog T3.4 |
+| `compat_matrix_report.py` | ci-gate | Judges the gateway client matrix manifest (no `fail` or `sut-unregistered` cell, every client ran) | `.github/workflows/gateway-acceptance.yml`; `make script-tests` (`--self-test`); backlog T3.5 |
 | `s3-tests/reference_parity.py` | ci-gate | Plans the reference parity targets, lists a run's failures for the single rerun, and compares every candidate's s3-tests JUnit against the pinned reference per node id with a tolerated-difference file | `.github/workflows/reference-parity.yml`; backlog T3.2 |
 | `s3-tests/test_reference_parity.py` | ci-gate | Contract tests for `reference_parity.py` | `make script-tests` |
 | `test_reference_binary.py` | ci-gate | Contract tests for `.github/actions/reference-binary/reference_binary.py` (pin resolution and verified unpacking) | `make script-tests` |
@@ -130,8 +126,11 @@ their issue closes.
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |
-| `run_four_node_cluster_failover_bench.sh` | dev-tool | Four-node cluster failover benchmark | `docker/compose/README.md`; internode runbook |
-| `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner (warp/s3bench) | internode + scanner runbooks |
+| `check_internode_rpc_timeout_boundary.py` | dev-tool | Verifies under-budget success, over-budget deadlines and post-stall recovery from recorded internode RPC probe reports | internode gRPC benchmark runbook; `test_internode_rpc_timeout_boundary.py` |
+| `run_four_node_cluster_failover_bench.sh` | dev-tool | Four-node cluster failover benchmark with configurable host ports and optional server-only image build | `docker/compose/README.md`; internode runbook |
+| `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner with PUT-specific Warp summary extraction | internode + scanner runbooks |
+| `test_object_batch_bench.sh` | dev-tool | Regression test for Warp PUT summary extraction | `scripts/test_object_batch_bench.sh` |
+| `wait_storage_quiescence.py` | dev-tool | Fail-closed dirty/writeback and PSI stability gate before storage benchmarks | `python3 -m unittest scripts/test_wait_storage_quiescence.py` |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
 | `prepare_conditional_read_baseline.py` | dev-tool | Installs only the matching conditional-read benchmark harness in a clean detached baseline | `docs/testing/conditional-read-benchmark.md` |
@@ -221,3 +220,5 @@ referenced only by other scripts in this same archived set. Reasons:
 | `setup-test-binaries.sh` | One-shot Docker-build test binary fixture |
 | `test.sh` | Ancient manual `mc` bucket smoke scratchpad |
 | `test_policy.json` | Orphaned IAM policy fixture (hardcoded test bucket) |
+| `dual_stack.py`, `test_dual_stack.py` | Both-stack lanes (stack proof, gateway preflight, per-profile diff); retired when the gateway stack became the only S3 stack. Not runnable from here: it imports `junit_diff.py` |
+| `mint_stack_diff.py`, `test_mint_stack_diff.py` | Mint legacy-versus-gateway gate; retired with the legacy stack. Imports `dual_stack.py` |

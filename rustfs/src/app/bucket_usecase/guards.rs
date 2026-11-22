@@ -33,9 +33,13 @@ fn bucket_create_and_delete_use_admitted_fresh_tasks() {
         (
             "execute_create_bucket",
             "bucket creation",
-            "execute_create_bucket_inner(req, mutation_permit).await",
+            "execute_create_bucket_inner(envelope, input, mutation_permit).await",
         ),
-        ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner(req).await"),
+        (
+            "execute_delete_bucket",
+            "bucket deletion",
+            "execute_delete_bucket_inner(envelope, input).await",
+        ),
     ] {
         let body = usecase_method_source(source, method);
         assert!(
@@ -51,10 +55,30 @@ fn bucket_create_and_delete_use_admitted_fresh_tasks() {
     );
 }
 
+const REPLICATION_MUTATION_CALLS: [(&str, &str); 2] = [
+    (
+        "execute_delete_bucket_replication",
+        "self.delete_bucket_replication(envelope, bucket, site_peers, contract).await",
+    ),
+    (
+        "execute_put_bucket_replication",
+        "self.put_bucket_replication(envelope, bucket, replication_configuration, site_peers, contract).await",
+    ),
+];
+
+fn assert_replication_mutation_delegation(source: &crate::guard_sources::SourceSet) {
+    for (method, call) in REPLICATION_MUTATION_CALLS {
+        let body: String = usecase_method_source(source, method).split_whitespace().collect();
+        let call: String = call.split_whitespace().collect();
+        assert!(body.contains(call.as_str()), "{method} must await its bucket metadata mutation");
+    }
+}
+
 #[test]
 fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
     let sources = bucket_usecase_sources();
     let source = &sources;
+    assert_replication_mutation_delegation(source);
     for (method, operation, scanner_maintenance_change) in [
         ("execute_delete_bucket_policy", "delete bucket policy", false),
         ("execute_put_bucket_policy", "put bucket policy", false),
@@ -65,8 +89,8 @@ fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
         ("execute_put_bucket_versioning", "put bucket versioning", false),
         ("execute_delete_bucket_tagging", "delete bucket tagging", false),
         ("execute_put_bucket_tagging", "put bucket tagging", false),
-        ("execute_delete_bucket_replication", "delete bucket replication", true),
-        ("execute_put_bucket_replication", "put bucket replication", true),
+        ("delete_bucket_replication", "delete bucket replication", true),
+        ("put_bucket_replication", "put bucket replication", true),
         ("execute_delete_bucket_cors", "delete bucket cors", false),
         ("execute_put_bucket_cors", "put bucket cors", false),
         ("execute_delete_bucket_encryption", "delete bucket encryption", false),
@@ -82,12 +106,39 @@ fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
             body.contains(operation),
             "{method} should identify the bucket metadata operation in reload logs"
         );
-        let expected_reload = format!(
-            "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change}).await;"
-        );
+        let expected_reload = |bucket| {
+            format!(
+                "notify_bucket_metadata_reload({bucket}, \"{operation}\", request_context, {scanner_maintenance_change}).await;"
+            )
+        };
         assert!(
-            body.contains(&expected_reload),
+            body.contains(&expected_reload("bucket.clone()")) || body.contains(&expected_reload("bucket.to_owned()")),
             "{method} should propagate scanner_maintenance_change={scanner_maintenance_change}"
         );
+    }
+}
+
+#[test]
+fn replication_metadata_reload_guard_rejects_disconnected_mutations() {
+    let methods: String = REPLICATION_MUTATION_CALLS
+        .iter()
+        .map(|(method, call)| format!("    async fn {method}(&self) {{\n        {call};\n    }}\n"))
+        .collect();
+    let production = format!("impl Usecase {{\n{methods}}}\n");
+    let root = crate::guard_sources::fixture_root(&[("src/app/bucket_usecase.rs", &production)]);
+    let source =
+        crate::guard_sources::SourceSet::production_under(root.path(), "src/app/bucket_usecase.rs", "src/app/bucket_usecase");
+    assert_replication_mutation_delegation(&source);
+
+    for (method, call) in REPLICATION_MUTATION_CALLS {
+        let broken = production.replacen(call, "self.unrelated().await", 1);
+        let broken = format!(
+            "{broken}\nimpl Sibling {{\n    async fn unrelated(&self) {{\n        {call};\n    }}\n}}\n#[cfg(test)]\nmod tests {{\n    fn mention() {{ {call}; }}\n}}\n"
+        );
+        let root = crate::guard_sources::fixture_root(&[("src/app/bucket_usecase.rs", &broken)]);
+        let source =
+            crate::guard_sources::SourceSet::production_under(root.path(), "src/app/bucket_usecase.rs", "src/app/bucket_usecase");
+        let message = crate::guard_sources::panic_message(|| assert_replication_mutation_delegation(&source));
+        assert!(message.contains(method), "{message}");
     }
 }

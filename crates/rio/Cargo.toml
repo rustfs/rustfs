@@ -32,6 +32,7 @@ workspace = true
 internode-transport = []
 default = []
 hotpath = [
+    "dep:hotpath",
     "hotpath/hotpath",
     "hotpath/tokio",
     "hotpath/futures",
@@ -59,7 +60,8 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath.workspace = true
+# Feature-gated in src (measure_block!); optional so default builds do not warn.
+hotpath = { workspace = true, optional = true }
 arc-swap.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 rand = { workspace = true, features = ["serde"] }
@@ -73,14 +75,12 @@ bytes = { workspace = true, features = ["serde"] }
 reqwest = { workspace = true, features = ["stream"] }
 rustls-pki-types.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
-faster-hex.workspace = true
 futures.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
 serde_json = { workspace = true, features = ["raw_value"] }
-md-5 = { workspace = true }
 hmac.workspace = true
 minlz.workspace = true
 tracing.workspace = true
@@ -92,6 +92,8 @@ xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+md-5 = { workspace = true }
+faster-hex.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }

@@ -145,6 +145,39 @@ impl Condition {
         }
     }
 
+    pub fn key_names(&self) -> Vec<String> {
+        use Condition::*;
+        match self {
+            StringEquals(s)
+            | StringNotEquals(s)
+            | StringEqualsIgnoreCase(s)
+            | StringNotEqualsIgnoreCase(s)
+            | StringLike(s)
+            | StringNotLike(s)
+            | ArnLike(s)
+            | ArnNotLike(s)
+            | ArnEquals(s)
+            | ArnNotEquals(s) => s.key_names().collect(),
+            BinaryEquals(s) => s.key_names().collect(),
+            IpAddress(s) | NotIpAddress(s) => s.key_names().collect(),
+            Null(s) | Bool(s) => s.key_names().collect(),
+            NumericEquals(s)
+            | NumericNotEquals(s)
+            | NumericLessThan(s)
+            | NumericLessThanEquals(s)
+            | NumericGreaterThan(s)
+            | NumericGreaterThanIfExists(s)
+            | NumericGreaterThanEquals(s) => s.key_names().collect(),
+            DateEquals(s)
+            | DateNotEquals(s)
+            | DateLessThan(s)
+            | DateLessThanEquals(s)
+            | DateGreaterThan(s)
+            | DateGreaterThanEquals(s) => s.key_names().collect(),
+            IfExists(inner) => inner.key_names(),
+        }
+    }
+
     pub fn has_any_key_in(&self, values: &HashMap<String, Vec<String>>) -> bool {
         use Condition::*;
         match self {
@@ -271,7 +304,7 @@ impl Condition {
                 NumericLessThan(s) => s.evaluate(i64::lt, false, values),
                 NumericLessThanEquals(s) => s.evaluate(i64::le, false, values),
                 NumericGreaterThan(s) => s.evaluate(i64::gt, false, values),
-                NumericGreaterThanIfExists(s) => s.evaluate(i64::ge, true, values),
+                NumericGreaterThanIfExists(s) => s.evaluate(i64::gt, true, values),
                 NumericGreaterThanEquals(s) => s.evaluate(i64::ge, false, values),
                 DateEquals(s) => s.evaluate(OffsetDateTime::eq, false, values),
                 DateNotEquals(s) => s.evaluate(OffsetDateTime::ne, true, values),
@@ -514,6 +547,34 @@ mod tests {
                 serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize condition")).expect("parse condition");
             assert_eq!(functions.evaluate(&HashMap::new()).await, absent, "{operator}");
         }
+    }
+
+    #[tokio::test]
+    async fn numeric_greater_than_if_exists_keeps_strict_comparison() {
+        // `NumericGreaterThanIfExists` is `NumericGreaterThan` with IfExists semantics:
+        // the comparison stays strict (`> 30`, not `>= 30`) and only key absence matches.
+        for (operator, value, expected) in [
+            ("NumericGreaterThanIfExists", "31", true),
+            ("NumericGreaterThanIfExists", "30", false),
+            ("NumericGreaterThanIfExists", "29", false),
+            ("NumericGreaterThan", "31", true),
+            ("NumericGreaterThan", "30", false),
+            ("NumericGreaterThanEquals", "30", true),
+        ] {
+            let document = serde_json::json!({operator: {"s3:max-keys": "30"}});
+            let functions: Functions =
+                serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize condition")).expect("parse condition");
+            let values = HashMap::from([("max-keys".to_string(), vec![value.to_string()])]);
+            assert_eq!(functions.evaluate(&values).await, expected, "{operator} with max-keys={value}");
+        }
+
+        let document = serde_json::json!({"NumericGreaterThanIfExists": {"s3:max-keys": "30"}});
+        let functions: Functions =
+            serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize condition")).expect("parse condition");
+        assert!(
+            functions.evaluate(&HashMap::new()).await,
+            "NumericGreaterThanIfExists must match when the key is absent"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! The S3 operations the gateway stack serves, and the one way an operation is served
 //! (rustfs/backlog#2734).
 //!
-//! Responsible for: [`Served`], what one operation supplies; the only `impl Handler` in RustFS,
+//! Responsible for: [`Served`], what one operation supplies; the S3 `impl Handler`,
 //! which runs every request through the same sequence; and [`OPERATIONS`], the table that both
 //! registers the handlers and is what the gateway's early gate consults. An operation without a
 //! row has no handler, and the gateway answers it `501 NotImplemented`.
@@ -23,8 +23,8 @@
 //! routing a request (the gateway), or any S3 behaviour (the use cases in `crate::app`).
 //! Upstream: the gateway's dispatch. Downstream: `crate::app` use cases.
 //!
-//! An operation is one `impl Served` and one row of `ROWS` in the family file named after its
-//! migration batch, the stem `storage/legacy_edge/` uses for the same operations.
+//! Every operation has one `ROWS` entry. Standard operations implement `Served`; browser POST
+//! uses the gateway’s two-stage PostObject registration.
 
 mod access;
 mod envelope;
@@ -34,20 +34,26 @@ mod bucket_access;
 mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
+mod lifecycle_input;
 mod listing_multipart;
+pub(crate) mod metadata_listing;
 mod object_commit;
 mod object_meta;
 mod object_misc;
 mod object_read;
 mod object_write;
+#[cfg(test)]
+mod post_archive_diagnostic_tests;
+mod post_object;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use self::error::handler_error;
-use crate::app::RequestEnvelope;
+pub(super) use self::access::verified_signature;
+pub(super) use self::error::handler_error;
+use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::{AppContext, ServerContextSlot};
-use rustfs_gateway::{Handler, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};
+use rustfs_gateway::{Handler, HandlerError, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -64,14 +70,36 @@ impl GatewayBackend {
         Self { server_ctx }
     }
 
-    /// The fixed sequence: the shared access phase, the operation's own authorization, the count,
-    /// the use case. Nothing is skipped and nothing is reordered per operation.
-    async fn serve<O: Served>(&self, request: Req<O>) -> S3Result<Resp<O>> {
-        let mut envelope = access::admit(&self.server_ctx, request.context()).await?;
-        O::authorize(&mut envelope, &request).await?;
-        record_s3_op(O::METRIC);
-        O::execute(self.server_ctx.app_context(), envelope, request).await
+    /// The fixed sequence: the shared access phase, the operation's own authorization, the SSE
+    /// refusal the gateway deferred, the count, the use case. Nothing is skipped and nothing is
+    /// reordered per operation.
+    async fn serve<O: Served>(&self, request: Req<O>) -> HandlerResult<O> {
+        let mut envelope = access::admit(&self.server_ctx, request.context())
+            .await
+            .map_err(handler_error)?;
+        let authorized = O::authorize(&mut envelope, &request).await;
+        let deferred = request.sse().deferred_refusal().map(|refusal| refusal.error().clone());
+        authorized_then(authorized, deferred, || {
+            record_s3_op(O::METRIC);
+            O::execute(self.server_ctx.app_context(), envelope, request)
+        })
+        .await
     }
+}
+
+/// Runs `execute` only when `authorized` succeeded and the gateway deferred no refusal: a denial
+/// is answered before a refused SSE header, as on legacy RustFS, and a refused request executes
+/// nothing.
+async fn authorized_then<T, Fut: Future<Output = S3Result<T>>>(
+    authorized: S3Result<()>,
+    deferred: Option<HandlerError>,
+    execute: impl FnOnce() -> Fut,
+) -> Result<T, HandlerError> {
+    authorized.map_err(handler_error)?;
+    if let Some(refusal) = deferred {
+        return Err(refusal);
+    }
+    execute().await.map_err(handler_error)
 }
 
 /// One S3 operation the gateway stack serves.
@@ -92,9 +120,20 @@ pub(crate) trait Served: OperationCodec + Sized {
     ) -> impl Future<Output = S3Result<Resp<Self>>> + Send;
 }
 
+/// The gateway's answer for a use case's [`Answered`]: its status when it set one, and the headers
+/// its legacy body wrote. The gateway refuses a header it owns or its encoder wrote with a `500`.
+fn resp<O: Served>(answered: Answered<O::Output>) -> Resp<O> {
+    let Answered { output, status, headers } = answered;
+    match status {
+        Some(status) => Resp::with_status(output, status.as_u16()),
+        None => Resp::new(output),
+    }
+    .with_extra_headers(headers)
+}
+
 impl<O: Served> Handler<O> for GatewayBackend {
     async fn call(&self, request: Req<O>) -> HandlerResult<O> {
-        self.serve(request).await.map_err(handler_error)
+        self.serve(request).await
     }
 }
 
@@ -175,6 +214,49 @@ mod tests {
         );
     }
 
+    fn refusal() -> HandlerError {
+        HandlerError::new(rustfs_gateway_types::ErrorCode::INVALID_REQUEST, "deferred refusal")
+    }
+
+    async fn run(authorized: S3Result<()>, deferred: Option<HandlerError>) -> (Result<u8, HandlerError>, usize) {
+        let executed = std::cell::Cell::new(0);
+        let answer = authorized_then(authorized, deferred, || {
+            executed.set(executed.get() + 1);
+            async { Ok(7) }
+        })
+        .await;
+        (answer, executed.get())
+    }
+
+    #[tokio::test]
+    async fn n_a_denial_is_answered_before_a_deferred_refusal_and_nothing_executes() {
+        let denied = || rustfs_s3_types::s3_error!(AccessDenied, "denied");
+        let (answer, executed) = run(Err(denied()), Some(refusal())).await;
+        assert_eq!(answer, Err(handler_error(denied())));
+        assert_ne!(answer, Err(refusal()));
+        assert_eq!(executed, 0);
+    }
+
+    #[tokio::test]
+    async fn n_an_authorized_request_with_a_deferred_refusal_is_refused_and_never_executes() {
+        let (answer, executed) = run(Ok(()), Some(refusal())).await;
+        assert_eq!(answer, Err(refusal()));
+        assert_eq!(executed, 0);
+    }
+
+    #[tokio::test]
+    async fn n_a_denial_without_a_refusal_is_answered_and_nothing_executes() {
+        let denied = || rustfs_s3_types::s3_error!(AccessDenied, "denied");
+        let (answer, executed) = run(Err(denied()), None).await;
+        assert_eq!(answer, Err(handler_error(denied())));
+        assert_eq!(executed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_authorized_request_without_a_refusal_executes_once() {
+        assert_eq!(run(Ok(()), None).await, (Ok(7), 1));
+    }
+
     #[test]
     fn registration_registers_exactly_the_rows() {
         let backend = Arc::new(GatewayBackend::new(ServerContextSlot::new()));
@@ -182,5 +264,199 @@ mod tests {
         let registered: BTreeSet<&str> = register(OPERATIONS, ServiceBuilder::new(), &backend).registered().collect();
 
         assert_eq!(registered, rows(OPERATIONS).map(|row| row.name).collect());
+    }
+
+    /// An invalid header value does not alter the response status or other headers.
+    #[test]
+    fn a_stored_tag_a_header_cannot_hold_is_left_out_and_the_answer_stands() {
+        for stored in ["a\rb", "a\nb", "a\0b"] {
+            let etag = crate::app::dto_values::stored_etag(stored);
+            let rendered = etag.render(rustfs_gateway_types::EtagRender::HeaderQuoted);
+            let mut response = rustfs_gateway::EncodedResponse::of(200);
+            response.set_header("etag", &rendered);
+            response.set_header("x-amz-version-id", "null");
+
+            assert_eq!(response.status, http::StatusCode::OK, "{stored:?}");
+            assert!(response.headers.get(http::header::ETAG).is_none(), "{stored:?}");
+            assert_eq!(response.headers.get("x-amz-version-id").map(|value| value.as_bytes()), Some(&b"null"[..]));
+        }
+    }
+
+    #[test]
+    fn an_answered_status_and_headers_reach_the_gateway_answer_unchanged_and_absent_ones_add_nothing() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-amz-tagging-count", http::HeaderValue::from_static("2"));
+        headers.append("x-amz-meta-repeated", http::HeaderValue::from_static("one"));
+        headers.append("x-amz-meta-repeated", http::HeaderValue::from_static("two"));
+        let answered = Answered {
+            output: rustfs_gateway::dto::HeadBucketOutput::default(),
+            status: Some(http::StatusCode::PARTIAL_CONTENT),
+            headers: headers.clone(),
+        };
+
+        let (_, status, extra) = resp::<rustfs_gateway::dto::HeadBucket>(answered).into_parts();
+        let (_, default_status, no_extra) =
+            resp::<rustfs_gateway::dto::HeadBucket>(Answered::new(Default::default())).into_parts();
+
+        assert_eq!((status, extra), (206, headers));
+        assert_eq!(default_status, 200);
+        assert!(no_extra.is_empty());
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExtraCase {
+        Repeated,
+        OwnedConflict,
+        EncoderConflict,
+    }
+
+    struct WireAnswer(ExtraCase);
+    impl Handler<rustfs_gateway::dto::HeadObject> for WireAnswer {
+        async fn call(&self, _request: Req<rustfs_gateway::dto::HeadObject>) -> HandlerResult<rustfs_gateway::dto::HeadObject> {
+            let mut headers = http::HeaderMap::new();
+            headers.append("vary", http::HeaderValue::from_static("Origin"));
+            headers.append("vary", http::HeaderValue::from_static("Access-Control-Request-Method"));
+            headers.insert(
+                "x-amz-restore-request-date",
+                http::HeaderValue::from_static("Fri, 02 Jan 2026 03:04:05 GMT"),
+            );
+            match self.0 {
+                ExtraCase::Repeated => {}
+                ExtraCase::OwnedConflict => {
+                    headers.insert("connection", http::HeaderValue::from_static("close"));
+                }
+                ExtraCase::EncoderConflict => {
+                    headers.insert("content-type", http::HeaderValue::from_static("text/html"));
+                }
+            }
+            object_read::head_response(Answered {
+                output: crate::app::object_usecase::HeadObjectOutputFacts {
+                    dto: rustfs_gateway::dto::HeadObjectOutput {
+                        content_type: Some("text/plain".to_owned()),
+                        content_length: Some(7),
+                        ..Default::default()
+                    },
+                    etag: Some(crate::app::object_usecase::ResponseEtag {
+                        opaque: "a\\\"b".to_owned(),
+                        weak: true,
+                    }),
+                },
+                status: Some(http::StatusCode::PARTIAL_CONTENT),
+                headers,
+            })
+            .map_err(handler_error)
+        }
+    }
+
+    async fn answered_over_socket(case: ExtraCase) -> http::Response<bytes::Bytes> {
+        use http_body_util::BodyExt as _;
+        use hyper_util::rt::TokioIo;
+        use rustfs_gateway::{Credentials, RegionSet, SigV4Authenticator, StaticCredentials, allow_when};
+        let credentials =
+            Arc::new(StaticCredentials::new().with(Credentials::new("answeredkey", b"answered-fixture-secret").unwrap()));
+        let service = Arc::new(
+            ServiceBuilder::new()
+                .authenticator(SigV4Authenticator::new(credentials, RegionSet::new(["us-east-1"]).unwrap()))
+                .authorizer(allow_when(|_| true))
+                .register::<rustfs_gateway::dto::HeadObject, _>(Arc::new(WireAnswer(case)))
+                .build()
+                .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(
+                    TokioIo::new(socket),
+                    hyper::service::service_fn(move |request| {
+                        let service = Arc::clone(&service);
+                        async move { Ok::<_, std::convert::Infallible>(service.call(request).await) }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket)).await.unwrap();
+        let client = tokio::spawn(connection);
+        let request = test_support::signed_request(
+            test_support::Signed::Header,
+            http::Method::HEAD,
+            "/bucket/key",
+            "",
+            "answeredkey",
+            "answered-fixture-secret",
+        );
+        let response = sender.send_request(request).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let body = body.collect().await.unwrap().to_bytes();
+        drop(sender);
+        server.await.unwrap();
+        client.await.unwrap().unwrap();
+        http::Response::from_parts(parts, body)
+    }
+
+    #[tokio::test]
+    async fn answered_headers_and_conflicts_are_observed_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for (case, status) in [
+                (ExtraCase::Repeated, 206),
+                (ExtraCase::OwnedConflict, 500),
+                (ExtraCase::EncoderConflict, 500),
+            ] {
+                assert_answered_case(case, status).await;
+            }
+        })
+        .await
+        .expect("socket exchange completes");
+    }
+    async fn assert_answered_case(case: ExtraCase, status: u16) {
+        let response = answered_over_socket(case).await;
+        assert_eq!(response.status().as_u16(), status);
+        assert!(response.body().is_empty(), "HEAD never delivers an entity body");
+        if status == 206 {
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all("vary")
+                    .iter()
+                    .map(|v| v.as_bytes())
+                    .collect::<Vec<_>>(),
+                [b"Origin".as_slice(), b"Access-Control-Request-Method".as_slice()]
+            );
+            assert_eq!(response.headers()["x-amz-restore-request-date"], "Fri, 02 Jan 2026 03:04:05 GMT");
+            assert_eq!(response.headers()["content-type"], "text/plain");
+            assert_eq!(response.headers()["etag"].as_bytes(), b"W/\"a\\\"b\"");
+        } else {
+            assert!(
+                response.headers().get("x-amz-restore-request-date").is_none(),
+                "extras do not leak onto the refusal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_raw_headers_are_observed_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), assert_answered_case(ExtraCase::Repeated, 206))
+            .await
+            .expect("socket exchange completes");
+    }
+
+    #[tokio::test]
+    async fn answered_transport_header_conflict_is_rejected_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), assert_answered_case(ExtraCase::OwnedConflict, 500))
+            .await
+            .expect("socket exchange completes");
+    }
+
+    #[tokio::test]
+    async fn answered_encoder_header_conflict_is_rejected_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), assert_answered_case(ExtraCase::EncoderConflict, 500))
+            .await
+            .expect("socket exchange completes");
     }
 }

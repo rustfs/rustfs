@@ -56,12 +56,10 @@ required-features = ["swift"]
 name = "swift_object_integration_test"
 required-features = ["swift"]
 
-# Starts an embedded server on the gateway stack, which only a build with the
-# feature can select.
+# Starts an embedded server on the gateway stack.
 [[test]]
 name = "embedded_gateway_stack_test"
 path = "tests/embedded_gateway_stack_test/main.rs"
-required-features = ["gateway-stack"]
 
 [features]
 internode-transport = ["rustfs-ecstore/internode-transport", "rustfs-rio/internode-transport"]
@@ -77,19 +75,16 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
-# The debug-only E2E binary also carries the gateway S3 stack, so the gateway smoke
-# lane runs the same artifact as the legacy one with RUSTFS_S3_STACK as its only change.
-e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks", "gateway-stack"]
+e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
-# The rustfs-gateway S3 stack, selected at startup with RUSTFS_S3_STACK=gateway
-# (rustfs/backlog#2734). Under construction: off by default and never enabled in a
-# release build; the stack refuses to compile without debug assertions, and
-# `scripts/check_connect_release_boundary.py` keeps every release-reachable feature from enabling it.
-gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter", "dep:rustfs-gateway-stream"]
+# Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
+cuobject = ["dep:rustfs-cuobject", "rustfs-cuobject/server"]
+# NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
+nixl = ["dep:rustfs-nixl", "rustfs-nixl/sys"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
@@ -97,6 +92,12 @@ dial9 = ["rustfs-obs/dial9"]
 diagnostic-allocator-live = []
 # Default-off sampled local batch wall/CPU and request correlation diagnostics.
 diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
+# Exact Hyper HTTP/2 PING ACK timeout accounting. Diagnostic-only because the
+# upstream tracing event is unstable and requires an explicit build cfg.
+diagnostic-internode-http2-ping = [
+    "rustfs-obs/diagnostic-internode-http2-ping",
+    "rustfs-protos/diagnostic-internode-http2-ping",
+]
 # Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
 # Diagnostic-only fixed-prefix attribution for actual Scanner metadata visits.
@@ -128,7 +129,6 @@ hotpath = [
     "rustfs-kms/hotpath",
     "rustfs-lock/hotpath",
     "rustfs-log-analyzer/hotpath",
-    "rustfs-madmin/hotpath",
     "rustfs-notify/hotpath",
     "rustfs-object-capacity/hotpath",
     "rustfs-object-data-cache/hotpath",
@@ -173,7 +173,6 @@ hotpath-alloc = [
     "rustfs-kms/hotpath-alloc",
     "rustfs-lock/hotpath-alloc",
     "rustfs-log-analyzer/hotpath-alloc",
-    "rustfs-madmin/hotpath-alloc",
     "rustfs-notify/hotpath-alloc",
     "rustfs-object-capacity/hotpath-alloc",
     "rustfs-object-data-cache/hotpath-alloc",
@@ -218,7 +217,6 @@ hotpath-cpu = [
     "rustfs-kms/hotpath-cpu",
     "rustfs-lock/hotpath-cpu",
     "rustfs-log-analyzer/hotpath-cpu",
-    "rustfs-madmin/hotpath-cpu",
     "rustfs-notify/hotpath-cpu",
     "rustfs-object-capacity/hotpath-cpu",
     "rustfs-object-data-cache/hotpath-cpu",
@@ -258,6 +256,8 @@ rustfs-config = { workspace = true, features = ["notify", "server-config-model"]
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-cuobject = { workspace = true, optional = true }
+rustfs-nixl = { workspace = true, optional = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
 rustfs-keystone = { workspace = true }
@@ -270,9 +270,11 @@ rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
-rustfs-gateway = { workspace = true, optional = true }
-rustfs-gateway-adapter = { workspace = true, optional = true }
-rustfs-gateway-stream = { workspace = true, optional = true }
+rustfs-gateway = { workspace = true }
+rustfs-gateway-adapter = { workspace = true }
+rustfs-gateway-core = { workspace = true }
+rustfs-gateway-dialect-rustfs-admin = { workspace = true }
+rustfs-gateway-stream = { workspace = true }
 rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
@@ -353,7 +355,7 @@ zstd.workspace = true
 ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
-rustix = { workspace = true, features = ["param"] }
+rustix = { workspace = true, features = ["param", "fs"] }
 x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
@@ -367,7 +369,7 @@ async_zip = { workspace = true, default-features = false, features = ["tokio", "
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
-rsa = { workspace = true, features = ["sha2"] }
+rsa = { workspace = true, features = ["pkcs1v15"] }
 base64-simd.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 const-str = { workspace = true, features = ["std", "proc"] }
@@ -393,7 +395,7 @@ zip = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 regex = { workspace = true }
-aes-gcm = { workspace = true, features = ["rand_core"] }
+aes-gcm = { workspace = true, features = ["rand_core", "zeroize"] }
 chacha20poly1305 = { workspace = true }
 
 # Observability and Metrics
@@ -418,6 +420,7 @@ object = { workspace = true, optional = true, features = ["read", "std", "elf"] 
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
 
 [dev-dependencies]
+h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
@@ -443,14 +446,4 @@ rustfs-ecstore = { workspace = true, features = ["test-util"] }
 rustfs-heal = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
-http.workspace = true
-futures.workspace = true
-s3s = { workspace = true, features = ["minio"] }
-clap = { workspace = true, features = ["derive", "env"] }
-hyper-util = { workspace = true, features = [
-    "tokio",
-    "server-auto",
-    "server-graceful",
-    "tracing",
-] }
 shadow-rs = { workspace = true, default-features = false, features = ["build"] }

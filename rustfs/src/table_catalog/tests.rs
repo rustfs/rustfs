@@ -33,6 +33,9 @@ mod object_maintenance_equivalence;
 #[path = "tests/object_backup_transfer.rs"]
 mod object_backup_transfer;
 
+#[path = "tests/rename_recovery.rs"]
+mod rename_recovery;
+
 #[tokio::test]
 async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     let object_backend = TestCatalogObjectBackend::default();
@@ -1249,11 +1252,6 @@ async fn catalog_backings_hide_and_reject_mutation_of_inactive_resources() {
                 .expect("views should list")
                 .is_empty()
         );
-        assert_matches!(
-            store.drop_namespace(&bucket, &namespace.public_name()).await,
-            Err(TableCatalogStoreError::Conflict(_))
-        );
-
         backend.seed_object(&bucket, &new_metadata, b"{}".to_vec()).await;
         let commit_error = store
             .commit_table(TableCommitRequest {
@@ -1285,6 +1283,18 @@ async fn catalog_backings_hide_and_reject_mutation_of_inactive_resources() {
             .await
             .expect_err("inactive view must reject replacement");
         assert_matches!(view_error, TableCatalogStoreError::NotFound(_));
+
+        store
+            .drop_namespace(&bucket, &namespace.public_name())
+            .await
+            .expect("deleted resources should allow namespace deletion");
+        assert!(
+            store
+                .get_namespace(&bucket, &namespace.public_name())
+                .await
+                .expect("namespace lookup should succeed")
+                .is_none()
+        );
     }
 }
 
@@ -7876,7 +7886,7 @@ async fn object_catalog_pagination_bounds_sparse_namespace_scans() {
 }
 
 #[tokio::test]
-async fn object_catalog_drop_namespace_scans_all_pages_for_inactive_resources() {
+async fn object_catalog_drop_namespace_scans_all_pages_for_pending_resources() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -7903,7 +7913,7 @@ async fn object_catalog_drop_namespace_scans_all_pages_for_inactive_resources() 
         &table,
         default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
     );
-    inactive.state = TableCatalogEntryState::Deleted;
+    inactive.state = TableCatalogEntryState::Deleting;
     store
         .write_entry(
             store.catalog_bucket(),
@@ -14361,12 +14371,24 @@ fn table_metadata_pointer_json_round_trips() {
     assert_eq!(pointer.metadata_location, location);
 }
 
-#[test]
-fn object_mutation_entrypoints_call_reserved_prefix_guard() {
+const PUT_OBJECT_MUTATION_BOUNDARY: &str = "self.put_object_core(write, body, input.frame_trailers, start_time).await?;";
+
+fn assert_object_mutation_reserved_prefix_guards(delete: &str) {
+    assert_object_mutation_reserved_prefix_sources(
+        delete,
+        include_str!("../app/object/put.rs"),
+        include_str!("../app/object/extract.rs"),
+    );
+}
+
+fn assert_object_mutation_reserved_prefix_sources(delete: &str, put: &str, extract: &str) {
     // Scope every assertion to one implementation method: a guard in a sibling
     // method (or its tests) must not satisfy another entrypoint's contract.
     fn method<'a>(source: &'a str, signature: &str) -> &'a str {
         source
+            .split("\nmod tests {")
+            .next()
+            .unwrap()
             .split_once(signature)
             .unwrap_or_else(|| panic!("missing object mutation method: {signature}"))
             .1
@@ -14385,25 +14407,45 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         }
     }
 
-    let put = include_str!("../app/object/put.rs");
     let copy = include_str!("../app/object/copy.rs");
-    let delete = include_str!("../app/object/delete.rs");
-    let extract = include_str!("../app/object/extract.rs");
     let restore = include_str!("../app/object/restore.rs");
 
     for (source, signature, delegate) in [
-        (put, "fn execute_put_object(", "self.execute_put_object_boxed(_fs, req)"),
-        (put, "fn execute_put_object_boxed<'a>(", "self.execute_put_object_inner(_fs, req)"),
-        (put, "fn execute_put_object_inner(", "self.execute_put_object_extract(req)"),
-        (copy, "fn execute_copy_object(", "self.execute_copy_object_body_boxed(req)"),
-        (copy, "fn execute_copy_object_body_boxed(", "self.execute_copy_object_body(req)"),
-        (delete, "fn execute_delete_object(", "owner.execute_delete_object_owned(req)"),
-        (delete, "fn execute_delete_objects(", "owner.execute_delete_objects_owned(req)"),
-        (extract, "fn execute_put_object_extract(", "self.execute_put_object_extract_boxed(req)"),
+        (put, "fn execute_put_object_owned(", "self.execute_put_object_inner(envelope, input)"),
+        (
+            put,
+            "fn execute_put_object_inner(",
+            "self.execute_put_object_extract_owned(envelope, input)",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_owned(",
+            "self.execute_copy_object_body_boxed(envelope, input)",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_body_boxed(",
+            "self.execute_copy_object_body(envelope, input)",
+        ),
+        (
+            delete,
+            "fn execute_delete_object(",
+            "self.execute_delete_object_fields(\n            envelope,\n            input.bucket.as_str().to_owned(),\n            input.key.as_str().to_owned(),\n            input.version_id,\n        )",
+        ),
+        (
+            delete,
+            "fn execute_delete_object_fields(",
+            "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
+        ),
+        (
+            delete,
+            "fn execute_delete_objects(",
+            "owner.execute_delete_objects_owned(envelope, input)",
+        ),
         (
             extract,
-            "fn execute_put_object_extract_boxed(",
-            "self.execute_put_object_extract_inner(req)",
+            "fn execute_put_object_extract_owned(",
+            "self.execute_put_object_extract_inner(envelope, input)",
         ),
     ] {
         assert!(
@@ -14419,7 +14461,7 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
             put,
             "fn execute_put_object_inner(",
             "validate_new_object_key(&key, request_method_name)?;",
-            "self.put_object_core(write, body, start_time).await?;",
+            PUT_OBJECT_MUTATION_BOUNDARY,
         ),
         (
             copy,
@@ -14443,7 +14485,7 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         assert_ordered(method(source, signature), &[key_validation, key_guard, mutation_boundary]);
     }
     assert_ordered(
-        method(restore, "fn execute_restore_object("),
+        method(restore, "fn execute_restore_object_owned("),
         &[
             "validate_table_catalog_object_mutation(&bucket, &object).await?;",
             store_resolution,
@@ -14468,17 +14510,151 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     );
 }
 
+#[test]
+fn object_mutation_entrypoints_call_reserved_prefix_guard() {
+    assert_object_mutation_reserved_prefix_guards(include_str!("../app/object/delete.rs"));
+}
+
+#[test]
+fn object_mutation_reserved_prefix_guard_rejects_broken_delete_chains() {
+    fn assert_rejected(delete: &str, name: &str, expected: &str) {
+        let failure = std::panic::catch_unwind(|| assert_object_mutation_reserved_prefix_guards(delete)).expect_err(name);
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains(expected), "{name}: expected {expected}, got {message}");
+    }
+
+    let delete = include_str!("../app/object/delete.rs");
+    for (name, from, to) in [
+        (
+            "typed edge bypasses common fields",
+            "self.execute_delete_object_fields(",
+            "self.execute_delete_object_unchecked(",
+        ),
+        (
+            "common fields bypasses owned implementation",
+            "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
+            "owner.execute_delete_object_unchecked(envelope, bucket, key, version_id)",
+        ),
+        (
+            "batch delegate uses different input",
+            "owner.execute_delete_objects_owned(envelope, input)",
+            "owner.execute_delete_objects_owned(envelope, changed_input)",
+        ),
+        ("typed method missing", "fn execute_delete_object(", "fn missing_delete_object("),
+        (
+            "common method missing",
+            "fn execute_delete_object_fields(",
+            "fn missing_delete_object_fields(",
+        ),
+        (
+            "owned method missing",
+            "fn execute_delete_object_owned(",
+            "fn missing_delete_object_owned(",
+        ),
+        (
+            "key validation missing",
+            "validate_object_key(&key, \"DELETE\")?;",
+            "validate_other_key(&key, \"DELETE\")?;",
+        ),
+        (
+            "reserved prefix guard missing",
+            "validate_table_catalog_object_mutation(&bucket, &key).await?;",
+            "validate_other_mutation(&bucket, &key).await?;",
+        ),
+    ] {
+        assert!(delete.contains(from), "mutation target missing: {name}");
+        let broken = delete.replacen(from, to, 1);
+        let production = broken.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let (sibling, test_mention, expected) = if from.starts_with("fn ") {
+            (
+                String::new(),
+                format!("{from}&self) {{}}"),
+                format!("missing object mutation method: {from}"),
+            )
+        } else {
+            let expected = match from {
+                "self.execute_delete_object_fields(" => "fn execute_delete_object( must call its guarded implementation",
+                "owner.execute_delete_object_owned(envelope, bucket, key, version_id)" => {
+                    "fn execute_delete_object_fields( must call its guarded implementation"
+                }
+                "owner.execute_delete_objects_owned(envelope, input)" => {
+                    "fn execute_delete_objects( must call its guarded implementation"
+                }
+                _ => from,
+            };
+            (
+                format!("impl Sibling {{\n    async fn unrelated(&self) {{\n        {from};\n    }}\n}}"),
+                format!("async fn mentions(&self) {{ {from}; }}"),
+                expected.to_owned(),
+            )
+        };
+        let broken = format!("{production}\n{sibling}\n#[cfg(test)]\nmod tests {{\n    impl Fixture {{ {test_mention} }}\n}}\n");
+        assert_rejected(&broken, name, &expected);
+    }
+
+    let owned_signature = "async fn execute_delete_object_owned(";
+    let (prefix, owned) = delete.split_once(owned_signature).unwrap();
+    let guard = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+    for (name, anchor, before) in [
+        ("guard before key validation", "validate_object_key(&key, \"DELETE\")?;", true),
+        ("guard after store resolution", "validate_bucket_exists(&store, &bucket).await?;", false),
+    ] {
+        assert!(owned.contains(guard) && owned.contains(anchor), "mutation target missing: {name}");
+        let without_guard = owned.replacen(guard, "", 1);
+        let replacement = if before {
+            format!("{guard}\n{anchor}")
+        } else {
+            format!("{anchor}\n{guard}")
+        };
+        let broken = format!("{prefix}{owned_signature}{}", without_guard.replacen(anchor, &replacement, 1));
+        let expected = if before {
+            guard
+        } else {
+            "let Some(store) = self.object_store()"
+        };
+        assert_rejected(&broken, name, expected);
+    }
+}
+
+#[test]
+fn object_mutation_guard_rejects_wrong_delete_input_forwarding() {
+    let delete = include_str!("../app/object/delete.rs");
+    let typed_call = "self.execute_delete_object_fields(\n            envelope,\n            input.bucket.as_str().to_owned(),\n            input.key.as_str().to_owned(),\n            input.version_id,\n        )";
+    let owned_call = "owner.execute_delete_object_owned(envelope, bucket, key, version_id)";
+    for (signature, call, fields) in [
+        (
+            "fn execute_delete_object(",
+            typed_call,
+            [
+                "input.bucket.as_str().to_owned()",
+                "input.key.as_str().to_owned()",
+                "input.version_id",
+            ],
+        ),
+        ("fn execute_delete_object_fields(", owned_call, ["bucket", "key", "version_id"]),
+    ] {
+        for field in fields {
+            let forwarded = call.replacen(field, "other_input", 1);
+            let broken = delete.replacen(call, &forwarded, 1);
+            assert_ne!(broken, delete, "fixture must replace {field} in {signature}");
+            let message = crate::guard_sources::panic_message(|| assert_object_mutation_reserved_prefix_guards(&broken));
+            assert!(
+                message.contains(&format!("{signature} must call its guarded implementation")),
+                "{field}: {message}"
+            );
+        }
+    }
+}
+
 const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+const MULTIPART_BORROWED_KEY_GUARD: &str = "validate_table_catalog_object_mutation(bucket, key).await?;";
 const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
 const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
+const OBJECT_METADATA_BORROWED_KEY_GUARD: &str = MULTIPART_BORROWED_KEY_GUARD;
 
 fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
-    assert_eq!(
-        source.count(MULTIPART_KEY_GUARD),
-        4,
-        "reserved-prefix guard calls across {}",
-        source.describe()
-    );
+    let guard_calls = source.count(MULTIPART_KEY_GUARD) + source.count(MULTIPART_BORROWED_KEY_GUARD);
+    assert_eq!(guard_calls, 4, "reserved-prefix guard calls across {}", source.describe());
 }
 
 fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
@@ -14489,7 +14665,7 @@ fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sour
         source.describe()
     );
     assert_eq!(
-        source.count(OBJECT_METADATA_KEY_GUARD),
+        source.count(OBJECT_METADATA_KEY_GUARD) + source.count(OBJECT_METADATA_BORROWED_KEY_GUARD),
         2,
         "reserved-prefix guard calls across {}",
         source.describe()
@@ -14506,10 +14682,9 @@ fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    assert_object_metadata_reserved_prefix_guard_calls(&crate::guard_sources::SourceSet::production(
-        "src/storage/ecfs.rs",
-        "src/storage/legacy_edge",
-    ));
+    // Tagging, retention and legal-hold mutations go through the owned use cases.
+    let sources = crate::guard_sources::SourceSet::production("src/app/mod.rs", "src/app/object_meta");
+    assert_object_metadata_reserved_prefix_guard_calls(&sources);
 }
 
 /// `count` production calls of `guard`, one per method, for count-guard fixtures.
@@ -14528,7 +14703,7 @@ fn guard_fixture(files: &[(&str, &str)], file: &str, split_dir: &str) -> crate::
 #[test]
 fn multipart_count_guard_fails_when_a_dropped_production_call_is_replaced_by_test_mentions() {
     let parent = format!(
-        "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_KEY_GUARD}\n    }}\n}}\n",
+        "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_BORROWED_KEY_GUARD}\n    }}\n}}\n",
         guarded_methods(MULTIPART_KEY_GUARD, 2)
     );
     let source = guard_fixture(
@@ -14562,6 +14737,134 @@ fn multipart_count_guard_passes_when_calls_move_into_the_split_directory() {
     );
 
     assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn multipart_count_guard_accepts_borrowed_resource_names() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 3).as_str()),
+            (
+                "src/app/multipart_usecase/upload_part.rs",
+                guarded_methods(MULTIPART_BORROWED_KEY_GUARD, 1).as_str(),
+            ),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_count_guard_accepts_owned_and_borrowed_resource_names() {
+    for borrowed in 0..=2 {
+        let production = format!(
+            "{}{}{}",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 2 - borrowed),
+            guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, borrowed),
+        );
+        let source = guard_fixture(&[("src/app/mod.rs", &production)], "src/app/mod.rs", "src/app/object_meta");
+        assert_object_metadata_reserved_prefix_guard_calls(&source);
+    }
+}
+
+#[test]
+fn object_metadata_borrowed_guard_rejects_test_only_replacements() {
+    let source = format!(
+        "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mention() {{ {OBJECT_METADATA_BORROWED_KEY_GUARD} }}\n}}\n",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 1),
+    );
+    let source = guard_fixture(&[("src/app/mod.rs", &source)], "src/app/mod.rs", "src/app/object_meta");
+    let message = crate::guard_sources::panic_message(|| assert_object_metadata_reserved_prefix_guard_calls(&source));
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
+}
+
+#[test]
+fn multipart_count_guard_accepts_owned_and_borrowed_resource_arguments() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 2).as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+            (
+                "src/app/multipart_usecase/upload_part.rs",
+                guarded_methods(MULTIPART_BORROWED_KEY_GUARD, 1).as_str(),
+            ),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn multipart_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        MULTIPART_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        MULTIPART_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        MULTIPART_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(MULTIPART_KEY_GUARD, 3)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/multipart_usecase.rs", parent.as_str()),
+                ("src/app/multipart_usecase/upload_part.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/multipart_usecase.rs",
+            "src/app/multipart_usecase",
+        );
+
+        let message = crate::guard_sources::panic_message(move || assert_multipart_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
+}
+
+#[test]
+fn object_metadata_key_count_guard_accepts_borrowed_resource_names() {
+    let source = guard_fixture(
+        &[
+            ("src/app/mod.rs", guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2).as_str()),
+            (
+                "src/app/object_meta/retention.rs",
+                guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 2).as_str(),
+            ),
+        ],
+        "src/app/mod.rs",
+        "src/app/object_meta",
+    );
+
+    assert_object_metadata_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_key_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {OBJECT_METADATA_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/mod.rs", parent.as_str()),
+                ("src/app/object_meta/retention.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/mod.rs",
+            "src/app/object_meta",
+        );
+        let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
 }
 
 #[test]
@@ -15757,6 +16060,22 @@ async fn object_catalog_source_recreation_after_rename_preserves_the_original_id
             .seed_object(bucket, &replacement_metadata, serde_json::to_vec(&replacement_json).unwrap())
             .await;
 
+        if destination_namespace != "sales" {
+            restarted.drop_namespace(bucket, "sales").await.unwrap();
+            assert!(restarted.get_namespace(bucket, "sales").await.unwrap().is_none());
+            assert_eq!(backend.read_object(bucket, &next).await.unwrap(), Some(before_next.clone()));
+            assert_eq!(
+                restarted
+                    .load_table(bucket, destination_namespace, "orders_v2")
+                    .await
+                    .unwrap(),
+                Some(renamed.clone())
+            );
+            restarted
+                .create_namespace(test_namespace_entry(bucket, &source_namespace))
+                .await
+                .unwrap();
+        }
         restarted
             .create_table(replacement.clone())
             .await
@@ -16389,4 +16708,53 @@ async fn compaction_planner_stats_data_files_without_reading_their_bodies() {
     assert_eq!(report.candidate_file_count, 2);
     assert_eq!(backend.metadata_call_count().await, 2);
     assert_eq!(backend.read_call_count().await, 2, "only the manifest list and manifest may be read");
+}
+
+#[test]
+fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
+    let put = include_str!("../app/object/put.rs");
+    let extract = include_str!("../app/object/extract.rs");
+    for (surface, from, to) in [
+        (
+            "put",
+            "self.execute_put_object_inner(envelope, input)",
+            "self.unchecked_put(envelope, input)",
+        ),
+        ("put", "validate_new_object_key(&key, request_method_name)?;", "unchecked_key();"),
+        ("put", PUT_OBJECT_MUTATION_BOUNDARY, "unchecked_put_core();"),
+        (
+            "put",
+            "validate_table_catalog_object_mutation(&bucket, &key).await?;",
+            "unchecked_table();",
+        ),
+        (
+            "extract",
+            "self.execute_put_object_extract_inner(envelope, input)",
+            "self.unchecked_extract(envelope, input)",
+        ),
+    ] {
+        let source = match surface {
+            "put" => put,
+            _ => extract,
+        };
+        assert!(source.contains(from), "mutation target missing: {surface}");
+        let broken = source.replacen(from, to, 1);
+        let failure = crate::guard_sources::panic_message(|| {
+            assert_object_mutation_reserved_prefix_sources(
+                include_str!("../app/object/delete.rs"),
+                if surface == "put" { &broken } else { put },
+                if surface == "extract" { &broken } else { extract },
+            );
+        });
+        let expected = if from.starts_with("validate_") || from == PUT_OBJECT_MUTATION_BOUNDARY {
+            format!("missing or out-of-order object mutation guard: {from}")
+        } else {
+            let signature = match surface {
+                "put" => "fn execute_put_object_owned(",
+                _ => "fn execute_put_object_extract_owned(",
+            };
+            format!("{signature} must call its guarded implementation")
+        };
+        assert!(failure.contains(&expected), "{surface}: expected {expected}, got {failure}");
+    }
 }

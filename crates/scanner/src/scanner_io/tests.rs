@@ -27,10 +27,10 @@ use crate::storage_api::owner::{
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
-    DATA_USAGE_BLOOM_NAME_PATH, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints,
-    ScannerObjectOptions, ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests,
-    init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
-    save_config,
+    BUCKET_META_PREFIX, DATA_USAGE_BLOOM_NAME_PATH, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
+    InstanceContext, PoolEndpoints, ScannerObjectOptions, ScannerPutObjReader, UNKNOWN_TIER,
+    init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
+    new_disk, path2_bucket_object_with_base_path, save_config,
 };
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
@@ -45,17 +45,24 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
+#[cfg(unix)]
+mod checkpoint_owner;
 mod cold_bucket_service;
 mod collector_lifecycle;
 mod cycle_collector_diagnostics;
 mod expiry_lock;
 mod listing_window_scope;
+pub(super) mod local_drive_recovery;
 mod node_admission;
 mod partial_bucket_carry;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
 mod service_cohort;
+pub(crate) mod source_turn_retirement;
+pub(crate) mod usage_candidate_seal;
 mod usage_expiration;
+pub(crate) mod usage_remote_drain;
+mod usage_watch_cycle;
 
 #[derive(Clone)]
 struct FixedWorkloadProvider {
@@ -98,6 +105,7 @@ fn scanner_activity_preflight_defers_a_temporarily_offline_peer() {
 
 #[test]
 fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
+    let before = global_metrics().scan_observation().snapshot();
     let preflight = scanner_segment_reuse_activation_preflight();
 
     assert!(preflight.production_activation);
@@ -118,6 +126,9 @@ fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
             "distributed_without_peer_invalidation",
         ]
     );
+    let after = global_metrics().scan_observation().snapshot();
+    assert_eq!(after.prefix_scope_resolution.evaluated, before.prefix_scope_resolution.evaluated);
+    assert_eq!(after.prefix_cycle_completion.evaluated, before.prefix_cycle_completion.evaluated);
 }
 
 #[test]
@@ -538,14 +549,105 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
     setup_local_scanner_store(2, 4).await
 }
 
-async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> (tempfile::TempDir, Arc<ECStore>) {
+pub(crate) async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
+    let store = open_local_scanner_store(temp_dir.path(), pool_count, drives_per_set, false).await;
+    (temp_dir, store)
+}
+
+#[tokio::test]
+async fn epoch_fenced_cache_save_uses_background_admission_on_every_disk() {
+    #[derive(Clone)]
+    struct AdmissionRecorder {
+        root: String,
+        counts: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    }
+    impl metrics::Recorder for AdmissionRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            if key.name() != "rustfs_disk_io_admission_total"
+                || !key
+                    .labels()
+                    .any(|label| label.key() == "class" && label.value() == "background")
+            {
+                return metrics::Counter::noop();
+            }
+            let Some(disk) = key
+                .labels()
+                .find(|label| label.key() == "disk" && label.value().starts_with(&self.root))
+            else {
+                return metrics::Counter::noop();
+            };
+            metrics::Counter::from_arc(
+                self.counts
+                    .lock()
+                    .expect("admission counters")
+                    .entry(disk.value().to_string())
+                    .or_default()
+                    .clone(),
+            )
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+    let (root, store) = setup_local_scanner_store(1, 4).await;
+    let set = store.pools[0].disk_set[0].clone();
+    let epoch = scanner_publication_epoch(set.clone()).await.expect("publication epoch");
+    let cache_name = "background-admission/.usage-cache.bin";
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "background-admission".to_string();
+    let recorder = AdmissionRecorder {
+        root: root.path().to_str().expect("fixture path").to_string(),
+        counts: Arc::default(),
+    };
+    let counts = recorder.counts.clone();
+    // nextest runs this test in its own process; the recorder also observes the
+    // detached commit tasks and filters out every disk outside this fixture.
+    metrics::set_global_recorder(recorder).expect("native save recorder");
+    cache.save(set.clone(), cache_name).await.expect("unclassified control save");
+    assert!(counts.lock().expect("control counters").is_empty());
+    let revisions = DataUsageCache::read_revisions(set.clone(), cache_name)
+        .await
+        .expect("cache revisions");
+    cache.info.next_cycle = 7;
+    cache
+        .save_with_revisions_for_epoch(set.clone(), cache_name, &revisions, epoch, CancellationToken::new())
+        .await
+        .expect("background primary and backup save");
+    {
+        let counts = counts.lock().expect("background counters");
+        assert_eq!(counts.len(), 4, "every local disk must receive background cache I/O");
+        assert!(counts.values().all(|counter| counter.load(Ordering::Relaxed) > 0));
+    }
+    for name in [cache_name.to_string(), format!("{cache_name}.bkp")] {
+        let body = crate::read_config(set.clone(), &path_join_buf(&[crate::BUCKET_META_PREFIX, &name]))
+            .await
+            .expect("persisted cache copy");
+        let saved: DataUsageCache = rmp_serde::from_slice(&body).expect("decode persisted cache");
+        assert_eq!(saved.info.name, cache.info.name);
+        assert_eq!(saved.info.next_cycle, 7);
+    }
+}
+
+async fn open_local_scanner_store(
+    root: &std::path::Path,
+    pool_count: usize,
+    drives_per_set: usize,
+    process_boot: bool,
+) -> Arc<ECStore> {
+    init_ecstore_config_for_scanner_tests();
     let mut pools = Vec::new();
     for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
         for disk_index in 0..drives_per_set {
-            let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
+            let disk_path = root.join(format!("pool{pool_index}-disk{disk_index}"));
             tokio::fs::create_dir_all(&disk_path)
                 .await
                 .expect("multi-pool scanner test disk should be created");
@@ -567,7 +669,18 @@ async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> 
     }
 
     let endpoint_pools = EndpointServerPools::from(pools);
+    if process_boot {
+        crate::storage_api::ecstore_init_local_disks(endpoint_pools.clone())
+            .await
+            .expect("process disk registry");
+        let store = ECStore::new("127.0.0.1:0".parse().expect("test address"), endpoint_pools, CancellationToken::new())
+            .await
+            .expect("process scanner store");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+        return store;
+    }
     let instance_ctx = Arc::new(InstanceContext::new());
+    instance_ctx.set_endpoints(endpoint_pools.clone());
     init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
         .await
         .expect("multi-pool local disks should initialize");
@@ -580,8 +693,21 @@ async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> 
     .await
     .expect("multi-pool ECStore should initialize");
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+    assert_eq!(
+        store
+            .instance_endpoints()
+            .expect("scanner fixture must publish its instance endpoints")
+            .0
+            .len(),
+        pool_count
+    );
+    let owner = store
+        .scanner_usage_watch_store_handle()
+        .await
+        .expect("scanner fixture must expose its live metadata owner");
+    assert!(Arc::ptr_eq(&owner, &store), "scanner watch metadata owner must be this fixture");
 
-    (temp_dir, store)
+    store
 }
 
 #[tokio::test]
@@ -1050,7 +1176,7 @@ async fn checkpoint_rejects_unreadable_or_changed_global_fence() {
     }
 }
 
-async fn wait_for_namespace_commit_tails(store: &ECStore) {
+pub(crate) async fn wait_for_namespace_commit_tails(store: &ECStore) {
     tokio::time::timeout(Duration::from_secs(30), async {
         while ecstore_namespace_commits_pending(store) {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1322,6 +1448,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
             nsscanner_with_storage_status_scoped(
                 store.as_ref(),
                 ScannerCycleRequest {
+                    owner_ctx: ctx.clone(),
                     ctx,
                     budget,
                     updates,
@@ -1333,6 +1460,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                     observed_usage_candidate: None,
                     requires_full_scan,
                     resolved_scope_observer: Some(observer),
+                    post_walk_hook: None,
                     post_walk_gate: None,
                     peer_observations: None,
                     service_cohort: None,
@@ -1414,6 +1542,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
             nsscanner_with_storage_status_scoped(
                 store.as_ref(),
                 ScannerCycleRequest {
+                    owner_ctx: ctx.clone(),
                     ctx,
                     budget,
                     updates,
@@ -1425,6 +1554,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                     observed_usage_candidate: None,
                     requires_full_scan: false,
                     resolved_scope_observer: None,
+                    post_walk_hook: None,
                     post_walk_gate: None,
                     peer_observations: None,
                     service_cohort: None,
@@ -1469,6 +1599,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
             nsscanner_with_storage_status_scoped(
                 store.as_ref(),
                 ScannerCycleRequest {
+                    owner_ctx: ctx.clone(),
                     ctx,
                     budget,
                     updates,
@@ -1480,6 +1611,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                     observed_usage_candidate: None,
                     requires_full_scan,
                     resolved_scope_observer: None,
+                    post_walk_hook: None,
                     post_walk_gate: None,
                     peer_observations: None,
                     service_cohort: None,
@@ -1781,6 +1913,7 @@ async fn scanner_item_object_lock_uses_cached_config() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
     let resolved = object_lock_config_for_scanner_item(&item)
@@ -2112,7 +2245,7 @@ fn dirty_usage_clear_plan_excludes_cache_save_failures() {
     let snapshot = DirtyUsageBuckets::from([("photos".to_string(), 1), ("videos".to_string(), 2)]);
     let failed_buckets = HashSet::from(["videos".to_string()]);
 
-    let clear_snapshot = should_clear_dirty_usage_snapshot(true, true, false, true, &snapshot, &failed_buckets)
+    let clear_snapshot = should_clear_dirty_usage_snapshot(true, true, true, &snapshot, &failed_buckets)
         .expect("successful completed cycle should produce a clear snapshot");
 
     assert!(clear_snapshot.contains_key("photos"));
@@ -2362,6 +2495,260 @@ async fn set_cache_send_failure_logs_receiver_and_snapshot_without_changing_retu
 
 #[tokio::test]
 #[serial]
+async fn set_snapshot_accepts_backup_catchup_to_the_same_decoded_primary() {
+    use crate::data_usage_define::read_config_with_revision;
+
+    let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let primary_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+    let backup_path = format!("{primary_path}.bkp");
+    let (primary_body, _) = read_config_with_revision(Arc::clone(&set), &primary_path)
+        .await
+        .expect("read decoded primary bytes");
+    let primary_body = primary_body.expect("primary exists");
+    let mut older = cache.clone();
+    older.info.scan_execution_digest = Some(DataUsageScanPlanDigest([8; 32]));
+    save_config(Arc::clone(&set), &backup_path, older.marshal_msg().expect("encode older backup"))
+        .await
+        .expect("seed a lagging backup");
+    let mut loaded = DataUsageCache::default();
+    let initial = loaded
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("capture primary with lagging backup");
+    save_config(Arc::clone(&set), &backup_path, primary_body)
+        .await
+        .expect("backup catches up without changing primary");
+    let current = loaded
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("capture the reconciled backup");
+    assert_ne!(initial.revisions(), current.revisions());
+    assert!(current.permits_unchanged_baseline_since(&initial));
+
+    let mut candidate = cache;
+    candidate.info.next_cycle += 1;
+    candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+    candidate.replace(
+        "photos",
+        DATA_USAGE_ROOT,
+        DataUsageEntry {
+            size: 20,
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let cycle = candidate.info.next_cycle;
+    let cycle_floor = AtomicU64::new(cycle);
+    let (tx, mut rx) = mpsc::channel(1);
+    assert!(
+        persist_and_publish_cache_snapshot(Arc::clone(&set), &tx, candidate, Some(&initial), &cycle_floor, epoch)
+            .await
+            .is_some(),
+        "content-preserving backup catchup must not veto the new snapshot"
+    );
+    let published = rx.try_recv().expect("new snapshot reached the collector");
+    assert_eq!(published.info.next_cycle, cycle);
+    assert_eq!(published.find("photos").expect("new bucket entry").size, 20);
+    let (primary, primary_revision) = read_config_with_revision(Arc::clone(&set), &primary_path)
+        .await
+        .expect("read new primary");
+    let (backup, backup_revision) = read_config_with_revision(set, &backup_path).await.expect("read new backup");
+    assert_eq!(primary, backup, "backup CAS must use the reconciled current revision");
+    assert_eq!(primary_revision, backup_revision);
+    let persisted = DataUsageCache::unmarshal(&primary.expect("new primary body")).expect("decode new primary");
+    assert_eq!(persisted.info.next_cycle, cycle);
+    assert_eq!(persisted.find("photos").expect("persisted new entry").size, 20);
+}
+
+#[tokio::test]
+#[serial]
+async fn set_snapshot_backup_catchup_keeps_revision_provenance_and_epoch_fences() {
+    use crate::data_usage_define::read_config_with_revision;
+
+    for case in ["different_backup", "different_primary", "corrupt_primary", "changed_epoch"] {
+        let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+        let set = Arc::clone(&store.pools[0].disk_set[0]);
+        let primary_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        let backup_path = format!("{primary_path}.bkp");
+        let (primary_body, _) = read_config_with_revision(Arc::clone(&set), &primary_path)
+            .await
+            .expect("read original primary");
+        let primary_body = primary_body.expect("original primary exists");
+        let mut older = cache.clone();
+        older.info.scan_execution_digest = Some(DataUsageScanPlanDigest([8; 32]));
+        save_config(Arc::clone(&set), &backup_path, older.marshal_msg().expect("encode lagging backup"))
+            .await
+            .expect("seed lagging backup");
+        if case == "corrupt_primary" {
+            save_config(Arc::clone(&set), &primary_path, b"corrupt-primary".to_vec())
+                .await
+                .expect("inject primary corruption before the initial load");
+        }
+        let mut loaded = DataUsageCache::default();
+        let initial = loaded
+            .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("capture original baseline source and revisions");
+        let mut replacement = cache.clone();
+        replacement.info.scan_execution_digest = Some(DataUsageScanPlanDigest([9; 32]));
+        match case {
+            "different_backup" => {
+                save_config(Arc::clone(&set), &backup_path, replacement.marshal_msg().expect("encode changed backup"))
+                    .await
+                    .expect("backup changes to different contents");
+            }
+            "different_primary" => {
+                let body = replacement.marshal_msg().expect("encode changed primary");
+                save_config(Arc::clone(&set), &primary_path, body.clone())
+                    .await
+                    .expect("primary advances");
+                save_config(Arc::clone(&set), &backup_path, body)
+                    .await
+                    .expect("backup follows changed primary");
+            }
+            "corrupt_primary" => {
+                save_config(Arc::clone(&set), &backup_path, b"corrupt-primary".to_vec())
+                    .await
+                    .expect("backup matches the corrupt primary ETag without a decoded primary proof");
+            }
+            "changed_epoch" => {
+                save_config(Arc::clone(&set), &backup_path, primary_body)
+                    .await
+                    .expect("backup catches up before epoch refusal");
+            }
+            _ => unreachable!("fixed test cases"),
+        }
+        let before_primary = read_config_with_revision(Arc::clone(&set), &primary_path)
+            .await
+            .expect("current primary");
+        let before_backup = read_config_with_revision(Arc::clone(&set), &backup_path)
+            .await
+            .expect("current backup");
+        let mut candidate = cache;
+        candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+        let cycle_floor = AtomicU64::new(candidate.info.next_cycle);
+        let requested_epoch = if case == "changed_epoch" {
+            epoch.checked_add(1).expect("fixture epoch can advance")
+        } else {
+            epoch
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let (result, events) = capture_set_cache_logs(persist_and_publish_cache_snapshot(
+            Arc::clone(&set),
+            &tx,
+            candidate,
+            Some(&initial),
+            &cycle_floor,
+            requested_epoch,
+        ))
+        .await;
+        assert!(result.is_none(), "{case} must still refuse publication");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "{case} forwards no snapshot"
+        );
+        let expected_state = if case == "changed_epoch" {
+            "save_failed"
+        } else {
+            "scan_baseline_revision_changed"
+        };
+        assert_set_cache_context(set_cache_event(&events, expected_state), Some((0, 0)));
+        assert_eq!(
+            read_config_with_revision(Arc::clone(&set), &primary_path)
+                .await
+                .expect("protected primary"),
+            before_primary,
+            "{case} does not overwrite primary"
+        );
+        assert_eq!(
+            read_config_with_revision(set, &backup_path).await.expect("protected backup"),
+            before_backup,
+            "{case} does not overwrite backup"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn set_cache_cas_preserves_updates_after_backup_catchup_validation() {
+    use crate::data_usage_define::read_config_with_revision;
+
+    for changed_copy in ["primary", "backup"] {
+        let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+        let set = Arc::clone(&store.pools[0].disk_set[0]);
+        let primary_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        let backup_path = format!("{primary_path}.bkp");
+        let (primary_body, _) = read_config_with_revision(Arc::clone(&set), &primary_path)
+            .await
+            .expect("read initial primary");
+        let mut lagging = cache.clone();
+        lagging.info.scan_execution_digest = Some(DataUsageScanPlanDigest([8; 32]));
+        save_config(Arc::clone(&set), &backup_path, lagging.marshal_msg().expect("lagging backup bytes"))
+            .await
+            .expect("seed backup lag");
+        let mut loaded = DataUsageCache::default();
+        let initial = loaded
+            .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("read initial baseline");
+        save_config(Arc::clone(&set), &backup_path, primary_body.expect("initial primary exists"))
+            .await
+            .expect("finish backup catchup");
+        let current = loaded
+            .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("read reconciled baseline");
+        assert!(current.permits_unchanged_baseline_since(&initial));
+        let changed_path = if changed_copy == "primary" {
+            &primary_path
+        } else {
+            &backup_path
+        };
+        let mut concurrent = cache.clone();
+        concurrent.info.scan_execution_digest = Some(DataUsageScanPlanDigest([9; 32]));
+        let concurrent_body = concurrent.marshal_msg().expect("encode concurrent update");
+        save_config(Arc::clone(&set), changed_path, concurrent_body.clone())
+            .await
+            .expect("copy changes after the baseline validation");
+        let mut candidate = cache;
+        candidate.info.next_cycle += 1;
+        candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+        let result = candidate
+            .save_with_revisions_for_epoch(
+                Arc::clone(&set),
+                DATA_USAGE_CACHE_NAME,
+                current.revisions(),
+                epoch,
+                CancellationToken::new(),
+            )
+            .await;
+        if changed_copy == "primary" {
+            assert!(result.is_err(), "primary CAS refuses the intervening update");
+        } else {
+            result.expect("primary remains durable when the best-effort backup CAS refuses an update");
+        }
+        let (protected, _) = read_config_with_revision(Arc::clone(&set), changed_path)
+            .await
+            .expect("read protected concurrent copy");
+        assert_eq!(
+            protected,
+            Some(concurrent_body),
+            "{changed_copy} CAS must not overwrite the concurrent update"
+        );
+        let (primary, _) = read_config_with_revision(set, &primary_path)
+            .await
+            .expect("read resulting primary");
+        let primary = DataUsageCache::unmarshal(&primary.expect("primary exists")).expect("primary remains decodable");
+        assert_eq!(
+            primary.info.scan_execution_digest,
+            Some(DataUsageScanPlanDigest([if changed_copy == "primary" { 9 } else { 3 }; 32])),
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let set = Arc::clone(&store.pools[0].disk_set[0]);
@@ -2374,7 +2761,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
         .expect("seed legacy set cache");
     let mut persisted = DataUsageCache::default();
     let initial = persisted
-        .load_with_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
         .await
         .expect("capture the shared starting revision");
     let mut fresh = legacy.clone();
@@ -2400,7 +2787,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
     assert_eq!(published.find("photos").expect("published bucket").size, 20);
     assert_eq!(published.info.scan_execution_digest, fresh.info.scan_execution_digest);
     let current = persisted
-        .load_with_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
         .await
         .expect("capture the current revision for the unidentified execution");
 
@@ -2459,6 +2846,8 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
         ctx.clone(),
         ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
         ScannerBucketScanPlan {
+            owner_ctx: ctx.clone(),
+            usage_watch_store: None,
             service_cohort: None,
             buckets: Vec::new(),
             all_buckets: Arc::new(Vec::new()),
@@ -2466,6 +2855,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             digest: DataUsageScanPlanDigest([6; 32]),
             bucket_coverage_digest: DataUsageScanPlanDigest([6; 32]),
             checkpoint_coverage_digest: DataUsageScanPlanDigest([6; 32]),
+            completed_checkpoint_cycle_floor: None,
             requires_full_scan: false,
             execution_digest: empty_execution,
             leader_epoch: 11,
@@ -2686,6 +3076,130 @@ fn scoped_scan_requires_a_complete_authoritative_baseline_with_exact_set_provena
             scan_plan_digest,
         }),
         None
+    );
+}
+
+#[test]
+fn scoped_scan_baseline_rejections_preserve_the_existing_first_failed_check() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let digest = DataUsageScanPlanDigest([9; 32]);
+    let baseline = complete_usage_baseline(source, digest, 7, 11);
+    let snapshot: DataUsageInfo = serde_json::from_slice(&baseline).expect("decode complete baseline");
+    let proof = ScannerCacheBaselineProof {
+        authoritative_data: Some(&baseline),
+        observed_candidate_data: None,
+        expected_sources: &expected_sources,
+        leader_epoch: 11,
+        want_cycle: 8,
+        scan_plan_digest: digest,
+    };
+    type RejectionCase = (ScannerBaselineRejection, fn(&mut DataUsageInfo));
+    let cases: [RejectionCase; 13] = [
+        (ScannerBaselineRejection::Incomplete, |s| s.usage_snapshot_complete = false),
+        (ScannerBaselineRejection::Partial, |s| s.usage_snapshot_partial = true),
+        (ScannerBaselineRejection::Marks, |s| s.usage_snapshot_converged = None),
+        (ScannerBaselineRejection::Epoch, |s| s.scanner_epoch = Some(10)),
+        (ScannerBaselineRejection::SourceCount, |s| s.usage_snapshot_set_states.clear()),
+        (ScannerBaselineRejection::PlanMissing, |s| {
+            s.usage_snapshot_set_states[0].scan_plan_digest = None
+        }),
+        (ScannerBaselineRejection::PlanMismatch, |s| {
+            s.usage_snapshot_set_states[0].scan_plan_digest = Some([8; 32])
+        }),
+        (ScannerBaselineRejection::SourceMembership, |s| {
+            s.usage_snapshot_set_states[0].set_index = 3
+        }),
+        (ScannerBaselineRejection::SetIncomplete, |s| {
+            s.usage_snapshot_set_states[0].complete = false
+        }),
+        (ScannerBaselineRejection::SetTombstone, |s| {
+            s.usage_snapshot_set_states[0].tombstone = true
+        }),
+        (ScannerBaselineRejection::SetEpoch, |s| {
+            s.usage_snapshot_set_states[0].scanner_epoch = None
+        }),
+        (ScannerBaselineRejection::SetCycle, |s| {
+            s.usage_snapshot_set_states[0].scanner_cycle = Some(9)
+        }),
+        (ScannerBaselineRejection::SetCycle, |s| {
+            s.usage_snapshot_set_states[0].scanner_cycle = None
+        }),
+    ];
+    assert_eq!(validate_scanner_cache_snapshot_plan_digest(&snapshot, proof, None), Ok(digest));
+    for (expected, mutate) in cases {
+        let mut invalid = snapshot.clone();
+        mutate(&mut invalid);
+        assert_eq!(validate_scanner_cache_snapshot_plan_digest(&invalid, proof, None), Err(expected));
+        assert_eq!(complete_scanner_cache_snapshot_plan_digest(&invalid, proof, None), None);
+    }
+    let mut invalid = snapshot.clone();
+    invalid.usage_snapshot_partial = true;
+    invalid.scanner_epoch = Some(10);
+    assert_eq!(
+        validate_scanner_cache_snapshot_plan_digest(&invalid, proof, None),
+        Err(ScannerBaselineRejection::Partial)
+    );
+
+    let two_sources = HashSet::from([source, DataUsageCacheSource::new(1, 3)]);
+    let mut two_sets = snapshot.clone();
+    two_sets
+        .usage_snapshot_set_states
+        .push(two_sets.usage_snapshot_set_states[0].clone());
+    let two_set_proof = ScannerCacheBaselineProof {
+        expected_sources: &two_sources,
+        ..proof
+    };
+    assert_eq!(
+        validate_scanner_cache_snapshot_plan_digest(&two_sets, two_set_proof, None),
+        Err(ScannerBaselineRejection::SourceDuplicate)
+    );
+    two_sets.usage_snapshot_set_states[1].set_index = 3;
+    two_sets.usage_snapshot_set_states[1].scan_plan_digest = Some([8; 32]);
+    assert_eq!(
+        validate_scanner_cache_snapshot_plan_digest(&two_sets, two_set_proof, None),
+        Err(ScannerBaselineRejection::SetPlan)
+    );
+
+    let undecodable = Bytes::from_static(b"not-json");
+    for (data, expected) in [
+        (None, ScannerBaselineRejection::Missing),
+        (Some(&undecodable), ScannerBaselineRejection::Decode),
+    ] {
+        assert_eq!(
+            validate_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+                authoritative_data: data,
+                ..proof
+            }),
+            Err(ScannerBaselineValidationFailure {
+                authoritative: expected,
+                observed: None
+            })
+        );
+    }
+    let mut wrong_epoch = snapshot;
+    wrong_epoch.scanner_epoch = Some(10);
+    let wrong_epoch = Bytes::from(serde_json::to_vec(&wrong_epoch).expect("encode stale epoch baseline"));
+    let stale_proof = ScannerCacheBaselineProof {
+        authoritative_data: Some(&wrong_epoch),
+        ..proof
+    };
+    assert_eq!(
+        validate_scanner_cache_baseline_plan_digest(stale_proof),
+        Err(ScannerBaselineValidationFailure {
+            authoritative: ScannerBaselineRejection::Epoch,
+            observed: Some(ScannerBaselineRejection::Missing),
+        })
+    );
+    assert_eq!(
+        validate_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            observed_candidate_data: Some(&undecodable),
+            ..stale_proof
+        }),
+        Err(ScannerBaselineValidationFailure {
+            authoritative: ScannerBaselineRejection::Epoch,
+            observed: Some(ScannerBaselineRejection::Decode)
+        })
     );
 }
 
@@ -3123,6 +3637,12 @@ fn distributed_segment_reuse_activation_keeps_remote_dirty_buckets_at_bucket_sco
         "durable local producer proof may activate local segment reuse after distributed ACK capability evidence"
     );
     assert!(
+        result
+            .segment_reuse_activation_preflight
+            .expect("actual scope proof is retained for observation")
+            .scanner_segment_reuse_activated
+    );
+    assert!(
         result.scope.prefix_scope_for("archive").is_none(),
         "remote dirty usage has only bucket-granularity evidence and must not be narrowed to a local prefix"
     );
@@ -3540,6 +4060,10 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
         .checked_flatten("stable")
         .expect("selected bucket placeholder should exist");
     assert_eq!((stable.size, stable.objects), (0, 0));
+    let observation = rustfs_scanner_metrics::scan_observation::ScannerScanObservation::default();
+    prepared.record_cold_bucket_reuse(&observation);
+    assert_eq!(observation.snapshot().bucket_reuse["scoped_cold_bucket"].count, 0);
+
     assert!(prepared.cache.find("stable/prefix").is_none());
     assert_eq!(prepared.cache.find("dirty").map(|entry| (entry.size, entry.objects)), Some((0, 0)));
     assert!(prepared.cache.find("deleted").is_none());
@@ -3549,6 +4073,124 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
     assert!(prepared.cache.info.lkg_snapshot_complete);
     assert_eq!(prepared.cache.info.lkg_next_cycle, Some(7));
     assert_eq!(prepared.cache.info.lkg_scan_plan_digest, Some(baseline_digest));
+}
+
+#[test]
+fn cold_bucket_reuse_observation_rejects_unbound_or_failed_preparation() {
+    let baseline_digest = DataUsageScanPlanDigest([1; 32]);
+    let mut old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20)], baseline_digest);
+    old_cache.info.scan_bucket_incarnations = test_bucket_incarnations(&["stable", "dirty"]);
+    let incarnations = old_cache.info.scan_bucket_incarnations.clone();
+    let buckets = vec![
+        bucket_info_with_created_time("stable"),
+        bucket_info_with_created_time("dirty"),
+    ];
+    let scope = ScannerBucketScanScope {
+        selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        selected_bucket_prefixes: None,
+        baseline_scan_plan_digest: Some(baseline_digest),
+    };
+    let generation = ScannerSetCacheGeneration {
+        want_cycle: 8,
+        leader_epoch: 11,
+        tier_registry_generation: 13,
+        source: DataUsageCacheSource::new(1, 2),
+        scan_plan_digest: DataUsageScanPlanDigest([2; 32]),
+    };
+    let observation = rustfs_scanner_metrics::scan_observation::ScannerScanObservation::default();
+    let prepared = prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, Some(&incarnations))
+        .expect("bound complete cache permits a cold bucket copy");
+    prepared.record_cold_bucket_reuse(&observation);
+    assert_eq!(observation.snapshot().bucket_reuse["scoped_cold_bucket"].count, 1);
+
+    for case in ["incomplete", "duplicate", "nil_incarnation"] {
+        let mut invalid_cache = old_cache.clone();
+        let mut invalid_buckets = buckets.clone();
+        let mut invalid_incarnations = incarnations.clone();
+        match case {
+            "incomplete" => invalid_cache.info.snapshot_complete = false,
+            "duplicate" => invalid_buckets.push(buckets[0].clone()),
+            "nil_incarnation" => {
+                invalid_incarnations.insert("stable".to_string(), Uuid::nil());
+            }
+            _ => unreachable!("fixed test cases"),
+        }
+        let prepared = prepare_scoped_set_scan(
+            &invalid_cache,
+            &invalid_buckets,
+            &invalid_buckets,
+            &scope,
+            generation,
+            Some(&invalid_incarnations),
+        );
+        assert!(prepared.is_none(), "{case} must not return a reusable prepared cache");
+        if let Some(prepared) = prepared {
+            prepared.record_cold_bucket_reuse(&observation);
+        }
+        assert_eq!(
+            observation.snapshot().bucket_reuse["scoped_cold_bucket"].count,
+            1,
+            "{case} does not count completed reuse"
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_root_reuse_counts_only_successful_collector_delivery() {
+    use rustfs_scanner_metrics::scan_observation::ScannerScanObservation;
+
+    let observation = ScannerScanObservation::default();
+    let cache = DataUsageCache::default();
+    let pending = AtomicBool::new(false);
+    let root = || DataUsageEntryInfo {
+        name: "bucket".to_string(),
+        parent: DATA_USAGE_ROOT.to_string(),
+        entry: DataUsageEntry {
+            size: 10,
+            objects: 2,
+            ..Default::default()
+        },
+        bucket_incarnation: Some(Uuid::from_u128(7)),
+        tier_registry_generation: None,
+        value_origin: None,
+    };
+    let (sender, mut receiver) = mpsc::channel(1);
+    super::io_cache::send_current_cache_root_entry(&sender, root(), &cache, &pending, &observation)
+        .await
+        .expect("current root is delivered to the collector");
+    let delivered = receiver.recv().await.expect("collector received the root");
+    assert_eq!((delivered.entry.size, delivered.entry.objects), (10, 2));
+    assert_eq!(observation.snapshot().bucket_reuse["current_root"].count, 1);
+    drop(receiver);
+    assert!(
+        super::io_cache::send_current_cache_root_entry(&sender, root(), &cache, &pending, &observation)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        observation.snapshot().bucket_reuse["current_root"].count,
+        1,
+        "closed collector is not completed reuse"
+    );
+
+    let (sender, _receiver) = mpsc::channel(1);
+    sender.send(root()).await.expect("fill bounded collector channel");
+    {
+        let mut send = Box::pin(super::io_cache::send_current_cache_root_entry(
+            &sender,
+            root(),
+            &cache,
+            &pending,
+            &observation,
+        ));
+        assert!(futures::poll!(send.as_mut()).is_pending(), "full collector keeps reuse unfinished");
+    }
+    assert_eq!(
+        observation.snapshot().bucket_reuse["current_root"].count,
+        1,
+        "dropping unfinished delivery is not reuse"
+    );
+    assert_eq!(observation.snapshot().bucket_reuse["scoped_cold_bucket"].count, 0);
 }
 
 #[test]
@@ -3592,6 +4234,12 @@ fn scoped_set_scan_reuses_unselected_buckets_with_matching_incarnations() {
     )
     .expect("matching bucket incarnations should authorize cold bucket reuse");
 
+    let observation = rustfs_scanner_metrics::scan_observation::ScannerScanObservation::default();
+    prepared.record_cold_bucket_reuse(&observation);
+    let observed = observation.snapshot();
+    assert_eq!(observed.bucket_reuse["scoped_cold_bucket"].count, 1);
+    assert_eq!(observed.bucket_reuse["current_root"].count, 0);
+    assert!(observed.cache_reuse.values().all(|reuse| reuse.count == 0));
     assert_eq!(prepared.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(), ["dirty"]);
     let stable = prepared
         .cache
@@ -3694,6 +4342,94 @@ fn scoped_set_scan_rejects_unbound_bucket_incarnations() {
     assert!(
         prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, Some(&mismatched)).is_none(),
         "a same-name unselected bucket with a different incarnation must rebuild"
+    );
+}
+
+pub(crate) fn assert_incarnation_change_rejects_carry_and_old_certificate(old: Uuid, current: Uuid) {
+    use crate::DataUsageBucketValueOrigin;
+    use rustfs_data_usage::TierAccountingProof;
+    assert_ne!(old, current);
+    let digest = DataUsageScanPlanDigest([1; 32]);
+    let mut old_cache = complete_set_usage_cache(&[("bucket", 10), ("dirty", 20)], digest);
+    old_cache.info.scan_bucket_incarnations = HashMap::from([("bucket".into(), old), ("dirty".into(), Uuid::from_u128(3))]);
+    let mut identities = old_cache.info.scan_bucket_incarnations.clone();
+    let buckets = vec![
+        bucket_info_with_created_time("bucket"),
+        bucket_info_with_created_time("dirty"),
+    ];
+    let scope = ScannerBucketScanScope {
+        selected_buckets: Some(Arc::new(HashSet::from(["dirty".into()]))),
+        selected_bucket_prefixes: None,
+        baseline_scan_plan_digest: Some(digest),
+    };
+    let generation = ScannerSetCacheGeneration {
+        want_cycle: 8,
+        leader_epoch: 11,
+        tier_registry_generation: 13,
+        source: DataUsageCacheSource::new(1, 2),
+        scan_plan_digest: DataUsageScanPlanDigest([2; 32]),
+    };
+    assert!(prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, Some(&identities)).is_some());
+    identities.insert("bucket".into(), current);
+    assert!(
+        prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, Some(&identities)).is_none(),
+        "an old source root cannot be carried across recreation"
+    );
+
+    for bucket in ["bucket", "dirty"] {
+        let mut entry = old_cache.checked_flatten(bucket).unwrap();
+        entry.tier_accounting_proof = Some(TierAccountingProof {
+            logical_total: entry.size as u64,
+            logical_known: entry.size as u64,
+            ..Default::default()
+        });
+        old_cache.replace(bucket, DATA_USAGE_ROOT, entry);
+        old_cache.info.scan_bucket_value_origins.insert(
+            bucket.into(),
+            DataUsageBucketValueOrigin {
+                epoch: 11,
+                cycle: 7,
+                completed_at: old_cache.info.last_update.unwrap(),
+                carried: false,
+            },
+        );
+    }
+    let sources = HashSet::from([generation.source]);
+    let names = vec!["bucket".into(), "dirty".into()];
+    let build = |cache: DataUsageCache, cycle| {
+        completed_usage_candidate(
+            &[cache],
+            &ScannerSnapshotScope {
+                sources: &sources,
+                buckets: &names,
+                identity: ScannerSnapshotIdentity {
+                    cycle,
+                    leader_epoch: 11,
+                    plan_digest: digest,
+                    coverage_digest: digest,
+                    tier_registry_generation: Some(13),
+                },
+            },
+            &[],
+            true,
+            false,
+        )
+        .expect("valid exact source root")
+    };
+    let (baseline, _) = build(old_cache.clone(), 7).prepare(ScannerCycleStatus::Complete, &ScannerCyclePendingBuckets::new());
+    assert!(baseline.buckets_usage["bucket"].usage_certification.is_some());
+    old_cache.info.next_cycle = 8;
+    old_cache.info.scan_bucket_incarnations = identities;
+    for origin in old_cache.info.scan_bucket_value_origins.values_mut() {
+        origin.carried = true;
+    }
+    let mut successor = build(old_cache, 8);
+    successor.retain_carried_certifications(&baseline);
+    let (successor, _) = successor.prepare(ScannerCycleStatus::Complete, &ScannerCyclePendingBuckets::from(["bucket".into()]));
+    assert_eq!(successor.buckets_usage["bucket"].size, baseline.buckets_usage["bucket"].size);
+    assert!(
+        successor.buckets_usage["bucket"].usage_certification.is_none(),
+        "equal counters do not transfer a dead incarnation's certificate"
     );
 }
 
@@ -3851,7 +4587,6 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         classify_nsscanner_cycle(
             true,
             false,
-            false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unchanged,
@@ -3864,7 +4599,6 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         classify_nsscanner_cycle(
             true,
             false,
-            false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Changed,
             ScannerCycleActivityStatus::Unchanged,
@@ -3875,7 +4609,6 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         assert_eq!(
             classify_nsscanner_cycle(
                 true,
-                false,
                 false,
                 ScannerBucketScanStatus::Complete,
                 dirty_usage_status,
@@ -3889,7 +4622,6 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         classify_nsscanner_cycle(
             true,
             false,
-            false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
@@ -3901,7 +4633,6 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         classify_nsscanner_cycle(
             false,
             false,
-            false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unchanged,
@@ -3909,29 +4640,18 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         classify_nsscanner_cycle(
             true,
             true,
-            false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unchanged,
         ),
         classify_nsscanner_cycle(
             true,
-            false,
-            true,
-            ScannerBucketScanStatus::Complete,
-            DirtyUsageSnapshotStatus::Current,
-            ScannerCycleActivityStatus::Unchanged,
-        ),
-        classify_nsscanner_cycle(
-            true,
-            false,
             false,
             ScannerBucketScanStatus::Failed,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Changed,
         ),
         classify_nsscanner_cycle(
-            false,
             false,
             false,
             ScannerBucketScanStatus::Partial,
@@ -3950,7 +4670,6 @@ fn carried_partial_buckets_complete_the_cycle_as_pending() {
             classify_nsscanner_cycle(
                 true,
                 false,
-                false,
                 ScannerBucketScanStatus::PartialCarried,
                 dirty_usage_status,
                 ScannerCycleActivityStatus::Unchanged,
@@ -3963,7 +4682,6 @@ fn carried_partial_buckets_complete_the_cycle_as_pending() {
         classify_nsscanner_cycle(
             true,
             false,
-            false,
             ScannerBucketScanStatus::PartialCarried,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Changed,
@@ -3975,31 +4693,28 @@ fn carried_partial_buckets_complete_the_cycle_as_pending() {
         classify_nsscanner_cycle(
             true,
             false,
-            false,
             ScannerBucketScanStatus::PartialCarried,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
         ),
         ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     );
-    for (completed_all_sets, budget, cancelled, bucket_status) in [
-        (false, false, false, ScannerBucketScanStatus::PartialCarried),
-        (true, true, false, ScannerBucketScanStatus::PartialCarried),
-        (true, false, true, ScannerBucketScanStatus::PartialCarried),
-        (true, false, false, ScannerBucketScanStatus::Partial),
+    for (completed_all_sets, cancelled, bucket_status) in [
+        (false, false, ScannerBucketScanStatus::PartialCarried),
+        (true, true, ScannerBucketScanStatus::PartialCarried),
+        (true, false, ScannerBucketScanStatus::Partial),
     ] {
         assert_eq!(
             classify_nsscanner_cycle(
                 completed_all_sets,
-                budget,
                 cancelled,
                 bucket_status,
                 DirtyUsageSnapshotStatus::Current,
                 ScannerCycleActivityStatus::Unchanged,
             ),
             ScannerCycleStatus::Incomplete,
-            "a set that could not stand in, a budget, a cancellation, or an uncovered partial walk stays incomplete \
-             ({completed_all_sets}, {budget}, {cancelled}, {bucket_status:?})"
+            "a missing set, owner cancellation, or an uncovered partial walk stays incomplete \
+             ({completed_all_sets}, {cancelled}, {bucket_status:?})"
         );
     }
     for bucket_status in [ScannerBucketScanStatus::Partial, ScannerBucketScanStatus::PartialCarried] {
@@ -4012,15 +4727,14 @@ fn carried_partial_buckets_complete_the_cycle_as_pending() {
 
 #[test]
 fn checkpoint_fixture_superseded_is_distinct_from_partial_and_cancel() {
-    for (budget, cancelled, bucket, expected) in [
-        (false, false, ScannerBucketScanStatus::Complete, ScannerCycleStatus::Superseded),
-        (true, false, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
-        (false, true, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
+    for (cancelled, bucket, expected) in [
+        (false, ScannerBucketScanStatus::Complete, ScannerCycleStatus::Superseded),
+        (false, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
+        (true, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
     ] {
         assert_eq!(
             classify_nsscanner_cycle(
                 true,
-                budget,
                 cancelled,
                 bucket,
                 DirtyUsageSnapshotStatus::Changed,
@@ -4029,19 +4743,20 @@ fn checkpoint_fixture_superseded_is_distinct_from_partial_and_cancel() {
             expected,
         );
     }
-    // Budget and cancellation stay `Incomplete` even when the guardrail
-    // passed and only dirty usage moved.
-    for (budget, cancelled) in [(true, false), (false, true)] {
+    // A bucket dirty change retains pending responsibility without superseding
+    // a complete root when the activity guardrail is unchanged. Owner
+    // cancellation still rejects that root even after full coverage.
+    // Pending propagation and ACK retention are verified by separate tests.
+    for (cancelled, expected) in [(false, ScannerCycleStatus::Complete), (true, ScannerCycleStatus::Incomplete)] {
         assert_eq!(
             classify_nsscanner_cycle(
                 true,
-                budget,
                 cancelled,
                 ScannerBucketScanStatus::Complete,
                 DirtyUsageSnapshotStatus::Changed,
                 ScannerCycleActivityStatus::Unchanged
             ),
-            ScannerCycleStatus::Incomplete,
+            expected,
         );
     }
 }
@@ -4054,7 +4769,6 @@ fn unverified_activity_defers_partial_and_floor_cycles() {
         classify_nsscanner_cycle(
             true,
             false,
-            false,
             ScannerBucketScanStatus::Partial,
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
@@ -4063,7 +4777,6 @@ fn unverified_activity_defers_partial_and_floor_cycles() {
     );
     assert_eq!(
         classify_nsscanner_cycle(
-            false,
             false,
             false,
             ScannerBucketScanStatus::Complete,
@@ -4182,7 +4895,6 @@ fn scanner_cycle_fails_closed_for_namespace_disappearance() {
             classify_nsscanner_cycle(
                 false,
                 false,
-                false,
                 ScannerBucketScanStatus::NamespaceNotFound,
                 DirtyUsageSnapshotStatus::Changed,
                 activity_status,
@@ -4194,7 +4906,6 @@ fn scanner_cycle_fails_closed_for_namespace_disappearance() {
         classify_nsscanner_cycle(
             false,
             false,
-            false,
             ScannerBucketScanStatus::NamespaceNotFound,
             DirtyUsageSnapshotStatus::Changed,
             ScannerCycleActivityStatus::Unverified,
@@ -4203,7 +4914,6 @@ fn scanner_cycle_fails_closed_for_namespace_disappearance() {
     );
     assert_eq!(
         classify_nsscanner_cycle(
-            true,
             true,
             false,
             ScannerBucketScanStatus::NamespaceNotFound,
@@ -4219,7 +4929,6 @@ fn scanner_cycle_fails_closed_when_dirty_generation_is_unverified() {
     assert_eq!(
         classify_nsscanner_cycle(
             true,
-            false,
             false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Unverified,
@@ -4534,13 +5243,38 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
+    let before = global_metrics().scan_observation().snapshot().metadata_reads;
     let err = disk
-        .get_size(item)
+        .get_size(item.clone())
         .await
         .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
     assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+
+    let missing = global_metrics().scan_observation().snapshot().metadata_reads;
+    assert_eq!(missing.attempts, before.attempts + 1);
+    assert_eq!(missing.not_found, before.not_found + 1);
+    assert_eq!(missing.bytes, before.bytes);
+
+    #[cfg(unix)]
+    {
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("recreate object directory");
+        std::os::unix::fs::symlink(STORAGE_FORMAT_FILE, &metadata_path).expect("inject a metadata symlink loop");
+        let err = disk
+            .get_size(item)
+            .await
+            .expect_err("symlink loop must remain a read failure");
+        assert!(is_scanner_metadata_transient_error(&err), "read error: {err:?}");
+        let failed = global_metrics().scan_observation().snapshot().metadata_reads;
+        assert_eq!(failed.attempts, missing.attempts + 1);
+        assert_eq!(failed.errors, missing.errors + 1);
+        assert_eq!(failed.succeeded, before.succeeded);
+        assert_eq!(failed.bytes, before.bytes);
+    }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -4590,8 +5324,10 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
+    let before = global_metrics().scan_observation().snapshot().metadata_reads;
     for contents in [b"".as_slice(), b"not-valid-filemeta".as_slice()] {
         tokio::fs::write(&metadata_path, contents)
             .await
@@ -4602,6 +5338,16 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
             .expect_err("corrupt metadata should be surfaced as scanner-heal work");
         assert!(is_scanner_metadata_corrupt_error(&err));
     }
+
+    let reads = global_metrics().scan_observation().snapshot().metadata_reads;
+    assert_eq!(reads.attempts, before.attempts + 2);
+    assert_eq!(
+        reads.succeeded,
+        before.succeeded + 2,
+        "storage reads succeed before decoding rejects corruption"
+    );
+    assert_eq!(reads.errors, before.errors);
+    assert_eq!(reads.bytes, before.bytes + 18);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -4673,13 +5419,20 @@ async fn get_size_counts_delete_markers_separately_from_versions() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
+    let before = global_metrics().scan_observation().snapshot().metadata_reads;
+    let expected_bytes = tokio::fs::metadata(&metadata_path).await.expect("stat stored metadata").len();
     let summary = disk.get_size(item).await.expect("scanner should read versioned metadata");
 
     assert_eq!(summary.versions, 2);
     assert_eq!(summary.delete_markers, 1);
     assert_eq!(summary.total_size, 30);
+    let reads = global_metrics().scan_observation().snapshot().metadata_reads;
+    assert_eq!(reads.attempts, before.attempts + 1);
+    assert_eq!(reads.succeeded, before.succeeded + 1);
+    assert_eq!(reads.bytes, before.bytes + expected_bytes);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -4852,6 +5605,7 @@ async fn completed_bucket_results_count_distinct_current_roots_even_after_cancel
                     },
                     bucket_incarnation: None,
                     tier_registry_generation: Some(generation),
+                    value_origin: None,
                 }),
             )
             .await
@@ -4871,9 +5625,9 @@ async fn completed_bucket_results_count_distinct_current_roots_even_after_cancel
         }
         assert_eq!(complete, expected, "duplicate and wrong-tier roots cannot fill the missing bucket");
         assert_eq!(complete.len(), if fill_missing { 53 } else { 52 });
-        assert_eq!(should_publish_completed_snapshot(complete.len(), BUCKETS, false, false), fill_missing);
+        assert_eq!(should_publish_completed_snapshot(complete.len(), BUCKETS, false), fill_missing);
         assert!(
-            !should_publish_completed_snapshot(complete.len(), BUCKETS, false, true),
+            !should_publish_completed_snapshot(complete.len(), BUCKETS, true),
             "drained coverage must not override cancellation"
         );
         assert_eq!(cache.find("bucket-00").expect("applied duplicate root").size, 2);
@@ -4918,6 +5672,7 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
             },
             bucket_incarnation: Some(Uuid::from_u128(7)),
             tier_registry_generation: None,
+            value_origin: None,
         },
         update_time,
     )
@@ -4962,6 +5717,7 @@ fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
             },
             bucket_incarnation: Some(Uuid::from_u128(7)),
             tier_registry_generation: Some(8),
+            value_origin: None,
         },
         SystemTime::now(),
     );
@@ -5010,6 +5766,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
         let initial = nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
                 ctx,
                 updates,
@@ -5022,6 +5779,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
                 requires_full_scan: true,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },
@@ -5118,6 +5876,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
         let result = nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
                 ctx,
                 updates,
@@ -5130,6 +5889,7 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
                 requires_full_scan: true,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },
@@ -5231,11 +5991,17 @@ fn clear_coordinator_bucket_scan_probe() {
 #[test]
 fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
     let server_epoch = Uuid::from_u128(7);
+    let capabilities = crate::storage_api::scanner_io::NsScannerCapabilities {
+        server_epoch,
+        supports_durable_progress: false,
+        supports_complete_observation: false,
+        supports_usage_watch: false,
+    };
     let workers = vec![
         ("local-a", NamespaceScannerWorkerMode::Coordinator),
         ("local-b", NamespaceScannerWorkerMode::Coordinator),
         ("legacy-peer", NamespaceScannerWorkerMode::Coordinator),
-        ("v4-peer", NamespaceScannerWorkerMode::RemoteV4(server_epoch)),
+        ("v4-peer", NamespaceScannerWorkerMode::RemoteV4(capabilities)),
     ];
     let is_local = |disk: &&str| disk.starts_with("local");
 
@@ -5271,7 +6037,7 @@ fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
     assert_eq!(
         walkers
             .iter()
-            .filter(|walker| walker.mode == NamespaceScannerWorkerMode::RemoteV4(server_epoch))
+            .filter(|walker| walker.mode == NamespaceScannerWorkerMode::RemoteV4(capabilities))
             .count(),
         1
     );
@@ -5295,6 +6061,7 @@ async fn run_full_cycle(store: &Arc<ECStore>, cycle: u64) -> ScannerCycleStatus 
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx,
                 budget,
                 updates,
@@ -5307,6 +6074,7 @@ async fn run_full_cycle(store: &Arc<ECStore>, cycle: u64) -> ScannerCycleStatus 
                 requires_full_scan: true,
                 resolved_scope_observer: None,
                 service_cohort: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },

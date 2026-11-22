@@ -34,9 +34,10 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Exact HTTP/2 keepalive timeout observation through Hyper's unstable tracing
+# event. Requires `RUSTFLAGS="--cfg hyper_unstable_tracing"`.
+diagnostic-internode-http2-ping = ["dep:hyper", "rustfs-io-metrics/diagnostic-internode-http2-ping"]
 hotpath = [
-    "hotpath/hotpath",
-    "hotpath/tokio",
     "rustfs-common/hotpath",
     "rustfs-config/hotpath",
     "rustfs-io-metrics/hotpath",
@@ -45,7 +46,6 @@ hotpath = [
 ]
 hotpath-alloc = [
     "hotpath",
-    "hotpath/hotpath-alloc",
     "rustfs-common/hotpath-alloc",
     "rustfs-config/hotpath-alloc",
     "rustfs-io-metrics/hotpath-alloc",
@@ -54,7 +54,6 @@ hotpath-alloc = [
 ]
 hotpath-cpu = [
     "hotpath",
-    "hotpath/hotpath-cpu",
     "rustfs-common/hotpath-cpu",
     "rustfs-config/hotpath-cpu",
     "rustfs-io-metrics/hotpath-cpu",
@@ -63,7 +62,6 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath.workspace = true
 rustfs-common.workspace = true
 rustfs-heal-contracts.workspace = true
 rustfs-io-metrics.workspace = true
@@ -75,6 +73,8 @@ prost = { workspace = true }
 tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-aws-lc", "gzip", "deflate"] }
 tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
+hyper = { workspace = true, optional = true, features = ["tracing"] }
+hyper-util = { workspace = true, features = ["client-legacy", "tokio"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -90,3 +90,4 @@ serde_json = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
+tracing-subscriber = { workspace = true }

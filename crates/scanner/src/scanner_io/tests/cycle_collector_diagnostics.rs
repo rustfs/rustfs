@@ -56,12 +56,15 @@ async fn run_cycle(
             ..Default::default()
         },
     );
+    // Keep real checkpoint persistence inside the production drain window.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx: budget.token(),
                 budget: Arc::clone(&budget),
                 updates,
@@ -74,6 +77,7 @@ async fn run_cycle(
                 requires_full_scan,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },
@@ -123,6 +127,8 @@ async fn collector_reports_an_unobserved_slot_after_a_stale_set_snapshot() {
     let events = collector_events(&events);
     assert_eq!(events.len(), 1, "a non-budget incomplete cycle needs one collector observation");
     let fields = events[0];
+    assert_eq!(fields["partial_stage"], "source_result_missing");
+    assert_eq!(result.partial_stage, Some("source_result_missing"));
     assert_eq!(fields["cycle"], 7);
     assert_eq!(fields["leader_epoch"], LEADER_EPOCH);
     assert_eq!(fields["expected_sources"], 1);
@@ -167,6 +173,7 @@ async fn collector_reports_received_incomplete_cache_only_for_non_budget_partial
     let events = collector_events(&events);
     assert_eq!(events.len(), 1, "a non-budget incomplete cycle needs one collector observation");
     let fields = events[0];
+    assert_eq!(fields["partial_stage"], second.partial_stage.expect("non-budget incomplete stage"));
     assert_eq!(fields["observed_slots"], 1);
     assert_eq!(fields["unobserved_slots"], 0);
     assert_eq!(fields["sample_observed"], true);
@@ -183,6 +190,7 @@ async fn collector_reports_received_incomplete_cache_only_for_non_budget_partial
 
     let ((third, snapshot, _), events) = capture_cycle(run_cycle(&store, 3, None, false)).await;
     assert_eq!(third.status, ScannerCycleStatus::Complete);
+    assert_eq!(third.partial_stage, None);
     assert!(snapshot.is_some_and(|snapshot| snapshot.usage_snapshot_complete));
     assert!(
         collector_events(&events).is_empty(),

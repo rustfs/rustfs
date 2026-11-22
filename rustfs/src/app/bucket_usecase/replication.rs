@@ -15,11 +15,8 @@
 //! Bucket replication configuration use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use rustfs_gateway_types::persistence::parse_replication_dto;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 fn validate_replication_config_targets(targets: &BucketTargets, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets
@@ -168,6 +165,15 @@ async fn write_replication_targets_after_config_delete(
     removed: usize,
     expected_incarnation_id: Option<uuid::Uuid>,
 ) -> S3Result<()> {
+    #[cfg(test)]
+    if let Some(fail) = tests::TARGET_CLEANUP_FAILURE
+        .try_with(std::cell::RefCell::take)
+        .ok()
+        .flatten()
+    {
+        fail.await?;
+    }
+
     let json_targets = serde_json::to_vec(&targets).map_err(to_internal_error)?;
     update_bucket_config_for_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
         .await
@@ -210,38 +216,60 @@ async fn restore_replication_config_after_target_cleanup_failure(
 }
 
 impl DefaultBucketUsecase {
-    /// `site_peers` is the set of remote site-replication peer deployment ids
-    /// (empty when site replication is disabled). The interface layer reads it
-    /// from the persisted state and fails closed on a read error, so this
-    /// usecase stays a pure function of its inputs (layer rule: app never
-    /// imports interface).
-    pub async fn execute_delete_bucket_replication(
+    /// Removes operator rules and targets unique to those rules.
+    ///
+    /// Preparation runs inside the audit scope and resolves the peer contract
+    /// before any bucket lookup or mutation.
+    pub(crate) async fn execute_delete_bucket_replication(
         &self,
-        req: S3Request<DeleteBucketReplicationInput>,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        prepare: impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send,
+    ) -> S3Result<()> {
+        // Preserve the success status recorded by the legacy audit for an empty response.
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::DeleteBucketReplication,
+            StatusCode::OK,
+            |envelope| async move {
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
+                let (site_peers, contract) = prepare.await?;
+                self.delete_bucket_replication(envelope, bucket, site_peers, contract).await
+            },
+        )
+        .await
+    }
+
+    async fn delete_bucket_replication(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: &str,
         site_peers: HashSet<String>,
         contract: OperatorRuleContract,
-    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketReplicationInput { bucket, .. } = req.input;
+    ) -> S3Result<()> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+        let request_context = envelope.request_context().cloned();
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
-        let targets_guard = lock_bucket_targets_metadata(&bucket).await;
-        let replication_config = match metadata_sys::get_replication_config(&bucket).await {
+        let targets_guard = lock_bucket_targets_metadata(bucket).await;
+        let replication_config = match metadata_sys::get_replication_config(bucket).await {
             Ok((config, _)) => Some(config),
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
         let (remaining_config, updated_targets) = if let Some(config) = replication_config.as_ref() {
             let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone(), &site_peers, contract);
-            let targets = replication_targets_without_arns(&bucket, &removable_arns).await?;
+            let targets = replication_targets_without_arns(bucket, &removable_arns).await?;
             (remaining, targets)
         } else {
             (None, None)
@@ -252,23 +280,23 @@ impl DefaultBucketUsecase {
             // S3 delete (issue #1948); only the operator-authored rules go.
             Some(remaining) => {
                 let data = serialize_config(&remaining)?;
-                update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
+                update_bucket_config_for_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
                     .await
                     .map_err(ApiError::from)?;
             }
             None => {
-                delete_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
+                delete_bucket_config_for_incarnation(bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
                     .await
                     .map_err(ApiError::from)?;
             }
         }
         if let Some((targets, removed)) = updated_targets
             && let Err(err) =
-                write_replication_targets_after_config_delete(&bucket, &targets, removed, expected_incarnation_id).await
+                write_replication_targets_after_config_delete(bucket, &targets, removed, expected_incarnation_id).await
         {
             if let Some(config) = replication_config.as_ref() {
                 return Err(restore_replication_config_after_target_cleanup_failure(
-                    &bucket,
+                    bucket,
                     config,
                     err,
                     expected_incarnation_id,
@@ -279,16 +307,16 @@ impl DefaultBucketUsecase {
         }
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context, true).await;
+        notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket replication", request_context, true).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
+        let item = sr_bucket_meta_item(bucket.to_owned(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config delete hook failed");
         }
 
         info!(bucket = %bucket, "deleted bucket replication config");
 
-        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
+        Ok(())
     }
 
     /// The stored replication configuration as the gateway's answer holds it.
@@ -335,36 +363,56 @@ impl DefaultBucketUsecase {
         })
     }
 
-    /// See [`Self::execute_delete_bucket_replication`] for `site_peers` and
-    /// `contract`. `replication_configuration` is the request body in the
-    /// engine's shape: the s3s edge (`storage::ecfs`) converts it, and this use
-    /// case never reads `req.input.replication_configuration`.
-    pub async fn execute_put_bucket_replication(
+    /// Replaces operator rules after the interface resolves the peer contract.
+    pub(crate) async fn execute_put_bucket_replication(
         &self,
-        req: S3Request<PutBucketReplicationInput>,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        prepare: impl Future<Output = S3Result<(PersistedReplicationConfiguration, HashSet<String>, OperatorRuleContract)>> + Send,
+    ) -> S3Result<()> {
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::PutBucketReplication,
+            StatusCode::OK,
+            |envelope| async move {
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
+                let (replication_configuration, site_peers, contract) = prepare.await?;
+                self.put_bucket_replication(envelope, bucket, replication_configuration, site_peers, contract)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn put_bucket_replication(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: &str,
         replication_configuration: PersistedReplicationConfiguration,
         site_peers: HashSet<String>,
         contract: OperatorRuleContract,
-    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketReplicationInput { bucket, .. } = req.input;
+    ) -> S3Result<()> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+        let request_context = envelope.request_context().cloned();
         info!(bucket = %bucket, "updating bucket replication config");
 
         validate_replication_config_capabilities(&replication_configuration)?;
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let targets_guard = lock_bucket_targets_metadata(&bucket).await;
-        validate_bucket_replication_update(&bucket, &replication_configuration).await?;
-        let existing_config = match metadata_sys::get_replication_config(&bucket).await {
+        let targets_guard = lock_bucket_targets_metadata(bucket).await;
+        validate_bucket_replication_update(bucket, &replication_configuration).await?;
+        let existing_config = match metadata_sys::get_replication_config(bucket).await {
             Ok((config, _)) => Some(config),
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
@@ -372,14 +420,14 @@ impl DefaultBucketUsecase {
         let replication_configuration =
             merge_user_replication_config_update(replication_configuration, existing_config, &site_peers, contract);
         let data = serialize_config(&replication_configuration)?;
-        update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
+        update_bucket_config_for_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context, true).await;
+        notify_bucket_metadata_reload(bucket.to_owned(), "put bucket replication", request_context, true).await;
 
-        let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
+        let mut item = sr_bucket_meta_item(bucket.to_owned(), "replication-config");
         item.replication_config = Some(
             serialize_config(&replication_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
         );
@@ -387,19 +435,29 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
-        Ok(S3Response::new(PutBucketReplicationOutput::default()))
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
+    use crate::app::runtime_sources::ServerContextSlot;
+    use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
+    use crate::site_replication::hooks::{BUCKET_META_HOOK_CALLS, BucketMetaHookCall};
+    use futures::{FutureExt, future::BoxFuture};
     use http::Method;
+    use rustfs_credentials::Credentials;
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
         PersistedEncryptionConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
     };
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use serial_test::serial;
+    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     fn replication_rule_for_target(arn: &str) -> PersistedReplicationRule {
         PersistedReplicationRule {
@@ -834,16 +892,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_delete_bucket_replication_returns_internal_error_when_store_uninitialized() {
-        let input = DeleteBucketReplicationInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
-
         let err = usecase
-            .execute_delete_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
+            .execute_delete_bucket_replication(owned_envelope(Method::DELETE), "test-bucket", async {
+                Ok((HashSet::new(), OperatorRuleContract::Derived))
+            })
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -869,17 +922,11 @@ mod tests {
             role: "arn:aws:iam::123456789012:role/test".to_string(),
             rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
         };
-        let input = PutBucketReplicationInput::builder()
-            .bucket("test-bucket".to_string())
-            .replication_configuration(Default::default())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
-
         let err = usecase
-            .execute_put_bucket_replication(req, configuration, HashSet::new(), OperatorRuleContract::Derived)
+            .execute_put_bucket_replication(owned_envelope(Method::PUT), "test-bucket", async {
+                Ok((configuration, HashSet::new(), OperatorRuleContract::Derived))
+            })
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -893,19 +940,10 @@ mod tests {
             role: String::new(),
             rules: vec![rule],
         };
-        let input = PutBucketReplicationInput::builder()
-            .bucket("test-bucket".to_string())
-            .replication_configuration(Default::default())
-            .build()
-            .unwrap();
-
         let err = DefaultBucketUsecase::without_context()
-            .execute_put_bucket_replication(
-                build_request(input, Method::PUT),
-                configuration,
-                HashSet::new(),
-                OperatorRuleContract::Derived,
-            )
+            .execute_put_bucket_replication(owned_envelope(Method::PUT), "test-bucket", async {
+                Ok((configuration, HashSet::new(), OperatorRuleContract::Derived))
+            })
             .await
             .expect_err("unsupported fields must be rejected before store access");
 
@@ -914,5 +952,317 @@ mod tests {
             err.message(),
             Some("replication field Destination.Account is not supported by this RustFS version")
         );
+    }
+
+    const PEER_ARN: &str = "arn:rustfs:replication::peer-dep:bucket";
+    const USER_ARN: &str = "arn:rustfs:replication:us-east-1:user:bucket";
+    const SITE_RULE: &str = "site-repl-peer-dep";
+
+    tokio::task_local! {
+        pub(super) static TARGET_CLEANUP_FAILURE: RefCell<Option<BoxFuture<'static, S3Result<()>>>>;
+    }
+
+    fn put_configuration() -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(USER_ARN, "new-operator", 3),
+                replication_rule_with_id(PEER_ARN, "shared-peer-target", 4),
+            ],
+        }
+    }
+
+    async fn seed_replication(store: &ECStore, bucket: &str, operator: &str) -> (Vec<u8>, Vec<u8>) {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for replication");
+        metadata_sys::update(
+            bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("enable versioning");
+        let config = PersistedReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(USER_ARN, operator, 1),
+                replication_rule_with_id(PEER_ARN, SITE_RULE, 2),
+            ],
+        };
+        let targets = BucketTargets {
+            targets: [PEER_ARN, USER_ARN]
+                .into_iter()
+                .map(|arn| BucketTarget {
+                    source_bucket: bucket.to_owned(),
+                    arn: arn.to_owned(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let bytes = serialize(&config).expect("seed configuration bytes");
+        let targets = serde_json::to_vec(&targets).expect("seed target bytes");
+        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, targets.clone())
+            .await
+            .expect("seed target metadata");
+        metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, bytes.clone())
+            .await
+            .expect("seed replication configuration");
+        (bytes, targets)
+    }
+
+    async fn persisted_replication(bucket: &str) -> (Vec<u8>, Vec<u8>) {
+        let stored = metadata_sys::get_global_bucket_metadata_sys()
+            .expect("initialized metadata system")
+            .read()
+            .await
+            .get_config_from_disk(bucket)
+            .await
+            .expect("disk metadata");
+        (stored.replication_config_xml, stored.bucket_targets_config_json)
+    }
+
+    async fn authorize_replication(context: &Arc<AppContext>, bucket: &str, method: Method) -> RequestEnvelope {
+        let server = ServerContextSlot::new();
+        assert!(server.install(Arc::clone(context)));
+        let mut request = build_request((), method);
+        request.uri = format!("/{bucket}?replication").parse().expect("replication URI");
+        request.extensions.insert(Arc::clone(&server));
+        request.extensions.insert(ReqInfo {
+            cred: Some(Credentials {
+                access_key: "replication-owner".to_owned(),
+                ..Default::default()
+            }),
+            is_owner: true,
+            ..Default::default()
+        });
+        let mut envelope = RequestEnvelope::from_s3s(&request);
+        authorize_bucket_config_mutation(
+            &server,
+            &mut envelope,
+            bucket,
+            Action::S3Action(S3Action::PutReplicationConfigurationAction),
+        )
+        .await
+        .expect("snapshot authorized bucket");
+        envelope
+    }
+
+    async fn edit_replication(
+        usecase: &DefaultBucketUsecase,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        put: bool,
+    ) -> S3Result<()> {
+        let peers = HashSet::from(["peer-dep".to_owned()]);
+        if put {
+            usecase
+                .execute_put_bucket_replication(envelope, bucket, async {
+                    Ok((put_configuration(), peers, OperatorRuleContract::Derived))
+                })
+                .await
+        } else {
+            usecase
+                .execute_delete_bucket_replication(envelope, bucket, async { Ok((peers, OperatorRuleContract::Derived)) })
+                .await
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Reload {
+        completed: bool,
+        maintenance: bool,
+        target_lock_available: bool,
+        hook_calls: usize,
+    }
+
+    async fn observe_replication_edit(
+        bucket: &str,
+        edit: impl Future<Output = S3Result<()>>,
+    ) -> (S3Result<()>, Vec<Reload>, Vec<BucketMetaHookCall>) {
+        let reloads = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&reloads);
+        let target_bucket = bucket.to_owned();
+        let (result, hooks) = BUCKET_META_HOOK_CALLS
+            .scope(
+                RefCell::default(),
+                BUCKET_METADATA_RELOAD_PROBE.scope(
+                    (
+                        bucket.to_owned(),
+                        Box::new(move |completed, _, maintenance| {
+                            record.lock().expect("reloads").push(Reload {
+                                completed,
+                                maintenance,
+                                target_lock_available: lock_bucket_targets_metadata(&target_bucket).now_or_never().is_some(),
+                                hook_calls: BUCKET_META_HOOK_CALLS.with(|calls| calls.borrow().len()),
+                            });
+                        }),
+                    ),
+                    async {
+                        let result = edit.await;
+                        (result, BUCKET_META_HOOK_CALLS.with(RefCell::take))
+                    },
+                ),
+            )
+            .await;
+        let reloads = std::mem::take(&mut *reloads.lock().expect("reloads"));
+        (result, reloads, hooks)
+    }
+
+    #[test]
+    #[serial]
+    fn owned_replication_preserves_peer_rules_and_finishes_reload_before_site_hook() {
+        run_large_stack_test("owned-replication-peer-rules", || async {
+            let context = shared_gating_ambient().await;
+            let bucket = format!("replication-peer-{}", uuid::Uuid::new_v4().simple());
+            let (original, _) = seed_replication(&context.object_store(), &bucket, "old-operator").await;
+            let usecase = DefaultBucketUsecase::with_context(Some(Arc::clone(&context)));
+            for (put, method) in [(true, Method::PUT), (false, Method::DELETE)] {
+                let envelope = authorize_replication(&context, &bucket, method).await;
+                let (result, reloads, hooks) =
+                    observe_replication_edit(&bucket, edit_replication(&usecase, envelope, &bucket, put)).await;
+                result.expect("replication edit");
+                assert_eq!(
+                    reloads,
+                    [
+                        Reload {
+                            completed: false,
+                            maintenance: true,
+                            target_lock_available: true,
+                            hook_calls: 0
+                        },
+                        Reload {
+                            completed: true,
+                            maintenance: true,
+                            target_lock_available: true,
+                            hook_calls: 0
+                        },
+                    ]
+                );
+
+                let (xml, target_bytes) = persisted_replication(&bucket).await;
+                assert_ne!(xml, original);
+                let config = rustfs_gateway_types::persistence::parse_replication(&xml).expect("stored XML");
+                let ids: HashSet<_> = config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect();
+                let targets: BucketTargets = serde_json::from_slice(&target_bytes).expect("stored targets");
+                let arns: HashSet<_> = targets.targets.iter().map(|target| target.arn.as_str()).collect();
+                if put {
+                    assert_eq!(ids, HashSet::from([SITE_RULE, "new-operator", "shared-peer-target"]));
+                    assert_eq!(arns, HashSet::from([PEER_ARN, USER_ARN]));
+                } else {
+                    assert_eq!(ids, HashSet::from([SITE_RULE]));
+                    assert_eq!(arns, HashSet::from([PEER_ARN]));
+                }
+                assert_eq!(hooks.len(), 1);
+                assert_eq!(
+                    (hooks[0].bucket.as_str(), hooks[0].item_type.as_str()),
+                    (bucket.as_str(), "replication-config")
+                );
+                assert_eq!(hooks[0].replication_config.as_deref().map(str::as_bytes), put.then_some(xml.as_slice()));
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn owned_replication_stale_edits_leave_replacement_bytes_and_skip_callbacks() {
+        run_large_stack_test("owned-replication-stale", || async {
+            let context = shared_gating_ambient().await;
+            let store = context.object_store();
+            let usecase = DefaultBucketUsecase::with_context(Some(Arc::clone(&context)));
+            for (method, preserve_peer) in [(Method::PUT, true), (Method::DELETE, true), (Method::DELETE, false)] {
+                let bucket = format!("replication-stale-{}", uuid::Uuid::new_v4().simple());
+                seed_replication(&store, &bucket, "old-operator").await;
+                let put = method == Method::PUT;
+                let envelope = authorize_replication(&context, &bucket, method).await;
+                store
+                    .delete_bucket(&bucket, &DeleteBucketOptions::default())
+                    .await
+                    .expect("delete authorized bucket");
+                let replacement = seed_replication(&store, &bucket, "replacement").await;
+                let edit = async {
+                    if preserve_peer {
+                        edit_replication(&usecase, envelope, &bucket, put).await
+                    } else {
+                        usecase
+                            .execute_delete_bucket_replication(envelope, &bucket, async {
+                                Ok((HashSet::new(), OperatorRuleContract::Derived))
+                            })
+                            .await
+                    }
+                };
+                let (result, reloads, hooks) = observe_replication_edit(&bucket, edit).await;
+                assert_eq!(
+                    (
+                        result.err().map(|err| err.code().clone()),
+                        persisted_replication(&bucket).await,
+                        reloads.len(),
+                        hooks.len()
+                    ),
+                    (Some(S3ErrorCode::NoSuchBucket), replacement, 0, 0),
+                    "stale {}",
+                    if put { "Put" } else { "Delete" }
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn owned_replication_cleanup_error_restores_original_and_never_overwrites_a_replacement() {
+        run_large_stack_test("owned-replication-cleanup", || async {
+            let context = shared_gating_ambient().await;
+            let store = context.object_store();
+            let usecase = DefaultBucketUsecase::with_context(Some(Arc::clone(&context)));
+            for (replace, fail_target_write) in [(false, true), (true, true), (true, false)] {
+                let bucket = format!("replication-cleanup-{}", uuid::Uuid::new_v4().simple());
+                let original = seed_replication(&store, &bucket, "old-operator").await;
+                let envelope = authorize_replication(&context, &bucket, Method::DELETE).await;
+                let expected_storage = Arc::new(Mutex::new(original));
+                let output = Arc::clone(&expected_storage);
+                let replacement_bucket = bucket.clone();
+                let old_store = Arc::clone(&store);
+                let fail = Box::pin(async move {
+                    let (after_delete, _) = persisted_replication(&replacement_bucket).await;
+                    assert!(!String::from_utf8_lossy(&after_delete).contains("old-operator"));
+                    assert!(lock_bucket_targets_metadata(&replacement_bucket).now_or_never().is_none());
+                    if replace {
+                        old_store
+                            .delete_bucket(&replacement_bucket, &DeleteBucketOptions::default())
+                            .await
+                            .expect("delete original before restoration");
+                        let replacement = seed_replication(&old_store, &replacement_bucket, "replacement").await;
+                        *output.lock().expect("replacement bytes") = replacement;
+                    }
+                    if fail_target_write {
+                        Err(s3_error!(InternalError, "replication target cleanup failed"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let (result, reloads, hooks) = TARGET_CLEANUP_FAILURE
+                    .scope(
+                        RefCell::new(Some(fail)),
+                        observe_replication_edit(&bucket, edit_replication(&usecase, envelope, &bucket, false)),
+                    )
+                    .await;
+                let expected = if fail_target_write {
+                    S3ErrorCode::InternalError
+                } else {
+                    S3ErrorCode::NoSuchBucket
+                };
+                let stored = persisted_replication(&bucket).await;
+                assert_eq!(
+                    (result.as_ref().err().map(|error| error.code().clone()), stored),
+                    (Some(expected), expected_storage.lock().expect("expected bytes").clone())
+                );
+                if fail_target_write {
+                    assert_eq!(result.unwrap_err().message(), Some("replication target cleanup failed"));
+                }
+                assert!(reloads.is_empty() && hooks.is_empty());
+            }
+        });
     }
 }

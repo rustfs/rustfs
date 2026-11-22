@@ -21,10 +21,20 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/listing_multipart.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
-// The table snapshot reads the access module's private table-catalog state.
-use super::super::*;
-use rustfs_s3_types::S3Result;
+use crate::auth::facts::AuthzTarget;
+use crate::error::ApiError;
+use crate::storage::authorization::*;
+use crate::storage::authorization_actions::list_parts_authorize_action;
+use crate::storage::options::destination_version_id;
+use crate::storage::storage_api::runtime_sources_consumer::{ServerContextSlot, runtime_sources};
+use rustfs_policy::policy::Args;
+use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+use rustfs_s3_types::{S3Error, S3Result};
 use rustfs_utils::http::SUFFIX_INCLUDE_DELETED;
+use rustfs_utils::http::get_header;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use time::OffsetDateTime;
 
 const TABLE_DATA_PLANE_LIST_CURSOR_KEY_CONTEXT: &[u8] = b"rustfs-table-list-cursor-key:v1";
 
@@ -49,7 +59,99 @@ pub(crate) async fn authorize_bucket_listing<R: AuthorizationRequest + ?Sized>(
     if action == S3Action::ListBucketAction && get_header(req.headers(), SUFFIX_INCLUDE_DELETED).as_deref() == Some("true") {
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await?;
     }
-    Ok(prepare_table_data_plane_list_access(req, bucket, action).await?)
+    prepare_table_data_plane_list_access(req, bucket, action).await
+}
+
+/// The authorization of ListMultipartUploads: the bucket generation captured before the decision,
+/// `ListBucketMultipartUploads` on the bucket, the table snapshot, and the generation handed on
+/// after an allow (a generation that could not be read is raised then, not before the decision).
+///
+/// # Errors
+///
+/// `InternalError` when the access phase installed no `ReqInfo`; otherwise what the policy
+/// decision, the table catalog or the generation read refuses.
+pub(crate) async fn authorize_list_multipart_uploads<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    let action = S3Action::ListBucketMultipartUploadsAction;
+    authorize_bucket_request(req, bucket, Action::S3Action(action)).await?;
+    prepare_table_data_plane_list_access(req, bucket, action).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
+/// Checks ListMultipartUploadParts on the object and hands its bucket generation to the use case.
+pub(crate) async fn authorize_list_parts<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+
+    authorize_request(req, list_parts_authorize_action()).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
+/// Authorizes Abort on the object and installs the bucket generation captured before the decision.
+pub(crate) async fn authorize_abort_multipart_upload<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+
+    authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
+/// Decoded request facts used by both multipart initiation access hooks.
+pub(crate) struct CreateMultipartAuthorization<'a> {
+    pub(crate) bucket: &'a str,
+    pub(crate) key: &'a str,
+    pub(crate) query_version: Option<&'a str>,
+    pub(crate) retain_until: Option<OffsetDateTime>,
+    pub(crate) legal_hold_present: bool,
+    pub(crate) retention_present: bool,
+}
+
+/// Binds authorization to the requested object and captures its bucket incarnation before
+/// checking write, replication and Object Lock permissions.
+pub(crate) async fn authorize_create_multipart_upload<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    facts: CreateMultipartAuthorization<'_>,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, facts.bucket).await;
+    let version = destination_version_id(facts.query_version, req.headers());
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(facts.bucket.to_owned());
+    req_info.object = Some(facts.key.to_owned());
+    req_info.version_id = version;
+
+    set_requested_object_lock_retain_until(req, facts.retain_until);
+    authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+    authorize_replication_only_put_headers(req).await?;
+    if facts.legal_hold_present {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+    }
+    if facts.retention_present {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+    }
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
 }
 
 /// The authorization of ListObjectsV2: the object listing's, with the bucket generation an
@@ -102,7 +204,7 @@ fn table_list_snapshot_fingerprint(resources: &[TableDataPlaneListResource]) -> 
     hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
-fn table_list_cursor_key<R: AuthorizationRequest + ?Sized>(req: &R) -> super::super::S3Result<[u8; 32]> {
+fn table_list_cursor_key<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<[u8; 32]> {
     let credentials = match req.server_context() {
         Some(server_ctx) => server_ctx
             .installed_app_context()
@@ -119,11 +221,11 @@ fn table_list_cursor_key<R: AuthorizationRequest + ?Sized>(req: &R) -> super::su
 
 /// Snapshots which tables of a table bucket the caller may list, for the listing's use case. A
 /// bucket that is not a table bucket installs nothing.
-pub(crate) async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
+async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     bucket: &str,
     action: S3Action,
-) -> super::super::S3Result<()> {
+) -> S3Result<()> {
     if !table_bucket_enabled_for_data_plane(req, bucket).await? {
         return Ok(());
     }
@@ -139,7 +241,7 @@ pub(crate) async fn prepare_table_data_plane_list_access<R: AuthorizationRequest
     let default_cred = rustfs_credentials::Credentials::default();
     let condition_cred = cred.as_ref().unwrap_or(&default_cred);
     let root_access_key = root_access_key();
-    let principal = AuthzPrincipal::new(condition_cred, &root_access_key);
+    let principal = request_principal(req, condition_cred, &root_access_key);
     let facts = request_authz_facts(
         req,
         AuthzTarget {

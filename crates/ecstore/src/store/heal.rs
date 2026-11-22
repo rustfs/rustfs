@@ -29,6 +29,7 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+const EVENT_HEAL_DELETE_RECOVERY_BLOCKED: &str = "heal_delete_recovery_blocked";
 
 /// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
 pub(crate) struct BucketHealScope {
@@ -109,6 +110,14 @@ fn invalid_heal_pool_index(pool_idx: usize, pool_count: usize) -> Error {
 
 fn is_pool_meta_object(bucket: &str, object: &str) -> bool {
     bucket == RUSTFS_META_BUCKET && object == POOL_META_NAME
+}
+
+/// Republish only for a confirmed missing, stale, or corrupt replica. A failed
+/// probe (including a timeout) can leave the replica intact. Republishing to
+/// the other drives in that case can leave no quorum after the next drive loss.
+fn pool_meta_drive_needs_repair(state: &str) -> bool {
+    use rustfs_heal_contracts::heal_channel::DriveState;
+    state == DriveState::Missing.to_str() || state == DriveState::Corrupt.to_str()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,6 +214,12 @@ fn heal_format_fence_lost_error() -> Error {
 }
 
 impl ECStore {
+    /// Whether this exact storage instance requires an incarnation-bound write
+    /// for the object currently owned by a bucket-heal scope.
+    pub fn object_requires_incarnation(&self, bucket: &str, object: &str) -> bool {
+        bucket_heal_scope_for_object(bucket, object).is_some_and(|scope| std::ptr::eq(Arc::as_ptr(&scope.store), self))
+    }
+
     pub async fn purge_delete_marker_with_proof(
         self: &Arc<Self>,
         bucket: &str,
@@ -385,7 +400,7 @@ impl ECStore {
                 dry_run: opts.dry_run,
                 explicit_delete,
                 namespace_owner: (!opts.dry_run)
-                    .then(|| Arc::new((scope.clone(), store.ctx.begin_namespace_commit())) as Arc<dyn Send + Sync>),
+                    .then(|| Arc::new((scope.clone(), store.ctx.begin_namespace_commit_for_bucket(&bucket))) as Arc<dyn Send + Sync>),
                 ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &can_commit)
             };
             let mut summary = crate::set_disk::DeleteRecoverySummary::default();
@@ -408,6 +423,24 @@ impl ECStore {
                         summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
                     }
                 }
+            }
+            if let Some(object) = &object
+                && !opts.dry_run
+                && summary.blocked > 0
+            {
+                tracing::debug!(
+                    event = EVENT_HEAL_DELETE_RECOVERY_BLOCKED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
+                    state = "insufficient_evidence",
+                    bucket = ?bucket,
+                    object = ?decode_dir_object(object),
+                    pool = opts.pool,
+                    set = opts.set,
+                    legacy_ambiguous = summary.legacy_ambiguous,
+                    other_blocked = summary.blocked - summary.legacy_ambiguous,
+                    "Exact-key delete recovery is blocked"
+                );
             }
             if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
@@ -1489,7 +1522,11 @@ impl ECStore {
             .await?;
         let target = pool.get_disks_for_heal_object(POOL_META_NAME, opts)?;
         let owns_replica = Arc::ptr_eq(&target, &pool.get_disks_by_key(POOL_META_NAME));
-        let needs_repair = !before.after.drives.is_empty() && before.after.drives.iter().any(|drive| drive.state != "ok");
+        let needs_repair = before
+            .after
+            .drives
+            .iter()
+            .any(|drive| pool_meta_drive_needs_repair(&drive.state));
         if opts.dry_run || error.is_some() || !owns_replica || !needs_repair {
             return Ok((before, error, absence));
         }
@@ -1570,6 +1607,7 @@ mod tests {
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{
         RebalanceInfo, RebalanceStats, test_three_pool_stores_with_isolated_node_contexts, test_two_pool_stores,
+        test_two_pool_stores_with_three_drive_sets,
     };
     use crate::storage_api_contracts::bucket::{
         BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
@@ -3793,6 +3831,88 @@ mod tests {
             missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
             "pool metadata read repair should restore the missing shard"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_repair_does_not_republish_for_an_unreachable_drive() {
+        // Three drives at EC:1. A republish while one drive is unreachable would
+        // give the two others a version the unreachable drive lacks; losing one
+        // of them later would leave pool.bin without read quorum.
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores_with_three_drive_sets().await;
+        let disks: Vec<DiskStore> = store.pools[0]
+            .get_disks_by_key(POOL_META_NAME)
+            .disks
+            .read()
+            .await
+            .iter()
+            .map(|disk| disk.clone().expect("pool metadata fixture disk should be online"))
+            .collect();
+        assert_eq!(disks.len(), 3);
+        let unreachable = &disks[0];
+        unreachable.close().await.expect("stop disk monitoring");
+        unreachable.force_offline_for_test();
+        let mut replicas_before = Vec::new();
+        for disk in &disks[1..] {
+            let raw = disk
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .expect("reachable pool metadata replica");
+            replicas_before.push(raw.buf);
+        }
+
+        let (result, error) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    read_repair: true,
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("pool metadata read repair should not hang on an unreachable drive")
+        .expect("pool metadata read repair should report its outcome");
+
+        assert!(error.is_none(), "pool metadata inspection should have read quorum: {error:?}");
+        assert!(!result.metadata_repair_verified, "skipping a write must not report a verified repair");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| [DriveState::Offline.to_string(), DriveState::Faulty.to_string()].contains(&drive.state)),
+            "the fixture drive should be reported unreachable: {:?}",
+            result.after.drives
+        );
+        for (disk, before) in disks[1..].iter().zip(replicas_before) {
+            let after = disk
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .expect("reachable pool metadata replica");
+            assert_eq!(after.buf, before, "pool.bin must keep the version the unreachable drive holds");
+        }
+    }
+
+    #[test]
+    fn pool_meta_drive_needs_repair_only_for_confirmed_replica_damage() {
+        for state in [
+            DriveState::Ok,
+            DriveState::Offline,
+            DriveState::Faulty,
+            DriveState::Unknown(DiskError::Timeout.to_string()),
+            DriveState::Unknown(DiskError::from(tonic::Status::deadline_exceeded("metadata read deadline")).to_string()),
+            DriveState::Unknown(DiskError::from(tonic::Status::permission_denied("metadata read denied")).to_string()),
+        ] {
+            assert!(!pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
+        }
+        for state in [DriveState::Missing, DriveState::Corrupt] {
+            assert!(pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
+        }
     }
 
     #[tokio::test]

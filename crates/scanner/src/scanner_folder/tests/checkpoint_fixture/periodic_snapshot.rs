@@ -150,7 +150,7 @@ async fn nested_periodic_snapshot(
         .await
         .expect("initial periodic fixture revisions");
     snapshot
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist real mid-walk periodic snapshot");
     let mut loaded = DataUsageCache::default();
@@ -223,7 +223,7 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
         .await
         .expect("initial periodic fixture revisions");
     periodic
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("seed durable periodic snapshot");
 
@@ -281,11 +281,16 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
 
         store.reject_save.store(round == 0, Ordering::SeqCst);
         let saved = terminal
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await;
         if round == 0 {
             assert!(saved.is_err(), "injected terminal persistence failure must be observable");
+            assert!(terminal.completed_bucket_observation().is_some());
             let retained = store.strict_load().await;
+            assert!(
+                retained.info.scan_bucket_observations.is_empty(),
+                "a failed CAS cannot publish the terminal companion"
+            );
             assert_eq!(retained.info.scan_coverage_receipt, periodic.info.scan_coverage_receipt);
             assert_eq!(retained.info.scan_checkpoint, periodic.info.scan_checkpoint);
             assert!(
@@ -297,6 +302,7 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
             let retained = store.strict_load().await;
             assert!(!retained.has_scan_position());
             assert_eq!(retained.info.snapshot_complete, round == 2);
+            assert_eq!(retained.completed_bucket_observation().is_some(), round == 1);
         }
         store.reject_save.store(false, Ordering::SeqCst);
     }
@@ -363,7 +369,7 @@ async fn periodic_nested_snapshot_keeps_durable_frontier_across_early_repeated_h
         .await
         .expect("initial repeated-handoff revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("save the inherited valid subtree frontier");
     let (mut scanner, unused_root) = build_test_scanner().await;
@@ -436,7 +442,7 @@ async fn periodic_nested_snapshot_keeps_durable_frontier_across_early_repeated_h
         "inherited completed object and both newly read objects must survive"
     );
     candidate
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist later coverage without losing the inherited prefix");
     let mut latest = DataUsageCache::default();
@@ -814,6 +820,11 @@ async fn periodic_nested_snapshot_adoption_records_checkpoint_used_on_real_scan_
         .await
         .expect("create the real cached subtree directory");
     let (mut cache, _) = bound_checkpoint();
+    cache.info.scan_directory_source = Some(
+        directory_cursor::physical_source(&scanner.local_disk)
+            .await
+            .expect("fixture disk source"),
+    );
     cache.info.skip_healing = true;
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -848,6 +859,80 @@ async fn periodic_nested_snapshot_adoption_records_checkpoint_used_on_real_scan_
     );
     assert_eq!(budget.progress().1, 1, "adoption must avoid entering the completed subtree");
     assert_eq!(budget.reason(), None);
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_compacted_checkpoint_survives_a_crash_inside_the_first_quantum() {
+    use super::super::{enumeration_restart::seed_flat_bucket, fair_prefix_quantum::run_until_finished};
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    // seed_flat_bucket creates its directory; retain the allocated native
+    // disk and initialize this already-created bucket in the same shape.
+    let template = tempfile::tempdir().expect("fixture directory");
+    let cache = seed_flat_bucket(&template.path().join("initial"), 0).await;
+    for index in 0..40 {
+        write_checkpoint_object(&root, &format!("object-{index:04}"), &[(Some(Uuid::from_u128(index + 1)), 3)]).await;
+    }
+    prepare_scanner(&mut scanner, cache);
+    let (tx, mut rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(tx);
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL - 1;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("checkpoint interval");
+    let ctx = CancellationToken::new();
+    scanner.budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, Default::default());
+    let mut entry = DataUsageEntry::default();
+    super::super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            let checkpoint = {
+                let scan = scanner.scan_folder(
+                    ctx.clone(),
+                    CachedFolder {
+                        name: "bucket".to_owned(),
+                        parent: None,
+                        object_heal_prob_div: 1,
+                    },
+                    &mut entry,
+                );
+                tokio::pin!(scan);
+                tokio::select! {
+                    checkpoint=rx.recv()=>checkpoint.expect("compacted owner emitted a periodic checkpoint"),
+                    result=&mut scan=>panic!("scan returned before it checkpointed a completed compacted child: {result:?}"),
+                }
+            };
+            assert!(!ctx.is_cancelled());
+            assert!(!checkpoint.info.snapshot_complete);
+            assert!(
+                checkpoint
+                    .info
+                    .scan_directory_work
+                    .iter()
+                    .any(|receipt| receipt.progress(&checkpoint.info).is_some())
+            );
+            let total = checkpoint.checked_flatten("bucket").expect("connected partial root");
+            assert!((1..40).contains(&total.objects));
+            assert_eq!(total.size, total.objects * 3);
+            let bytes = checkpoint.marshal_msg().expect("persist running checkpoint");
+            drop(scanner);
+            let durable = DataUsageCache::unmarshal(&bytes).expect("reload checkpoint after crash");
+            let resumed = run_until_finished(
+                &root,
+                durable,
+                ScannerCycleBudgetConfig {
+                    max_objects: Some(6),
+                    ..Default::default()
+                },
+                12,
+            )
+            .await;
+            let complete = resumed.checked_flatten("bucket").expect("restarted compacted root");
+            assert_eq!((complete.objects, complete.size, complete.versions), (40, 120, 40));
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -952,7 +1037,7 @@ async fn periodic_failed_subtree_resumes_healthy_descendants_and_compacted_debt(
             .await
             .expect("fresh revisions");
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist failure-bearing coverage");
         let mut adopted = DataUsageCache::default();
@@ -1214,7 +1299,7 @@ async fn checkpoint_debt_restart_round(request: &CheckpointDebtRequest) -> serde
     let expected = checkpoint_debt_observation(&cache, state.identity, frontier, failed_objects);
     assert_eq!(cache.info.leader_epoch, 8 + u64::from(request.round));
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist combined healthy coverage and failure debt with CAS");
     let saved = store.strict_load().await;

@@ -1218,6 +1218,8 @@ impl std::fmt::Debug for GetObjectSink {
 
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    /// Part copies retain source locks and cannot queue for capped upload staging.
+    pub multipart_copy_source_locked: bool,
     #[doc(hidden)]
     pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
     /// Caller-provided destination for a GET body: when set, the legacy
@@ -1232,6 +1234,9 @@ pub struct ObjectOptions {
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: Option<usize>,
 
+    /// Exact logical versions authorized under the recursive delete bucket write lock.
+    /// An empty request plan must not dispatch any disk mutation. Never serialized.
+    pub recursive_delete_targets: Option<Arc<[(String, Uuid)]>>,
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
@@ -1254,6 +1259,11 @@ pub struct ObjectOptions {
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
+    /// Bucket incarnation that was admitted for an externally visible event.
+    /// This is kept separate from the storage fence because recovered work may
+    /// be allowed to commit while its notification provenance remains unknown.
+    #[doc(hidden)]
+    pub notification_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
     /// Require complete participant observations for internal multipart size decisions.
     /// This transient flag is never derived from client input or stored on disk.
@@ -1280,6 +1290,10 @@ pub struct ObjectOptions {
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
     pub metadata_cache_safe: bool,
+    /// Read-quorum proof captured from the live distributed namespace guard.
+    /// This transient value is never serialized or persisted.
+    #[doc(hidden)]
+    pub metadata_cache_fence_proof: Option<Arc<rustfs_lock::CacheFenceProof>>,
 
     pub versioned: bool,
     pub version_suspended: bool,
@@ -1388,6 +1402,10 @@ pub struct ObjectOptions {
     #[doc(hidden)]
     pub multipart_completion_authorization:
         Option<Arc<dyn crate::storage_api_contracts::multipart::MultipartCompletionAuthorization<Error = Error>>>,
+    /// In-process authorization against the selected upload, while Abort holds its write lock.
+    #[doc(hidden)]
+    pub multipart_abort_authorization:
+        Option<Arc<dyn crate::storage_api_contracts::multipart::MultipartAbortAuthorization<Error = Error>>>,
     pub eval_metadata: Option<HashMap<String, String>>,
     /// Internal compare-and-set condition for replication workers publishing
     /// terminal status after remote I/O. Storage validates it while holding
@@ -1501,6 +1519,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("expected_bucket_incarnation_id", &self.expected_bucket_incarnation_id)
             .field("no_lock", &self.no_lock)
             .field("metadata_cache_safe", &self.metadata_cache_safe)
+            .field("metadata_cache_fence_proof", &self.metadata_cache_fence_proof.is_some())
             .field("versioned", &self.versioned)
             .field("version_suspended", &self.version_suspended)
             .field("incl_free_versions", &self.incl_free_versions)
@@ -1580,6 +1599,7 @@ impl ObjectOptions {
         let mut opts = self.clone();
         opts.no_lock = true;
         opts.metadata_cache_safe = false;
+        opts.metadata_cache_fence_proof = None;
         opts.include_part_checksums = true;
         opts
     }
@@ -1648,6 +1668,11 @@ impl ObjectOptions {
         if let Some(signal) = guard.lock_lost_signal() {
             self.add_namespace_lock_lost_signal(signal);
         }
+    }
+
+    pub(crate) fn add_metadata_cache_read_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        self.add_namespace_lock_guard(guard);
+        self.metadata_cache_fence_proof = guard.cache_fence_proof().cloned().map(Arc::new);
     }
 
     pub fn add_bucket_lifecycle_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {

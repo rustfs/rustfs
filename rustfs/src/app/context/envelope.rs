@@ -26,7 +26,6 @@
 //! envelope lives in `storage/s3_compat/envelope.rs`.
 
 use super::ServerContextSlot;
-use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
@@ -41,6 +40,7 @@ use crate::app::storage_api::context::{
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
+use crate::storage::request_markers::WebsiteRead;
 use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
@@ -178,13 +178,6 @@ pub(crate) struct RequestHead {
 /// There is deliberately no generic extension lookup: a payload the app layer
 /// needs gets a named field here, so an edge that builds an envelope can see
 /// everything it has to supply.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "fields read only by the crate-private accessors stay unread until call sites move in T1.8 (rustfs/backlog#2749)"
-    )
-)]
 pub struct RequestEnvelope {
     method: Method,
     uri: Uri,
@@ -204,6 +197,8 @@ pub struct RequestEnvelope {
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
+    gateway_post: bool,
+    gateway_post_archive_identity: Option<Arc<()>>,
     post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
@@ -222,6 +217,10 @@ pub struct RequestEnvelope {
     requested_object_legal_hold: Option<RequestedObjectLegalHold>,
     requested_object_tags: Option<RequestedObjectTags>,
     requested_copy_source: Option<RequestedCopySource>,
+    permission_probe: bool,
+    permission_probe_caller_authentication: Option<crate::auth::facts::CallerAuthentication>,
+    permission_probe_auth_type: Option<crate::auth::facts::AuthTypeCondition>,
+    permission_probe_known_request_facts: u8,
     residual_extensions: Extensions,
 }
 
@@ -251,6 +250,8 @@ impl RequestEnvelope {
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
             post_object: extensions.remove(),
+            gateway_post: false,
+            gateway_post_archive_identity: None,
             post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
@@ -268,6 +269,10 @@ impl RequestEnvelope {
             requested_object_legal_hold: extensions.remove(),
             requested_object_tags: extensions.remove(),
             requested_copy_source: extensions.remove(),
+            permission_probe: false,
+            permission_probe_caller_authentication: None,
+            permission_probe_auth_type: None,
+            permission_probe_known_request_facts: 0,
             residual_extensions: extensions,
         }
     }
@@ -278,10 +283,6 @@ impl RequestEnvelope {
     /// budget. The table publication guards are one shared set, so a lock the copy's
     /// authorization retains stays held for the original's write too. Anything else installed on
     /// the copy does not show on the original.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the PutObject archive member loop of batch D is its first caller")
-    )]
     pub(crate) fn fork_for_authorization(&self) -> Self {
         Self {
             method: self.method.clone(),
@@ -300,6 +301,8 @@ impl RequestEnvelope {
             verified_presigned: self.verified_presigned,
             website_read: self.website_read.clone(),
             post_object: self.post_object.clone(),
+            gateway_post: self.gateway_post,
+            gateway_post_archive_identity: self.gateway_post_archive_identity.clone(),
             post_object_policy_headers: self.post_object_policy_headers.clone(),
             req_info: self.req_info.clone(),
             bucket_generation: self.bucket_generation.clone(),
@@ -317,7 +320,78 @@ impl RequestEnvelope {
             requested_object_legal_hold: self.requested_object_legal_hold.clone(),
             requested_object_tags: self.requested_object_tags.clone(),
             requested_copy_source: self.requested_copy_source.clone(),
+            permission_probe: self.permission_probe,
+            permission_probe_caller_authentication: self.permission_probe_caller_authentication,
+            permission_probe_auth_type: self.permission_probe_auth_type,
+            permission_probe_known_request_facts: self.permission_probe_known_request_facts,
             residual_extensions: self.residual_extensions.clone(),
+        }
+    }
+
+    /// A read-only policy query preserves verified connection and identity facts, without
+    /// operation guards, body metadata or internal authorization shortcuts. The caller
+    /// must already be authenticated by the accepting edge; its signing facts are captured
+    /// before the operation URI is replaced, independently of any planned placement.
+    pub(crate) fn fork_for_permission_probe(&self, method: Method, uri: Uri, req_info: ReqInfo) -> Self {
+        let caller_authentication = self.credentials.as_ref().filter(|_| req_info.cred.is_some()).map(|_| {
+            self.permission_probe_caller_authentication.unwrap_or_else(|| {
+                crate::auth::facts::CallerAuthentication::from_authenticated_request_parts(&self.headers, self.uri.query())
+            })
+        });
+        let mut extensions = Extensions::new();
+        if let Some(addr) = self.remote_addr {
+            extensions.insert(Some(RemoteAddr(addr)));
+        }
+        if let Some(client_info) = &self.client_info {
+            extensions.insert(client_info.clone());
+        }
+        if let Some(transport) = self.native_tls_transport {
+            extensions.insert(NativeTlsTransport(transport));
+        }
+        if let Some(context) = &self.server_context {
+            extensions.insert(context.clone());
+        }
+        extensions.insert(req_info);
+        let mut headers = HeaderMap::new();
+        for name in ["authorization", "x-amz-date", "x-amz-security-token"] {
+            if let Some(value) = self.headers.get(name) {
+                headers.insert(http::header::HeaderName::from_static(name), value.clone());
+            }
+        }
+        let mut probe = Self::from_parts(
+            RequestHead {
+                method,
+                uri,
+                headers,
+                credentials: self.credentials.clone(),
+                region: self.region.clone(),
+                service: self.service.clone(),
+            },
+            extensions,
+        );
+        probe.permission_probe = true;
+        probe.permission_probe_caller_authentication = caller_authentication;
+        probe
+    }
+
+    pub(crate) fn set_permission_probe_auth_type(&mut self, auth_type: crate::auth::facts::AuthTypeCondition) {
+        if self.permission_probe {
+            self.permission_probe_auth_type = Some(auth_type);
+        }
+    }
+
+    pub(crate) fn mark_permission_probe_request_fact_known(
+        &mut self,
+        fact: crate::storage::request_markers::PermissionProbeRequestFact,
+    ) {
+        if self.permission_probe {
+            self.permission_probe_known_request_facts |= fact as u8;
+        }
+    }
+
+    pub(crate) fn set_permission_probe_operation(&mut self, operation: &str) {
+        if self.permission_probe {
+            self.multipart_staging_operation = MultipartStagingOperation::for_operation(operation);
         }
     }
 
@@ -417,6 +491,26 @@ impl RequestEnvelope {
         self.post_object.as_ref()
     }
 
+    pub(crate) fn is_gateway_post(&self) -> bool {
+        self.gateway_post
+    }
+
+    pub(crate) fn mark_gateway_post(&mut self) {
+        self.gateway_post = true;
+        self.gateway_post_archive_identity = None;
+    }
+
+    pub(crate) fn bind_gateway_post_archive_identity(&mut self) -> Option<&Arc<()>> {
+        if !self.gateway_post {
+            return None;
+        }
+        Some(self.gateway_post_archive_identity.get_or_insert_with(|| Arc::new(())))
+    }
+
+    pub(crate) fn gateway_post_identity(&self) -> Option<&Arc<()>> {
+        self.gateway_post_archive_identity.as_ref()
+    }
+
     pub(crate) fn req_info(&self) -> Option<&ReqInfo> {
         self.req_info.as_ref()
     }
@@ -431,6 +525,10 @@ impl RequestEnvelope {
 
     pub(crate) fn bucket_generation(&self) -> Option<&BucketGenerationGuard> {
         self.bucket_generation.as_ref()
+    }
+
+    pub(crate) fn take_bucket_generation(&mut self) -> Option<BucketGenerationGuard> {
+        self.bucket_generation.take()
     }
 
     pub(crate) fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard> {
@@ -455,6 +553,11 @@ impl RequestEnvelope {
 
     pub(crate) fn install_table_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
         self.table_publication_guards = Some(guards);
+    }
+
+    /// Releases preflight guards before uncommitted POST staging; publication must reauthorize.
+    pub(crate) fn release_table_publication_guards(&mut self) {
+        self.table_publication_guards = None;
     }
 
     pub(crate) fn table_list_access(&self) -> Option<&TableDataPlaneListAccess> {
@@ -489,6 +592,10 @@ impl RequestEnvelope {
         self.post_object_policy_headers.as_ref()
     }
 
+    pub(crate) fn post_object_policy_headers_mut(&mut self) -> Option<&mut HeaderMap> {
+        self.post_object_policy_headers.as_mut().map(|headers| &mut headers.0)
+    }
+
     pub(crate) fn requested_object_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
         self.requested_object_legal_hold.as_ref()
     }
@@ -505,6 +612,18 @@ impl RequestEnvelope {
 /// The authorization core in `storage` reads requests only through
 /// [`AuthorizationRequest`]; this impl hands it the envelope's named fields.
 impl AuthorizationRequest for RequestEnvelope {
+    fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
+        self.permission_probe_caller_authentication
+    }
+    fn permission_probe_request_fact_known(&self, fact: crate::storage::request_markers::PermissionProbeRequestFact) -> bool {
+        self.permission_probe_known_request_facts & (fact as u8) != 0
+    }
+    fn permission_probe(&self) -> bool {
+        self.permission_probe
+    }
+    fn permission_probe_auth_type(&self) -> Option<crate::auth::facts::AuthTypeCondition> {
+        self.permission_probe_auth_type
+    }
     fn headers(&self) -> &HeaderMap {
         self.headers()
     }
@@ -572,6 +691,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn staged_multipart_part(&self) -> bool {
         self.staged_multipart_part_authorization().is_some()
     }
+    fn set_staged_multipart_part(&mut self, staged: bool) {
+        self.staged_multipart_part_authorization = staged.then_some(StagedMultipartPartAuthorization);
+    }
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
         self.requested_object_lock_retention()
     }
@@ -583,6 +705,9 @@ impl AuthorizationRequest for RequestEnvelope {
     }
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
         self.requested_object_tags()
+    }
+    fn take_requested_object_tags(&mut self) -> Option<RequestedObjectTags> {
+        self.requested_object_tags.take()
     }
     fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention) {
         self.requested_object_lock_retention = Some(retention);
@@ -608,8 +733,17 @@ impl AuthorizationRequest for RequestEnvelope {
     fn policy_headers(&self) -> &HeaderMap {
         self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
     }
+    fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders) {
+        self.post_object_policy_headers = Some(headers);
+    }
+    fn install_post_object_marker(&mut self) {
+        self.post_object = Some(PostObjectRequestMarker);
+    }
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions()
+    }
+    fn take_object_tag_conditions(&mut self) -> Option<ObjectTagConditions> {
+        self.object_tag_conditions.take()
     }
     fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
         self.install_object_tag_conditions(conditions);
@@ -651,9 +785,7 @@ pub(crate) async fn authorize_owned_request(
     location_constraint: Option<String>,
 ) -> rustfs_s3_types::S3Result<()> {
     prepare_owned_authorization(req, action)?;
-    authorize_request_core(req, action, location_constraint, false)
-        .await
-        .map_err(Into::into)
+    authorize_request_core(req, action, location_constraint, false).await
 }
 
 /// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
@@ -664,7 +796,7 @@ pub(crate) async fn authorize_owned_internal_object_request(
     action: Action,
 ) -> rustfs_s3_types::S3Result<()> {
     prepare_owned_authorization(req, action)?;
-    authorize_request_core(req, action, None, true).await.map_err(Into::into)
+    authorize_request_core(req, action, None, true).await
 }
 
 fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
@@ -707,17 +839,16 @@ impl RequestEnvelope {
             self.client_info(),
             self.remote_addr(),
             self.request_context(),
+            PendingDeleteBucketGenerationGuard::resolve_generation(
+                self.bucket_generation(),
+                self.pending_delete_bucket_generation(),
+            )
+            .ok()
+            .flatten(),
         )
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the operation batches of rustfs/backlog#2749 are its first callers (task H2)"
-    )
-)]
 impl RequestEnvelope {
     /// Runs `handler` on this request and records its outcome as an audit-only
     /// entry for `op`, the owned form of the legacy edge's `audit_only_operation`.

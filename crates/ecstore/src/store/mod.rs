@@ -410,7 +410,7 @@ async fn enqueue_transition_after_write(
             // transition/expiry already ran for the original commit; the scanner
             // still sees the object if that commit never reached this hook.
             if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_transition_immediate(&oi, src.clone(), opts.expected_bucket_incarnation_id).await;
                 // Immediate expiry needs the bucket incarnation under the
                 // metadata-transaction lock; a lockless cache PUT leaves expiry
                 // to the scanner.
@@ -440,6 +440,7 @@ pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
+mod format_bootstrap;
 mod init;
 pub(crate) mod init_format;
 pub(crate) mod list_objects;
@@ -458,6 +459,8 @@ pub use object::{
 mod peer;
 mod rebalance;
 #[cfg(test)]
+mod usage_watch_tests;
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 
@@ -466,8 +469,8 @@ pub use peer::external_rpc_disk;
 use peer::init_local_peer;
 pub use peer::{
     BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
-    get_disk_infos, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
-    prewarm_local_disk_id_map_with_instance_ctx,
+    find_local_disk_by_ref_for_scanner_rpc, get_disk_infos, init_local_disks, init_local_disks_with_instance_ctx,
+    init_lock_clients, prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
 };
 
 pub struct ECStore {
@@ -838,6 +841,13 @@ impl ECStore {
         runtime_sources::bucket_metadata_sys()
     }
 
+    /// Recover this instance's weak metadata owner without accepting a
+    /// process-global store belonging to another scanner or test fixture.
+    pub async fn scanner_usage_watch_store_handle(&self) -> Option<Arc<Self>> {
+        let owner = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await?;
+        std::ptr::eq(self, owner.as_ref()).then_some(owner)
+    }
+
     /// Get the global endpoints
     pub fn endpoints(&self) -> EndpointServerPools {
         runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into())
@@ -919,6 +929,72 @@ impl ECStore {
 
     pub fn scanner_namespace_mutation_generation(&self) -> u64 {
         list_objects::scanner_namespace_mutation_generation().saturating_add(self.ctx.namespace_commit_generation())
+    }
+
+    /// Query named buckets against their current storage-owned incarnation.
+    /// Unknown identities, expired tokens and resource pressure remain explicit
+    /// Unknown entries; absence from a dirty list never creates a clean proof.
+    pub async fn scanner_usage_watch(
+        &self,
+        requests: &[crate::runtime::usage_watch::ScannerUsageWatchRequest],
+    ) -> Vec<crate::runtime::usage_watch::ScannerUsageWatchObservation> {
+        use crate::runtime::usage_watch::ScannerUsageWatchObservation;
+        let mut observations = Vec::with_capacity(requests.len().min(32));
+        if requests.len() > 32 {
+            return observations;
+        }
+        let local_map = self.ctx.local_disk_map();
+        let local_disks = local_map.read().await;
+        let bindings_complete = !local_disks.is_empty()
+            && local_disks.values().all(|disk| {
+                disk.as_ref().is_some_and(|disk| match disk.as_ref() {
+                    crate::disk::Disk::Local(wrapper) => wrapper.get_disk().usage_watch_binding.matches(&self.ctx.usage_watches),
+                    crate::disk::Disk::Remote(_) => false,
+                })
+            });
+        drop(local_disks);
+        for request in requests {
+            if request.release {
+                // Retirement needs the exact saved token, not current bucket
+                // metadata. Deleted buckets must not retain scarce watch slots.
+                self.ctx.usage_watches.observe(self.id, request);
+                observations.push(ScannerUsageWatchObservation {
+                    bucket: request.bucket.clone(),
+                    known: None,
+                });
+                continue;
+            }
+            let current = self.bucket_incarnation_id_from_disk(&request.bucket).await;
+            let known = match current {
+                Ok(incarnation) if bindings_complete && incarnation == request.bucket_incarnation && !incarnation.is_nil() => {
+                    self.ctx.usage_watches.observe(self.id, request)
+                }
+                _ => None,
+            };
+            observations.push(ScannerUsageWatchObservation {
+                bucket: request.bucket.clone(),
+                known,
+            });
+        }
+        observations
+    }
+
+    /// Invalidate session proofs after replay or an unsupported producer mode
+    /// transition; this does not change durable dirty ACK responsibility.
+    pub fn invalidate_scanner_usage_watches(&self) {
+        self.ctx.usage_watches.invalidate();
+    }
+
+    pub fn scanner_usage_watch_session_id(&self) -> Uuid {
+        self.ctx.usage_watches.session_id()
+    }
+
+    /// Revoke an exact local token without awaiting storage or peer I/O. A
+    /// failed keepalive must not let a later successful query revive its proof.
+    pub fn scanner_release_usage_watch(&self, request: &crate::runtime::usage_watch::ScannerUsageWatchRequest) {
+        if request.release {
+            self.ctx.usage_watches.observe(self.id, request);
+        }
     }
 
     pub async fn scanner_data_movement_active(&self) -> bool {
@@ -1898,7 +1974,12 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 
     #[instrument(skip(self))]
     async fn local_storage_info(&self) -> Self::StorageInfo {
-        self.handle_local_storage_info().await
+        self.handle_local_storage_info(true).await
+    }
+
+    #[instrument(skip(self))]
+    async fn local_storage_info_with_metrics(&self, include_metrics: bool) -> Self::StorageInfo {
+        self.handle_local_storage_info(include_metrics).await
     }
 
     #[instrument(skip(self))]

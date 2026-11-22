@@ -22,6 +22,7 @@ use rustfs_heal::heal::{
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
 };
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_test_utils::TestECStoreEnvBuilder;
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
@@ -29,6 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
 
@@ -86,13 +88,18 @@ async fn wait_for_object_copies(disks: &[PathBuf], bucket: &str, object: &str) {
 /// Test helper: build the shared 4-disk temp-dir ECStore environment
 /// (rustfs-test-utils, backlog#1153 infra-1) and wrap it in the heal storage
 /// layer. Port 0 + uuid temp dirs keep this parallel-safe under nextest.
-async fn heal_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
-    let env = rustfs_test_utils::TestECStoreEnv::builder()
-        .prefix("rustfs_heal_heal_test")
-        .build()
-        .await;
+async fn heal_env(builder: TestECStoreEnvBuilder) -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
+    let env = builder.prefix("rustfs_heal_heal_test").build().await;
     let heal_storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
     (env.disk_paths, env.ecstore, heal_storage)
+}
+
+fn delete_proof_env_builder() -> TestECStoreEnvBuilder {
+    // The foreground heal must own recovery of these deliberately retained
+    // proofs. Cancel the discovery and settlement workers before they start.
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    TestECStoreEnvBuilder::default().shutdown_token(shutdown)
 }
 
 /// Test helper: Create a test bucket
@@ -288,7 +295,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_object_basic() {
-        let (disk_paths, ecstore, heal_storage) = heal_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env(Default::default()).await;
 
         // Create test bucket and object
         let bucket_name = "test-heal-object-basic";
@@ -349,7 +356,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_object_reclaims_orphan_data_dir_when_healthy() {
-        let (disk_paths, ecstore, heal_storage) = heal_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env(Default::default()).await;
 
         let bucket_name = "test-heal-reclaim-orphan";
         let object_name = "healthy-object.bin";
@@ -462,7 +469,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_bucket_basic() {
-        let (disk_paths, ecstore, heal_storage) = heal_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env(Default::default()).await;
 
         // Create test bucket
         let bucket_name = "test-heal-bucket-basic";
@@ -533,7 +540,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_format_basic() {
-        let (disk_paths, _ecstore, heal_storage) = heal_env().await;
+        let (disk_paths, _ecstore, heal_storage) = heal_env(Default::default()).await;
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -559,7 +566,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_format_with_data() {
-        let (disk_paths, ecstore, heal_storage) = heal_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env(Default::default()).await;
 
         // Create test bucket and object
         let bucket_name = "test-heal-format-with-data";
@@ -644,7 +651,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_storage_api_direct() {
-        let (_disk_paths, ecstore, heal_storage) = heal_env().await;
+        let (_disk_paths, ecstore, heal_storage) = heal_env(Default::default()).await;
 
         // Test direct heal storage API calls
 
@@ -912,7 +919,7 @@ async fn replacement_delete_recovery_on_fresh_target_case() {
         (HealRequestSource::Admin, true),
         (HealRequestSource::Admin, false),
     ] {
-        let (disk_paths, ecstore, storage) = heal_env().await;
+        let (disk_paths, ecstore, storage) = heal_env(delete_proof_env_builder()).await;
         let bucket = "replacement-delete-prepass";
         create_test_bucket(&ecstore, bucket).await;
         let original = non_inline_test_data();
@@ -1027,7 +1034,7 @@ async fn bucket_removal_recovers_delete_proofs_before_removing_empty_volumes() {
     use rustfs_heal::heal::task::HealTask;
     use rustfs_heal_contracts::heal_channel::HealRequestSource;
     use storage_api::integration::{DeleteRecoveryState, DiskAPI as _, DiskSetSelector, StorageAdminApi as _};
-    let (disk_paths, ecstore, storage) = heal_env().await;
+    let (disk_paths, ecstore, storage) = heal_env(delete_proof_env_builder()).await;
     let bucket = "delete-proof-before-volume-removal";
     create_test_bucket(&ecstore, bucket).await;
     upload_test_object(&ecstore, bucket, "deleted", &non_inline_test_data()).await;

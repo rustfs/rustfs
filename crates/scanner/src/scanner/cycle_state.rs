@@ -653,7 +653,7 @@ pub(super) fn record_scanner_cycle_recovery_retry(attempt: u32, cycle_interval: 
 }
 
 fn unix_now_secs() -> u64 {
-    u64::try_from(Utc::now().timestamp()).unwrap_or(0)
+    u64::try_from(Timestamp::now().as_second()).unwrap_or(0)
 }
 
 pub(super) fn sha256_hex(parts: &[&[u8]]) -> String {
@@ -3881,16 +3881,24 @@ pub(crate) fn encode_scanner_cycle_fence_for_test(next_cycle: u64, leader_epoch:
 pub(crate) async fn current_scanner_leader_epoch() -> Result<u64, ScannerError> {
     let store = crate::resolve_scanner_object_store_handle()
         .ok_or_else(|| ScannerError::Other("scanner object layer is unavailable".to_string()))?;
-    match read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await {
-        Ok(buf) => {
-            let (_, leader_epoch) = decode_persisted_scanner_cycle_fence(&buf)?;
-            if leader_epoch == 0 {
-                return Err(ScannerError::Other("persisted scanner cycle state has no leader epoch".to_string()));
-            }
-            Ok(leader_epoch)
-        }
-        Err(err) => Err(ScannerError::Other(format!("failed to read persisted scanner leader epoch: {err}"))),
+    Ok(read_scanner_status_fence(store).await?.0)
+}
+
+/// Read the committed leader generation, next cycle and successful completion history
+/// for a point-in-time scanner observation. This does not initialize or repair state.
+///
+/// # Errors
+/// Returns an error if the requested store has no readable, valid, fenced cycle state.
+pub async fn read_scanner_status_fence<S: ScannerObjectIO>(store: Arc<S>) -> Result<(u64, CurrentCycle), ScannerError> {
+    let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to read persisted scanner leader epoch: {err}")))?;
+    let (cycle, epoch) = decode_scanner_cycle_state(&buf)
+        .map_err(|err| ScannerError::Other(format!("persisted scanner cycle state is invalid: {err}")))?;
+    if epoch == 0 {
+        return Err(ScannerError::Other("persisted scanner cycle state has no leader epoch".to_string()));
     }
+    Ok((epoch, cycle))
 }
 
 pub(super) fn decode_scanner_cycle_state_for_startup(buf: &[u8]) -> Result<(CurrentCycle, u64), ScannerCycleStateError> {
@@ -4853,42 +4861,64 @@ where
 {
     tokio::pin!(cycle);
     tokio::pin!(lock_lost);
-    let deadline = async {
-        if let Some(deadline) = budget.deadline() {
-            tokio::time::sleep_until(deadline).await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
-    tokio::pin!(deadline);
-    tokio::select! {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Stop {
+        Budget,
+        LockLost,
+        Cancelled,
+    }
+
+    let mut stop = tokio::select! {
         biased;
-        _ = &mut lock_lost => {
-            cycle_ctx.cancel();
-            let _ = tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle).await;
-            ScannerCycleWaitOutcome::LockLost
-        }
-        _ = &mut deadline => {
-            budget.cancel_for_runtime();
-            // Let the budget cancellation reach the scanner first so it can
-            // persist a partial cursor. Only an uncooperative worker gets the
-            // parent cancellation, and it is dropped after the bounded window;
-            // the caller fences its epoch next.
-            let worker_stopped = if tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle)
-                .await
-                .is_ok()
-            {
-                true
-            } else {
+        _ = &mut lock_lost => Stop::LockLost,
+        _ = budget.wait_for_stop() => Stop::Budget,
+        _ = cycle_ctx.cancelled() => Stop::Cancelled,
+        output = &mut cycle => return ScannerCycleWaitOutcome::Completed(output),
+    };
+    if stop != Stop::Budget {
+        cycle_ctx.cancel();
+    }
+    let drain_deadline = budget
+        .drain_deadline(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT)
+        .unwrap_or_else(|| tokio::time::Instant::now() + SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+    let runtime_stop = stop == Stop::Budget && budget.reason() == Some(ScannerCycleBudgetReason::Runtime);
+    let mut owner_cancelled = cycle_ctx.is_cancelled();
+    if owner_cancelled && stop == Stop::Budget && !runtime_stop {
+        stop = Stop::Cancelled;
+    }
+
+    // Every stop shares the original deadline. Losing ownership during drain
+    // cancels publication immediately and must not grant a second grace period.
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut lock_lost, if stop != Stop::LockLost => {
+                stop = Stop::LockLost;
                 cycle_ctx.cancel();
-                false
-            };
-            ScannerCycleWaitOutcome::Deadline { worker_stopped }
+                owner_cancelled = true;
+            }
+            _ = cycle_ctx.cancelled(), if !owner_cancelled => {
+                owner_cancelled = true;
+                if !runtime_stop {
+                    stop = Stop::Cancelled;
+                }
+            }
+            _ = tokio::time::sleep_until(drain_deadline) => {
+                cycle_ctx.cancel();
+                return match stop {
+                    Stop::LockLost => ScannerCycleWaitOutcome::LockLost,
+                    Stop::Cancelled => ScannerCycleWaitOutcome::Cancelled,
+                    Stop::Budget => ScannerCycleWaitOutcome::Deadline { worker_stopped: false },
+                };
+            }
+            output = &mut cycle => {
+                return match stop {
+                    Stop::LockLost => ScannerCycleWaitOutcome::LockLost,
+                    Stop::Cancelled => ScannerCycleWaitOutcome::Cancelled,
+                    Stop::Budget if runtime_stop => ScannerCycleWaitOutcome::Deadline { worker_stopped: true },
+                    Stop::Budget => ScannerCycleWaitOutcome::Completed(output),
+                };
+            }
         }
-        _ = cycle_ctx.cancelled() => {
-            let _ = tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle).await;
-            ScannerCycleWaitOutcome::Cancelled
-        }
-        output = &mut cycle => ScannerCycleWaitOutcome::Completed(output),
     }
 }

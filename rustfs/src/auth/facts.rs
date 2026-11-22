@@ -162,6 +162,26 @@ fn scheme_conditions(auth_type: &AuthType) -> (Option<AuthTypeCondition>, Option
     }
 }
 
+/// Authentication placement and signature family of an already authenticated caller.
+/// These typed facts carry no signature, credential or operation capability.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallerAuthentication {
+    auth_type: Option<AuthTypeCondition>,
+    signature_version: Option<SignatureVersionCondition>,
+}
+
+impl CallerAuthentication {
+    /// The accepting edge has already authenticated these original request parts.
+    /// A permission query captures them before replacing the operation URI.
+    pub(crate) fn from_authenticated_request_parts(headers: &HeaderMap, raw_query: Option<&str>) -> Self {
+        let (auth_type, signature_version) = scheme_conditions(&get_request_auth_type_with_query(headers, raw_query));
+        Self {
+            auth_type,
+            signature_version,
+        }
+    }
+}
+
 /// Every request fact a policy condition key is derived from.
 ///
 /// No field holds a secret: see the module documentation. There is no
@@ -185,6 +205,23 @@ pub(crate) struct AuthzFacts {
 }
 
 impl AuthzFacts {
+    /// Restore only the caller's authenticated scheme after a permission query replaces
+    /// the URI. A later planned placement override does not change the signature family.
+    pub(crate) fn with_caller_authentication(mut self, authentication: Option<CallerAuthentication>) -> Self {
+        if let Some(authentication) = authentication {
+            self.auth_type = authentication.auth_type;
+            self.signature_version = authentication.signature_version;
+        }
+        self
+    }
+    /// An authenticated permission query may describe the authentication placement of the
+    /// intended S3 operation. Identity, source address, transport and signing version stay verified.
+    pub(crate) fn with_planned_auth_type(mut self, auth_type: Option<AuthTypeCondition>) -> Self {
+        if let Some(auth_type) = auth_type {
+            self.auth_type = Some(auth_type);
+        }
+        self
+    }
     /// The facts of a request the legacy edge received, resolved by its rules.
     ///
     /// The client address is the one a trusted proxy attested, else the socket
@@ -346,9 +383,17 @@ impl<'a> AuthzPrincipal<'a> {
     /// `root_access_key` is the deployment's root access key, empty when it is
     /// not known. A principal acting as that user is the `Account`.
     pub(crate) fn new(credentials: &'a Credentials, root_access_key: &str) -> Self {
-        // Temporary and service-account credentials act for their parent user.
-        // `is_temp` reads the clock, which is why this is resolved here.
-        let username = if credentials.is_temp() || credentials.is_service_account() {
+        Self::with_session_presence(credentials, root_access_key, None)
+    }
+
+    /// Uses the original session presence when the accepting edge erased the token bytes.
+    pub(crate) fn with_session_presence(
+        credentials: &'a Credentials,
+        root_access_key: &str,
+        original_session: Option<bool>,
+    ) -> Self {
+        let is_temp = original_session.map_or_else(|| credentials.is_temp(), |present| present && !credentials.is_expired());
+        let username = if is_temp || credentials.is_service_account() {
             credentials.parent_user.as_str()
         } else {
             credentials.access_key.as_str()
@@ -407,8 +452,10 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
         args.insert("Referer".to_owned(), vec![referer.to_str().unwrap_or("").to_owned()]);
     }
 
-    args.insert("userid".to_owned(), vec![principal.username.to_owned()]);
-    args.insert("username".to_owned(), vec![principal.username.to_owned()]);
+    if !principal.username.is_empty() {
+        args.insert("userid".to_owned(), vec![principal.username.to_owned()]);
+        args.insert("username".to_owned(), vec![principal.username.to_owned()]);
+    }
     args.insert("principaltype".to_owned(), vec![principal.principal_type.as_str().to_owned()]);
 
     if let Some(version_id) = facts.version_id.as_deref()
@@ -509,7 +556,7 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
                 .get(name)
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.is_empty() && !(name == IF_MATCH.as_str() && *value == "*"))
             {
                 args.insert(name.to_owned(), vec![value.to_owned()]);
             }

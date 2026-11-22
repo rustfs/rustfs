@@ -35,8 +35,8 @@ pub const DEFAULT_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS: u64 = 30_000;
 /// Additional time beyond the configured object-lock acquisition deadline.
 pub const HEALTH_OBJECT_PROGRESS_LOCK_MARGIN_MS: u64 = 5_000;
 
-/// Timeout for cluster health readiness collectors (milliseconds).
-/// This bounds expensive storage and lock quorum checks used by cluster probes.
+/// End-to-end budget for cluster health readiness probes (milliseconds).
+/// Includes cache/singleflight waiting, storage observations, and lock checks.
 pub const ENV_HEALTH_CLUSTER_TIMEOUT_MS: &str = "RUSTFS_HEALTH_CLUSTER_TIMEOUT_MS";
 pub const DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS: u64 = 2000;
 
