@@ -56,7 +56,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
     use crate::app::bucket_usecase::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
@@ -75,10 +75,8 @@ mod tests {
             let context = shared_gating_ambient().await;
             let bucket = format!("logging-missing-{}", uuid::Uuid::new_v4().simple());
             let usecase = DefaultBucketUsecase::with_context(Some(context));
-            let request = build_request((), Method::PUT);
-            let envelope = RequestEnvelope::from_s3s(&request);
             let error = usecase
-                .execute_put_bucket_logging(envelope, &bucket, || {
+                .execute_put_bucket_logging(owned_envelope(Method::PUT), &bucket, || {
                     Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid logging configuration"))
                 })
                 .await

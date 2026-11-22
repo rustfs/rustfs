@@ -243,16 +243,15 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
 
     #[tokio::test]
     async fn execute_delete_bucket_policy_returns_internal_error_when_store_uninitialized() {
-        let req = build_request((), Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_delete_bucket_policy(RequestEnvelope::from_s3s(&req), "test-bucket")
+            .execute_delete_bucket_policy(owned_envelope(Method::DELETE), "test-bucket")
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
@@ -280,11 +279,10 @@ mod tests {
             bucket: bucket("test-bucket"),
             ..Default::default()
         };
-        let req = build_request((), Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_get_bucket_policy_status(RequestEnvelope::from_s3s(&req), input)
+            .execute_get_bucket_policy_status(owned_envelope(Method::GET), input)
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
@@ -292,11 +290,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_policy_returns_internal_error_when_store_uninitialized() {
-        let req = build_request((), Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_policy(RequestEnvelope::from_s3s(&req), "test-bucket", "{}")
+            .execute_put_bucket_policy(owned_envelope(Method::PUT), "test-bucket", "{}")
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
