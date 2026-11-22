@@ -14,8 +14,8 @@
 
 //! Object keying: a derived object key, sealed in the MinIO-compatible format.
 
-use crate::core::keying::NewObjectKey;
-use crate::core::keying::material::{EncryptionKeyKind, ManagedSealedKey};
+use crate::core::keying::material::{EncryptionKeyKind, EncryptionMaterial, ManagedSealedKey};
+use crate::core::keying::{NewObjectKey, StoredDataKey, StoredKeyMode};
 use crate::error::SseError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -25,9 +25,11 @@ use hmac::{Hmac, Mac};
 use rand::RngExt;
 use rustfs_kms::DataKey;
 use rustfs_utils::http::object_encryption_keys::{
-    INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_IV_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEType,
+    INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEType,
 };
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -274,6 +276,110 @@ pub(crate) fn parse_minio_managed_sealed_key(
     };
 
     Ok(Some(ManagedSealedKey { iv, sealed_key }))
+}
+
+/// SSE-C: record the object key sealed under the customer key.
+pub(crate) fn record_sealed_customer_key(metadata: &mut HashMap<String, String>, sealed: &ManagedSealedKey) {
+    metadata.insert(
+        MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+        BASE64_STANDARD.encode_to_string(sealed.iv),
+    );
+    metadata.insert(
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+        MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+    );
+    metadata.insert(
+        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
+        BASE64_STANDARD.encode_to_string(sealed.sealed_key),
+    );
+}
+
+/// Managed SSE: record the wrapped data key in MinIO's slots.
+///
+/// With a sealed object key the slots hold what MinIO itself writes. Without one
+/// the key was formed in Direct mode, and the slots mirror its wrapped data key and
+/// nonce: [`parse_minio_managed_sealed_key`] turns that shape down by its length, so
+/// the object is read back in Direct mode.
+pub(crate) fn record_data_key_in_minio_slots(
+    metadata: &mut HashMap<String, String>,
+    material: &EncryptionMaterial,
+    wrapped_data_key: &[u8],
+) {
+    metadata.insert(
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+        MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+    );
+    if let Some(kms_key_id) = &material.kms_key_id {
+        metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), kms_key_id.to_string());
+    }
+
+    let encoded_data_key = BASE64_STANDARD.encode_to_string(wrapped_data_key);
+    match &material.managed_sealed_key {
+        Some(sealed) => {
+            metadata.insert(
+                MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+                BASE64_STANDARD.encode_to_string(sealed.iv),
+            );
+            match material.sse_type {
+                SSEType::SseS3 => {
+                    metadata.insert(
+                        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
+                        BASE64_STANDARD.encode_to_string(sealed.sealed_key),
+                    );
+                }
+                SSEType::SseKms => {
+                    metadata.insert(
+                        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(),
+                        BASE64_STANDARD.encode_to_string(sealed.sealed_key),
+                    );
+                }
+                SSEType::SseC => {}
+            }
+            metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(), encoded_data_key);
+        }
+        None => {
+            metadata.insert(
+                MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+                BASE64_STANDARD.encode_to_string(material.base_nonce),
+            );
+            match material.sse_type {
+                SSEType::SseS3 => {
+                    metadata.insert(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(), encoded_data_key);
+                }
+                SSEType::SseKms => {
+                    metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), encoded_data_key.clone());
+                    metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(), encoded_data_key);
+                }
+                SSEType::SseC => {}
+            }
+        }
+    }
+}
+
+/// Managed SSE: read back the wrapped data key that seals `sealed_key`.
+///
+/// `normalized_metadata` is `metadata` with the managed keys normalized.
+pub(crate) fn read_sealed_data_key(
+    metadata: &HashMap<String, String>,
+    normalized_metadata: &HashMap<String, String>,
+    sealed_key: ManagedSealedKey,
+) -> Result<StoredDataKey, SseError> {
+    let encrypted_key_b64 = normalized_metadata
+        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER))
+        .ok_or_else(|| SseError::internal("Missing encrypted key in metadata"))?;
+    let wrapped = BASE64_STANDARD
+        .decode_to_vec(encrypted_key_b64)
+        .map_err(|e| SseError::internal(format!("Failed to decode encrypted key: {e}")))?;
+
+    Ok(StoredDataKey {
+        wrapped,
+        algorithm: normalized_metadata
+            .get(INTERNAL_ENCRYPTION_ALGORITHM_HEADER)
+            .cloned()
+            .unwrap_or_else(|| "AES256".to_string()),
+        mode: StoredKeyMode::Object { sealed_key },
+    })
 }
 
 /// Whether a multipart session needs the customer key when it is created.

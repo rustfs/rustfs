@@ -36,6 +36,25 @@ pub(crate) struct NewObjectKey {
     pub(crate) sealed_key: Option<ManagedSealedKey>,
 }
 
+/// A managed-SSE data key as a stored object recorded it, still wrapped.
+pub(crate) struct StoredDataKey {
+    /// The data key, wrapped by the provider that issued it.
+    pub(crate) wrapped: Vec<u8>,
+    /// The cipher the object recorded.
+    pub(crate) algorithm: String,
+    /// What the data key is to the object once it is unwrapped.
+    pub(crate) mode: StoredKeyMode,
+}
+
+/// The mode a stored key was recorded in.
+pub(crate) enum StoredKeyMode {
+    /// The data key is the object's key, under the nonce stored beside it.
+    Direct { base_nonce: [u8; 12] },
+    /// The data key unseals the object's key.
+    #[cfg(feature = "rio-v2")]
+    Object { sealed_key: ManagedSealedKey },
+}
+
 // The mode new objects are written in. Every build reads every mode it can
 // recognize; writing picks exactly one, and this is the only place that says which.
 #[cfg(not(feature = "rio-v2"))]

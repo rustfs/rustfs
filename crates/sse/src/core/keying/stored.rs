@@ -19,15 +19,15 @@
 //! neither says how an object written earlier was keyed.
 
 use crate::core::keying::context::{build_object_encryption_context, decode_minio_kms_context};
-use crate::core::keying::direct::read_stored_ssec_nonce;
+use crate::core::keying::direct::{read_stored_ssec_nonce, read_wrapped_data_key};
 use crate::core::keying::material::EncryptionKeyKind;
-#[cfg(not(feature = "rio-v2"))]
-use crate::core::keying::material::ManagedSealedKey;
 use crate::core::keying::metadata::recode_minio_kms_context;
 #[cfg(feature = "rio-v2")]
 use crate::core::keying::object::{
-    infer_minio_managed_sse_type, is_legacy_rustfs_managed_metadata, parse_minio_managed_sealed_key, unseal_object_key,
+    infer_minio_managed_sse_type, is_legacy_rustfs_managed_metadata, parse_minio_managed_sealed_key, read_sealed_data_key,
+    unseal_object_key,
 };
+use crate::core::keying::{StoredDataKey, StoredKeyMode};
 use crate::error::SseError;
 use crate::host::SseHost;
 use crate::kms::local::is_local_sse_dek;
@@ -36,13 +36,10 @@ use crate::kms::local::is_rustfs_managed_data_key;
 #[cfg(feature = "rio-v2")]
 use crate::kms::provider::decrypt_unenveloped_sealed_dek;
 use crate::kms::provider::{SseDekProvider, bare_data_key_kms_provider, get_local_sse_dek_provider, kms_sse_dek_provider};
-use base64_simd::STANDARD as BASE64_STANDARD;
 use rustfs_kms::is_data_key_envelope;
 use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 use rustfs_utils::http::object_encryption_keys::{
-    INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
-    INTERNAL_ENCRYPTION_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER, SSEType,
-    contains_managed_encryption_metadata, normalize_managed_metadata,
+    INTERNAL_ENCRYPTION_KEY_ID_HEADER, SSEType, contains_managed_encryption_metadata, normalize_managed_metadata,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -161,76 +158,56 @@ pub(crate) async fn open_under_stored_data_key(
     stored: &StoredManagedKey<'_>,
     kms_key_id: &str,
 ) -> Result<(OpenedObjectKey, String), SseError> {
-    let metadata = stored.metadata;
-    let normalized_metadata = &stored.normalized_metadata;
-    let sse_type = stored.sse_type;
+    let record = read_stored_data_key(host, stored).await?;
+    let data_key = unwrap_stored_data_key(host, bucket, key, stored, &record, kms_key_id).await?;
 
-    #[cfg(feature = "rio-v2")]
-    let minio_sealed_key = parse_minio_managed_sealed_key(metadata, sse_type)?;
-    #[cfg(not(feature = "rio-v2"))]
-    let minio_sealed_key: Option<ManagedSealedKey> = None;
-
-    let (encrypted_data_key, iv, algorithm) = if minio_sealed_key.is_some() {
-        let encrypted_key_b64 = normalized_metadata
-            .get(INTERNAL_ENCRYPTION_KEY_HEADER)
-            .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER))
-            .ok_or_else(|| SseError::internal("Missing encrypted key in metadata"))?;
-        let encrypted_data_key = BASE64_STANDARD
-            .decode_to_vec(encrypted_key_b64)
-            .map_err(|e| SseError::internal(format!("Failed to decode encrypted key: {e}")))?;
-        (
-            encrypted_data_key,
-            Vec::new(),
-            normalized_metadata
-                .get(INTERNAL_ENCRYPTION_ALGORITHM_HEADER)
-                .cloned()
-                .unwrap_or_else(|| "AES256".to_string()),
-        )
-    } else if let Some(service) = host.encryption_service().await {
-        // Production mode: use service for metadata parsing
-        let parsed = service
-            .headers_to_metadata(normalized_metadata)
-            .map_err(|e| SseError::internal(format!("Failed to parse encryption metadata: {e}")))?;
-
-        if parsed.iv.len() != 12 {
-            return Err(SseError::internal("Invalid encryption nonce length; expected 12 bytes"));
-        }
-
-        (parsed.encrypted_data_key, parsed.iv, parsed.algorithm)
-    } else {
-        // Test mode: parse metadata manually
-        let encrypted_key_b64 = normalized_metadata
-            .get(INTERNAL_ENCRYPTION_KEY_HEADER)
-            .ok_or_else(|| SseError::internal("Missing encrypted key in metadata"))?;
-        let encrypted_data_key = BASE64_STANDARD
-            .decode_to_vec(encrypted_key_b64)
-            .map_err(|e| SseError::internal(format!("Failed to decode encrypted key: {e}")))?;
-
-        let iv_b64 = normalized_metadata
-            .get(INTERNAL_ENCRYPTION_IV_HEADER)
-            .ok_or_else(|| SseError::internal("Missing IV in metadata"))?;
-        let iv = BASE64_STANDARD
-            .decode_to_vec(iv_b64)
-            .map_err(|e| SseError::internal(format!("Failed to decode IV: {e}")))?;
-
-        if iv.len() != 12 {
-            return Err(SseError::internal("Invalid encryption nonce length; expected 12 bytes"));
-        }
-
-        let algorithm = normalized_metadata
-            .get(INTERNAL_ENCRYPTION_ALGORITHM_HEADER)
-            .cloned()
-            .unwrap_or_else(|| "AES256".to_string());
-
-        (encrypted_data_key, iv, algorithm)
+    let opened = match record.mode {
+        StoredKeyMode::Direct { base_nonce } => OpenedObjectKey {
+            key_bytes: data_key,
+            base_nonce,
+            key_kind: EncryptionKeyKind::Direct,
+        },
+        #[cfg(feature = "rio-v2")]
+        StoredKeyMode::Object { sealed_key } => OpenedObjectKey {
+            key_bytes: unseal_object_key(&sealed_key, data_key, stored.sse_type, bucket, key)?,
+            base_nonce: [0u8; 12],
+            key_kind: EncryptionKeyKind::Object,
+        },
     };
 
-    let kms_context = if matches!(sse_type, SSEType::SseKms) {
-        decode_minio_kms_context(metadata)?
+    Ok((opened, record.algorithm))
+}
+
+/// Read the stored data key in the mode the object recorded.
+///
+/// This is the recognition order: a mode listed earlier claims the object first, and
+/// Direct takes whatever no other mode recognizes. A mode this build cannot read is
+/// not listed, so its objects fail in the Direct reader instead of being misread.
+async fn read_stored_data_key(host: &dyn SseHost, stored: &StoredManagedKey<'_>) -> Result<StoredDataKey, SseError> {
+    #[cfg(feature = "rio-v2")]
+    if let Some(sealed_key) = parse_minio_managed_sealed_key(stored.metadata, stored.sse_type)? {
+        return read_sealed_data_key(stored.metadata, &stored.normalized_metadata, sealed_key);
+    }
+
+    read_wrapped_data_key(host, &stored.normalized_metadata).await
+}
+
+/// Unwrap the stored data key with the provider its own bytes identify.
+async fn unwrap_stored_data_key(
+    host: &dyn SseHost,
+    bucket: &str,
+    key: &str,
+    stored: &StoredManagedKey<'_>,
+    record: &StoredDataKey,
+    kms_key_id: &str,
+) -> Result<[u8; 32], SseError> {
+    let kms_context = if matches!(stored.sse_type, SSEType::SseKms) {
+        decode_minio_kms_context(stored.metadata)?
     } else {
         None
     };
     let object_context = build_object_encryption_context(bucket, key, kms_context.as_ref());
+    let wrapped = record.wrapped.as_slice();
 
     // Persisted wrapping format is the read-side source of truth. The
     // advertised SSE scheme and current KMS availability are write policy
@@ -240,11 +217,12 @@ pub(crate) async fn open_under_stored_data_key(
     // stored without an envelope. It is offered to the KMS only when the
     // local provider could not have written those bytes and the active
     // backend is one whose released versions persisted them that way.
-    let bare_kms = if is_data_key_envelope(&encrypted_data_key) || is_local_sse_dek(&encrypted_data_key) {
+    let bare_kms = if is_data_key_envelope(wrapped) || is_local_sse_dek(wrapped) {
         None
     } else {
         bare_data_key_kms_provider(host).await
     };
+
     // A MinIO sealed key alone does not mean MinIO wrote the object: RustFS's own
     // writer fills MinIO's metadata slots too, while still storing a RustFS
     // envelope in them, so neither the slot nor the header name distinguishes the
@@ -253,74 +231,23 @@ pub(crate) async fn open_under_stored_data_key(
     // recognizing RustFS positively — and treating only the remainder as MinIO —
     // keeps a RustFS envelope from ever reaching MinIO's decoder.
     #[cfg(feature = "rio-v2")]
-    let unenveloped_sealed_dek = if minio_sealed_key.is_some() && !is_rustfs_managed_data_key(&encrypted_data_key) {
-        Some(
-            decrypt_unenveloped_sealed_dek(
-                bare_kms.clone(),
-                get_local_sse_dek_provider(),
-                &encrypted_data_key,
-                kms_key_id,
-                &object_context,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    #[cfg(not(feature = "rio-v2"))]
-    let unenveloped_sealed_dek: Option<[u8; 32]> = None;
+    if matches!(record.mode, StoredKeyMode::Object { .. }) && !is_rustfs_managed_data_key(wrapped) {
+        return decrypt_unenveloped_sealed_dek(bare_kms, get_local_sse_dek_provider(), wrapped, kms_key_id, &object_context)
+            .await;
+    }
 
-    let decrypted_data_key = match unenveloped_sealed_dek {
-        Some(data_key) => data_key,
-        None => {
-            let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(&encrypted_data_key) {
-                kms_sse_dek_provider(host).await?
-            } else if let Some(kms_provider) = bare_kms {
-                kms_provider
-            } else {
-                get_local_sse_dek_provider()?
-            };
-            #[cfg(feature = "rio-v2")]
-            let decrypted_data_key = if is_legacy_rustfs_managed_metadata(normalized_metadata) {
-                provider
-                    .decrypt_legacy_sse_dek(&encrypted_data_key, kms_key_id, &object_context)
-                    .await
-            } else {
-                provider
-                    .decrypt_sse_dek(&encrypted_data_key, kms_key_id, &object_context)
-                    .await
-            };
-            #[cfg(not(feature = "rio-v2"))]
-            let decrypted_data_key = provider
-                .decrypt_sse_dek(&encrypted_data_key, kms_key_id, &object_context)
-                .await;
-            decrypted_data_key?
-        }
+    let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(wrapped) {
+        kms_sse_dek_provider(host).await?
+    } else if let Some(kms_provider) = bare_kms {
+        kms_provider
+    } else {
+        get_local_sse_dek_provider()?
     };
 
     #[cfg(feature = "rio-v2")]
-    let opened = if let Some(sealed_key) = minio_sealed_key {
-        OpenedObjectKey {
-            key_bytes: unseal_object_key(&sealed_key, decrypted_data_key, sse_type, bucket, key)?,
-            base_nonce: [0u8; 12],
-            key_kind: EncryptionKeyKind::Object,
-        }
-    } else {
-        data_key_under_stored_nonce(decrypted_data_key, &iv)
-    };
-    #[cfg(not(feature = "rio-v2"))]
-    let opened = data_key_under_stored_nonce(decrypted_data_key, &iv);
-
-    Ok((opened, algorithm))
-}
-
-/// Direct mode: the data key is the object's key, under the nonce stored beside it.
-fn data_key_under_stored_nonce(data_key: [u8; 32], iv: &[u8]) -> OpenedObjectKey {
-    let mut base_nonce = [0u8; 12];
-    base_nonce.copy_from_slice(&iv[..12]);
-    OpenedObjectKey {
-        key_bytes: data_key,
-        base_nonce,
-        key_kind: EncryptionKeyKind::Direct,
+    if is_legacy_rustfs_managed_metadata(&stored.normalized_metadata) {
+        return provider.decrypt_legacy_sse_dek(wrapped, kms_key_id, &object_context).await;
     }
+
+    provider.decrypt_sse_dek(wrapped, kms_key_id, &object_context).await
 }

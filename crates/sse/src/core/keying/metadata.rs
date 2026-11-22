@@ -15,9 +15,10 @@
 //! Encryption metadata as it is stored with the object.
 
 use crate::core::keying::context::encode_minio_kms_context;
+use crate::core::keying::direct::{record_customer_key_nonce, record_wrapped_data_key};
 use crate::core::keying::material::{EncryptionKeyKind, EncryptionMaterial};
 #[cfg(feature = "rio-v2")]
-use crate::core::keying::object::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM;
+use crate::core::keying::object::{record_data_key_in_minio_slots, record_sealed_customer_key};
 use crate::error::SseError;
 use base64_simd::STANDARD as BASE64_STANDARD;
 use rustfs_utils::http::object_encryption_keys::{
@@ -106,166 +107,94 @@ pub fn normalize_encryption_metadata_case(
     Ok(Cow::Owned(normalized))
 }
 
+/// Turn the material of an encrypted write into the metadata stored with the object.
+///
+/// The scheme is recorded here. How the key itself is recorded belongs to the mode
+/// that formed it, in `direct.rs` and `object.rs`, next to the code that reads it back.
 pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<HashMap<String, String>, SseError> {
     let mut metadata = HashMap::new();
 
     match material.sse_type {
         SSEType::SseC => {
-            metadata.insert(
-                "x-amz-server-side-encryption".to_string(),
-                material.server_side_encryption.as_str().to_string(),
-            );
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                material.algorithm.as_str().to_string(),
-            );
-            if let Some(customer_key_md5) = &material.customer_key_md5 {
-                metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), customer_key_md5.to_string());
-            }
-            if let Some(original_size) = material.original_size {
-                metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
-            }
+            record_ssec_scheme(&mut metadata, material);
 
-            // Persist the random base nonce for the SSE-C Direct scheme (default,
-            // non-`rio-v2` build) so decrypt can read it back instead of recomputing a
-            // deterministic value. Written under both the RustFS and MinIO keys per repo
-            // convention. This covers single-PUT persistence and multipart-session
-            // persistence (CreateMultipartUpload builds session metadata here). Under
-            // `rio-v2` the SSE-C path uses `EncryptionKeyKind::Object` and the sealed-key
-            // block below, so this branch is not taken.
+            // A `rio-v2` build seals an object key instead, so a Direct key there is a
+            // multipart session created without its customer key.
             if material.key_kind == EncryptionKeyKind::Direct {
-                metadata.insert(
-                    INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(material.base_nonce),
-                );
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(material.base_nonce),
-                );
+                record_customer_key_nonce(&mut metadata, material.base_nonce);
             }
-
             #[cfg(feature = "rio-v2")]
             if let Some(sealed) = &material.managed_sealed_key {
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(sealed.iv),
-                );
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                );
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(sealed.sealed_key),
-                );
+                record_sealed_customer_key(&mut metadata, sealed);
             }
         }
         SSEType::SseS3 | SSEType::SseKms => {
-            let encrypted_data_key = material
+            let wrapped_data_key = material
                 .encrypted_data_key
                 .as_deref()
                 .ok_or_else(|| SseError::internal("managed SSE materials must carry an encrypted data key"))?;
-            metadata.insert(
-                "x-amz-server-side-encryption".to_string(),
-                material.server_side_encryption.as_str().to_string(),
-            );
-
-            let internal_key_id = material.kms_key_id.clone().unwrap_or_else(|| "default".to_string());
-            metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), internal_key_id.clone());
-
-            if matches!(material.sse_type, SSEType::SseKms) {
-                metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), internal_key_id);
-            }
-
-            if let Some(original_size) = material.original_size {
-                metadata.insert(INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
-            }
-
-            if let Some(kms_context) = &material.managed_kms_context
-                && !kms_context.is_empty()
-            {
-                if let Ok(serialized) = serde_json::to_string(kms_context) {
-                    metadata.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), serialized);
-                }
-                if matches!(material.sse_type, SSEType::SseKms)
-                    && let Ok(encoded) = encode_minio_kms_context(kms_context)
-                {
-                    metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), encoded);
-                }
-            }
+            record_managed_scheme(&mut metadata, material);
 
             if material.key_kind == EncryptionKeyKind::Direct {
-                metadata.insert(
-                    INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(encrypted_data_key),
-                );
-                metadata.insert(
-                    INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(material.base_nonce),
-                );
-                metadata.insert(INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), material.algorithm.as_str().to_string());
+                record_wrapped_data_key(&mut metadata, wrapped_data_key, material.base_nonce, material.algorithm.as_str());
             }
-
             #[cfg(feature = "rio-v2")]
-            if let Some(sealed) = &material.managed_sealed_key {
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(sealed.iv),
-                );
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                );
-                if let Some(kms_key_id) = &material.kms_key_id {
-                    metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), kms_key_id.to_string());
-                }
-                match material.sse_type {
-                    SSEType::SseS3 => {
-                        metadata.insert(
-                            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
-                            BASE64_STANDARD.encode_to_string(sealed.sealed_key),
-                        );
-                    }
-                    SSEType::SseKms => {
-                        metadata.insert(
-                            MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(),
-                            BASE64_STANDARD.encode_to_string(sealed.sealed_key),
-                        );
-                    }
-                    SSEType::SseC => {}
-                }
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(encrypted_data_key),
-                );
-            } else if cfg!(feature = "rio-v2") {
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                    BASE64_STANDARD.encode_to_string(material.base_nonce),
-                );
-                metadata.insert(
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                );
-                if let Some(kms_key_id) = &material.kms_key_id {
-                    metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), kms_key_id.to_string());
-                }
-                let encoded_key = BASE64_STANDARD.encode_to_string(encrypted_data_key);
-                match material.sse_type {
-                    SSEType::SseS3 => {
-                        metadata.insert(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(), encoded_key);
-                    }
-                    SSEType::SseKms => {
-                        metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), encoded_key.clone());
-                        metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(), encoded_key);
-                    }
-                    SSEType::SseC => {}
-                }
-            }
+            record_data_key_in_minio_slots(&mut metadata, material, wrapped_data_key);
         }
     }
 
     Ok(metadata)
+}
+
+/// SSE-C: the scheme, the fingerprint of the customer key, and the plaintext size.
+fn record_ssec_scheme(metadata: &mut HashMap<String, String>, material: &EncryptionMaterial) {
+    metadata.insert(
+        "x-amz-server-side-encryption".to_string(),
+        material.server_side_encryption.as_str().to_string(),
+    );
+    metadata.insert(
+        "x-amz-server-side-encryption-customer-algorithm".to_string(),
+        material.algorithm.as_str().to_string(),
+    );
+    if let Some(customer_key_md5) = &material.customer_key_md5 {
+        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), customer_key_md5.to_string());
+    }
+    if let Some(original_size) = material.original_size {
+        metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
+    }
+}
+
+/// Managed SSE: the scheme, the key the data key is wrapped under, the plaintext
+/// size, and the encryption context of the request.
+fn record_managed_scheme(metadata: &mut HashMap<String, String>, material: &EncryptionMaterial) {
+    metadata.insert(
+        "x-amz-server-side-encryption".to_string(),
+        material.server_side_encryption.as_str().to_string(),
+    );
+
+    let internal_key_id = material.kms_key_id.clone().unwrap_or_else(|| "default".to_string());
+    metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), internal_key_id.clone());
+
+    if matches!(material.sse_type, SSEType::SseKms) {
+        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), internal_key_id);
+    }
+
+    if let Some(original_size) = material.original_size {
+        metadata.insert(INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
+    }
+
+    if let Some(kms_context) = &material.managed_kms_context
+        && !kms_context.is_empty()
+    {
+        if let Ok(serialized) = serde_json::to_string(kms_context) {
+            metadata.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), serialized);
+        }
+        if matches!(material.sse_type, SSEType::SseKms)
+            && let Ok(encoded) = encode_minio_kms_context(kms_context)
+        {
+            metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), encoded);
+        }
+    }
 }
 
 /// Strip source encryption metadata before constructing metadata for a copy destination.
