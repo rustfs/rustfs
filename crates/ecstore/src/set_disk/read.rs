@@ -10016,6 +10016,80 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn nixl_shard_not_found_triggers_repair_after_reconstruction() {
+        use crate::cluster::rpc::nixl_internode::{
+            READ_FILE_NIXL_PATH,
+            read_test_support::{nixl_reader, read_peer},
+        };
+        use crate::io_support::bitrot::ShardReader;
+        use std::io::Cursor;
+        for (status, marker, body, missing) in [
+            ("404 Not Found", Some(rustfs_rio::INTERNODE_FILE_NOT_FOUND), "missing", true),
+            ("404 Not Found", None, "file not found", true),
+            ("404 Not Found", None, "internode rpc route not found", false),
+            ("404 Not Found", Some("unknown"), "file not found", false),
+            ("503 Service Unavailable", None, "file not found", false),
+        ] {
+            let header = marker
+                .map(|value| format!("{}: {value}\r\n", rustfs_rio::INTERNODE_DISK_ERROR_HEADER))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (endpoint, peer) = read_peer(response.into_bytes()).await;
+            let payload = b"abcdefgh";
+            let erasure = coding::Erasure::new(1, 1, payload.len());
+            let algo = HashAlgorithm::HighwayHash256S;
+            let shards = erasure.encode_data(payload).expect("encode data and parity");
+            let mut writer = coding::BitrotWriter::new(Cursor::new(Vec::new()), erasure.shard_size(), algo.clone());
+            writer.write(&shards[1]).await.expect("encode healthy parity");
+            let parity = ShardReader::InMemory(Cursor::new(Bytes::from(writer.into_inner().into_inner())));
+            let remote = ShardReader::Chunked(nixl_reader(&endpoint, erasure.shard_size() + algo.size()));
+            let readers = [remote, parity]
+                .into_iter()
+                .map(|reader| Some(coding::BitrotReader::new(reader, erasure.shard_size(), algo.clone(), false)))
+                .collect();
+            CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+            let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 1, false);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = build_legacy_per_part_fallback_reader(
+                erasure,
+                readers,
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                payload.len(),
+                payload.len(),
+                Some((context, true)),
+            );
+            let mut output = Vec::new();
+            reader
+                .read_to_end(&mut output)
+                .await
+                .expect("read reconstructed part through EOF");
+            assert_eq!(output, payload);
+            assert_eq!(peer.await.expect("NIXL peer").path(), READ_FILE_NIXL_PATH);
+            if missing {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("submit missing shard for repair");
+            }
+            assert_eq!(
+                CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed),
+                usize::from(missing),
+                "{status} {marker:?} {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn legacy_per_part_fallback_preserves_repair_evidence() {
         CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
         let erasure = coding::Erasure::new(2, 2, 64);
