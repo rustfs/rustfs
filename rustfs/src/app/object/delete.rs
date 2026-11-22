@@ -2853,6 +2853,42 @@ mod tests {
         assert_eq!(delete_entry_response_version_id(None, true, Some(Uuid::nil()), true), None);
     }
 
+    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
+    fn method_only_delete_envelope(method: Method) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        )
+    }
+
+    async fn delete_object_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: DeleteObjectInput,
+    ) -> crate::app::storage_api::s3::S3Result<gateway_dto::DeleteObjectOutput> {
+        usecase
+            .execute_delete_object_fields(method_only_delete_envelope(Method::DELETE), input.bucket, input.key, input.version_id)
+            .await
+            .map_err(s3s::S3Error::from)
+    }
+
+    async fn delete_objects_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: DeleteObjectsInput,
+    ) -> crate::app::storage_api::s3::S3Result<S3Response<DeleteObjectsOutput>> {
+        let output = usecase
+            .execute_delete_objects(method_only_delete_envelope(Method::POST), input.into())
+            .await
+            .map_err(s3s::S3Error::from)?;
+        Ok(S3Response::new(output.into()))
+    }
+
     #[tokio::test]
     async fn execute_delete_object_rejects_invalid_object_key() {
         let input = DeleteObjectInput::builder()
@@ -2861,10 +2897,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::DELETE);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_delete_object_from_s3s(req)).await.unwrap_err();
+        let err = Box::pin(delete_object_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2932,10 +2967,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_objects_from_s3s(req).await.unwrap_err();
+        let err = delete_objects_method_only(&usecase, input).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2954,10 +2988,9 @@ mod tests {
             .build()
             .expect("delete objects input should build");
 
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_objects_from_s3s(req).await.unwrap_err();
+        let err = delete_objects_method_only(&usecase, input).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -2976,10 +3009,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_objects_from_s3s(req).await.unwrap_err();
+        let err = delete_objects_method_only(&usecase, input).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(err.message(), Some("Not init"));
     }
@@ -3089,8 +3121,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let err = DefaultObjectUsecase::without_context()
-            .execute_delete_object_from_s3s(build_request(input, Method::DELETE))
+        let err = delete_object_method_only(&DefaultObjectUsecase::without_context(), input)
             .await
             .expect_err("an uninitialized store should be reported after non-force admission");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
