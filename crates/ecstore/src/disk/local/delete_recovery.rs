@@ -39,6 +39,8 @@ struct DiscoverySession {
     _mount: std::fs::File,
     frames: Vec<(String, std::fs::ReadDir)>,
     touched: Instant,
+    #[cfg(test)]
+    metadata_stats: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Names an object-scoped scan skips without a stat (plain children of the
@@ -146,12 +148,30 @@ impl DiscoverySession {
                 continue;
             }
             visited += 1;
+            if self.object.is_none() && !may_be_delete_evidence(&name) {
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                };
+                if ft.is_symlink() {
+                    return Err(std::io::Error::from(DiskError::InvalidPath));
+                }
+                if !ft.is_dir() && !ft.is_file() {
+                    return Err(std::io::Error::from(ErrorKind::InvalidData));
+                }
+                if ft.is_file() {
+                    continue;
+                }
+            }
             let relative = if parent.is_empty() {
                 name.clone()
             } else {
                 format!("{parent}/{name}")
             };
             let path = self.root.join(&relative);
+            #[cfg(test)]
+            self.metadata_stats.fetch_add(1, Ordering::Relaxed);
             reject_local_disk_symlink_components(&self.root, &path).map_err(std::io::Error::from)?;
             let kind = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -1670,6 +1690,8 @@ impl LocalDisk {
             _mount: mount,
             frames: Vec::new(),
             touched: Instant::now(),
+            #[cfg(test)]
+            metadata_stats: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -9172,6 +9194,50 @@ mod tests {
                     .expect("finalize tx4")
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_bucket_wide_discovery_skips_inert_regular_files_without_stats_and_rejects_symlinks() {
+        let (temp, disk, _info, _) = fixture().await;
+        let bucket_root = temp.path().join("recovery");
+        for idx in 0..32 {
+            let obj_dir = bucket_root.join(format!("obj-{idx:02}"));
+            let data_dir = obj_dir.join(Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&data_dir).expect("create object and data dir");
+            std::fs::write(obj_dir.join(STORAGE_FORMAT_FILE), b"inert-meta").expect("write xl.meta");
+            std::fs::write(data_dir.join("part.1"), b"inert-part").expect("write part.1");
+        }
+
+        let disc_path = disk.delete_discovery_path("recovery", None).expect("discovery path");
+        let session = disk
+            .new_delete_discovery_session("recovery", None, &disc_path)
+            .expect("discovery session");
+        let stats_counter = Arc::clone(&session.metadata_stats);
+        let (transactions, next) = disk
+            .advance_delete_discovery(&disc_path, session, 16)
+            .await
+            .expect("bucket-wide discovery over inert objects");
+        assert!(transactions.is_empty());
+        assert!(next.is_none());
+        let stats = stats_counter.load(Ordering::Relaxed);
+        // fixture() pre-creates recovery/object (1 directory + 1 xl.meta); with 32 obj-XX + 32 data_dir directories,
+        // only the 65 directories reach symlink_metadata, while all 65 regular files (xl.meta and part.1) are skipped
+        // via DirEntry::file_type() with 0 stats.
+        assert_eq!(
+            stats, 65,
+            "bucket-wide discovery must skip inert regular files without symlink_metadata stats"
+        );
+
+        // A symlink with an inert file name ("part.1") inside a bucket-wide walk must still fail closed with InvalidPath.
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::os::unix::fs::symlink(outside.path().join("target"), bucket_root.join("obj-00").join("part.1"))
+            .expect("create inert-named symlink");
+        let err = disk
+            .discover_delete_transactions("recovery", None, None, 16)
+            .await
+            .expect_err("symlink in bucket-wide discovery must fail closed");
+        assert_eq!(err, DiskError::InvalidPath);
     }
 }
 
