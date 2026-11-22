@@ -16,14 +16,14 @@
 
 use super::*;
 use crate::app::storage_api::bucket_usecase::contract::list::ListOperations as _;
+#[cfg(test)]
+use crate::app::storage_api::s3::S3ErrorCode;
 use crate::app::storage_api::s3::dto::{
     CommonPrefix, DeleteMarkerEntry, EncodingType, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input,
     ListObjectsV2Output, MetadataEntry, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
     UserMetadata,
 };
 use crate::app::storage_api::s3::xml::{SerResult, SerializeContent};
-#[cfg(test)]
-use crate::app::storage_api::s3::{S3ErrorCode, S3Request, S3Response};
 use crate::app::storage_api::s3::{S3Result, xml};
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -605,15 +605,6 @@ fn build_list_objects_v2_metadata_output(
 }
 
 impl DefaultBucketUsecase {
-    #[cfg(test)]
-    pub(crate) async fn execute_list_objects_v2m(
-        &self,
-        req: S3Request<ListObjectsV2Input>,
-    ) -> S3Result<S3Response<ListObjectsV2MetadataOutput>> {
-        let envelope = RequestEnvelope::from_s3s(&req);
-        self.list_objects_v2_metadata(&envelope, req.input).await.map(S3Response::new)
-    }
-
     /// One page of `GET /{bucket}?list-type=2&metadata=true`, for the caller the envelope's
     /// authorization installed: each entry's metadata and tags as far as that caller may read them.
     pub(crate) async fn list_objects_v2_metadata(
@@ -686,17 +677,6 @@ impl DefaultBucketUsecase {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn execute_list_object_versions_m(
-        &self,
-        req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsMetadataOutput>> {
-        let envelope = RequestEnvelope::from_s3s(&req);
-        self.list_object_versions_metadata(&envelope, req.input)
-            .await
-            .map(S3Response::new)
-    }
-
     /// One page of `GET /{bucket}?versions&metadata=true`, as [`Self::list_objects_v2_metadata`].
     pub(crate) async fn list_object_versions_metadata(
         &self,
@@ -760,7 +740,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
 
     /// Response bodies are not bucket configurations: they are written by the
@@ -780,10 +760,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_list_object_versions_m(req).await.unwrap_err();
+        let err = usecase
+            .list_object_versions_metadata(&owned_envelope(Method::GET), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -1142,10 +1124,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        let err = usecase
+            .list_objects_v2_metadata(&owned_envelope(Method::GET), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -1422,10 +1406,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        let err = usecase
+            .list_objects_v2_metadata(&owned_envelope(Method::GET), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -1437,10 +1423,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        let err = usecase
+            .list_objects_v2_metadata(&owned_envelope(Method::GET), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Invalid continuation token"));
     }
@@ -1453,10 +1441,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_list_object_versions_m(req).await.unwrap_err();
+        let err = usecase
+            .list_object_versions_metadata(&owned_envelope(Method::GET), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }
