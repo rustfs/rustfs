@@ -1933,6 +1933,7 @@ pub(crate) struct ScannerCycleResult {
     usage_watch_proofs: Vec<ScannerUsageWatchProof>,
     usage_watch_retirements: Vec<ScannerUsageWatchProof>,
     pub(crate) status: ScannerCycleStatus,
+    pub(crate) partial_stage: Option<&'static str>,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
     activity_baseline: Option<Arc<crate::scanner::ScannerActivitySnapshot>>,
@@ -1959,6 +1960,7 @@ impl ScannerCycleResult {
             usage_watch_proofs: Vec::new(),
             usage_watch_retirements: Vec::new(),
             status,
+            partial_stage: None,
             publication_epoch: None,
             activity_digest: None,
             activity_baseline: None,
@@ -1978,6 +1980,11 @@ impl ScannerCycleResult {
             scope_fallback: None,
             publication_expectation: None,
         }
+    }
+
+    fn with_partial_stage(mut self, stage: Option<&'static str>) -> Self {
+        self.partial_stage = stage;
+        self
     }
 
     pub(crate) fn with_publication_epoch(mut self, publication_epoch: Option<u64>) -> Self {

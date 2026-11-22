@@ -126,6 +126,7 @@ async fn compacted_prefix_expiration_between_usage_samples() {
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
+                    local_stop: None,
                 },
             )
             .await

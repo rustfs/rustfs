@@ -1131,7 +1131,7 @@ async fn checkpoint_admission_log_capture_survives_another_future_dispatcher() {
     }
 }
 
-async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
+pub(super) async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
     let mut metadata = FileMeta::new();
     for (index, (version_id, size)) in versions.iter().enumerate() {
         let mut info = FileInfo::new(object, 4, 2);
