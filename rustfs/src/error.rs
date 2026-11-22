@@ -18,6 +18,7 @@ use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use rustfs_lock::LockError;
 use rustfs_s3_types::S3ErrorCode;
+use rustfs_sse::{SseError, data_plane_kms_error};
 use s3s::S3Error as LegacyS3Error;
 use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
 
@@ -51,7 +52,7 @@ pub(crate) fn rpc_replay_admission_exhausted_status() -> tonic::Status {
 const UNSUPPORTED_PARTICIPANT_MESSAGE: &str = "A storage participant does not support this operation's protocol version. If the cluster is being upgraded, finish upgrading every node and retry.";
 
 /// S3 error code for a request that names a KMS key the KMS does not hold.
-pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
+pub use rustfs_sse::KMS_KEY_NOT_FOUND_ERROR_CODE;
 
 fn lock_resource_class(resource: Option<&str>) -> &'static str {
     let Some(resource) = resource else {
@@ -119,77 +120,6 @@ fn record_s3_lock_failure(err: &StorageError) {
             record(Some(&resource), mode, "quorum");
         }
         _ => {}
-    }
-}
-
-/// Map a KMS failure that surfaced on the S3 data path to its S3 error code.
-///
-/// The contract deliberately differs from the admin lifecycle handlers
-/// (`kms_key_lifecycle::lifecycle_error_status`): there a key id is the
-/// resource being addressed, so a missing key is `404`. Here the key id
-/// arrives inside a request header or a bucket default, so a key that is
-/// missing, disabled, or otherwise unusable is configuration the caller has to
-/// correct — AWS answers `400`, and reporting `500` instead both misfiles the
-/// failure as a server fault and makes SDKs back off and retry a request that
-/// cannot succeed.
-///
-/// `None` keeps the caller's fallthrough, which is the `500` that integrity
-/// faults — damaged, unreadable, or unknown-format key material — must keep.
-///
-/// Messages either name what the caller asked for or stay generic; detail that
-/// belongs to the deployment rather than the request stays in `source`, which
-/// the caller attaches and the logs retain.
-fn data_plane_kms_error(error: &rustfs_kms::KmsError) -> Option<(S3ErrorCode, String)> {
-    use rustfs_kms::KmsError as Kms;
-
-    let generic = |code: S3ErrorCode| {
-        let message = ApiError::error_code_to_message(&code);
-        Some((code, message))
-    };
-
-    match error {
-        Kms::KeyNotFound { key_id } => Some((
-            S3ErrorCode::Custom(KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
-            format!("KMS key not found: {key_id}"),
-        )),
-        Kms::KeyVersionNotFound { key_id, version } => Some((
-            S3ErrorCode::Custom(KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
-            format!("KMS key version {version} not found for key {key_id}"),
-        )),
-        // The key exists but its state forbids the operation (disabled,
-        // pending deletion). AWS treats an invalid key state as a request
-        // error, not a server fault.
-        Kms::InvalidOperation { .. } => Some((S3ErrorCode::InvalidRequest, error.to_string())),
-        // A policy decision needs a human, so it must be distinguishable from
-        // the transient classes an SDK retries.
-        Kms::AccessDenied { .. } => generic(S3ErrorCode::AccessDenied),
-        // Request-side faults: what was asked for cannot be served as asked.
-        Kms::ContextMismatch { .. }
-        | Kms::InvalidKey { .. }
-        | Kms::ValidationError { .. }
-        | Kms::UnsupportedAlgorithm { .. }
-        | Kms::InvalidKeySize { .. } => Some((S3ErrorCode::InvalidRequest, error.to_string())),
-        // A deployment whose KMS configuration cannot serve the request (for
-        // example no key named and no default). Actionable, but the detail
-        // describes the deployment, so it stays out of the response body.
-        Kms::ConfigurationError { .. } => {
-            Some((S3ErrorCode::InvalidRequest, "The KMS configuration cannot serve this request".to_string()))
-        }
-        // Transient: worth retrying, and must be counted against availability
-        // rather than against the caller. `IoError` belongs here because it is
-        // how a backend reports that its key store itself was unreachable —
-        // rustfs/rustfs#7470 separated that from a missing key precisely so the
-        // two stop looking alike, and leaving it on the 500 fallthrough would
-        // erase that distinction again at the S3 boundary.
-        Kms::BackendError { .. }
-        | Kms::IoError { .. }
-        | Kms::OperationTimedOut { .. }
-        | Kms::OperationCancelled { .. }
-        | Kms::CredentialsUnavailable { .. }
-        | Kms::CacheError { .. } => generic(S3ErrorCode::ServiceUnavailable),
-        // A permanent gap in the configured backend, never a missing resource.
-        Kms::UnsupportedCapability { .. } => Some((S3ErrorCode::NotImplemented, error.to_string())),
-        _ => None,
     }
 }
 
@@ -759,6 +689,17 @@ impl From<crate::table_catalog::TableCatalogStoreError> for ApiError {
             message: Self::error_code_to_message(&code),
             code,
             source: Some(Box::new(err)),
+        }
+    }
+}
+
+/// An SSE failure arrives already classified for the S3 data path; carry it over as is.
+impl From<SseError> for ApiError {
+    fn from(err: SseError) -> Self {
+        ApiError {
+            code: err.code,
+            message: err.message,
+            source: err.source,
         }
     }
 }

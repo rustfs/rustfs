@@ -1,7 +1,7 @@
 # AWS KMS backend: setup, verification, and operations
 
 **Use this when:** connecting RustFS to AWS KMS for the first time, verifying an existing AWS-backed deployment, upgrading one from 1.0.4 or 1.0.5, or deciding how to run and protect the AWS keys RustFS depends on.
-**Source of truth:** `crates/kms/src/backends/aws.rs` (backend behavior and its deviations), `crates/kms/src/config.rs` (`ENV_KMS_AWS_*`), `crates/kms/src/policy.rs` (retry, deadline and circuit breaker), `rustfs/src/storage/sse.rs` (SSE data path). 中文版: [kms-aws-backend-guide.zh-CN.md](kms-aws-backend-guide.zh-CN.md).
+**Source of truth:** `crates/kms/src/backends/aws.rs` (backend behavior and its deviations), `crates/kms/src/config.rs` (`ENV_KMS_AWS_*`), `crates/kms/src/policy.rs` (retry, deadline and circuit breaker), `crates/sse/src/lib.rs` (SSE data path). 中文版: [kms-aws-backend-guide.zh-CN.md](kms-aws-backend-guide.zh-CN.md).
 
 The statements about behavior on this page were observed against the real AWS KMS service (region `eu-north-1`) and, for failures AWS cannot be asked to produce on demand, against a loopback stand-in that speaks the AWS KMS wire protocol. Where a statement is guidance that was not exercised, it says so. For the contract-level differences between AWS and the other backends, see [KMS backend security properties](kms-backend-security.md#aws-kms-deviations-from-the-shared-backend-contract).
 

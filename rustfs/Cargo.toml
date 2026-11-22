@@ -80,7 +80,7 @@ e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hook
 connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
-rio-v2 = ["rustfs-ecstore/rio-v2"]
+rio-v2 = ["rustfs-ecstore/rio-v2", "rustfs-sse/rio-v2"]
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
 cuobject = ["dep:rustfs-cuobject", "rustfs-cuobject/server"]
 # NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
@@ -281,6 +281,7 @@ rustfs-rio = { workspace = true }
 rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true, features = ["compat-s3s"] }
 rustfs-s3-ops = { workspace = true }
+rustfs-sse = { workspace = true }
 rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
@@ -424,6 +425,7 @@ h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
+rustfs-sse = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

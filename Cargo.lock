@@ -9956,6 +9956,7 @@ dependencies = [
  "rustfs-scanner-metrics",
  "rustfs-security-governance",
  "rustfs-signer",
+ "rustfs-sse",
  "rustfs-storage-api",
  "rustfs-targets",
  "rustfs-test-utils",
@@ -11428,6 +11429,33 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "rustfs-sse"
+version = "1.0.5"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "axum",
+ "base64-simd",
+ "chacha20poly1305",
+ "hmac 0.13.0",
+ "http 1.5.0",
+ "md-5",
+ "rand 0.10.4",
+ "rustfs-config",
+ "rustfs-kms",
+ "rustfs-policy",
+ "rustfs-s3-types",
+ "rustfs-utils",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
