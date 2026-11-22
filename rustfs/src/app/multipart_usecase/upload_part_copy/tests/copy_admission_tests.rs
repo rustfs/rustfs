@@ -76,9 +76,38 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                         .any(|label| label.key() == "size_bucket" && label.value() == source_size_bucket)
             })
         };
-        let error = Box::pin(usecase.execute_upload_part_copy(build_request(input.clone(), Method::PUT)))
-            .await
-            .expect_err("copy must not bypass the occupied UploadPart pool");
+        let saturated = input.clone();
+        let condition = |value| match value {
+            crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+        };
+        let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(
+            owned_envelope(Method::PUT),
+            UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: saturated.bucket,
+                    key: saturated.key,
+                    upload_id: saturated.upload_id,
+                },
+                part_number: saturated.part_number,
+                copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(saturated.copy_source),
+                copy_source_range: saturated.copy_source_range,
+                copy_source_if_match: saturated.copy_source_if_match.map(&condition),
+                copy_source_if_none_match: saturated.copy_source_if_none_match.map(&condition),
+                sse_customer_algorithm: saturated.sse_customer_algorithm,
+                sse_customer_key: saturated.sse_customer_key,
+                sse_customer_key_md5: saturated.sse_customer_key_md5,
+                copy_source_sse_customer_algorithm: saturated.copy_source_sse_customer_algorithm,
+                copy_source_sse_customer_key: saturated.copy_source_sse_customer_key,
+                copy_source_sse_customer_key_md5: saturated.copy_source_sse_customer_key_md5,
+            },
+        ))
+        .await
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("copy must not bypass the occupied UploadPart pool"),
+        };
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert!(!source_reader_observed(), "saturated copy must not construct a source body reader");
         let parts = store
@@ -165,9 +194,37 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                 .upload_id(deleted_upload.upload_id.clone())
                 .build()
                 .expect("deleted-source copy request");
-            let error = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT)))
-                .await
-                .expect_err("deleted source must fail before conditions or admission");
+            let condition = |value| match value {
+                crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+                crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+                crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+            };
+            let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(
+                owned_envelope(Method::PUT),
+                UploadPartCopyWriteInput {
+                    target: UploadPartTarget::Legacy {
+                        bucket: input.bucket,
+                        key: input.key,
+                        upload_id: input.upload_id,
+                    },
+                    part_number: input.part_number,
+                    copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+                    copy_source_range: input.copy_source_range,
+                    copy_source_if_match: input.copy_source_if_match.map(&condition),
+                    copy_source_if_none_match: input.copy_source_if_none_match.map(&condition),
+                    sse_customer_algorithm: input.sse_customer_algorithm,
+                    sse_customer_key: input.sse_customer_key,
+                    sse_customer_key_md5: input.sse_customer_key_md5,
+                    copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+                    copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+                    copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+                },
+            ))
+            .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("deleted source must fail before conditions or admission"),
+            };
             assert_eq!(error.code(), &expected);
         }
     });
@@ -211,7 +268,32 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
             .upload_id(cancelled_upload.upload_id.clone())
             .build()
             .expect("cancelled copy request");
-        let mut cancelled_copy = Box::pin(usecase.execute_upload_part_copy(build_request(cancelled_input, Method::PUT)));
+        let condition = |value| match value {
+            crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+        };
+        let mut cancelled_copy = Box::pin(usecase.execute_upload_part_copy_with_audit(
+            owned_envelope(Method::PUT),
+            UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: cancelled_input.bucket,
+                    key: cancelled_input.key,
+                    upload_id: cancelled_input.upload_id,
+                },
+                part_number: cancelled_input.part_number,
+                copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(cancelled_input.copy_source),
+                copy_source_range: cancelled_input.copy_source_range,
+                copy_source_if_match: cancelled_input.copy_source_if_match.map(&condition),
+                copy_source_if_none_match: cancelled_input.copy_source_if_none_match.map(&condition),
+                sse_customer_algorithm: cancelled_input.sse_customer_algorithm,
+                sse_customer_key: cancelled_input.sse_customer_key,
+                sse_customer_key_md5: cancelled_input.sse_customer_key_md5,
+                copy_source_sse_customer_algorithm: cancelled_input.copy_source_sse_customer_algorithm,
+                copy_source_sse_customer_key: cancelled_input.copy_source_sse_customer_key,
+                copy_source_sse_customer_key_md5: cancelled_input.copy_source_sse_customer_key_md5,
+            },
+        ));
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
                 biased;
@@ -220,7 +302,10 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                         tokio::task::yield_now().await;
                     }
                 } => {}
-                result = &mut cancelled_copy => panic!("copy completed before cancellation: {result:?}"),
+                result = &mut cancelled_copy => match result {
+                    Ok(_) => panic!("copy completed before cancellation"),
+                    Err(error) => panic!("copy completed before cancellation: {error:?}"),
+                },
             }
         })
         .await
@@ -260,17 +345,39 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                 .upload_id(upload.upload_id.clone())
                 .build()
                 .expect("range request");
-            let response = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT))).await;
+            let response = Box::pin(usecase.execute_upload_part_copy_with_audit(
+                owned_envelope(Method::PUT),
+                UploadPartCopyWriteInput {
+                    target: UploadPartTarget::Legacy {
+                        bucket: input.bucket,
+                        key: input.key,
+                        upload_id: input.upload_id,
+                    },
+                    part_number: input.part_number,
+                    copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+                    copy_source_range: input.copy_source_range,
+                    copy_source_if_match: input.copy_source_if_match.map(&condition),
+                    copy_source_if_none_match: input.copy_source_if_none_match.map(&condition),
+                    sse_customer_algorithm: input.sse_customer_algorithm,
+                    sse_customer_key: input.sse_customer_key,
+                    sse_customer_key_md5: input.sse_customer_key_md5,
+                    copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+                    copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+                    copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+                },
+            ))
+            .await;
             assert_eq!(
                 manager.put_object_admission_snapshot().active,
                 Some(0),
                 "copy releases its permit on every outcome"
             );
             if capped {
-                assert_eq!(
-                    response.expect_err("range exceeds destination size limit").code(),
-                    &S3ErrorCode::EntityTooLarge
-                );
+                let error = match response {
+                    Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                    Ok(_) => panic!("range exceeds destination size limit"),
+                };
+                assert_eq!(error.code(), &S3ErrorCode::EntityTooLarge);
                 let parts = store
                     .list_object_parts(&bucket, "object", &upload.upload_id, None, 1000, &ObjectOptions::default())
                     .await
@@ -281,16 +388,16 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                     .await
                     .expect("abort capped session");
             } else {
-                let copied = response.expect("range copy after failed request released its source and permit");
+                let copied = match response {
+                    Ok(output) => output,
+                    Err(error) => panic!("range copy after failed request released its source and permit: {error:?}"),
+                };
                 let etag = copied
-                    .output
-                    .copy_part_result
-                    .expect("range result")
                     .e_tag
-                    .expect("range ETag")
-                    .value()
-                    .trim_matches('"')
-                    .to_owned();
+                    .as_deref()
+                    .map(crate::storage::storage_api::to_s3s_xml_etag)
+                    .expect("range ETag");
+                let etag = etag.value().trim_matches('"').to_owned();
                 Arc::clone(&store)
                     .complete_multipart_upload(
                         &bucket,
