@@ -138,7 +138,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
     use crate::app::storage_api::s3::dto::{self, PutBucketTaggingInput, Tag, Tagging};
     use http::Method;
     use rustfs_s3_types::S3ErrorCode;
@@ -249,11 +249,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging::default())
+            .execute_put_bucket_tagging(owned_envelope(Method::PUT), &input.bucket, PersistedTagging::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -267,7 +266,7 @@ mod tests {
             (vec![tag; MAX_BUCKET_TAGS + 1], "Cannot have more than 50 tags per bucket"),
         ] {
             let err = usecase
-                .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging { tag_set })
+                .execute_put_bucket_tagging(owned_envelope(Method::PUT), &input.bucket, PersistedTagging { tag_set })
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidTag);

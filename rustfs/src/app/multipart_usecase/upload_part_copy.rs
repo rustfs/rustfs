@@ -561,6 +561,9 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::app::multipart_usecase::UploadPartTarget;
+    use crate::app::object_usecase::CopySourceCondition;
+    use crate::app::storage_api::s3::dto::ETag;
 
     #[tokio::test]
     async fn execute_upload_part_copy_returns_internal_error_when_store_uninitialized() {
@@ -576,9 +579,37 @@ mod tests {
             .upload_id("upload-id".to_string())
             .build()
             .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
+        let condition = |value| match value {
+            crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+        };
+        let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(
+            owned_envelope(Method::PUT),
+            UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: input.bucket,
+                    key: input.key,
+                    upload_id: input.upload_id,
+                },
+                part_number: input.part_number,
+                copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+                copy_source_range: input.copy_source_range,
+                copy_source_if_match: input.copy_source_if_match.map(&condition),
+                copy_source_if_none_match: input.copy_source_if_none_match.map(&condition),
+                sse_customer_algorithm: input.sse_customer_algorithm,
+                sse_customer_key: input.sse_customer_key,
+                sse_customer_key_md5: input.sse_customer_key_md5,
+                copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+                copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+                copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+            },
+        ))
+        .await
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("uninitialized store must be an internal error"),
+        };
         assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InternalError);
     }
 
@@ -597,9 +628,37 @@ mod tests {
                 .upload_id("upload-id".to_string())
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
+            let condition = |value| match value {
+                crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+                crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+                crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+            };
+            let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(
+                owned_envelope(Method::PUT),
+                UploadPartCopyWriteInput {
+                    target: UploadPartTarget::Legacy {
+                        bucket: input.bucket,
+                        key: input.key,
+                        upload_id: input.upload_id,
+                    },
+                    part_number: input.part_number,
+                    copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+                    copy_source_range: input.copy_source_range,
+                    copy_source_if_match: input.copy_source_if_match.map(&condition),
+                    copy_source_if_none_match: input.copy_source_if_none_match.map(&condition),
+                    sse_customer_algorithm: input.sse_customer_algorithm,
+                    sse_customer_key: input.sse_customer_key,
+                    sse_customer_key_md5: input.sse_customer_key_md5,
+                    copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+                    copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+                    copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+                },
+            ))
+            .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("invalid part number must be rejected"),
+            };
             assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
