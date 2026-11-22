@@ -83,11 +83,11 @@ and `x-amz-rdma-bytes-transferred`. A malformed token is ignored and the
 empty body is stored as an empty object, exactly as without the feature;
 the NIXL client treats a reply without `x-amz-rdma-reply` as declined.
 
-For PUT, read-ahead reserves chunks in object order. A request that may
-populate the object cache, or whose eager reader can retain multiple chunks
-before storage starts, copies the retained frames out of the registered
-pool. A single-chunk, non-cacheable PUT can hand its registered frame to
-storage directly.
+For PUT, read-ahead reserves chunks in object order. A streaming PUT or
+UploadPart consumes the registered frames directly and returns each staging
+slot after its last byte is consumed. An eager reader retaining multiple
+frames copies them out of the pool before reserving more. A cache fill also
+keeps its retained bytes independently of the staging pool.
 
 ## Validation
 

@@ -1994,7 +1994,7 @@ impl DefaultObjectUsecase {
             let compressed_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
-                StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
             );
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
@@ -2043,7 +2043,7 @@ impl DefaultObjectUsecase {
                     // for ≤4KiB is negligible cost.
                     let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_direct(
-                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                        upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                     )
                     .await?;
@@ -2071,7 +2071,7 @@ impl DefaultObjectUsecase {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_read_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_body = read_small_put_body_exact_pooled(
-                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                        upload_frame_reader(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         body_size as usize,
                         pool.as_ref(),
                     )
@@ -2103,7 +2103,7 @@ impl DefaultObjectUsecase {
                 let collector = fill_on_put_collector.clone();
                 let body = tokio::io::BufReader::with_capacity(
                     buffer_size,
-                    StreamReader::new(body.map(move |f| {
+                    upload_frame_reader(body.map(move |f| {
                         let f = f.map_err(s3s_body_error_to_io);
                         if let (Some(collector), Ok(frame)) = (&collector, &f) {
                             collector

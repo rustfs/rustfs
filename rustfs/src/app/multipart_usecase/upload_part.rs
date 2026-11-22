@@ -16,8 +16,8 @@
 
 use super::*;
 use crate::app::RequestEnvelope;
-use crate::app::object::BodyChunks;
 use crate::app::object::request_body::{DemandReader, UploadChunks, guard_native_upload_progress};
+use crate::app::object::{BodyChunks, upload_frame_reader};
 use crate::app::storage_api::multipart_usecase::access::AuthorizationRequest;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOwner;
@@ -289,7 +289,7 @@ impl DefaultMultipartUsecase {
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
+            upload_frame_reader(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
         );
 
         // An SSE-C passthrough session stores ciphertext parts verbatim: a

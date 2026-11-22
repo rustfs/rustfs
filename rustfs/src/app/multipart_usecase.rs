@@ -119,7 +119,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
