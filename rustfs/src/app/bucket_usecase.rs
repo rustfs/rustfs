@@ -509,7 +509,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
+    use crate::app::bucket_usecase::test_support::{build_request_with_req_info, owned_envelope};
     use crate::app::storage_api::s3::dto::CreateBucketInput;
     use http::Method;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1005,11 +1005,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
-        let req = build_request((), Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_list_buckets(RequestEnvelope::from_s3s(&req), gateway_dto::ListBucketsInput::default())
+            .execute_list_buckets(owned_envelope(Method::GET), gateway_dto::ListBucketsInput::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);

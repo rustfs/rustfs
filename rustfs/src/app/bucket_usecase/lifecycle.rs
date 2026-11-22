@@ -405,7 +405,7 @@ mod tests {
         // waiter again on the single-thread test runtime.
         assert_eq!(admission.available_permits(), 1);
     }
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
@@ -775,13 +775,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
             .execute_put_bucket_lifecycle_configuration(
-                RequestEnvelope::from_s3s(&req),
-                &req.input.bucket,
+                owned_envelope(Method::PUT),
+                &input.bucket,
                 PreparedLifecycleConfiguration::Missing,
             )
             .await
