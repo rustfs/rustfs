@@ -147,9 +147,9 @@ impl Operation for ListCannedPolicies {
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
-        let kvs: HashMap<String, Policy> = policies
+        let kvs: HashMap<_, _> = policies
             .into_iter()
-            .filter(|(_, v)| serde_json::to_string(v).is_ok())
+            .filter_map(|(name, policy)| policy.to_export_value().ok().map(|document| (name, document)))
             .collect();
 
         let body = serde_json::to_vec(&kvs).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
