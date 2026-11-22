@@ -150,6 +150,19 @@ pub(crate) enum PendingDeleteBucketGenerationGuard {
 }
 
 impl PendingDeleteBucketGenerationGuard {
+    /// Resolves the identity storage will validate for a mutation. A deferred
+    /// delete capture takes precedence, including a failure to capture it.
+    pub(crate) fn resolve_generation<'a>(
+        ordinary: Option<&'a BucketGenerationGuard>,
+        pending_delete: Option<&'a Self>,
+    ) -> S3Result<Option<&'a BucketGenerationGuard>> {
+        match pending_delete {
+            Some(Self::Ready(guard)) => Ok(Some(guard)),
+            Some(Self::Failed { code, message }) => Err(S3Error::with_message(code.clone(), message.clone())),
+            None => Ok(ordinary),
+        }
+    }
+
     pub(crate) fn from_result(result: S3Result<BucketGenerationGuard>) -> Self {
         match result {
             Ok(guard) => Self::Ready(guard),
@@ -268,13 +281,8 @@ pub(crate) fn apply_bucket_generation_guard<R: AuthorizationRequest + ?Sized>(
     bucket: &str,
     opts: &mut ObjectOptions,
 ) -> S3Result<()> {
-    let guard = match req.pending_delete_bucket_generation() {
-        Some(PendingDeleteBucketGenerationGuard::Ready(guard)) => Some(guard),
-        Some(PendingDeleteBucketGenerationGuard::Failed { code, message }) => {
-            return Err(S3Error::with_message(code.clone(), message.clone()));
-        }
-        None => req.bucket_generation(),
-    };
+    let guard =
+        PendingDeleteBucketGenerationGuard::resolve_generation(req.bucket_generation(), req.pending_delete_bucket_generation())?;
     apply_generation_fence(
         req,
         guard.map(|guard| (guard.bucket.as_str(), guard.incarnation_id)),

@@ -40,6 +40,7 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
         scan_mode,
         prefix_scan_scope: None,
         checkpoint_tx: None,
+        local_stop: None,
     }
 }
 
@@ -1130,7 +1131,7 @@ async fn checkpoint_admission_log_capture_survives_another_future_dispatcher() {
     }
 }
 
-async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
+pub(super) async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
     let mut metadata = FileMeta::new();
     for (index, (version_id, size)) in versions.iter().enumerate() {
         let mut info = FileInfo::new(object, 4, 2);
@@ -1309,6 +1310,7 @@ where
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
+                    local_stop: None,
                 },
             )
             .await
@@ -1392,6 +1394,7 @@ where
                 scan_mode: HealScanMode::Normal,
                 prefix_scan_scope: None,
                 checkpoint_tx: None,
+                local_stop: None,
             },
         )
         .await;

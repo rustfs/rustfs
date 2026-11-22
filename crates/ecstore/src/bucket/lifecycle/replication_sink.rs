@@ -66,8 +66,12 @@ pub(crate) fn lifecycle_action_waits_for_replication(action: IlmAction) -> bool 
     )
 }
 
-pub(crate) async fn schedule_delete(bucket: String, delete_object: DeletedObject) {
-    ReplicationLifecycleBridge::schedule_delete(bucket, delete_object).await;
+pub(crate) async fn schedule_delete(
+    bucket: String,
+    delete_object: DeletedObject,
+    notification_bucket_incarnation: Option<uuid::Uuid>,
+) {
+    ReplicationLifecycleBridge::schedule_delete(bucket, delete_object, notification_bucket_incarnation).await;
 }
 
 #[cfg(test)]

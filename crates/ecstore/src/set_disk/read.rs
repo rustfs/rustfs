@@ -1407,7 +1407,11 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, FileInfo, usize, Option<StorageError>) {
-        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
+        // Unversioned/latest-version deletes discard `parts_metadata` and
+        // `op_online_disks`, and `latest_early_stop_decision` requires write
+        // quorum agreement with zero conflicts, NotFound, or hard errors.
+        let allow_early_stop = opts.version_id.as_deref().is_none_or(str::is_empty);
+        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, allow_early_stop).await {
             Ok(snapshot) => snapshot,
             Err(e) => return (ObjectInfo::default(), FileInfo::default(), 0, Some(e)),
         };
@@ -6635,6 +6639,135 @@ mod metadata_cache_tests {
             set.cached_get_object_fileinfo("bucket", "fresh-object").await.is_some(),
             "freshly inserted entry should be retrievable"
         );
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn get_object_info_fileinfo_and_quorum_early_stops_at_write_quorum_and_preserves_explicit_version_fanout() {
+        use crate::object_api::WriteCompletion;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                ("RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE", Some("true")),
+            ],
+            async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+                let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(8, 4, ctx).await;
+                let bucket = "delete-preflight-early-stop";
+                let object = "delete-preflight.bin";
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket");
+                let committed = set
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![0x42; 4096]),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit 8 shards");
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+
+                for version_id in [None, Some(String::new())] {
+                    let calls = disk_call_counters::observe(object);
+                    let opts = ObjectOptions {
+                        version_id,
+                        ..Default::default()
+                    };
+                    let (oi, fi, write_quorum, err) = set.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+                    assert!(err.is_none(), "healthy preflight read must succeed: {err:?}");
+                    assert_eq!(write_quorum, 5);
+                    assert_eq!(oi.etag, committed.etag);
+                    assert_eq!(fi.size, 4096);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        5,
+                        "healthy unversioned/latest delete preflight must early-stop at write quorum (5/8)"
+                    );
+                    assert!(
+                        set.cached_get_object_fileinfo(bucket, object).await.is_none(),
+                        "delete preflight read_data=false early-stop must not populate metadata cache"
+                    );
+                }
+
+                // Remove xl.meta on 3 drives so any 5-drive initial subset sees FileNotFound and expands fanout,
+                // while the remaining 5 drives still satisfy write quorum.
+                for dir in &dirs[..3] {
+                    std::fs::remove_file(dir.path().join(bucket).join(object).join("xl.meta")).expect("remove drive xl.meta");
+                }
+                let calls = disk_call_counters::observe(object);
+                let (oi_degraded, fi_degraded, quorum_degraded, err_degraded) = set
+                    .get_object_info_fileinfo_and_quorum(bucket, object, &ObjectOptions::default())
+                    .await;
+                assert!(err_degraded.is_none(), "5/8 surviving drives must still succeed: {err_degraded:?}");
+                assert_eq!(quorum_degraded, 5);
+                assert_eq!(oi_degraded.etag, committed.etag);
+                assert_eq!(fi_degraded.size, 4096);
+                assert!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION) > 5,
+                    "missing shard in initial subset must expand fanout beyond write quorum"
+                );
+
+                // Explicit versionId on a 6+2 set with RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE=true
+                // must keep full 8-drive fanout rather than stopping at 4/8.
+                let ctx62 = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx62.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+                let (_dirs62, set62) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(8, 2, ctx62).await;
+                let v_bucket = "delete-preflight-62";
+                let v_object = "delete-preflight-versioned.bin";
+                set62
+                    .make_bucket(
+                        v_bucket,
+                        &MakeBucketOptions {
+                            versioning_enabled: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create versioned 6+2 bucket");
+                let v_vid = Uuid::new_v4().to_string();
+                let v_committed = set62
+                    .put_object(
+                        v_bucket,
+                        v_object,
+                        &mut PutObjReader::from_vec(vec![0x24; 4096]),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(v_vid.clone()),
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit versioned 6+2 object");
+                set62.invalidate_get_object_metadata_cache(v_bucket, v_object).await;
+                let v_calls = disk_call_counters::observe(v_object);
+                let v_opts = ObjectOptions {
+                    versioned: true,
+                    version_id: Some(v_vid),
+                    ..Default::default()
+                };
+                let (v_oi, _v_fi, v_quorum, v_err) = set62.get_object_info_fileinfo_and_quorum(v_bucket, v_object, &v_opts).await;
+                assert!(v_err.is_none(), "explicit-version preflight on 6+2 must succeed: {v_err:?}");
+                assert_eq!(v_quorum, 6);
+                assert_eq!(v_oi.etag, v_committed.etag);
+                assert_eq!(
+                    v_calls.total(disk_call_counters::KIND_READ_VERSION),
+                    8,
+                    "explicit-version delete preflight must keep full fanout even when version early-stop is enabled"
+                );
+            },
+        )
+        .await;
     }
 }
 

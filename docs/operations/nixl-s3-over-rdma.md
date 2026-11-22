@@ -41,8 +41,8 @@ also enabled.
 | `RUSTFS_NIXL_NUM_WORKERS` | `1` | UCX progress workers of the agent. |
 | `RUSTFS_NIXL_CHUNK_BYTES` | `16 MiB` | Staging chunk, one transfer descriptor at most. |
 | `RUSTFS_NIXL_POOL_BYTES` | `1 GiB` | Registered staging memory. |
-| `RUSTFS_NIXL_MAX_INFLIGHT` | `256` | Transfers in flight per node. |
-| `RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS` | `60` | A transfer that has not completed by then fails the request instead of hanging it. |
+| `RUSTFS_NIXL_MAX_INFLIGHT` | `256` | Maximum queued and active native transfers per node. A timeout or caller cancellation holds the slot until the native operation finishes. |
+| `RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS` | `60` | Maximum wait for a free transfer slot and, separately, for a posted transfer to complete. |
 | `RUSTFS_NIXL_DEVICE_CHECK` | `true` | Check the devices at startup and leave out unhealthy ones (see below). |
 | `RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS` | `16` | Leave out a device whose link dropped this many times more since boot than the quietest device of its link layer; `0` skips this test. |
 | `RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS` | `3000` | How long the startup check watches the link counters; `0` skips the watch. |
@@ -96,7 +96,7 @@ Request headers (GET, PUT, UploadPart):
 | Header | Value |
 |---|---|
 | `x-rustfs-nixl-agent` | The client's agent name (printable ASCII, up to 128 bytes). |
-| `x-rustfs-nixl-metadata` | The client's agent metadata (`get_local_md`), base64. May be omitted once this server has loaded that agent; a server that does not know the agent declines the request. A restarted client sends new metadata, which replaces the old. |
+| `x-rustfs-nixl-metadata` | The client's agent metadata (`get_local_md`), base64. Send on each request for reliable reuse across nodes and cache eviction. The server can accept an omitted value while the registration is cached. In-flight requests pin the registration, including timed-out transfers until native completion. The five-minute idle period starts when the last native request finishes. The server checks once a minute and may reclaim idle registrations sooner under cache pressure. |
 | `x-rustfs-nixl-buffer` | `<dram|vram>:<device>:<address>:<length>`: the registered buffer the object (or the requested range) lands in from offset 0, or is read from for a PUT. Address and length are decimal or `0x` hex. |
 
 Reply headers: `x-amz-rdma-reply` (`200`, `206` for a range, `501` when the

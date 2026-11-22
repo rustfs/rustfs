@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #[cfg(test)]
+mod access_request_validation_test;
+
+#[cfg(test)]
 mod storage_metric_ownership_test;
 
 mod reliant;
@@ -104,6 +107,9 @@ mod replication_target_matrix_test;
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;
+
+#[cfg(test)]
+mod scanner_wide_directory_test;
 
 // KMS-specific test modules
 #[cfg(test)]

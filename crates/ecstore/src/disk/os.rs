@@ -428,6 +428,24 @@ pub(crate) mod prepared_publication_test_hooks {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_rename_hooks(source: &Path, destination: &Path) -> bool {
+        let before_publication = {
+            let guard = BEFORE_PUBLICATION.lock();
+            !guard.is_empty()
+                && (guard.contains_key(&(Stage::Rename, source.to_path_buf()))
+                    || guard.contains_key(&(Stage::Rename, destination.to_path_buf())))
+        };
+        #[cfg(test)]
+        {
+            before_publication || RENAME_DESTINATIONS.lock().contains_key(source)
+        }
+        #[cfg(not(test))]
+        {
+            before_publication
+        }
+    }
+
     #[cfg(test)]
     type RenameDestinationHook = Box<dyn FnOnce(&Path) + Send>;
     #[cfg(test)]
@@ -2671,6 +2689,7 @@ pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
+const FSYNC_IDLE_YIELD_ITERS: usize = 2;
 const DEFAULT_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 256;
 const MAX_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
@@ -2869,6 +2888,11 @@ impl DiskBlockingQueue {
         self.lanes.iter().map(|lane| lane.state.lock().submitted_jobs).sum()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn submitted_fsync_jobs_for_test(&self) -> usize {
+        self.lane(DiskBlockingLane::Fsync).state.lock().submitted_jobs
+    }
+
     #[inline]
     fn foreground_lane() -> DiskBlockingLane {
         if is_isolated_io_thread() {
@@ -2970,6 +2994,18 @@ impl DiskBlockingQueue {
                         }
                         std::hint::spin_loop();
                         spun += 1;
+                    }
+                    if lane == DiskBlockingLane::Fsync
+                        && spin_iters > 0
+                        && spun == spin_iters
+                        && !queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        for _ in 0..FSYNC_IDLE_YIELD_ITERS {
+                            std::thread::yield_now();
+                            if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
                     }
                     if let Some(metrics) = spin_metrics {
                         metrics.finish(spun);
@@ -3271,6 +3307,37 @@ fn disk_namespace_mutation_lock_by_key(key: &[u8]) -> Arc<NamespaceMutationLock>
 static DISK_METADATA_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
     LazyLock::new(ShardedPathLockRegistry::new);
 
+/// Distinct handle for the per-object metadata mutation lock domain so callers
+/// cannot accidentally swap metadata and namespace lock handles across stages.
+#[derive(Clone)]
+pub(crate) struct MetadataMutationLockHandle(Arc<NamespaceMutationLock>);
+
+impl MetadataMutationLockHandle {
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Distinct handle for the per-path namespace mutation lock domain.
+#[derive(Clone)]
+pub(in crate::disk) struct NamespaceMutationLockHandle(Arc<NamespaceMutationLock>);
+
+impl NamespaceMutationLockHandle {
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+pub(crate) fn lookup_metadata_mutation_lock(object: &Path) -> MetadataMutationLockHandle {
+    MetadataMutationLockHandle(DISK_METADATA_MUTATION_LOCKS.get_or_create(object, || AsyncMutex::new(())))
+}
+
+pub(in crate::disk) fn lookup_namespace_mutation_lock(path: &Path) -> NamespaceMutationLockHandle {
+    NamespaceMutationLockHandle(disk_namespace_mutation_lock(path))
+}
+
 /// Serializes the complete xl.meta read/modify/commit transaction. This domain
 /// precedes namespace/volume publication locks, whose narrower syscall leases
 /// may retain it after cancellation of the async caller.
@@ -3283,9 +3350,16 @@ pub(crate) async fn acquire_metadata_mutation_lease(
     object: &Path,
     owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<MetadataMutationLease> {
-    let lock = DISK_METADATA_MUTATION_LOCKS.get_or_create(object, || AsyncMutex::new(()));
+    let lock = lookup_metadata_mutation_lock(object);
+    acquire_metadata_mutation_lease_with_lock(&lock, owner).await
+}
+
+pub(crate) async fn acquire_metadata_mutation_lease_with_lock(
+    lock: &MetadataMutationLockHandle,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<MetadataMutationLease> {
     Arc::new(MetadataMutationLease {
-        _guard: lock.lock_owned().await,
+        _guard: lock.0.clone().lock_owned().await,
         _owner: owner,
     })
 }
@@ -3322,8 +3396,25 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
     let blocking_queue = disk_blocking_queue_for_path(path);
+    acquire_namespace_mutation_lease_with_queue(path, blocking_queue, namespace_owner).await
+}
+
+pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_queue(
+    path: &Path,
+    blocking_queue: Arc<DiskBlockingQueue>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
+    let lock = lookup_namespace_mutation_lock(path);
+    acquire_namespace_mutation_lease_with_lock_and_queue(&lock, blocking_queue, namespace_owner).await
+}
+
+pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_lock_and_queue(
+    lock: &NamespaceMutationLockHandle,
+    blocking_queue: Arc<DiskBlockingQueue>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
     Arc::new(NamespaceMutationLease {
-        _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
+        _namespace_guard: lock.0.clone().lock_owned().await,
         _staging_guard: None,
         _volume_guard: None,
         external_guard: Mutex::new(None),
@@ -5308,11 +5399,11 @@ pub(crate) async fn rename_all_with_prepared_source(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
-    guard.directories.prepare_destination().map_err(to_file_error)?;
-    #[cfg(test)]
-    prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(any(test, feature = "test-util"))]
-    {
+    if prepared_publication_test_hooks::has_rename_hooks(source, destination) {
+        guard.directories.prepare_destination().map_err(to_file_error)?;
+        #[cfg(test)]
+        prepared_publication_test_hooks::run_rename_destination(source, destination);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
     }
@@ -5670,12 +5761,13 @@ pub(crate) async fn acquire_file_sync_admission(disk_permits: Arc<Semaphore>) ->
 /// Keep the disk admission and namespace lease with the blocking syscall if
 /// the async waiter is cancelled. The process-wide admission remains with the
 /// waiter so cancellation cannot starve healthy disks.
+#[cfg(any(unix, test))]
 pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     admission: &FileSyncAdmission,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    run_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
+    run_cancellable_blocking_namespace_file_sync_operation(lease, admission, move |_| operation()).await
 }
 
 pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Send + 'static>(
@@ -5684,16 +5776,6 @@ pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Se
     operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
-}
-
-async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
-    lease: Arc<NamespaceMutationLease>,
-    admission: &FileSyncAdmission,
-    global_permits: &Semaphore,
-    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, global_permits, move |_| operation())
-        .await
 }
 
 async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
@@ -12583,11 +12665,16 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let waiter_global_permits = global_permits.clone();
         let waiter = tokio::spawn(async move {
-            run_blocking_namespace_file_sync_operation_with_global(lease, &admission, waiter_global_permits.as_ref(), move || {
-                entered_tx.send(()).expect("signal blocking work");
-                release_rx.recv().expect("wait for blocking work release");
-                Ok(())
-            })
+            run_cancellable_blocking_namespace_file_sync_operation_with_global(
+                lease,
+                &admission,
+                waiter_global_permits.as_ref(),
+                move |_| {
+                    entered_tx.send(()).expect("signal blocking work");
+                    release_rx.recv().expect("wait for blocking work release");
+                    Ok(())
+                },
+            )
             .await
         });
 

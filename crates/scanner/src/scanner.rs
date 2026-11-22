@@ -34,8 +34,9 @@ use crate::runtime_config::{
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::{
-    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, dirty_usage_bucket_notified, dirty_usage_buckets_pending,
-    dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
+    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, ScannerServiceCohort, dirty_usage_bucket_notified,
+    dirty_usage_buckets_pending, dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed,
+    scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
@@ -55,7 +56,7 @@ use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
     CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot,
     ScannerUsagePublicationObservation, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
-    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
+    emit_scan_cycle_deferred, emit_scan_cycle_partial_with_stage, emit_scan_cycle_superseded, global_metrics,
 };
 use rustfs_scanner_metrics::startup::ScannerStartupToken;
 use serde::{Deserialize, Serialize};
@@ -248,13 +249,13 @@ const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 /// otherwise idle instance whose clean-idle backoff had doubled a 60 s
 /// interval), which defeats the fast path it is meant to protect.
 ///
-/// The exponential growth in [`ScannerRetryBackoff::retry_interval`] is
-/// what protects against a persistently hot bucket driving an unbroken
-/// full-scan loop, so it can start small: 5 s, 10 s, 20 s … capped by
-/// [`SCANNER_RETRY_MAX_INTERVAL`]. A one-off race recovers in seconds; a
-/// genuinely hot bucket still reaches minute-scale backoff within a handful of
-/// cycles. Preflight deferrals use the same bounded schedule so a temporarily
-/// unavailable peer cannot drive a tight retry loop.
+/// The exponential growth in [`ScannerRetryBackoff::retry_interval`] protects
+/// against a persistently hot bucket driving an unbroken full-scan loop, so
+/// retries can start small: 5 s, 10 s, 20 s … Superseded retries cap this
+/// schedule at the ordinary cycle interval and preserve an operator-selected
+/// nominal cadence. Preflight deferrals retain the generic
+/// [`SCANNER_RETRY_MAX_INTERVAL`] cap so a temporarily unavailable peer cannot
+/// drive a tight retry loop.
 const SCANNER_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
 const SCANNER_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Probe cadence while data movement pauses the scanner. Recovery retries use
@@ -1212,6 +1213,8 @@ where
         }
 
         let mut transient_backoff = ScannerRetryBackoff::default();
+        // Only this supervisor, for this storage instance, owns resumable service.
+        let mut service_continuation = None;
         let mut recovery_retry_count = 0_u32;
         loop {
             if ctx_clone.is_cancelled() {
@@ -1226,6 +1229,7 @@ where
                 startup_features,
                 startup_maintenance_generation,
                 startup,
+                &mut service_continuation,
             )
             .await;
             if let Err(e) = &run_result {
@@ -1773,11 +1777,26 @@ where
     }
 }
 
+/// Scheduling and mutation witnesses retained across a clean local deadline.
+/// Only an immediately succeeding leadership claim can resume this cohort.
+struct ScannerServiceContinuation {
+    cohort: Arc<StdMutex<ScannerServiceCohort>>,
+    fenced_epoch: u64,
+    fenced_revision: DataUsageCacheRevision,
+}
+
+impl ScannerServiceContinuation {
+    fn matches_claim(&self, previous_revision: &DataUsageCacheRevision, claimed_epoch: u64) -> bool {
+        &self.fenced_revision == previous_revision && self.fenced_epoch.checked_add(1) == Some(claimed_epoch)
+    }
+}
+
 struct ScannerCycleDeadlineState<'a> {
     cycle_info: &'a mut CurrentCycle,
     cycle_revision: &'a mut DataUsageCacheRevision,
     leader_epoch: &'a mut u64,
     cycle_budget: &'a ScannerCycleBudget,
+    service_cohort: Arc<StdMutex<ScannerServiceCohort>>,
     allow_bootstrap_pending: bool,
 }
 
@@ -1791,7 +1810,8 @@ async fn handle_scanner_cycle_deadline<Store>(
     state: ScannerCycleDeadlineState<'_>,
     worker_stopped: bool,
     guard: &mut NamespaceLockGuard,
-) where
+) -> Option<ScannerServiceContinuation>
+where
     Store: ScannerObjectIO + ScannerConfigObjectDelete,
 {
     let fenced = fence_scanner_epoch_after_cycle_timeout(
@@ -1821,8 +1841,14 @@ async fn handle_scanner_cycle_deadline<Store>(
     global_metrics().record_scanner_cycle_timeout(recovery_required, state.cycle_budget.progress_age());
     // Stop renewing before releasing the lease. A new leader can then claim the
     // higher persisted generation instead of inheriting the expired worker.
+    let may_resume = !recovery_required && !guard.is_lock_lost() && !ctx.is_cancelled();
     guard.release();
     global_metrics().set_cycle(None).await;
+    may_resume.then(|| ScannerServiceContinuation {
+        cohort: state.service_cohort,
+        fenced_epoch: *state.leader_epoch,
+        fenced_revision: state.cycle_revision.clone(),
+    })
 }
 
 async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard: &mut ScannerCycleMetricsGuard) {
@@ -1881,6 +1907,48 @@ where
         },
     )
     .await
+}
+
+/// Observe the outer wait so that an expired drain records the attempt even when
+/// the worker is dropped before its first poll. Only one terminal record is emitted.
+async fn await_observed_scanner_cycle(
+    metrics: &rustfs_scanner_metrics::metrics::Metrics,
+    epoch: u64,
+    cycle: u64,
+    ctx: &CancellationToken,
+    budget: &ScannerCycleBudget,
+    worker: impl Future<Output = ScannerCycleOutcome>,
+    lock_lost: impl Future<Output = ()>,
+) -> ScannerCycleWaitOutcome<ScannerCycleOutcome> {
+    let started = tokio::time::Instant::now();
+    let mut completed = None;
+    let worker = async {
+        let outcome = worker.await;
+        completed = Some(outcome);
+        outcome
+    };
+    let wait = await_scanner_cycle_with_budget_fence(ctx, budget, worker, lock_lost).await;
+    let partial = || ("partial", budget.reason().map(|reason| scan_cycle_partial_reason(Some(reason)).as_str()));
+    let (result, partial_reason) = match (&wait, completed.as_ref()) {
+        (ScannerCycleWaitOutcome::Completed(outcome), _) | (_, Some(outcome)) => match outcome {
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => ("success", None),
+            ScannerCycleOutcome::Partial => partial(),
+            ScannerCycleOutcome::Superseded => ("superseded", None),
+            ScannerCycleOutcome::Deferred(_) => ("deferred", None),
+            ScannerCycleOutcome::Failed | ScannerCycleOutcome::StatePersistenceFailed => ("error", None),
+        },
+        (ScannerCycleWaitOutcome::LockLost, None) => ("lock_lost", None),
+        (ScannerCycleWaitOutcome::Cancelled, None) => ("cancelled", None),
+        (ScannerCycleWaitOutcome::Deadline { .. }, None) => partial(),
+    };
+    metrics.record_cluster_attempt(rustfs_scanner_metrics::metrics::ScannerAttemptRecord {
+        epoch,
+        cycle,
+        result,
+        partial_reason,
+        duration: started.elapsed(),
+    });
+    wait
 }
 
 #[instrument(skip_all)]
@@ -2460,13 +2528,20 @@ where
                 event = EVENT_SCANNER_CYCLE_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                cycle = cycle_info.current,
-                required_cycle,
                 state = "cache_cycle_ahead",
+                partial_stage = "cache_cycle_ahead",
+                cycle = cycle_info.current,
+                leader_epoch,
+                required_cycle,
                 partial_cause = "cache_cycle_ahead",
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
-            emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+            let partial = emit_scan_cycle_partial_with_stage(
+                cycle_start.elapsed(),
+                ScanCyclePartialReason::Unknown,
+                None,
+                Some("cache_cycle_ahead"),
+            );
             let persisted = persist_required_scanner_cycle_floor_for_epoch(
                 ctx,
                 storeapi.clone(),
@@ -2480,6 +2555,7 @@ where
                 },
             )
             .await;
+            partial.observe_state_write(persisted);
             return if persisted {
                 cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
@@ -2530,18 +2606,7 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
-    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
-        "saved_bucket_progress"
-    } else if scan_cycle_result.has_usage_update()
-        && matches!(
-            scan_cycle_result.status,
-            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        )
-    {
-        "activity_unverified_observation"
-    } else {
-        "incomplete_coverage"
-    };
+    let (partial_cause, partial_stage) = partial_cycle_diagnostic(&scan_cycle_result);
     #[cfg(feature = "e2e-test-hooks")]
     let durable_observation = scan_cycle_result
         .publication_expectation()
@@ -2620,25 +2685,35 @@ where
         );
     }
     if cycle_budget.budget_elapsed() {
+        let budget_reason = cycle_budget.reason();
+        let budget_stage = match budget_reason {
+            Some(ScannerCycleBudgetReason::Runtime) => Some("runtime_budget"),
+            Some(ScannerCycleBudgetReason::Objects) => Some("object_budget"),
+            Some(ScannerCycleBudgetReason::Directories) => Some("directory_budget"),
+            Some(ScannerCycleBudgetReason::Entries) => Some("entry_budget"),
+            None => None,
+        };
         warn!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "budget_reached",
+            partial_stage = budget_stage,
             cycle = cycle_info.current,
+            leader_epoch,
             duration = ?now.elapsed(),
-            reason = ?cycle_budget.reason(),
+            reason = ?budget_reason,
             max_duration = ?cycle_budget.max_duration(),
             max_objects = ?cycle_budget.max_objects(),
             max_directories = ?cycle_budget.max_directories(),
-            state = "budget_reached",
             "Scanner cycle budget reached"
         );
-        let budget_reason = cycle_budget.reason();
-        emit_scan_cycle_partial_with_source(
+        let partial = emit_scan_cycle_partial_with_stage(
             cycle_start.elapsed(),
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
+            budget_stage,
         );
         let persisted = finalize_partial_scan_cycle_for_epoch(
             ctx,
@@ -2650,6 +2725,7 @@ where
             publication_epoch,
         )
         .await;
+        partial.observe_state_write(persisted);
         return if persisted {
             cycle_budget.mark_cycle_state_persisted();
             ScannerCycleOutcome::Partial
@@ -2683,29 +2759,56 @@ where
             return ScannerCycleOutcome::Failed;
         }
         ScannerCycleOutcome::Partial => {
-            if ctx.is_cancelled() {
+            let owner_cancelled = ctx.is_cancelled();
+            let partial_stage = if owner_cancelled { "owner_cancelled" } else { partial_stage };
+            if owner_cancelled {
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_CYCLE_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    cycle = cycle_info.current,
                     state = "incomplete_cancelled",
+                    cycle = cycle_info.current,
+                    leader_epoch,
+                    partial_stage,
                     "Scanner cycle stopped before a complete usage snapshot was produced"
                 );
-            } else {
+            } else if partial_cause == "saved_bucket_progress"
+                && matches!(partial_stage, "bucket_checkpoint_saved" | "bucket_walk_incomplete")
+            {
                 warn!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_CYCLE_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    cycle = cycle_info.current,
                     state = "incomplete",
+                    cycle = cycle_info.current,
+                    leader_epoch,
                     partial_cause,
-                    "Scanner cycle ended without a complete usage snapshot"
+                    partial_stage,
+                    "Scanner saved bucket progress before completing coverage"
+                );
+            } else {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_CYCLE_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "incomplete",
+                    cycle = cycle_info.current,
+                    leader_epoch,
+                    partial_cause,
+                    partial_stage,
+                    persist_outcome = ?usage_persist_outcome,
+                    "Scanner cycle could not certify complete usage"
                 );
             }
-            emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+            let partial = emit_scan_cycle_partial_with_stage(
+                cycle_start.elapsed(),
+                ScanCyclePartialReason::Unknown,
+                None,
+                Some(partial_stage),
+            );
             let persisted = finalize_partial_scan_cycle_for_epoch(
                 ctx,
                 storeapi.clone(),
@@ -2716,6 +2819,7 @@ where
                 publication_epoch,
             )
             .await;
+            partial.observe_state_write(persisted);
             return if persisted {
                 cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
@@ -2909,6 +3013,7 @@ where
         maintenance_features,
         maintenance_generation,
         runtime_guard.startup_token(),
+        &mut None,
     )
     .await
 }
@@ -2995,10 +3100,12 @@ async fn run_data_scanner_with_maintenance_state<S>(
     mut maintenance_features: ScannerMaintenanceFeatures,
     mut maintenance_generation_seen: Option<u64>,
     startup: ScannerStartupToken,
+    continuation: &mut Option<ScannerServiceContinuation>,
 ) -> Result<(), ScannerError>
 where
     S: ScannerStorage,
 {
+    let previous = continuation.take();
     reset_scanner_cycle_schedule();
     // Normal scanner entry is an attempt, not evidence of leadership, coverage, or publication.
     global_metrics().startup().record_attempt(startup);
@@ -3108,7 +3215,6 @@ where
     let mut deferred_backoff = ScannerRetryBackoff::default();
     let mut scope_fallback_backoff = ScannerRetryBackoff::default();
     let scope_fallback_slot = Arc::new(ScannerScopeFallbackSlot::default());
-    let service_cohort = Arc::new(StdMutex::new(crate::scanner_io::ScannerServiceCohort::default()));
     let initial_runtime_config = resolve_scanner_runtime_config();
     if clean_idle_topology_supported && maintenance_generation_seen.is_none() {
         let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
@@ -3269,6 +3375,7 @@ where
         finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
         return Ok(());
     }
+    let previous_revision = cycle_revision.clone();
     let claim_ctx = ctx.child_token();
     let leadership_claimed = await_scanner_cycle_with_lock_fence(
         &claim_ctx,
@@ -3318,6 +3425,10 @@ where
         finish_scanner_leader_iteration(false, "epoch_claim_failed", "leadership epoch claim failed".to_string()).await;
         return Ok(());
     }
+    let service_cohort = previous
+        .filter(|previous| previous.matches_claim(&previous_revision, leader_epoch))
+        .map(|previous| previous.cohort)
+        .unwrap_or_default();
     if rebuild_from_quarantine {
         record_scanner_cycle_state_rebuilt_from_quarantine(cycle_info.next, leader_epoch);
     }
@@ -3369,7 +3480,10 @@ where
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
         record_scanner_cycle_attempt(None);
-        let initial_outcome = match await_scanner_cycle_with_budget_fence(
+        let initial_outcome = match await_observed_scanner_cycle(
+            global_metrics(),
+            leader_epoch,
+            cycle_info.next,
             &cycle_ctx,
             &cycle_budget,
             run_data_scanner_cycle_with_budget(
@@ -3402,7 +3516,7 @@ where
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
-                handle_scanner_cycle_deadline(
+                *continuation = handle_scanner_cycle_deadline(
                     &ctx,
                     storeapi.clone(),
                     ScannerCycleDeadlineState {
@@ -3410,6 +3524,7 @@ where
                         cycle_revision: &mut cycle_revision,
                         leader_epoch: &mut leader_epoch,
                         cycle_budget: &cycle_budget,
+                        service_cohort,
                         allow_bootstrap_pending: allow_usage_floor_bootstrap_pending,
                     },
                     worker_stopped,
@@ -3528,8 +3643,7 @@ where
         ));
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
-        let superseded_retry_interval =
-            scanner_superseded_retry_interval(superseded_backoff, &runtime_config, maintenance_features);
+        let superseded_retry_interval = scanner_superseded_retry_interval(superseded_backoff, &runtime_config);
         let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
         let scope_fallback_retry_interval = scanner_scope_fallback_retry_interval(scope_fallback_backoff, &runtime_config);
         let mut convergence_retry_interval = superseded_retry_interval
@@ -3707,7 +3821,10 @@ where
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
         record_scanner_cycle_attempt(Some(wake_reason));
-        let outcome = match await_scanner_cycle_with_budget_fence(
+        let outcome = match await_observed_scanner_cycle(
+            global_metrics(),
+            leader_epoch,
+            cycle_info.next,
             &cycle_ctx,
             &cycle_budget,
             run_data_scanner_cycle_with_budget(
@@ -3747,7 +3864,7 @@ where
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
-                handle_scanner_cycle_deadline(
+                *continuation = handle_scanner_cycle_deadline(
                     &ctx,
                     storeapi.clone(),
                     ScannerCycleDeadlineState {
@@ -3755,6 +3872,7 @@ where
                         cycle_revision: &mut cycle_revision,
                         leader_epoch: &mut leader_epoch,
                         cycle_budget: &cycle_budget,
+                        service_cohort,
                         allow_bootstrap_pending: allow_usage_floor_bootstrap_pending,
                     },
                     worker_stopped,
@@ -4334,6 +4452,18 @@ fn finalize_scanner_cycle_result(
     )
 }
 
+fn partial_cycle_diagnostic(scan: &crate::scanner_io::ScannerCycleResult) -> (&'static str, &'static str) {
+    if scan.has_partial_bucket_progress() && !scan.has_usage_update() {
+        ("saved_bucket_progress", scan.partial_stage.unwrap_or("bucket_checkpoint_saved"))
+    } else if scan.has_usage_update()
+        && scan.status == ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    {
+        ("activity_unverified_observation", "activity_baseline_unverified")
+    } else {
+        ("incomplete_coverage", scan.partial_stage.unwrap_or("root_coverage_incomplete"))
+    }
+}
+
 fn scanner_cycle_completion_outcome_for_result(
     scan_cycle_result: &crate::scanner_io::ScannerCycleResult,
     usage_persist_outcome: DataUsagePersistOutcome,
@@ -4463,6 +4593,7 @@ pub use backlog::{
 };
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
+pub use cycle_state::read_scanner_status_fence;
 pub use cycle_state::{
     SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
     ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord, ScannerRecoveryIntentRequest,

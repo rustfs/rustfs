@@ -39,6 +39,13 @@ pub(crate) struct SiteReplicationState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_remove: Option<PendingRemove>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_remove_v2: Option<PendingRemoveV2>,
+    /// Completed removal identities survive disabled replication and fence delayed retries.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) remove_v2_receipts: BTreeMap<String, SiteRemovalReceipt>,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    pub(crate) removal_v2_fence: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_endpoint_refresh: Option<PendingEndpointRefresh>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retry_queue: Vec<SiteReplicationRetryEvent>,
@@ -212,12 +219,34 @@ impl SiteReplicationState {
     pub(crate) fn enabled(&self) -> bool {
         self.peers.len() > 1
     }
+
+    pub(crate) fn removal_pending(&self) -> bool {
+        self.pending_remove.is_some() || self.pending_remove_v2.is_some()
+    }
 }
 
 pub(crate) fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicationState> {
     let mut state: SiteReplicationState = serde_json::from_slice(data)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
     state.peers = normalize_peer_map_by_identity(state.peers);
+    if let Some(pending) = &state.pending_remove_v2 {
+        validate_removal_plan(&pending.plan, &pending.plan.coordinator)
+            .map_err(|_| s3_error!(InternalError, "invalid persisted decommission plan"))?;
+        if state.pending_remove.is_some()
+            || !pending.cleaned_peers.is_subset(&required_removal_peers(&pending.plan))
+            || !pending.committed_peers.is_subset(&pending.cleaned_peers)
+            || (pending.coordinator
+                && pending.commit_decided
+                && (!pending.local_cleanup_complete || !required_removal_peers(&pending.plan).is_subset(&pending.cleaned_peers)))
+        {
+            return Err(s3_error!(InternalError, "inconsistent persisted decommission progress"));
+        }
+    }
+    for (id, receipt) in &state.remove_v2_receipts {
+        if *id != receipt.plan.id || site_removal_digest(&receipt.plan)? != receipt.digest {
+            return Err(s3_error!(InternalError, "invalid persisted decommission receipt"));
+        }
+    }
     // A peer-edit high-water mark only fences a CURRENT peer. A site that
     // leaves drops below two peers, which clears its own state object and
     // restarts its generation counter — a mark left over from the previous
@@ -277,6 +306,12 @@ pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
 /// exactly the reconciler-owned rules (issue #1948); a state-read failure
 /// propagates so the edit fails closed.
 pub(crate) async fn site_replication_edit_context() -> S3Result<(HashSet<String>, OperatorRuleContract)> {
+    if load_site_replication_state().await?.pending_remove_v2.is_some() {
+        return Err(s3_error!(
+            InvalidRequest,
+            "bucket replication edits are blocked while decommissioning is pending"
+        ));
+    }
     let Some(runtime) = runtime_site_replication_targets().await? else {
         // Enabled without a service account is a state this site cannot
         // broadcast from either; the peers are still the reconciler's.
@@ -401,7 +436,12 @@ pub(crate) async fn persist_site_replication_state_no_lock(
     guard: &crate::storage_api::site_replication::WriteCommitGuard,
 ) -> S3Result<()> {
     state.peers = normalize_peer_map_by_identity(state.peers);
-    if state.peers.len() <= 1 && state.pending_rotation.is_none() && state.pending_remove.is_none() {
+    if state.peers.len() <= 1
+        && state.pending_rotation.is_none()
+        && !state.removal_pending()
+        && state.remove_v2_receipts.is_empty()
+        && state.removal_v2_fence.is_none()
+    {
         match delete_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
             Ok(()) | Err(StorageError::ConfigNotFound) => Ok(()),
             Err(err) => Err(S3Error::with_message(S3ErrorCode::InternalError, format!("clear state failed: {err}"))),

@@ -413,6 +413,8 @@ struct SystemAdminDiscovery {
 #[derive(Serialize)]
 struct ServerInfoResponse {
     info: InfoMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory: Option<rustfs_madmin::ClusterInventory>,
     admin_discovery: SystemAdminDiscovery,
     /// Startup bitrot algorithm self-test outcome (rustfs/backlog#1873):
     /// `passed` (algorithms verified at boot), `failed` (a drifted hash
@@ -438,6 +440,13 @@ fn encode_server_info_response(path: &str, response: &ServerInfoResponse) -> ser
     } else {
         serde_json::to_vec(response)
     }
+}
+
+fn server_info_inventory_requested(uri: &http::Uri) -> bool {
+    !is_compat_admin_request(uri.path())
+        && uri.query().is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes()).any(|(key, value)| key == "include" && value == "inventory")
+        })
 }
 
 /// Same split as [`encode_server_info_response`]: madmin decodes `StorageInfo`
@@ -477,13 +486,16 @@ impl Operation for ServerInfoHandler {
         authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
 
         let usecase = default_admin_usecase();
-        let info = usecase
-            .execute_query_server_info(QueryServerInfoRequest { include_pools: true })
+        let result = usecase
+            .execute_query_server_info(QueryServerInfoRequest {
+                include_pools: true,
+                include_inventory: server_info_inventory_requested(req.uri()),
+            })
             .await
-            .map_err(S3Error::from)?
-            .info;
+            .map_err(S3Error::from)?;
         let response = ServerInfoResponse {
-            info,
+            info: result.info,
+            inventory: result.inventory,
             admin_discovery: system_admin_discovery(&usecase),
             bitrot_selftest: bitrot_selftest_status_str(),
         };
@@ -1722,29 +1734,38 @@ mod tests {
             Arc::new(rustfs_kms::KmsServiceManager::new()),
         )));
 
-        let request = crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/v3/info")
-            .headers(HeaderMap::new())
-            .extensions(Extensions::new())
-            .body(Body::empty())
-            .credentials(ROOT_ACCESS_KEY, ROOT_SECRET_KEY, None)
-            .build();
+        for (path, expect_inventory) in [
+            ("/rustfs/admin/v3/info", false),
+            ("/rustfs/admin/v3/info?include=inventory", true),
+        ] {
+            let request = crate::admin::operation::test_support::TestRequest::new(Method::GET, path)
+                .headers(HeaderMap::new())
+                .extensions(Extensions::new())
+                .body(Body::empty())
+                .credentials(ROOT_ACCESS_KEY, ROOT_SECRET_KEY, None)
+                .build();
 
-        let (status, _headers, body) = super::ServerInfoHandler {}
-            .call(request, Params::new())
-            .await
-            .expect("root admin credentials must be served server info")
-            .into_parts();
-        assert_eq!(status, hyper::StatusCode::OK);
+            let (status, _headers, body) = super::ServerInfoHandler {}
+                .call(request, Params::new())
+                .await
+                .expect("root admin credentials must be served server info")
+                .into_parts();
+            assert_eq!(status, hyper::StatusCode::OK);
 
-        let bytes = body.collect().await.expect("server info body should read").to_bytes();
-        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("server info must be json");
-        let pools = payload["info"]["pools"]
-            .as_object()
-            .expect("server info must carry a pools object");
-        assert!(
-            pools.contains_key("0"),
-            "server info must report the erasure-set topology of pool 0, got {pools:?}"
-        );
+            let bytes = body.collect().await.expect("server info body should read").to_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("server info must be json");
+            let pools = payload["info"]["pools"]
+                .as_object()
+                .expect("server info must carry a pools object");
+            assert!(
+                pools.contains_key("0"),
+                "server info must report the erasure-set topology of pool 0, got {pools:?}"
+            );
+            assert_eq!(payload.get("inventory").is_some(), expect_inventory);
+            if expect_inventory {
+                assert!(payload["inventory"].as_object().unwrap().contains_key("current_buckets"));
+            }
+        }
     }
 
     /// Authorization denial for this exact action is pinned to AccessDenied by
@@ -1773,6 +1794,7 @@ mod tests {
     fn server_info_response_exposes_admin_discovery_paths() {
         let usecase = DefaultAdminUsecase::without_context();
         let response = ServerInfoResponse {
+            inventory: None,
             info: InfoMessage {
                 mode: None,
                 domain: None,
@@ -1815,6 +1837,7 @@ mod tests {
 
     fn server_info_response_with_deployment_id(deployment_id: &str) -> ServerInfoResponse {
         ServerInfoResponse {
+            inventory: None,
             info: InfoMessage {
                 mode: Some("online".to_string()),
                 domain: None,
@@ -1868,6 +1891,33 @@ mod tests {
         assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(value["bitrotSelftest"], "passed");
         assert!(value.get("deploymentID").is_none(), "envelope must not duplicate the message: {value}");
+    }
+
+    #[test]
+    fn server_info_inventory_requires_native_opt_in_and_preserves_legacy_envelopes() {
+        let native = "/rustfs/admin/v3/info";
+        let compat = "/minio/admin/v3/info";
+        for (path, expected) in [
+            (native.to_owned(), false),
+            (format!("{native}?include=other"), false),
+            (format!("{native}?include=inventory"), true),
+            (format!("{compat}?include=inventory"), false),
+        ] {
+            assert_eq!(super::server_info_inventory_requested(&path.parse().unwrap()), expected);
+        }
+        let mut response = server_info_response_with_deployment_id("inventory-test");
+        let encode = |path, response: &ServerInfoResponse| -> serde_json::Value {
+            serde_json::from_slice(&super::encode_server_info_response(path, response).unwrap()).unwrap()
+        };
+        assert!(encode(native, &response).get("inventory").is_none());
+        response.inventory = Some(rustfs_madmin::ClusterInventory {
+            current_buckets: Some(2),
+            ..Default::default()
+        });
+        let value = encode(native, &response);
+        assert_eq!(value["inventory"]["current_buckets"], 2);
+        assert!(value["inventory"]["measured_objects"].is_null());
+        assert!(encode(compat, &response).get("inventory").is_none());
     }
 
     #[test]
@@ -2034,6 +2084,7 @@ mod tests {
         assert_missing_credentials(&ServiceHandle {}, Method::POST, "/rustfs/admin/v3/service").await;
         assert_missing_credentials(&UpdateHandler {}, Method::POST, "/rustfs/admin/v3/update").await;
         assert_missing_credentials(&ServerInfoHandler {}, Method::GET, "/rustfs/admin/v3/info").await;
+        assert_missing_credentials(&ServerInfoHandler {}, Method::GET, "/rustfs/admin/v3/info?include=inventory").await;
         assert_missing_credentials(&InspectDataHandler {}, Method::GET, "/rustfs/admin/v3/inspect-data").await;
         assert_missing_credentials(&StorageInfoHandler {}, Method::GET, "/rustfs/admin/v3/storageinfo").await;
         assert_missing_credentials(&RuntimeCapabilitiesHandler {}, Method::GET, "/rustfs/admin/v4/runtime/capabilities").await;

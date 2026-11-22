@@ -4103,9 +4103,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
             if let Some(want) = opts.want_checksum.as_ref()
-                && !want.checksum_type.is(checksum_type)
+                && (want.checksum_type.base() != checksum_type.base()
+                    || (want.checksum_type.is(rustfs_rio::ChecksumType::FULL_OBJECT) && !checksum_type.full_object_requested()))
             {
-                return Err(Error::other(format!("checksum type mismatch, got {:?}, want {:?}", want, checksum_type)));
+                debug!(
+                    target: "rustfs_ecstore::set_disk",
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    result = "checksum_type_mismatch",
+                    op = "complete_multipart_upload",
+                    bucket = %bucket,
+                    object = %object,
+                    upload_id = %upload_id,
+                    want = %want.checksum_type,
+                    got = %checksum_type,
+                    "Set disk multipart completion checksum algorithm mismatch"
+                );
+                return Err(Error::other(rustfs_rio::ChecksumMismatch {
+                    want: want.checksum_type.to_string(),
+                    got: checksum_type.to_string(),
+                }));
             }
         }
 
@@ -4328,25 +4346,52 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         if let Some(wtcs) = opts.want_checksum.as_ref() {
             if checksum_type.full_object_requested() {
-                if wtcs.encoded != checksum.encoded {
-                    error!(
-                        "complete_multipart_upload checksum mismatch want={}, got={}",
-                        wtcs.encoded, checksum.encoded
+                // A wire `-N` suffix (including `-0`) sets MULTIPART without INCLUDES_MULTIPART;
+                // stored multipart records carry both flags and are not suffixed claims.
+                let has_part_suffix = wtcs.want_parts != 0
+                    || (wtcs.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART)
+                        && !wtcs.checksum_type.is(rustfs_rio::ChecksumType::INCLUDES_MULTIPART));
+                if (!wtcs.encoded.is_empty() && wtcs.encoded != checksum.encoded) || has_part_suffix {
+                    let want = if has_part_suffix {
+                        format!("{}-{}", wtcs.encoded, wtcs.want_parts)
+                    } else {
+                        wtcs.encoded.clone()
+                    };
+                    debug!(
+                        target: "rustfs_ecstore::set_disk",
+                        event = EVENT_SET_DISK_MULTIPART,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        result = "checksum_mismatch",
+                        op = "complete_multipart_upload",
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        want = %want,
+                        got = %checksum.encoded,
+                        "Set disk multipart full-object checksum mismatch"
                     );
-                    return Err(Error::other(format!(
-                        "complete_multipart_upload checksum mismatch want={}, got={}",
-                        wtcs.encoded, checksum.encoded
-                    )));
+                    return Err(Error::other(rustfs_rio::ChecksumMismatch {
+                        want,
+                        got: checksum.encoded,
+                    }));
                 }
             } else if let Err(err) = wtcs.matches(&checksum_combined, uploaded_parts.len() as i32) {
-                error!(
-                    "complete_multipart_upload checksum matches failed want={}, got={}, err={}",
-                    wtcs.encoded, checksum.encoded, err
+                debug!(
+                    target: "rustfs_ecstore::set_disk",
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    result = "checksum_mismatch",
+                    op = "complete_multipart_upload",
+                    bucket = %bucket,
+                    object = %object,
+                    upload_id = %upload_id,
+                    want = %err.want,
+                    got = %err.got,
+                    "Set disk multipart composite checksum mismatch"
                 );
-                return Err(Error::other(format!(
-                    "complete_multipart_upload checksum matches failed want={}, got={}",
-                    wtcs.encoded, checksum.encoded
-                )));
+                return Err(Error::other(err));
             }
         }
 
@@ -17969,5 +18014,286 @@ mod tests {
             Some(full_object.encoded.as_str()),
             "legacy records must keep returning their stored checksum value"
         );
+    }
+
+    fn unwrap_checksum_mismatch(err: Error) -> rustfs_rio::ChecksumMismatch {
+        match err {
+            Error::Io(io_err) => io_err
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<rustfs_rio::ChecksumMismatch>())
+                .cloned()
+                .unwrap_or_else(|| panic!("expected ChecksumMismatch, got Io({io_err:?})")),
+            other => panic!("expected ChecksumMismatch Io error, got {other:?}"),
+        }
+    }
+
+    async fn stage_checksummed_multipart_upload(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        create_checksum_type: Option<rustfs_rio::ChecksumType>,
+        parts: &[&[u8]],
+    ) -> (String, Vec<CompletePart>, Vec<rustfs_rio::Checksum>) {
+        let create_opts = ObjectOptions {
+            want_checksum: create_checksum_type.map(|checksum_type| rustfs_rio::Checksum {
+                checksum_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("multipart upload should be created");
+        let mut complete_parts = Vec::with_capacity(parts.len());
+        let mut part_checksums = Vec::with_capacity(parts.len());
+        for (index, bytes) in parts.iter().enumerate() {
+            let len = i64::try_from(bytes.len()).expect("test payload length fits i64");
+            let mut hash_reader = HashReader::from_stream(Cursor::new(bytes.to_vec()), len, len, None, None, false)
+                .expect("hash reader should be constructed");
+            let part_checksum = create_checksum_type.map(|ty| {
+                let checksum = rustfs_rio::Checksum::new_from_data(ty.base(), bytes).expect("part checksum");
+                hash_reader
+                    .add_non_trailing_checksum(Some(checksum.clone()), false)
+                    .expect("attach part checksum");
+                checksum
+            });
+            let mut reader = PutObjReader::new(hash_reader);
+            let part = set_disks
+                .put_object_part(bucket, object, &upload.upload_id, index + 1, &mut reader, &create_opts)
+                .await
+                .expect("uploading part should succeed");
+            let mut complete_part = CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            };
+            if let (Some(ty), Some(cs)) = (create_checksum_type, part_checksum) {
+                match ty.base() {
+                    rustfs_rio::ChecksumType::SHA256 => complete_part.checksum_sha256 = Some(cs.encoded.clone()),
+                    rustfs_rio::ChecksumType::CRC32 => complete_part.checksum_crc32 = Some(cs.encoded.clone()),
+                    other => panic!("unsupported test checksum type {other:?}"),
+                }
+                part_checksums.push(cs);
+            }
+            complete_parts.push(complete_part);
+        }
+        (upload.upload_id, complete_parts, part_checksums)
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_returns_checksum_mismatch_for_invalid_composite_and_preserves_upload_issue_9272() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "complete-checksum-composite-9272";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+
+        let part1 = vec![0x61_u8; 5 * 1024 * 1024];
+        let part2 = b"part-two-payload";
+        let (upload_id, parts, part_checksums) =
+            stage_checksummed_multipart_upload(&set, bucket, object, Some(rustfs_rio::ChecksumType::SHA256), &[&part1, part2])
+                .await;
+
+        let whole_payload: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+        let whole_sha256 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, &whole_payload).expect("whole object sha256");
+
+        let mut combined = Vec::new();
+        for cs in &part_checksums {
+            combined.extend_from_slice(&cs.raw);
+        }
+        let composite_base =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, &combined).expect("composite sha256");
+        let wrong_part_count =
+            rustfs_rio::Checksum::new_with_type(rustfs_rio::ChecksumType::SHA256, &format!("{}-3", composite_base.encoded))
+                .expect("wrong part count checksum");
+        let wrong_algorithm =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"part").expect("crc32 checksum");
+
+        for (label, bad_checksum) in [
+            ("whole-object sha256", whole_sha256),
+            ("wrong composite part count", wrong_part_count),
+            ("mismatched algorithm", wrong_algorithm),
+        ] {
+            let err = set
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload_id,
+                    parts.clone(),
+                    &ObjectOptions {
+                        want_checksum: Some(bad_checksum),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err(label);
+            let _mismatch = unwrap_checksum_mismatch(err);
+
+            let info_err = set
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect_err("failed completion must not publish object");
+            assert!(is_err_object_not_found(&info_err), "{label}: got {info_err:?}");
+            assert!(
+                set.get_multipart_info(bucket, object, &upload_id, &ObjectOptions::default())
+                    .await
+                    .is_ok(),
+                "{label}: upload must remain active after rejected completion"
+            );
+        }
+
+        let matching_composite =
+            rustfs_rio::Checksum::new_with_type(rustfs_rio::ChecksumType::SHA256, &format!("{}-2", composite_base.encoded))
+                .expect("matching composite checksum");
+        let completed = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload_id,
+                parts,
+                &ObjectOptions {
+                    want_checksum: Some(matching_composite),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching composite checksum should complete");
+        assert_eq!(completed.size, i64::try_from(whole_payload.len()).expect("test payload length fits i64"));
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_returns_checksum_mismatch_for_full_object_and_unconfigured_uploads_issue_9272() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "complete-checksum-full-object-9272";
+        make_bucket_on_all(&disks, bucket).await;
+
+        let full_object_type = rustfs_rio::ChecksumType::from_string_with_obj_type("CRC32", "FULL_OBJECT");
+        let payload = b"full-object-part-payload";
+        let (full_upload_id, full_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "full-obj", Some(full_object_type), &[payload]).await;
+
+        let right_crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, payload).expect("right crc32");
+        let wrong_crc32 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"different-payload").expect("wrong crc32");
+        let suffixed_crc32 = |parts| {
+            rustfs_rio::Checksum::new_with_type(full_object_type, &format!("{}-{parts}", right_crc32.encoded))
+                .expect("suffixed crc32")
+        };
+
+        for (label, bad_checksum) in [
+            ("wrong value", wrong_crc32),
+            ("composite suffix on FULL_OBJECT", suffixed_crc32(1)),
+            ("zero-part suffix on FULL_OBJECT", suffixed_crc32(0)),
+        ] {
+            let err = set
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    "full-obj",
+                    &full_upload_id,
+                    full_parts.clone(),
+                    &ObjectOptions {
+                        want_checksum: Some(bad_checksum),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err(label);
+            let _mismatch = unwrap_checksum_mismatch(err);
+        }
+
+        // Omitting the optional x-amz-checksum-type header passes a bare CRC32 checksum_type.
+        let bare_right_crc32 =
+            rustfs_rio::Checksum::new_with_type(rustfs_rio::ChecksumType::CRC32, &right_crc32.encoded).expect("bare crc32");
+        let completed_full = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "full-obj",
+                &full_upload_id,
+                full_parts,
+                &ObjectOptions {
+                    want_checksum: Some(bare_right_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching full-object CRC32 without optional checksum-type flag should succeed");
+        assert_eq!(completed_full.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
+
+        // A stored multipart record carries MULTIPART | INCLUDES_MULTIPART with no wire suffix;
+        // a matching value in that shape must still complete a FULL_OBJECT upload.
+        let (internal_upload_id, internal_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "full-obj-internal", Some(full_object_type), &[payload]).await;
+        let mut internal_type = full_object_type;
+        internal_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+        let stored_record_crc32 = rustfs_rio::Checksum {
+            checksum_type: internal_type,
+            encoded: right_crc32.encoded.clone(),
+            raw: right_crc32.raw.clone(),
+            want_parts: 0,
+        };
+        let completed_internal = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "full-obj-internal",
+                &internal_upload_id,
+                internal_parts,
+                &ObjectOptions {
+                    want_checksum: Some(stored_record_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching stored-record FULL_OBJECT checksum should complete");
+        assert_eq!(
+            completed_internal.size,
+            i64::try_from(payload.len()).expect("test payload length fits i64")
+        );
+
+        let (plain_upload_id, plain_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "plain-obj", None, &[payload]).await;
+        let payload_sha256 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, payload).expect("payload sha256");
+        let unconfigured_err = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "plain-obj",
+                &plain_upload_id,
+                plain_parts.clone(),
+                &ObjectOptions {
+                    want_checksum: Some(payload_sha256),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("unconfigured upload with mismatched digest must fail with ChecksumMismatch");
+        let _mismatch = unwrap_checksum_mismatch(unconfigured_err);
+
+        // Legacy stack compatibility (pinned by embedded_gateway_stack_test): an unconfigured
+        // upload compares want_checksum against the empty combined part-digest buffer.
+        let empty_crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"").expect("empty crc32");
+        let completed_plain = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "plain-obj",
+                &plain_upload_id,
+                plain_parts,
+                &ObjectOptions {
+                    want_checksum: Some(empty_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unconfigured upload with empty-buffer CRC32 should preserve legacy compatibility");
+        assert_eq!(completed_plain.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
     }
 }

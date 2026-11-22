@@ -1,0 +1,12 @@
+{
+  "allow_schema_gaps": [
+    {
+      "id": "health-service.job.wrong-target",
+      "reason": "The organization, cluster, and device tuple is bound to the enrolled Agent identity by the Rust runtime validator."
+    },
+    {
+      "id": "health-service.job.revoked-consent",
+      "reason": "The consent expiry relation is cross-field and is enforced by the Rust runtime validator before execution."
+    }
+  ]
+}

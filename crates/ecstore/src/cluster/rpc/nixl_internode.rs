@@ -256,6 +256,16 @@ async fn fetch_chunk(pool: Arc<dyn NixlRecvPool>, request: ReadStreamRequest, ti
     );
     build_auth_headers(&url, &Method::GET, &mut headers)?;
     let (status, response_headers, body) = rustfs_rio::internode_http_request(&url, Method::GET, headers, Some(timeout)).await?;
+    finish_read_chunk(buffer, request.length, status, &response_headers, &body)
+}
+
+fn finish_read_chunk(
+    buffer: LentBuffer,
+    requested: usize,
+    status: http::StatusCode,
+    response_headers: &http::HeaderMap,
+    body: &[u8],
+) -> io::Result<(usize, Bytes)> {
     if !status.is_success() {
         debug!(
             component = LOG_COMPONENT_INTERNODE,
@@ -269,9 +279,10 @@ async fn fetch_chunk(pool: Arc<dyn NixlRecvPool>, request: ReadStreamRequest, ti
             // RUSTFS_COMPAT_TODO(9526): Older peers report a missing file in the body. Remove after all supported peers send the disk error header.
             let missing = match response_headers.get(rustfs_rio::INTERNODE_DISK_ERROR_HEADER) {
                 Some(marker) => marker == rustfs_rio::INTERNODE_FILE_NOT_FOUND,
-                None => body.as_ref() == b"file not found",
+                None => body == b"file not found",
             };
             if missing {
+                buffer.release();
                 return Err(crate::disk::error::DiskError::FileNotFound.into());
             }
         }
@@ -282,10 +293,10 @@ async fn fetch_chunk(pool: Arc<dyn NixlRecvPool>, request: ReadStreamRequest, ti
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
         .ok_or_else(|| io::Error::other("nixl internode read reply lacks the byte count"))?;
-    if landed > request.length {
+    if landed > requested {
         return Err(io::Error::other("nixl internode read reports more bytes than requested"));
     }
-    Ok((request.length, buffer.complete(landed)?))
+    Ok((requested, buffer.complete(landed)?))
 }
 
 type ChunkFuture = BoxFuture<'static, io::Result<(usize, Bytes)>>;
@@ -894,6 +905,38 @@ mod tests {
                 .expect("shard write");
             assert_eq!(server.await.expect("segment server"), 40);
             assert_eq!(pool.0.available_permits(), chunks, "acknowledged buffers return to the pool");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_confirmed_missing_shards_release_the_buffer_on_refusal() {
+        for (marker, body, confirmed) in [
+            (Some("file-not-found"), &b""[..], true),
+            (None, &b"file not found"[..], true),
+            (Some("other"), &b"file not found"[..], false),
+            (None, &b"no such route"[..], false),
+        ] {
+            let released = Arc::new(AtomicUsize::new(0));
+            let buffer = LentBuffer {
+                buffer: Some(Box::new(CountingBuffer {
+                    released: released.clone(),
+                })),
+            };
+            let mut headers = http::HeaderMap::new();
+            if let Some(marker) = marker {
+                headers.insert(rustfs_rio::INTERNODE_DISK_ERROR_HEADER, HeaderValue::from_static(marker));
+            }
+            let error = finish_read_chunk(buffer, 8, http::StatusCode::NOT_FOUND, &headers, body).expect_err("refused read");
+            assert_eq!(
+                matches!(
+                    error
+                        .get_ref()
+                        .and_then(|err| err.downcast_ref::<crate::disk::error::DiskError>()),
+                    Some(crate::disk::error::DiskError::FileNotFound)
+                ),
+                confirmed
+            );
+            assert_eq!(released.load(Ordering::SeqCst), usize::from(confirmed));
         }
     }
 

@@ -159,6 +159,7 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
 
     let info_body = cluster_admin_ok(&dist.cluster, Method::GET, "/rustfs/admin/v3/info", None).await?;
     let info: Value = serde_json::from_str(&info_body)?;
+    assert!(info.get("inventory").is_none(), "inventory requires explicit opt-in");
     let servers = info["info"]["servers"]
         .as_array()
         .ok_or_else(|| format!("admin info omitted servers: {info}"))?;
@@ -200,6 +201,24 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
         assert!(sample.finally, "node {node_idx} metrics sample was not terminal");
         assert!(sample.errors.is_empty(), "node {node_idx} metrics reported errors: {:?}", sample.errors);
         assert!(!sample.hosts.is_empty(), "node {node_idx} metrics omitted hosts");
+        assert!(sample.scanner_node.is_none(), "default metrics must not expose the internal peer sample");
+        wait_until(
+            Duration::from_secs(30),
+            || async {
+                let frame: Value = serde_json::from_str(
+                    &node_admin_body(&dist, node_idx, "/rustfs/admin/v3/realtime?scope=cluster&types=1&n=1").await?,
+                )?;
+                assert_eq!(frame["final"], true);
+                let summary = &frame["cluster_scanner"];
+                assert_eq!(summary["nodes_total"], 4, "known cluster membership");
+                assert!(summary["sampled_at"].as_str().is_some());
+                assert!(matches!(summary["state"].as_str(), Some("scanning" | "idle" | "unknown")));
+                assert_eq!(summary["current"].is_object(), summary["state"] == "scanning");
+                Ok(summary["nodes_responded"] == 4)
+            },
+            "every request node reaches the full scanner peer set",
+        )
+        .await?;
     }
 
     let targets_body = cluster_admin_ok(&dist.cluster, Method::GET, "/rustfs/admin/v3/audit/target/list", None).await?;
@@ -233,6 +252,38 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
         !audit.to_string().contains(&dist.cluster.secret_key),
         "audit entry leaked the root secret key"
     );
+
+    let pending = unique_bucket("inventory");
+    dist.create_bucket(&pending).await?;
+    let listed = dist.client(1)?.list_buckets().send().await?;
+    assert_eq!(listed.buckets().len(), 2, "expected the two test buckets");
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            let body = node_admin_body(&dist, 1, "/rustfs/admin/v3/info?include=inventory").await?;
+            let response: Value = serde_json::from_str(&body)?;
+            let inventory: rustfs_madmin::ClusterInventory = serde_json::from_value(response["inventory"].clone())?;
+            if inventory.current_buckets != Some(2) {
+                return Ok(false);
+            }
+            match inventory.measured_buckets {
+                None | Some(0) => {
+                    assert_eq!(inventory.measured_objects, None);
+                    assert_eq!(inventory.measured_bytes, None);
+                }
+                Some(1 | 2) => {
+                    assert!(inventory.measured_objects.is_some_and(|objects| objects <= 1));
+                }
+                Some(count) => panic!("measured {count} buckets across a two-bucket namespace"),
+            }
+            if inventory.measured_buckets != Some(2) {
+                assert_ne!(inventory.converged, Some(true));
+            }
+            Ok(true)
+        },
+        "inventory reflects the current namespace and reports scanner coverage independently",
+    )
+    .await?;
 
     let result = verify_write_observations_during_peer_failure(&dist, &bucket).await;
     collector.abort();
