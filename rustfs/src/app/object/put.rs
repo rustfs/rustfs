@@ -2741,31 +2741,28 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let request = |invalid_class: bool| {
-            let input = PutObjectInput {
-                bucket: bucket.clone(),
-                key: "counted".to_owned(),
-                body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
-                content_length: Some(5),
-                storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
-                ..Default::default()
-            };
-            build_request(input, Method::PUT)
+        let input = |invalid_class: bool| PutObjectInput {
+            bucket: bucket.clone(),
+            key: "counted".to_owned(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
+            content_length: Some(5),
+            storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
+            ..Default::default()
         };
         let baseline = official_count();
         let mut observed = 0;
         metrics::with_local_recorder(&recorder, || {
-            drop(put_owned(&usecase, request(false)));
+            drop(put_method_only(&usecase, input(false)));
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "constructing a future does not count a PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
             let error = runtime
-                .block_on(Box::pin(put_owned(&usecase, request(true))))
+                .block_on(Box::pin(put_method_only(&usecase, input(true))))
                 .expect_err("invalid class");
             assert_eq!(error.code(), &S3ErrorCode::InvalidStorageClass);
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count a refused PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
             runtime
-                .block_on(Box::pin(put_owned(&usecase, request(false))))
+                .block_on(Box::pin(put_method_only(&usecase, input(false))))
                 .expect("successful PUT");
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count an accepted PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
@@ -2964,9 +2961,8 @@ mod tests {
                 .content_length(Some(14))
                 .build()
                 .expect("capacity PUT input must build");
-            let request = build_request(input, Method::PUT);
             let error = PUT_STORAGE_TEST_FAILURE
-                .scope((PutStorageTestStage::Commit, failure), put_owned(&usecase, request))
+                .scope((PutStorageTestStage::Commit, failure), put_method_only(&usecase, input))
                 .await
                 .expect_err("capacity refusal must fail PUT");
             assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
@@ -4523,10 +4519,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
         assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
     }
