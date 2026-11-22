@@ -1004,6 +1004,7 @@ impl ScannerIOCache for SetDisks {
         if turn_bucket_count == 0 {
             bucket_work_complete.cancel();
         }
+        let local_recovery_attempts = Arc::new(Mutex::new(HashSet::<String>::new()));
         for NamespaceScannerWalker {
             disk,
             mode: worker_mode,
@@ -1025,6 +1026,7 @@ impl ScannerIOCache for SetDisks {
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone = bucket_result_tx.clone();
             let bucket_observations_clone = bucket_observations.clone();
+            let local_recovery_attempts_clone = local_recovery_attempts.clone();
             let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             let queued_disk_bucket_scans_clone = queued_disk_bucket_scans.clone();
             let active_disk_bucket_scans_clone = active_disk_bucket_scans.clone();
@@ -1092,6 +1094,34 @@ impl ScannerIOCache for SetDisks {
                         pool_label_clone.clone(),
                         set_label_clone.clone(),
                     );
+                    let assigned_disk = &disk;
+                    let disk = if assigned_disk.is_local() {
+                        match current_local_scanner_disk(&store_clone_clone, assigned_disk, &ctx_clone, &budget_clone).await {
+                            Some(current) => current,
+                            None => {
+                                drop(_active_guard);
+                                drop(_permit);
+                                let retry_available = {
+                                    local_recovery_attempts_clone.lock().await.insert(bucket.name.clone())
+                                };
+                                if retry_available
+                                    && wait_for_local_scanner_recovery(
+                                        &store_clone_clone, assigned_disk, &ctx_clone, &budget_clone,
+                                    ).await.is_some()
+                                    && requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await
+                                {
+                                    increment_disk_bucket_scans_queued(
+                                        &queued_disk_bucket_scans_clone, &pool_label_clone, &set_label_clone,
+                                    );
+                                } else {
+                                    record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        assigned_disk.clone()
+                    };
                     if ctx_clone.is_cancelled() || budget_clone.budget_elapsed() {
                         break;
                     }
@@ -1666,6 +1696,14 @@ impl ScannerIOCache for SetDisks {
 
                     let resumed_watch_sweep = cache.has_scan_position();
                     let scan_position_before = cache.durable_scan_progress();
+                    let local_stop = Arc::new(ScannerLocalStop::default());
+                    #[cfg(test)]
+                    super::tests::local_drive_recovery::before_attempt(&bucket.name, &disk).await;
+                    let current_set_disks = if disk.is_local() && heal_disk_inventory.is_some() {
+                        scanner_set_disk_inventory(&store_clone_clone).await
+                    } else {
+                        heal_disk_inventory.as_deref().cloned().unwrap_or_default()
+                    };
                     #[cfg(feature = "e2e-test-hooks")]
                     {
                         let disk_uuid = if crate::e2e_barrier::worker_observation::enabled() {
@@ -1686,13 +1724,14 @@ impl ScannerIOCache for SetDisks {
                     let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         bucket_budget.clone(),
-                        heal_disk_inventory.as_deref().cloned().unwrap_or_default(),
+                        current_set_disks,
                         cache,
                         None,
                         ScannerDiskScanOptions {
                             scan_mode,
                             prefix_scan_scope,
                             checkpoint_tx: Some(checkpoint_tx),
+                            local_stop: Some(local_stop.clone()),
                         },
                     ));
                     tokio::pin!(scan);
@@ -1725,6 +1764,9 @@ impl ScannerIOCache for SetDisks {
                                     scan_ctx.cancel();
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
                                     break Err(Error::other("scanner bucket cache lock was lost during bucket scan"));
+                                }
+                                if disk.is_local() && let Some(reason) = local_scanner_stop_reason(&store_clone_clone, &disk).await {
+                                    local_stop.stop(reason, &scan_ctx);
                                 }
                             }
                             checkpoint = checkpoint_rx.recv(), if !checkpoint_channel_closed => {
@@ -1833,6 +1875,9 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     }
+                    if disk.is_local() && let Some(reason) = local_scanner_stop_reason(&store_clone_clone, &disk).await {
+                        local_stop.stop(reason, &scan_ctx);
+                    }
                     let scan_outcome = match scan_result {
                         Ok(scan_outcome) => scan_outcome,
                         Err(e) if bucket_budget.quantum_exhausted() || bucket_budget.source_turn_exhausted() => {
@@ -1877,6 +1922,15 @@ impl ScannerIOCache for SetDisks {
 
                             continue;
                         }
+                    };
+
+                    let scan_outcome = match scan_outcome {
+                        ScannerDiskScanOutcome::Complete(mut cache) | ScannerDiskScanOutcome::Partial(mut cache)
+                            if local_stop.reason().is_some() => {
+                            retain_interrupted_local_cache(&mut cache);
+                            ScannerDiskScanOutcome::Partial(cache)
+                        }
+                        other => other,
                     };
 
                     let (cache, partial) = match scan_outcome {
@@ -2003,6 +2057,31 @@ impl ScannerIOCache for SetDisks {
                             if partial_progress_proven && cache.durable_scan_progress().advanced_from(&scan_position_before) {
                                 bucket_budget.record_durable_turn_progress();
                             }
+                        }
+                        if local_stop.reason().is_some() {
+                            // Recovery is independent of durable forward progress, but
+                            // cannot retry an unsaved result or renew its own cache lease.
+                            drop(cache_guard);
+                            drop(_local_admission);
+                            drop(_active_guard);
+                            drop(_permit);
+                            let retry_available = {
+                                local_recovery_attempts_clone.lock().await.insert(bucket.name.clone())
+                            };
+                            if partial_progress_proven
+                                && retry_available
+                                && wait_for_local_scanner_recovery(
+                                    &store_clone_clone, &disk, &ctx_clone, &budget_clone,
+                                ).await.is_some()
+                                && requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await
+                            {
+                                increment_disk_bucket_scans_queued(
+                                    &queued_disk_bucket_scans_clone, &pool_label_clone, &set_label_clone,
+                                );
+                            } else {
+                                record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                            }
+                            continue;
                         }
                         // Only saved forward motion earns another turn in this
                         // cycle; otherwise the bucket waits for the next one.
