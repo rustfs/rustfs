@@ -1681,7 +1681,7 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
     };
     log_site_replication_retry_liabilities(&runtime.state);
     if runtime.state.pending_endpoint_refresh.is_some()
-        || runtime.state.pending_remove.is_some()
+        || runtime.state.removal_pending()
         || runtime.state.pending_rotation.is_some()
     {
         return Ok(());
@@ -1708,7 +1708,7 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
                 return Ok(());
             };
             if runtime.state.pending_endpoint_refresh.is_some()
-                || runtime.state.pending_remove.is_some()
+                || runtime.state.removal_pending()
                 || runtime.state.pending_rotation.is_some()
             {
                 return Ok(());
@@ -1742,7 +1742,7 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         return Ok(());
     };
     if runtime.state.pending_endpoint_refresh.is_some()
-        || runtime.state.pending_remove.is_some()
+        || runtime.state.removal_pending()
         || runtime.state.pending_rotation.is_some()
     {
         // The tick-level gate ran before the reconcilers; a multi-step flow
@@ -1777,7 +1777,7 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
                 return Ok(());
             };
             if runtime.state.pending_endpoint_refresh.is_some()
-                || runtime.state.pending_remove.is_some()
+                || runtime.state.removal_pending()
                 || runtime.state.pending_rotation.is_some()
             {
                 return Ok(());
