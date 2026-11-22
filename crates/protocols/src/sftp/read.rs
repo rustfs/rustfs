@@ -69,7 +69,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             attrs,
             read_cache,
         })?;
-        Ok(Handle { id, handle })
+        Ok(Handle {
+            id,
+            handle: handle.into(),
+        })
     }
 
     /// Body of the SSH_FXP_READ handler. Returns up to len bytes starting
@@ -256,7 +259,7 @@ mod tests {
             .allocate_handle(file_handle("bucket", "secret.txt", 4096, FileAttributes::default()))
             .expect("allocate read handle");
         driver.try_populate_read_cache(&handle, 0, vec![42; 4096]);
-        let error = with_test_auth_override(|_, _, _| true, driver.read(1, handle, 0, 1024))
+        let error = with_test_auth_override(|_, _, _| true, driver.read(1, handle.into(), 0, 1024))
             .await
             .expect_err("backend policy denial must prevent cached content disclosure");
         assert!(matches!(StatusCode::from(error), StatusCode::PermissionDenied));
@@ -270,7 +273,7 @@ mod tests {
             .allocate_handle(file_handle("bucket", "k", 100, FileAttributes::default()))
             .expect("allocate");
         let err = driver
-            .read(1, handle_id, 0, 0)
+            .read(1, handle_id.into(), 0, 0)
             .await
             .expect_err("len=0 must return BadMessage");
         assert!(matches!(StatusCode::from(err), StatusCode::BadMessage));
@@ -284,7 +287,7 @@ mod tests {
             .allocate_handle(file_handle("bucket", "k", 10, FileAttributes::default()))
             .expect("allocate");
         let err = driver
-            .read(2, handle_id, 10, 4)
+            .read(2, handle_id.into(), 10, 4)
             .await
             .expect_err("offset==size must return Eof");
         assert!(matches!(StatusCode::from(err), StatusCode::Eof));
@@ -299,7 +302,7 @@ mod tests {
             .allocate_handle(file_handle("bucket", "k", 5, FileAttributes::default()))
             .expect("allocate");
 
-        let data = with_test_auth_override(|_, _, _| true, driver.read(3, handle_id, 0, 1024))
+        let data = with_test_auth_override(|_, _, _| true, driver.read(3, handle_id.into(), 0, 1024))
             .await
             .expect("read must succeed");
         assert_eq!(data.data, b"hello".to_vec());
@@ -317,7 +320,7 @@ mod tests {
             .allocate_handle(file_handle("bucket", "k", 10, FileAttributes::default()))
             .expect("allocate");
 
-        let (result, captured) = capture_tracing_at(Level::ERROR, async { driver.read(11, handle_id, 10, 4).await }).await;
+        let (result, captured) = capture_tracing_at(Level::ERROR, async { driver.read(11, handle_id.into(), 10, 4).await }).await;
         let err = result.expect_err("offset==size must return Eof");
         assert!(matches!(StatusCode::from(err), StatusCode::Eof));
         assert!(
@@ -342,8 +345,11 @@ mod tests {
             .allocate_handle(file_handle("bucket", "k", 1024, FileAttributes::default()))
             .expect("allocate");
 
-        let (result, captured) =
-            capture_tracing_at(Level::ERROR, with_test_auth_override(|_, _, _| true, driver.read(12, handle_id, 0, 256))).await;
+        let (result, captured) = capture_tracing_at(
+            Level::ERROR,
+            with_test_auth_override(|_, _, _| true, driver.read(12, handle_id.into(), 0, 256)),
+        )
+        .await;
         let err = result.expect_err("backend error must propagate as Err");
         assert!(!matches!(StatusCode::from(err), StatusCode::Eof), "backend error must not be Eof");
         assert!(
@@ -379,7 +385,7 @@ mod tests {
         let start = Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            with_test_auth_override(|_, _, _| true, driver.read(14, handle_id, 0, 4096)),
+            with_test_auth_override(|_, _, _| true, driver.read(14, handle_id.into(), 0, 4096)),
         )
         .await;
         let elapsed = start.elapsed();
@@ -425,7 +431,7 @@ mod tests {
         let mut assembled: Vec<u8> = Vec::with_capacity(object_size as usize);
         let mut reads: u32 = 0;
         while offset < object_size {
-            let data = with_test_auth_override(|_, _, _| true, driver.read(20 + reads, handle_id.clone(), offset, chunk))
+            let data = with_test_auth_override(|_, _, _| true, driver.read(20 + reads, handle_id.clone().into(), offset, chunk))
                 .await
                 .expect("read inside the cached window must succeed without a second backend call");
             assert!(!data.data.is_empty(), "non-empty hit");
@@ -461,21 +467,21 @@ mod tests {
             .expect("allocate");
 
         // First read fetches from the backend and populates window 1.
-        let r1 = with_test_auth_override(|_, _, _| true, driver.read(30, handle_id.clone(), 0, 1024))
+        let r1 = with_test_auth_override(|_, _, _| true, driver.read(30, handle_id.clone().into(), 0, 1024))
             .await
             .expect("first read must succeed");
         assert!(r1.data.iter().all(|b| *b == 0xAA), "first read must come from window 1");
 
         // Second read inside the cached chunk is served from the
         // buffer. No second backend call yet.
-        let r2 = with_test_auth_override(|_, _, _| true, driver.read(31, handle_id.clone(), 1024, 1024))
+        let r2 = with_test_auth_override(|_, _, _| true, driver.read(31, handle_id.clone().into(), 1024, 1024))
             .await
             .expect("mid-window read must succeed from cache");
         assert!(r2.data.iter().all(|b| *b == 0xAA), "mid-window read still in window 1");
 
         // Reading at offset == window falls outside the cached chunk
         // and triggers the second backend call.
-        let r3 = with_test_auth_override(|_, _, _| true, driver.read(32, handle_id.clone(), window, 1024))
+        let r3 = with_test_auth_override(|_, _, _| true, driver.read(32, handle_id.clone().into(), window, 1024))
             .await
             .expect("read at offset=window must succeed via second backend call");
         assert!(r3.data.iter().all(|b| *b == 0xBB), "read at window boundary must come from window 2");
@@ -483,7 +489,7 @@ mod tests {
         // A read inside the second cached chunk is served from the
         // buffer. The queue is empty by now, so any third backend
         // call would fail.
-        let r4 = with_test_auth_override(|_, _, _| true, driver.read(33, handle_id, window + 1024, 1024))
+        let r4 = with_test_auth_override(|_, _, _| true, driver.read(33, handle_id.into(), window + 1024, 1024))
             .await
             .expect("mid-window-2 read must succeed from cache");
         assert!(r4.data.iter().all(|b| *b == 0xBB), "mid-window-2 read still in window 2");
@@ -511,13 +517,13 @@ mod tests {
             .expect("allocate");
 
         // Populate window 1 with a full read.
-        let _ = with_test_auth_override(|_, _, _| true, driver.read(40, handle_id.clone(), 0, window as u32))
+        let _ = with_test_auth_override(|_, _, _| true, driver.read(40, handle_id.clone().into(), 0, window as u32))
             .await
             .expect("populate window 1");
 
         // Ask for 256 bytes starting 64 bytes before window end. Only
         // 64 bytes are in the window. The driver must return 64.
-        let edge = with_test_auth_override(|_, _, _| true, driver.read(41, handle_id, window - 64, 256))
+        let edge = with_test_auth_override(|_, _, _| true, driver.read(41, handle_id.into(), window - 64, 256))
             .await
             .expect("partial-hit read must succeed");
         assert_eq!(edge.data.len(), 64, "partial hit must return only the in-window portion");
@@ -552,9 +558,10 @@ mod tests {
 
         for i in 0..read_count {
             let offset = (chunk_size as u64) * (i as u64);
-            let data = with_test_auth_override(|_, _, _| true, driver.read(50 + i, handle_id.clone(), offset, chunk_size as u32))
-                .await
-                .expect("each read must succeed via the backend");
+            let data =
+                with_test_auth_override(|_, _, _| true, driver.read(50 + i, handle_id.clone().into(), offset, chunk_size as u32))
+                    .await
+                    .expect("each read must succeed via the backend");
             assert_eq!(data.data.len(), chunk_size, "read must return full requested length");
             let expected_byte = (i + 1) as u8;
             assert!(
