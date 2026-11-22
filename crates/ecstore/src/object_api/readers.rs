@@ -974,12 +974,18 @@ impl ReadPlan {
                 let _ = sequence_number;
                 let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
                     match material.mode {
-                        ReadEncryptionMode::Object => crate::io_support::rio::decrypt_multipart_reader_with_object_key(
-                            reader,
-                            material.key_bytes,
-                            part_numbers,
-                            sequence_number,
-                        ),
+                        ReadEncryptionMode::Object => {
+                            // The rio-v2 reader fails a stream that ends before a
+                            // listed part, so it must not hear about empty ones.
+                            #[cfg(feature = "rio-v2")]
+                            let part_numbers = without_empty_parts(part_numbers, &oi.parts);
+                            crate::io_support::rio::decrypt_multipart_reader_with_object_key(
+                                reader,
+                                material.key_bytes,
+                                part_numbers,
+                                sequence_number,
+                            )
+                        }
                         ReadEncryptionMode::Direct { base_nonce } => crate::io_support::rio::decrypt_multipart_reader(
                             reader,
                             material.key_bytes,
@@ -1432,6 +1438,17 @@ fn is_multipart_encrypted_object(parts: &[ObjectPartInfo], etag: Option<&str>) -
 
 fn multipart_part_numbers(parts: &[ObjectPartInfo]) -> Vec<usize> {
     parts.iter().map(|part| part.number).collect()
+}
+
+/// Drops from `part_numbers` the parts that stored no bytes: a DARE writer
+/// emits no package for an empty part, so none follows on disk.
+#[cfg(feature = "rio-v2")]
+fn without_empty_parts(mut part_numbers: Vec<usize>, parts: &[ObjectPartInfo]) -> Vec<usize> {
+    let empty_parts: Vec<usize> = parts.iter().filter(|part| part.size == 0).map(|part| part.number).collect();
+    if !empty_parts.is_empty() {
+        part_numbers.retain(|number| !empty_parts.contains(number));
+    }
+    part_numbers
 }
 
 #[cfg(test)]

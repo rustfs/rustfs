@@ -390,9 +390,18 @@ impl NotificationSystem {
         self.services.config_manager.lifecycle().state()
     }
 
-    /// Returns whether the latest accepted lifecycle generation is active.
+    /// Returns whether the latest accepted lifecycle generation has been handed
+    /// to the runtime. A published generation serves admin operations even when
+    /// some targets are quarantined; per-target health is reported by the target
+    /// list, and the reconciler must not rebuild a published generation.
     pub fn runtime_lifecycle_is_converged(&self) -> bool {
         self.services.config_manager.lifecycle().is_converged()
+    }
+
+    /// Returns whether the last published generation activated every configured
+    /// target. Used by the one-shot `initialize` API's strict contract.
+    pub fn runtime_lifecycle_all_targets_activated(&self) -> bool {
+        self.services.config_manager.lifecycle().all_targets_activated()
     }
 
     /// Validates a bucket notification configuration against the runtime targets

@@ -223,6 +223,13 @@ pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> s
 
     r.insert(
         Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}").as_str(),
+        AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+
+    // Legacy spelling kept for consoles that still call the reset suffix.
+    r.insert(
+        Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/reset").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
     )?;

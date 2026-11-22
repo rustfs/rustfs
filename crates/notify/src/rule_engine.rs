@@ -55,8 +55,9 @@ struct CachedBucketRules {
     refresh_requested: Arc<AtomicBool>,
     refresh_state: Arc<RefreshState>,
     // Cache rejected snapshots too, so corrupt persisted routes are not
-    // repeatedly compiled on the event hot path.
-    rules: Option<RulesMap>,
+    // repeatedly compiled on the event hot path. Shared by `Arc` so matching an
+    // event does not clone the whole rule set.
+    rules: Option<Arc<RulesMap>>,
 }
 
 struct RefreshAttempt {
@@ -187,7 +188,7 @@ impl NotifyRuleEngine {
                         incarnation_id,
                         refresh_requested,
                         refresh_state,
-                        rules: Some(rules_map),
+                        rules: Some(Arc::new(rules_map)),
                     },
                 )
                 .await;
@@ -214,7 +215,7 @@ impl NotifyRuleEngine {
         self.bucket_rules_map.get(&bucket.to_owned()).await
     }
 
-    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<RulesMap> {
+    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<Arc<RulesMap>> {
         self.snapshot_for_bucket(bucket).await.and_then(|snapshot| snapshot.rules)
     }
 
@@ -248,14 +249,14 @@ impl NotifyRuleEngine {
             incarnation_id,
             refresh_requested,
             refresh_state,
-            rules: rules_from_metadata(&metadata),
+            rules: rules_from_metadata(&metadata).map(Arc::new),
         };
         self.bucket_rules_map.insert(key, snapshot.clone()).await;
         Some(snapshot)
     }
 
     #[cfg(test)]
-    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<RulesMap> {
+    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<Arc<RulesMap>> {
         self.snapshot_for_metadata(bucket, metadata)
             .await
             .and_then(|snapshot| snapshot.rules)
@@ -689,7 +690,7 @@ mod tests {
                 .await
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![target_id.clone()]
+            vec![std::sync::Arc::new(target_id.clone())]
         );
 
         engine.clear_bucket_rules("bucket").await;

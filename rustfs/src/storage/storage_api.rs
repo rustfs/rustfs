@@ -949,6 +949,14 @@ impl StorageReplicationPoolHandle {
         self.inner.get_bucket_resync_status(bucket).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn read_durable_bucket_resync_status(
+        &self,
+        bucket: &str,
+    ) -> Result<ecstore_bucket::replication::BucketReplicationResyncStatus> {
+        self.inner.read_durable_bucket_resync_status(bucket).await
+    }
+
     pub(crate) async fn cancel_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<()> {
         self.inner.clone().cancel_bucket_resync(opts).await
     }

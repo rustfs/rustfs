@@ -617,7 +617,7 @@ fn notification_dispatch_follows_peer_reload_delete_and_recreation() {
                 .await
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![inert_target]
+            vec![std::sync::Arc::new(inert_target)]
         );
         assert!(system.has_subscriber(&bucket, &EventName::ObjectRemovedDelete).await);
         assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);
