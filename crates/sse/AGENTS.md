@@ -9,6 +9,21 @@ Applies to `crates/sse/`.
 - Translation to and from storage-engine types (`ObjectEncryptionResolver`, `WriteEncryption`, `MultipartCompletionAuthorization`) and request types belongs in `rustfs/src/storage/sse.rs`, not here.
 - Report failures as `SseError`, classified with the S3 error code the caller answers with. A failure that did not originate from the request goes through `SseError::internal`, which keeps its detail out of the response.
 
+## Layout
+
+- `src/startup.rs` settles the state that is fixed for the lifetime of the process and reports it. Nothing that follows the KMS service state belongs there: the service follows configuration and can be started, restarted, or stopped from the admin API, so every choice that depends on it is made per request.
+- `src/core/` holds the entry points (`write.rs`, `read.rs`, `rewrap.rs`) and the request principal (`request.rs`). An entry point only orders the steps; the decisions live in the two layers below it.
+- `src/core/s3/` is what S3 defines: the SSE headers of a request and a response, the scheme a write or a stored object resolves to, the SSE-C checks, and the authorization of a KMS key.
+- `src/core/keying/` is how RustFS forms, seals, and records an object's key. `direct.rs` and `object.rs` are the two modes; `mod.rs` is the only place that says which mode a build writes; `stored.rs` recognizes how a stored object was keyed and recovers its key; `metadata.rs` is the stored form.
+- `src/kms/` holds the data-key providers: they wrap and unwrap a data key and decide nothing about schemes. The write and rewrap entry points, `core/keying/stored.rs`, and the startup check of the local master key call them; `core/s3/` never does.
+
+Rules that keep the layers apart:
+
+- `core/keying/` never imports from `core/s3/`. `core/s3/` reads stored metadata only through `core/keying/metadata.rs`. Anything else that needs both layers is joined in an entry point.
+- `#[cfg(feature = "rio-v2")]` appears only under `core/keying/` and `kms/`. An entry point or `core/s3/` that needs a build-dependent answer asks `core/keying/` for it.
+- A new stored format, including a MinIO-compatible one, is added under `core/keying/` (and `kms/` when it brings its own wrapping) without changes under `core/s3/`.
+- A read decides from what the object recorded. The scheme a request advertises and whether a KMS is running now are write policy and runtime state; neither says how an existing object was keyed.
+
 ## Security
 
 - Never log plaintext customer keys, decrypted key material, data-key envelopes, nonces, or SSE request payloads, including through error strings and `Debug` output.
