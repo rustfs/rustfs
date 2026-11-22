@@ -2667,6 +2667,8 @@ fn self_service_deny_check(args: &Args<'_>) -> bool {
                 AdminAction::ChangeOwnPasswordAdminAction
                     | AdminAction::CreateUserAdminAction
                     | AdminAction::ManageOwnMFAAdminAction
+                    | AdminAction::ListServiceAccountsAdminAction
+                    | AdminAction::RemoveServiceAccountAdminAction
             )
         )
 }
@@ -3219,6 +3221,163 @@ mod tests {
             inside_allowed && ordinary_false && ordinary_keeps_opa,
             "C07_UNMARKED_COMPAT: preserve ordinary STS and valid marked scope"
         );
+    }
+
+    #[tokio::test]
+    async fn service_account_self_service_deny_check_allows_active_policyless_user_only() {
+        let iam_sys = test_iam_sys().await;
+        let now = OffsetDateTime::now_utc();
+        let active_user = UserIdentity::from(Credentials {
+            access_key: "policyless-enabled".to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        let inactive_user = UserIdentity::from(Credentials {
+            access_key: "policyless-disabled".to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: rustfs_policy::auth::ACCOUNT_OFF.to_string(),
+            ..Default::default()
+        });
+        iam_sys.store.cache.with_write_lock(|cache| {
+            cache.add_or_update_user("policyless-enabled", &active_user, now);
+            cache.add_or_update_user("policyless-disabled", &inactive_user, now);
+        });
+
+        let groups = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        for action in [
+            AdminAction::ListServiceAccountsAdminAction,
+            AdminAction::RemoveServiceAccountAdminAction,
+        ] {
+            let active_self_args = Args {
+                account: "policyless-enabled",
+                groups: &groups,
+                action: Action::AdminAction(action),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &claims,
+                deny_only: true,
+            };
+            assert!(
+                iam_sys.is_allowed(&active_self_args).await,
+                "active policyless user must retain self-service for {action:?}"
+            );
+
+            let active_full_args = Args {
+                deny_only: false,
+                ..active_self_args.clone()
+            };
+            assert!(
+                !iam_sys.is_allowed(&active_full_args).await,
+                "active policyless user must not satisfy deny_only=false for {action:?}"
+            );
+
+            let inactive_self_args = Args {
+                account: "policyless-disabled",
+                ..active_self_args
+            };
+            assert!(
+                !iam_sys.is_allowed(&inactive_self_args).await,
+                "inactive policyless user must be denied for {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_attempt_sts_is_terminally_denied_for_service_account_self_service_checks() {
+        ensure_test_global_credentials();
+        let iam = IamSys::new(IamCache::new(StsTestMockStore::new(false)).await.unwrap());
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        let signing_key = crate::root_credentials::token_signing_key().expect("test signing key");
+        let mut metadata = HashMap::from([
+            ("parent".into(), Value::String("sts-fallback-test-parent".into())),
+            (
+                "exp".into(),
+                serde_json::json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+            ),
+            (
+                SESSION_POLICY_NAME.into(),
+                Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/inside"]}]}"#,
+                )),
+            ),
+        ]);
+        metadata.insert(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.into(), Value::Bool(true));
+        let mut marked = get_new_credentials_with_metadata(&metadata, &signing_key).unwrap();
+        marked.parent_user = "sts-fallback-test-parent".into();
+        let marked_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&marked.session_token, &signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        iam.store.cache.add_or_update_sts_account(
+            &marked.access_key,
+            &UserIdentity::from(marked.clone()),
+            OffsetDateTime::now_utc(),
+        );
+
+        metadata.remove(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        let mut ordinary = get_new_credentials_with_metadata(&metadata, &signing_key).unwrap();
+        ordinary.parent_user = marked.parent_user.clone();
+        let ordinary_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&ordinary.session_token, &signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        iam.store.cache.add_or_update_sts_account(
+            &ordinary.access_key,
+            &UserIdentity::from(ordinary.clone()),
+            OffsetDateTime::now_utc(),
+        );
+
+        let groups = None;
+        let conditions = HashMap::new();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+        let mut results = Vec::new();
+        for action in [
+            AdminAction::ListServiceAccountsAdminAction,
+            AdminAction::RemoveServiceAccountAdminAction,
+        ] {
+            let marked_args = Args {
+                account: &marked.access_key,
+                groups: &groups,
+                action: Action::AdminAction(action),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &marked_claims,
+                deny_only: true,
+            };
+            let prepared_marked = iam.prepare_auth(&marked_args).await;
+            let terminal = matches!(prepared_marked.mode, PreparedIamMode::TerminalDeny)
+                && matches!(
+                    iam.try_eval_prepared(&prepared_marked, &marked_args).await,
+                    Err(Error::IAMActionNotAllowed)
+                )
+                && !iam.is_allowed(&marked_args).await;
+
+            let ordinary_args = Args {
+                account: &ordinary.access_key,
+                claims: &ordinary_claims,
+                ..marked_args.clone()
+            };
+            let ordinary_allowed = iam.is_allowed(&ordinary_args).await;
+            results.push((action, terminal, ordinary_allowed));
+        }
+        *get_policy_plugin_state().write().await = previous;
+
+        for (action, terminal, ordinary_allowed) in results {
+            assert!(
+                terminal,
+                "plugin-attempt STS with S3-only session policy must receive TerminalDeny on deny_only self-service check for {action:?}"
+            );
+            assert!(
+                ordinary_allowed,
+                "unmarked STS session whose parent has no explicit admin deny retains self-service fallback for {action:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -2275,9 +2275,11 @@ mod tests {
     fn restricted_service_account_cannot_delete_inspect_or_list_sibling_accounts_issue_9514() {
         crate::app::gating_test_env::run_large_stack_test("service-account-sibling-authz-9514", || async {
             use crate::admin::operation::test_support::TestRequest;
-            use crate::admin::runtime_sources::{AppContext, IamInterface, publish_test_app_context};
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
             use rustfs_iam::store::UserType;
             use rustfs_iam::store::object::ObjectStore;
+            use rustfs_iam::sys::{PLUGIN_ATTEMPT_CREDENTIAL_CLAIM, SESSION_POLICY_NAME};
+            use rustfs_policy::auth::get_new_credentials_with_metadata;
             use std::sync::Arc;
 
             struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
@@ -2290,31 +2292,55 @@ mod tests {
                 }
             }
 
-            struct RestoreAmbient(Arc<AppContext>);
-            impl Drop for RestoreAmbient {
-                fn drop(&mut self) {
-                    publish_test_app_context(Arc::clone(&self.0));
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
                 }
             }
 
-            if rustfs_credentials::get_global_action_cred().is_none() {
+            let root_cred = rustfs_credentials::get_global_action_cred().unwrap_or_else(|| {
                 let _ = rustfs_credentials::init_global_action_credentials(
                     Some("root-9514".to_owned()),
                     Some("root-secret-9514".to_owned()),
                 );
-            }
+                rustfs_credentials::get_global_action_cred().expect("global action credentials initialized")
+            });
 
-            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
-            let _restore = RestoreAmbient(Arc::clone(&ambient));
-            let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-            ObjectStore::new(store.clone())
-                .save_iam_config(
-                    json!({"version": 1}),
-                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
-                )
-                .await
-                .expect("initialize IAM storage");
-            let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialized IAM");
+            let (_isolated_dir, canonical) = if let Some(existing) = crate::runtime_sources::current_app_context()
+                && existing.iam().is_ready()
+            {
+                if existing.action_credentials().get().is_none() {
+                    let _ = existing.publish_action_credentials(root_cred.clone());
+                }
+                (None, existing)
+            } else {
+                let (directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+                ObjectStore::new(store.clone())
+                    .save_iam_config(
+                        json!({"version": 1}),
+                        format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                    )
+                    .await
+                    .expect("initialize IAM storage");
+                let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialized IAM");
+                let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+                let _ = context.publish_action_credentials(root_cred.clone());
+                let canonical = publish_test_app_context(context);
+                if canonical.action_credentials().get().is_none() {
+                    let _ = canonical.publish_action_credentials(root_cred.clone());
+                }
+                (Some(directory), canonical)
+            };
+            let iam = canonical.iam().handle();
+            let active_root = canonical
+                .action_credentials()
+                .get()
+                .expect("canonical AppContext must expose action credentials");
+            assert!(
+                Arc::ptr_eq(&iam, &crate::admin::runtime_sources::current_ready_iam_handle().expect("ready IAM")),
+                "test setup and handlers must share the exact same IAM instance"
+            );
 
             let s3_rw_policy = Policy::parse_config(
                 br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,
@@ -2343,6 +2369,16 @@ mod tests {
                 .expect("set svc-admin policy");
 
             let secret = "secret-key-9514";
+            iam.create_user(
+                "nopolicy-9514",
+                &rustfs_madmin::AddOrUpdateUserReq {
+                    secret_key: secret.to_owned(),
+                    policy: None,
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create policyless test user");
             for (user, policy_name) in [
                 ("alice-9514", "s3-rw-9514"),
                 ("carol-9514", "deny-admin-9514"),
@@ -2376,7 +2412,21 @@ mod tests {
                 ]}"#,
             )
             .expect("restricted s3-only policy");
+            let s3_only_policy_b64 = base64_simd::URL_SAFE_NO_PAD
+                .encode_to_string(serde_json::to_vec(&restricted_s3_only_policy).expect("serialize s3-only policy"));
 
+            let (nopolicy_sa, _) = iam
+                .new_service_account(
+                    "nopolicy-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "nopolicy-sa-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create policyless user service account");
             let (sa_denied, _) = iam
                 .new_service_account(
                     "alice-9514",
@@ -2479,14 +2529,28 @@ mod tests {
                 .await
                 .expect("create admin sibling target");
 
-            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(Arc::clone(&iam))), ambient.kms()));
-            assert!(context.publish_action_credentials(StoredCredentials {
-                access_key: "root-9514".to_owned(),
-                secret_key: "root-secret-9514".to_owned(),
-                status: "on".to_owned(),
-                ..Default::default()
-            }));
-            publish_test_app_context(context);
+            let alice_cred = iam.get_user("alice-9514").await.expect("alice user exists").credentials;
+            let exp_ts = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+            let mut sts_claims = HashMap::from([
+                ("parent".to_owned(), serde_json::Value::String("alice-9514".to_owned())),
+                ("exp".to_owned(), json!(exp_ts)),
+                (SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(s3_only_policy_b64)),
+                (PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.to_owned(), json!(true)),
+            ]);
+            let mut plugin_sts =
+                get_new_credentials_with_metadata(&sts_claims, &active_root.secret_key).expect("mint plugin-attempt sts");
+            plugin_sts.parent_user = "alice-9514".to_owned();
+            iam.set_temp_user(&plugin_sts.access_key, &plugin_sts, None)
+                .await
+                .expect("persist plugin-attempt sts");
+
+            sts_claims.remove(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+            let mut ordinary_sts =
+                get_new_credentials_with_metadata(&sts_claims, &active_root.secret_key).expect("mint ordinary sts");
+            ordinary_sts.parent_user = "alice-9514".to_owned();
+            iam.set_temp_user_from_parent(&ordinary_sts, &alice_cred)
+                .await
+                .expect("persist ordinary sts");
 
             // Restricted service accounts (both explicit Deny admin:* and least-privilege S3-only,
             // under either a regular parent or an admin parent) must be denied from deleting,
@@ -2614,6 +2678,226 @@ mod tests {
                     .expect_err("explicit admin deny must block owner bulk list")
                     .code(),
                 &S3ErrorCode::AccessDenied
+            );
+
+            // Plugin-attempt STS sessions are confined to their S3 session policy even
+            // when their parent user (alice-9514) has no explicit admin Deny.
+            for target in [sa_sibling.access_key.as_str(), "missing-sa-9514"] {
+                let delete_req = TestRequest::new(
+                    http::Method::DELETE,
+                    format!("/rustfs/admin/v3/delete-service-account?accessKey={target}").as_str(),
+                )
+                .header("x-amz-security-token", &plugin_sts.session_token)
+                .credentials(&plugin_sts.access_key, &plugin_sts.secret_key, Some(&plugin_sts.session_token))
+                .build();
+                assert_eq!(
+                    DeleteServiceAccount {}
+                        .call(delete_req, Params::new())
+                        .await
+                        .expect_err("plugin-attempt STS delete must fail")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "plugin-attempt STS delete {target}"
+                );
+
+                let info_req = TestRequest::new(
+                    http::Method::GET,
+                    format!("/rustfs/admin/v3/info-service-account?accessKey={target}").as_str(),
+                )
+                .header("x-amz-security-token", &plugin_sts.session_token)
+                .credentials(&plugin_sts.access_key, &plugin_sts.secret_key, Some(&plugin_sts.session_token))
+                .build();
+                assert_eq!(
+                    InfoServiceAccount {}
+                        .call(info_req, Params::new())
+                        .await
+                        .expect_err("plugin-attempt STS info must fail")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "plugin-attempt STS info {target}"
+                );
+            }
+            assert!(
+                iam.get_service_account(&sa_sibling.access_key).await.is_ok(),
+                "sibling service account must remain after rejected plugin-attempt STS delete"
+            );
+
+            let plugin_list_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .header("x-amz-security-token", &plugin_sts.session_token)
+                .credentials(&plugin_sts.access_key, &plugin_sts.secret_key, Some(&plugin_sts.session_token))
+                .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(plugin_list_req, Params::new())
+                    .await
+                    .expect_err("plugin-attempt STS list must fail")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+
+            let plugin_bulk_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .header("x-amz-security-token", &plugin_sts.session_token)
+                .credentials(&plugin_sts.access_key, &plugin_sts.secret_key, Some(&plugin_sts.session_token))
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(plugin_bulk_req, Params::new())
+                    .await
+                    .expect_err("plugin-attempt STS bulk list must fail")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+
+            // An unmarked STS session with the same S3 session policy retains self-service fallback
+            // when neither parent nor session policy contains an explicit admin Deny.
+            let ord_list_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .header("x-amz-security-token", &ordinary_sts.session_token)
+                .credentials(&ordinary_sts.access_key, &ordinary_sts.secret_key, Some(&ordinary_sts.session_token))
+                .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(ord_list_req, Params::new())
+                    .await
+                    .expect("unmarked STS list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let ord_info_req = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-service-account?accessKey={}", sa_sibling.access_key).as_str(),
+            )
+            .header("x-amz-security-token", &ordinary_sts.session_token)
+            .credentials(&ordinary_sts.access_key, &ordinary_sts.secret_key, Some(&ordinary_sts.session_token))
+            .build();
+            assert_eq!(
+                InfoServiceAccount {}
+                    .call(ord_info_req, Params::new())
+                    .await
+                    .expect("unmarked STS info should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let ord_bulk_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .header("x-amz-security-token", &ordinary_sts.session_token)
+                .credentials(&ordinary_sts.access_key, &ordinary_sts.secret_key, Some(&ordinary_sts.session_token))
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(ord_bulk_req, Params::new())
+                    .await
+                    .expect("unmarked STS bulk list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+
+            // An active regular owner with NO attached policies retains self-service over own accounts
+            // while remaining denied from cross-user operations.
+            let nopolicy_list = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .credentials("nopolicy-9514", secret, None)
+                .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(nopolicy_list, Params::new())
+                    .await
+                    .expect("policyless owner list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let nopolicy_info = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-service-account?accessKey={}", nopolicy_sa.access_key).as_str(),
+            )
+            .credentials("nopolicy-9514", secret, None)
+            .build();
+            assert_eq!(
+                InfoServiceAccount {}
+                    .call(nopolicy_info, Params::new())
+                    .await
+                    .expect("policyless owner info should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let nopolicy_bulk = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .credentials("nopolicy-9514", secret, None)
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(nopolicy_bulk, Params::new())
+                    .await
+                    .expect("policyless owner bulk list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let nopolicy_cross_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={}", sa_sibling.access_key).as_str(),
+            )
+            .credentials("nopolicy-9514", secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(nopolicy_cross_delete, Params::new())
+                    .await
+                    .expect_err("policyless owner must not delete another user's service account")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            assert!(
+                iam.get_service_account(&sa_sibling.access_key).await.is_ok(),
+                "alice sibling service account must remain after rejected cross-user delete by nopolicy-9514"
+            );
+            let nopolicy_cross_info = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-service-account?accessKey={}", sa_sibling.access_key).as_str(),
+            )
+            .credentials("nopolicy-9514", secret, None)
+            .build();
+            assert_eq!(
+                InfoServiceAccount {}
+                    .call(nopolicy_cross_info, Params::new())
+                    .await
+                    .expect_err("policyless owner must not inspect another user's service account")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            let nopolicy_cross_list =
+                TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts?user=alice-9514")
+                    .credentials("nopolicy-9514", secret, None)
+                    .build();
+            assert_eq!(
+                ListServiceAccount {}
+                    .call(nopolicy_cross_list, Params::new())
+                    .await
+                    .expect_err("policyless owner must not list another user's service accounts")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            let nopolicy_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={}", nopolicy_sa.access_key).as_str(),
+            )
+            .credentials("nopolicy-9514", secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(nopolicy_delete, Params::new())
+                    .await
+                    .expect("policyless owner delete should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            assert!(
+                iam.get_service_account(&nopolicy_sa.access_key)
+                    .await
+                    .is_err_and(|err| is_err_no_such_service_account(&err)),
+                "policyless owner delete must remove its own service account"
             );
 
             // Regular parent user without explicit admin Deny retains self-service access to own accounts.
