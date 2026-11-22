@@ -992,15 +992,18 @@ pub(crate) fn scanner_slot_disk_id(set: &SetDisks, disk: &Disk) -> Option<uuid::
         .filter(|id| !id.is_nil())
 }
 
-async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Option<Arc<ObjectLockConfiguration>> {
+async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Result<Option<Arc<ObjectLockConfiguration>>> {
     if let Some(config) = item.object_lock.clone() {
-        return Some(config);
+        return Ok(Some(config));
     }
 
-    get_object_lock_config(&item.bucket)
-        .await
-        .ok()
-        .map(|(config, _)| Arc::new(config))
+    match crate::storage_api::get_object_lock_config_state(&item.bucket).await? {
+        crate::storage_api::ObjectLockConfigState::ConfirmedAbsent => Ok(None),
+        crate::storage_api::ObjectLockConfigState::Configured { config, .. } => Ok(Some(Arc::new(config))),
+        crate::storage_api::ObjectLockConfigState::Fabricated => {
+            Err(Error::other("scanner Object Lock configuration unavailable"))
+        }
+    }
 }
 
 fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {

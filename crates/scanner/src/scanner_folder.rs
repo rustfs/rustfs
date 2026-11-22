@@ -394,7 +394,7 @@ struct PendingScannerAccounting<'a> {
 impl PendingScannerAccounting<'_> {
     fn apply(self, size_summary: &mut SizeSummary, cumulative_size: &mut i64, queued: bool) {
         let size = if queued { self.expired_size } else { self.retained_size };
-        size_summary.actions_accounting(self.object, size, self.retained_size);
+        crate::data_usage_define::account_version_usage(size_summary, self.object, size, !queued);
         *cumulative_size = cumulative_size.saturating_add(size);
     }
 }
@@ -1434,6 +1434,11 @@ impl FolderScanner {
             ScannerCacheReuseDecision::CompactedParent
         } else if !self.old_cache.is_compacted(hash) {
             ScannerCacheReuseDecision::UncompactedChild
+        } else if self.old_cache.info.lifecycle.as_ref().is_some_and(|config| {
+            let (_, prefix) = path2_bucket_object_with_base_path(&self.root, &hash.0);
+            config.has_active_rules(&prefix)
+        }) {
+            ScannerCacheReuseDecision::ActiveLifecycle
         } else if hash.mod_(self.old_cache.info.next_cycle as u32, data_usage_update_dir_cycles()) {
             ScannerCacheReuseDecision::SelectedForWalk
         } else {

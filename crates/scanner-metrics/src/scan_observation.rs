@@ -126,6 +126,7 @@ pub enum ScannerCacheReuseDecision {
     DeepScan,
     ForwardSweep,
     ActiveReplication,
+    ActiveLifecycle,
     NotRoot,
     CompactedParent,
     MissingCachedChild,
@@ -140,12 +141,13 @@ pub enum ScannerCacheReuseDecision {
 }
 
 impl ScannerCacheReuseDecision {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::MissingScope,
         Self::NoResumeSweep,
         Self::DeepScan,
         Self::ForwardSweep,
         Self::ActiveReplication,
+        Self::ActiveLifecycle,
         Self::NotRoot,
         Self::CompactedParent,
         Self::MissingCachedChild,
@@ -166,6 +168,7 @@ impl ScannerCacheReuseDecision {
             Self::DeepScan => "deep_scan",
             Self::ForwardSweep => "forward_sweep",
             Self::ActiveReplication => "active_replication",
+            Self::ActiveLifecycle => "active_lifecycle",
             Self::NotRoot => "not_root",
             Self::CompactedParent => "compacted_parent",
             Self::MissingCachedChild => "missing_cached_child",
@@ -183,7 +186,12 @@ impl ScannerCacheReuseDecision {
     fn not_evaluated(self) -> bool {
         matches!(
             self,
-            Self::MissingScope | Self::NoResumeSweep | Self::DeepScan | Self::ForwardSweep | Self::ActiveReplication
+            Self::MissingScope
+                | Self::NoResumeSweep
+                | Self::DeepScan
+                | Self::ForwardSweep
+                | Self::ActiveReplication
+                | Self::ActiveLifecycle
         )
     }
 }

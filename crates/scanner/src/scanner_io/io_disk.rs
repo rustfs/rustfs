@@ -96,24 +96,23 @@ impl ScannerIODisk for Disk {
             .get_file_info_versions(item.bucket.as_str(), object_path.as_str(), false)
             .map_err(|_| StorageError::FileCorrupt)?;
 
-        // Single versioning lookup per object, shared with `apply_actions`
-        // (which used to query it a second time). On failure keep the
-        // historical fallback: default configuration (versioned = false) plus
-        // the warn that `apply_actions` used to emit.
+        // Preserve identities from disk when versioning is unavailable. Lifecycle
+        // also needs the bucket policy to distinguish an unversioned delete.
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let versioning_result = BucketVersioningSys::get(&item.bucket).await;
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let versioning_config = match versioning_result {
             Ok(versioning_config) => versioning_config,
             Err(_) => {
+                item.lifecycle = None;
                 warn!(
                     target: "rustfs::scanner::folder",
                     event = EVENT_SCANNER_LIFECYCLE_ACTION,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                     bucket = %item.bucket,
-                    state = "versioning_lookup_failed_defaulting",
-                    "Scanner lifecycle action falling back to default bucket versioning"
+                    state = "versioning_lookup_failed",
+                    "Scanner deferred lifecycle evaluation because bucket versioning is unavailable"
                 );
                 VersioningConfiguration::default()
             }
@@ -140,7 +139,26 @@ impl ScannerIODisk for Disk {
         };
 
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
-        let lock_config = object_lock_config_for_scanner_item(&item).await;
+        let lock_config = if item.lifecycle.is_some() {
+            match object_lock_config_for_scanner_item(&item).await {
+                Ok(config) => config,
+                Err(_) => {
+                    item.lifecycle = None;
+                    warn!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        state = "object_lock_unavailable",
+                        bucket = %item.bucket,
+                        "Scanner deferred lifecycle evaluation because Object Lock configuration is unavailable"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
 
         // Count every version this object contributes to the scan, independent
@@ -244,12 +262,14 @@ impl ScannerIODisk for Disk {
                     OffsetDateTime::now_utc(),
                 ));
 
+        cache.info.replication = None;
         if replication_config.has_active_rules("", true)
             && let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await
         {
             cache.info.replication = Some(Arc::new(ReplicationConfig::new(Some(replication_config), Some(targets))));
         }
 
+        cache.info.object_lock = None;
         if let Ok((object_lock_config, _)) =
             crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_object_lock_config(&cache.info.name)).await
             && object_lock_config_enabled(&object_lock_config)

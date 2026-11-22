@@ -290,90 +290,108 @@ pub trait ScannerSizeSummaryExt {
     fn actions_accounting_unknown(&mut self, oi: &ObjectInfo);
 }
 
-impl ScannerSizeSummaryExt for SizeSummary {
-    fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
-        if oi.delete_marker {
-            self.delete_markers = self.delete_markers.saturating_add(1);
-            return;
-        }
+fn account_inbound_replica(summary: &mut SizeSummary, oi: &ObjectInfo) {
+    if oi.replication_status == crate::ReplicationStatusType::Replica
+        && !oi.transitioned_object.free_version
+        && oi.version_purge_status.is_empty()
+    {
+        summary.replica_count = summary.replica_count.saturating_add(1);
+        summary.replica_size = summary.replica_size.saturating_add(oi.size.max(0));
+    }
+}
 
-        if oi.version_id.is_some_and(|v| !v.is_nil()) && size == actual_size {
-            self.versions = self.versions.saturating_add(1);
-        }
+pub(crate) fn account_version_usage(summary: &mut SizeSummary, oi: &ObjectInfo, size: i64, retained: bool) {
+    if oi.delete_marker {
+        summary.delete_markers = summary.delete_markers.saturating_add(1);
+        return;
+    }
 
-        let logical_size = size.max(0);
-        let size = usize::try_from(logical_size).unwrap_or(usize::MAX);
-        self.total_size = self.total_size.saturating_add(size);
-        let logical_bytes = u64::try_from(logical_size).unwrap_or(u64::MAX);
-        let physical_bytes = u64::try_from(oi.size.max(0)).unwrap_or(0);
-        let mut proof = TierAccountingProof {
-            logical_total: logical_bytes,
-            logical_known: 0,
-            physical_total: physical_bytes,
-            physical_known: 0,
-            overflowed: false,
-        };
+    if retained {
+        account_inbound_replica(summary, oi);
+    }
+    if oi.version_id.is_some_and(|v| !v.is_nil()) && retained {
+        summary.versions = summary.versions.saturating_add(1);
+    }
 
-        if oi.transitioned_object.free_version {
-            proof.logical_known = logical_bytes;
-            proof.physical_known = physical_bytes;
-            self.tier_accounting_proof.saturating_add(proof);
-            return;
-        }
+    let logical_size = size.max(0);
+    let size = usize::try_from(logical_size).unwrap_or(usize::MAX);
+    summary.total_size = summary.total_size.saturating_add(size);
+    let logical_bytes = u64::try_from(logical_size).unwrap_or(u64::MAX);
+    let physical_bytes = u64::try_from(oi.size.max(0)).unwrap_or(0);
+    let mut proof = TierAccountingProof {
+        logical_total: logical_bytes,
+        logical_known: 0,
+        physical_total: physical_bytes,
+        physical_known: 0,
+        overflowed: false,
+    };
 
-        let tier = if oi.transitioned_object.status == TRANSITION_COMPLETE {
-            oi.transitioned_object.tier.as_str()
-        } else {
-            oi.storage_class.as_deref().unwrap_or(storageclass::STANDARD)
-        };
+    if oi.transitioned_object.free_version {
+        proof.logical_known = logical_bytes;
+        proof.physical_known = physical_bytes;
+        summary.tier_accounting_proof.saturating_add(proof);
+        return;
+    }
 
-        let builtin_tier = tier == storageclass::STANDARD || tier == storageclass::RRS;
-        let tier_registry_is_empty =
-            self.tier_stats.is_empty() || (self.tier_stats.len() == 1 && self.tier_stats.contains_key(UNKNOWN_TIER));
-        let known_tier = tier != UNKNOWN_TIER && (builtin_tier || self.tier_stats.contains_key(tier));
+    let tier = if oi.transitioned_object.status == TRANSITION_COMPLETE {
+        oi.transitioned_object.tier.as_str()
+    } else {
+        oi.storage_class.as_deref().unwrap_or(storageclass::STANDARD)
+    };
 
-        // With no configured tier, retain the historical empty-map shape for
-        // ordinary STANDARD/RRS objects. A non-built-in key is still an
-        // observable unknown and must create only the fixed bucket.
-        if tier_registry_is_empty && known_tier {
-            proof.logical_known = logical_bytes;
-            proof.physical_known = physical_bytes;
-            self.tier_accounting_proof.saturating_add(proof);
-            return;
-        }
+    let builtin_tier = tier == storageclass::STANDARD || tier == storageclass::RRS;
+    let tier_registry_is_empty =
+        summary.tier_stats.is_empty() || (summary.tier_stats.len() == 1 && summary.tier_stats.contains_key(UNKNOWN_TIER));
+    let known_tier = tier != UNKNOWN_TIER && (builtin_tier || summary.tier_stats.contains_key(tier));
 
-        // Configured tiers and the fixed bucket are normally seeded, so the
-        // hot path can mutate them without allocating a key for every object.
-        // The fallback inserts only when a legacy/no-config summary sees its
-        // first unknown key.
-        let tier_stats = if known_tier {
-            if let Some(stats) = self.tier_stats.get_mut(tier) {
-                stats
-            } else {
-                self.tier_stats.entry(tier.to_owned()).or_default()
-            }
-        } else if let Some(stats) = self.tier_stats.get_mut(UNKNOWN_TIER) {
+    // With no configured tier, retain the historical empty-map shape for
+    // ordinary STANDARD/RRS objects. A non-built-in key is still an
+    // observable unknown and must create only the fixed bucket.
+    if tier_registry_is_empty && known_tier {
+        proof.logical_known = logical_bytes;
+        proof.physical_known = physical_bytes;
+        summary.tier_accounting_proof.saturating_add(proof);
+        return;
+    }
+
+    // Configured tiers and the fixed bucket are normally seeded, so the
+    // hot path can mutate them without allocating a key for every object.
+    // The fallback inserts only when a legacy/no-config summary sees its
+    // first unknown key.
+    let tier_stats = if known_tier {
+        if let Some(stats) = summary.tier_stats.get_mut(tier) {
             stats
         } else {
-            self.tier_stats.entry(UNKNOWN_TIER.to_string()).or_default()
-        };
-        *tier_stats = tier_stats.add(&TierStats {
-            total_size: physical_bytes,
-            num_versions: 1,
-            num_objects: u64::from(oi.is_latest),
-        });
-        if known_tier {
-            proof.logical_known = logical_bytes;
-            proof.physical_known = physical_bytes;
+            summary.tier_stats.entry(tier.to_owned()).or_default()
         }
-        if !known_tier {
-            self.unknown_tier_stats
-                .record_dimensions(tier, logical_bytes, physical_bytes, 1, u64::from(oi.is_latest));
-            if self.unknown_tier_stats.counter_overflowed {
-                proof.overflowed = true;
-            }
+    } else if let Some(stats) = summary.tier_stats.get_mut(UNKNOWN_TIER) {
+        stats
+    } else {
+        summary.tier_stats.entry(UNKNOWN_TIER.to_string()).or_default()
+    };
+    *tier_stats = tier_stats.add(&TierStats {
+        total_size: physical_bytes,
+        num_versions: 1,
+        num_objects: u64::from(oi.is_latest),
+    });
+    if known_tier {
+        proof.logical_known = logical_bytes;
+        proof.physical_known = physical_bytes;
+    }
+    if !known_tier {
+        summary
+            .unknown_tier_stats
+            .record_dimensions(tier, logical_bytes, physical_bytes, 1, u64::from(oi.is_latest));
+        if summary.unknown_tier_stats.counter_overflowed {
+            proof.overflowed = true;
         }
-        self.tier_accounting_proof.saturating_add(proof);
+    }
+    summary.tier_accounting_proof.saturating_add(proof);
+}
+
+impl ScannerSizeSummaryExt for SizeSummary {
+    fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
+        account_version_usage(self, oi, size, size == actual_size);
     }
 
     fn actions_accounting_unknown(&mut self, oi: &ObjectInfo) {
@@ -382,6 +400,7 @@ impl ScannerSizeSummaryExt for SizeSummary {
             return;
         }
 
+        account_inbound_replica(self, oi);
         if oi.version_id.is_some_and(|v| !v.is_nil()) {
             self.versions = self.versions.saturating_add(1);
         }

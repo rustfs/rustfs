@@ -960,30 +960,30 @@ async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
 
 #[test]
 fn test_pending_scanner_accounting_requires_enqueue_success() {
-    let object = ObjectInfo {
-        size: 10,
-        version_id: Some(uuid::Uuid::new_v4()),
-        ..Default::default()
-    };
-    let pending = PendingScannerAccounting {
-        object: &object,
-        retained_size: 10,
-        expired_size: 0,
-    };
-
-    let mut failed_summary = SizeSummary::default();
-    let mut failed_cumulative_size = 0;
-    pending.apply(&mut failed_summary, &mut failed_cumulative_size, false);
-    assert_eq!(failed_summary.versions, 1);
-    assert_eq!(failed_summary.total_size, 10);
-    assert_eq!(failed_cumulative_size, 10);
-
-    let mut queued_summary = SizeSummary::default();
-    let mut queued_cumulative_size = 0;
-    pending.apply(&mut queued_summary, &mut queued_cumulative_size, true);
-    assert_eq!(queued_summary.versions, 0);
-    assert_eq!(queued_summary.total_size, 0);
-    assert_eq!(queued_cumulative_size, 0);
+    for bytes in [0, 1] {
+        let object = ObjectInfo {
+            size: bytes,
+            version_id: Some(uuid::Uuid::new_v4()),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+        let pending = PendingScannerAccounting {
+            object: &object,
+            retained_size: bytes,
+            expired_size: 0,
+        };
+        for queued in [false, true] {
+            let mut summary = SizeSummary::default();
+            let mut cumulative_size = 0;
+            pending.apply(&mut summary, &mut cumulative_size, queued);
+            let retained = if queued { 0 } else { bytes };
+            assert_eq!(summary.versions, usize::from(!queued));
+            assert_eq!(summary.total_size, usize::try_from(retained).unwrap());
+            assert_eq!(cumulative_size, retained);
+            assert_eq!(summary.replica_count, usize::from(!queued));
+            assert_eq!(summary.replica_size, retained);
+        }
+    }
 }
 
 #[tokio::test]
