@@ -177,7 +177,7 @@ futures-lite = "2.6.1"
 futures-util = "0.3.34"
 pollster = "1.0.3"
 pulsar = { default-features = false, version = "=6.9.0" }
-lapin = { default-features = false, version = "4.12.3" }
+lapin = { default-features = false, version = "4.13.0" }
 hyper = { version = "1.12.0" }
 h2 = { version = "0.4.20" }
 hyper-rustls = { default-features = false, version = "0.27.10" }
@@ -303,7 +303,7 @@ flate2 = "1.1.11"
 glob = "0.3.4"
 google-cloud-storage = "1.22.0"
 google-cloud-auth = "1.19.0"
-hashbrown = { version = "0.17.1" }
+hashbrown = { version = "0.17.2" }
 # Base32 for RFC 6238 TOTP shared secrets (RFC 4648 unpadded, the alphabet
 # every authenticator app expects). Already in the graph transitively.
 data-encoding = "2.11.1"
@@ -409,8 +409,8 @@ libunftp = { version = "0.25.1" }
 unftp-core = "0.1.1"
 suppaftp = { version = "13.0.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.65.2" }
-russh-sftp = "3.0.1"
+russh = { version = "0.65.4" }
+russh-sftp = "4.0.0"
 
 # WebDAV
 dav-server = "0.12.0"
