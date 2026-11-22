@@ -194,9 +194,37 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                 .upload_id(deleted_upload.upload_id.clone())
                 .build()
                 .expect("deleted-source copy request");
-            let error = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT)))
-                .await
-                .expect_err("deleted source must fail before conditions or admission");
+            let condition = |value| match value {
+                crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+                crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+                crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+            };
+            let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(
+                owned_envelope(Method::PUT),
+                UploadPartCopyWriteInput {
+                    target: UploadPartTarget::Legacy {
+                        bucket: input.bucket,
+                        key: input.key,
+                        upload_id: input.upload_id,
+                    },
+                    part_number: input.part_number,
+                    copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(input.copy_source),
+                    copy_source_range: input.copy_source_range,
+                    copy_source_if_match: input.copy_source_if_match.map(&condition),
+                    copy_source_if_none_match: input.copy_source_if_none_match.map(&condition),
+                    sse_customer_algorithm: input.sse_customer_algorithm,
+                    sse_customer_key: input.sse_customer_key,
+                    sse_customer_key_md5: input.sse_customer_key_md5,
+                    copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+                    copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+                    copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+                },
+            ))
+            .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("deleted source must fail before conditions or admission"),
+            };
             assert_eq!(error.code(), &expected);
         }
     });
