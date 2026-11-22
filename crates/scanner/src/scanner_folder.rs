@@ -2704,7 +2704,7 @@ impl FolderScanner {
                         }
                     }
                     FolderScanSource::Existing => {
-                        // Usage sampling is not proof that a Deep check ran.
+                        // An unchanged subtree can contain objects that have aged into a lifecycle rule.
                         if self.scan_mode != HealScanMode::Deep
                             && !forward_sweep
                             && !self
@@ -2715,6 +2715,10 @@ impl FolderScanner {
                                 .is_some_and(|config| config.has_active_rules("", true))
                             && !into.compacted
                             && self.old_cache.is_compacted(&h)
+                            && !active_life_cycle.as_ref().is_some_and(|config| {
+                                let (_, prefix) = path2_bucket_object_with_base_path(&self.root, &folder_item.name);
+                                config.has_active_rules(&prefix)
+                            })
                         {
                             let next_cycle = self.old_cache.info.next_cycle as u32;
                             if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
