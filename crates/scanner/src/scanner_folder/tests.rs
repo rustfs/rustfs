@@ -3140,7 +3140,7 @@ async fn cache_reuse_gates_report_only_the_first_production_condition() {
     let abandoned = HashSet::from([hash.0.clone()]);
     let before = global_metrics().scan_observation().snapshot();
 
-    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child, &hash, &abandoned));
+    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child.name, &hash, &abandoned));
     let missing_scope = global_metrics().scan_observation().snapshot();
     assert_eq!(
         missing_scope.reuse_decisions["clean_prefix"].not_evaluated["missing_scope"],
@@ -3148,7 +3148,7 @@ async fn cache_reuse_gates_report_only_the_first_production_condition() {
     );
     scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
     scanner.is_erasure_mode = true;
-    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child, &hash, &abandoned));
+    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child.name, &hash, &abandoned));
     let erasure = global_metrics().scan_observation().snapshot();
     assert_eq!(
         erasure.reuse_decisions["clean_prefix"].blocked["erasure_health_required"],
