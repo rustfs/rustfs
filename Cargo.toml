@@ -23,6 +23,7 @@ members = [
     "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
     "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
+    "crates/cuobject-sys", # Native NVIDIA cuObject server SDK bindings
     "crates/cuobject", # NVIDIA cuObject S3-over-RDMA staging and transfers (optional)
     "crates/nixl", # NIXL/UCX S3-over-RDMA server side (optional)
     "crates/ecstore", # Erasure coding storage implementation
@@ -108,6 +109,7 @@ rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.5" }
 rustfs-credentials = { path = "crates/credentials", version = "1.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "1.0.5" }
 rustfs-cuobject = { path = "crates/cuobject", version = "1.0.5" }
+rustfs-cuobject-sys = { path = "crates/cuobject-sys", version = "1.0.5" }
 rustfs-nixl = { path = "crates/nixl", version = "1.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "1.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.5" }

@@ -1,0 +1,22 @@
+[package]
+name = "rustfs-cuobject-sys"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Native bindings to the NVIDIA cuObject server SDK"
+links = "cuobjserver"
+
+[lints]
+workspace = true
+
+[dependencies]
+cxx = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+[build-dependencies]
+cxx-build = { workspace = true, optional = true }
+
+[features]
+server = ["dep:cxx", "dep:cxx-build", "dep:libc"]

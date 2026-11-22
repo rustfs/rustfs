@@ -10188,12 +10188,19 @@ name = "rustfs-cuobject"
 version = "1.0.5"
 dependencies = [
  "bytes",
+ "parking_lot 0.13.0",
+ "rustfs-cuobject-sys",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "rustfs-cuobject-sys"
+version = "1.0.5"
+dependencies = [
  "cxx",
  "cxx-build",
  "libc",
- "parking_lot 0.13.0",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

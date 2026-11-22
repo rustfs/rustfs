@@ -9,6 +9,7 @@ on:
     paths:
       - "crates/nixl/**"
       - "crates/cuobject/**"
+      - "crates/cuobject-sys/**"
       - "rustfs/src/storage/rpc/nixl*"
       - "rustfs/src/app/object/cuobject.rs"
       - "rustfs/src/app/object/get.rs"
@@ -81,6 +82,8 @@ jobs:
           cache-shared-key: ci-feat-cuobject
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
+      - name: Check the cuObject crates without the NVIDIA SDK
+        run: cargo check --locked -p rustfs-cuobject -p rustfs-cuobject-sys
       - name: Install the NVIDIA server SDK
         working-directory: ${{ runner.temp }}
         run: |

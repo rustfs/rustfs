@@ -13,9 +13,7 @@ either can be enabled on its own.
 
 ## Build
 
-The optional Linux `cuobject` feature builds the workspace crate
-`rustfs-cuobject`. Its C++17 bridge includes `cuobjserver.h` and links
-directly to NVIDIA's `libcuobjserver`. Install `libcuobjserver`,
+The optional Linux `cuobject` feature enables `rustfs-cuobject` for buffer and transfer management. Its dependency `rustfs-cuobject-sys` compiles the C++17 bridge against `cuobjserver.h` and links NVIDIA's `libcuobjserver`. Install `libcuobjserver`,
 `libcuobjserver-dev` and the RDMA development headers for the target
 architecture. A default build does not require the NVIDIA SDK.
 

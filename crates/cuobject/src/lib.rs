@@ -21,7 +21,7 @@
 //! through NVIDIA's `libcuobjserver` and answers with an empty body plus
 //! `x-amz-rdma-reply` and `x-amz-rdma-bytes-transferred`.
 //!
-//! This crate binds the NVIDIA server SDK directly and owns
+//! This crate uses the NVIDIA server bindings in `rustfs-cuobject-sys` and owns
 //! RustFS's pool of registered, page-aligned host staging buffers: the regular
 //! read path fills a staging chunk and
 //! [`CuObjectServer::write_to_client_owned`] pushes it.
@@ -32,11 +32,7 @@
 #![cfg(feature = "server")]
 
 use bytes::Bytes;
-// SAFETY: the private bridge declares the SDK ABI and channel ownership rules.
-#[allow(unsafe_code)]
-mod sdk;
-use cxx::SharedPtr;
-use sdk::{Channel, ffi};
+use rustfs_cuobject_sys::{self as sdk, BufferHandle, Channel, ServerHandle};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -66,7 +62,7 @@ pub const MAX_SG_RANGES: usize = 10;
 /// Version of the cuObject server headers the bindings were built against, as
 /// (major, minor).
 pub fn library_version() -> (u32, u32) {
-    let version = ffi::header_version();
+    let version = sdk::header_version();
     (version / 1000, version % 1000)
 }
 
@@ -100,6 +96,15 @@ pub enum CuObjectError {
     AsyncUnavailable(u16),
     #[error("cuobject read source failed: {0}")]
     Source(#[source] std::io::Error),
+}
+
+impl CuObjectError {
+    fn sdk(op: &'static str, error: sdk::Exception) -> Self {
+        Self::Os {
+            op,
+            source: std::io::Error::other(error),
+        }
+    }
 }
 
 /// Parsed `x-amz-rdma-token`.
@@ -225,7 +230,7 @@ impl Default for CuObjectConfig {
 }
 
 struct Staging {
-    buffer: SharedPtr<ffi::Buffer>,
+    buffer: BufferHandle,
     free: parking_lot::Mutex<VecDeque<usize>>,
     permits: Semaphore,
     chunk_bytes: usize,
@@ -233,7 +238,7 @@ struct Staging {
 
 /// One cuObject server bound to the RDMA device that owns an IP address.
 pub struct CuObjectServer {
-    server: SharedPtr<ffi::Server>,
+    server: ServerHandle,
     staging: Staging,
     addr: IpAddr,
     port: u16,
@@ -277,7 +282,7 @@ pub struct ArenaRange {
 /// Host memory registered with one server, owned by the caller (see
 /// [`CuObjectServer::register_arena`]).
 pub struct RegisteredArena {
-    buffer: SharedPtr<ffi::Buffer>,
+    buffer: BufferHandle,
     server: Arc<CuObjectServer>,
     id: u64,
 }
@@ -285,7 +290,7 @@ pub struct RegisteredArena {
 impl RegisteredArena {
     /// Length of the registered memory.
     pub fn len(&self) -> usize {
-        ffi::size(&self.buffer)
+        sdk::size(&self.buffer)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -306,7 +311,7 @@ impl RegisteredArena {
     /// long as this arena; callers hand out disjoint ranges of it and never
     /// touch a range while a transfer sends it.
     pub fn as_mut_ptr(&self) -> *mut u8 {
-        ffi::data(&self.buffer)
+        sdk::data(&self.buffer)
     }
 }
 
@@ -373,7 +378,7 @@ impl StagingChunk {
         let len = self.capacity() - self.len;
         // SAFETY: the range lies in this chunk (see the type docs) and
         // `&mut self` excludes every other borrow of it.
-        Ok(unsafe { std::slice::from_raw_parts_mut(ffi::data(&self.server.staging.buffer).add(self.start() + self.len), len) })
+        Ok(unsafe { std::slice::from_raw_parts_mut(sdk::data(&self.server.staging.buffer).add(self.start() + self.len), len) })
     }
 
     /// Marks `n` more bytes of the spare area as staged.
@@ -395,7 +400,7 @@ impl AsRef<[u8]> for StagingChunk {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: the chunk owns this range of the registration. A shared borrow
         // excludes mutation and DMA reads into the chunk require owned access.
-        unsafe { std::slice::from_raw_parts(ffi::data(&self.server.staging.buffer).add(self.start()), self.len) }
+        unsafe { std::slice::from_raw_parts(sdk::data(&self.server.staging.buffer).add(self.start()), self.len) }
     }
 }
 
@@ -426,11 +431,11 @@ impl CuObjectServer {
         if config.chunk_bytes == 0 || config.chunk_bytes > MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
             return Err(CuObjectError::Invalid("invalid staging configuration"));
         }
-        let server = ffi::open_server(&addr.to_string(), config.port, config.num_dcis, config.cq_depth)
-            .map_err(|e| sdk::failure("open server", e))?;
+        let server = sdk::open_server(&addr.to_string(), config.port, config.num_dcis, config.cq_depth)
+            .map_err(|e| CuObjectError::sdk("open server", e))?;
         let chunks = config.pool_bytes / config.chunk_bytes;
-        let buffer = ffi::register_buffer(server.clone(), chunks * config.chunk_bytes)
-            .map_err(|e| sdk::failure("register staging memory", e))?;
+        let buffer = sdk::register_buffer(server.clone(), chunks * config.chunk_bytes)
+            .map_err(|e| CuObjectError::sdk("register staging memory", e))?;
         Ok(Arc::new(Self {
             channels: Arc::new(ChannelCapacity::new(usize::try_from(config.num_dcis).unwrap_or(1).max(1))),
             async_transfers: config.async_transfers,
@@ -494,7 +499,7 @@ impl CuObjectServer {
     /// server for callers that manage the memory themselves (a shard arena the
     /// decoder reads into and the server RDMA-writes from without staging).
     pub fn register_arena(self: &Arc<Self>, len: usize) -> Result<Arc<RegisteredArena>, CuObjectError> {
-        let buffer = ffi::register_buffer(self.server.clone(), len).map_err(|e| sdk::failure("register arena", e))?;
+        let buffer = sdk::register_buffer(self.server.clone(), len).map_err(|e| CuObjectError::sdk("register arena", e))?;
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Arc::new(RegisteredArena {
             buffer,
@@ -605,7 +610,10 @@ impl CuObjectServer {
             };
             let transfer = Transfer {
                 capacity: Arc::clone(&server.channels),
-                channel: Channel::lease(&server.server)?,
+                channel: Channel::lease(&server.server).map_err(|source| CuObjectError::Os {
+                    op: "lease channel",
+                    source,
+                })?,
                 region,
                 keep: chunk,
                 _permit: channel_permit,
@@ -644,7 +652,10 @@ impl CuObjectServer {
         let prepare = move || -> Result<_, CuObjectError> {
             Ok(Transfer {
                 capacity: Arc::clone(&server.channels),
-                channel: Channel::lease(&server.server)?,
+                channel: Channel::lease(&server.server).map_err(|source| CuObjectError::Os {
+                    op: "lease channel",
+                    source,
+                })?,
                 region: server.region(&local)?,
                 keep,
                 _permit: permit,
@@ -703,16 +714,16 @@ impl CuObjectServer {
                 if let Some((offset, len)) = contiguous_range(ranges) {
                     (arena.buffer.clone(), offset, len)
                 } else {
-                    let mut entries = [ffi::Range { offset: 0, size: 0 }; MAX_SG_RANGES];
+                    let mut entries = [sdk::Range { offset: 0, size: 0 }; MAX_SG_RANGES];
                     let entries = entries
                         .get_mut(..ranges.len())
                         .ok_or(CuObjectError::Invalid("too many scatter-gather ranges"))?;
                     for (entry, &(offset, size)) in entries.iter_mut().zip(ranges) {
-                        *entry = ffi::Range { offset, size };
+                        *entry = sdk::Range { offset, size };
                     }
-                    let list =
-                        ffi::scatter_list(arena.buffer.clone(), entries).map_err(|e| sdk::failure("register scatter list", e))?;
-                    let size = ffi::size(&list);
+                    let list = sdk::scatter_list(arena.buffer.clone(), entries)
+                        .map_err(|e| CuObjectError::sdk("register scatter list", e))?;
+                    let size = sdk::size(&list);
                     (list, 0, size)
                 }
             }
@@ -762,7 +773,7 @@ enum Mode {
 }
 
 struct Region {
-    buffer: SharedPtr<ffi::Buffer>,
+    buffer: BufferHandle,
     offset: usize,
     length: usize,
 }
@@ -774,7 +785,7 @@ impl Region {
         token: &'a Descriptor,
         remote_offset: u64,
         mode: Mode,
-    ) -> Result<ffi::Operation<'a>, CuObjectError> {
+    ) -> Result<sdk::Operation<'a>, CuObjectError> {
         if key.contains('\0') {
             return Err(CuObjectError::Invalid("key contains NUL"));
         }
@@ -782,10 +793,10 @@ impl Region {
             .offset
             .checked_add(self.length)
             .ok_or(CuObjectError::Invalid("local range overflow"))?;
-        if end > ffi::size(&self.buffer) {
+        if end > sdk::size(&self.buffer) {
             return Err(CuObjectError::Invalid("transfer exceeds registration"));
         }
-        Ok(ffi::Operation {
+        Ok(sdk::Operation {
             key,
             token: &token.raw,
             address: token.address(remote_offset, self.length)?,
@@ -869,14 +880,17 @@ fn retain_until_completion<T>(
 }
 
 async fn await_completion(fd: &AsyncFd<sdk::CompletionFd>) -> Result<isize, CuObjectError> {
-    let mut events = [ffi::Completion::default(); 8];
+    let mut events = [sdk::Completion::default(); 8];
     loop {
         let mut ready = fd.readable().await.map_err(|source| CuObjectError::Os {
             op: "completion wait",
             source,
         })?;
         loop {
-            let n = fd.get_ref().drain(&mut events)?;
+            let n = fd.get_ref().drain(&mut events).map_err(|source| CuObjectError::Os {
+                op: "process completions",
+                source,
+            })?;
             if let Some(done) = events[..n].iter().find(|e| e.handle == 1) {
                 return Ok(done.status);
             }
@@ -1075,6 +1089,6 @@ mod tests {
         let region = server.region(&local).unwrap();
         drop(local);
         drop(server);
-        assert_eq!(ffi::size(&region.buffer), 40);
+        assert_eq!(sdk::size(&region.buffer), 40);
     }
 }

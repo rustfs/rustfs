@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "rustfs-cuobject/src/sdk.rs.h"
+#include "rustfs-cuobject-sys/src/sdk.rs.h"
 #include <cuobjserver.h>
 #include <array>
 #include <cerrno>

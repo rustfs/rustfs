@@ -14,13 +14,12 @@
 
 //! Private ABI for the NVIDIA server SDK.
 
-use crate::CuObjectError;
 use cxx::SharedPtr;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
 #[cxx::bridge(namespace = "rustfs::cuobject")]
-pub(super) mod ffi {
+mod ffi {
     #[derive(Clone, Copy, Debug)]
     struct Range {
         offset: usize,
@@ -75,33 +74,28 @@ unsafe impl Sync for ffi::Server {}
 unsafe impl Send for ffi::Buffer {}
 unsafe impl Sync for ffi::Buffer {}
 
-pub(super) fn failure(op: &'static str, err: cxx::Exception) -> CuObjectError {
-    CuObjectError::Os {
-        op,
-        source: io::Error::other(err),
-    }
-}
+pub use ffi::{Completion, Operation, Outcome, Range, data, header_version, open_server, register_buffer, scatter_list, size};
 
-pub(super) fn errno(status: isize) -> io::Error {
+pub type ServerHandle = SharedPtr<ffi::Server>;
+pub type BufferHandle = SharedPtr<ffi::Buffer>;
+
+pub fn errno(status: isize) -> io::Error {
     match status.checked_neg().and_then(|code| i32::try_from(code).ok()) {
         Some(code) => io::Error::from_raw_os_error(code),
         None => io::Error::other("invalid NVIDIA error status"),
     }
 }
 
-pub(super) struct Channel {
+pub struct Channel {
     server: SharedPtr<ffi::Server>,
     id: u16,
 }
 
 impl Channel {
-    pub(super) fn lease(server: &SharedPtr<ffi::Server>) -> Result<Self, CuObjectError> {
-        let id = ffi::lease_channel(server).map_err(|e| failure("lease channel", e))?;
+    pub fn lease(server: &SharedPtr<ffi::Server>) -> io::Result<Self> {
+        let id = ffi::lease_channel(server).map_err(io::Error::other)?;
         if id == u16::MAX {
-            return Err(CuObjectError::Os {
-                op: "lease channel",
-                source: io::Error::from_raw_os_error(libc::EBUSY),
-            });
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         Ok(Self {
             server: server.clone(),
@@ -109,7 +103,7 @@ impl Channel {
         })
     }
 
-    pub(super) fn fd(&self) -> Option<CompletionFd> {
+    pub fn fd(&self) -> Option<CompletionFd> {
         let fd = ffi::completion_fd(&self.server, self.id);
         (fd >= 0).then(|| CompletionFd {
             fd,
@@ -117,9 +111,13 @@ impl Channel {
         })
     }
 
-    /// The caller must own the registered bytes until a terminal response and
-    /// retain them if the SDK reports an unknown submission outcome.
-    pub(super) unsafe fn submit(&mut self, buffer: &ffi::Buffer, mut op: ffi::Operation<'_>) -> ffi::Outcome {
+    /// Submits a transfer to the leased channel.
+    ///
+    /// # Safety
+    /// The caller must exclusively own the local range, keep the remote token valid,
+    /// and retain the channel and registrations until the SDK confirms completion.
+    /// An unknown submission or undelivered completion must preserve those owners.
+    pub unsafe fn submit(&mut self, buffer: &ffi::Buffer, mut op: ffi::Operation<'_>) -> ffi::Outcome {
         op.channel = self.id;
         // SAFETY: the caller holds the range and the exclusive channel lease.
         unsafe { ffi::transfer(&self.server, buffer, &op) }
@@ -132,7 +130,7 @@ impl Drop for Channel {
     }
 }
 
-pub(super) struct CompletionFd {
+pub struct CompletionFd {
     fd: RawFd,
     server: SharedPtr<ffi::Server>,
 }
@@ -144,11 +142,8 @@ impl AsRawFd for CompletionFd {
 }
 
 impl CompletionFd {
-    pub(super) fn drain(&self, events: &mut [ffi::Completion]) -> Result<usize, CuObjectError> {
+    pub fn drain(&self, events: &mut [ffi::Completion]) -> io::Result<usize> {
         let count = ffi::drain(&self.server, self.fd, events);
-        usize::try_from(count).map_err(|_| CuObjectError::Os {
-            op: "process completions",
-            source: errno(count as isize),
-        })
+        usize::try_from(count).map_err(|_| errno(count as isize))
     }
 }
