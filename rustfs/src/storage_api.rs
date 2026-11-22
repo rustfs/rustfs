@@ -233,7 +233,6 @@ pub(crate) mod server {
                     StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
                     set_bucket_metadata,
                 };
-                pub(crate) use s3s::S3Request;
             }
         }
 

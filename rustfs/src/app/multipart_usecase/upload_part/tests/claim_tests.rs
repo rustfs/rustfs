@@ -14,6 +14,7 @@
 
 //! Upload target ownership and refusal order against real multipart state.
 
+use super::super::super::test_support::owned_envelope;
 use super::*;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
@@ -101,7 +102,7 @@ async fn native_claim_checks_order_ownership_and_one_active_lookup() {
                 Body::from(Bytes::from_static(b"abc"))
             }
         });
-        let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
+        let envelope = owned_envelope(Method::PUT);
         LOOKUP
             .scope((Cell::new(0), mode), async {
                 let result = usecase.execute_upload_part_with_audit(envelope, input).await;
@@ -211,7 +212,7 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                 copy_source_sse_customer_key: None,
                 copy_source_sse_customer_key_md5: None,
             };
-            let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
+            let envelope = owned_envelope(Method::PUT);
             LOOKUP
                 .scope((Cell::new(0), mode), async {
                     let result = Box::pin(usecase.execute_upload_part_copy_with_audit(envelope, input)).await;
