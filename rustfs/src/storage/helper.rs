@@ -1954,6 +1954,7 @@ mod tests {
                 // Drive the real data path: the principal built from this request is
                 // what carries the audit slot into the SSE code.
                 let metadata = unreadable_sse_kms_metadata();
+                use crate::storage::sse::SseKmsPrincipalExt as _;
                 let envelope = crate::app::RequestEnvelope::from_s3s(&req);
                 let principal =
                     crate::storage::sse::SseKmsPrincipal::from_request(&envelope).expect("authenticated request has a principal");

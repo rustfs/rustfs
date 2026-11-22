@@ -252,4 +252,237 @@ mod tests {
 
         println!("✅ Full cycle (generate -> encrypt DEK -> decrypt DEK -> decrypt data) test passed!");
     }
+
+    #[tokio::test]
+    async fn test_simple_sse_dek_provider_encrypt_decrypt() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
+
+        // 2. Generate a data encryption key
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let kms_key_id = "default"; // Key ID is ignored in simple provider
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+
+        let (data_key, _encrypted_dek) = provider
+            .generate_sse_dek(&context, kms_key_id)
+            .await
+            .expect("Failed to generate DEK");
+
+        // 3. Prepare test data (plaintext)
+        let plaintext = b"Hello, World! This is a test message for encryption and decryption.";
+        println!("Original plaintext: {:?}", String::from_utf8_lossy(plaintext));
+        println!("Plaintext length: {} bytes", plaintext.len());
+
+        // 4. Encrypt with EncryptReader.
+        let plaintext_reader = Cursor::new(plaintext.to_vec());
+        let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
+
+        // Read encrypted data
+        let mut encrypted_data = Vec::new();
+        encrypt_reader
+            .read_to_end(&mut encrypted_data)
+            .await
+            .expect("Failed to read encrypted data");
+
+        println!("Encrypted data length: {} bytes", encrypted_data.len());
+        println!(
+            "First 16 bytes of encrypted data: {:02x?}",
+            &encrypted_data[..16.min(encrypted_data.len())]
+        );
+
+        // Verify encrypted data is different from plaintext
+        assert_ne!(
+            &encrypted_data[..plaintext.len()],
+            plaintext,
+            "Encrypted data should be different from plaintext"
+        );
+
+        // 5. Decrypt with DecryptReader.
+        let encrypted_reader = Cursor::new(encrypted_data);
+        let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
+
+        // Read decrypted data
+        let mut decrypted_data = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted_data)
+            .await
+            .expect("Failed to read decrypted data");
+
+        println!("Decrypted data: {:?}", String::from_utf8_lossy(&decrypted_data));
+        println!("Decrypted length: {} bytes", decrypted_data.len());
+
+        // 6. Verify decrypted data matches original plaintext
+        assert_eq!(decrypted_data, plaintext, "Decrypted data should match original plaintext");
+
+        println!("✅ Encryption/Decryption test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_simple_sse_dek_provider_encrypt_decrypt_large_data() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
+
+        let bucket = "test-bucket";
+        let key = "test-key-large";
+        let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+
+        let (data_key, _encrypted_dek) = provider
+            .generate_sse_dek(&context, kms_key_id)
+            .await
+            .expect("Failed to generate DEK");
+
+        // Create 1MB of test data
+        let plaintext_size = 1024 * 1024; // 1MB
+        let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i % 256) as u8).collect();
+        println!("Testing with {} bytes of data", plaintext.len());
+
+        // Encrypt.
+        let plaintext_reader = Cursor::new(plaintext.clone());
+        let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
+
+        let mut encrypted_data = Vec::new();
+        encrypt_reader
+            .read_to_end(&mut encrypted_data)
+            .await
+            .expect("Failed to encrypt large data");
+
+        println!("Encrypted {} bytes to {} bytes", plaintext.len(), encrypted_data.len());
+
+        // Decrypt.
+        let encrypted_reader = Cursor::new(encrypted_data);
+        let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
+
+        let mut decrypted_data = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted_data)
+            .await
+            .expect("Failed to decrypt large data");
+
+        // Verify
+        assert_eq!(decrypted_data.len(), plaintext.len(), "Decrypted size should match original");
+        assert_eq!(decrypted_data, plaintext, "Decrypted data should match original plaintext");
+
+        println!("✅ Large data encryption/decryption test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_simple_sse_dek_provider_different_nonces() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
+
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+
+        // Generate two different keys (with different nonces)
+        let (data_key1, _) = provider
+            .generate_sse_dek(&context, kms_key_id)
+            .await
+            .expect("Failed to generate DEK 1");
+
+        let (data_key2, _) = provider
+            .generate_sse_dek(&context, kms_key_id)
+            .await
+            .expect("Failed to generate DEK 2");
+
+        // Verify nonces are different
+        assert_ne!(data_key1.nonce, data_key2.nonce, "Different keys should have different nonces");
+
+        // Same plaintext
+        let plaintext = b"Same plaintext";
+
+        // Encrypt with first key.
+        let reader1 = Cursor::new(plaintext.to_vec());
+        let mut encrypt_reader1 = EncryptReader::new(reader1, data_key1.plaintext_key, data_key1.nonce);
+        let mut encrypted1 = Vec::new();
+        encrypt_reader1.read_to_end(&mut encrypted1).await.unwrap();
+
+        // Encrypt with second key.
+        let reader2 = Cursor::new(plaintext.to_vec());
+        let mut encrypt_reader2 = EncryptReader::new(reader2, data_key2.plaintext_key, data_key2.nonce);
+        let mut encrypted2 = Vec::new();
+        encrypt_reader2.read_to_end(&mut encrypted2).await.unwrap();
+
+        // Verify ciphertexts are different (due to different nonces/keys)
+        assert_ne!(
+            encrypted1, encrypted2,
+            "Same plaintext with different nonces should produce different ciphertext"
+        );
+
+        println!("✅ Different nonces produce different ciphertext - test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_simple_sse_dek_provider_decrypt_with_encrypted_dek() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
+
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+
+        // 1. Generate DEK and get encrypted DEK
+        let (data_key, encrypted_dek) = provider
+            .generate_sse_dek(&context, kms_key_id)
+            .await
+            .expect("Failed to generate DEK");
+
+        let original_plaintext_key = data_key.plaintext_key;
+        let original_nonce = data_key.nonce;
+
+        // 2. Simulate storing encrypted_dek and nonce in metadata
+        // In real scenario, nonce would be stored separately in metadata
+
+        // 3. Later, decrypt the DEK
+        let decrypted_plaintext_key = provider
+            .decrypt_sse_dek(&encrypted_dek, kms_key_id, &context)
+            .await
+            .expect("Failed to decrypt DEK");
+
+        // 4. Verify decrypted key matches original
+        assert_eq!(
+            decrypted_plaintext_key, original_plaintext_key,
+            "Decrypted DEK should match original plaintext key"
+        );
+
+        // 5. Use decrypted key to encrypt/decrypt data
+        let plaintext = b"Test data with decrypted DEK";
+
+        // Encrypt with original key.
+        let reader = Cursor::new(plaintext.to_vec());
+        let mut encrypt_reader = EncryptReader::new(reader, original_plaintext_key, original_nonce);
+        let mut encrypted_data = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
+
+        // Decrypt with recovered key (simulating GET operation).
+        let reader = Cursor::new(encrypted_data);
+        let mut decrypt_reader = DecryptReader::new(
+            reader,
+            decrypted_plaintext_key,
+            original_nonce, // In real scenario, read from metadata
+        );
+        let mut decrypted_data = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted_data).await.unwrap();
+
+        // Verify
+        assert_eq!(decrypted_data, plaintext, "Data decrypted with recovered key should match original");
+
+        println!("✅ Full cycle (generate -> encrypt DEK -> decrypt DEK -> decrypt data) test passed!");
+    }
 }

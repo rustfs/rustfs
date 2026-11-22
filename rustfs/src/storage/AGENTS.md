@@ -12,7 +12,9 @@ Applies to `rustfs/src/storage/`.
 
 - Never log plaintext customer keys, decrypted key material, or sensitive SSE request payloads.
 - Keep SSE behavior aligned with KMS and admin handler integrations.
+- SSE key resolution lives in `crates/sse/`; `sse.rs` here only binds it to the running server (`RustfsSseHost`) and translates across the storage-engine boundary. Put new SSE logic in the crate unless it needs ecstore, IAM, or request types.
 - Coordinate related changes with:
+  - `crates/sse/`
   - `crates/kms/`
   - `rustfs/src/admin/handlers/kms*.rs`
   - `crates/ecstore/`
