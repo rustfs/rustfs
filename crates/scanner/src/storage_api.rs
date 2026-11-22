@@ -438,7 +438,7 @@ pub(crate) mod scanner_io {
         bucket::{
             lifecycle::bucket_lifecycle_ops::init_background_expiry,
             metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG},
-            metadata_sys::update as update_bucket_metadata,
+            metadata_sys::{get_config_from_disk, set_bucket_metadata, update as update_bucket_metadata},
         },
         data_usage::{
             apply_bucket_usage_memory_overlay, get_bucket_usage_memory, load_admin_data_usage_from_backend_cached,

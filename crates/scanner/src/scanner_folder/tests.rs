@@ -767,6 +767,41 @@ async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
 }
 
+#[test]
+fn size_ledger_hydration_does_not_readmit_smaller_records_older_than_a_byte_eviction() {
+    let now = 1000;
+    let bulk = MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET / 1024 - 1;
+    let mut records: HashMap<_, _> = (0..bulk + 2)
+        .map(|i| {
+            let key = format!("{i:01000}");
+            (
+                key.clone(),
+                SizeReconciliationEntry {
+                    key,
+                    first_seen: now,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    // Select the two final inputs in this map's actual drain order. The larger record
+    // overflows by itself. Its older, smaller sibling would otherwise fit in the gap.
+    for (i, record) in records.values_mut().enumerate() {
+        if i < bulk {
+            record.object = "x".repeat(1024 - size_reconciliation_entry_bytes(record));
+        } else if i == bulk {
+            record.first_seen = now - 1;
+            record.object = "x".repeat(512);
+        } else {
+            record.first_seen = now - 2;
+        }
+    }
+    let index = SizeLedgerIndex::from_persisted(&mut records, now);
+    assert_eq!(records.len(), bulk);
+    assert_eq!(index.bytes, bulk * 1024);
+    assert!(records.values().all(|record| record.first_seen == now));
+}
+
 #[tokio::test]
 async fn size_ledger_tracks_only_outstanding_scopes_and_preserves_eviction_order_after_restart() {
     let (mut scanner, root) = build_test_scanner().await;

@@ -36,6 +36,7 @@ impl SizeLedgerIndex {
 
     pub(super) fn from_persisted(records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) -> Self {
         let mut index = Self::default();
+        let mut evicted_through: Option<(u64, String)> = None;
         for (key, mut entry) in std::mem::take(records) {
             if key != entry.key || !Self::valid(&entry) {
                 continue;
@@ -46,12 +47,20 @@ impl SizeLedgerIndex {
             if now.saturating_sub(entry.first_seen) > MAX_SIZE_RECONCILIATION_AGE_SECS {
                 continue;
             }
+            // HashMap iteration can deliver a smaller, older record after a byte eviction.
+            // Every record through the last evicted age/key would also lose a full ordered prune.
+            if evicted_through
+                .as_ref()
+                .is_some_and(|(seen, cutoff)| (entry.first_seen, key.as_str()) <= (*seen, cutoff.as_str()))
+            {
+                continue;
+            }
             index.add(&entry);
             records.insert(key, entry);
             if records.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
                 || index.bytes > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
             {
-                index.prune(records, now);
+                evicted_through = index.prune(records, now);
             }
         }
         index
@@ -78,7 +87,8 @@ impl SizeLedgerIndex {
         }
     }
 
-    pub(super) fn prune(&mut self, records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) {
+    pub(super) fn prune(&mut self, records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) -> Option<(u64, String)> {
+        let mut last = None;
         while let Some((first_seen, key)) = self.by_age.first() {
             if now.saturating_sub(*first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
                 && records.len() <= MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
@@ -88,10 +98,12 @@ impl SizeLedgerIndex {
             }
             if let Some(entry) = records.remove(key) {
                 self.remove(&entry);
+                last = Some((entry.first_seen, entry.key));
             } else {
                 self.by_age.pop_first();
             }
         }
+        last
     }
 }
 
