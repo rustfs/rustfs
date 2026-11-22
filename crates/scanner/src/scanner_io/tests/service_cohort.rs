@@ -15,6 +15,30 @@
 use super::*;
 use crate::data_usage_define::{DATA_USAGE_OBJ_NAME_PATH, read_config_with_revision};
 
+// Two-pool EC fixtures keep many scan futures live at once and overflow
+// Linux libtest's default 2 MiB test-thread stack. Run each case on a
+// dedicated 32 MiB thread (same approach as scoped_entry_fallback).
+fn run_cohort_test<F, Fut>(thread_name: &'static str, test_fn: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("service cohort test runtime should build");
+            runtime.block_on(test_fn());
+        })
+        .expect("service cohort test thread should spawn");
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 async fn create_cohort_bucket(store: &ECStore, bucket: &str) {
     create_cohort_bucket_objects(store, bucket, 1).await;
 }
@@ -104,9 +128,16 @@ async fn run_cohort_cycle(
     (result, usage)
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn service_cohort_production_dispatch_services_waiters_across_sources() {
+fn service_cohort_production_dispatch_services_waiters_across_sources() {
+    run_cohort_test(
+        "cohort-prod-disp",
+        service_cohort_production_dispatch_services_waiters_across_sources_case,
+    );
+}
+
+async fn service_cohort_production_dispatch_services_waiters_across_sources_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     let hot = format!("a-hot-{}", Uuid::new_v4().simple());
@@ -197,9 +228,16 @@ async fn service_cohort_production_dispatch_services_waiters_across_sources() {
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn service_cohort_flat_bucket_budget_does_not_publish_unscanned_small_bucket() {
+fn service_cohort_flat_bucket_budget_does_not_publish_unscanned_small_bucket() {
+    run_cohort_test(
+        "cohort-flat-bud",
+        service_cohort_flat_bucket_budget_does_not_publish_unscanned_small_bucket_case,
+    );
+}
+
+async fn service_cohort_flat_bucket_budget_does_not_publish_unscanned_small_bucket_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     let flat = format!("a-flat-{}", Uuid::new_v4().simple());
@@ -283,9 +321,16 @@ async fn service_cohort_flat_bucket_budget_does_not_publish_unscanned_small_buck
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn service_cohort_fresh_complete_aggregate_preserves_reordered_sources() {
+fn service_cohort_fresh_complete_aggregate_preserves_reordered_sources() {
+    run_cohort_test(
+        "cohort-fresh-agg",
+        service_cohort_fresh_complete_aggregate_preserves_reordered_sources_case,
+    );
+}
+
+async fn service_cohort_fresh_complete_aggregate_preserves_reordered_sources_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     for bucket in ["cohort-first", "cohort-second"] {
@@ -329,9 +374,16 @@ async fn service_cohort_fresh_complete_aggregate_preserves_reordered_sources() {
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_permits() {
+fn service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_permits() {
+    run_cohort_test(
+        "cohort-cancelled",
+        service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_permits_case,
+    );
+}
+
+async fn service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_permits_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     let bucket = format!("cancel-{}", Uuid::new_v4().simple());
@@ -360,9 +412,16 @@ async fn service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_perm
 /// N=17, q=4: every bucket reaches a worker within ceil(17/4)=5 rounds while
 /// one bucket stays hot and another fails forever, with leader-local state
 /// discarded after each round as a restart would.
-#[tokio::test]
+#[test]
 #[serial]
-async fn cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket() {
+fn cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket() {
+    run_cohort_test(
+        "cold-svc-bound",
+        cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket_case,
+    );
+}
+
+async fn cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket_case() {
     const BUCKETS: usize = 17;
     const QUANTA: u64 = 4;
     const ROUND_BOUND: usize = 5;
@@ -434,9 +493,16 @@ fn quantum_budget(quantum: crate::scanner_budget::ScannerBucketQuantum) -> Arc<S
     )
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn source_turn_dispatch_rotates_real_sources_and_retains_completed_roots() {
+fn source_turn_dispatch_rotates_real_sources_and_retains_completed_roots() {
+    run_cohort_test(
+        "src-turn-disp",
+        source_turn_dispatch_rotates_real_sources_and_retains_completed_roots_case,
+    );
+}
+
+async fn source_turn_dispatch_rotates_real_sources_and_retains_completed_roots_case() {
     let mut evidence = None;
     temp_env::async_with_vars([(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("1"))], async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -503,9 +569,16 @@ async fn source_turn_dispatch_rotates_real_sources_and_retains_completed_roots()
     );
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn source_turn_zero_new_frontier_stops_requeuing_without_starving_other_sources() {
+fn source_turn_zero_new_frontier_stops_requeuing_without_starving_other_sources() {
+    run_cohort_test(
+        "src-turn-zero",
+        source_turn_zero_new_frontier_stops_requeuing_without_starving_other_sources_case,
+    );
+}
+
+async fn source_turn_zero_new_frontier_stops_requeuing_without_starving_other_sources_case() {
     temp_env::async_with_vars([(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("1"))], async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
         let (_dir, store) = setup_two_pool_scanner_store().await;
@@ -533,9 +606,13 @@ async fn source_turn_zero_new_frontier_stops_requeuing_without_starving_other_so
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets() {
+fn fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets() {
+    run_cohort_test("fair-spent-qm", fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets_case);
+}
+
+async fn fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets_case() {
     let (_dir, store) = setup_local_scanner_store(1, 4).await;
     clear_dirty_usage_buckets_for_tests();
     create_cohort_bucket_objects(&store, "a-flat", 6).await;
@@ -565,9 +642,13 @@ async fn fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets() {
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn() {
+fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn() {
+    run_cohort_test("fair-no-motion", fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn_case);
+}
+
+async fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn_case() {
     let (_dir, store) = setup_local_scanner_store(1, 4).await;
     clear_dirty_usage_buckets_for_tests();
     create_cohort_bucket_objects(&store, "a-flat", 6).await;
@@ -590,9 +671,16 @@ async fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn() {
 
 /// A one-object share stops inside its first child, so the frontier never
 /// moves. Requeuing that bucket would spin until the cycle deadline.
-#[tokio::test]
+#[test]
 #[serial]
-async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeuing() {
+fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeuing() {
+    run_cohort_test(
+        "fair-rep-share",
+        fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeuing_case,
+    );
+}
+
+async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeuing_case() {
     let (_dir, store) = setup_local_scanner_store(1, 4).await;
     clear_dirty_usage_buckets_for_tests();
     create_cohort_bucket_objects(&store, "a-flat", 3).await;
@@ -613,9 +701,16 @@ async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeui
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners() {
+fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners() {
+    run_cohort_test(
+        "cold-saved-ord",
+        cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners_case,
+    );
+}
+
+async fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners_case() {
     let (_dir, store) = setup_local_scanner_store(1, 4).await;
     clear_dirty_usage_buckets_for_tests();
     create_cohort_bucket(&store, "cold-only").await;

@@ -47,6 +47,7 @@ use rand::seq::SliceRandom;
 use rustfs_filemeta::{
     FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetadataResolutionParams,
 };
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration;
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
     ListObjectsGatherCaller, ListObjectsGatherObservation,
@@ -77,6 +78,113 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
+
+/// Evidence from a single named object during free-version recovery.
+#[derive(Debug)]
+pub(crate) enum TierRecoveryEntry {
+    Version(Box<ObjectInfo>),
+    Unreadable { object: String },
+}
+
+enum ListingMergeOutput {
+    Entries(Sender<MetaCacheEntry>),
+    TierRecovery {
+        sender: Sender<Result<TierRecoveryEntry>>,
+        bucket: String,
+        versioning: Option<PersistedVersioningConfiguration>,
+        marker: Option<String>,
+    },
+}
+
+impl From<Sender<MetaCacheEntry>> for ListingMergeOutput {
+    fn from(sender: Sender<MetaCacheEntry>) -> Self {
+        Self::Entries(sender)
+    }
+}
+
+impl ListingMergeOutput {
+    fn accepts_key(&self, key: &str) -> Result<bool> {
+        if let Self::TierRecovery { marker, .. } = self {
+            if key.is_empty() {
+                return Err(Error::FileCorrupt);
+            }
+            // The drive may repeat the last key. A recovery cursor covers every
+            // version (or the unreadable metadata) at that key.
+            return Ok(marker.as_deref().is_none_or(|marker| key > marker));
+        }
+        Ok(true)
+    }
+
+    async fn send_group(
+        &self,
+        cancel: &CancellationToken,
+        mut entry: MetaCacheEntry,
+        others: std::vec::Drain<'_, MetaCacheEntry>,
+        last_emitted: &mut String,
+    ) -> Result<bool> {
+        if !self.accepts_key(&entry.name)? {
+            return Ok(true);
+        }
+        let merge = if others.as_slice().is_empty() {
+            Ok(())
+        } else {
+            merge_object_entry_versions(
+                &mut entry,
+                others,
+                match self {
+                    Self::Entries(_) => log_listing_merge_corruption,
+                    // Recovery reports unreadable keys once per page.
+                    Self::TierRecovery { .. } => |_, _, _| {},
+                },
+            )
+        };
+        let is_new = entry.name != *last_emitted;
+        if is_new {
+            last_emitted.clone_from(&entry.name);
+        }
+        match (self, merge) {
+            (Self::TierRecovery { sender, .. }, Err(Error::FileCorrupt)) if is_new => {
+                send_or_cancel(cancel, sender, Ok(TierRecoveryEntry::Unreadable { object: entry.name })).await
+            }
+            (Self::TierRecovery { .. }, Err(Error::FileCorrupt)) => Ok(true),
+            (_, Err(err)) => Err(err),
+            (_, Ok(())) if is_new => self.send(cancel, entry).await,
+            (_, Ok(())) => Ok(true),
+        }
+    }
+
+    async fn send(&self, cancel: &CancellationToken, entry: MetaCacheEntry) -> Result<bool> {
+        match self {
+            Self::Entries(sender) => send_or_cancel(cancel, sender, entry).await,
+            Self::TierRecovery {
+                sender,
+                bucket,
+                versioning,
+                ..
+            } => {
+                if entry.is_dir() {
+                    return Ok(true);
+                }
+                // This operation decodes an already enumerated buffer. Even
+                // parser errors wrapping UnexpectedEof are local to this key.
+                let versions = match entry.file_info_versions_with_free_versions(bucket) {
+                    Ok(versions) => versions,
+                    Err(_) => {
+                        return send_or_cancel(cancel, sender, Ok(TierRecoveryEntry::Unreadable { object: entry.name })).await;
+                    }
+                };
+                let versioned = versioning.as_ref().is_some_and(|v| v.versioned(&entry.name));
+                for fi in versions.versions.into_iter().chain(versions.free_versions) {
+                    let info = ObjectInfo::from_owned_file_info(fi, bucket, &entry.name, versioned);
+                    if !send_or_cancel(cancel, sender, Ok(TierRecoveryEntry::Version(Box::new(info)))).await? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
 
 fn unversioned_authoritative_page(bucket: &str, page: ListPage) -> Result<ListObjectVersionsInfo> {
     let mut objects = Vec::new();
@@ -1358,7 +1466,7 @@ impl ECStore {
             return Ok(Vec::new());
         };
         if entries.len() > 0 {
-            merge_object_entry_versions(&mut entry, entries)?;
+            merge_object_entry_versions(&mut entry, entries, log_listing_merge_corruption)?;
         }
         // This projection excludes tier free-version bookkeeping but retains
         // pending version purges for the evaluator's replication safeguards.
@@ -1714,12 +1822,63 @@ impl ECStore {
         check_list_objs_args(bucket, prefix, &None)?;
 
         let rx = rx.child_token();
+        let (sender, receiver) = mpsc::channel(100);
+        // Some strict consumers drain the result only after walk returns.
+        let _forwarder = spawn_walk_entry_forwarder(rx.clone(), receiver, result, opts.clone(), bucket.to_owned());
+        self.walk_merged_entries(rx, bucket, prefix, opts, sender.into()).await
+    }
+
+    pub(crate) async fn walk_for_tier_recovery(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+        bucket: &str,
+        sender: Sender<Result<TierRecoveryEntry>>,
+        mut opts: WalkOptions,
+    ) -> Result<()> {
+        check_list_objs_args(bucket, "", &None)?;
+        let cancel = cancel.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let versioning = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = sender.closed() => return Ok(()),
+            result = get_versioning_config(bucket) => result.ok().map(|(config, _)| config),
+        };
+        if opts.marker.is_some() && opts.limit > 0 {
+            // Drives include forward_to in their limit; the consumer counts
+            // only distinct keys strictly beyond the recovery marker.
+            opts.limit = opts.limit.saturating_add(1);
+        }
+        let output = ListingMergeOutput::TierRecovery {
+            sender,
+            bucket: bucket.to_owned(),
+            versioning,
+            marker: opts.marker.clone(),
+        };
+        self.walk_merged_entries(cancel, bucket, "", opts, output).await
+    }
+
+    async fn walk_merged_entries(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        opts: WalkOptions,
+        output: ListingMergeOutput,
+    ) -> Result<()> {
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
         for eset in self.pools.iter() {
             for set in eset.disk_set.iter() {
-                let (mut disks, infos, _) = set.get_online_disks_with_healing_and_info(true).await;
+                let online_disks = set.get_online_disks_with_healing_and_info(true);
+                let (mut disks, infos, _) = match &output {
+                    ListingMergeOutput::Entries(_) => online_disks.await,
+                    ListingMergeOutput::TierRecovery { sender, .. } => tokio::select! {
+                        _ = rx.cancelled() => return Ok(()),
+                        _ = sender.closed() => return Ok(()),
+                        disks = online_disks => disks,
+                    },
+                };
                 let opts = opts.clone();
 
                 let (sender, list_out_rx) = mpsc::channel::<MetaCacheEntry>(1);
@@ -1832,13 +1991,7 @@ impl ECStore {
             }
         }
 
-        let (merge_tx, merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        let bucket = bucket.to_owned();
-        // Not awaited: callers may drain `result` only after this returns, so
-        // waiting on the forwarder here could stall them on the channel bound.
-        let _forwarder = spawn_walk_entry_forwarder(rx.clone(), merge_rx, result, opts, bucket.clone());
-
-        let merge_task = spawn_listing_merge(rx, inputs, merge_tx);
+        let merge_task = spawn_listing_merge(rx, inputs, output);
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
@@ -1918,6 +2071,23 @@ impl ECStore {
             return Err(Error::other("authoritative object walk was cancelled"));
         }
         Ok(())
+    }
+}
+
+/// Stop the producers if recovery drops its receiver, retaining terminal
+/// producer errors that may already be in flight.
+async fn run_tier_walk_with_consumer(
+    cancel: &CancellationToken,
+    consumer: &Sender<Result<TierRecoveryEntry>>,
+    walk: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(walk);
+    tokio::select! {
+        result = &mut walk => result,
+        _ = consumer.closed() => {
+            cancel.cancel();
+            walk.await
+        }
     }
 }
 
@@ -2476,7 +2646,7 @@ async fn send_or_cancel<T: Send>(rx: &CancellationToken, out_channel: &Sender<T>
     }
 }
 
-fn listing_merge_corruption(object: &str, version_id: Option<Uuid>, validation: &'static str) -> Error {
+fn log_listing_merge_corruption(object: &str, version_id: Option<Uuid>, validation: &'static str) {
     error!(
         event = EVENT_LISTING_MERGE_REJECTED,
         component = LOG_COMPONENT_ECSTORE,
@@ -2487,30 +2657,39 @@ fn listing_merge_corruption(object: &str, version_id: Option<Uuid>, validation: 
         validation,
         "Listing version merge rejected metadata"
     );
-    Error::FileCorrupt
 }
 
 /// Each input has already been resolved inside its own erasure set. This is a
 /// union of version histories, never a quorum vote between unrelated pools.
-fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator<Item = MetaCacheEntry>) -> Result<()> {
-    let name = first.name.clone();
+fn merge_object_entry_versions(
+    first: &mut MetaCacheEntry,
+    others: impl Iterator<Item = MetaCacheEntry>,
+    report_corruption: fn(&str, Option<Uuid>, &'static str),
+) -> Result<()> {
+    let name = first.name.as_str();
+    let corrupt = |version_id, validation| {
+        report_corruption(name, version_id, validation);
+        Error::FileCorrupt
+    };
     let mut versions: HashMap<(Option<Uuid>, bool), (FileMetaShallowVersion, ObjectInfo)> = HashMap::new();
-    for mut entry in std::iter::once(std::mem::take(first)).chain(others) {
-        let meta = match entry.cached.take() {
+    let inputs = std::iter::once((first.cached.take(), std::mem::take(&mut first.metadata)))
+        .chain(others.map(|entry| (entry.cached, entry.metadata)));
+    for (cached, metadata) in inputs {
+        let meta = match cached {
             Some(meta) => meta,
-            None => FileMeta::load(&entry.metadata).map_err(|_| listing_merge_corruption(&name, None, "metadata_decode"))?,
+            None => FileMeta::load(&metadata).map_err(|_| corrupt(None, "metadata_decode"))?,
         };
         if meta.versions.is_empty() {
-            return Err(listing_merge_corruption(&name, None, "empty_version_stack"));
+            return Err(corrupt(None, "empty_version_stack"));
         }
         for version in meta.versions {
-            let corrupt = |validation| listing_merge_corruption(&name, version.header.version_id, validation);
+            let corrupt = |validation| corrupt(version.header.version_id, validation);
             let parsed = version.parse_version_meta().map_err(|_| corrupt("version_decode"))?;
             if !parsed.valid() || parsed.version_type != version.header.version_type {
                 return Err(corrupt("version_type_or_validity"));
             }
             let fi = parsed
-                .into_fileinfo("", &name, true)
+                .into_fileinfo("", name, true)
                 .map_err(|_| corrupt("file_info_decode"))?;
             let version_id = fi.version_id.filter(|id| !id.is_nil());
             if version_id != version.header.version_id.filter(|id| !id.is_nil())
@@ -2519,7 +2698,7 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
             {
                 return Err(corrupt("version_header_mismatch"));
             }
-            let info = ObjectInfo::from_file_info(&fi, "", &name, true);
+            let info = ObjectInfo::from_file_info(&fi, "", name, true);
             let identity = (version_id, version.header.free_version());
             match versions.entry(identity) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
@@ -2588,13 +2767,9 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
             std::cmp::Ordering::Equal
         }
     });
-    let metadata = merged.marshal_msg()?;
-    *first = MetaCacheEntry {
-        name,
-        metadata,
-        cached: Some(merged),
-        reusable: true,
-    };
+    first.metadata = merged.marshal_msg()?;
+    first.cached = Some(merged);
+    first.reusable = true;
     Ok(())
 }
 
@@ -2603,11 +2778,25 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
 fn spawn_listing_merge(
     rx: CancellationToken,
     inputs: Vec<Receiver<MetaCacheEntry>>,
-    sender: Sender<MetaCacheEntry>,
+    sender: impl Into<ListingMergeOutput>,
 ) -> AbortOnDropHandle<Result<()>> {
+    let sender = sender.into();
     AbortOnDropHandle::new(tokio::spawn(
         async move {
-            let result = merge_entry_channels(rx.clone(), inputs, sender, 1).await;
+            let consumer = match &sender {
+                ListingMergeOutput::TierRecovery { sender, .. } => Some(sender.clone()),
+                ListingMergeOutput::Entries(_) => None,
+            };
+            let merge = merge_entry_channels(rx.clone(), inputs, sender, 1);
+            let result = match consumer {
+                Some(consumer) => {
+                    // End the event stream as soon as merge finishes, even if a
+                    // drive is still winding down. Recovery bounds that join.
+                    let _stop_producers = rx.clone().drop_guard();
+                    run_tier_walk_with_consumer(&rx, &consumer, merge).await
+                }
+                None => merge.await,
+            };
             if result.is_err() {
                 rx.cancel();
             }
@@ -2620,7 +2809,7 @@ fn spawn_listing_merge(
 async fn merge_entry_channels(
     rx: CancellationToken,
     in_channels: Vec<Receiver<MetaCacheEntry>>,
-    out_channel: Sender<MetaCacheEntry>,
+    out_channel: impl Into<ListingMergeOutput>,
     read_quorum: usize,
 ) -> Result<()> {
     let completions = (0..in_channels.len()).map(|_| None).collect();
@@ -2633,9 +2822,10 @@ async fn merge_entry_channels_with_cuts(
     rx: CancellationToken,
     in_channels: Vec<Receiver<MetaCacheEntry>>,
     mut completions: Vec<Option<MergeCompletion>>,
-    out_channel: Sender<MetaCacheEntry>,
+    out_channel: impl Into<ListingMergeOutput>,
     read_quorum: usize,
 ) -> Result<Option<String>> {
+    let out_channel = out_channel.into();
     if in_channels.is_empty() {
         return Ok(None);
     }
@@ -2648,8 +2838,7 @@ async fn merge_entry_channels_with_cuts(
             tokio::select! {
                 has_entry = in_channels[0].recv()=>{
                     if let Some(entry) = has_entry{
-                        // warn!("merge_entry_channels entry {}", &entry.name);
-                        if !send_or_cancel(&rx, &out_channel, entry).await? {
+                        if out_channel.accepts_key(&entry.name)? && !out_channel.send(&rx, entry).await? {
                             return Ok(None);
                         }
                     } else {
@@ -2755,21 +2944,12 @@ async fn merge_entry_channels_with_cuts(
             }
         }
 
-        if !object_entries.is_empty()
-            && let Some(winner) = object_winner.as_mut()
-        {
-            merge_object_entry_versions(&mut winner.entry, object_entries.drain(..))?;
-        }
-
         if let Some(head) = object_winner.or(dir_winner)
-            && head.entry.name != last_emitted
+            && !out_channel
+                .send_group(&rx, head.entry, object_entries.drain(..), &mut last_emitted)
+                .await?
         {
-            last_emitted.clear();
-            last_emitted.push_str(&head.entry.name);
-            let MergeHead { entry, .. } = *head;
-            if !send_or_cancel(&rx, &out_channel, entry).await? {
-                return Ok(None);
-            }
+            return Ok(None);
         }
 
         for &idx in &refill {
@@ -3606,6 +3786,137 @@ mod test {
         );
         assert!(entry_tx.is_closed());
         assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tier_recovery_walk_isolates_named_decode_and_cross_pool_merge_failures() {
+        use super::{ListingMergeOutput, TierRecoveryEntry};
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt().with_writer(logs.clone()).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let corrupt = |name: &str| MetaCacheEntry {
+            name: name.to_owned(),
+            metadata: vec![0xff],
+            ..Default::default()
+        };
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid version timestamp");
+        let mut inputs = Vec::new();
+        for entries in [
+            vec![
+                corrupt("a-marker"),
+                test_object_meta_entry("b-healthy"),
+                corrupt("c-bad-buffer"),
+                test_object_meta_entry_with_erasure_versions("d-conflict", &[(time, "first-etag", 2, 2)]),
+            ],
+            vec![
+                test_object_meta_entry_with_erasure_versions("d-conflict", &[(time, "different-etag", 2, 2)]),
+                test_object_meta_entry("e-later"),
+            ],
+        ] {
+            let (tx, rx) = mpsc::channel(entries.len());
+            for entry in entries {
+                tx.try_send(entry).expect("buffer each sorted set stream");
+            }
+            inputs.push(rx);
+        }
+        let (sender, mut events) = mpsc::channel(8);
+        let output = ListingMergeOutput::TierRecovery {
+            sender,
+            bucket: "bucket".to_owned(),
+            versioning: None,
+            marker: Some("a-marker".to_owned()),
+        };
+        merge_entry_channels(CancellationToken::new(), inputs, output, 1)
+            .await
+            .expect("isolated metadata failures should allow the walk to finish");
+        assert!(
+            !logs.contents().contains("Listing version merge rejected metadata"),
+            "recovery reports its unreadable keys in one page summary"
+        );
+        let mut actual = Vec::new();
+        while let Some(event) = events.recv().await {
+            actual.push(match event.expect("each event belongs to an enumerated key") {
+                TierRecoveryEntry::Version(info) => (info.name, false),
+                TierRecoveryEntry::Unreadable { object } => (object, true),
+            });
+        }
+        assert_eq!(
+            actual,
+            [
+                ("b-healthy".to_owned(), false),
+                ("c-bad-buffer".to_owned(), true),
+                ("d-conflict".to_owned(), true),
+                ("e-later".to_owned(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_recovery_walk_closes_event_stream_before_joining_drives() {
+        let (source, input) = mpsc::channel(1);
+        let (sender, mut events) = mpsc::channel(1);
+        let output = super::ListingMergeOutput::TierRecovery {
+            sender,
+            bucket: "bucket".to_owned(),
+            versioning: None,
+            marker: None,
+        };
+        let cancel = CancellationToken::new();
+        let merge = super::spawn_listing_merge(cancel.clone(), vec![input], output);
+        // A later drive join may still be pending. Recovery must be able to
+        // observe EOF and apply its shutdown timeout as soon as the merge ends.
+        drop(source);
+        timeout(Duration::from_secs(5), async {
+            assert!(events.recv().await.is_none());
+            cancel.cancelled().await;
+            merge.await.expect("merge worker must not panic").expect("clean stream");
+        })
+        .await
+        .expect("end of stream must release producers before their final join");
+    }
+
+    #[tokio::test]
+    async fn tier_recovery_walk_dropped_receiver_cancels_producers_and_preserves_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let (started_tx, started) = oneshot::channel();
+        let producer = async {
+            started_tx.send(()).expect("notify that the producer is running");
+            cancel.cancelled().await;
+            Err(StorageError::FaultyDisk)
+        };
+        let close_receiver = async {
+            started.await.expect("wait for the active producer");
+            drop(receiver);
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(super::run_tier_walk_with_consumer(&cancel, &sender, producer), close_receiver)
+        })
+        .await
+        .expect("receiver loss must cancel the active walk");
+        assert_eq!(result.expect_err("terminal disk errors must still propagate"), StorageError::FaultyDisk);
+    }
+
+    #[tokio::test]
+    async fn tier_recovery_walk_propagates_unattributed_failures() {
+        let (source, input) = mpsc::channel(1);
+        let (complete, completion) = oneshot::channel();
+        drop(source);
+        complete
+            .send(Err(StorageError::FileCorrupt))
+            .expect("set should report its terminal error");
+        let (sender, mut events) = mpsc::channel(1);
+        let output = super::ListingMergeOutput::TierRecovery {
+            sender,
+            bucket: "bucket".to_owned(),
+            versioning: None,
+            marker: None,
+        };
+        let error = merge_entry_channels_with_cuts(CancellationToken::new(), vec![input], vec![Some(completion)], output, 1)
+            .await
+            .expect_err("corruption without a trusted object key must abort recovery");
+        assert_eq!(error, StorageError::FileCorrupt);
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -8749,7 +9060,7 @@ mod test {
                 .insert("x-amz-meta-private".to_string(), "sensitive-value-must-not-be-logged".to_string());
         });
         assert_eq!(
-            super::merge_object_entry_versions(&mut original, std::iter::once(conflicting))
+            super::merge_object_entry_versions(&mut original, std::iter::once(conflicting), super::log_listing_merge_corruption)
                 .expect_err("conflicting user metadata must still fail closed"),
             StorageError::FileCorrupt
         );
