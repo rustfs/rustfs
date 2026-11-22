@@ -1200,6 +1200,43 @@ async fn terminal_frame_without_eof_still_obeys_semantic_stall_timeout() {
     assert!(error.to_string().contains("no semantic progress"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn heartbeat_frames_without_discovery_do_not_extend_semantic_deadline() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let (mut writer, reader) = tokio::io::duplex(4096);
+    let heartbeats = tokio::spawn(async move {
+        let mut sequence = 0;
+        loop {
+            write_frame(
+                &mut writer,
+                &writer_auth,
+                &mut sequence,
+                &RemoteScannerFrame::with_phase(
+                    RemoteScannerProgress::default(),
+                    RemoteScannerPhase::Scanning,
+                    RemoteScannerFrameResult::Progress,
+                ),
+            )
+            .await
+            .expect("deliver authenticated heartbeat");
+            writer.flush().await.expect("flush heartbeat");
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+    });
+    let owner = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&owner, ScannerCycleBudgetConfig::default());
+    let started = Instant::now();
+    let error = consume_remote_scanner_stream(reader, owner, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+        .await
+        .expect_err("heartbeats without work cannot keep the scanner alive");
+    assert!(error.to_string().contains("no semantic progress"));
+    assert_eq!(started.elapsed(), NS_SCANNER_SEMANTIC_STALL_TIMEOUT);
+    heartbeats.abort();
+    let _ = heartbeats.await;
+}
+
 struct ResetAfterFrame {
     bytes: Vec<u8>,
     position: usize,

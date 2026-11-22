@@ -963,9 +963,14 @@ async fn scan_and_persist_local_bucket_with_store(
             }
         })?;
     let mut cache = DataUsageCache::default();
-    let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
-        RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
-    })?;
+    let Some(mut revisions) = Box::pin(cache.load_for_scan(set.clone(), &cache_name, &ctx, &budget))
+        .await
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
+        })?
+    else {
+        return Ok(RemoteScannerFrameResult::Partial);
+    };
     let expected_incarnation = cache
         .info
         .scan_identity

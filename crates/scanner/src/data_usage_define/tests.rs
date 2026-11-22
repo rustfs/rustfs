@@ -653,6 +653,7 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
     cache.replace("bucket", "", DataUsageEntry::default());
     let revisions = DataUsageCacheRevisions {
         main: DataUsageCacheRevision::Missing,
+        damaged_pages: DamagedPages::default(),
         backup: None,
     };
 
@@ -779,6 +780,7 @@ fn baseline_revisions_allow_only_a_decoded_unchanged_primary_backup_catchup() {
         revisions: DataUsageCacheRevisions {
             main: etag("primary"),
             backup: Some(etag("old-backup")),
+            damaged_pages: DamagedPages::default(),
         },
         loaded_from_main: true,
     };
@@ -2953,6 +2955,7 @@ async fn test_save_backup_budget_tracks_primary_cost() {
         let store = Arc::new(store);
         let revisions = DataUsageCacheRevisions {
             main: DataUsageCacheRevision::Missing,
+            damaged_pages: DamagedPages::default(),
             backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
         };
         DataUsageCache::default()
@@ -3005,6 +3008,7 @@ async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
             let store = Arc::new(store);
             let revisions = DataUsageCacheRevisions {
                 main: DataUsageCacheRevision::Missing,
+                damaged_pages: DamagedPages::default(),
                 backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
             };
             let started = Instant::now();
