@@ -513,8 +513,11 @@ where
             if this.ciphertext_buf.len() < package_len {
                 this.ciphertext_buf.resize(package_len, 0);
             }
+            // `ciphertext_read` is zero when a package starts and is reset only
+            // once that package is opened: a `Pending` below re-enters here with
+            // the header already buffered and must resume after the ciphertext
+            // already read rather than refill the buffer from its start.
             *this.ciphertext_len = package_len;
-            *this.ciphertext_read = 0;
 
             while *this.ciphertext_read < *this.ciphertext_len {
                 let mut read_buf = ReadBuf::new(&mut this.ciphertext_buf[*this.ciphertext_read..*this.ciphertext_len]);
@@ -983,5 +986,113 @@ mod tests {
             .await
             .expect_err("multipart stream truncated within a part must fail");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A bounded pipe whose producer lags the consumer: it hands out at most
+    /// `capacity` bytes, then reports `Pending` once before the next refill.
+    struct RefillingPipe {
+        data: Vec<u8>,
+        position: usize,
+        capacity: usize,
+        available: usize,
+    }
+
+    impl RefillingPipe {
+        fn new(data: Vec<u8>, capacity: usize) -> Self {
+            Self {
+                data,
+                position: 0,
+                capacity,
+                available: capacity,
+            }
+        }
+    }
+
+    impl AsyncRead for RefillingPipe {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let unread = self.data.len() - self.position;
+            if unread > 0 && self.available == 0 {
+                self.available = self.capacity;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let len = min(min(unread, self.available), buf.remaining());
+            let start = self.position;
+            buf.put_slice(&self.data[start..start + len]);
+            self.position += len;
+            self.available -= len;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn patterned_plaintext(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| u8::try_from((index + seed) % 251).expect("a remainder below 251 fits in u8"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn decrypt_reader_resumes_a_package_after_pending_mid_ciphertext() {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+        let object_key = [0x3Du8; 32];
+
+        // (plaintext length, pipe capacity). The first group is a single package
+        // slightly larger than a 64 KiB pipe; the second is a multi-package stream
+        // whose packages straddle 1 MiB refills; the last drains byte by byte so
+        // every header and ciphertext position sees a `Pending`.
+        let mut failures = Vec::new();
+        for (plaintext_len, capacity) in [
+            (DARE_PAYLOAD_SIZE - 1, 64 * KIB),
+            (DARE_PAYLOAD_SIZE, 64 * KIB),
+            (DARE_PAYLOAD_SIZE + 1, 64 * KIB),
+            (70 * KIB, 64 * KIB),
+            (3 * MIB, MIB),
+            (3 * MIB + 1, MIB),
+            (DARE_PAYLOAD_SIZE + 17, 1),
+        ] {
+            let plaintext = patterned_plaintext(plaintext_len, capacity);
+            let mut encrypted = Vec::new();
+            EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypt singlepart stream");
+
+            let mut decrypted = Vec::new();
+            let outcome = DecryptReader::new_with_object_key(RefillingPipe::new(encrypted, capacity), object_key)
+                .read_to_end(&mut decrypted)
+                .await;
+            match outcome {
+                Ok(_) if decrypted == plaintext => {}
+                Ok(_) => failures.push(format!("{plaintext_len} bytes through a {capacity}-byte pipe: plaintext mismatch")),
+                Err(err) => failures.push(format!("{plaintext_len} bytes through a {capacity}-byte pipe: {err}")),
+            }
+        }
+
+        assert!(failures.is_empty(), "decrypt failed for: {failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn multipart_decrypt_reader_resumes_a_package_after_pending_mid_ciphertext() {
+        const MIB: usize = 1024 * 1024;
+        let object_key = [0x5Eu8; 32];
+        let part_plaintexts = [patterned_plaintext(5 * MIB, 1), patterned_plaintext(MIB + 17, 2)];
+
+        let mut encrypted = Vec::new();
+        for (part_number, part_plaintext) in (1u32..).zip(&part_plaintexts) {
+            EncryptReader::new_multipart_with_object_key(Cursor::new(part_plaintext.clone()), object_key, part_number)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypt multipart part");
+        }
+
+        let mut decrypted = Vec::new();
+        DecryptReader::new_multipart_with_object_key(RefillingPipe::new(encrypted, MIB), object_key, vec![1, 2])
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decrypt multipart stream through a 1 MiB pipe");
+
+        assert!(decrypted == part_plaintexts.concat(), "multipart plaintext mismatch through a 1 MiB pipe");
     }
 }
