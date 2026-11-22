@@ -177,7 +177,7 @@ These have no persistent key and are read from the environment only.
 | `RUSTFS_SCANNER_ALERT_COOLDOWN_SECS` | `86400` (`DEFAULT_SCANNER_ALERT_COOLDOWN_SECS`, `scanner_folder.rs`) | Per-(kind, bucket, object) cooldown between S3 excess-alert events; `0` emits every cycle. See [Scanner Excess Alerts](scanner-excess-alerts.md). |
 | `RUSTFS_SCANNER_DEEP_VERIFY_COOLDOWN_SECS` | `60` (`DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS`, `scanner_folder.rs`) | Objects modified within this window are skipped by deep (bitrot) verification in the current cycle. |
 | `RUSTFS_HEAL_OBJECT_SELECT_PROB` | `1024` (`DEFAULT_HEAL_OBJECT_SELECT_PROB`, `scanner_folder.rs`) | Sampling divisor for scanner-originated heal checks: roughly one object in N per cycle is selected for a low-priority heal check. |
-| `RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES` | `16` (`DATA_USAGE_UPDATE_DIR_CYCLES`, `scanner_folder.rs`) | Every N cycles a compacted directory is re-descended instead of reusing its cached usage. `1` forces re-descent every cycle (used by lifecycle e2e lanes). |
+| `RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES` | `16` (`DATA_USAGE_UPDATE_DIR_CYCLES`, `scanner_folder.rs`) | Revisits compacted directories every N cycles for usage accounting. `1` revisits them every cycle. A scanner walk also visits prefixes covered by active lifecycle rules between usage samples. |
 | `RUSTFS_DATA_USAGE_FAILED_OBJECT_TTL_SECS` | `86400` (`DEFAULT_FAILED_OBJECT_TTL_SECS`, `scanner_folder.rs`) | Retention of per-bucket failed-object entries in the usage cache. |
 | `RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX` | `10000` (`DEFAULT_FAILED_OBJECTS_MAX`, `scanner_folder.rs`) | Cap on retained failed-object entries per bucket. |
 

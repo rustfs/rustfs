@@ -140,6 +140,8 @@ clap = { workspace = true, features = ["derive", "env"] }
 [dev-dependencies]
 serde-value.workspace = true
 s3s = { workspace = true, features = ["minio"] }
+s3s-sigv4.workspace = true
+url.workspace = true
 async-compression = { workspace = true, features = ["tokio", "bzip2", "lz4", "xz"] }
 aws-config = { workspace = true }
 aws-sdk-sts = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }

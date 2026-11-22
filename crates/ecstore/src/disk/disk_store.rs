@@ -1631,6 +1631,8 @@ pub struct LocalDiskWrapper {
     health_check: bool,
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
+    /// Retirement belongs to this wrapper instance, not its monitoring policy.
+    retired: CancellationToken,
     /// Disk ID for stale checking
     disk_id: Arc<RwLock<Option<Uuid>>>,
     /// Timeout policy for scanner-sensitive operations, loaded once on wrapper initialization.
@@ -1784,6 +1786,7 @@ impl LocalDiskWrapper {
             physical_admission: Arc::new(crate::disk::io_admission::PhysicalDiskBinding::default()),
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
+            retired: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
             timeout_health_policy: get_drive_timeout_health_policy(),
         };
@@ -1873,28 +1876,9 @@ impl LocalDiskWrapper {
     }
 
     async fn acquire_disk_io_permit(&self) -> Result<Option<crate::disk::io_admission::DiskIoPermit>> {
-        if let Some(context) = current_disk_io_context() {
-            if let Some(permit) = context.permit.as_ref()
-                && permit.is_for(&self.io_admission)
-            {
-                return Ok(Some(permit.clone()));
-            }
-            if context
-                .admission
-                .as_ref()
-                .is_some_and(|admission| Arc::ptr_eq(admission, &self.io_admission))
-            {
-                return Ok(None);
-            }
-            if context.class == DiskIoClass::Background {
-                return context
-                    .background_permit(&self.io_admission)
-                    .await
-                    .map(Some)
-                    .map_err(DiskError::Io);
-            }
-        }
-        Ok(Some(self.io_admission.foreground()))
+        crate::disk::io_admission::acquire_wrapper_disk_io_permit(&self.io_admission)
+            .await
+            .map_err(DiskError::Io)
     }
 
     pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
@@ -1989,6 +1973,11 @@ impl LocalDiskWrapper {
     /// Stop the disk monitoring
     pub async fn stop_monitoring(&self) {
         self.cancel_token.cancel();
+    }
+
+    /// Observe retirement without granting callers authority to retire this wrapper.
+    pub fn retirement_token(&self) -> CancellationToken {
+        self.retired.child_token()
     }
 
     fn spawn_recovery_monitor_if_needed(&self) {
@@ -2988,6 +2977,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn close(&self) -> Result<()> {
+        self.retired.cancel();
         self.stop_monitoring().await;
         self.disk.close().await
     }

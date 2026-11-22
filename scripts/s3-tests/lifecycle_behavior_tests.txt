@@ -20,10 +20,6 @@
 #   RUSTFS_ILM_DEBUG_DAY_SECS=10   (1 "day" = 10s, matches s3-tests lc_debug_interval)
 #   RUSTFS_SCANNER_ENABLED=true
 #   RUSTFS_SCANNER_CYCLE=2         (scan every 2s, well under a debug-day)
-#   RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1  (re-descend compacted dirs every cycle so
-#                                  ILM is evaluated ~every 2s, not once per 16 cycles;
-#                                  without this a Days=1 object due at 10s is not
-#                                  expired until the next ~32s boundary — #4772)
 #   RUSTFS_SCANNER_START_DELAY_SECS=0
 #   RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s  (multipart abort lane)
 #

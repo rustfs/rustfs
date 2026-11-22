@@ -40,6 +40,7 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
         scan_mode,
         prefix_scan_scope: None,
         checkpoint_tx: None,
+        local_stop: None,
     }
 }
 
@@ -1309,6 +1310,7 @@ where
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
+                    local_stop: None,
                 },
             )
             .await
@@ -1392,6 +1394,7 @@ where
                 scan_mode: HealScanMode::Normal,
                 prefix_scan_scope: None,
                 checkpoint_tx: None,
+                local_stop: None,
             },
         )
         .await;

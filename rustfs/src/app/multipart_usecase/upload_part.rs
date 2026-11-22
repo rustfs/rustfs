@@ -16,8 +16,8 @@
 
 use super::*;
 use crate::app::RequestEnvelope;
-use crate::app::object::BodyChunks;
 use crate::app::object::request_body::{DemandReader, UploadChunks, guard_native_upload_progress};
+use crate::app::object::{BodyChunks, upload_frame_reader};
 use crate::app::storage_api::multipart_usecase::access::AuthorizationRequest;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOwner;
@@ -205,8 +205,7 @@ impl DefaultMultipartUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(req.headers()) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                let (body, total) =
-                    crate::app::object::cuobject::rdma_put_body(bucket, key, &token, true).map_err(S3Error::from)?;
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(bucket, key, &token).map_err(S3Error::from)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
                 (Some(body), Some(total), Some(total))
             }
@@ -290,7 +289,7 @@ impl DefaultMultipartUsecase {
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
+            upload_frame_reader(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
         );
 
         // An SSE-C passthrough session stores ciphertext parts verbatim: a

@@ -22,7 +22,7 @@ use rustfs_trusted_proxies::ClientInfo;
 use std::net::SocketAddr;
 
 /// An admin request whose application-facing state is owned by RustFS.
-pub(crate) struct AdminRequest {
+pub struct AdminRequest {
     envelope: RequestEnvelope,
     body: Body,
 }
@@ -129,7 +129,7 @@ impl AdminRequest {
 
 /// The raw HTTP response produced by an owned admin operation.
 #[derive(Debug)]
-pub(crate) struct AdminResponse {
+pub struct AdminResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: Body,
@@ -156,7 +156,7 @@ impl AdminResponse {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait Operation: Send + Sync + 'static {
+pub trait Operation: Send + Sync + 'static {
     async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse>;
 }
 

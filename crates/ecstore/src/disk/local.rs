@@ -8343,8 +8343,9 @@ pub struct LocalDisk {
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
     mount_lease: Arc<std::fs::File>,
+    // The descriptor pins this identity even if the configured path is remounted.
     #[cfg(target_os = "linux")]
-    mount_lease_mount_id: Option<u64>,
+    mount_lease_identity: Option<ReplacementMountIdentity>,
     /// Public path for callers that need the configured disk layout. Internal
     /// disk I/O uses `io_format_path`, which is rooted at `mount_lease`.
     pub format_path: PathBuf,
@@ -8544,72 +8545,50 @@ struct ReplacementMountIdentity {
 }
 
 #[cfg(target_os = "linux")]
-fn replacement_mount_identity(metadata: &std::fs::Metadata, mount_id: u64) -> ReplacementMountIdentity {
-    use std::os::unix::fs::MetadataExt as _;
-
-    ReplacementMountIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mount_id,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
-    use rustix::fs::{AtFlags, StatxFlags};
-    use std::os::fd::AsRawFd as _;
-
-    rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
-        .ok()
-        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
-        .map(|statx| statx.stx_mnt_id)
-        .or_else(|| mount_id_from_fdinfo(fd.as_raw_fd()))
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_for_path(path: &Path) -> Option<u64> {
-    use rustix::fs::{AtFlags, CWD, StatxFlags};
-
-    rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID)
-        .ok()
-        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
-        .map(|statx| statx.stx_mnt_id)
-        .or_else(|| {
-            std::fs::canonicalize(path)
-                .ok()
-                .and_then(|path| mount_id_from_mountinfo(&path))
+fn statx_replacement_mount_identity(
+    dir: impl std::os::fd::AsFd,
+    path: &Path,
+    flags: rustix::fs::AtFlags,
+) -> Option<ReplacementMountIdentity> {
+    use rustix::fs::{FileType, StatxFlags, makedev, statx};
+    let fields = StatxFlags::TYPE | StatxFlags::INO | StatxFlags::MNT_ID;
+    let stat = statx(dir, path, flags, fields).ok()?;
+    (StatxFlags::from_bits_retain(stat.stx_mask).contains(fields) && FileType::from_raw_mode(stat.stx_mode.into()).is_dir())
+        .then_some(ReplacementMountIdentity {
+            device: makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            inode: stat.stx_ino,
+            mount_id: stat.stx_mnt_id,
         })
 }
 
 #[cfg(target_os = "linux")]
-fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
-    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+fn replacement_mount_identity_for_fd(directory: &std::fs::File) -> Option<ReplacementMountIdentity> {
+    statx_replacement_mount_identity(directory, Path::new(""), rustix::fs::AtFlags::EMPTY_PATH)
+        .or_else(|| replacement_mount_identity_from_fdinfo(directory))
+}
+
+#[cfg(target_os = "linux")]
+fn replacement_mount_identity_for_path(path: &Path) -> Option<ReplacementMountIdentity> {
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, open};
+    statx_replacement_mount_identity(CWD, path, AtFlags::empty()).or_else(|| {
+        let directory = std::fs::File::from(open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?);
+        replacement_mount_identity_from_fdinfo(&directory)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn replacement_mount_identity_from_fdinfo(directory: &std::fs::File) -> Option<ReplacementMountIdentity> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
+    let fd = directory.as_raw_fd();
+    let mount_id = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_from_mountinfo(path: &Path) -> Option<u64> {
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    mount_id_from_mountinfo_contents(&mountinfo, path)
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64> {
-    let mountpoint = path
-        .to_string_lossy()
-        .replace('\\', "\\134")
-        .replace('\t', "\\011")
-        .replace('\n', "\\012")
-        .replace(' ', "\\040");
-    mountinfo.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let mount_id = fields.next()?.parse().ok()?;
-        fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        (fields.next()? == mountpoint).then_some(mount_id)
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())?;
+    let metadata = directory.metadata().ok()?;
+    Some(ReplacementMountIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mount_id,
     })
 }
 
@@ -8667,24 +8646,53 @@ impl LocalDisk {
     /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
         #[cfg(target_os = "linux")]
-        {
-            let Ok(configured) = std::fs::metadata(self.endpoint.get_file_path()) else {
-                return false;
-            };
-            let Ok(pinned) = self.mount_lease.metadata() else {
-                return false;
-            };
-            let Some(configured_mount_id) = mount_id_for_path(Path::new(&self.endpoint.get_file_path())) else {
-                return false;
-            };
-            let Some(pinned_mount_id) = self.mount_lease_mount_id else {
-                return false;
-            };
-            replacement_mount_identity(&configured, configured_mount_id) == replacement_mount_identity(&pinned, pinned_mount_id)
-        }
+        return self
+            .current_replacement_mount_identity(Path::new(&self.endpoint.get_file_path()))
+            .is_some();
 
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_replacement_mount_identity(&self, configured_path: &Path) -> Option<ReplacementMountIdentity> {
+        let pinned = self.mount_lease_identity?;
+        (replacement_mount_identity_for_path(configured_path)? == pinned).then_some(pinned)
+    }
+
+    pub(super) fn replacement_mount(&self, _mount_roots: &[PathBuf]) -> Option<super::ReplacementMount> {
+        #[cfg(target_os = "linux")]
+        {
+            let configured_path = self.endpoint.get_file_path();
+            let configured_path = Path::new(&configured_path);
+            let canonical_path = std::fs::canonicalize(&self.io_root).ok()?;
+            let expected = _mount_roots
+                .iter()
+                .filter(|root| root.is_absolute() && (configured_path.starts_with(root) || canonical_path.starts_with(root)))
+                .max_by_key(|root| root.components().count())
+                .unwrap_or(&canonical_path);
+            // The expected root must be its own mount boundary. If it is
+            // unmounted, the exposed directory and its parent share a mount ID.
+            if !canonical_path.starts_with(expected) {
+                return None;
+            }
+            // When the configured endpoint is the expected mount root, this
+            // live observation also supplies the mount ID for the boundary.
+            let identity = self.current_replacement_mount_identity(configured_path)?;
+            if (expected != configured_path && replacement_mount_identity_for_path(expected)?.mount_id != identity.mount_id)
+                || replacement_mount_identity_for_path(expected.parent()?)?.mount_id == identity.mount_id
+            {
+                return None;
+            }
+            Some(super::ReplacementMount {
+                canonical_path,
+                physical_device_ids: rustfs_utils::os::get_physical_device_ids(self.io_root.to_str()?).ok()?,
+                filesystem_identity: format!("{}:{}:{}", identity.mount_id, identity.device, identity.inode),
+            })
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 
     /// Return the descriptor-rooted path for the mount instance admitted for
@@ -8740,10 +8748,10 @@ impl LocalDisk {
             PathBuf::from(format!(".rustfs-format-control/{format_device:x}/{}", Uuid::from_bytes(format_file_id)));
 
         #[cfg(target_os = "linux")]
-        let (mount_lease, io_root, mount_lease_mount_id) = (
+        let (mount_lease, io_root, mount_lease_identity) = (
             publication_root.directory().clone(),
             publication_root.io_path().to_path_buf(),
-            mount_id_for_fd(publication_root.directory()),
+            replacement_mount_identity_for_fd(publication_root.directory()),
         );
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
@@ -8926,7 +8934,7 @@ impl LocalDisk {
             #[cfg(target_os = "linux")]
             mount_lease: mount_lease.clone(),
             #[cfg(target_os = "linux")]
-            mount_lease_mount_id,
+            mount_lease_identity,
             endpoint: ep.clone(),
             format_path,
             io_format_path,
@@ -9768,7 +9776,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         if volume == RUSTFS_META_MULTIPART_BUCKET {
             crate::disk::multipart_source::native_source_protocol(&fi)?;
@@ -10048,7 +10056,7 @@ impl LocalDisk {
         let mut mutation = mutation;
         mutation.namespace_owner = self.usage_watch_binding.owner(volume, mutation.namespace_owner.take());
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let DeleteVersionMutation {
@@ -10735,7 +10743,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         if let Some((_, gen_str)) = path.rsplit_once(".integrity.")
             && let Ok(generation) = Uuid::parse_str(gen_str)
@@ -12572,7 +12580,7 @@ impl LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -41606,10 +41614,18 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mountinfo_fallback_uses_the_exact_escaped_mountpoint() {
-        let mountinfo = "101 1 0:30 / / rw - rootfs rootfs rw\n202 101 0:42 / /mnt/replacement\\040disk rw - tmpfs tmpfs rw\n";
-        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement disk")), Some(202));
-        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement")), None);
+    fn mount_id_fdinfo_can_identify_a_directory_below_a_mount() {
+        let temp = tempfile::tempdir().expect("mount fixture directory");
+        let child_path = temp.path().join("data");
+        std::fs::create_dir(&child_path).expect("create data subdirectory");
+        let parent = std::fs::File::open(temp.path()).expect("open parent directory");
+        let child = std::fs::File::open(&child_path).expect("open data subdirectory");
+        let parent_identity = replacement_mount_identity_from_fdinfo(&parent).expect("read parent identity");
+        let child_identity = replacement_mount_identity_from_fdinfo(&child).expect("read child identity");
+        assert_eq!(child_identity.mount_id, parent_identity.mount_id);
+        assert_ne!(child_identity.inode, parent_identity.inode);
+        assert_eq!(replacement_mount_identity_for_fd(&child), Some(child_identity));
+        assert_eq!(replacement_mount_identity_for_path(&child_path), Some(child_identity));
     }
 
     #[cfg(not(windows))]
@@ -41959,6 +41975,226 @@ mod test {
             take_prepared_part_txn_receipt(&txn2_open).is_none(),
             "Drop for LocalDisk must purge cached part transaction receipts"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hotpath_non_inline_delete_and_multipart_budgets() {
+        const CHILD: &str = "RUSTFS_TEST_HOTPATH_BUDGET_CHILD";
+        const TEST: &str = "disk::local::test::hotpath_non_inline_delete_and_multipart_budgets";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("RUSTFS_DURABILITY_MODE", "strict")
+                .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                .output()
+                .expect("hotpath budget subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "hotpath budget child failed: {stdout}{stderr}");
+            assert!(
+                stdout.contains("HOTPATH_BUDGET_OK"),
+                "hotpath budget child must execute all assertions: {stdout}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "hotpath-budget";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_MULTIPART_BUCKET).await;
+        disk.multipart_index.initialize().await;
+        disk.wait_for_startup_cleanup().await;
+        bucket_durability::set(bucket, Some(DurabilityMode::Strict));
+
+        let bucket_dir = disk.io_root().join(bucket);
+        let tmp_dir = disk.io_root().join(RUSTFS_META_TMP_BUCKET);
+
+        // 1. Non-inline rename_data with presynced part.1:
+        //    Must execute in 1 Fsync blocking-queue job (and 1 total queue job) with 2 bucket-tree directory fsyncs
+        //    (<object> and <bucket>), 1 staged data-directory fsync before rename, and 0 prepare_destination jobs.
+        let object = "non-inline-obj";
+        let data_dir = Uuid::new_v4();
+        let stage_id = Uuid::new_v4().to_string();
+        let part_rel = format!("{stage_id}/{data_dir}/part.1");
+        let payload = vec![b'x'; 131_072];
+        let mut writer = disk
+            .create_file(bucket, RUSTFS_META_TMP_BUCKET, &part_rel, payload.len() as i64)
+            .await
+            .expect("create_file for presynced part.1");
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
+            .await
+            .expect("write payload");
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect("shutdown writer");
+        drop(writer);
+
+        let jobs_before_put = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_put = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let bucket_syncs_before_put = os::fsync_dir_recorder::count_under(&bucket_dir);
+        let tmp_syncs_before_put = os::fsync_dir_recorder::count_under(&tmp_dir);
+
+        let mut fi = test_file_info(object, Uuid::nil(), Some(data_dir), None);
+        fi.size = payload.len() as i64;
+        fi.parts[0].size = payload.len();
+        fi.parts[0].actual_size = payload.len() as i64;
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, &stage_id, fi.clone(), bucket, object)
+            .await
+            .expect("non-inline rename_data");
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_put,
+            2,
+            "non-inline rename_data with presynced shard must submit 1 Fsync commit job + 1 Foreground staging-cleanup job"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_put,
+            1,
+            "non-inline rename_data must submit exactly 1 job on the Fsync lane"
+        );
+        assert!(
+            (2..=3).contains(&(os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs_before_put)),
+            "fresh non-inline commit must fsync only the object directory and bucket directory"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&tmp_dir) - tmp_syncs_before_put,
+            1,
+            "presynced non-inline commit must fsync the staged data directory once before rename"
+        );
+
+        // 2. Fused recoverable DELETE (Stage 1 -> Stage 2 -> Stage 3):
+        //    Must execute in 3 Fsync blocking-queue jobs (plus at most 1 reserve replenish job if reserve was disarmed)
+        //    and 7 directory fsyncs under Strict mode (Stage 1: 4, Stage 2: 1, Stage 3: 2).
+        let reserve_extra = usize::from(!disk.delete_reserve.is_armed());
+        let jobs_before_del = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_del = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let bucket_syncs_before_del = os::fsync_dir_recorder::count_under(&bucket_dir);
+        let del_tx = Uuid::new_v4();
+        let del_opts = DeleteOptions {
+            recoverable_delete: true,
+            old_data_dir: Some(del_tx),
+            ..Default::default()
+        };
+        disk.delete_version(bucket, object, fi, false, del_opts)
+            .await
+            .expect("recoverable delete stage 1");
+        let (journal, sole, satisfied) = disk
+            .try_publish_prepared_delete_local(bucket, object, del_tx, None)
+            .await
+            .expect("publish delete stage 2")
+            .expect("delete stage 2 satisfied");
+        assert!(sole && satisfied);
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local(bucket, object, del_tx, &journal, None)
+                .await
+                .expect("finalize delete stage 3")
+        );
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_del,
+            3 + reserve_extra,
+            "fused recoverable delete (Stage 1..3) must submit 3 blocking-queue jobs"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_del,
+            3 + reserve_extra,
+            "fused recoverable delete (Stage 1..3) must run on the Fsync lane"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs_before_del,
+            7,
+            "strict non-inline recoverable delete must execute 7 directory fsyncs across Stages 1..3"
+        );
+
+        // 3. Multipart part transaction on RUSTFS_META_MULTIPART_BUCKET
+        //    (prepare_part_transaction -> rename_part -> settle_part_transaction):
+        //    Must hit PreparedPartTxnReceipt, PublishedPartTxnReceipt, and MultipartSourceAdmission caches
+        //    and submit 3 Fsync blocking-queue jobs.
+        let mp_dst_path = concat!(
+            "6f897928dfe04a87a269ccd9f5a5897d9cbbdf6b55e4d903ef3cbc1125c0cb8f/",
+            "8f897819-2604-4f3d-b843-c32a45d198b2x1786372838834745500/",
+            "58ba822c-06e4-4332-81cc-be2c9d921900/part.1"
+        );
+        let source_root = multipart_staging::upload_scope_root(mp_dst_path, true);
+        let mut upload = FileInfo::new(source_root, 2, 2);
+        upload.erasure.index = 1;
+        upload.data_dir = Some(Uuid::new_v4());
+        upload.mod_time = Some(time::OffsetDateTime::now_utc());
+        upload.fresh = true;
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, source_root, upload)
+            .await
+            .expect("initialize live upload head");
+
+        let part_payload = Bytes::from_static(b"multipart-part-payload");
+        let part_meta = Bytes::from(
+            crate::disk::ObjectPartInfo {
+                number: 1,
+                size: part_payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all(RUSTFS_META_TMP_BUCKET, "mp-stage/part.1", part_payload.clone())
+            .await
+            .expect("stage multipart part");
+
+        let mp_dir = disk.io_root().join(RUSTFS_META_MULTIPART_BUCKET);
+        let jobs_before_mp = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_mp = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let mp_syncs_before = os::fsync_dir_recorder::count_under(&mp_dir);
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            "mp-stage/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            mp_dst_path,
+            part_meta.clone(),
+        )
+        .await
+        .expect("prepare_part_transaction");
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            "mp-stage/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            mp_dst_path,
+            part_meta,
+        )
+        .await
+        .expect("rename_part");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path, PartTransactionAction::Commit)
+            .await
+            .expect("settle_part_transaction");
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_mp,
+            3,
+            "prepare_part_transaction + rename_part + settle_part_transaction must submit 3 blocking-queue jobs"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_mp,
+            3,
+            "multipart part transaction stages must run on the Fsync lane"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&mp_dir) - mp_syncs_before,
+            2,
+            "multipart part transaction commit must fsync the upload directory once in rename_part and once in settle_part_transaction"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path)
+                .await
+                .expect("read settled part"),
+            part_payload
+        );
+
+        println!("HOTPATH_BUDGET_OK");
     }
 
     #[test]
