@@ -6,10 +6,19 @@ use super::*;
 #[test]
 #[serial]
 fn abandoned_listing_drains_candidate_buffered_before_finished() {
+    isolated_listing_fixture("abandoned_listing_drains_candidate_buffered_before_finished", false);
+}
+
+#[test]
+#[serial]
+fn abandoned_listing_admits_versions_beyond_first_1024_across_frames() {
+    isolated_listing_fixture("abandoned_listing_admits_versions_beyond_first_1024_across_frames", true);
+}
+
+fn isolated_listing_fixture(name: &str, multiple_frames: bool) {
     use std::io::{Read, Seek, SeekFrom};
     use std::process::{Command, Stdio};
 
-    const TEST: &str = "scanner_folder::tests::listing_completion::abandoned_listing_drains_candidate_buffered_before_finished";
     const CHILD: &str = "RUSTFS_ABANDONED_LISTING_OVERFLOW_CHILD";
     const MARKER: &str = "abandoned-listing-overflow-completed";
 
@@ -18,7 +27,7 @@ fn abandoned_listing_drains_candidate_buffered_before_finished() {
             .enable_all()
             .build()
             .expect("fixture runtime")
-            .block_on(run_abandoned_listing_overflow_case());
+            .block_on(run_abandoned_listing_overflow_case(multiple_frames));
         println!("{MARKER}");
         return;
     }
@@ -32,7 +41,11 @@ fn abandoned_listing_drains_candidate_buffered_before_finished() {
         .expect("child output");
     let output_writer = output.try_clone().expect("clone child output");
     let mut child = Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", TEST, "--nocapture"])
+        .args([
+            "--exact",
+            &format!("scanner_folder::tests::listing_completion::{name}"),
+            "--nocapture",
+        ])
         .env(CHILD, "1")
         .env("TMPDIR", output_dir.path())
         .env("TMP", output_dir.path())
@@ -107,28 +120,46 @@ fn retain_unknown_listing_child(child: std::process::Child, output_dir: tempfile
     panic!("listing fixture child status unknown; pid={pid}, evidence={}", path.display());
 }
 
-async fn run_abandoned_listing_overflow_case() {
+async fn run_abandoned_listing_overflow_case(multiple_frames: bool) {
     let (mut scanner, root) = build_test_scanner().await;
     let bucket = "bucket";
     let object = "abandoned/object";
     tokio::fs::create_dir_all(root.join(bucket)).await.expect("local bucket");
     let mut disks = vec![scanner.local_disk.clone()];
     let mut original_metadata = Vec::new();
+    let mut expected = HashSet::new();
     for (index, version) in [(2, Some(0x1933)), (3, None), (4, Some(0x1935))] {
         let disk_root = root.join(format!("disk-{index}"));
-        let mut fi = FileInfo::new(object, 4, 2);
-        fi.volume = bucket.to_owned();
-        fi.name = object.to_owned();
-        fi.version_id = version.map(Uuid::from_u128);
-        fi.versioned = fi.version_id.is_some();
-        fi.erasure.index = index - 1;
-        fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
-        fi.validate_for_metadata_read().expect("valid per-disk fixture");
-        let mut meta = FileMeta::new();
-        meta.add_version(fi).expect("fixture version");
-        let metadata = meta.marshal_msg().expect("fixture metadata");
-        write_test_object_metadata_bytes(&disk_root, bucket, object, &metadata).await;
-        original_metadata.push((disk_root.join(bucket).join(object).join(STORAGE_FORMAT_FILE), metadata));
+        let objects: &[&str] = if multiple_frames {
+            &["abandoned/a", "abandoned/b"]
+        } else {
+            &[object]
+        };
+        for key in objects {
+            let mut meta = FileMeta::new();
+            // 514 distinct versions per frame, all below the per-frame limit.
+            let versions = if multiple_frames { 512 } else { 1 };
+            for n in 0..if index == 2 { versions } else { 1 } {
+                let mut fi = FileInfo::new(key, 4, 2);
+                fi.volume = bucket.to_owned();
+                fi.name = (*key).to_owned();
+                fi.version_id = version.map(|id| Uuid::from_u128(id + n * 16));
+                fi.versioned = fi.version_id.is_some();
+                fi.erasure.index = index - 1;
+                fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+                fi.validate_for_metadata_read().expect("valid per-disk fixture");
+                let listed_key = if multiple_frames {
+                    (*key).to_owned()
+                } else {
+                    format!("{key}/")
+                };
+                expected.insert((listed_key, fi.version_id.map(|v| v.to_string()), Some(fi.versioned)));
+                meta.add_version(fi).expect("fixture version");
+            }
+            let metadata = meta.marshal_msg().expect("fixture metadata");
+            write_test_object_metadata_bytes(&disk_root, bucket, key, &metadata).await;
+            original_metadata.push((disk_root.join(bucket).join(key).join(STORAGE_FORMAT_FILE), metadata));
+        }
         let endpoint = Endpoint::try_from(disk_root.to_string_lossy().as_ref()).expect("listing fixture endpoint");
         disks.push(
             new_disk(
@@ -146,7 +177,11 @@ async fn run_abandoned_listing_overflow_case() {
         cache.info.name = bucket.to_owned();
     }
     scanner.old_cache.replace(
-        "bucket/abandoned/object",
+        if multiple_frames {
+            "bucket/abandoned"
+        } else {
+            "bucket/abandoned/object"
+        },
         bucket,
         DataUsageEntry {
             objects: 1,
@@ -157,12 +192,12 @@ async fn run_abandoned_listing_overflow_case() {
     scanner.disks = disks;
     scanner.disks_quorum = 2;
     scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
-    scanner.partial_heal_candidate_limit = Some(1);
+    scanner.partial_heal_candidate_limit = (!multiple_frames).then_some(1);
     let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel();
     scanner.partial_heal_discovery_observer = Some(discovery_tx);
     // Force the valid select ordering that receives terminal errors before the
     // final candidate. One candidate frame fits in the bounded partial channel.
-    scanner.defer_abandoned_entries_until_finished = true;
+    scanner.defer_abandoned_entries_until_finished = !multiple_frames;
     let (_commands, mut heal_rx) = rustfs_heal_contracts::heal_channel::init_heal_channels().expect("isolated heal channel");
     let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
     let responder = tokio::spawn(async move {
@@ -178,7 +213,7 @@ async fn run_abandoned_listing_overflow_case() {
         }
     });
     let result = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(if multiple_frames { 15 } else { 2 }),
         scanner.scan_folder(
             CancellationToken::new(),
             CachedFolder {
@@ -195,11 +230,17 @@ async fn run_abandoned_listing_overflow_case() {
     result
         .expect("listing completion must close every callback channel")
         .expect("complete folder scan");
-    assert_eq!(
-        discovery_rx.try_recv().expect("partial frame should be observed"),
-        (1, 2),
-        "the unversioned candidate must be in the overflow of the same frame"
-    );
+    let mut frames = Vec::new();
+    while let Ok(frame) = discovery_rx.try_recv() {
+        if frame != (0, 0) {
+            frames.push(frame);
+        }
+    }
+    if multiple_frames {
+        assert_eq!(frames, [(514, 0), (514, 0)]);
+    } else {
+        assert_eq!(frames, [(1, 2)], "the unversioned candidate must fall in the overflow of the same frame");
+    }
     let mut candidates = Vec::new();
     while let Ok((object, version, remove_corrupted)) = captured_rx.try_recv() {
         if let Some(object) = object {
@@ -210,13 +251,8 @@ async fn run_abandoned_listing_overflow_case() {
         candidates.first().is_some_and(|(_, version, _)| version.is_some()),
         "the first candidate must be versioned"
     );
+    assert_eq!(candidates.len(), expected.len(), "every exact target must be admitted once");
     let candidates: HashSet<_> = candidates.into_iter().collect();
-    let object = format!("{object}/");
-    let expected = HashSet::from([
-        (object.clone(), Some(Uuid::from_u128(0x1933).to_string()), Some(true)),
-        (object.clone(), None, Some(false)),
-        (object, Some(Uuid::from_u128(0x1935).to_string()), Some(true)),
-    ]);
     assert_eq!(
         candidates, expected,
         "buffered overflow candidates must retain their exact version and deletion policy"

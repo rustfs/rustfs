@@ -45,10 +45,7 @@ use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, Ecs
 use crate::workload_admission::{run_scanner_metadata_operation, run_scanner_node_operation};
 use metrics::{counter, describe_counter};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
-use rustfs_filemeta::{
-    MAX_META_CACHE_HEAL_CANDIDATES, MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS, MetaCacheEntries, MetaCacheEntry,
-    MetaCacheHealCandidateKind,
-};
+use rustfs_filemeta::{MAX_META_CACHE_HEAL_CANDIDATES, MetaCacheEntries, MetaCacheEntry, MetaCacheHealCandidateKind};
 use rustfs_heal_contracts::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
     HealRequestSource, HealScanMode, send_heal_request_with_receipt,
@@ -3494,8 +3491,6 @@ impl FolderScanner {
                 let mut agreed_closed = false;
                 let mut partial_closed = false;
                 let mut finished_closed = false;
-                let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
-                let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
                     if child_ctx.is_cancelled() || (agreed_closed && partial_closed && finished_closed) {
@@ -3552,15 +3547,13 @@ impl FolderScanner {
                                 counter!(METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL).increment(1);
                             }
 
+                            // The merge emits one key per partial frame, with all its replicas.
+                            // Deduplicate overflow versions within that key, never across the subtree.
+                            let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
                             for candidate in discovery.candidates {
                                 let sub_quorum_candidate = candidate.replica_count < disks_quorum;
                                 let version_id = candidate.validated_version().map(|id| id.to_string());
                                 let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
-                                if seen_heal_candidates.len() >= MAX_META_CACHE_HEAL_CANDIDATES
-                                    && !seen_heal_candidates.contains(&identity)
-                                {
-                                    continue;
-                                }
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
@@ -3609,12 +3602,6 @@ impl FolderScanner {
                             for candidate in discovery.truncated_candidates {
                                 let version_id = candidate.validated_version().map(|id| id.to_string());
                                 let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
-                                if seen_truncated_objects.len() >= MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
-                                    && !seen_truncated_objects.contains(&candidate.object)
-                                {
-                                    continue;
-                                }
-                                seen_truncated_objects.insert(candidate.object.clone());
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
