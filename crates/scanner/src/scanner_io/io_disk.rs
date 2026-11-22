@@ -64,12 +64,19 @@ impl ScannerIODisk for Disk {
         let metadata_object_path = item.object_path();
         let metadata_result =
             crate::workload_admission::with_scanner_metadata_io(self.read_metadata(&item.bucket, &metadata_object_path)).await;
+        #[cfg(test)]
+        let metadata_result = if super::tests::local_drive_recovery::after_metadata_read(&item.bucket).await {
+            Err(DiskError::FaultyDisk)
+        } else {
+            metadata_result
+        };
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let data = match metadata_result {
             Ok(data) => data,
             Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
                 return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
             }
+            Err(e @ (DiskError::FaultyDisk | DiskError::DiskNotFound)) if self.is_local() => return Err(e.into()),
             Err(e) => {
                 return Err(scanner_metadata_transient_error(
                     format!("failed to read metadata: {e}"),
@@ -196,7 +203,15 @@ impl ScannerIODisk for Disk {
             scan_mode,
             prefix_scan_scope,
             checkpoint_tx,
+            local_stop,
         } = options;
+        let local_stop = local_stop.unwrap_or_default();
+        let retirement = self.local_retirement_token();
+        // Only this attempt stops; cycle budgets and the leader fence remain owned by the caller.
+        let ctx = ctx.child_token();
+        if retirement.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            local_stop.stop(ScannerLocalStopReason::Retired, &ctx);
+        }
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
         let bucket = clone_cache_value(&cache.info.name);
@@ -256,9 +271,8 @@ impl ScannerIODisk for Disk {
         .then_some(prefix_scan_scope)
         .flatten();
 
-        let result = crate::storage_api::ecstore_with_background_disk_io(
-            ctx.clone(),
-            scan_data_folder_scoped(
+        let result = crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), async {
+            let scan = scan_data_folder_scoped(
                 ctx.clone(),
                 budget,
                 set_disks,
@@ -270,12 +284,53 @@ impl ScannerIODisk for Disk {
                 SCANNER_SLEEPER.for_disk(&self.path()),
                 prefix_scan_scope,
                 checkpoint_tx,
-            ),
-        )
+                Some(local_stop.clone()),
+            );
+            tokio::pin!(scan);
+            loop {
+                tokio::select! {
+                    result = &mut scan => break result,
+                    _ = async {
+                        match &retirement {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if local_stop.reason().is_none() => {
+                        local_stop.stop(ScannerLocalStopReason::Retired, &ctx);
+                    }
+                }
+            }
+        })
         .await;
+
+        #[cfg(test)]
+        super::tests::local_drive_recovery::after_walk(&bucket, &self).await;
+        if retirement.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            local_stop.stop(ScannerLocalStopReason::Retired, &ctx);
+        }
+        if let Some(reason) = local_stop.reason() {
+            warn!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "local_drive_interrupted",
+                bucket = %bucket,
+                endpoint = %crate::storage_api::owner::EcstoreDiskAPI::endpoint(self.as_ref()),
+                reason = reason.as_str(),
+                "Scanner retained unfinished work after a local drive interruption"
+            );
+        }
 
         match result {
             Ok(mut data_usage_info) => {
+                if local_stop.reason().is_some() {
+                    retain_interrupted_local_cache(&mut data_usage_info);
+                    done_drive();
+                    emit_scan_bucket_drive_partial(source, &bucket, &disk_path, drive_start.elapsed());
+                    failure_guard.mark_not_failed();
+                    return Ok(ScannerDiskScanOutcome::Partial(data_usage_info));
+                }
                 done_drive();
                 emit_scan_bucket_drive_complete(source, true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
@@ -283,6 +338,9 @@ impl ScannerIODisk for Disk {
                 Ok(ScannerDiskScanOutcome::Complete(data_usage_info))
             }
             Err(ScannerError::PartialCache(mut partial_cache)) => {
+                if local_stop.reason().is_some() {
+                    retain_interrupted_local_cache(&mut partial_cache);
+                }
                 done_drive();
                 emit_scan_bucket_drive_partial(source, &bucket, &disk_path, drive_start.elapsed());
                 partial_cache.info.last_update.get_or_insert_with(SystemTime::now);
