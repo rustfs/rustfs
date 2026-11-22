@@ -31,10 +31,27 @@ A run starts one server per process configuration, one after another on the same
 | `e1x-text`, `e1x-short` | No KMS, local master key set to an invalid value |
 | `e2` | Local KMS backend, per-key authorization off |
 | `e2e` | Local KMS backend, per-key authorization enforced |
+| `e2e-audit` | As `e2e`, with audit entries delivered to a receiver inside the driver |
+| `e2m` | Local KMS backend and a loaded local master key |
+| `e3` | Vault Transit backend |
+| `e4` | Vault KV2 backend |
+| `e8` | Static backend: one key from the environment |
+
+`e3` and `e4` need the `vault` binary on `PATH` (or at the path in `SSE_BB_VAULT_BIN`). The first of them to start launches one Vault development server on `SSE_BB_VAULT_PORT` (default 20108; Vault also takes the next port for its cluster listener) as a child of the driver, and the run stops it at its end; nothing has to be running beforehand and Docker is not used. The root token is generated for the run, reaches the server under test through its environment, and is redacted from `vault/vault.log` in the run directory. Without the binary, or with the port taken, every case of these configurations reports `env-error`. `backends.py` holds these configurations and the table of what each backend can do; a case skips only by that table.
+
+`e2e-audit` starts an HTTP receiver on `SSE_BB_AUX_PORT` (default 20107) in a thread of the driver and points the server's audit webhook at it. With the port taken, its cases report `env-error`.
+
+## Leak scans
+
+Every secret a run uses is a canary: each SSE-C key a request sends, the local master key (also an invalid value, including its first and last characters), every other secret in a server's environment, the material of each Local-backend key file, and each plaintext data key the admin API returns. A canary is searched for in standard base64, URL-safe base64, hex and as raw bytes, and by the first 12 characters of each spelling. The registry lives in memory only; a report names a canary by kind and digest, never by value.
+
+`archive.py` keeps every HTTP exchange of the run in `archive/exchanges.jsonl`: response headers and documents in full, of a larger object body its hash and its first and last bytes. The full response is searched when it arrives. Request bodies are kept as hash and length, the value of a secret request header as a digest, and a canary found in a response as a marker.
+
+Four cases of the configuration `run` judge the run as a whole after its last site stopped: no response contains a canary (`SEC-01`), no server log does (`SEC-02`), no response carries a storage-internal header (`SEC-03`), and every 500 says one of a fixed set of texts (`SEC-06`). The one accepted occurrence of a canary is a generated data key in the body of the response that returned it. Before scanning, the run plants a throwaway canary in a file and requires the scanner to find it; a scan with nothing to search for reports `skip`, not `pass`.
 
 ## Output
 
-Each run directory holds `run.json` (binary identity, configurations, counts), `results.jsonl` (one verdict per case and per table row), `observations.jsonl` (the observation vectors), `report.md`, the server logs under `sites/`, and `DONE` with the overall status. A run without `DONE` did not finish and cannot be compared.
+Each run directory holds `run.json` (binary identity, configurations, counts), `results.jsonl` (one verdict per case and per table row), `observations.jsonl` (the observation vectors), `report.md`, the server logs under `sites/`, the exchange archive under `archive/`, and `DONE` with the overall status. A run without `DONE` did not finish and cannot be compared.
 
 A verdict is `pass`, `fail` (an expectation about the product does not hold) or `env-error` (the site is down or a dependency is missing). An environment error is never a pass and never a product failure, and a run with one does not succeed.
 
@@ -51,6 +68,22 @@ Equal behavior of two binaries does not show that one can read what the other wr
 ```bash
 uv run --python 3.12 --no-project scripts/test/sse_blackbox/suite.py cross --writer base-default --reader head-default
 ```
+
+## Stored form
+
+The `SF` cases form a second layer: they read the drives of the site instead of its responses. They state which metadata keys an encrypted object has, which of their values are fixed and what shape the random ones have, that every drive holds the same copy, and that no file on any drive contains the plaintext, the customer key, a data key or an object key. A failure in this layer means the stored form changed, not that a request misbehaved.
+
+The cases decode `xl.meta` with the repository's own reader, built once with `cargo build -p rustfs-filemeta --example dump_fileinfo`; `SSE_BB_DUMP_FILEINFO` points the suite at another copy. Without a reader the cases that need one report `env-error`. Keep using a reader built from a commit whose format you trust: one rebuilt together with the server under test follows a format change instead of exposing it. `SF-01` searches raw bytes, needs no reader, and runs at the default level.
+
+What a build must store is written down in `gold/<build>.json`: one entry per scheme and layout, listing every metadata key with its exact value or, where the value is random by design, its shape. `SF-02` names every key that is missing, extra or different. `stored.py` keeps the one table of keys that count as random; a key outside it is compared verbatim, so a new random value shows up as a difference instead of vanishing into a shape.
+
+A manifest is never edited to make a run pass. When the stored form changes, someone confirms that the change is intended and that other readers (an older release, the other build) still cope; the manifest is then replaced by what the new binary stores:
+
+```bash
+uv run --python 3.12 --no-project scripts/test/sse_blackbox/stored.py propose <run dir> > scripts/test/sse_blackbox/gold/<build>.json
+```
+
+Each of these cases also records a `stored-form` observation per object, and `cross` records one for every object the writer stored. `diff` over two runs, or over two `cross` runs, therefore compares what two binaries put on the drives: key names and fixed values exactly, random values by shape.
 
 ## Checking that the suite can fail
 

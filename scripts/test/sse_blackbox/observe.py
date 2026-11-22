@@ -46,6 +46,11 @@ def end_case() -> None:
     _context = None
 
 
+def context() -> dict | None:
+    """The configuration, case and row in progress, or None outside a case. A copy: callers only read it."""
+    return dict(_context) if _context is not None else None
+
+
 def in_case() -> bool:
     return _context is not None and _quiet == 0
 

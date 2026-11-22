@@ -30,6 +30,7 @@ import framework as fw
 import harness as h
 import observe
 import selftest
+import stored
 
 # Every `cases_*.py` next to this file registers its cases and configurations on import. The order is by file
 # name, so it is the same on every machine.
@@ -318,6 +319,7 @@ def _cross_write(site: h.Site, bucket: str, objects) -> None:
 def cmd_cross(args) -> int:
     writer, writer_identity = load_binary(args.writer)
     reader, reader_identity = load_binary(args.reader)
+    h.STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock = (h.STATE_DIR / "lock").open("w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -336,9 +338,14 @@ def cmd_cross(args) -> int:
         case = fw.Case(f"CROSS-{config}", f"{writer_identity['name']} writes, {reader_identity['name']} reads", "p1", "L1",
                        (config,), None)
 
-        def read_all(c: fw.Ctx, objects=objects, bucket=bucket) -> None:
+        # The stored form of every object as the writer left it, filled in once the writer has stopped.
+        forms: dict = {}
+
+        def read_all(c: fw.Ctx, objects=objects, bucket=bucket, forms=forms) -> None:
             for key, _, read_headers, want, parts in objects:
                 with c.row(key):
+                    # Recorded first: a read that fails ends the row, and the stored form does not depend on it.
+                    stored.note_form(bucket, key, forms[key])
                     c.read_back(bucket, key, b"".join(parts), read_headers, want, key)
                     status, head_headers = h.head(c.site, bucket, key, read_headers)
                     if c.check(status == 200, f"{key} HEAD: HTTP {status}, expected 200"):
@@ -351,6 +358,7 @@ def cmd_cross(args) -> int:
             h.make_bucket(site, bucket)
             _cross_write(site, bucket, objects)
             h.stop_site(site)
+            forms.update(stored.forms_on_drives(site, bucket, [key for key, *_ in objects]))
             # The key files and the data directory are the writer's; only the process changes.
             h.start_site(site, reader, fw.CONFIGS[config](site))
             if config in fw.CONFIG_PROVISION:

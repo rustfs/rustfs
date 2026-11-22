@@ -40,11 +40,18 @@ def _observation_key(o: dict) -> tuple:
     return (o["config"], o["case"], o["kind"], o["seq"], o.get("name", ""))
 
 
-def _field_differences(a: dict, b: dict) -> list[str]:
+def _field_differences(a: dict, b: dict, path: str = "") -> list[str]:
+    """One line per field that differs. A field that is an object on both sides is entered, so a large value
+    (a stored form) is reported by the entries that differ and not as two whole documents."""
     out = []
     for name in sorted(set(a) | set(b)):
-        if a.get(name) != b.get(name):
-            out.append(f"{name}: {json.dumps(a.get(name), sort_keys=True)} != {json.dumps(b.get(name), sort_keys=True)}")
+        left, right = a.get(name), b.get(name)
+        if left == right:
+            continue
+        if isinstance(left, dict) and isinstance(right, dict):
+            out.extend(_field_differences(left, right, f"{path}{name}."))
+        else:
+            out.append(f"{path}{name}: {json.dumps(left, sort_keys=True)} != {json.dumps(right, sort_keys=True)}")
     return out
 
 

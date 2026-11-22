@@ -35,6 +35,9 @@ RUN_DIR: Path | None = None
 # Called with every signed exchange, in or out of a case: request and response in full. For modules that keep
 # what a run saw (an archive for leak scans); the comparison between runs uses `observe`, not these.
 EXCHANGE_HOOKS: list = []
+# Called as `hook(site, env_overrides)` right before a server process starts, so a secret in its environment is
+# known as a canary before the process can repeat it.
+SITE_START_HOOKS: list = []
 
 ADMIN_PREFIX = "/rustfs/admin/v3"
 REGION = "us-east-1"
@@ -47,8 +50,9 @@ SECRET_KEY = "rustfsadmin"
 # The port is a local-development choice; CI and other machines override it.
 DEFAULT_PORT = int(os.environ.get("SSE_BB_PORT", "20105"))
 # Helpers the suite starts next to the site under test. Each is a local-development choice like the site port.
-AUX_PORT = int(os.environ.get("SSE_BB_AUX_PORT", "20108"))      # audit receiver or fake KMS endpoint
-VAULT_PORT = int(os.environ.get("SSE_BB_VAULT_PORT", "20109"))  # Vault or OpenBao
+AUX_PORT = int(os.environ.get("SSE_BB_AUX_PORT", "20107"))      # audit receiver or fake KMS endpoint
+# Vault or OpenBao. A development server also listens on the next port for its cluster address.
+VAULT_PORT = int(os.environ.get("SSE_BB_VAULT_PORT", "20108"))
 
 STARTUP_TIMEOUT = 90.0
 STOP_GRACE = 10.0
@@ -441,8 +445,14 @@ def key_list(s: Site) -> list[str]:
 
 
 def write_local_key_file(key_dir: Path, key_id: str) -> None:
-    """Pre-create a Local-backend key file in the development format, with material generated for this run."""
+    """Pre-create a Local-backend key file in the development format, with material generated for this run.
+
+    An existing key file is left alone: replacing its material would make every object already wrapped by it
+    unreadable, which a restart of the same site must never do.
+    """
     key_dir.mkdir(parents=True, exist_ok=True)
+    if (key_dir / f"{key_id}.key").exists():
+        return
     created = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     stored = {
         "key_id": key_id, "version": 1, "algorithm": "AES_256", "usage": "EncryptDecrypt", "status": "Active",
@@ -544,6 +554,8 @@ def start_site(s: Site, binary: Path, env_overrides: dict[str, str]) -> None:
     })
     env.update(env_overrides)
     s.env = dict(env_overrides)
+    for hook in SITE_START_HOOKS:
+        hook(s, s.env)
     shown = {k: ("<redacted>" if any(m in k for m in SECRET_ENV_MARKERS) else v) for k, v in s.env.items()}
     with s.stdout_log.open("ab") as log:
         log.write(f"\n===== start {datetime.datetime.now().isoformat(timespec='seconds')} env={json.dumps(shown)}\n".encode())

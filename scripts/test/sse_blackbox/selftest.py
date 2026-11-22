@@ -10,6 +10,7 @@ import diffing
 import framework as fw
 import harness as h
 import observe
+import stored
 
 LIST_PARTS = (
     '<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>b</Bucket><Key>k</Key>'
@@ -98,5 +99,12 @@ def _diff_checks() -> list[str]:
     return failures
 
 
+def _leak_scan_checks() -> list[str]:
+    """The leak scans report a canary in every spelling and accept only the one exempt occurrence."""
+    import archive  # imported here: the module installs its hooks on import, and only a run needs them
+
+    return archive.selftest()
+
+
 def run() -> list[str]:
-    return [*_xml_checks(), *_deviation_checks(), *_diff_checks()]
+    return [*_xml_checks(), *_deviation_checks(), *_diff_checks(), *stored.selftest(), *_leak_scan_checks()]

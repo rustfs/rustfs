@@ -281,6 +281,9 @@ class Ctx:
         """PUT, GET and HEAD one object: the projection holds on all three and the bytes come back unchanged."""
         put_headers, _ = self.ok(h.put(self.site, bucket, key, data, write_headers), f"{what} PUT")
         self.projection(put_headers, want, f"{what} PUT")
+        # Recorded as soon as the object exists: what was stored does not depend on the reads below, and the
+        # check that the binary is the build it was registered as needs it even when a read fails.
+        self.stored(bucket, key)
         get_headers, body = self.ok(h.get(self.site, bucket, key, read_headers), f"{what} GET")
         self.projection(get_headers, want, f"{what} GET")
         self.bytes_equal(get_headers, body, data, f"{what} GET")
@@ -289,7 +292,6 @@ class Ctx:
             self.projection(head_headers, want, f"{what} HEAD")
             self.check(head_headers.get("content-length") == str(len(data)),
                        f"{what} HEAD: Content-Length {head_headers.get('content-length')}, expected {len(data)}")
-        self.stored(bucket, key)
 
     def read_back(self, bucket: str, key: str, data: bytes, read_headers: dict | None, want: dict[str, str],
                   what: str) -> None:
