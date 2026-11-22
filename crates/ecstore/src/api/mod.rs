@@ -28,7 +28,7 @@ pub mod diagnostic {
 }
 
 pub mod admin {
-    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
+    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info, get_server_info_with_inventory};
 }
 
 pub mod bitrot {
@@ -460,7 +460,7 @@ pub mod data_usage {
         record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
-        store_data_usage_in_backend,
+        store_data_usage_in_backend, verified_account_bucket_usage,
     };
     pub use crate::data_usage::{get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline};
 }
@@ -504,7 +504,7 @@ pub mod disk {
         PoolMetaNativeInspection, PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
         QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
+        UNCLEAN_SHUTDOWN_MARKER_PATH, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
         validate_batch_read_version_item_count, validate_format_control_path,
     };
     pub use crate::disk::{
@@ -770,8 +770,8 @@ pub mod storage {
     pub use crate::store::external_rpc_disk;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,
-        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc,
+        init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
         prewarm_local_disk_id_map_with_instance_ctx,
     };
     pub use crate::store::{HealObjectAbsenceProof, HealObjectStorageResult};

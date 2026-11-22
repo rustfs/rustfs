@@ -55,7 +55,7 @@ pub(crate) mod s3 {
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
     pub(crate) use rustfs_s3_types::StdError;
-    #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) use s3s::Body;
     #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
@@ -91,8 +91,11 @@ pub(crate) mod s3 {
 }
 
 pub(crate) mod admin {
-    pub(crate) async fn get_server_info(get_pools: bool) -> rustfs_madmin::InfoMessage {
-        crate::storage::storage_api::ecstore_admin::get_server_info(get_pools).await
+    pub(crate) async fn get_server_info(
+        get_pools: bool,
+        include_inventory: bool,
+    ) -> (rustfs_madmin::InfoMessage, Option<rustfs_madmin::ClusterInventory>) {
+        crate::storage::storage_api::ecstore_admin::get_server_info_with_inventory(get_pools, include_inventory).await
     }
 }
 

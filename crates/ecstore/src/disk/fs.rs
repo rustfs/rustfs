@@ -139,7 +139,17 @@ pub fn create_dir_all_std(path: &Path) -> io::Result<()> {
     match std::fs::create_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+                return match std::fs::create_dir(path) {
+                    Ok(()) => Ok(()),
+                    Err(_) if path.is_dir() => Ok(()),
+                    Err(e) => Err(e),
+                };
+            }
+            std::fs::create_dir_all(path)
+        }
         Err(e) => Err(e),
     }
 }

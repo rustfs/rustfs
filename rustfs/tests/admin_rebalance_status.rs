@@ -18,9 +18,7 @@ use reqwest::{Client, StatusCode};
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 use rustfs_ecstore::api::{config::com::save_config, rebalance::RebalanceMeta};
-use s3s_sigv4::{
-    AmzDate, EMPTY_STRING_SHA256_HASH, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
-};
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::{path::Path, sync::Arc, time::Duration};
 
 mod common;
@@ -39,33 +37,15 @@ fn signed_status_request(
     secret_key: &str,
 ) -> reqwest::RequestBuilder {
     let host = endpoint.strip_prefix("http://").expect("local HTTP endpoint");
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let date = AmzDate::parse(&timestamp).expect("valid signing date");
-    let canonical = create_canonical_request(
-        "GET",
-        path,
-        &[] as &[(&str, &str)],
-        [
-            ("host", host),
-            ("x-amz-content-sha256", EMPTY_STRING_SHA256_HASH),
-            ("x-amz-date", timestamp.as_str()),
-        ],
-        Payload::SingleChunk(EMPTY_STRING_SHA256_HASH),
-    );
-    let string_to_sign = create_string_to_sign(&canonical, &date, "us-east-1", "s3");
-    let signature = calculate_signature(&string_to_sign, secret_key, &date, "us-east-1", "s3");
-    client
-        .get(format!("{endpoint}{path}"))
-        .header("host", host)
-        .header("x-amz-date", &timestamp)
+    let url = format!("{endpoint}{path}");
+    let request = http::Request::get(&url)
+        .header(http::header::HOST, host)
         .header("x-amz-content-sha256", EMPTY_STRING_SHA256_HASH)
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential={access_key}/{}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}",
-                date.fmt_date()
-            ),
-        )
+        .body(())
+        .expect("build status request");
+    let signed = rustfs_signer::try_sign_v4_headers(request.into_parts().0, 0, access_key, secret_key, "", "us-east-1")
+        .expect("sign status request");
+    client.get(url).headers(signed)
 }
 
 async fn status_response_with_logs(
@@ -89,7 +69,12 @@ fn rebalance_status_preserves_http_contract_and_log_severity() {
         .without_time()
         .with_env_filter(
             tracing_subscriber::EnvFilter::new("off")
-                .add_directive("s3s::ops=debug".parse().expect("S3 route log filter"))
+                .add_directive("rustfs_gateway=debug".parse().expect("gateway log filter"))
+                .add_directive(
+                    "rustfs::server::gateway_stack=debug"
+                        .parse()
+                        .expect("gateway host log filter"),
+                )
                 .add_directive(
                     "rustfs::admin::handlers::rebalance=debug"
                         .parse()

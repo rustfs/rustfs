@@ -668,7 +668,7 @@ impl<'a> PeerAdminRequest<'a> {
         }
         let signed = sign_v4(
             request
-                .body(Body::empty())
+                .body(rustfs_s3_types::Body::empty())
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
             payload.as_ref().map(|(payload, _)| payload.len() as i64).unwrap_or(0),
             self.access_key,
