@@ -263,6 +263,16 @@ impl EventNotifier {
         let mut deferred_handles = Vec::new();
         let mut direct_handles = Vec::new();
 
+        // The entity carries only event-level fields and every target reads it
+        // without mutation, so build it once and share it across the matched
+        // targets instead of cloning the whole event per target.
+        let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
+            object_name: object_key.to_string(),
+            bucket_name: bucket_name.to_string(),
+            event_name,
+            data: event.as_ref().clone(),
+        });
+
         // A lifecycle writer holds this gate only while handing queue-store
         // ownership from one runtime generation to the next. Taking the read
         // guard before cloning targets means the writer both blocks new sends
@@ -286,12 +296,15 @@ impl EventNotifier {
                 // Clone an Arc<Box<dyn Target>> (which is where target_list is stored) to move into an asynchronous task
                 // target_arc is already Arc, clone it for the async task
                 let target_for_task = target_arc.clone();
+                // Resolve the identifier once: `name()`/`id()` each clone the
+                // two Strings inside `TargetID`, and this runs per target per event.
+                let target_id = target_for_task.id();
                 if !target_for_task.is_enabled() {
                     debug!(
                         event = EVENT_NOTIFY_DISPATCH_SKIPPED,
                         component = LOG_COMPONENT_NOTIFY,
                         subsystem = LOG_SUBSYSTEM_DISPATCH,
-                        target_id = %target_for_task.id(),
+                        target_id = %target_id,
                         reason = "target_disabled",
                         "Skipped notify dispatch target"
                     );
@@ -307,24 +320,15 @@ impl EventNotifier {
                     self.send_limiter.clone()
                 };
                 let metrics = self.metrics.clone();
-                let event_clone = event.clone();
-                let target_name_for_task = target_for_task.name(); // Get the name before generating the task
                 debug!(
                     event = EVENT_NOTIFY_DISPATCH_STARTED,
                     component = LOG_COMPONENT_NOTIFY,
                     subsystem = LOG_SUBSYSTEM_DISPATCH,
-                    target_id = %target_for_task.id(),
+                    target_id = %target_id,
                     deferred = is_deferred,
                     "notify dispatch"
                 );
-                // Use cloned data in closures to avoid borrowing conflicts
-                // Create an EntityTarget from the event
-                let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
-                    object_name: object_key.to_string(),
-                    bucket_name: bucket_name.to_string(),
-                    event_name,
-                    data: event_clone.as_ref().clone(),
-                });
+                let entity_target = Arc::clone(&entity_target);
                 let handle = tokio::spawn(async move {
                     let _direct_dispatch_lease = direct_dispatch_lease;
                     let _deferred_dispatch_guard = deferred_dispatch_guard;
@@ -339,7 +343,7 @@ impl EventNotifier {
                                     event = EVENT_NOTIFY_DISPATCH_SKIPPED,
                                     component = LOG_COMPONENT_NOTIFY,
                                     subsystem = LOG_SUBSYSTEM_DISPATCH,
-                                    target_id = %target_name_for_task,
+                                    target_id = %target_id,
                                     reason = "runtime_generation_replaced",
                                     "Skipped pending direct notify dispatch"
                                 );
@@ -357,7 +361,7 @@ impl EventNotifier {
                                 event = EVENT_NOTIFY_DISPATCH_FAILED,
                                 component = LOG_COMPONENT_NOTIFY,
                                 subsystem = LOG_SUBSYSTEM_DISPATCH,
-                                target_id = %target_name_for_task,
+                                target_id = %target_id,
                                 error = %e,
                                 reason = "permit_acquire_failed",
                                 "Failed to acquire notify dispatch permit"
@@ -366,13 +370,13 @@ impl EventNotifier {
                             return;
                         }
                     };
-                    if let Err(e) = target_for_task.save(entity_target.clone()).await {
+                    if let Err(e) = target_for_task.save(entity_target).await {
                         metrics.increment_failed();
                         error!(
                             event = EVENT_NOTIFY_DISPATCH_FAILED,
                             component = LOG_COMPONENT_NOTIFY,
                             subsystem = LOG_SUBSYSTEM_DISPATCH,
-                            target_id = %target_name_for_task,
+                            target_id = %target_id,
                             error = %e,
                             reason = "send_failed",
                             "Failed to dispatch notify event"
@@ -396,7 +400,7 @@ impl EventNotifier {
                             event = EVENT_NOTIFY_DISPATCH_COMPLETED,
                             component = LOG_COMPONENT_NOTIFY,
                             subsystem = LOG_SUBSYSTEM_DISPATCH,
-                            target_id = %target_name_for_task,
+                            target_id = %target_id,
                             deferred = is_deferred,
                             "notify dispatch"
                         );

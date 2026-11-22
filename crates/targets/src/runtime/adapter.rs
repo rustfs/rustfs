@@ -162,7 +162,6 @@ where
     ) -> PreparedActivation<E> {
         let mut prepared = Vec::with_capacity(targets.len());
         let mut failures = Vec::new();
-        let mut rejected_targets = Vec::new();
         let mut targets = targets.into_iter();
         while let Some(target) = targets.next() {
             match prepare_target(target, cancellation).await {
@@ -179,19 +178,6 @@ where
                     });
                     prepared.push(target);
                 }
-                PrepareTargetResult::Failed { error, target } => {
-                    drop(error);
-                    let target_id = target.id().to_string();
-                    tracing::warn!(
-                        target_id,
-                        reason = "initialization_failed",
-                        "Target initialization failed during lifecycle preparation"
-                    );
-                    failures.push(TargetActivationFailure {
-                        detail: format!("{target_id}: initialization failed"),
-                    });
-                    rejected_targets.push(Arc::from(target));
-                }
                 PrepareTargetResult::Cancelled(target) => {
                     prepared.push(Arc::from(target));
                     prepared.extend(targets.map(Arc::from));
@@ -201,7 +187,7 @@ where
         }
         PreparedActivation {
             failures,
-            rejected_targets,
+            rejected_targets: Vec::new(),
             targets: prepared,
         }
     }
@@ -615,13 +601,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_adapter_skips_non_store_target_when_init_fails() {
+    async fn builtin_adapter_keeps_non_store_target_when_init_fails() {
         let adapter = builtin_adapter();
         let target = MockTarget::new("primary", "webhook").with_init_failures(usize::MAX);
 
+        // A target without a queue store has nothing to replay, but it stays in
+        // the runtime so it self-heals and remains visible to the target list.
         let activation = adapter.activate_with_replay(vec![Box::new(target)]).await;
 
-        assert!(activation.targets.is_empty());
+        assert_eq!(activation.targets.len(), 1);
         assert!(activation.replay_workers.is_empty());
     }
 
