@@ -81,7 +81,17 @@ struct CachedResponse {
 
 /// Cache key: (lowercased bucket, normalized prefix, max entries).
 type PrefixUsageCacheKey = (String, String, usize);
-type PrefixUsageCacheMap = Option<HashMap<PrefixUsageCacheKey, CachedResponse>>;
+enum PrefixUsageCacheEntry {
+    Computing(Arc<()>),
+    Ready(CachedResponse),
+}
+
+enum PrefixUsageLookup {
+    Hit(Arc<BucketPrefixUsageResponse>),
+    Compute(Arc<()>),
+}
+
+type PrefixUsageCacheMap = Option<HashMap<PrefixUsageCacheKey, PrefixUsageCacheEntry>>;
 
 static PREFIX_USAGE_CACHE: Mutex<PrefixUsageCacheMap> = Mutex::new(None);
 
@@ -114,14 +124,15 @@ pub async fn bucket_prefix_usage(
     }
     let normalized_prefix = prefix.trim_matches('/').to_string();
     let cache_key = (bucket.to_ascii_lowercase(), normalized_prefix.clone(), max_entries);
-    if let Some(response) = lookup_cached(&cache_key) {
-        return Ok((*response).clone());
-    }
+    let reservation = match lookup_or_reserve(&cache_key) {
+        PrefixUsageLookup::Hit(response) => return Ok((*response).clone()),
+        PrefixUsageLookup::Compute(reservation) => reservation,
+    };
 
     let store = ecstore_resolve_object_store_handle()
         .ok_or_else(|| ScannerError::Other("object store is not initialized".to_string()))?;
     let response = Arc::new(compute_prefix_usage(store, bucket, &normalized_prefix, max_entries).await);
-    store_cached(cache_key, response.clone());
+    store_cached(&cache_key, &reservation, response.clone());
     Ok((*response).clone())
 }
 
@@ -266,40 +277,46 @@ fn aggregate_set_prefix_usage(
     }
 }
 
-fn lookup_cached(key: &(String, String, usize)) -> Option<Arc<BucketPrefixUsageResponse>> {
-    let mut guard = PREFIX_USAGE_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let map = guard.as_mut()?;
-    let cached = map.get(key)?;
-    if cached.computed_at.elapsed() > CACHE_TTL {
-        map.remove(key);
-        return None;
-    }
-    Some(cached.response.clone())
-}
-
-fn store_cached(key: (String, String, usize), response: Arc<BucketPrefixUsageResponse>) {
+fn lookup_or_reserve(key: &PrefixUsageCacheKey) -> PrefixUsageLookup {
     let mut guard = PREFIX_USAGE_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    // Bound the cache: drop expired entries first, and if the cap is still
-    // exceeded clear wholesale — the next queries recompute in milliseconds.
+    match map.get(key) {
+        Some(PrefixUsageCacheEntry::Ready(cached)) if cached.computed_at.elapsed() <= CACHE_TTL => {
+            return PrefixUsageLookup::Hit(cached.response.clone());
+        }
+        Some(PrefixUsageCacheEntry::Computing(reservation)) => return PrefixUsageLookup::Compute(reservation.clone()),
+        _ => {}
+    }
+
     if map.len() >= CACHE_MAX_ENTRIES {
-        map.retain(|_, cached| cached.computed_at.elapsed() <= CACHE_TTL);
+        map.retain(|_, entry| !matches!(entry, PrefixUsageCacheEntry::Ready(cached) if cached.computed_at.elapsed() > CACHE_TTL));
         if map.len() >= CACHE_MAX_ENTRIES {
             map.clear();
         }
     }
-    map.insert(
-        key,
-        CachedResponse {
+    let reservation = Arc::new(());
+    map.insert(key.clone(), PrefixUsageCacheEntry::Computing(reservation.clone()));
+    PrefixUsageLookup::Compute(reservation)
+}
+
+fn store_cached(key: &PrefixUsageCacheKey, reservation: &Arc<()>, response: Arc<BucketPrefixUsageResponse>) {
+    let mut guard = PREFIX_USAGE_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(entry) = guard.as_mut().and_then(|map| map.get_mut(key))
+        && matches!(entry, PrefixUsageCacheEntry::Computing(owner) if Arc::ptr_eq(owner, reservation))
+    {
+        // Invalidation or eviction retires the reservation with its entry.
+        *entry = PrefixUsageCacheEntry::Ready(CachedResponse {
             computed_at: std::time::Instant::now(),
             response,
-        },
-    );
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CACHE_MAX_ENTRIES, PREFIX_USAGE_CACHE, invalidate_prefix_usage_cache, store_cached};
+    use super::{
+        CACHE_MAX_ENTRIES, PREFIX_USAGE_CACHE, PrefixUsageLookup, invalidate_prefix_usage_cache, lookup_or_reserve, store_cached,
+    };
     use rustfs_data_usage::PrefixUsageSummary;
 
     fn response(bucket: &str) -> super::BucketPrefixUsageResponse {
@@ -318,10 +335,10 @@ mod tests {
     }
 
     fn seed(bucket: &str, prefix: &str) {
-        store_cached(
-            (bucket.to_ascii_lowercase(), prefix.to_string(), 10),
-            std::sync::Arc::new(response(bucket)),
-        );
+        let key = (bucket.to_ascii_lowercase(), prefix.to_string(), 10);
+        if let PrefixUsageLookup::Compute(reservation) = lookup_or_reserve(&key) {
+            store_cached(&key, &reservation, std::sync::Arc::new(response(bucket)));
+        }
     }
 
     fn contains(bucket: &str, prefix: &str) -> bool {
@@ -348,6 +365,28 @@ mod tests {
         // Wholesale clear.
         invalidate_prefix_usage_cache("");
         assert!(!contains("beta", "y"));
+
+        // A query on the previous generation may finish after its replacement.
+        let key = ("alpha".to_owned(), "x".to_owned(), 10);
+        for invalidate in ["alpha", ""] {
+            let PrefixUsageLookup::Compute(old) = lookup_or_reserve(&key) else {
+                panic!("expected cold lookup")
+            };
+            invalidate_prefix_usage_cache(invalidate);
+            let PrefixUsageLookup::Compute(new) = lookup_or_reserve(&key) else {
+                panic!("expected replacement")
+            };
+            // A late old result must not claim the replacement's still-computing slot.
+            store_cached(&key, &old, std::sync::Arc::new(response("alpha")));
+            let expected = std::sync::Arc::new(response("alpha"));
+            store_cached(&key, &new, expected.clone());
+            store_cached(&key, &old, std::sync::Arc::new(response("alpha")));
+            let PrefixUsageLookup::Hit(actual) = lookup_or_reserve(&key) else {
+                panic!("expected cached result")
+            };
+            assert!(std::sync::Arc::ptr_eq(&actual, &expected));
+            invalidate_prefix_usage_cache("alpha");
+        }
 
         // Hard cap: overflow clears rather than grows.
         for index in 0..=(CACHE_MAX_ENTRIES / 2) {
