@@ -15,6 +15,8 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
+use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::access::authorize_missing_object_disclosure;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
 use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, Timestamp, TimestampFormat};
@@ -41,6 +43,32 @@ pub(super) async fn read_answer<T>(
         answer.headers = cors;
     }
     answer
+}
+
+/// Complete the read with the status the caller may see, including in its audit record.
+pub(super) async fn finish_object_read_error<T>(
+    req: &mut RequestEnvelope,
+    helper: OperationHelper,
+    error: rustfs_s3_types::S3Error,
+) -> rustfs_s3_types::S3Result<crate::app::Answered<T>> {
+    // A current delete marker carries its own documented 404 and version headers.
+    let error = if req.check_list_bucket_on_missing_key
+        && error.code() == &rustfs_s3_types::S3ErrorCode::NoSuchKey
+        && error.status_code() == Some(StatusCode::NOT_FOUND)
+        && !error
+            .headers()
+            .is_some_and(|headers| headers.contains_key(X_AMZ_DELETE_MARKER))
+    {
+        match authorize_missing_object_disclosure(req).await {
+            Ok(()) => error,
+            Err(denial) => denial,
+        }
+    } else {
+        error
+    };
+    let result = Err(error);
+    complete_read(helper, &result);
+    result
 }
 
 pub(super) fn complete_read<T>(helper: OperationHelper, result: &rustfs_s3_types::S3Result<crate::app::Answered<T>>) {

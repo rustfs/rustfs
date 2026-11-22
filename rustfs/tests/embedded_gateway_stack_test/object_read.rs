@@ -91,6 +91,101 @@ fn gateway_head_object_reports_missing_bucket_without_a_body() {
     });
 }
 
+async fn assert_object_read_permissions(client: &aws_sdk_s3::Client, bucket: &str, caller: &str, status: u16, code: &str) {
+    let object = client
+        .get_object()
+        .bucket(bucket)
+        .key("present")
+        .send()
+        .await
+        .expect("read fixture object");
+    assert_eq!(object.body.collect().await.expect("read response body").into_bytes().as_ref(), b"payload");
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key("present")
+        .send()
+        .await
+        .expect("head fixture object");
+    assert_eq!(head.content_length(), Some(7));
+
+    let get = client
+        .get_object()
+        .bucket(bucket)
+        .key("missing")
+        .send()
+        .await
+        .expect_err("GET missing object");
+    assert_eq!(super::refusal(&get), (Some(code.to_owned()), Some(status)), "{caller} GET {bucket}");
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key("missing")
+        .send()
+        .await
+        .expect_err("HEAD missing object");
+    let response = head.raw_response().expect("HEAD wire response");
+    assert_eq!(response.status().as_u16(), status, "{caller} HEAD {bucket}");
+    assert!(response.body().bytes().expect("collected HEAD body").is_empty(), "{caller} HEAD {bucket}");
+}
+
+#[test]
+#[serial_test::serial]
+fn missing_object_read_permissions_for_signed_and_anonymous_callers() {
+    super::with_stack(super::GATEWAY, |server| async move {
+        let endpoint = server.endpoint();
+        let root = super::s3_client(&endpoint, server.access_key(), server.secret_key());
+        let anonymous = super::anonymous_client(&endpoint).await;
+        let iam = super::get_global_app_context()
+            .expect("embedded server context")
+            .iam()
+            .handle();
+        for (bucket, list_effects, list_prefix, status, code) in [
+            ("read-without-list", &[][..], None, 403, "AccessDenied"),
+            ("read-with-list", &["Allow"][..], None, 404, "NoSuchKey"),
+            ("read-with-denied-list", &["Allow", "Deny"][..], None, 403, "AccessDenied"),
+            ("read-with-prefix-list", &["Allow"][..], Some("reports/"), 403, "AccessDenied"),
+        ] {
+            super::create_bucket_in_the_store(bucket).await;
+            super::put_object_in_the_store(bucket, "present").await;
+            let mut statements = vec![serde_json::json!({
+                "Effect": "Allow", "Action": "s3:GetObject", "Resource": format!("arn:aws:s3:::{bucket}/*")
+            })];
+            for effect in list_effects {
+                let mut statement = serde_json::json!({
+                    "Effect": effect, "Action": "s3:ListBucket", "Resource": format!("arn:aws:s3:::{bucket}")
+                });
+                if let Some(prefix) = list_prefix {
+                    statement["Condition"] = serde_json::json!({"StringEquals": {"s3:prefix": prefix}});
+                }
+                statements.push(statement);
+            }
+            let mut policy = serde_json::json!({"Version": "2012-10-17", "Statement": statements});
+            super::create_user_without_a_policy(bucket).await;
+            let user_policy =
+                rustfs_policy::policy::Policy::parse_config(policy.to_string().as_bytes()).expect("parse IAM policy");
+            iam.set_policy(bucket, user_policy).await.expect("store IAM policy");
+            iam.policy_db_set(bucket, rustfs_iam::store::UserType::Reg, false, bucket)
+                .await
+                .expect("attach IAM policy");
+            let signed = super::s3_client(&endpoint, bucket, super::USER_SECRET_KEY);
+            assert_object_read_permissions(&signed, bucket, "signed", status, code).await;
+
+            // Install public grants only after testing the signed caller's identity policy in isolation.
+            for statement in policy["Statement"].as_array_mut().expect("policy statements") {
+                statement["Principal"] = serde_json::json!("*");
+            }
+            root.put_bucket_policy()
+                .bucket(bucket)
+                .policy(policy.to_string())
+                .send()
+                .await
+                .expect("store bucket policy");
+            assert_object_read_permissions(&anonymous, bucket, "anonymous", status, code).await;
+        }
+    });
+}
+
 async fn head_answers(server: super::RustFSServer) {
     use rustfs::app::context::get_global_app_context;
     use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};

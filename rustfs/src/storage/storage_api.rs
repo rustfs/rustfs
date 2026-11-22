@@ -175,7 +175,8 @@ pub(crate) mod access_consumer {
         authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
     };
     pub(crate) use super::super::authorization::{
-        authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+        authorize_missing_object_disclosure, authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny,
+        prepare_list_buckets_iam_authorization,
     };
     pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
     pub(crate) use super::super::denial_audit::DenialAuditor;

@@ -36,7 +36,7 @@ use super::table_data_plane::{
     TablePermissionConditions, authorize_table_data_plane_if_needed, deny_anonymous_table_data_plane_if_needed,
 };
 use super::{AuthorizationRequest, missing_req_info_error, req_info_mut, req_info_ref, request_iam_store, request_object_store};
-use crate::auth::facts::{AuthzTarget, base_conditions, build_args};
+use crate::auth::facts::{AuthzFacts, AuthzTarget, base_conditions, build_args};
 use crate::error::ApiError;
 use crate::storage::authorization_actions::versioned_read_action;
 use crate::storage::denial_audit::DenialAuditor;
@@ -311,6 +311,48 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
     location_constraint: Option<String>,
     internal_object_authorization: bool,
 ) -> S3Result<()> {
+    let facts = policy_request_facts(req, action, location_constraint.as_deref())?;
+    authorize_request_with_facts(req, &facts, internal_object_authorization).await
+}
+
+/// Checks whether a caller may learn that the current object is absent. Only called
+/// on a terminal read error, after the original object authorization succeeded.
+pub(crate) async fn authorize_missing_object_disclosure<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
+    let info = req_info_mut(req)?;
+    info.object = None;
+    info.version_id = None;
+    info.suppress_denial_log = true;
+    info.suppress_denial_audit = true;
+    let mut facts = policy_request_facts(req, Action::S3Action(S3Action::ListBucketAction), None)?;
+    // The caller made an object read. Only actual listings supply prefix, delimiter and max-keys.
+    facts.clear_list_query();
+    authorize_request_with_facts(req, &facts, false).await
+}
+
+fn policy_request_facts<R: AuthorizationRequest + ?Sized>(
+    req: &R,
+    action: Action,
+    location_constraint: Option<&str>,
+) -> S3Result<AuthzFacts> {
+    let info = req_info_ref(req)?;
+    Ok(request_authz_facts(
+        req,
+        AuthzTarget {
+            action,
+            bucket: info.bucket.as_deref().unwrap_or_default(),
+            object: info.object.as_deref().unwrap_or_default(),
+            version_id: info.version_id.as_deref(),
+            location_constraint,
+        },
+    ))
+}
+
+async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    facts: &AuthzFacts,
+    internal_object_authorization: bool,
+) -> S3Result<()> {
+    let action = facts.action();
     let req_info = req.req_info().ok_or_else(missing_req_info_error)?;
     let cred = req_info.cred.clone();
     let is_owner = req_info.is_owner;
@@ -336,19 +378,9 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
 
         let root_access_key = root_access_key();
         let principal = request_principal(req, cred, &root_access_key).with_owner(is_owner);
-        let facts = request_authz_facts(
-            req,
-            AuthzTarget {
-                action,
-                bucket: bucket.as_str(),
-                object: object.as_str(),
-                version_id: version_id.as_deref(),
-                location_constraint: location_constraint.as_deref(),
-            },
-        );
-        let mut conditions = authorization_conditions_with_internal(req, &principal, &facts, internal_object_authorization)?;
+        let mut conditions = authorization_conditions_with_internal(req, &principal, facts, internal_object_authorization)?;
 
-        let action_args = build_args(&principal, &facts, &conditions);
+        let action_args = build_args(&principal, facts, &conditions);
         let prepared = iam_store.prepare_auth(&action_args).await;
         let needs_tag_from_iam = prepared.needs_existing_object_tag;
 
@@ -412,7 +444,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
             if needs_tag {
                 conditions.insert(PROBE_EXISTING_TAGS_RESOLVED.to_owned(), vec!["true".to_owned()]);
             }
-            let args = build_args(&principal, &facts, &conditions);
+            let args = build_args(&principal, facts, &conditions);
             let bucket_args = BucketPolicyArgs {
                 bucket: bucket.as_str(),
                 action,
@@ -503,7 +535,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
                 PROBE_RETENTION_FACTS_KNOWN,
             };
             let mut values = conditions.clone();
-            let original_values = base_conditions(&principal, &facts);
+            let original_values = base_conditions(&principal, facts);
             for marker in [
                 PROBE_EXISTING_TAGS_RESOLVED,
                 PROBE_RETENTION_FACTS_KNOWN,
@@ -522,7 +554,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         };
         let evaluation_conditions = probe_evaluation_conditions.as_ref().unwrap_or(&conditions);
         let iam_allowed = {
-            let mut final_args = build_args(&principal, &facts, evaluation_conditions);
+            let mut final_args = build_args(&principal, facts, evaluation_conditions);
             let allowed = iam_store
                 .try_eval_prepared(&prepared, &final_args)
                 .await
@@ -640,17 +672,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         let default_cred = rustfs_credentials::Credentials::default();
         let root_access_key = root_access_key();
         let principal = request_principal(req, &default_cred, &root_access_key);
-        let facts = request_authz_facts(
-            req,
-            AuthzTarget {
-                action,
-                bucket: bucket.as_str(),
-                object: object.as_str(),
-                version_id: version_id.as_deref(),
-                location_constraint: location_constraint.as_deref(),
-            },
-        );
-        let mut conditions = authorization_conditions_with_internal(req, &principal, &facts, internal_object_authorization)?;
+        let mut conditions = authorization_conditions_with_internal(req, &principal, facts, internal_object_authorization)?;
 
         let no_groups: Option<Vec<String>> = None;
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {

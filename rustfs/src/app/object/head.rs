@@ -308,11 +308,15 @@ impl DefaultObjectUsecase {
     }
 
     async fn finish_on_demand_migration_head(
-        req: &RequestEnvelope,
+        req: &mut RequestEnvelope,
         bucket: &str,
         helper: OperationHelper,
-        output: HeadObjectOutputFacts,
+        output: S3Result<HeadObjectOutputFacts>,
     ) -> S3Result<Answered<HeadObjectOutputFacts>> {
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => return finish_object_read_error(req, helper, error).await,
+        };
         let mut response = read_answer(bucket, req.method(), req.headers(), output).await;
         mark_on_demand_migration_response(&mut response.headers);
         let result = Ok(response);
@@ -458,9 +462,10 @@ impl DefaultObjectUsecase {
 
     pub(crate) async fn execute_head_object(
         &self,
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         input: gateway_dto::HeadObjectInput,
     ) -> S3Result<Answered<HeadObjectOutputFacts>> {
+        envelope.check_list_bucket_on_missing_key = input.version_id.is_none();
         self.execute_head_object_fields(envelope, input.into()).await
     }
 
@@ -528,7 +533,6 @@ impl DefaultObjectUsecase {
 
         prepare_odm_read_generation(&store, &mut req, &bucket).await;
 
-        // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let lookup = store.get_object_info(&bucket, &key, &opts).await;
         // Single classification point for the on-demand migration gate
         // (rustfs/backlog#2155): a not-found error or a latest delete marker.
@@ -536,7 +540,6 @@ impl DefaultObjectUsecase {
         let info = match lookup {
             Ok(info) => info,
             Err(err) => {
-                // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                     if is_dir_object(&key) {
                         let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
@@ -547,7 +550,8 @@ impl DefaultObjectUsecase {
                             }
                         };
                         let msg = head_prefix_not_found_message(&bucket, &key, has_children);
-                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                        return finish_object_read_error(&mut req, helper, S3Error::with_message(S3ErrorCode::NoSuchKey, msg))
+                            .await;
                     }
                     // Active-active replication lag window: an object missing
                     // locally may still be served by proxying the HEAD to a
@@ -564,22 +568,21 @@ impl DefaultObjectUsecase {
                     if let Some(miss) = odm_miss
                         && let Some(result) = Self::on_demand_migration_head(&req, &store, &bucket, &key, &opts, miss).await
                     {
-                        return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
+                        return Self::finish_on_demand_migration_head(&mut req, &bucket, helper, result).await;
                     }
-                    return Err(enrich_delete_marker_read_error(
+                    let error = enrich_delete_marker_read_error(
                         &store,
                         &bucket,
                         &key,
                         &opts,
                         S3Error::new(S3ErrorCode::NoSuchKey).into(),
                     )
-                    .await
-                    .into());
+                    .await;
+                    return finish_object_read_error(&mut req, helper, error.into()).await;
                 }
                 // Other errors, such as insufficient permissions, still return the original error
-                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into())
-                    .await
-                    .into());
+                let error = enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into()).await;
+                return finish_object_read_error(&mut req, helper, error.into()).await;
             }
         };
         if info.delete_marker {
@@ -589,7 +592,7 @@ impl DefaultObjectUsecase {
                 if let Some(miss) = odm_miss
                     && let Some(result) = Self::on_demand_migration_head(&req, &store, &bucket, &key, &opts, miss).await
                 {
-                    return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
+                    return Self::finish_on_demand_migration_head(&mut req, &bucket, helper, result).await;
                 }
                 return Err(with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey).into(), &info, None).into());
             }

@@ -335,11 +335,11 @@ pub(crate) mod access {
         AuthorizationRequest, CopySourceObject, RequestedObjectLegalHold, RequestedObjectLockRetention,
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_copy_object_tags, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
-        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
-        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
-        set_requested_object_lock_retain_until,
+        authorize_copy_object_tags, authorize_missing_object_disclosure, authorize_request, bucket_config_mutation_incarnation,
+        delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
+        log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
+        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized,
+        req_info_mut, req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
     };
 }
 
