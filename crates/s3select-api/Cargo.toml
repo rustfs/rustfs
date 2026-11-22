@@ -58,7 +58,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 metrics = { workspace = true }
 async-compression = { workspace = true, features = ["tokio", "gzip", "bzip2"] }
 async-trait.workspace = true

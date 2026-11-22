@@ -77,7 +77,7 @@ ftps = []
 sftp = []
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-credentials.workspace = true
 rustfs-ecstore.workspace = true

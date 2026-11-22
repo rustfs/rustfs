@@ -59,7 +59,7 @@ hotpath-cpu = [
 demo-examples = []
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-ecstore = { workspace = true }
 rustfs-s3-types = { workspace = true }

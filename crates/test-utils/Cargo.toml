@@ -51,7 +51,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 rustfs-ecstore.workspace = true
 rustfs-storage-api = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }

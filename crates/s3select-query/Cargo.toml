@@ -41,7 +41,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-s3select-api/hotpat
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-s3select-api/hotpath-cpu"]
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 rustfs-s3select-api = { workspace = true }
 async-trait.workspace = true
 bytes.workspace = true

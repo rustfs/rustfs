@@ -107,7 +107,7 @@ required-features = ["dial9"]
 workspace = true
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-heal-contracts = { workspace = true }

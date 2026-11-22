@@ -567,6 +567,72 @@ async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_a_budget_deadline_before_the_first_worker_poll() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    budget.wait_for_stop().await;
+    advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+    let worker = std::future::poll_fn(|_| panic!("expired drain must win before polling the worker"));
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, worker, std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("dropped attempt");
+    assert_eq!(
+        (attempt.epoch, attempt.cycle, attempt.result, attempt.partial_reason),
+        (9, 40, "partial", Some("runtime"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_lock_loss_cancellation_and_cooperative_completion() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, std::future::pending(), std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics.scanner_node_observation().await.last_attempt.expect("lost lock");
+    assert_eq!(attempt.result, "lock_lost");
+    assert!(attempt.duration >= SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    ctx.cancel();
+    let wait = await_observed_scanner_cycle(&metrics, 9, 41, &ctx, &budget, std::future::pending(), std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Cancelled);
+    assert_eq!(
+        metrics
+            .scanner_node_observation()
+            .await
+            .last_attempt
+            .expect("cancelled attempt")
+            .result,
+        "cancelled"
+    );
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let worker = std::future::ready(ScannerCycleOutcome::Completed);
+    let wait = await_observed_scanner_cycle(&metrics, 9, 42, &ctx, &budget, worker, std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("cooperative result");
+    assert_eq!((attempt.cycle, attempt.result), (42, "success"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn cycle_budget_fences_late_writer_after_timeout() {
     let cycle_ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new(
@@ -1632,6 +1698,94 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
     ));
     assert!(!global_metrics().report().await.current_cycle_active);
 
+    global_metrics().set_cycle(None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn single_drive_cycle_persists_usage_and_advances_with_healing_marker() {
+    use crate::scanner_io::{clear_dirty_usage_buckets_for_tests, tests::wait_for_namespace_commit_tails};
+    use crate::storage_api::scan::{HEALING_MARKER_PATH, MakeBucketOptions};
+
+    clear_dirty_usage_buckets_for_tests();
+    let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
+    let store = setup_scanner_cycle_store_at_path_with_layout(temp_dir.path(), true, 1, 1, 1).await;
+    let bucket = "marked-drive-bucket";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("fixture bucket should be created");
+    let mut reader = PutObjReader::from_vec(vec![7; 16]);
+    store
+        .put_object(bucket, "object", &mut reader, &ObjectOptions::default())
+        .await
+        .expect("fixture object should persist");
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+
+    let marker = temp_dir
+        .path()
+        .join("pool0/disk0")
+        .join(RUSTFS_META_BUCKET)
+        .join(HEALING_MARKER_PATH);
+    let marker_contents = b"leftover marker";
+    tokio::fs::write(&marker, marker_contents)
+        .await
+        .expect("fixture healing marker should persist");
+    let set = &store.pools[0].disk_set[0];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !set.get_online_disks_with_healing(true).await.1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("disk info should observe the marker after its cache expires");
+
+    let ctx = CancellationToken::new();
+    let mut cycle_info = CurrentCycle {
+        next: 1,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    let leader_epoch = 11;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, leader_epoch),
+    )
+    .await
+    .expect("scanner cycle should finish");
+    assert!(
+        matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ),
+        "unexpected cycle outcome: {outcome:?}",
+    );
+
+    let mut set_snapshot = DataUsageCache::default();
+    set_snapshot
+        .load_with_revisions(Arc::clone(set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("set usage snapshot should be readable");
+    assert!(set_snapshot.info.snapshot_complete);
+    assert_eq!(set_snapshot.info.next_cycle, 1);
+
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("global usage snapshot should be durable");
+    let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("global usage snapshot should decode");
+    assert!(usage.usage_snapshot_complete);
+    assert!(usage.last_update.is_some());
+    assert_eq!(usage.buckets_usage[bucket].objects_count, 1);
+
+    let persisted_cycle = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("scanner cycle cursor should be durable");
+    let (persisted_cycle, persisted_epoch) =
+        decode_scanner_cycle_state(&persisted_cycle).expect("scanner cycle cursor should decode");
+    assert_eq!(persisted_epoch, leader_epoch);
+    assert_eq!(persisted_cycle.next, 2);
+    assert_eq!(tokio::fs::read(marker).await.expect("healing marker should remain"), marker_contents);
+    clear_dirty_usage_buckets_for_tests();
     global_metrics().set_cycle(None).await;
 }
 

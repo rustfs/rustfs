@@ -50,7 +50,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 async-trait.workspace = true
 metrics.workspace = true
 rustfs-scanner-metrics.workspace = true
