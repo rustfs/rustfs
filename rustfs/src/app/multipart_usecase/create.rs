@@ -597,12 +597,13 @@ mod tests {
             .storage_class(Some(StorageClass::from("invalid".to_string())))
             .build()
             .unwrap();
-        let req = build_request(input, Method::POST);
-
-        let err = make_usecase()
-            .execute_create_multipart_upload_from_s3s(req)
+        let err = match make_usecase()
+            .execute_create_multipart_upload(owned_envelope(Method::POST), CreateMultipartUploadFields::from_legacy(input), None)
             .await
-            .unwrap_err();
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("invalid storage class must be rejected"),
+        };
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
