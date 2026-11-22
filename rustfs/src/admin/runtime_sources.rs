@@ -141,7 +141,7 @@ mod tests {
         object_store_from_envelope, publish_test_app_context,
     };
     use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-    use crate::admin::router::S3Router;
+    use crate::admin::router::{S3Router, call_legacy};
     use crate::app::{RequestEnvelope, RequestHead};
     use hyper::{Method, StatusCode};
     use matchit::Params;
@@ -323,15 +323,13 @@ mod tests {
             .insert(Method::GET, "/context-probe", ContextDependentAdminRoute)
             .expect("register test route");
 
-        let err = router
-            .call_legacy(Method::GET, "/context-probe", http::Extensions::new())
+        let err = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())
             .await
             .expect_err("empty slot must fail closed");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable.into());
 
         assert!(slot.install(distinct_context(&ambient)));
-        let response = router
-            .call_legacy(Method::GET, "/context-probe", http::Extensions::new())
+        let response = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())
             .await
             .expect("installed slot must serve request");
         assert_eq!(response.status, Some(StatusCode::NO_CONTENT));
