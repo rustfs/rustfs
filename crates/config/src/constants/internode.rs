@@ -349,10 +349,8 @@ pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
 /// Legacy alias for "tcp-http". Both values select the TCP/HTTP transport backend.
 pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 
-/// Internode reads whose data moves over NIXL/UCX (InfiniBand rails or RoCE by
-/// LID/GID, no IP needed); requests, writes and walks stay on TCP/HTTP. Requires
-/// a binary built with the `nixl` feature and `RUSTFS_NIXL_ENABLE`; until the
-/// NIXL agent is up, and for any read it cannot serve, it uses TCP/HTTP.
+/// Shard reads and writes use NIXL/UCX and require an active NIXL agent on both peers.
+/// Format metadata, directory walks and scanner requests use the control transport.
 pub const INTERNODE_DATA_TRANSPORT_NIXL: &str = "nixl";
 
 /// Known internode transport backend names accepted by the config parser.

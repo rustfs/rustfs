@@ -58,9 +58,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::Body;
     #[cfg(test)]
-    pub(crate) use s3s::auth::{Credentials, SimpleAuth};
-    #[cfg(test)]
-    pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
+    pub(crate) use s3s::auth::Credentials;
     pub(crate) use s3s::dto;
     #[cfg(test)]
     pub(crate) use s3s::dto::{
@@ -68,23 +66,21 @@ pub(crate) mod s3 {
         ObjectLockRetention,
     };
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
+    pub(crate) use s3s::dto::{GetObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput};
+    pub(crate) use s3s::dto::{GetObjectOutput, PutObjectInput};
     #[cfg(test)]
-    pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
+    pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
     pub(crate) use s3s::header;
     pub(crate) use s3s::s3_error;
-    #[cfg(test)]
-    pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
     pub(crate) use s3s::stream;
     #[cfg(test)]
-    pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
+    pub(crate) use s3s::stream::upload_stream::UploadStreamError;
     pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{BodySizeLimitExceeded, S3, TrailingHeaders};
+    pub(crate) use s3s::{BodySizeLimitExceeded, TrailingHeaders};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
     #[cfg(test)]
     pub(crate) use s3s::{S3Request, S3Response};
@@ -1943,10 +1939,10 @@ pub(crate) mod owned_parity {
     pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
         AuthorizationRequest, DenialAuditor, DenialRateLimiter, DenialScope, PostObjectPolicyHeaders, PostObjectRequestMarker,
         ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
-        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, authorization_denial_entry,
-        authorization_denial_entry_for_view, authorize_bucket_config_mutation, authorize_create_bucket, authorize_delete_bucket,
-        authorize_object_request, authorize_replication_only_put_headers, authorize_staged_multipart_part,
-        authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
+        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, authorization_denial_entry_for_view,
+        authorize_bucket_config_mutation, authorize_create_bucket, authorize_delete_bucket, authorize_object_request,
+        authorize_replication_only_put_headers, authorize_staged_multipart_part, authorize_write_etag_condition,
+        bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
     pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
         authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,

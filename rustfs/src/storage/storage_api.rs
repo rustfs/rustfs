@@ -100,8 +100,6 @@ pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::ListPartsInfo;
-        #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
@@ -205,7 +203,7 @@ pub(crate) mod owned_parity_consumer {
         authorize_staged_multipart_part, authorize_write_etag_condition,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
-    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
+    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry_for_view};
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_context::RequestContext;
     pub(crate) use super::super::request_markers::{
@@ -435,14 +433,8 @@ pub(crate) mod s3_api_consumer {
         pub(crate) mod contract {
             pub(crate) mod multipart {
                 pub(crate) use super::super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
-
-                #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, PartInfo};
             }
         }
-
-        #[cfg(test)]
-        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod tagging {
@@ -2369,15 +2361,6 @@ pub(crate) fn decode_tags_to_map(tags: &str) -> std::collections::HashMap<String
     ecstore_bucket::tagging::decode_tags_to_map(tags)
 }
 
-/// Writes an s3s response body for test assertions. Bucket configurations go
-/// through `ecstore_bucket::utils::serialize`, which owns their persisted form.
-#[cfg(test)]
-pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    val.serialize(&mut s3s::xml::Serializer::new(&mut buf))?;
-    Ok(buf)
-}
-
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
 }
@@ -2658,11 +2641,6 @@ pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
     ecstore_set_disk::is_valid_storage_class(storage_class)
 }
 
-#[cfg(test)]
-pub(crate) fn effective_storage_class<'a>(stored_class: Option<&'a str>, completed_transition_tier: Option<&'a str>) -> &'a str {
-    ecstore_config::storageclass::effective_class(stored_class, completed_transition_tier)
-}
-
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool
 where
     F: Fn(EventArgs) + Send + Sync + 'static,
@@ -2710,201 +2688,138 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
     ecstore_data_usage::init_compression_total_memory_from_backend(store).await
 }
 
-// Bucket configurations cross the legacy S3 edge by writing one codec's XML and
-// reading it with the other (rustfs/backlog#2745). The byte goldens in
-// `crates/ecstore/tests/bucket_config_goldens.rs` pin both codecs to the same
-// bytes for every family, so each direction is lossless for every document
-// either side produces. Tagging converts field by field because it carries no
-// XML of its own on this path. DELETE BY T4.1 (rustfs/backlog#2783) with the
-// rest of the legacy edge.
-/// Reads the persisted shape of a request configuration through the legacy writer.
-///
-/// A document the legacy edge accepted but the persisted reader refuses is
-/// answered as `MalformedXML`, the code the old codec used for its own refusals.
-#[cfg(test)]
-pub(crate) fn persisted_from_s3s<S, T>(value: &S) -> s3s::S3Result<T>
-where
-    S: s3s::xml::Serialize,
-    T: ecstore_bucket::utils::BucketConfigXml,
-{
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = s3s::xml::Serializer::new(&mut buf);
-        value
-            .serialize(&mut ser)
-            .map_err(|err| s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, err.to_string()))?;
-    }
-    ecstore_bucket::utils::deserialize::<T>(&buf)
-        .map_err(|err| s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, err.to_string()))
-}
-
-/// Renders a persisted configuration as the DTO the legacy edge answers with.
-#[cfg(test)]
-pub(crate) fn persisted_to_s3s<T, S>(value: &T) -> s3s::S3Result<S>
-where
-    T: ecstore_bucket::utils::BucketConfigXml,
-    S: for<'xml> s3s::xml::Deserialize<'xml>,
-{
-    let internal = |err: &dyn std::fmt::Display| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, err.to_string());
-    let bytes = ecstore_bucket::utils::serialize(value).map_err(|err| internal(&err))?;
-    let mut de = s3s::xml::Deserializer::new(&bytes);
-    let value = S::deserialize(&mut de).map_err(|err| internal(&err))?;
-    de.expect_eof().map_err(|err| internal(&err))?;
-    Ok(value)
-}
-
-#[cfg(test)]
-fn tags_from_s3s(tags: Vec<s3s::dto::Tag>) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
-    tags.into_iter()
-        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
-            key: tag.key,
-            value: tag.value,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn tags_to_s3s(tags: Vec<rustfs_gateway_types::cors_tagging::PersistedTag>) -> Vec<s3s::dto::Tag> {
-    tags.into_iter()
-        .map(|tag| s3s::dto::Tag {
-            key: tag.key,
-            value: tag.value,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn tagging_from_s3s(value: &s3s::dto::Tagging) -> rustfs_gateway_types::cors_tagging::PersistedTagging {
-    rustfs_gateway_types::cors_tagging::PersistedTagging {
-        tag_set: tags_from_s3s(value.tag_set.clone()),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn tagging_to_s3s(value: &rustfs_gateway_types::cors_tagging::PersistedTagging) -> s3s::dto::Tagging {
-    s3s::dto::Tagging {
-        tag_set: tags_to_s3s(value.tag_set.clone()),
-    }
-}
-
 #[cfg(test)]
 mod bucket_config_compat_tests {
-    use super::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
-    use rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration;
+    use crate::app::dto_values::stored_config;
+    use rustfs_gateway_types::cors_tagging::parse_cors;
     use rustfs_gateway_types::persistence::{
-        PersistedBucketEncryptionConfiguration, PersistedObjectLockConfiguration, PersistedVersioningConfiguration,
-        PersistedWebsiteConfiguration,
+        parse_bucket_encryption, parse_bucket_encryption_dto, parse_cors_dto, parse_object_lock, parse_versioning,
+        parse_versioning_dto, parse_website, parse_website_dto, serialize_bucket_encryption_dto, serialize_cors_dto,
+        serialize_versioning_dto, serialize_website_dto,
     };
-    use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, ErrorDocument, ExcludedPrefix, IndexDocument, ObjectLockConfiguration,
-        ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ServerSideEncryption, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, VersioningConfiguration, WebsiteConfiguration,
-    };
-    use s3s::dto::{Tag, Tagging};
 
     #[test]
     fn versioning_round_trips_including_the_minio_extensions() {
-        let input = VersioningConfiguration {
-            exclude_folders: Some(true),
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("tmp/".to_owned()),
-            }]),
-            mfa_delete: None,
-            status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
-        };
-        let persisted: PersistedVersioningConfiguration = persisted_from_s3s(&input).expect("convert");
-        assert_eq!(persisted.status.as_deref(), Some("Enabled"));
-        assert_eq!(persisted.exclude_folders, Some(true));
-        assert_eq!(persisted.excluded_prefixes, Some(vec![Some("tmp/".to_owned())]));
-        let back: VersioningConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, input);
+        let xml = b"<VersioningConfiguration><ExcludeFolders>true</ExcludeFolders>\
+            <ExcludedPrefixes><Prefix>tmp/</Prefix></ExcludedPrefixes><Status>Enabled</Status></VersioningConfiguration>";
+        let stored = parse_versioning(xml).expect("stored versioning");
+        assert_eq!(stored.status.as_deref(), Some("Enabled"));
+        assert_eq!(stored.exclude_folders, Some(true));
+        assert_eq!(stored.excluded_prefixes, Some(vec![Some("tmp/".to_owned())]));
+        assert!(stored.mfa_delete.is_none());
+        let config = stored_config(&stored, parse_versioning_dto).expect("gateway configuration");
+        assert_eq!(serialize_versioning_dto(&config), xml);
     }
 
     #[test]
     fn an_unknown_versioning_status_survives_the_round_trip_for_the_use_case_to_refuse() {
-        let input = VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static("Invalid")),
-            ..Default::default()
-        };
-        let persisted: PersistedVersioningConfiguration = persisted_from_s3s(&input).expect("convert");
-        assert_eq!(persisted.status.as_deref(), Some("Invalid"));
+        let xml = b"<VersioningConfiguration><Status>Invalid</Status></VersioningConfiguration>";
+        let config = parse_versioning_dto(xml).expect("string-backed gateway status");
+        let stored = parse_versioning(&serialize_versioning_dto(&config)).expect("prepare versioning update");
+        assert_eq!(stored.status.as_deref(), Some("Invalid"));
     }
 
     #[test]
+    #[serial_test::serial]
     fn object_lock_round_trips_the_default_retention() {
-        let input = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    days: Some(30),
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    years: None,
-                }),
-            }),
-        };
-        let persisted: PersistedObjectLockConfiguration = persisted_from_s3s(&input).expect("convert");
-        assert_eq!(persisted.object_lock_enabled.as_deref(), Some("Enabled"));
-        let back: ObjectLockConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, input);
+        use super::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
+        use crate::runtime_sources::{AppContext, ServerContextSlot};
+        use crate::server::TestGateway;
+        use bytes::Bytes;
+        use http::{Method, StatusCode};
+        use http_body_util::BodyExt;
+        use md5::Digest;
+        use std::sync::Arc;
+
+        run_large_stack_test("bucket-config-object-lock", || async {
+            let ambient = shared_gating_ambient().await;
+            let store = shared_gating_ecstore().await;
+            let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(Arc::clone(&context)));
+            let gateway = TestGateway::over(&context, slot);
+            let bucket = format!("lock-config-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create object-lock bucket");
+
+            let xml = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>";
+            let target = format!("/{bucket}?object-lock");
+            let checksum = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(xml));
+            let put = gateway
+                .signed(Method::PUT, &target, vec![("content-md5", checksum)], Bytes::from_static(xml))
+                .await
+                .unwrap();
+            let put_status = put.status();
+            let put_body = put.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(put_status, StatusCode::OK, "{}", String::from_utf8_lossy(&put_body));
+            let (stored, _) = super::ecstore_bucket::metadata_sys::get_object_lock_config(&bucket)
+                .await
+                .expect("stored lock config");
+            assert_eq!(stored.object_lock_enabled.as_deref(), Some("Enabled"));
+            let get = gateway.signed(Method::GET, &target, vec![], Bytes::new()).await.unwrap();
+            assert_eq!(get.status(), StatusCode::OK);
+            let body = get.into_body().collect().await.unwrap().to_bytes();
+            let returned = parse_object_lock(&body).expect("get lock configuration");
+            assert_eq!(returned, stored);
+            let retention = returned.rule.unwrap().default_retention.unwrap();
+            assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
+            assert_eq!(retention.days, Some(30));
+            assert_eq!(retention.years, None);
+        });
     }
 
     #[test]
     fn encryption_cors_and_website_round_trip() {
-        let encryption = ServerSideEncryptionConfiguration {
-            rules: vec![ServerSideEncryptionRule {
-                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    kms_master_key_id: Some("key".to_owned()),
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                }),
-                blocked_encryption_types: None,
-                bucket_key_enabled: Some(true),
-            }],
-        };
-        let persisted: PersistedBucketEncryptionConfiguration = persisted_from_s3s(&encryption).expect("convert");
-        let back: ServerSideEncryptionConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, encryption);
+        let xml = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+            <KMSMasterKeyID>key</KMSMasterKeyID><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault>\
+            <BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
+        let stored = parse_bucket_encryption(xml).expect("stored encryption");
+        assert!(stored.rules[0].blocked_encryption_types.is_none());
+        let config = stored_config(&stored, parse_bucket_encryption_dto).expect("gateway encryption");
+        assert_eq!(serialize_bucket_encryption_dto(&config).unwrap(), xml);
 
-        let cors = CORSConfiguration {
-            cors_rules: vec![CORSRule {
-                allowed_headers: Some(vec!["*".to_owned()]),
-                allowed_methods: vec!["GET".to_owned()],
-                allowed_origins: vec!["https://example.com".to_owned()],
-                expose_headers: None,
-                id: Some("r".to_owned()),
-                max_age_seconds: Some(60),
-            }],
-        };
-        let persisted: PersistedCorsConfiguration = persisted_from_s3s(&cors).expect("convert");
-        let back: CORSConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, cors);
+        let xml = b"<CORSConfiguration><CORSRule><AllowedHeader>*</AllowedHeader><AllowedMethod>GET</AllowedMethod>\
+            <AllowedOrigin>https://example.com</AllowedOrigin><ID>r</ID><MaxAgeSeconds>60</MaxAgeSeconds></CORSRule></CORSConfiguration>";
+        let stored = parse_cors(xml).expect("stored CORS");
+        assert!(stored.cors_rules[0].expose_headers.is_none());
+        let config = stored_config(&stored, parse_cors_dto).expect("gateway CORS");
+        assert!(config.cors_rules[0].expose_headers.is_empty());
+        assert_eq!(serialize_cors_dto(&config), xml);
 
-        let website = WebsiteConfiguration {
-            error_document: Some(ErrorDocument {
-                key: "404.html".to_owned(),
-            }),
-            index_document: Some(IndexDocument {
-                suffix: "index.html".to_owned(),
-            }),
-            redirect_all_requests_to: None,
-            routing_rules: None,
-        };
-        let persisted: PersistedWebsiteConfiguration = persisted_from_s3s(&website).expect("convert");
-        let back: WebsiteConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, website);
+        let xml = b"<WebsiteConfiguration><ErrorDocument><Key>404.html</Key></ErrorDocument>\
+            <IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>";
+        let stored = parse_website(xml).expect("stored website");
+        let config = stored_config(&stored, parse_website_dto).expect("gateway website");
+        assert!(config.redirect_all_requests_to.is_none());
+        assert!(config.routing_rules.is_none());
+        assert_eq!(serialize_website_dto(&config), xml);
     }
 
     #[test]
     fn tagging_keeps_keyless_tags() {
-        let tagging = Tagging {
-            tag_set: vec![
-                Tag {
-                    key: Some("k".to_owned()),
-                    value: Some("v".to_owned()),
-                },
-                Tag { key: None, value: None },
-            ],
-        };
-        assert_eq!(tagging_to_s3s(&tagging_from_s3s(&tagging)), tagging);
+        use rustfs_gateway_types::persistence::{parse_tagging_dto, serialize_tagging_dto};
+
+        let xml = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag><Tag></Tag></TagSet></Tagging>";
+        let tagging = parse_tagging_dto(xml).expect("read stored tags");
+        let pairs: Vec<_> = tagging
+            .tag_set
+            .iter()
+            .map(|tag| (tag.key.as_deref(), tag.value.as_deref()))
+            .collect();
+        assert_eq!(pairs, [(Some("k"), Some("v")), (None, None)]);
+        let stored = rustfs_gateway_types::cors_tagging::parse_tagging(&serialize_tagging_dto(&tagging)).expect("read back tags");
+        assert_eq!(stored, rustfs_gateway_types::cors_tagging::parse_tagging(xml).unwrap());
     }
 }
 

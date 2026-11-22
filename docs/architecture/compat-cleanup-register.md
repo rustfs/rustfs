@@ -11,6 +11,8 @@
 
 ## Open Items
 
+- `9526` NIXL shard reads recognize the exact file-missing response from peers that predate the disk error header. Remove the response-body check once all supported NIXL peers send the header.
+
 - `openidconnect-hmac-signature-width` ID token verification guard: openidconnect 4.1.0 converts decoded HMAC signatures to fixed-size arrays, which panic on unexpected lengths. Check HS256, HS384, and HS512 signature widths before delegating all cryptographic, issuer, audience, expiry, and nonce checks to the upstream verifier. Remove the guard after a supported upstream release returns verification errors for arbitrary HMAC signature lengths.
 
 - `zstd-013-fixed-backend` dependency constraint bridge: Avro, Arrow IPC, Parquet, and Kafka still require zstd 0.13. The local adapter re-exports the fixed registry zstd 0.14.3 implementation and its zstd-safe types. Remove the adapter and Cargo patch after every dependency accepts the fixed zstd line without the 0.13 bridge.

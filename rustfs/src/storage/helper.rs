@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
-#[cfg(test)]
-use crate::shared_types::RemoteAddr;
 use crate::shared_types::convert_ecstore_object_info;
 use crate::storage::req_info::ReqInfo;
 use crate::storage::request_context::RequestContext;
@@ -29,8 +27,6 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
-#[cfg(test)]
-use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::Action;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
@@ -38,19 +34,13 @@ use rustfs_s3_types::EventName;
 use rustfs_targets::{extract_params_header, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
-#[cfg(test)]
-use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
 use std::net::SocketAddr;
 use tokio::runtime::{Builder, Handle};
-
-/// Request type seen by the denial auditor, so `denial_audit` stays off the direct s3s surface.
-#[cfg(test)]
-pub(crate) type DenialRequest<T> = S3Request<T>;
 use tracing::{Instrument, info_span, warn};
 
-/// The request fields used to build an audit entry, shared by both request edges.
+/// The decoded request fields used to build an audit entry.
 pub(crate) struct AuditRequestView<'a> {
     bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     headers: &'a HeaderMap,
@@ -62,27 +52,6 @@ pub(crate) struct AuditRequestView<'a> {
 }
 
 impl<'a> AuditRequestView<'a> {
-    #[cfg(test)]
-    pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
-        Self {
-            bucket_generation: super::authorization::PendingDeleteBucketGenerationGuard::resolve_generation(
-                req.extensions.get(),
-                req.extensions.get(),
-            )
-            .ok()
-            .flatten(),
-            headers: &req.headers,
-            uri: &req.uri,
-            req_info: req.extensions.get::<ReqInfo>(),
-            client_info: req.extensions.get::<ClientInfo>(),
-            remote_addr: req
-                .extensions
-                .get::<Option<RemoteAddr>>()
-                .and_then(|addr| addr.map(|addr| addr.0)),
-            request_context: req.extensions.get::<RequestContext>(),
-        }
-    }
-
     /// The view of a request whose facts an owned edge already decoded.
     pub(crate) fn from_facts(
         headers: &'a HeaderMap,
@@ -215,17 +184,6 @@ impl<'a> OperationOutcome<'a> {
         match result {
             Ok(_) => Self::Success { status, headers },
             Err(err) => Self::failure(err.status_code(), Some(err.message().unwrap_or_else(|| err.code().as_str()))),
-        }
-    }
-
-    #[cfg(test)]
-    fn legacy<T>(result: &'a S3Result<S3Response<T>>) -> Self {
-        match result {
-            Ok(res) => Self::Success {
-                status: res.status.unwrap_or(StatusCode::OK),
-                headers: &res.headers,
-            },
-            Err(err) => Self::failure(err.status_code(), err.message()),
         }
     }
 
@@ -382,30 +340,13 @@ pub struct EnabledOperationHelper {
 }
 
 impl OperationHelper {
-    /// Builds the legacy request helper for audit and notification fixtures.
-    #[cfg(test)]
-    pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
-        record_s3_op(op);
-        Self::from_view(&AuditRequestView::legacy(req), event, op)
-    }
-
     /// Builds the helper from the audit facts decoded by the operation edge.
     /// The edge counts the operation before calling the use case.
     pub(crate) fn from_view(req: &AuditRequestView<'_>, event: EventName, op: S3Operation) -> Self {
         Self::build(req, event, op, false)
     }
 
-    /// Create an OperationHelper that only emits an audit entry, never a bucket notification.
-    ///
-    /// For operations that have no notification event of their own (`UploadPart`, the
-    /// bucket configuration writes) or whose event is internal (`AbortMultipartUpload`).
-    /// The handler records the per-operation metric.
-    #[cfg(test)]
-    pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
-        Self::audit_only_from_view(&AuditRequestView::legacy(req), op)
-    }
-
-    /// [`Self::audit_only`] for a request whose audit facts an owned edge decoded.
+    /// Starts an audit entry without building a notification event.
     pub(crate) fn audit_only_from_view(req: &AuditRequestView<'_>, op: S3Operation) -> Self {
         let event = op.to_event_name().unwrap_or(EventName::AuditS3Operation);
         Self::build(req, event, op, true)
@@ -631,16 +572,7 @@ impl OperationHelper {
         self
     }
 
-    /// Complete operational details from S3 results.
-    /// This method should be called immediately before the function returns.
-    /// It consumes and prepares auxiliary structures for use during `drop`.
-    #[cfg(test)]
-    pub fn complete<T>(self, result: &S3Result<S3Response<T>>) -> Self {
-        self.complete_with(OperationOutcome::legacy(result))
-    }
-
-    /// [`Self::complete`] for an owned operation, which answers success with
-    /// `status` and adds `headers` beyond its output.
+    /// Records the operation result with its success status and response headers.
     pub(crate) fn complete_owned<T>(
         self,
         result: &rustfs_s3_types::S3Result<T>,
@@ -747,20 +679,6 @@ pub(crate) enum DenialScope {
     Keys(u64),
 }
 
-/// Builds the audit entry for a request the authorization layer refused.
-///
-/// The entry carries the action that was denied and the internal denial reason, so an
-/// audit consumer can tell a refused request from a handler that never ran.
-#[cfg(test)]
-pub(crate) fn authorization_denial_entry<T>(
-    req: &S3Request<T>,
-    action: &Action,
-    reason: &'static str,
-    scope: DenialScope,
-) -> AuditEntry {
-    authorization_denial_entry_for_view(&AuditRequestView::legacy(req), action, reason, scope)
-}
-
 pub(crate) fn authorization_denial_entry_for_view(
     req: &AuditRequestView<'_>,
     action: &Action,
@@ -808,23 +726,6 @@ pub(crate) fn authorization_denial_entry_for_view(
         .error("Access Denied")
         .tags(tags)
         .build()
-}
-
-/// Runs `handler` on `req` and records the outcome as an audit-only entry for `op`.
-///
-/// The helper is built before the request is handed over so it sees the original headers
-/// and extensions, and it completes with the handler's result, so failed requests are audited too.
-#[cfg(test)]
-pub(crate) async fn audit_only_operation<I, O, F, Fut>(req: S3Request<I>, op: S3Operation, handler: F) -> S3Result<S3Response<O>>
-where
-    I: Send + Sync,
-    F: FnOnce(S3Request<I>) -> Fut,
-    Fut: Future<Output = S3Result<S3Response<O>>>,
-{
-    let helper = OperationHelper::audit_only(&req, op);
-    let result = handler(req).await;
-    let _helper = helper.complete(&result);
-    result
 }
 
 fn should_build_notification_event(notify_module_enabled: bool) -> bool {
@@ -896,19 +797,17 @@ impl Drop for OperationHelper {
 #[allow(unused_imports)]
 mod tests {
     use super::OperationHelper;
+    use crate::app::{RequestEnvelope, RequestHead};
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
     use crate::storage::req_info::ReqInfo;
     use crate::storage::request_context::RequestContext;
-    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
-    use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
+    use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_audit::ObjectVersion;
     use rustfs_credentials::Credentials;
     use rustfs_s3_ops::S3Operation;
-    use rustfs_s3_types::EventName;
+    use rustfs_s3_types::{EventName, S3Error, S3ErrorCode, S3Result};
     use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
-    use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput, GetObjectInput, GetObjectOutput};
-    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use temp_env::{async_with_vars, with_vars};
 
     #[cfg(feature = "diagnostic-read-version-caller")]
@@ -972,7 +871,7 @@ mod tests {
             access_key: "keystone:test".to_owned(),
             ..Default::default()
         };
-        let result: S3Result<S3Response<()>> = rustfs_keystone::KEYSTONE_CREDENTIALS
+        let result: S3Result<()> = rustfs_keystone::KEYSTONE_CREDENTIALS
             .scope(Some(credentials), async {
                 super::run_owned_mutation(async {
                     assert_eq!(
@@ -980,18 +879,9 @@ mod tests {
                             .with(|credentials| credentials.as_ref().map(|value| value.access_key.clone())),
                         Some("keystone:test".to_owned())
                     );
-                    let req = S3Request {
-                        input: (),
-                        method: Method::DELETE,
-                        uri: Uri::from_static("/owned-mutation-panic/object"),
-                        headers: HeaderMap::new(),
-                        extensions: Extensions::new(),
-                        credentials: None,
-                        region: None,
-                        service: None,
-                        trailing_headers: None,
-                    };
-                    let _helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
+                    let req = request(Method::DELETE, Uri::from_static("/owned-mutation-panic/object"), |_, _| {});
+                    let _helper =
+                        OperationHelper::from_view(&req.audit_view(), EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
                     panic!("injected mutation panic before reporting a commit");
                 })
                 .await
@@ -1111,110 +1001,52 @@ mod tests {
 
         let ordinary = uuid::Uuid::new_v4();
         let deleted = uuid::Uuid::new_v4();
-        let mut request = build_request((), Method::DELETE, "/bucket/object".parse().expect("delete URI"));
-        request.extensions.insert(BucketGenerationGuard {
-            bucket: "bucket".to_string(),
-            incarnation_id: ordinary,
-        });
-        request
-            .extensions
-            .insert(PendingDeleteBucketGenerationGuard::Ready(BucketGenerationGuard {
-                bucket: "bucket".to_string(),
-                incarnation_id: deleted,
-            }));
+        let generation = |pending: Option<PendingDeleteBucketGenerationGuard>| {
+            let envelope = request(Method::DELETE, Uri::from_static("/bucket/object"), |_, extensions| {
+                extensions.insert(BucketGenerationGuard {
+                    bucket: "bucket".to_owned(),
+                    incarnation_id: ordinary,
+                });
+                if let Some(pending) = pending {
+                    extensions.insert(pending);
+                }
+            });
+            envelope.audit_view().bucket_generation.map(|guard| guard.incarnation_id)
+        };
         assert_eq!(
-            super::AuditRequestView::legacy(&request)
-                .bucket_generation
-                .map(|guard| guard.incarnation_id),
+            generation(Some(PendingDeleteBucketGenerationGuard::Ready(BucketGenerationGuard {
+                bucket: "bucket".to_owned(),
+                incarnation_id: deleted,
+            }))),
             Some(deleted),
             "delete notifications must use the deferred guard that storage validates"
         );
-        request.extensions.insert(PendingDeleteBucketGenerationGuard::Failed {
-            code: rustfs_s3_types::S3ErrorCode::NoSuchBucket,
-            message: "bucket generation unavailable".to_string(),
-        });
-        assert!(
-            super::AuditRequestView::legacy(&request).bucket_generation.is_none(),
+        assert_eq!(
+            generation(Some(PendingDeleteBucketGenerationGuard::Failed {
+                code: rustfs_s3_types::S3ErrorCode::NoSuchBucket,
+                message: "bucket generation unavailable".to_owned(),
+            })),
+            None,
             "a failed deferred capture must not fall back to another generation"
         );
-        request.extensions.remove::<PendingDeleteBucketGenerationGuard>();
-        assert_eq!(
-            super::AuditRequestView::legacy(&request)
-                .bucket_generation
-                .map(|guard| guard.incarnation_id),
-            Some(ordinary),
-            "ordinary operations retain their original generation"
-        );
+        assert_eq!(generation(None), Some(ordinary), "ordinary operations retain their original generation");
     }
 
-    fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
-        S3Request {
-            input,
-            method,
-            uri,
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct SeenMetricsRecorder {
-        counters: Arc<Mutex<Vec<Key>>>,
-    }
-
-    impl SeenMetricsRecorder {
-        fn saw_counter_named(&self, name: &str) -> bool {
-            self.counters.lock().unwrap().iter().any(|key| key.name() == name)
-        }
-    }
-
-    impl metrics::Recorder for SeenMetricsRecorder {
-        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-
-        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-
-        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-
-        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-            self.counters.lock().unwrap().push(key.clone());
-            Counter::from_arc(Arc::new(NoopCounter))
-        }
-
-        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-            Gauge::from_arc(Arc::new(NoopGauge))
-        }
-
-        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-            Histogram::from_arc(Arc::new(NoopHistogram))
-        }
-    }
-
-    struct NoopCounter;
-
-    impl CounterFn for NoopCounter {
-        fn increment(&self, _value: u64) {}
-
-        fn absolute(&self, _value: u64) {}
-    }
-
-    struct NoopGauge;
-
-    impl GaugeFn for NoopGauge {
-        fn increment(&self, _value: f64) {}
-
-        fn decrement(&self, _value: f64) {}
-
-        fn set(&self, _value: f64) {}
-    }
-
-    struct NoopHistogram;
-
-    impl HistogramFn for NoopHistogram {
-        fn record(&self, _value: f64) {}
+    fn request(method: Method, uri: Uri, configure: impl FnOnce(&mut HeaderMap, &mut Extensions)) -> RequestEnvelope {
+        let mut headers = HeaderMap::new();
+        let mut extensions = Extensions::new();
+        configure(&mut headers, &mut extensions);
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method,
+                uri,
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
     }
 
     #[test]
@@ -1227,26 +1059,23 @@ mod tests {
             || {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("input-bucket".to_string())
-                    .key("input-object".to_string())
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::DELETE, Uri::from_static("/from-uri/ignored"));
-                req.headers.insert("host", HeaderValue::from_static("example.com"));
-                req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
-                req.extensions.insert(ReqInfo {
-                    cred: Some(Credentials {
-                        access_key: "notifyTag".to_string(),
-                        ..Default::default()
-                    }),
-                    bucket: Some("issue-2292-bucket".to_string()),
-                    object: Some("prefix/issue-2292.txt".to_string()),
-                    version_id: Some("version-123".to_string()),
-                    ..Default::default()
-                });
 
-                let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
+                let req = request(Method::DELETE, Uri::from_static("/from-uri/ignored"), |headers, extensions| {
+                    headers.insert("host", HeaderValue::from_static("example.com"));
+                    headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+                    extensions.insert(ReqInfo {
+                        cred: Some(Credentials {
+                            access_key: "notifyTag".to_string(),
+                            ..Default::default()
+                        }),
+                        bucket: Some("issue-2292-bucket".to_string()),
+                        object: Some("prefix/issue-2292.txt".to_string()),
+                        version_id: Some("version-123".to_string()),
+                        ..Default::default()
+                    });
+                });
+                let helper =
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
                 let OperationHelper::Enabled(state) = &helper else {
                     panic!("helper should be enabled when notify/audit switches are on");
                 };
@@ -1285,22 +1114,21 @@ mod tests {
                         EventName::ObjectRemovedAbortMultipartUpload,
                     ),
                 ] {
-                    let input = DeleteObjectTaggingInput::builder()
-                        .bucket("audit-bucket".to_string())
-                        .key("object.txt".to_string())
-                        .build()
-                        .unwrap();
-                    let mut req = build_request(input, Method::PUT, Uri::from_static(uri));
-                    req.extensions.insert(ReqInfo {
-                        cred: Some(Credentials {
-                            access_key: "auditor".to_string(),
+                    let req = request(Method::PUT, Uri::from_static(uri), |_, extensions| {
+                        extensions.insert(ReqInfo {
+                            cred: Some(Credentials {
+                                access_key: "auditor".to_string(),
+                                ..Default::default()
+                            }),
                             ..Default::default()
-                        }),
-                        ..Default::default()
+                        });
                     });
-
-                    let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
-                    let mut helper = OperationHelper::audit_only(&req, op).complete(&result);
+                    let result = Ok(());
+                    let mut helper = OperationHelper::audit_only_from_view(&req.audit_view(), op).complete_owned(
+                        &result,
+                        StatusCode::OK,
+                        &HeaderMap::new(),
+                    );
                     assert!(!helper.wants_object_info(), "{} must not build a notification event", op.as_str());
                     assert!(helper.event_args().is_none(), "{} must not build a notification event", op.as_str());
                     let OperationHelper::Enabled(state) = &mut helper else {
@@ -1328,14 +1156,10 @@ mod tests {
             || {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("audit-bucket".to_string())
-                    .key("object.txt".to_string())
-                    .build()
-                    .unwrap();
-                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket/object.txt"));
+
+                let req = request(Method::PUT, Uri::from_static("/audit-bucket/object.txt"), |_, _| {});
                 assert!(matches!(
-                    OperationHelper::audit_only(&req, S3Operation::UploadPart),
+                    OperationHelper::audit_only_from_view(&req.audit_view(), S3Operation::UploadPart),
                     OperationHelper::Disabled
                 ));
             },
@@ -1355,15 +1179,10 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("audit-bucket".to_string())
-                    .key("object.txt".to_string())
-                    .build()
-                    .unwrap();
-                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket"));
-                let result: S3Result<S3Response<DeleteObjectTaggingOutput>> =
-                    Err(S3Error::with_message(S3ErrorCode::AccessDenied, "policy refused".to_string()));
-                let mut helper = OperationHelper::audit_only(&req, S3Operation::PutBucketPolicy).complete(&result);
+                let req = request(Method::PUT, Uri::from_static("/audit-bucket"), |_, _| {});
+                let result: S3Result<()> = Err(S3Error::with_message(S3ErrorCode::AccessDenied, "policy refused".to_string()));
+                let mut helper = OperationHelper::audit_only_from_view(&req.audit_view(), S3Operation::PutBucketPolicy)
+                    .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                 let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when the audit switch is on");
                 };
@@ -1388,18 +1207,14 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("audit-bucket".to_string())
-                    .key("object.txt".to_string())
-                    .build()
-                    .unwrap();
-                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket"));
-                let err = super::audit_only_operation(req, S3Operation::PutBucketPolicy, |req| async move {
-                    assert_eq!(req.input.bucket, "audit-bucket");
-                    Err::<S3Response<DeleteObjectTaggingOutput>, _>(S3Error::new(S3ErrorCode::AccessDenied))
-                })
-                .await
-                .unwrap_err();
+                let req = request(Method::PUT, Uri::from_static("/audit-bucket"), |_, _| {});
+                let err =
+                    RequestEnvelope::audit_only_operation(req, S3Operation::PutBucketPolicy, StatusCode::OK, |req| async move {
+                        assert_eq!(req.uri().path(), "/audit-bucket");
+                        Err::<(), _>(S3Error::new(S3ErrorCode::AccessDenied))
+                    })
+                    .await
+                    .unwrap_err();
                 assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
             },
         )
@@ -1424,44 +1239,42 @@ mod tests {
                     (Some("sts-session"), "testuser"),
                     (None, ""),
                     (Some(""), ""),
+                    (Some(""), "unverified-parent"),
                 ] {
                     let expected_access_key = access_key.filter(|key| !key.is_empty());
                     for outcome in [None, Some(true), Some(false)] {
-                        let input = GetObjectInput::builder()
-                            .bucket("audit-bucket".to_string())
-                            .key("object.txt".to_string())
-                            .build()
-                            .expect("get object input should build");
-                        let mut req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/object.txt"));
-                        req.extensions.insert(ReqInfo {
-                            cred: access_key.map(|key| Credentials {
-                                access_key: key.to_string(),
-                                secret_key: "audit-secret-must-not-leak".to_string(),
-                                session_token: "audit-token-must-not-leak".to_string(),
-                                parent_user: parent_user.to_string(),
-                                claims: match key {
-                                    "service-account" => Some(std::collections::HashMap::from([(
-                                        rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
-                                        serde_json::json!(rustfs_credentials::INHERITED_POLICY_TYPE),
-                                    )])),
-                                    "sts-session" => Some(std::collections::HashMap::from([(
-                                        "sessionPolicy".to_string(),
-                                        serde_json::json!("private-session-policy"),
-                                    )])),
-                                    _ => None,
-                                },
+                        let req = request(Method::GET, Uri::from_static("/audit-bucket/object.txt"), |_, extensions| {
+                            extensions.insert(ReqInfo {
+                                cred: access_key.map(|key| Credentials {
+                                    access_key: key.to_string(),
+                                    secret_key: "audit-secret-must-not-leak".to_string(),
+                                    session_token: "audit-token-must-not-leak".to_string(),
+                                    parent_user: parent_user.to_string(),
+                                    claims: match key {
+                                        "service-account" => Some(std::collections::HashMap::from([(
+                                            rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
+                                            serde_json::json!(rustfs_credentials::INHERITED_POLICY_TYPE),
+                                        )])),
+                                        "sts-session" => Some(std::collections::HashMap::from([(
+                                            "sessionPolicy".to_string(),
+                                            serde_json::json!("private-session-policy"),
+                                        )])),
+                                        _ => None,
+                                    },
+                                    ..Default::default()
+                                }),
                                 ..Default::default()
-                            }),
-                            ..Default::default()
+                            });
                         });
-                        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                        let mut helper =
+                            OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
                         if let Some(success) = outcome {
                             let result = if success {
-                                Ok(S3Response::new(GetObjectOutput::default()))
+                                Ok(())
                             } else {
                                 Err(S3Error::new(S3ErrorCode::NoSuchKey))
                             };
-                            helper = helper.complete(&result);
+                            helper = helper.complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                         }
                         let OperationHelper::Enabled(state) = &mut helper else {
                             panic!("helper should be enabled when the audit switch is on");
@@ -1469,10 +1282,11 @@ mod tests {
                         let entry = state.audit_builder.take().expect("audit builder should exist").build();
                         assert_eq!(entry.access_key.as_deref(), expected_access_key);
                         let json = serde_json::to_value(&entry).expect("audit entry should serialize");
-                        assert_eq!(json.get("accessKey").and_then(|key| key.as_str()), expected_access_key);
-                        let expected_parent_user = (!parent_user.is_empty()).then_some(parent_user);
+                        assert_eq!(json.get("accessKey").cloned(), expected_access_key.map(serde_json::Value::from));
+                        let expected_parent_user =
+                            (expected_access_key.is_some() && !parent_user.is_empty()).then_some(parent_user);
                         assert_eq!(entry.parent_user.as_deref(), expected_parent_user);
-                        assert_eq!(json.get("parentUser").and_then(|value| value.as_str()), expected_parent_user);
+                        assert_eq!(json.get("parentUser").cloned(), expected_parent_user.map(serde_json::Value::from));
                         assert!(!json.as_object().unwrap().contains_key("requestClaims"));
                         let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
                         assert!(!rendered.contains("audit-secret-must-not-leak"));
@@ -1543,19 +1357,24 @@ mod tests {
                         }
 
                         for outcome in [None, Some(true), Some(false)] {
-                            let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
-                            req.extensions.insert(ReqInfo {
-                                cred: Some(credentials.clone()),
-                                ..Default::default()
+                            let req = request(Method::GET, Uri::from_static("/audit-bucket/object.txt"), |_, extensions| {
+                                extensions.insert(ReqInfo {
+                                    cred: Some(credentials.clone()),
+                                    ..Default::default()
+                                });
                             });
-                            let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                            let mut helper = OperationHelper::from_view(
+                                &req.audit_view(),
+                                EventName::ObjectAccessedGet,
+                                S3Operation::GetObject,
+                            );
                             if let Some(success) = outcome {
                                 let result = if success {
-                                    Ok(S3Response::new(GetObjectOutput::default()))
+                                    Ok(())
                                 } else {
                                     Err(S3Error::new(S3ErrorCode::NoSuchKey))
                                 };
-                                helper = helper.complete(&result);
+                                helper = helper.complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                             }
                             let OperationHelper::Enabled(state) = &mut helper else {
                                 panic!("audit helper should be enabled");
@@ -1570,10 +1389,7 @@ mod tests {
                             assert!(!rendered.contains("private@example.test"));
                             assert!(!rendered.contains("audit-secret-must-not-leak"));
                             assert!(!rendered.contains("audit-token-must-not-leak"));
-                            assert_eq!(
-                                serde_json::to_value(req.extensions.get::<ReqInfo>().unwrap().cred.as_ref().unwrap()).unwrap(),
-                                before
-                            );
+                            assert_eq!(serde_json::to_value(req.req_info().unwrap().cred.as_ref().unwrap()).unwrap(), before);
                         }
                     }
                 }
@@ -1587,13 +1403,14 @@ mod tests {
 
         let credentials = oidc_audit_credentials(Some("https://idp.example.test"));
         let before = serde_json::to_value(&credentials).unwrap();
-        let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
-        req.extensions.insert(ReqInfo {
-            cred: Some(credentials),
-            ..Default::default()
+        let req = request(Method::GET, Uri::from_static("/audit-bucket/object.txt"), |_, extensions| {
+            extensions.insert(ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            });
         });
-        let entry = super::authorization_denial_entry(
-            &req,
+        let entry = super::authorization_denial_entry_for_view(
+            &req.audit_view(),
             &Action::S3Action(S3Action::GetObjectAction),
             "iam_explicit_deny",
             super::DenialScope::Request,
@@ -1615,10 +1432,7 @@ mod tests {
         assert!(!rendered.contains("private"));
         assert!(!rendered.contains("audit-secret-must-not-leak"));
         assert!(!rendered.contains("audit-token-must-not-leak"));
-        assert_eq!(
-            serde_json::to_value(req.extensions.get::<ReqInfo>().unwrap().cred.as_ref().unwrap()).unwrap(),
-            before
-        );
+        assert_eq!(serde_json::to_value(req.req_info().unwrap().cred.as_ref().unwrap()).unwrap(), before);
     }
 
     #[test]
@@ -1632,13 +1446,14 @@ mod tests {
         ] {
             let mut credentials = oidc_audit_credentials(None);
             credentials.claims.as_mut().unwrap().insert(key.to_string(), value);
-            let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
-            req.extensions.insert(ReqInfo {
-                cred: Some(credentials),
-                ..Default::default()
+            let req = request(Method::GET, Uri::from_static("/audit-bucket/object.txt"), |_, extensions| {
+                extensions.insert(ReqInfo {
+                    cred: Some(credentials),
+                    ..Default::default()
+                });
             });
             let entry = super::request_audit_builder(
-                &super::AuditRequestView::legacy(&req),
+                &req.audit_view(),
                 EventName::ObjectAccessedGet,
                 "GetObject",
                 rustfs_audit::ApiDetails::default(),
@@ -1692,24 +1507,20 @@ mod tests {
                     (None, None, ""),
                 ] {
                     for spoofed in [false, true] {
-                        let input = GetObjectInput::builder()
-                            .bucket("audit-bucket".to_string())
-                            .key("object.txt".to_string())
-                            .build()
-                            .expect("get object input should build");
-                        let mut req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/object.txt"));
-                        req.extensions.insert(remote_addr);
-                        if let Some(client_info) = client_info.as_ref() {
-                            req.extensions.insert(client_info.clone());
-                        }
-                        if spoofed {
-                            req.headers
-                                .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
-                            req.headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.98"));
-                        }
-                        let result = Ok(S3Response::new(GetObjectOutput::default()));
+                        let req = request(Method::GET, Uri::from_static("/audit-bucket/object.txt"), |headers, extensions| {
+                            extensions.insert(remote_addr);
+                            if let Some(client_info) = client_info.as_ref() {
+                                extensions.insert(client_info.clone());
+                            }
+                            if spoofed {
+                                headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
+                                headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.98"));
+                            }
+                        });
+                        let result = Ok(());
                         let mut helper =
-                            OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                            OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+                                .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                         let OperationHelper::Enabled(state) = &mut helper else {
                             panic!("helper should be enabled when the audit switch is on");
                         };
@@ -1734,28 +1545,25 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("test-bucket".to_string())
-                    .key("test-key".to_string())
-                    .build()
-                    .expect("delete object tagging input should build");
-                let req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket"));
+                let req = request(Method::DELETE, Uri::from_static("/test-bucket"), |_, _| {});
                 let objects = vec![
                     ObjectVersion::new("first-key".to_string(), None),
                     ObjectVersion::new("second-key".to_string(), Some("version-123".to_string())),
                 ];
-                let mut empty_helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects)
-                    .audit_objects(Vec::new());
+                let mut empty_helper =
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectRemovedDelete, S3Operation::DeleteObjects)
+                        .audit_objects(Vec::new());
                 let OperationHelper::Enabled(empty_state) = &mut empty_helper else {
                     panic!("helper should be enabled when the audit switch is on");
                 };
                 assert!(empty_state.api_builder.0.objects.is_none());
                 empty_state.audit_builder.take();
 
-                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
-                let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects)
-                    .audit_objects(objects.clone())
-                    .complete(&result);
+                let result = Ok(());
+                let mut helper =
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectRemovedDelete, S3Operation::DeleteObjects)
+                        .audit_objects(objects.clone())
+                        .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
 
                 let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when the audit switch is on");
@@ -1777,13 +1585,9 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = GetObjectInput::builder()
-                    .bucket("audit-bucket".to_string())
-                    .key("missing/object.txt".to_string())
-                    .build()
-                    .expect("get object input should build");
-                let req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"));
-                let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                let req = request(Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"), |_, _| {});
+                let mut helper =
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when the audit switch is on");
@@ -1809,15 +1613,11 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = GetObjectInput::builder()
-                    .bucket("audit-bucket".to_string())
-                    .key("missing/object.txt".to_string())
-                    .build()
-                    .expect("get object input should build");
-                let req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"));
-                let result: Result<S3Response<GetObjectOutput>, S3Error> = Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                let req = request(Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"), |_, _| {});
+                let result: S3Result<()> = Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 let mut helper =
-                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+                        .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
 
                 let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when the audit switch is on");
@@ -1842,36 +1642,30 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("test-bucket".to_string())
-                    .key("test-key".to_string())
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
-                req.headers.insert("host", HeaderValue::from_static("example.com"));
-                req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
-                req.headers
-                    .insert(REQUEST_ID_HEADER, HeaderValue::from_static("ingress-canonical-uuid"));
-                req.headers
-                    .insert("x-amz-request-id", HeaderValue::from_static("client-supplied-request-id"));
+                let req = request(Method::DELETE, Uri::from_static("/test-bucket/test-key"), |headers, extensions| {
+                    headers.insert("host", HeaderValue::from_static("example.com"));
+                    headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+                    headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("ingress-canonical-uuid"));
+                    headers.insert("x-amz-request-id", HeaderValue::from_static("client-supplied-request-id"));
 
-                req.extensions.insert(RequestContext {
-                    request_id: "ingress-canonical-uuid".to_string(),
-                    x_amz_request_id: "client-supplied-request-id".to_string(),
-                    trace_id: None,
-                    span_id: None,
-                    start_time: std::time::Instant::now(),
+                    extensions.insert(RequestContext {
+                        request_id: "ingress-canonical-uuid".to_string(),
+                        x_amz_request_id: "client-supplied-request-id".to_string(),
+                        trace_id: None,
+                        span_id: None,
+                        start_time: std::time::Instant::now(),
+                    });
+
+                    extensions.insert(ReqInfo {
+                        bucket: Some("test-bucket".to_string()),
+                        object: Some("test-key".to_string()),
+                        ..Default::default()
+                    });
                 });
-
-                req.extensions.insert(ReqInfo {
-                    bucket: Some("test-bucket".to_string()),
-                    object: Some("test-key".to_string()),
-                    ..Default::default()
-                });
-
-                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let result = Ok(());
                 let mut helper =
-                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+                        .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
 
                 // Verify the helper stored the RequestContext
                 let OperationHelper::Enabled(state) = &mut helper else {
@@ -1904,28 +1698,23 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("test-bucket".to_string())
-                    .key("test-key".to_string())
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
-                req.headers.insert("host", HeaderValue::from_static("example.com"));
-                req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+                let req = request(Method::DELETE, Uri::from_static("/test-bucket/test-key"), |headers, extensions| {
+                    headers.insert("host", HeaderValue::from_static("example.com"));
+                    headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
 
-                // No RequestContext inserted
-                req.extensions.insert(ReqInfo {
-                    bucket: Some("test-bucket".to_string()),
-                    object: Some("test-key".to_string()),
-                    ..Default::default()
+                    // No RequestContext inserted
+                    extensions.insert(ReqInfo {
+                        bucket: Some("test-bucket".to_string()),
+                        object: Some("test-key".to_string()),
+                        ..Default::default()
+                    });
                 });
-
-                let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
-                let request_context = helper.request_context_or_from_view(&super::AuditRequestView::legacy(&req));
+                let helper = OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
+                let request_context = helper.request_context_or_from_view(&req.audit_view());
                 let request_id = request_context.request_id;
                 assert!(uuid::Uuid::parse_str(&request_id).is_ok());
-                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
-                let helper = helper.complete(&result);
+                let result = Ok(());
+                let helper = helper.complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                 let OperationHelper::Enabled(state) = &helper else {
                     panic!("helper should be enabled when notify/audit switches are on");
                 };
@@ -1951,30 +1740,20 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("test-bucket".to_string())
-                    .key("test-key".to_string())
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
-                req.headers
-                    .insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-request-id"));
-                req.extensions.insert(RequestContext {
-                    request_id: "server-request-id".to_string(),
-                    x_amz_request_id: "server-request-id".to_string(),
-                    trace_id: None,
-                    span_id: None,
-                    start_time: std::time::Instant::now(),
+                let req = request(Method::DELETE, Uri::from_static("/test-bucket/test-key"), |headers, extensions| {
+                    headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-request-id"));
+                    extensions.insert(RequestContext {
+                        request_id: "server-request-id".to_string(),
+                        x_amz_request_id: "server-request-id".to_string(),
+                        trace_id: None,
+                        span_id: None,
+                        start_time: std::time::Instant::now(),
+                    });
                 });
-                let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                let helper = OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 assert!(matches!(&helper, OperationHelper::Disabled));
-                assert_eq!(
-                    helper
-                        .request_context_or_from_view(&super::AuditRequestView::legacy(&req))
-                        .request_id,
-                    "server-request-id"
-                );
+                assert_eq!(helper.request_context_or_from_view(&req.audit_view()).request_id, "server-request-id");
             },
         );
     }
@@ -2001,37 +1780,32 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("finance".to_string())
-                    .key("ledger.csv".to_string())
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::GET, Uri::from_static("/finance/ledger.csv"));
-                req.extensions.insert(RequestContext {
-                    request_id: "kms-tagged-request".to_string(),
-                    x_amz_request_id: "kms-tagged-request".to_string(),
-                    trace_id: None,
-                    span_id: None,
-                    start_time: std::time::Instant::now(),
-                });
-                req.extensions.insert(ReqInfo {
-                    cred: Some(Credentials {
-                        access_key: "analyst".to_string(),
+                let req = request(Method::GET, Uri::from_static("/finance/ledger.csv"), |_, extensions| {
+                    extensions.insert(RequestContext {
+                        request_id: "kms-tagged-request".to_string(),
+                        x_amz_request_id: "kms-tagged-request".to_string(),
+                        trace_id: None,
+                        span_id: None,
+                        start_time: std::time::Instant::now(),
+                    });
+                    extensions.insert(ReqInfo {
+                        cred: Some(Credentials {
+                            access_key: "analyst".to_string(),
+                            ..Default::default()
+                        }),
+                        bucket: Some("finance".to_string()),
+                        object: Some("ledger.csv".to_string()),
                         ..Default::default()
-                    }),
-                    bucket: Some("finance".to_string()),
-                    object: Some("ledger.csv".to_string()),
-                    ..Default::default()
+                    });
                 });
-
-                let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                let helper = OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Drive the real data path: the principal built from this request is
                 // what carries the audit slot into the SSE code.
                 let metadata = unreadable_sse_kms_metadata();
-                let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+
                 let principal =
-                    crate::storage::sse::SseKmsPrincipal::from_request(&envelope).expect("authenticated request has a principal");
+                    crate::storage::sse::SseKmsPrincipal::from_request(&req).expect("authenticated request has a principal");
                 crate::storage::sse::sse_decryption(crate::storage::sse::DecryptionRequest {
                     bucket: "finance",
                     key: "ledger.csv",
@@ -2043,8 +1817,8 @@ mod tests {
                 .await
                 .expect_err("metadata without an IV cannot be unwrapped");
 
-                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
-                let mut helper = helper.complete(&result);
+                let result = Ok(());
+                let mut helper = helper.complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                 let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when the audit switch is on");
                 };
@@ -2077,23 +1851,19 @@ mod tests {
                 refresh_notify_module_enabled();
                 refresh_audit_module_enabled();
 
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("finance".to_string())
-                    .key("plain.txt".to_string())
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::GET, Uri::from_static("/finance/plain.txt"));
-                req.extensions.insert(RequestContext {
-                    request_id: "plain-request".to_string(),
-                    x_amz_request_id: "plain-request".to_string(),
-                    trace_id: None,
-                    span_id: None,
-                    start_time: std::time::Instant::now(),
+                let req = request(Method::GET, Uri::from_static("/finance/plain.txt"), |_, extensions| {
+                    extensions.insert(RequestContext {
+                        request_id: "plain-request".to_string(),
+                        x_amz_request_id: "plain-request".to_string(),
+                        trace_id: None,
+                        span_id: None,
+                        start_time: std::time::Instant::now(),
+                    });
                 });
-
-                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let result = Ok(());
                 let mut helper =
-                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                    OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+                        .complete_owned(&result, StatusCode::OK, &HeaderMap::new());
                 let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when the audit switch is on");
                 };
@@ -2106,37 +1876,5 @@ mod tests {
             },
         )
         .await;
-    }
-
-    #[test]
-    fn operation_helper_still_records_s3_ops_when_audit_and_notify_are_disabled() {
-        with_vars(
-            [
-                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
-                (rustfs_config::ENV_AUDIT_ENABLE, Some("false")),
-            ],
-            || {
-                refresh_notify_module_enabled();
-                refresh_audit_module_enabled();
-
-                let recorder = SeenMetricsRecorder::default();
-                let input = DeleteObjectTaggingInput::builder()
-                    .bucket("test-bucket".to_string())
-                    .key("test-key".to_string())
-                    .build()
-                    .unwrap();
-                let req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
-
-                metrics::with_local_recorder(&recorder, || {
-                    let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
-                    assert!(matches!(helper, OperationHelper::Disabled));
-                });
-
-                assert!(
-                    recorder.saw_counter_named("rustfs_s3_operations_total"),
-                    "S3 operation metrics should still be recorded when audit/notify are disabled"
-                );
-            },
-        );
     }
 }

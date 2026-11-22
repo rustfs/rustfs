@@ -181,17 +181,8 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-use s3s::{S3Error, S3ErrorCode, S3Result};
 #[cfg(test)]
 use s3s::{S3Request, S3Response};
-
-fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
-    S3Error::with_message(code, message)
-}
-
-fn object_s3_error_default(code: S3ErrorCode) -> S3Error {
-    S3Error::new(code)
-}
 
 /// Remove replication history owned by another source object before a local
 /// object-creation decision is made. Compatibility keys are case-insensitive,
@@ -384,7 +375,12 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }
 
-    async fn check_bucket_quota(&self, bucket: &str, op: QuotaOperation, size: u64) -> S3Result<Option<QuotaCheckResult>> {
+    async fn check_bucket_quota(
+        &self,
+        bucket: &str,
+        op: QuotaOperation,
+        size: u64,
+    ) -> rustfs_s3_types::S3Result<Option<QuotaCheckResult>> {
         let Some(metadata_sys) = self.bucket_metadata_sys() else {
             return Ok(None);
         };

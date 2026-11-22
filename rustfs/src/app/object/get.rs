@@ -6283,7 +6283,8 @@ mod on_demand_migration_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::{HeadObjectInput, Range};
+    use crate::app::storage_api::s3::dto::Range;
+    use crate::app::test_seams::{head_envelope, head_object_input};
     use http::{HeaderMap, HeaderValue, Method};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -6400,22 +6401,19 @@ mod tests {
             assert_eq!(error.code(), &S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("304 validators")["etag"], format!("\"{etag}\""));
 
-            let mut req = build_request(
-                HeadObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(object.to_owned())
-                    .build()
-                    .expect("HEAD input"),
-                Method::HEAD,
-            );
-            req.headers.insert(
+            let mut headers = HeaderMap::new();
+            headers.insert(
                 http::header::IF_NONE_MATCH,
                 HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header"),
             );
-            let error = crate::app::test_seams::head_object(&usecase, req)
-                .await
-                .expect_err("conditional HEAD returns 304");
-            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            let error = crate::app::test_seams::head_object_gateway(
+                &usecase,
+                head_envelope(headers, http::Extensions::new()),
+                head_object_input(&bucket, object, None),
+            )
+            .await
+            .expect_err("conditional HEAD returns 304");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("HEAD validators")["etag"], format!("\"{etag}\""));
 
             let input = GetObjectInput::builder()
@@ -6536,13 +6534,24 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_get_object_response_injects_accept_ranges_header() {
-        let req = build_request(GetObjectInput::default(), Method::GET);
-        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::GET,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+            .suppress_event();
         let response = DefaultObjectUsecase::finalize_get_object_response(
             helper,
             "bucket",
-            &req.method,
-            &req.headers,
+            envelope.method(),
+            envelope.headers(),
             None,
             Some(262_144),
             String::new(),

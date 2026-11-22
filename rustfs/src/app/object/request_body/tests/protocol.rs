@@ -13,12 +13,9 @@
 // limitations under the License.
 
 use super::*;
-use crate::app::storage_api::s3::{
-    Body as S3Body, S3, S3Config, S3Error, S3Request, S3Response, S3Result, S3Service, S3ServiceBuilder, SimpleAuth,
-    StaticConfigProvider, UploadPartInput, UploadPartOutput,
-};
-use crate::app::trailer_adapter::trailer_source;
+use crate::server::gateway_stack::{GatewayAssembly, GatewayStack};
 use http_body_util::BodyExt;
+use rustfs_gateway::{Handler, HandlerResult, Req, Resp, dto};
 use rustfs_rio::{SharedTrailerSource, TrailerValue};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -29,25 +26,31 @@ struct Consumer {
     trailer: Arc<Mutex<Option<SharedTrailerSource>>>,
 }
 
-#[async_trait::async_trait]
-impl S3 for Consumer {
-    async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
-        let expected = req.input.content_length.expect("S3S must normalize the decoded length");
+impl Handler<dto::UploadPart> for Consumer {
+    async fn call(&self, req: Req<dto::UploadPart>) -> HandlerResult<dto::UploadPart> {
+        use crate::app::object::BodyChunks;
         let control = req
-            .extensions
+            .context()
+            .transport_extensions()
             .get::<BodyReadControl>()
             .expect("HTTP control extension")
             .clone();
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in req.context().headers().iter_raw() {
+            headers.append(name.clone(), value.clone());
+        }
+        let input = req.into_input();
+        let (chunks, trailers) = BodyChunks::new(input.body.expect("body").into_body());
+        let inner = rustfs_rio::wrap_reader(StreamReader::new(chunks.map(|item| item.map_err(io::Error::other))));
+        let declared_trailer = headers.contains_key("x-amz-trailer").then_some(trailers);
+        let expected = input.content_length;
         control.activate_upload(Duration::from_secs(300), "test-bucket", "test-key", "request", expected as u64);
-        let stream = req.input.body.expect("body");
-        let inner = rustfs_rio::wrap_reader(StreamReader::new(stream.map(|item| item.map_err(io::Error::other))));
         let mut reader =
             rustfs_rio::HashReader::from_stream(DemandReader::new(inner, control), expected, expected, None, None, false)
                 .expect("logical body reader");
-        let trailer = trailer_source(req.trailing_headers);
-        *self.trailer.lock() = trailer.clone();
+        *self.trailer.lock() = declared_trailer.clone();
         reader
-            .add_checksum(&req.headers, trailer, false)
+            .add_checksum(&headers, declared_trailer, false)
             .expect("request checksum context");
         let mut output = Vec::new();
         let mut buffer = [0; 8192];
@@ -55,7 +58,7 @@ impl S3 for Consumer {
             let count = reader
                 .read(&mut buffer)
                 .await
-                .map_err(|error| S3Error::from(ApiError::from(error)))?;
+                .map_err(|error| crate::server::handler_error(ApiError::from(error).into()))?;
             if count == 0 {
                 break;
             }
@@ -64,44 +67,64 @@ impl S3 for Consumer {
         }
         assert_eq!(output.len() as i64, expected, "wire length must not reach the business DTO");
         *self.committed.lock() = Some(output);
-        Ok(S3Response::new(UploadPartOutput {
-            checksum_crc32: reader.content_crc().get("CRC32").cloned(),
-            ..UploadPartOutput::default()
-        }))
+        let mut extra_headers = http::HeaderMap::new();
+        if let Some(checksum) = reader.content_crc().get("CRC32") {
+            extra_headers.insert("x-amz-checksum-crc32", checksum.parse().expect("base64 checksum"));
+        }
+        Ok(Resp::new(dto::UploadPartOutput {
+            e_tag: crate::app::dto_values::stored_etag("test-part"),
+            ..Default::default()
+        })
+        .with_extra_headers(extra_headers))
     }
 }
 
-fn service(consumer: Consumer) -> S3Service {
-    service_with_config(consumer, S3Config::default())
-}
-
-fn service_with_config(consumer: Consumer, mut config: S3Config) -> S3Service {
-    let mut builder = S3ServiceBuilder::new(consumer);
-    builder.set_auth(SimpleAuth::from_single("test-access", "test-secret"));
-    config.presigned_url_max_skew_time_secs = u32::MAX;
-    builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(config))));
-    builder.build()
+fn gateway_service(consumer: Consumer) -> GatewayStack {
+    use rustfs_gateway::{Credentials, RegionSet, SigV4Authenticator, StaticCredentials};
+    let credentials = StaticCredentials::new().with(Credentials::new("test-access", b"test-secret").unwrap());
+    GatewayStack::assemble_serving(
+        GatewayAssembly {
+            server_ctx: crate::runtime_sources::ServerContextSlot::new(),
+            root_access_key: "test-access".into(),
+            root_secret_key: "test-secret".into(),
+            region: Some("us-east-1".into()),
+            server_domains: Vec::new(),
+            body_read_timeout: Duration::from_secs(300),
+            keystone_auth: None,
+        },
+        |builder| {
+            builder
+                .authenticator(
+                    SigV4Authenticator::new(Arc::new(credentials), RegionSet::new(["us-east-1"]).unwrap()).rustfs_profile(),
+                )
+                .register::<dto::UploadPart, _>(Arc::new(consumer))
+        },
+    )
+    .expect("the gateway stack assembles")
 }
 
 #[tokio::test]
 async fn signed_chunk_size_limit_accepts_exact_boundary_and_rejects_one_more() {
     for exceeds_limit in [false, true] {
-        let payload = b"chunk-size-boundary";
+        // The RustFS gateway profile accepts one signed chunk of 16 MiB.
+        let payload = Bytes::from(vec![7; 16 * 1024 * 1024 + usize::from(exceeds_limit)]);
         let SignedRequest {
             request,
             sender,
             prefix,
             suffix,
-        } = signed_request(payload, false);
+        } = signed_request(&payload, false);
         let consumer = Consumer::default();
-        let mut config = S3Config::default();
-        config.aws_chunked_stream_max_chunk_size = payload.len() - usize::from(exceeds_limit);
-        let service = service_with_config(consumer.clone(), config);
+        let service = gateway_service(consumer.clone());
         sender.send(Ok(Frame::data(prefix))).expect("chunk metadata");
-        sender.send(Ok(Frame::data(Bytes::from_static(payload)))).expect("chunk data");
+        for offset in (0..payload.len()).step_by(64 * 1024) {
+            sender
+                .send(Ok(Frame::data(payload.slice(offset..(offset + 64 * 1024).min(payload.len())))))
+                .expect("chunk data");
+        }
         sender.send(Ok(Frame::data(suffix))).expect("terminating chunk");
         drop(sender);
-        let response = service.call(request).await.expect("S3 response");
+        let response = service.call(request).await;
         if exceeds_limit {
             assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
             let body = BodyExt::collect(response.into_body()).await.expect("error XML").to_bytes();
@@ -112,23 +135,24 @@ async fn signed_chunk_size_limit_accepts_exact_boundary_and_rejects_one_more() {
             assert!(consumer.committed.lock().is_none());
         } else {
             assert_eq!(response.status(), http::StatusCode::OK);
-            assert_eq!(*consumer.committed.lock(), Some(payload.to_vec()));
+            assert_eq!(consumer.committed.lock().as_deref(), Some(payload.as_ref()));
         }
     }
 }
 
+type WireBody = ObservedBody<StreamBody<UnboundedReceiverStream<io::Result<Frame<Bytes>>>>>;
+
 struct SignedRequest {
-    request: http::Request<S3Body>,
+    request: http::Request<WireBody>,
     sender: FrameSender,
     prefix: Bytes,
     suffix: Bytes,
 }
 
-/// Constructs a real SigV4 fixture using the production crypto primitives.
-/// S3S verifies both the request authorization and every signed chunk.
+/// Independently sign the wire fixture; the gateway verifies the header and each signed chunk.
 fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
-    const DATE: &str = "20130524T000000Z";
-    const SCOPE: &str = "20130524/us-east-1/s3/aws4_request";
+    use rustfs_signer::request_signature_v4::{get_scope, get_signature, get_signing_key};
+    use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
     const REGION: &str = "us-east-1";
     const SERVICE: &str = "s3";
     const SECRET_KEY: &str = "test-secret";
@@ -137,40 +161,45 @@ fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
     } else {
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
     };
-    let decoded_length = payload.len().to_string();
-    let mut signed_headers = vec![
-        ("content-encoding", "aws-chunked"),
-        ("host", "s3.amazonaws.com"),
-        ("x-amz-content-sha256", mode),
-        ("x-amz-date", DATE),
-        ("x-amz-decoded-content-length", decoded_length.as_str()),
-    ];
+    let mut builder = http::Request::put("https://s3.amazonaws.com/test-bucket/test-key?partNumber=1&uploadId=test-upload")
+        .header("host", "s3.amazonaws.com")
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-content-sha256", mode)
+        .header("x-amz-decoded-content-length", payload.len());
     if unsigned_trailer {
-        signed_headers.push(("x-amz-trailer", "x-amz-checksum-crc32"));
+        builder = builder.header("x-amz-trailer", "x-amz-checksum-crc32");
     }
-    signed_headers.sort_unstable_by(|lhs, rhs| lhs.0.cmp(rhs.0));
-    let signed_header_names = signed_headers.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(";");
-    let query = [("partNumber", "1"), ("uploadId", "test-upload")];
-    let payload_mode = if unsigned_trailer {
-        s3s_sigv4::Payload::UnsignedMultipleChunksWithTrailer
-    } else {
-        s3s_sigv4::Payload::MultipleChunks
-    };
-    let date = s3s_sigv4::AmzDate::parse(DATE).expect("fixture date");
-    let canonical = s3s_sigv4::create_canonical_request("PUT", "/test-bucket/test-key", &query, &signed_headers, payload_mode);
-    let string_to_sign = s3s_sigv4::create_string_to_sign(&canonical, &date, REGION, SERVICE);
-    let seed = s3s_sigv4::calculate_signature(&string_to_sign, SECRET_KEY, &date, REGION, SERVICE);
-    let chunk_signature = |previous: &str, data: &[u8]| {
-        let string_to_sign = s3s_sigv4::create_chunk_string_to_sign(&date, REGION, SERVICE, previous, &[data]);
-        s3s_sigv4::calculate_signature(&string_to_sign, SECRET_KEY, &date, REGION, SERVICE)
-    };
+    let request =
+        rustfs_signer::try_sign_v4(builder.body(()).unwrap(), payload.len() as i64, "test-access", SECRET_KEY, "", REGION)
+            .expect("the client signs the upload head");
     let (prefix, suffix) = if unsigned_trailer {
         (
             format!("{:x}\r\n", payload.len()),
             "\r\n0\r\nx-amz-checksum-crc32:y/Q5Jg==\r\n\r\n".to_owned(),
         )
     } else {
-        let signature = chunk_signature(&seed, payload);
+        let headers = request.headers();
+        let seed = headers["authorization"]
+            .to_str()
+            .unwrap()
+            .rsplit_once("Signature=")
+            .expect("seed signature")
+            .1;
+        let stamp = headers["x-amz-date"].to_str().unwrap();
+        let day = time::Date::parse(&stamp[..8], time::macros::format_description!("[year][month][day]"))
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let scope = get_scope(REGION, day, SERVICE);
+        let key = get_signing_key(SECRET_KEY, REGION, day, SERVICE);
+        let chunk_signature = |previous: &str, chunk: &[u8]| {
+            let digest = rustfs_utils::crypto::hex_sha256(chunk, str::to_owned);
+            get_signature(
+                key,
+                &format!("AWS4-HMAC-SHA256-PAYLOAD\n{stamp}\n{scope}\n{previous}\n{EMPTY_STRING_SHA256_HASH}\n{digest}"),
+            )
+        };
+        let signature = chunk_signature(seed, payload);
         (
             format!("{:x};chunk-signature={signature}\r\n", payload.len()),
             format!("\r\n0;chunk-signature={}\r\n\r\n", chunk_signature(&signature, b"")),
@@ -179,23 +208,10 @@ fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
     let (sender, receiver) = mpsc::unbounded_channel();
     let control = BodyReadControl::default();
     let body = ObservedBody::new(StreamBody::new(UnboundedReceiverStream::new(receiver)), control.clone());
-    let mut builder = http::Request::builder()
-        .method("PUT")
-        .uri("https://s3.amazonaws.com/test-bucket/test-key?partNumber=1&uploadId=test-upload")
-        .header("host", "s3.amazonaws.com")
-        .header("content-encoding", "aws-chunked")
-        .header("content-length", prefix.len() + payload.len() + suffix.len())
-        .header("x-amz-content-sha256", mode)
-        .header("x-amz-date", DATE)
-        .header("x-amz-decoded-content-length", payload.len())
-        .header(
-            "authorization",
-            format!("AWS4-HMAC-SHA256 Credential=test-access/{SCOPE}, SignedHeaders={signed_header_names}, Signature={seed}"),
-        );
-    if unsigned_trailer {
-        builder = builder.header("x-amz-trailer", "x-amz-checksum-crc32");
-    }
-    let mut request = builder.body(S3Body::http_body_unsync(body)).expect("signed request");
+    let mut request = request.map(|()| body);
+    request
+        .headers_mut()
+        .insert(http::header::CONTENT_LENGTH, (prefix.len() + payload.len() + suffix.len()).into());
     request.extensions_mut().insert(control);
     SignedRequest {
         request,
@@ -215,7 +231,7 @@ async fn signed_chunk_with_raw_progress_survives_eight_minutes_without_decoded_o
         suffix,
     } = signed_request(&payload, false);
     let consumer = Consumer::default();
-    let service = service(consumer.clone());
+    let service = gateway_service(consumer.clone());
     let mut call = Box::pin(service.call(request));
     sender.send(Ok(Frame::data(prefix))).expect("body receiver");
     assert!(poll!(call.as_mut()).is_pending());
@@ -234,7 +250,7 @@ async fn signed_chunk_with_raw_progress_survives_eight_minutes_without_decoded_o
     }
     sender.send(Ok(Frame::data(suffix))).expect("body receiver");
     drop(sender);
-    let response = call.await.expect("S3 response");
+    let response = call.await;
     assert_eq!(response.status(), http::StatusCode::OK);
     assert_eq!(start.elapsed(), Duration::from_secs(480));
     assert_eq!(*consumer.committed.lock(), Some(payload));
@@ -251,7 +267,7 @@ async fn decoded_length_does_not_end_waiting_for_terminator_trailer_or_raw_eof()
             suffix,
         } = signed_request(payload, unsigned_trailer);
         let consumer = Consumer::default();
-        let service = service(consumer.clone());
+        let service = gateway_service(consumer.clone());
         sender.send(Ok(Frame::data(prefix))).expect("prefix");
         sender.send(Ok(Frame::data(Bytes::from_static(payload)))).expect("payload");
         sender
@@ -261,7 +277,7 @@ async fn decoded_length_does_not_end_waiting_for_terminator_trailer_or_raw_eof()
         assert!(poll!(call.as_mut()).is_pending());
         assert_eq!(consumer.received.load(Ordering::Relaxed), payload.len());
         tokio::time::advance(Duration::from_secs(300)).await;
-        let response = call.await.expect("S3 error response");
+        let response = call.await;
         assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
         let xml = BodyExt::collect(response.into_body()).await.expect("error XML").to_bytes();
         assert!(String::from_utf8_lossy(&xml).contains("<Code>RequestTimeout</Code>"));
@@ -280,14 +296,14 @@ async fn unsigned_trailer_normalizes_length_and_signed_corruption_cannot_commit(
             suffix,
         } = signed_request(payload, !corrupt);
         let consumer = Consumer::default();
-        let service = service(consumer.clone());
+        let service = gateway_service(consumer.clone());
         sender.send(Ok(Frame::data(prefix))).expect("prefix");
         sender
             .send(Ok(Frame::data(Bytes::from_static(if corrupt { b"923456789" } else { payload }))))
             .expect("payload");
         sender.send(Ok(Frame::data(suffix))).expect("suffix");
         drop(sender);
-        let response = service.call(request).await.expect("S3 response");
+        let response = service.call(request).await;
         if corrupt {
             assert_ne!(response.status(), http::StatusCode::OK);
             assert_eq!(consumer.received.load(Ordering::Relaxed), 0);
@@ -312,7 +328,7 @@ async fn unsigned_trailer_with_wrong_checksum_cannot_commit() {
         request, sender, prefix, ..
     } = signed_request(b"123456789", true);
     let consumer = Consumer::default();
-    let service = service(consumer.clone());
+    let service = gateway_service(consumer.clone());
     sender.send(Ok(Frame::data(prefix))).expect("prefix");
     sender
         .send(Ok(Frame::data(Bytes::from_static(
@@ -320,7 +336,7 @@ async fn unsigned_trailer_with_wrong_checksum_cannot_commit() {
         ))))
         .expect("invalid trailer");
     drop(sender);
-    let response = service.call(request).await.expect("S3 response");
+    let response = service.call(request).await;
     assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
     let xml = BodyExt::collect(response.into_body()).await.expect("error XML").to_bytes();
     assert!(String::from_utf8_lossy(&xml).contains("<Code>BadDigest</Code>"));
@@ -337,7 +353,7 @@ async fn trailer_adapter_is_pending_until_the_decoded_body_ends() {
         suffix,
     } = signed_request(payload, true);
     let consumer = Consumer::default();
-    let service = service(consumer.clone());
+    let service = gateway_service(consumer.clone());
     sender.send(Ok(Frame::data(prefix))).expect("prefix");
     sender.send(Ok(Frame::data(Bytes::from_static(payload)))).expect("payload");
     sender.send(Ok(Frame::data(suffix.slice(..2)))).expect("chunk terminator");
@@ -350,7 +366,7 @@ async fn trailer_adapter_is_pending_until_the_decoded_body_ends() {
 
     sender.send(Ok(Frame::data(suffix.slice(2..)))).expect("trailer section");
     drop(sender);
-    let response = call.await.expect("S3 response");
+    let response = call.await;
     assert_eq!(response.status(), http::StatusCode::OK);
     assert_eq!(trailer.lookup("x-amz-checksum-crc32"), TrailerValue::Present("y/Q5Jg==".to_owned()));
     assert_eq!(trailer.lookup("x-amz-checksum-sha256"), TrailerValue::Missing);
@@ -363,7 +379,7 @@ async fn signed_chunk_trickle_cannot_renew_upload_progress_window() {
         request, sender, prefix, ..
     } = signed_request(&[7; 65536], false);
     let consumer = Consumer::default();
-    let service = service(consumer.clone());
+    let service = gateway_service(consumer.clone());
     sender.send(Ok(Frame::data(prefix))).unwrap();
     let mut call = Box::pin(service.call(request));
     assert!(poll!(call.as_mut()).is_pending());
@@ -374,7 +390,7 @@ async fn signed_chunk_trickle_cannot_renew_upload_progress_window() {
         assert_eq!(consumer.received.load(Ordering::Relaxed), 0);
     }
     tokio::time::advance(Duration::from_secs(10)).await;
-    let response = call.await.expect("S3 response");
+    let response = call.await;
     assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
     let body = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     assert!(String::from_utf8_lossy(&body).contains("<Code>RequestTimeout</Code>"));

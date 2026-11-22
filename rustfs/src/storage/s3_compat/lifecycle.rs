@@ -12,28 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Converts only the lifecycle family between the legacy S3 edge and its persistence shape. Answers
-//! cross the gateway seam instead (`app::bucket_usecase::lifecycle`); the reverse direction is
-//! compiled only as the oracle of the legacy answer-parity test and goes with the forward one.
-//! Dates keep their original precision and offset until an XML or cache encoder runs.
+//! The historical GetBucketLifecycleConfiguration output projection used by the XML parity test.
 
-use rustfs_gateway_types::persistence::{
-    PersistedAbortIncompleteMultipartUpload, PersistedDelMarkerExpiration, PersistedLifecycleAnd,
-    PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleFilter, PersistedLifecycleRule,
-    PersistedLifecycleTag, PersistedNoncurrentVersionExpiration, PersistedNoncurrentVersionTransition, PersistedTransition,
-};
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedLifecycleTag};
 use s3s::dto;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
-fn date_from_s3s(value: Option<dto::Timestamp>) -> std::io::Result<Option<String>> {
-    value
-        .map(|value| {
-            OffsetDateTime::from(value)
-                .format(&Rfc3339)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        })
-        .transpose()
-}
 
 #[cfg(test)]
 fn date_to_s3s(value: Option<String>) -> std::io::Result<Option<dto::Timestamp>> {
@@ -46,15 +29,6 @@ fn date_to_s3s(value: Option<String>) -> std::io::Result<Option<dto::Timestamp>>
         .transpose()
 }
 
-pub(crate) fn lifecycle_configuration_from_s3s(
-    value: dto::BucketLifecycleConfiguration,
-) -> std::io::Result<PersistedLifecycleConfiguration> {
-    Ok(PersistedLifecycleConfiguration {
-        expiry_updated_at: date_from_s3s(value.expiry_updated_at)?,
-        rules: value.rules.into_iter().map(rule_from_s3s).collect::<std::io::Result<_>>()?,
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn lifecycle_configuration_to_s3s(
     value: PersistedLifecycleConfiguration,
@@ -62,76 +36,6 @@ pub(crate) fn lifecycle_configuration_to_s3s(
     Ok(dto::BucketLifecycleConfiguration {
         expiry_updated_at: date_to_s3s(value.expiry_updated_at)?,
         rules: value.rules.into_iter().map(rule_to_s3s).collect::<std::io::Result<_>>()?,
-    })
-}
-
-fn rule_from_s3s(value: dto::LifecycleRule) -> std::io::Result<PersistedLifecycleRule> {
-    Ok(PersistedLifecycleRule {
-        abort_incomplete_multipart_upload: value.abort_incomplete_multipart_upload.map(|v| {
-            PersistedAbortIncompleteMultipartUpload {
-                days_after_initiation: v.days_after_initiation,
-            }
-        }),
-        del_marker_expiration: value
-            .del_marker_expiration
-            .map(|v| PersistedDelMarkerExpiration { days: v.days }),
-        expiration: value
-            .expiration
-            .map(|v| -> std::io::Result<PersistedLifecycleExpiration> {
-                Ok(PersistedLifecycleExpiration {
-                    date: date_from_s3s(v.date)?,
-                    days: v.days,
-                    expired_object_all_versions: v.expired_object_all_versions,
-                    expired_object_delete_marker: v.expired_object_delete_marker,
-                })
-            })
-            .transpose()?,
-        filter: value.filter.map(|v| PersistedLifecycleFilter {
-            and: v.and.map(|v| PersistedLifecycleAnd {
-                object_size_greater_than: v.object_size_greater_than,
-                object_size_less_than: v.object_size_less_than,
-                prefix: v.prefix,
-                tags: v.tags.map(|tags| tags.into_iter().map(tag_from_s3s).collect()),
-            }),
-            object_size_greater_than: v.object_size_greater_than,
-            object_size_less_than: v.object_size_less_than,
-            prefix: v.prefix,
-            tag: v.tag.map(tag_from_s3s),
-        }),
-        id: value.id,
-        noncurrent_version_expiration: value
-            .noncurrent_version_expiration
-            .map(|v| PersistedNoncurrentVersionExpiration {
-                newer_noncurrent_versions: v.newer_noncurrent_versions,
-                noncurrent_days: v.noncurrent_days,
-            }),
-        noncurrent_version_transitions: value.noncurrent_version_transitions.map(|values| {
-            values
-                .into_iter()
-                .map(|v| PersistedNoncurrentVersionTransition {
-                    newer_noncurrent_versions: v.newer_noncurrent_versions,
-                    noncurrent_days: v.noncurrent_days,
-                    storage_class: v.storage_class.map(|v| v.as_str().to_owned()),
-                })
-                .collect()
-        }),
-        prefix: value.prefix,
-        status: value.status.as_str().to_owned(),
-        transitions: value
-            .transitions
-            .map(|values| {
-                values
-                    .into_iter()
-                    .map(|v| -> std::io::Result<PersistedTransition> {
-                        Ok(PersistedTransition {
-                            date: date_from_s3s(v.date)?,
-                            days: v.days,
-                            storage_class: v.storage_class.map(|v| v.as_str().to_owned()),
-                        })
-                    })
-                    .collect::<std::io::Result<_>>()
-            })
-            .transpose()?,
     })
 }
 
@@ -203,12 +107,6 @@ fn rule_to_s3s(value: PersistedLifecycleRule) -> std::io::Result<dto::LifecycleR
     })
 }
 
-fn tag_from_s3s(value: dto::Tag) -> PersistedLifecycleTag {
-    PersistedLifecycleTag {
-        key: value.key,
-        value: value.value,
-    }
-}
 #[cfg(test)]
 fn tag_to_s3s(value: PersistedLifecycleTag) -> dto::Tag {
     dto::Tag {

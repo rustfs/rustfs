@@ -49,7 +49,9 @@ use super::super::{
     resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata,
     should_persist_encryption_original_size, strip_internal_multipart_metadata, to_object_err, warn,
 };
-use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::bitrot_self_verify::{
+    BitrotSelfVerifyTarget, WrittenBitrotShards, drop_failed_writer_disks, verify_written_bitrot_shards,
+};
 #[cfg(test)]
 use super::object::old_data_cleanup_receipt_path;
 use super::object::{
@@ -3022,16 +3024,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .map_err(|_| Error::other("put_object_part shard size overflows usize"))?;
                 verify_written_bitrot_shards(
                     &shuffle_disks,
-                    None,
+                    WrittenBitrotShards::Staged { directory: &tmp_part, layout: &fi.erasure, part_size: w_size },
                     BitrotSelfVerifyTarget {
                         operation: "put_object_part",
                         bucket,
                         object,
                         part_number: Some(part_id),
-                        volume: RUSTFS_META_TMP_BUCKET,
-                        path: &tmp_part_path,
                         logical_shard_size,
-                        shard_size: erasure.shard_size(),
+                        shard_size: frame_size,
                         write_quorum,
                     },
                 )

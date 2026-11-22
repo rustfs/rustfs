@@ -74,8 +74,7 @@ impl PreflightedPostArchive {
         let identity = envelope
             .gateway_post_identity()
             .ok_or_else(|| s3_error!(AccessDenied, "The POST archive request identity is missing"))?;
-        let options = super::super::extract::resolve_put_object_extract_options(envelope.headers())
-            .map_err(rustfs_s3_types::S3Error::from)?;
+        let options = super::super::extract::resolve_put_object_extract_options(envelope.headers())?;
         if !Arc::ptr_eq(identity, &self.request_identity)
             || bucket != self.bucket
             || key != self.key
@@ -126,8 +125,7 @@ async fn stage_post_archive_with_resources(
             .gateway_post_identity()
             .ok_or_else(|| s3_error!(AccessDenied, "The POST archive request identity is missing"))?,
     );
-    let options =
-        super::super::extract::resolve_put_object_extract_options(envelope.headers()).map_err(rustfs_s3_types::S3Error::from)?;
+    let options = super::super::extract::resolve_put_object_extract_options(envelope.headers())?;
     if resources.archive_snapshot_budget.is_closed() {
         return Err(staging_capacity_error());
     }
