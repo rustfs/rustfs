@@ -31,6 +31,7 @@ use crate::server::{
         BodylessStatusFixLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer,
         StsQueryApiCompatLayer,
     },
+    post_object_location::PostObjectLocationFixLayer,
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
@@ -2063,7 +2064,7 @@ macro_rules! external_service_stack {
         let keystone_auth = $keystone_auth;
         let compression_config = $compression_config;
         let server_ctx = $server_ctx;
-        let vh_domain_hosts = $vh_domain_hosts;
+        let vh_domain_hosts: std::sync::Arc<[String]> = $vh_domain_hosts;
         ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -2181,6 +2182,7 @@ macro_rules! external_service_stack {
             .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
             .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
             .layer(IcebergRestErrorCompatLayer)
+            .layer(PostObjectLocationFixLayer::new(vh_domain_hosts.clone(), connection_is_tls))
             .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .layer(BodylessStatusFixLayer)
@@ -3303,6 +3305,7 @@ fn process_connection(
         // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
         // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
         // 15. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        //     PostObjectLocationFixLayer             — absolute, encoded POST Object Location
         // 16. ConditionalCorsLayer                   — S3 API CORS
         // 17. RedirectLayer                          — console redirect (conditional)
         // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
@@ -10054,7 +10057,7 @@ mod tests {
     /// is part of the chain whether or not the layer is installed at runtime.
     /// The fixture's own inner service is not part of it. `legacy_compat` marks
     /// the patch layers that `server::legacy_compat` still groups.
-    const EXTERNAL_STACK_CENSUS: [&str; 23] = [
+    const EXTERNAL_STACK_CENSUS: [&str; 24] = [
         "AddExtension",                        // Option<RemoteAddr>
         "AddExtension",                        // SocketAddr (optional)
         "TrustedProxyMiddleware",              // TrustedProxyLayer (optional)
@@ -10073,6 +10076,7 @@ mod tests {
         "Compression",                         //
         "PathCategoryInjectionService",        // optional
         "IcebergRestErrorCompatService",       // legacy_compat
+        "PostObjectLocationFixService",        // POST Object Location encoding
         "ConditionalCorsService",              //
         "RedirectService",                     // optional
         "BodylessStatusFixService",            // legacy_compat

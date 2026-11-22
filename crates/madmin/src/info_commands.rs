@@ -322,6 +322,17 @@ pub struct Services {
     pub notifications: Option<Vec<HashMap<String, Vec<TargetIDStatus>>>>,
 }
 
+/// Namespace coverage and scanner measurements for the optional RustFS admin inventory.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterInventory {
+    pub current_buckets: Option<u64>,
+    pub measured_buckets: Option<u64>,
+    pub measured_objects: Option<u64>,
+    pub measured_bytes: Option<u64>,
+    pub snapshot_at: Option<jiff::Timestamp>,
+    pub converged: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Buckets {
     pub count: u64,

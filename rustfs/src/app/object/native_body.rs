@@ -442,6 +442,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sized_io_stream_preserves_chunk_storage_and_remaining_length() {
+        use http_body_util::BodyExt as _;
+
+        let bytes = Bytes::from(vec![1, 2, 3]);
+        let address = bytes.as_ptr();
+        let mut body = from_io_stream_with_length(futures::stream::iter([Ok(bytes), Ok(Bytes::from_static(b"x"))]), Some(4));
+        assert!(body.caps().contains(PayloadCaps::KNOWN_LENGTH));
+        assert_eq!(body.len_hint(), Some(4));
+        let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(chunk.as_ptr(), address);
+        assert_eq!(body.len_hint(), Some(1));
+        assert_eq!(body.frame().await.unwrap().unwrap().into_data().unwrap().as_ref(), b"x");
+        assert_eq!(body.len_hint(), Some(0));
+    }
+
     #[derive(Debug)]
     struct InternalProducerFailure;
 

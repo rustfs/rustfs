@@ -22,6 +22,8 @@ Identify the tested commit and any local changes. When testing a prebuilt binary
 List relevant checks not run and the remaining risk. Use the validation tier in AGENTS.md; do not run broader checks solely to fill this section. For documentation-only changes, list the applicable documentation checks. Use N/A only when verification is not applicable.
 -->
 
+**auto-testing regression coverage** <!-- For each issue-backed bug fix, give the added or extended case ID or PR link, the existing case ID/path and assertion that catches the bug, or "Skipped" with a brief reason. Omit this line for other changes, including documentation-only fixes. -->
+
 ## Impact
 <!--
 Describe user-facing, compatibility, API, deployment, configuration, or documentation impact. Use N/A when there is no expected impact.

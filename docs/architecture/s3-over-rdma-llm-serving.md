@@ -20,7 +20,7 @@ This document describes the design and the invariants of RustFS's S3-over-RDMA d
 | Layer | Code | Role |
 |---|---|---|
 | Client last hop, cuObject | `rustfs/src/app/object/cuobject.rs`, `crates/cuobject`, `crates/cuobject-sys` | The `cuobject` feature enables `x-amz-rdma-token` transfers. `rustfs-cuobject` manages registered buffers and transfers. `rustfs-cuobject-sys` builds the C++ bridge and links the NVIDIA server SDK. |
-| Client last hop, NIXL | `crates/nixl/src/lib.rs` (`RdmaToken::from_headers`, `ensure_remote`), `crates/nixl/src/mem.rs` | NIXL/UCX transport selected by the `nixl` feature. The client names a registered `dram` or `vram` buffer; the server WRITEs (GET) or READs (PUT) it. |
+| Client last hop, NIXL | `crates/nixl/src/lib.rs` (`RdmaToken::from_headers`), `crates/nixl/src/remotes.rs`, `crates/nixl/src/mem.rs` | NIXL/UCX transport selected by the `nixl` feature. The client names a registered `dram` or `vram` buffer; the server WRITEs (GET) or READs (PUT) it. |
 | Shared pipeline | `rustfs/src/app/object/cuobject.rs` | Segment fan-out of large GETs, staging chunks, shard arena, completion handling. The same pipeline serves both transports; only the transfer layer differs. |
 | Device health | `crates/nixl/src/devices.rs` | Startup check that leaves out RDMA devices that are down, slow or flapping. |
 | Internode, NIXL | `crates/ecstore/src/cluster/rpc/nixl_internode.rs`, `rustfs/src/storage/rpc/nixl_read.rs` | `RUSTFS_INTERNODE_DATA_TRANSPORT=nixl`: signed control request over HTTP, data over NIXL, for shard reads and writes. |
@@ -44,7 +44,7 @@ This document describes the design and the invariants of RustFS's S3-over-RDMA d
 
 - `Agent::post_xfer_req` in `nixl-sys` returns `true` while a transfer is in progress. Treating `true` as done refills staging chunks under the NIC and corrupts data. Verify any transport change with one round into a zeroed buffer, because repeated rounds mask the bug.
 - Every agent runs NIXL's progress thread, including agents that only receive RDMA writes; peers otherwise declare it dead.
-- A client exports its agent metadata after registering every buffer it will name. The server reloads metadata when its hash changes, so a request that still carries an older copy can make the server swap back to it. Register all buffers before the first transfer.
+- A client exports its agent metadata after registering every buffer it will name. The completion thread pins the registration until each native transfer finishes. Once idle, the registration can be replaced by a request carrying different metadata, including an older copy. Register all buffers before the first transfer.
 - A registered buffer that an abandoned request named stays out of the pool longer than the peer's transfer timeout.
 - Direct-I/O shard writers must be shut down at the end of every NIXL write segment (`finish_segment_file` in `rustfs/src/storage/rpc/nixl_read.rs`); otherwise the trailing sub-alignment bytes are lost.
 - A multipart upload keeps the ETag algorithm its bucket had when the upload was created.
