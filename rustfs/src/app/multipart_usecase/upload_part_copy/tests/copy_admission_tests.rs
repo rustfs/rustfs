@@ -76,9 +76,38 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                         .any(|label| label.key() == "size_bucket" && label.value() == source_size_bucket)
             })
         };
-        let error = Box::pin(usecase.execute_upload_part_copy(build_request(input.clone(), Method::PUT)))
-            .await
-            .expect_err("copy must not bypass the occupied UploadPart pool");
+        let saturated = input.clone();
+        let condition = |value| match value {
+            crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+        };
+        let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(
+            owned_envelope(Method::PUT),
+            UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: saturated.bucket,
+                    key: saturated.key,
+                    upload_id: saturated.upload_id,
+                },
+                part_number: saturated.part_number,
+                copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(saturated.copy_source),
+                copy_source_range: saturated.copy_source_range,
+                copy_source_if_match: saturated.copy_source_if_match.map(&condition),
+                copy_source_if_none_match: saturated.copy_source_if_none_match.map(&condition),
+                sse_customer_algorithm: saturated.sse_customer_algorithm,
+                sse_customer_key: saturated.sse_customer_key,
+                sse_customer_key_md5: saturated.sse_customer_key_md5,
+                copy_source_sse_customer_algorithm: saturated.copy_source_sse_customer_algorithm,
+                copy_source_sse_customer_key: saturated.copy_source_sse_customer_key,
+                copy_source_sse_customer_key_md5: saturated.copy_source_sse_customer_key_md5,
+            },
+        ))
+        .await
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("copy must not bypass the occupied UploadPart pool"),
+        };
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert!(!source_reader_observed(), "saturated copy must not construct a source body reader");
         let parts = store
