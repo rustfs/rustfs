@@ -405,6 +405,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
         directory_checkpoints: HashMap::new(),
+        size_ledger_index: SizeLedgerIndex::default(),
+        unobserved_size_scopes: HashSet::new(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -766,6 +768,99 @@ async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
 }
 
 #[test]
+fn size_ledger_hydration_does_not_readmit_smaller_records_older_than_a_byte_eviction() {
+    let now = 1000;
+    let bulk = MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET / 1024 - 1;
+    let mut records: HashMap<_, _> = (0..bulk + 2)
+        .map(|i| {
+            let key = format!("{i:01000}");
+            (
+                key.clone(),
+                SizeReconciliationEntry {
+                    key,
+                    first_seen: now,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    // Select the two final inputs in this map's actual drain order. The larger record
+    // overflows by itself. Its older, smaller sibling would otherwise fit in the gap.
+    for (i, record) in records.values_mut().enumerate() {
+        if i < bulk {
+            record.object = "x".repeat(1024 - size_reconciliation_entry_bytes(record));
+        } else if i == bulk {
+            record.first_seen = now - 1;
+            record.object = "x".repeat(512);
+        } else {
+            record.first_seen = now - 2;
+        }
+    }
+    let index = SizeLedgerIndex::from_persisted(&mut records, now);
+    assert_eq!(records.len(), bulk);
+    assert_eq!(index.bytes, bulk * 1024);
+    assert!(records.values().all(|record| record.first_seen == now));
+}
+
+#[tokio::test]
+async fn size_ledger_tracks_only_outstanding_scopes_and_preserves_eviction_order_after_restart() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, root);
+    let now = FolderScanner::now_secs();
+    for i in 0..=MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET {
+        let key = format!("v{i:05}");
+        scanner.new_cache.info.size_reconciliation.insert(
+            key.clone(),
+            SizeReconciliationEntry {
+                key,
+                bucket: "bucket".to_owned(),
+                object: format!("object-{i}"),
+                first_seen: now,
+                ..Default::default()
+            },
+        );
+    }
+    let records = &mut scanner.new_cache.info.size_reconciliation;
+    scanner.size_ledger_index = SizeLedgerIndex::from_persisted(records, now);
+    assert_eq!(records.len(), MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET);
+    assert!(!records.contains_key("v00000"), "ties must evict the lexicographically first key");
+    for n in 0..1000 {
+        let mut summary = SizeSummary::default();
+        summary.record_reconciliation_scope("bucket", &format!("healthy-{n}"));
+        scanner.apply_size_reconciliation(&summary);
+    }
+    assert!(
+        scanner.pending_size_reconciliation_scopes.is_empty(),
+        "unrelated healthy paths must not accumulate"
+    );
+    let mut resolved = SizeSummary::default();
+    resolved.record_reconciliation_scope("bucket", "object-10");
+    resolved.size_reconciliation_truncated = true;
+    scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
+    assert!(scanner.new_cache.info.size_reconciliation.contains_key("v00010"));
+    resolved.size_reconciliation_truncated = false;
+    scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
+    let records = &mut scanner.new_cache.info.size_reconciliation;
+    assert!(!records.contains_key("v00010"));
+    assert_eq!(
+        scanner.size_ledger_index.bytes,
+        records.values().map(size_reconciliation_entry_bytes).sum::<usize>()
+    );
+    scanner
+        .size_ledger_index
+        .prune(records, now + MAX_SIZE_RECONCILIATION_AGE_SECS);
+    assert_eq!(records.len(), MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET - 1);
+    scanner
+        .size_ledger_index
+        .prune(records, now + MAX_SIZE_RECONCILIATION_AGE_SECS + 1);
+    assert!(records.is_empty());
+    assert!(scanner.size_ledger_index.by_scope.is_empty());
+    assert_eq!(scanner.size_ledger_index.bytes, 0);
+}
+
+#[test]
 fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
     let temp_dir = std::env::temp_dir();
     let file_type = std::fs::metadata(&temp_dir)
@@ -960,30 +1055,30 @@ async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
 
 #[test]
 fn test_pending_scanner_accounting_requires_enqueue_success() {
-    let object = ObjectInfo {
-        size: 10,
-        version_id: Some(uuid::Uuid::new_v4()),
-        ..Default::default()
-    };
-    let pending = PendingScannerAccounting {
-        object: &object,
-        retained_size: 10,
-        expired_size: 0,
-    };
-
-    let mut failed_summary = SizeSummary::default();
-    let mut failed_cumulative_size = 0;
-    pending.apply(&mut failed_summary, &mut failed_cumulative_size, false);
-    assert_eq!(failed_summary.versions, 1);
-    assert_eq!(failed_summary.total_size, 10);
-    assert_eq!(failed_cumulative_size, 10);
-
-    let mut queued_summary = SizeSummary::default();
-    let mut queued_cumulative_size = 0;
-    pending.apply(&mut queued_summary, &mut queued_cumulative_size, true);
-    assert_eq!(queued_summary.versions, 0);
-    assert_eq!(queued_summary.total_size, 0);
-    assert_eq!(queued_cumulative_size, 0);
+    for bytes in [0, 1] {
+        let object = ObjectInfo {
+            size: bytes,
+            version_id: Some(uuid::Uuid::new_v4()),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+        let pending = PendingScannerAccounting {
+            object: &object,
+            retained_size: bytes,
+            expired_size: 0,
+        };
+        for queued in [false, true] {
+            let mut summary = SizeSummary::default();
+            let mut cumulative_size = 0;
+            pending.apply(&mut summary, &mut cumulative_size, queued);
+            let retained = if queued { 0 } else { bytes };
+            assert_eq!(summary.versions, usize::from(!queued));
+            assert_eq!(summary.total_size, usize::try_from(retained).unwrap());
+            assert_eq!(cumulative_size, retained);
+            assert_eq!(summary.replica_count, usize::from(!queued));
+            assert_eq!(summary.replica_size, retained);
+        }
+    }
 }
 
 #[tokio::test]

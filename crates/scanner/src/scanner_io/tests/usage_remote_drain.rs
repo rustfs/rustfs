@@ -221,6 +221,25 @@ async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
         .await
         .expect("actual RemoteDisk with fixture transport");
     assert!(!remote.is_local());
+    let denied = remote
+        .clone()
+        .nsscanner_disk(
+            owner.child_token(),
+            ScannerCycleBudget::new_with_progress_tracking(&owner, Default::default()),
+            vec![remote.clone()],
+            DataUsageCache::default(),
+            None,
+            ScannerDiskScanOptions {
+                checkpoint_endpoints: None,
+                scan_mode: HealScanMode::Normal,
+                prefix_scan_scope: None,
+                checkpoint_tx: None,
+                local_stop: None,
+            },
+        )
+        .await
+        .expect_err("the native walker must never open a peer's path on the coordinator");
+    assert!(denied.to_string().contains("requires a local disk"));
     {
         let mut slot = WALKER_PROBE.lock().expect("install controlled walker");
         assert!(slot.is_none());

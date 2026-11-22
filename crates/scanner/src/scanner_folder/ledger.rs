@@ -15,6 +15,242 @@
 /// to this hint cache, never to a committed durable repair obligation.
 use super::*;
 
+/// Transient indexes over the bucket's persisted unknown-size records. Folder completion
+/// touches refreshed objects and the oldest debt, including when the namespace is very wide.
+#[derive(Default)]
+pub(super) struct SizeLedgerIndex {
+    pub(super) by_scope: HashMap<String, HashSet<String>>,
+    pub(super) by_age: std::collections::BTreeSet<(u64, String)>,
+    pub(super) bytes: usize,
+}
+
+impl SizeLedgerIndex {
+    pub(super) fn valid(entry: &SizeReconciliationEntry) -> bool {
+        entry.key.len() <= 4096
+            && entry.bucket.len() <= 512
+            && entry.object.len() <= 512
+            && entry.version_id.as_deref().is_none_or(|v| v.len() <= 64)
+            && entry.generation.as_deref().is_none_or(|v| v.len() <= 64)
+            && entry.reason.len() <= 64
+    }
+
+    pub(super) fn from_persisted(records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) -> Self {
+        let mut index = Self::default();
+        let mut evicted_through: Option<(u64, String)> = None;
+        for (key, mut entry) in std::mem::take(records) {
+            if key != entry.key || !Self::valid(&entry) {
+                continue;
+            }
+            if entry.first_seen == 0 || entry.first_seen > now {
+                entry.first_seen = now;
+            }
+            if now.saturating_sub(entry.first_seen) > MAX_SIZE_RECONCILIATION_AGE_SECS {
+                continue;
+            }
+            // HashMap iteration can deliver a smaller, older record after a byte eviction.
+            // Every record through the last evicted age/key would also lose a full ordered prune.
+            if evicted_through
+                .as_ref()
+                .is_some_and(|(seen, cutoff)| (entry.first_seen, key.as_str()) <= (*seen, cutoff.as_str()))
+            {
+                continue;
+            }
+            index.add(&entry);
+            records.insert(key, entry);
+            if records.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
+                || index.bytes > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
+            {
+                evicted_through = index.prune(records, now);
+            }
+        }
+        index
+    }
+
+    pub(super) fn add(&mut self, entry: &SizeReconciliationEntry) {
+        self.bytes += size_reconciliation_entry_bytes(entry);
+        self.by_age.insert((entry.first_seen, entry.key.clone()));
+        self.by_scope
+            .entry(size_reconciliation_scope_key(&entry.bucket, &entry.object))
+            .or_default()
+            .insert(entry.key.clone());
+    }
+
+    fn remove(&mut self, entry: &SizeReconciliationEntry) {
+        self.by_age.remove(&(entry.first_seen, entry.key.clone()));
+        self.bytes -= size_reconciliation_entry_bytes(entry);
+        let scope = size_reconciliation_scope_key(&entry.bucket, &entry.object);
+        if let Some(keys) = self.by_scope.get_mut(&scope) {
+            keys.remove(&entry.key);
+            if keys.is_empty() {
+                self.by_scope.remove(&scope);
+            }
+        }
+    }
+
+    pub(super) fn prune(&mut self, records: &mut HashMap<String, SizeReconciliationEntry>, now: u64) -> Option<(u64, String)> {
+        let mut last = None;
+        while let Some((first_seen, key)) = self.by_age.first() {
+            if now.saturating_sub(*first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
+                && records.len() <= MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
+                && self.bytes <= MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
+            {
+                break;
+            }
+            if let Some(entry) = records.remove(key) {
+                self.remove(&entry);
+                last = Some((entry.first_seen, entry.key));
+            } else {
+                self.by_age.pop_first();
+            }
+        }
+        last
+    }
+}
+
+impl FolderScanner {
+    /// A missing path on one representative cannot discharge an earlier set-wide debt. Only
+    /// examine old, unobserved scopes after a completed walk, and require every configured slot.
+    pub(super) async fn retire_confirmed_absent_sizes(&mut self, ctx: &CancellationToken, configured: Option<&HashSet<String>>) {
+        use crate::storage_api::owner::EcstoreDiskAPI;
+        let Some(configured) = configured else { return };
+        let info = &self.new_cache.info;
+        if info.size_reconciliation.is_empty()
+            || self.unobserved_size_scopes.is_empty()
+            || configured.is_empty()
+            || info.scan_identity.as_ref().is_none_or(|identity| !identity.is_valid())
+            || info
+                .scan_progress
+                .is_some_and(|progress| progress.started_plan != progress.requested_plan)
+            || info.source.is_none()
+        {
+            return;
+        }
+        // A single-drive set has no peer heal inventory. Its representative owns the only slot.
+        let disks = if self.disks.is_empty() && configured.len() == 1 {
+            vec![self.local_disk.clone()]
+        } else {
+            self.disks.clone()
+        };
+        if disks.len() != configured.len()
+            || disks.iter().any(|disk| scanner_disk_heal_scope(disk) != info.source)
+            || disks.iter().map(|disk| disk.endpoint().to_string()).collect::<HashSet<_>>() != *configured
+        {
+            return;
+        }
+        let bucket = info.name.clone();
+        let Some(before) = self.size_debt_membership(ctx, &disks, &bucket).await else { return };
+        let scopes: Vec<_> = self.unobserved_size_scopes.drain().collect();
+        // Keep completed proofs when a later group is interrupted by the bucket deadline.
+        for group in scopes.chunks(32) {
+            let mut absent = Vec::new();
+            for scope in group {
+                if ctx.is_cancelled() || self.budget.budget_elapsed() {
+                    return;
+                }
+                self.collect_absent_size_keys(ctx, &disks, &bucket, scope, &mut absent).await;
+            }
+            if absent.is_empty() {
+                continue;
+            }
+            if self.size_debt_membership(ctx, &disks, &bucket).await.as_ref() != Some(&before) || ctx.is_cancelled() {
+                return;
+            }
+            for key in absent {
+                if let Some(entry) = self.new_cache.info.size_reconciliation.remove(&key) {
+                    self.size_ledger_index.remove(&entry);
+                }
+            }
+        }
+    }
+
+    async fn collect_absent_size_keys(
+        &self,
+        ctx: &CancellationToken,
+        disks: &[Arc<Disk>],
+        bucket: &str,
+        scope: &str,
+        absent: &mut Vec<String>,
+    ) {
+        use crate::storage_api::owner::EcstoreDiskAPI;
+        let Some(keys) = self.size_ledger_index.by_scope.get(scope) else { return };
+        // Oversized names have a digest for display. A literal S3 name can resemble
+        // that display value; only raw length-prefixed identities authorize a probe.
+        let raw_prefix = format!("{scope}|");
+        let Some(entry) = keys
+            .iter()
+            .filter(|key| key.starts_with(&raw_prefix))
+            .find_map(|key| self.new_cache.info.size_reconciliation.get(key))
+        else {
+            return;
+        };
+        if entry.bucket != bucket
+            || entry.object.is_empty()
+            || entry.object.starts_with('/')
+            || entry.object.contains(['\0', '\\'])
+            || entry.object.split('/').any(|part| part == "." || part == "..")
+        {
+            return;
+        }
+        let encoded = rustfs_utils::path::encode_dir_object_ref(&entry.object);
+        let path = path_join_buf(&[encoded.as_ref(), STORAGE_FORMAT_FILE]);
+        for disk in disks {
+            let result = self
+                .size_evidence_io(ctx, disk, 1, 1, disk.read_file_stream(bucket, &path, 0, 1))
+                .await;
+            if !matches!(result, Some(Err(DiskError::FileNotFound))) {
+                return;
+            }
+        }
+        absent.extend(keys.iter().filter(|key| key.starts_with(&raw_prefix)).cloned());
+    }
+
+    async fn size_debt_membership(
+        &self,
+        ctx: &CancellationToken,
+        disks: &[Arc<Disk>],
+        bucket: &str,
+    ) -> Option<Vec<(uuid::Uuid, time::OffsetDateTime)>> {
+        use crate::storage_api::owner::EcstoreDiskAPI;
+        let mut drives = Vec::with_capacity(disks.len());
+        let mut unique = HashSet::with_capacity(disks.len());
+        for disk in disks {
+            let (id, volume) = self
+                .size_evidence_io(ctx, disk, 2, 0, async {
+                    let id = disk.get_disk_id().await?;
+                    Ok((id, disk.stat_volume(bucket).await?))
+                })
+                .await?
+                .ok()?;
+            let id = id.filter(|id| !id.is_nil())?;
+            if volume.name != bucket || !unique.insert(id) {
+                return None;
+            }
+            drives.push((id, volume.created?));
+        }
+        Some(drives)
+    }
+
+    async fn size_evidence_io<T>(
+        &self,
+        ctx: &CancellationToken,
+        disk: &Disk,
+        ops: u64,
+        bytes: u64,
+        read: impl std::future::Future<Output = Result<T, DiskError>>,
+    ) -> Option<Result<T, DiskError>> {
+        wait_for_scanner_io(ctx, self.sleeper.admit_disk_io(ops, bytes)).await.ok()?;
+        let operation = crate::workload_admission::with_scanner_physical_disk(
+            disk.physical_admission(),
+            run_scanner_metadata_operation(
+                self.node_admission.as_ref(),
+                ctx,
+                crate::workload_admission::with_scanner_metadata_io(read),
+            ),
+        );
+        wait_for_scanner_io(ctx, operation).await.ok()?.ok()
+    }
+}
+
 const PENDING_HEAL_RETRY_BASE_SECS: u64 = 15 * 60;
 const PENDING_HEAL_RETRY_CAP_SECS: u64 = 6 * 60 * 60;
 

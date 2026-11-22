@@ -992,15 +992,18 @@ pub(crate) fn scanner_slot_disk_id(set: &SetDisks, disk: &Disk) -> Option<uuid::
         .filter(|id| !id.is_nil())
 }
 
-async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Option<Arc<ObjectLockConfiguration>> {
+async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Result<Option<Arc<ObjectLockConfiguration>>> {
     if let Some(config) = item.object_lock.clone() {
-        return Some(config);
+        return Ok(Some(config));
     }
 
-    get_object_lock_config(&item.bucket)
-        .await
-        .ok()
-        .map(|(config, _)| Arc::new(config))
+    match crate::storage_api::get_object_lock_config_state(&item.bucket).await? {
+        crate::storage_api::ObjectLockConfigState::ConfirmedAbsent => Ok(None),
+        crate::storage_api::ObjectLockConfigState::Configured { config, .. } => Ok(Some(Arc::new(config))),
+        crate::storage_api::ObjectLockConfigState::Fabricated => {
+            Err(Error::other("scanner Object Lock configuration unavailable"))
+        }
+    }
 }
 
 fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
@@ -1595,20 +1598,19 @@ fn namespace_scanner_workers<T>(
             .into_iter()
             .map(|disk| (disk, NamespaceScannerWorkerMode::Coordinator)),
     );
-    workers.extend(remote_disks.into_iter().map(|(disk, capabilities)| {
-        let mode = if remote_namespace_scanner_supports_budget(budget) {
-            NamespaceScannerWorkerMode::RemoteV4(capabilities)
-        } else {
-            NamespaceScannerWorkerMode::Coordinator
-        };
-        (disk, mode)
-    }));
+    if remote_namespace_scanner_supports_budget(budget) {
+        workers.extend(
+            remote_disks
+                .into_iter()
+                .map(|(disk, capabilities)| (disk, NamespaceScannerWorkerMode::RemoteV4(capabilities))),
+        );
+    }
     workers
 }
 
 /// The current remote request and progress wire account for time, objects,
-/// and directories only. Keep raw-entry/name-byte limits on the coordinator,
-/// where the existing RemoteDisk traversal charges every owning budget.
+/// and directories only. A native directory walk requires the owning node;
+/// select only local disks when the remote wire cannot enforce the budget.
 fn remote_namespace_scanner_supports_budget(budget: &ScannerCycleBudgetConfig) -> bool {
     budget.max_entries.is_none() && budget.max_entry_name_bytes.is_none()
 }
@@ -1835,9 +1837,9 @@ pub enum ScannerDiskScanOutcome {
 }
 
 /// A published checkpoint belongs to configured endpoint slots, even while their
-/// handles are unavailable. A walk without checkpoint identity needs no membership set.
+/// handles are unavailable. Size-debt retirement also requires the complete configured membership.
 pub(crate) fn scanner_checkpoint_endpoints(set: &SetDisks, cache: &DataUsageCache) -> Option<HashSet<String>> {
-    (cache.info.scan_identity.is_some() && cache.info.scan_progress.is_some())
+    (cache.info.scan_identity.is_some() && (cache.info.scan_progress.is_some() || !cache.info.size_reconciliation.is_empty()))
         .then(|| set.set_endpoints.iter().map(ToString::to_string).collect())
 }
 

@@ -44,7 +44,10 @@ pub(crate) use s3s::dto::{
     ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
 };
 #[cfg(test)]
-pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
+pub(crate) use s3s::dto::{
+    ExpirationStatus as EcstoreExpirationStatus, LifecycleExpiration, LifecycleRule as EcstoreLifecycleRule,
+    NoncurrentVersionExpiration,
+};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
     MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
@@ -65,10 +68,10 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::object_opts_fr
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys as ecstore_init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
-    BucketMetadataMutationGuard as EcstoreBucketMetadataMutationGuard,
+    BucketMetadataMutationGuard as EcstoreBucketMetadataMutationGuard, ObjectLockConfigState,
     ScannerBucketIncarnationReadGuard as EcstoreScannerBucketIncarnationReadGuard,
     get_lifecycle_config as ecstore_get_lifecycle_config, get_object_lock_config as ecstore_get_object_lock_config,
-    get_replication_config as ecstore_get_replication_config,
+    get_object_lock_config_state, get_replication_config as ecstore_get_replication_config,
 };
 pub(crate) use rustfs_ecstore::api::bucket::replication::{
     ReplicateObjectInfo, ReplicationConfig as EcstoreReplicationConfig,
@@ -155,9 +158,11 @@ pub(crate) use rustfs_ecstore::api::rpc::{
     ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket, ScannerPublicationLease as EcstoreScannerPublicationLease,
 };
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
-#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::set_object_store_resolver as ecstore_set_object_store_resolver;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::runtime::{
+    InstanceContext as EcstoreInstanceContext, bootstrap_ctx as ecstore_bootstrap_ctx,
+};
 pub(crate) use rustfs_ecstore::api::runtime::{
     expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
     object_store_handle as ecstore_resolve_object_store_handle, setup_is_erasure as ecstore_is_erasure,
@@ -433,7 +438,7 @@ pub(crate) mod scanner_io {
         bucket::{
             lifecycle::bucket_lifecycle_ops::init_background_expiry,
             metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG},
-            metadata_sys::update as update_bucket_metadata,
+            metadata_sys::{get_config_from_disk, set_bucket_metadata, update as update_bucket_metadata},
         },
         data_usage::{
             apply_bucket_usage_memory_overlay, get_bucket_usage_memory, load_admin_data_usage_from_backend_cached,

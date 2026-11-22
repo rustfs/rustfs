@@ -718,9 +718,9 @@ impl ScannerIOCache for SetDisks {
         let mut coordinator_disks = Vec::new();
         let mut remote_candidates = Vec::new();
         for disk in disks {
-            if disk.is_local() || !remote_budget_supported {
+            if disk.is_local() {
                 coordinator_disks.push(disk);
-            } else {
+            } else if remote_budget_supported {
                 remote_candidates.push(disk);
             }
         }
@@ -734,7 +734,6 @@ impl ScannerIOCache for SetDisks {
         }))
         .await;
         let mut remote_disks = Vec::new();
-        let mut unsupported_remote_disks = 0_usize;
         for (disks, capabilities) in capability_results {
             match capabilities {
                 Ok(Some(capabilities)) => {
@@ -755,8 +754,6 @@ impl ScannerIOCache for SetDisks {
                         state = "remote_scanner_unsupported",
                         "Scanner found a peer without remote namespace scanner support"
                     );
-                    unsupported_remote_disks = unsupported_remote_disks.saturating_add(disk_count);
-                    coordinator_disks.extend(disks);
                 }
                 Err(err) => {
                     let peer = disks.first().map(|disk| disk.host_name()).unwrap_or_default();
@@ -777,7 +774,6 @@ impl ScannerIOCache for SetDisks {
                 }
             }
         }
-        let remote_disk_count = remote_disks.len();
         let workers = namespace_scanner_workers(coordinator_disks, remote_disks, &source_budget);
         if workers.is_empty() {
             debug!(
@@ -811,20 +807,7 @@ impl ScannerIOCache for SetDisks {
             let _ = updates.send(incomplete_scope).await;
             return Ok(ScannerSourceTurnReceipt::default());
         }
-        if unsupported_remote_disks > 0 {
-            debug!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_SET_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                pool = self.pool_index,
-                set = self.set_index,
-                v4_disks = remote_disk_count,
-                unsupported_remote_disks,
-                state = "unsupported_remote_disks_using_coordinator",
-                "Scanner set assigned remote disks without namespace scanner support to coordinator-driven workers"
-            );
-        }
+
         let online_disks = workers.len();
         let walkers_per_disk = crate::runtime_config::scanner_walkers_per_disk_configured();
         let walkers = namespace_scanner_walkers(workers, walkers_per_disk, |disk| disk.is_local());
@@ -1137,7 +1120,7 @@ impl ScannerIOCache for SetDisks {
                         NamespaceScannerWorkerMode::Coordinator => None,
                     };
                     // Prefix hints are process-local. Never hand one to a
-                    // remote or legacy-coordinator disk path.
+                    // remote worker.
                     let prefix_scan_scope = disk.is_local().then(|| scope_clone.prefix_scope_for(&bucket.name)).flatten();
 
                     metrics::histogram!(

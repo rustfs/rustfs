@@ -45,10 +45,7 @@ use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, Ecs
 use crate::workload_admission::{run_scanner_metadata_operation, run_scanner_node_operation};
 use metrics::{counter, describe_counter};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
-use rustfs_filemeta::{
-    MAX_META_CACHE_HEAL_CANDIDATES, MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS, MetaCacheEntries, MetaCacheEntry,
-    MetaCacheHealCandidateKind,
-};
+use rustfs_filemeta::{MAX_META_CACHE_HEAL_CANDIDATES, MetaCacheEntries, MetaCacheEntry, MetaCacheHealCandidateKind};
 use rustfs_heal_contracts::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
     HealRequestSource, HealScanMode, send_heal_request_with_receipt,
@@ -397,7 +394,7 @@ struct PendingScannerAccounting<'a> {
 impl PendingScannerAccounting<'_> {
     fn apply(self, size_summary: &mut SizeSummary, cumulative_size: &mut i64, queued: bool) {
         let size = if queued { self.expired_size } else { self.retained_size };
-        size_summary.actions_accounting(self.object, size, self.retained_size);
+        crate::data_usage_define::account_version_usage(size_summary, self.object, size, !queued);
         *cumulative_size = cumulative_size.saturating_add(size);
     }
 }
@@ -870,6 +867,8 @@ pub struct FolderScanner {
     coverage_gap: bool,
     raw_enumeration_progress: Vec<RawEnumerationProgress>,
     directory_checkpoints: HashMap<String, HashMap<String, directory_cursor::Saved>>,
+    size_ledger_index: SizeLedgerIndex,
+    unobserved_size_scopes: HashSet<String>,
     pending_size_reconciliation_keys: HashSet<String>,
     pending_size_reconciliation_scopes: HashSet<String>,
     pending_size_reconciliation_truncated: bool,
@@ -1021,43 +1020,6 @@ fn size_reconciliation_entry_bytes(entry: &SizeReconciliationEntry) -> usize {
 
 fn size_reconciliation_scope_key(bucket: &str, object: &str) -> String {
     format!("{}:{}|{}:{}", bucket.len(), bucket, object.len(), object)
-}
-
-fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
-    info.size_reconciliation.retain(|key, entry| {
-        if entry.first_seen == 0 || entry.first_seen > now {
-            entry.first_seen = now;
-        }
-        key == &entry.key
-            && entry.key.len() <= 4096
-            && entry.bucket.len() <= 512
-            && entry.object.len() <= 512
-            && entry.version_id.as_deref().is_none_or(|value| value.len() <= 64)
-            && entry.generation.as_deref().is_none_or(|value| value.len() <= 64)
-            && entry.reason.len() <= 64
-            && now.saturating_sub(entry.first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
-    });
-
-    while info.size_reconciliation.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
-        || info
-            .size_reconciliation
-            .values()
-            .map(size_reconciliation_entry_bytes)
-            .sum::<usize>()
-            > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
-    {
-        let oldest = info
-            .size_reconciliation
-            .iter()
-            .min_by(|(left_key, left), (right_key, right)| {
-                left.first_seen.cmp(&right.first_seen).then_with(|| left_key.cmp(right_key))
-            })
-            .map(|(key, _)| clone_cache_value(key));
-        let Some(oldest) = oldest else {
-            break;
-        };
-        info.size_reconciliation.remove(&oldest);
-    }
 }
 
 async fn wait_for_scanner_io<T>(ctx: &CancellationToken, wait: impl std::future::Future<Output = T>) -> Result<T, ScannerError> {
@@ -1319,36 +1281,41 @@ impl FolderScanner {
     /// scanner cache is the durable boundary; progress updates contain only
     /// usage totals and never own a copy of the reconciliation ledger.
     fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
-        let now = Self::now_secs();
-        self.pending_size_reconciliation_keys
-            .extend(summary.size_reconciliation.iter().map(|entry| clone_cache_value(&entry.key)));
-        self.pending_size_reconciliation_scopes.extend(
-            summary
-                .reconciliation_scopes
-                .iter()
-                .map(|scope| size_reconciliation_scope_key(&scope.bucket, &scope.object)),
-        );
         self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
+        if summary.size_reconciliation.is_empty() && self.size_ledger_index.by_scope.is_empty() {
+            return;
+        }
 
-        let info = &mut self.new_cache.info;
+        let now = Self::now_secs();
+        let records = &mut self.new_cache.info.size_reconciliation;
         for incoming in &summary.size_reconciliation {
-            if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
-                existing.reason = clone_cache_value(&incoming.reason);
+            if !SizeLedgerIndex::valid(incoming) {
+                continue;
+            }
+            self.pending_size_reconciliation_keys.insert(incoming.key.clone());
+            if let Some(existing) = records.get_mut(&incoming.key) {
+                self.size_ledger_index.bytes -= size_reconciliation_entry_bytes(existing);
+                existing.reason.clone_from(&incoming.reason);
                 existing.physical_size = incoming.physical_size;
-                existing.generation = clone_cache_value(&incoming.generation);
-                existing.version_id = clone_cache_value(&incoming.version_id);
+                existing.generation.clone_from(&incoming.generation);
+                existing.version_id.clone_from(&incoming.version_id);
                 existing.attempts = existing.attempts.saturating_add(1);
-                continue;
+                self.size_ledger_index.bytes += size_reconciliation_entry_bytes(existing);
+            } else {
+                let mut entry = incoming.clone();
+                entry.first_seen = now;
+                entry.attempts = 1;
+                self.size_ledger_index.add(&entry);
+                records.insert(entry.key.clone(), entry);
             }
+        }
 
-            if size_reconciliation_entry_bytes(incoming) > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET {
-                continue;
+        for scope in &summary.reconciliation_scopes {
+            let scope = size_reconciliation_scope_key(&scope.bucket, &scope.object);
+            self.unobserved_size_scopes.remove(&scope);
+            if self.size_ledger_index.by_scope.contains_key(&scope) {
+                self.pending_size_reconciliation_scopes.insert(scope);
             }
-
-            let mut entry = clone_cache_value(incoming);
-            entry.first_seen = now;
-            entry.attempts = 1;
-            info.size_reconciliation.insert(clone_cache_value(&entry.key), entry);
         }
     }
 
@@ -1356,15 +1323,28 @@ impl FolderScanner {
         let now = Self::now_secs();
         let current_keys = std::mem::take(&mut self.pending_size_reconciliation_keys);
         let scopes = std::mem::take(&mut self.pending_size_reconciliation_scopes);
-        let truncated = std::mem::replace(&mut self.pending_size_reconciliation_truncated, false);
-
-        let info = &mut self.new_cache.info;
+        let truncated = std::mem::take(&mut self.pending_size_reconciliation_truncated);
+        let records = &mut self.new_cache.info.size_reconciliation;
         if !truncated {
-            info.size_reconciliation.retain(|key, entry| {
-                !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
-            });
+            for scope in scopes {
+                if let Some(keys) = self.size_ledger_index.by_scope.get_mut(&scope) {
+                    keys.retain(|key| {
+                        if current_keys.contains(key) {
+                            return true;
+                        }
+                        if let Some(entry) = records.remove(key) {
+                            self.size_ledger_index.bytes -= size_reconciliation_entry_bytes(&entry);
+                            self.size_ledger_index.by_age.remove(&(entry.first_seen, entry.key));
+                        }
+                        false
+                    });
+                    if keys.is_empty() {
+                        self.size_ledger_index.by_scope.remove(&scope);
+                    }
+                }
+            }
         }
-        prune_size_reconciliation(info, now);
+        self.size_ledger_index.prune(records, now);
     }
 
     fn record_scan_resume_hint(&mut self, folder: &str) {
@@ -1437,6 +1417,11 @@ impl FolderScanner {
             ScannerCacheReuseDecision::CompactedParent
         } else if !self.old_cache.is_compacted(hash) {
             ScannerCacheReuseDecision::UncompactedChild
+        } else if self.old_cache.info.lifecycle.as_ref().is_some_and(|config| {
+            let (_, prefix) = path2_bucket_object_with_base_path(&self.root, &hash.0);
+            config.has_active_rules(&prefix)
+        }) {
+            ScannerCacheReuseDecision::ActiveLifecycle
         } else if hash.mod_(self.old_cache.info.next_cycle as u32, data_usage_update_dir_cycles()) {
             ScannerCacheReuseDecision::SelectedForWalk
         } else {
@@ -3213,7 +3198,7 @@ impl FolderScanner {
                             outcome
                         }
                         Err(e) => {
-                            if matches!(&e, ScannerError::DirectoryChanged) {
+                            if matches!(&e, ScannerError::DirectoryChanged | ScannerError::AbandonedChildUnverified) {
                                 return Err(e);
                             }
                             if ctx.is_cancelled()
@@ -3386,13 +3371,14 @@ impl FolderScanner {
                 #[cfg(test)]
                 let list_path_raw_options_observer = self.list_path_raw_options_observer.clone();
 
-                tokio::spawn(async move {
+                let listing = tokio::spawn(async move {
                     let options = ListPathRawOptions {
                         disks,
                         bucket: bucket_clone.clone(),
                         path: prefix_clone.clone(),
                         recursive: true,
-                        report_not_found: true,
+                        // Each absent copy contributes an empty stream to this union.
+                        report_not_found: false,
                         min_disks: disks_quorum,
                         agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                             let entry_name = entry.name.clone();
@@ -3456,13 +3442,13 @@ impl FolderScanner {
                             options.walkdir_stall_timeout,
                         ));
                     }
-                    if let Err(e) = crate::storage_api::ecstore_with_background_disk_io(
+                    let result = crate::storage_api::ecstore_with_background_disk_io(
                         child_ctx_clone.clone(),
                         list_path_raw(child_ctx_clone.clone(), options),
                     )
-                    .await
-                    {
-                        if is_missing_path_disk_error(&e) {
+                    .await;
+                    if let Err(e) = &result {
+                        if is_missing_path_disk_error(e) {
                             debug!(
                                 target: "rustfs::scanner::folder",
                                 event = EVENT_SCANNER_FOLDER_STATE,
@@ -3488,14 +3474,13 @@ impl FolderScanner {
                             );
                         }
                     }
+                    result
                 });
 
                 let mut found_objects = false;
                 let mut agreed_closed = false;
                 let mut partial_closed = false;
                 let mut finished_closed = false;
-                let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
-                let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
                     if child_ctx.is_cancelled() || (agreed_closed && partial_closed && finished_closed) {
@@ -3552,15 +3537,13 @@ impl FolderScanner {
                                 counter!(METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL).increment(1);
                             }
 
+                            // The merge emits one key per partial frame, with all its replicas.
+                            // Deduplicate overflow versions within that key, never across the subtree.
+                            let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
                             for candidate in discovery.candidates {
                                 let sub_quorum_candidate = candidate.replica_count < disks_quorum;
                                 let version_id = candidate.validated_version().map(|id| id.to_string());
                                 let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
-                                if seen_heal_candidates.len() >= MAX_META_CACHE_HEAL_CANDIDATES
-                                    && !seen_heal_candidates.contains(&identity)
-                                {
-                                    continue;
-                                }
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
@@ -3609,12 +3592,6 @@ impl FolderScanner {
                             for candidate in discovery.truncated_candidates {
                                 let version_id = candidate.validated_version().map(|id| id.to_string());
                                 let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
-                                if seen_truncated_objects.len() >= MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
-                                    && !seen_truncated_objects.contains(&candidate.object)
-                                {
-                                    continue;
-                                }
-                                seen_truncated_objects.insert(candidate.object.clone());
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
@@ -3699,6 +3676,18 @@ impl FolderScanner {
                     }
                 }
 
+                if ctx.is_cancelled() {
+                    return Err(ScannerError::Other("Operation cancelled".to_owned()));
+                }
+                if child_ctx.is_cancelled() {
+                    return Err(ScannerError::AbandonedChildUnverified);
+                }
+                match listing.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if is_missing_path_disk_error(&error) => {}
+                    _ => return Err(ScannerError::AbandonedChildUnverified),
+                }
+
                 if found_objects {
                     let folder_item = CachedFolder {
                         name: name.clone(),
@@ -3728,7 +3717,7 @@ impl FolderScanner {
                             )
                             .await
                         {
-                            if matches!(&e, ScannerError::DirectoryChanged) {
+                            if matches!(&e, ScannerError::DirectoryChanged | ScannerError::AbandonedChildUnverified) {
                                 return Err(e);
                             }
                             if ctx.is_cancelled()
@@ -3749,7 +3738,7 @@ impl FolderScanner {
                                 error = %e,
                                 "Scanner heal child folder scan failed"
                             );
-                            continue;
+                            return Err(ScannerError::AbandonedChildUnverified);
                         }
                         tokio::task::yield_now().await;
 
@@ -4030,6 +4019,8 @@ pub(crate) async fn scan_data_folder_scoped(
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
         directory_checkpoints,
+        size_ledger_index: SizeLedgerIndex::default(),
+        unobserved_size_scopes: HashSet::new(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -4044,7 +4035,10 @@ pub(crate) async fn scan_data_folder_scoped(
     };
 
     let now = FolderScanner::now_secs();
-    prune_size_reconciliation(&mut scanner.new_cache.info, now);
+    scanner.size_ledger_index = SizeLedgerIndex::from_persisted(&mut scanner.new_cache.info.size_reconciliation, now);
+    scanner
+        .unobserved_size_scopes
+        .extend(scanner.size_ledger_index.by_scope.keys().cloned());
 
     // Check if context is cancelled
     if ctx.is_cancelled() && scanner.local_stop.as_ref().is_none_or(|stop| stop.reason().is_none()) {
@@ -4068,6 +4062,9 @@ pub(crate) async fn scan_data_folder_scoped(
         crate::workload_admission::with_scanner_physical_disk(physical, scanner.scan_folder(ctx.clone(), folder, &mut root)).await
     }
     .await;
+    if outcome.is_ok() && !scanner.coverage_gap && scanner.prefix_scan_scope.is_none() {
+        scanner.retire_confirmed_absent_sizes(&ctx, checkpoint_endpoints).await;
+    }
     // A source failure is a retry of the physical walk, never a failed object.
     // Reuse the interrupted-drive checkpoint path, including its EOF and identity fences.
     if matches!(&outcome, Err(ScannerError::SourceUnavailable(_)))
@@ -4078,7 +4075,9 @@ pub(crate) async fn scan_data_folder_scoped(
     // A changed directory invalidates the speculative traversal, not the disk.
     // Keep the input tree as an uncertified value. The incomplete-sweep path
     // discards every cursor and parks no work from the raced generation.
-    let outcome = if matches!(outcome, Err(ScannerError::DirectoryChanged)) {
+    // Preserve the cached child links needed to repeat an inconclusive cross-disk listing.
+    let retry_abandoned_child = matches!(outcome, Err(ScannerError::AbandonedChildUnverified));
+    let outcome = if retry_abandoned_child || matches!(outcome, Err(ScannerError::DirectoryChanged)) {
         scanner.coverage_gap = true;
         scanner.new_cache.cache = std::mem::take(&mut scanner.old_cache.cache);
         scanner.new_cache.info.scan_bucket_observations.clear();
@@ -4095,7 +4094,9 @@ pub(crate) async fn scan_data_folder_scoped(
             let coverage_gap = scanner.coverage_gap;
             scanner.reconcile_failed_objects_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
-            new_cache.force_compact(force_compact_limit_for_sweep(false));
+            if !retry_abandoned_child {
+                new_cache.force_compact(force_compact_limit_for_sweep(false));
+            }
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap

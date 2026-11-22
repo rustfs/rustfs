@@ -698,81 +698,49 @@ impl ScannerItem {
             .iter()
             .any(|resolution| matches!(resolution, SizeResolution::Corrupt { .. }));
 
-        // `versioning_config` is resolved once per object by the caller
-        // (`get_size`) and handed in; only `prefix_enabled` is consulted here.
+        let evaluated = if let Some(lifecycle) = self.lifecycle.clone() {
+            let object_opts = object_infos
+                .iter()
+                .map(crate::ecstore_object_opts_from_object_info)
+                .collect::<Vec<ObjectOpts>>();
 
-        let Some(lifecycle) = self.lifecycle.clone() else {
-            let mut cumulative_size: i64 = 0;
-            for (oi, resolved_size) in object_infos.iter().zip(resolved_sizes.iter()) {
+            match Evaluator::new(lifecycle.clone())
+                .with_lock_retention(lock_retention)
+                .with_replication_config(scanner_replication_config_for_lifecycle_eval(self.replication.clone()))
+                .eval(&object_opts)
+                .await
+            {
+                Ok(events) => Some((lifecycle, events)),
+                Err(e) => {
+                    warn!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        object_path = %object_path,
+                        state = "evaluate_failed",
+                        error = %e,
+                        "Scanner lifecycle action evaluation failed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let Some((lifecycle, events)) = evaluated else {
+            let mut cumulative_size = 0i64;
+            for (oi, resolution) in object_infos.iter().zip(&resolved_sizes) {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return;
                 }
-                let accounting_size = match resolved_size {
-                    SizeResolution::Known { logical, .. } => *logical,
-                    // A valid compressed legacy sentinel has no logical size,
-                    // but heal and replication still need to run. The
-                    // physical size is only an input to those operations; it
-                    // is not folded into the logical total below.
-                    SizeResolution::Unknown { physical, .. } => {
-                        self.heal_actions(oi, *physical, size_summary, cancellation).await;
-                        size_summary.actions_accounting_unknown(oi);
-                        continue;
-                    }
-                    SizeResolution::Corrupt { .. } => {
-                        size_summary.actions_accounting_unknown(oi);
-                        continue;
-                    }
-                };
-
-                let size = self.heal_actions(oi, accounting_size, size_summary, cancellation).await;
-
-                size_summary.actions_accounting(oi, size, accounting_size);
-
+                let size = self.retain_scanned_version(oi, resolution, size_summary, cancellation).await;
                 cumulative_size = cumulative_size.saturating_add(size);
             }
-
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return;
+            if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+                self.alert_excessive_versions(object_infos.len(), cumulative_size);
             }
-            self.alert_excessive_versions(object_infos.len(), cumulative_size);
-
-            debug!(
-                target: "rustfs::scanner::folder",
-                event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                object_path = %object_path,
-                state = "no_lifecycle_config",
-                "Scanner lifecycle action finished without lifecycle rules"
-            );
             return;
-        };
-
-        let object_opts = object_infos
-            .iter()
-            .map(crate::ecstore_object_opts_from_object_info)
-            .collect::<Vec<ObjectOpts>>();
-
-        let events = match Evaluator::new(lifecycle.clone())
-            .with_lock_retention(lock_retention)
-            .with_replication_config(scanner_replication_config_for_lifecycle_eval(self.replication.clone()))
-            .eval(&object_opts)
-            .await
-        {
-            Ok(events) => events,
-            Err(e) => {
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    object_path = %object_path,
-                    state = "evaluate_failed",
-                    error = %e,
-                    "Scanner lifecycle action evaluation failed"
-                );
-                return;
-            }
         };
 
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -784,13 +752,13 @@ impl ScannerItem {
         // reached only for buckets with lifecycle rules; it feeds
         // rustfs_ilm_versions_scanned_total via the Lifecycle source's checked
         // counter.
-        global_metrics().record_scanner_source_checked(ScannerWorkSource::Lifecycle, object_opts.len() as u64);
+        global_metrics().record_scanner_source_checked(ScannerWorkSource::Lifecycle, events.len() as u64);
 
         let mut to_delete_objs: Vec<ObjectToDelete> = Vec::new();
         let mut noncurrent_events: Vec<Event> = Vec::new();
         let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();
         let mut noncurrent_unknown: Vec<&ObjectInfo> = Vec::new();
-        let mut cumulative_size = 0;
+        let mut cumulative_size = 0i64;
         let mut remaining_versions = object_infos.len();
         let all_versions_known = object_infos
             .iter()
@@ -802,120 +770,24 @@ impl ScannerItem {
                 }
                 let oi = &object_infos[i];
                 let known_size = resolved_sizes[i].known_size();
-                if has_corrupt_size
-                    && matches!(
+                let blocked_by_corrupt_sibling = has_corrupt_size && event.action.delete_all();
+                if blocked_by_corrupt_sibling
+                    || !lifecycle_event_allowed(&resolved_sizes[i], event, &lifecycle)
+                    || Self::action_blocked_by_unknown_tier(
                         event.action,
-                        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction
+                        oi,
+                        all_versions_known,
+                        tier_names,
+                        &event.storage_class,
                     )
                 {
-                    // An all-version delete would also remove a corrupt
-                    // sibling that could not be reconciled safely.
+                    let size = self
+                        .retain_scanned_version(oi, &resolved_sizes[i], size_summary, cancellation)
+                        .await;
+                    cumulative_size = cumulative_size.saturating_add(size);
                     continue;
                 }
-                if !lifecycle_event_allowed(&resolved_sizes[i], event, &lifecycle) {
-                    // An unknown logical size must not make an otherwise
-                    // non-destructive scan disappear from heal/physical-tier
-                    // accounting. Size-filtered or deferred events remain
-                    // pending, so retain the version-only physical counters.
-                    if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
-                        self.heal_actions(oi, *physical, size_summary, cancellation).await;
-                        size_summary.actions_accounting_unknown(oi);
-                    }
-                    continue;
-                }
-                let actual_size = match known_size {
-                    Some(size) => size,
-                    None => {
-                        match event.action {
-                            IlmAction::DeleteAction
-                            | IlmAction::DeleteRestoredAction
-                            | IlmAction::DeleteRestoredVersionAction
-                            | IlmAction::DeleteAllVersionsAction
-                            | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                                let done_ilm = Metrics::time_ilm(event.action);
-                                let trace_started_at = trace_start_instant();
-                                let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                                emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
-                                if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
-                                    done_ilm(1)();
-                                    if event.action == IlmAction::DeleteAllVersionsAction
-                                        || event.action == IlmAction::DelMarkerDeleteAllVersionsAction
-                                    {
-                                        remaining_versions = 0;
-                                    }
-                                } else if matches!(
-                                    event.action,
-                                    IlmAction::DeleteAction
-                                        | IlmAction::DeleteRestoredAction
-                                        | IlmAction::DeleteRestoredVersionAction
-                                ) {
-                                    size_summary.actions_accounting_unknown(oi);
-                                } else {
-                                    size_summary.actions_accounting_unknown(oi);
-                                    for (j, retained) in object_infos.iter().enumerate().skip(i + 1) {
-                                        match &resolved_sizes[j] {
-                                            SizeResolution::Known { logical, .. } => PendingScannerAccounting {
-                                                object: retained,
-                                                retained_size: *logical,
-                                                expired_size: 0,
-                                            }
-                                            .apply(size_summary, &mut cumulative_size, false),
-                                            SizeResolution::Unknown { .. } => {
-                                                size_summary.actions_accounting_unknown(retained);
-                                            }
-                                            SizeResolution::Corrupt { .. } => {}
-                                        }
-                                    }
-                                }
-                            }
-                            IlmAction::DeleteVersionAction => {
-                                if let Some(target) = ecstore_lifecycle_version_delete_target(oi) {
-                                    to_delete_objs.push(target);
-                                    noncurrent_events.push(event.clone());
-                                    noncurrent_unknown.push(oi);
-                                } else {
-                                    if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
-                                        self.heal_actions(oi, *physical, size_summary, cancellation).await;
-                                    }
-                                    size_summary.actions_accounting_unknown(oi);
-                                }
-                            }
-                            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
-                                let trace_started_at = trace_start_instant();
-                                let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
-                                emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
-                                if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
-                                    let done_ilm = Metrics::time_ilm(event.action);
-                                    done_ilm(1)();
-                                }
-                                size_summary.actions_accounting_unknown(oi);
-                            }
-                            IlmAction::NoneAction | IlmAction::ActionCount => {
-                                if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
-                                    self.heal_actions(oi, *physical, size_summary, cancellation).await;
-                                }
-                                size_summary.actions_accounting_unknown(oi);
-                            }
-                        }
-                        continue;
-                    }
-                };
-
-                let mut size = actual_size;
-                let mut account_now = true;
-
-                // A retired/unknown source tier may point at a remote object
-                // that cannot be safely deleted or transitioned. Lifecycle
-                // evaluation is still useful for accounting, but all
-                // side-effecting tier actions fail closed until the registry
-                // recognizes the source again.
-                if Self::action_blocked_by_unknown_tier(event.action, oi, all_versions_known, tier_names, &event.storage_class) {
-                    size = self.heal_actions(oi, actual_size, size_summary, cancellation).await;
-                    size_summary.actions_accounting(oi, size, actual_size);
-                    cumulative_size += size;
-                    continue;
-                }
-
+                let mut expired = false;
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
                         debug!(
@@ -937,23 +809,14 @@ impl ScannerItem {
                             done_ilm(1)();
                             remaining_versions = 0;
                         } else {
-                            if let Some(actual_size) = known_size {
-                                PendingScannerAccounting {
-                                    object: oi,
-                                    retained_size: actual_size,
-                                    expired_size: 0,
+                            for (retained, resolution) in object_infos[i..].iter().zip(&resolved_sizes[i..]) {
+                                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                                    return;
                                 }
-                                .apply(size_summary, &mut cumulative_size, false);
-                            }
-                            for (j, retained) in object_infos.iter().enumerate().skip(i + 1) {
-                                if let Some(retained_size) = resolved_sizes[j].known_size() {
-                                    PendingScannerAccounting {
-                                        object: retained,
-                                        retained_size,
-                                        expired_size: 0,
-                                    }
-                                    .apply(size_summary, &mut cumulative_size, false);
-                                }
+                                let size = self
+                                    .retain_scanned_version(retained, resolution, size_summary, cancellation)
+                                    .await;
+                                cumulative_size = cumulative_size.saturating_add(size);
                             }
                         }
                         break 'eventLoop;
@@ -979,7 +842,7 @@ impl ScannerItem {
                             done_ilm(1)();
                             if !versioning_config.prefix_enabled(&object_path) && event.action == IlmAction::DeleteAction {
                                 remaining_versions -= 1;
-                                size = 0;
+                                expired = true;
                             }
                         }
                     }
@@ -992,10 +855,17 @@ impl ScannerItem {
                                     retained_size: actual_size,
                                     expired_size: 0,
                                 });
+                            } else {
+                                noncurrent_unknown.push(oi);
                             }
-                            account_now = false;
                             noncurrent_events.push(event.clone());
+                        } else {
+                            let size = self
+                                .retain_scanned_version(oi, &resolved_sizes[i], size_summary, cancellation)
+                                .await;
+                            cumulative_size = cumulative_size.saturating_add(size);
                         }
+                        continue;
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!(
@@ -1019,13 +889,20 @@ impl ScannerItem {
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
-                        size = self.heal_actions(oi, actual_size, size_summary, cancellation).await;
+                        let size = self
+                            .retain_scanned_version(oi, &resolved_sizes[i], size_summary, cancellation)
+                            .await;
+                        cumulative_size = cumulative_size.saturating_add(size);
+                        continue;
                     }
                 }
 
-                if account_now {
-                    size_summary.actions_accounting(oi, size, actual_size);
+                if let Some(actual_size) = known_size {
+                    let size = if expired { 0 } else { actual_size };
+                    crate::data_usage_define::account_version_usage(size_summary, oi, size, !expired);
                     cumulative_size = cumulative_size.saturating_add(size);
+                } else if !expired {
+                    size_summary.actions_accounting_unknown(oi);
                 }
             }
         }
@@ -1074,6 +951,32 @@ impl ScannerItem {
         }
         if !cancellation.is_some_and(CancellationToken::is_cancelled) {
             self.alert_excessive_versions(remaining_versions, cumulative_size);
+        }
+    }
+
+    /// Account an observed version independently of whether ILM could act on it.
+    async fn retain_scanned_version(
+        &mut self,
+        oi: &ObjectInfo,
+        resolution: &SizeResolution,
+        summary: &mut SizeSummary,
+        cancellation: Option<&CancellationToken>,
+    ) -> i64 {
+        match resolution {
+            SizeResolution::Known { logical, .. } => {
+                let size = self.heal_actions(oi, *logical, summary, cancellation).await;
+                summary.actions_accounting(oi, size, *logical);
+                size
+            }
+            SizeResolution::Unknown { physical, .. } => {
+                self.heal_actions(oi, *physical, summary, cancellation).await;
+                summary.actions_accounting_unknown(oi);
+                0
+            }
+            SizeResolution::Corrupt { .. } => {
+                summary.actions_accounting_unknown(oi);
+                0
+            }
         }
     }
 
@@ -1158,11 +1061,6 @@ impl ScannerItem {
                     _ => {}
                 }
             }
-        }
-
-        if oi.replication_status == ReplicationStatusType::Replica {
-            size_summary.replica_size = size_summary.replica_size.saturating_add(roi.size);
-            size_summary.replica_count = size_summary.replica_count.saturating_add(1);
         }
     }
 
@@ -1623,6 +1521,138 @@ mod tests {
         summary.record_reconciliation_scope(&known.bucket, &known.name);
         assert_eq!(summary.reconciliation_scopes.len(), 1);
         assert_eq!(summary.reconciliation_scopes[0].bucket, "bucket");
+    }
+
+    fn expiration_policy() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(crate::storage_api::LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                id: Some("expire".into()),
+                filter: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_lifecycle_evaluation_retains_observed_version_usage() {
+        let version = ObjectInfo {
+            bucket: "bucket".into(),
+            name: "object".into(),
+            size: 4096,
+            actual_size: 4096,
+            version_id: Some(uuid::Uuid::from_u128(1)),
+            ..Default::default()
+        };
+        for legacy in [false, true] {
+            let mut item = scanner_item_with_prefix("object");
+            let mut version = version.clone();
+            let mut policy = expiration_policy();
+            if legacy {
+                version.num_versions = 1;
+                policy.rules[0].noncurrent_version_expiration = Some(crate::storage_api::NoncurrentVersionExpiration {
+                    newer_noncurrent_versions: Some(-1),
+                    noncurrent_days: Some(1),
+                });
+            } else {
+                version.num_versions = 2;
+            }
+            let policy = Arc::new(policy);
+            let opts = crate::ecstore_object_opts_from_object_info(&version);
+            assert!(Evaluator::new(policy.clone()).eval(&[opts]).await.is_err());
+            item.lifecycle = Some(policy);
+            let mut usage = SizeSummary::default();
+            item.apply_actions(vec![version], None, Default::default(), &[], &mut usage)
+                .await;
+            assert_eq!((usage.total_size, usage.versions), (4096, 1));
+        }
+    }
+
+    fn expired_unknown_size_version() -> ObjectInfo {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".into());
+        ObjectInfo {
+            bucket: "tier-guard".into(),
+            name: "retained".into(),
+            size: 12,
+            actual_size: -1,
+            is_latest: true,
+            num_versions: 1,
+            version_id: Some(uuid::Uuid::from_u128(2)),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::days(1)),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_all_version_expiry_accounts_each_sibling_once() {
+        let mut item = scanner_item_with_prefix("retained");
+        let mut policy = expiration_policy();
+        policy.rules[0].expiration.as_mut().unwrap().expired_object_all_versions = Some(true);
+        let policy = Arc::new(policy);
+        let mut latest = expired_unknown_size_version();
+        latest.num_versions = 2;
+        let older = ObjectInfo {
+            bucket: latest.bucket.clone(),
+            name: latest.name.clone(),
+            size: 4096,
+            actual_size: 4096,
+            version_id: Some(uuid::Uuid::from_u128(3)),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            num_versions: 2,
+            ..Default::default()
+        };
+        let versions = vec![latest, older];
+        let opts: Vec<_> = versions.iter().map(crate::ecstore_object_opts_from_object_info).collect();
+        assert_eq!(
+            Evaluator::new(policy.clone()).eval(&opts).await.unwrap()[0].action,
+            IlmAction::DeleteAllVersionsAction
+        );
+        item.lifecycle = Some(policy);
+        item.bucket = versions[0].bucket.clone();
+        let mut summary = SizeSummary::default();
+        // No expiry runtime is installed in this process; the queue rejects the batch.
+        item.apply_actions(versions, None, Default::default(), &[], &mut summary)
+            .await;
+        assert_eq!((summary.total_size, summary.versions), (4096, 2));
+        assert_eq!(summary.size_reconciliation.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retired_tier_defers_expiry_of_unknown_size_without_dispatch() {
+        let object = ObjectInfo {
+            storage_class: Some("retired-tier".into()),
+            ..expired_unknown_size_version()
+        };
+        assert!(matches!(resolve_size(&object), SizeResolution::Unknown { .. }));
+        let policy = Arc::new(expiration_policy());
+        let opts = crate::ecstore_object_opts_from_object_info(&object);
+        let events = Evaluator::new(policy.clone()).eval(&[opts]).await.unwrap();
+        assert_eq!(events[0].action, IlmAction::DeleteAction);
+        let mut item = scanner_item_with_prefix("retained");
+        item.bucket = object.bucket.clone();
+        item.lifecycle = Some(policy);
+        let mut trace = rustfs_common::trace_bus::subscribe_trace_events();
+        let mut summary = SizeSummary::default();
+        item.apply_actions(vec![object], None, Default::default(), &[], &mut summary)
+            .await;
+        while let Ok(event) = trace.try_recv() {
+            assert!(!(event.func == TraceFunc::ScannerIlmAction && event.bucket.as_deref() == Some("tier-guard")));
+        }
+        assert_eq!((summary.total_size, summary.versions), (0, 1));
+        assert_eq!(summary.size_reconciliation.len(), 1);
+        assert_eq!(summary.size_reconciliation[0].physical_size, Some(12));
     }
 
     #[test]

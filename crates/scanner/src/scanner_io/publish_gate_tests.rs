@@ -1930,9 +1930,10 @@ async fn usage_quantum_real_remote_wire_and_entry_fallback_preserve_parent_limit
         let (source, source_token) = cycle.for_source(&owner);
         let (bucket, _) = source.for_bucket(&source_token);
         let workers = namespace_scanner_workers(vec!["local"], vec![("remote", capabilities)], &bucket.remaining_config());
-        assert_eq!(workers[1].1, NamespaceScannerWorkerMode::Coordinator);
+        assert_eq!(workers, vec![("local", NamespaceScannerWorkerMode::Coordinator)]);
+        assert!(namespace_scanner_workers(vec![], vec![("remote", capabilities)], &bucket.remaining_config()).is_empty());
         let walkers = namespace_scanner_walkers(workers, 2, |disk| *disk == "local");
-        assert_eq!(walkers.iter().filter(|walker| walker.disk == "remote").count(), 1);
+        assert!(walkers.iter().all(|walker| walker.disk == "local"));
         assert!(bucket.try_charge_raw_entry(3, 1));
         if let Some(limit) = entries {
             assert_eq!(cycle.remaining_config().max_entries, Some(limit - 1));
@@ -1943,7 +1944,7 @@ async fn usage_quantum_real_remote_wire_and_entry_fallback_preserve_parent_limit
             assert_eq!(bucket.remaining_config().max_entry_name_bytes, Some(limit - 3));
         }
         entry_modes.push(serde_json::json!({
-            "entries_limit": entries, "name_bytes_limit": names, "mode": "coordinator",
+            "entries_limit": entries, "name_bytes_limit": names, "mode": "local_only",
             "parent_entries_remaining": cycle.remaining_config().max_entries,
             "parent_name_bytes_remaining": cycle.remaining_config().max_entry_name_bytes,
         }));
