@@ -20,6 +20,7 @@ pub(crate) mod material;
 pub(crate) mod metadata;
 #[cfg(feature = "rio-v2")]
 pub(crate) mod object;
+pub(crate) mod stored;
 
 use crate::core::keying::material::{EncryptionKeyKind, ManagedSealedKey};
 

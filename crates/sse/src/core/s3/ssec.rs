@@ -23,7 +23,7 @@ use rustfs_s3_types::S3ErrorCode;
 use std::collections::HashMap;
 use tracing::error;
 
-pub(crate) fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
+fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
     hasher.finalize().into()
@@ -123,6 +123,41 @@ pub(crate) fn verify_ssec_key_match(
         None if minio_sealed_ssec => Ok(()),
         None => Err(ssec_invalid_request("Object has no stored SSE-C key metadata.")),
     }
+}
+
+/// Algorithm an SSE-C object recorded; objects that recorded none were written as `AES256`.
+pub(crate) fn stored_ssec_algorithm(metadata: &HashMap<String, String>) -> &str {
+    metadata
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .map(|s| s.as_str())
+        .unwrap_or("AES256")
+}
+
+/// The customer key and MD5 of a read of an SSE-C object, once both are present and
+/// the MD5 matches what the object recorded.
+///
+/// The key itself is not validated here; the caller does that next, so a request
+/// that names the wrong key learns of the mismatch before anything else.
+pub(crate) fn require_matching_ssec_key<'r>(
+    metadata: &HashMap<String, String>,
+    sse_customer_key: Option<&'r String>,
+    sse_customer_key_md5: Option<&'r String>,
+) -> Result<(&'r String, &'r String), SseError> {
+    let (key, key_md5) = match (sse_customer_key, sse_customer_key_md5) {
+        (Some(k), Some(md5)) => (k, md5),
+        _ => {
+            return Err(ssec_invalid_request(
+                "The object was stored using a form of Server Side Encryption. \
+                 The correct parameters must be provided to retrieve the object.",
+            ));
+        }
+    };
+
+    // Verify that the provided key MD5 matches the stored MD5 for security
+    let stored_md5 = metadata.get("x-amz-server-side-encryption-customer-key-md5");
+    verify_ssec_key_match(key_md5, stored_md5, minio_sealed_ssec_metadata(metadata))?;
+
+    Ok((key, key_md5))
 }
 
 /// Validate that the SSE-C headers required for reading an SSE-C encrypted object

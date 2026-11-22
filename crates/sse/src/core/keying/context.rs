@@ -14,7 +14,6 @@
 
 //! The encryption context a data key is bound to.
 
-use crate::core::s3::headers::sse_invalid_argument;
 use crate::error::SseError;
 use base64_simd::STANDARD as BASE64_STANDARD;
 use rustfs_kms::types::ObjectEncryptionContext;
@@ -36,27 +35,6 @@ pub(crate) fn build_kms_request_context(
         .entry(bucket.to_string())
         .or_insert_with(|| canonical_kms_bucket_path(bucket, key));
     context
-}
-
-/// Rejects a client encryption context that would replace the location binding.
-///
-/// [`build_kms_request_context`] binds the data key to `{bucket: bucket/key}`
-/// with `or_insert`, and only the client context is persisted. A client entry
-/// keyed by the bucket name therefore travels with the object and replaces the
-/// binding on every read, so the envelope would no longer be tied to the
-/// object's location. Only the write side rejects it: objects stored with such
-/// an entry stay readable because the read side rebuilds the context unchanged.
-pub(crate) fn reject_kms_context_location_override(
-    bucket: &str,
-    ssekms_context: Option<&HashMap<String, String>>,
-) -> Result<(), SseError> {
-    if ssekms_context.is_some_and(|context| context.contains_key(bucket)) {
-        return Err(sse_invalid_argument(&format!(
-            "The x-amz-server-side-encryption-context header contains the key \"{bucket}\", which equals the bucket name; \
-             that key is reserved for binding the data key to the object's location."
-        )));
-    }
-    Ok(())
 }
 
 pub(crate) fn build_object_encryption_context(

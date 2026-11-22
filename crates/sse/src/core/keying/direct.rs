@@ -18,10 +18,10 @@
 use crate::core::keying::NewObjectKey;
 #[cfg(not(feature = "rio-v2"))]
 use crate::core::keying::material::EncryptionKeyKind;
-use crate::core::s3::ssec::md5_bytes;
 #[cfg(not(feature = "rio-v2"))]
 use crate::error::SseError;
 use base64_simd::STANDARD as BASE64_STANDARD;
+use md5::{Digest as Md5Digest, Md5};
 #[cfg(not(feature = "rio-v2"))]
 use rand::Rng;
 #[cfg(not(feature = "rio-v2"))]
@@ -55,7 +55,7 @@ pub(crate) fn read_stored_ssec_nonce(metadata: &HashMap<String, String>, bucket:
 /// 2. Different objects get different nonces
 pub(crate) fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
     let nonce_source = format!("{bucket}-{key}");
-    let nonce_hash = md5_bytes(nonce_source.as_bytes());
+    let nonce_hash: [u8; 16] = Md5::digest(nonce_source.as_bytes()).into();
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&nonce_hash[..12]);
     nonce

@@ -125,6 +125,28 @@ pub fn extract_ssekms_context_from_headers(headers: &HeaderMap) -> Result<Option
     })
 }
 
+/// Rejects a client encryption context that would replace the location binding.
+///
+/// The request context binds the data key to `{bucket: bucket/key}` only when the
+/// client supplied no entry under that name, and only the client context is
+/// persisted. A client entry keyed by the bucket name therefore travels with the
+/// object and replaces the binding on every read, so the envelope would no longer
+/// be tied to the object's location. Only the write side rejects it: objects stored
+/// with such an entry stay readable because the read side rebuilds the context
+/// unchanged.
+pub(crate) fn reject_kms_context_location_override(
+    bucket: &str,
+    ssekms_context: Option<&HashMap<String, String>>,
+) -> Result<(), SseError> {
+    if ssekms_context.is_some_and(|context| context.contains_key(bucket)) {
+        return Err(sse_invalid_argument(&format!(
+            "The x-amz-server-side-encryption-context header contains the key \"{bucket}\", which equals the bucket name; \
+             that key is reserved for binding the data key to the object's location."
+        )));
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn validate_sse_headers_for_write(
     server_side_encryption: Option<&str>,

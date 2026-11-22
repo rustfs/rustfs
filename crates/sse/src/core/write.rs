@@ -15,13 +15,14 @@
 //! Write entry points: resolve the encryption material for a new object or multipart upload.
 
 use crate::core::audit::{envelope_master_key_version, record_managed_kms_outcome};
-use crate::core::keying::context::{build_object_encryption_context, reject_kms_context_location_override};
+use crate::core::keying::context::build_object_encryption_context;
 use crate::core::keying::material::EncryptionMaterial;
 use crate::core::keying::{
     SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
 };
 use crate::core::request::SseKmsPrincipal;
 use crate::core::s3::authorization::authorize_sse_kms_key;
+use crate::core::s3::headers::reject_kms_context_location_override;
 use crate::core::s3::scheme::{
     DEFAULT_SSE_ALGORITHM, WriteScheme, WriteSchemeHeaders, is_managed_sse, managed_sse_type, resolve_write_scheme,
 };
