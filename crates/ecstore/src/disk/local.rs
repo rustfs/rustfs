@@ -9768,7 +9768,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         if volume == RUSTFS_META_MULTIPART_BUCKET {
             crate::disk::multipart_source::native_source_protocol(&fi)?;
@@ -10048,7 +10048,7 @@ impl LocalDisk {
         let mut mutation = mutation;
         mutation.namespace_owner = self.usage_watch_binding.owner(volume, mutation.namespace_owner.take());
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let DeleteVersionMutation {
@@ -10735,7 +10735,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         if let Some((_, gen_str)) = path.rsplit_once(".integrity.")
             && let Ok(generation) = Uuid::parse_str(gen_str)
@@ -12572,7 +12572,7 @@ impl LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -41959,6 +41959,226 @@ mod test {
             take_prepared_part_txn_receipt(&txn2_open).is_none(),
             "Drop for LocalDisk must purge cached part transaction receipts"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hotpath_non_inline_delete_and_multipart_budgets() {
+        const CHILD: &str = "RUSTFS_TEST_HOTPATH_BUDGET_CHILD";
+        const TEST: &str = "disk::local::test::hotpath_non_inline_delete_and_multipart_budgets";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("RUSTFS_DURABILITY_MODE", "strict")
+                .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                .output()
+                .expect("hotpath budget subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "hotpath budget child failed: {stdout}{stderr}");
+            assert!(
+                stdout.contains("HOTPATH_BUDGET_OK"),
+                "hotpath budget child must execute all assertions: {stdout}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "hotpath-budget";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_MULTIPART_BUCKET).await;
+        disk.multipart_index.initialize().await;
+        disk.wait_for_startup_cleanup().await;
+        bucket_durability::set(bucket, Some(DurabilityMode::Strict));
+
+        let bucket_dir = disk.io_root().join(bucket);
+        let tmp_dir = disk.io_root().join(RUSTFS_META_TMP_BUCKET);
+
+        // 1. Non-inline rename_data with presynced part.1:
+        //    Must execute in 1 Fsync blocking-queue job (and 1 total queue job) with 2 bucket-tree directory fsyncs
+        //    (<object> and <bucket>), 1 staged data-directory fsync before rename, and 0 prepare_destination jobs.
+        let object = "non-inline-obj";
+        let data_dir = Uuid::new_v4();
+        let stage_id = Uuid::new_v4().to_string();
+        let part_rel = format!("{stage_id}/{data_dir}/part.1");
+        let payload = vec![b'x'; 131_072];
+        let mut writer = disk
+            .create_file(bucket, RUSTFS_META_TMP_BUCKET, &part_rel, payload.len() as i64)
+            .await
+            .expect("create_file for presynced part.1");
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
+            .await
+            .expect("write payload");
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect("shutdown writer");
+        drop(writer);
+
+        let jobs_before_put = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_put = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let bucket_syncs_before_put = os::fsync_dir_recorder::count_under(&bucket_dir);
+        let tmp_syncs_before_put = os::fsync_dir_recorder::count_under(&tmp_dir);
+
+        let mut fi = test_file_info(object, Uuid::nil(), Some(data_dir), None);
+        fi.size = payload.len() as i64;
+        fi.parts[0].size = payload.len();
+        fi.parts[0].actual_size = payload.len() as i64;
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, &stage_id, fi.clone(), bucket, object)
+            .await
+            .expect("non-inline rename_data");
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_put,
+            2,
+            "non-inline rename_data with presynced shard must submit 1 Fsync commit job + 1 Foreground staging-cleanup job"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_put,
+            1,
+            "non-inline rename_data must submit exactly 1 job on the Fsync lane"
+        );
+        assert!(
+            (2..=3).contains(&(os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs_before_put)),
+            "fresh non-inline commit must fsync only the object directory and bucket directory"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&tmp_dir) - tmp_syncs_before_put,
+            1,
+            "presynced non-inline commit must fsync the staged data directory once before rename"
+        );
+
+        // 2. Fused recoverable DELETE (Stage 1 -> Stage 2 -> Stage 3):
+        //    Must execute in 3 Fsync blocking-queue jobs (plus at most 1 reserve replenish job if reserve was disarmed)
+        //    and 7 directory fsyncs under Strict mode (Stage 1: 4, Stage 2: 1, Stage 3: 2).
+        let reserve_extra = usize::from(!disk.delete_reserve.is_armed());
+        let jobs_before_del = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_del = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let bucket_syncs_before_del = os::fsync_dir_recorder::count_under(&bucket_dir);
+        let del_tx = Uuid::new_v4();
+        let del_opts = DeleteOptions {
+            recoverable_delete: true,
+            old_data_dir: Some(del_tx),
+            ..Default::default()
+        };
+        disk.delete_version(bucket, object, fi, false, del_opts)
+            .await
+            .expect("recoverable delete stage 1");
+        let (journal, sole, satisfied) = disk
+            .try_publish_prepared_delete_local(bucket, object, del_tx, None)
+            .await
+            .expect("publish delete stage 2")
+            .expect("delete stage 2 satisfied");
+        assert!(sole && satisfied);
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local(bucket, object, del_tx, &journal, None)
+                .await
+                .expect("finalize delete stage 3")
+        );
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_del,
+            3 + reserve_extra,
+            "fused recoverable delete (Stage 1..3) must submit 3 blocking-queue jobs"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_del,
+            3 + reserve_extra,
+            "fused recoverable delete (Stage 1..3) must run on the Fsync lane"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs_before_del,
+            7,
+            "strict non-inline recoverable delete must execute 7 directory fsyncs across Stages 1..3"
+        );
+
+        // 3. Multipart part transaction on RUSTFS_META_MULTIPART_BUCKET
+        //    (prepare_part_transaction -> rename_part -> settle_part_transaction):
+        //    Must hit PreparedPartTxnReceipt, PublishedPartTxnReceipt, and MultipartSourceAdmission caches
+        //    and submit 3 Fsync blocking-queue jobs.
+        let mp_dst_path = concat!(
+            "6f897928dfe04a87a269ccd9f5a5897d9cbbdf6b55e4d903ef3cbc1125c0cb8f/",
+            "8f897819-2604-4f3d-b843-c32a45d198b2x1786372838834745500/",
+            "58ba822c-06e4-4332-81cc-be2c9d921900/part.1"
+        );
+        let source_root = multipart_staging::upload_scope_root(mp_dst_path, true);
+        let mut upload = FileInfo::new(source_root, 2, 2);
+        upload.erasure.index = 1;
+        upload.data_dir = Some(Uuid::new_v4());
+        upload.mod_time = Some(time::OffsetDateTime::now_utc());
+        upload.fresh = true;
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, source_root, upload)
+            .await
+            .expect("initialize live upload head");
+
+        let part_payload = Bytes::from_static(b"multipart-part-payload");
+        let part_meta = Bytes::from(
+            crate::disk::ObjectPartInfo {
+                number: 1,
+                size: part_payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all(RUSTFS_META_TMP_BUCKET, "mp-stage/part.1", part_payload.clone())
+            .await
+            .expect("stage multipart part");
+
+        let mp_dir = disk.io_root().join(RUSTFS_META_MULTIPART_BUCKET);
+        let jobs_before_mp = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_mp = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let mp_syncs_before = os::fsync_dir_recorder::count_under(&mp_dir);
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            "mp-stage/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            mp_dst_path,
+            part_meta.clone(),
+        )
+        .await
+        .expect("prepare_part_transaction");
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            "mp-stage/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            mp_dst_path,
+            part_meta,
+        )
+        .await
+        .expect("rename_part");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path, PartTransactionAction::Commit)
+            .await
+            .expect("settle_part_transaction");
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_mp,
+            3,
+            "prepare_part_transaction + rename_part + settle_part_transaction must submit 3 blocking-queue jobs"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_mp,
+            3,
+            "multipart part transaction stages must run on the Fsync lane"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&mp_dir) - mp_syncs_before,
+            2,
+            "multipart part transaction commit must fsync the upload directory once in rename_part and once in settle_part_transaction"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path)
+                .await
+                .expect("read settled part"),
+            part_payload
+        );
+
+        println!("HOTPATH_BUDGET_OK");
     }
 
     #[test]
