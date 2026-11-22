@@ -29,6 +29,7 @@ import diffing
 import framework as fw
 import harness as h
 import observe
+import selftest
 
 BIN_DIR = h.STATE_DIR / "bin"
 RUNS_DIR = h.STATE_DIR / "runs"
@@ -351,6 +352,14 @@ def _resolve_run(value: str) -> Path:
     return path if path.is_dir() else RUNS_DIR / value
 
 
+def cmd_selftest(_args) -> int:
+    failures = selftest.run()
+    for failure in failures:
+        print(f"selftest failed: {failure}")
+    print("selftest: " + ("ok" if not failures else f"{len(failures)} failed"))
+    return 1 if failures else 0
+
+
 def cmd_diff(args) -> int:
     run_a, run_b = diffing.load_run(_resolve_run(args.a)), diffing.load_run(_resolve_run(args.b))
     outcome = diffing.compare(run_a, run_b)
@@ -396,6 +405,8 @@ def main() -> int:
     cross.add_argument("--reader", required=True)
     cross.add_argument("--port", type=int, default=h.DEFAULT_PORT)
     cross.set_defaults(fn=cmd_cross)
+
+    sub.add_parser("selftest", help="check offline that the suite tells apart what it must").set_defaults(fn=cmd_selftest)
 
     diff = sub.add_parser("diff", help="compare two finished runs")
     diff.add_argument("a")

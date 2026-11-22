@@ -25,6 +25,12 @@ _HEX32_PARTS = re.compile(r'^"?[0-9a-f]{32}-(\d+)"?$')
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9+/_=-]{40,}")
 _RANDOM_QUERY = ("uploadId", "versionId")
+# Elements of a result document whose value differs from run to run; only their presence is compared.
+_XML_VOLATILE = frozenset({
+    "UploadId", "LastModified", "Initiated", "VersionId", "RequestId", "HostId", "UploadIdMarker",
+    "NextUploadIdMarker", "VersionIdMarker", "NextVersionIdMarker", "ContinuationToken", "NextContinuationToken",
+})
+_ENDPOINT = re.compile(r"^https?://[^/]+")
 # Headers that leak storage internals if they ever reach a client.
 _INTERNAL_PREFIXES = ("x-rustfs-encryption-", "x-rustfs-internal-", "x-minio-internal-")
 _INTERNAL_EXACT = ("x-amz-server-side-encryption-customer-key",)
@@ -90,6 +96,37 @@ def _query_shape(query: str) -> str:
     return "&".join(parts)
 
 
+def _xml_leaves(root: ET.Element) -> list[list[str]]:
+    """Every leaf of a result document as [path, value], in document order.
+
+    Order and repetition are kept, so a listing with a missing, extra or reordered entry differs. Values are kept
+    verbatim except for the elements known to vary between runs.
+    """
+    leaves: list[list[str]] = []
+
+    def walk(element: ET.Element, path: str) -> None:
+        name = element.tag.rpartition("}")[2]
+        here = f"{path}/{name}" if path else name
+        children = list(element)
+        if children:
+            for child in children:
+                walk(child, here)
+            return
+        text = (element.text or "").strip()
+        if name in _XML_VOLATILE:
+            value = "<present>" if text else ""
+        elif name == "ETag":
+            value = _etag_shape(text) or ""
+        elif name == "Location":
+            value = _ENDPOINT.sub("<endpoint>", text)
+        else:
+            value = text
+        leaves.append([here, value])
+
+    walk(root, "")
+    return leaves
+
+
 def _body_shape(status: int, method: str, headers: dict[str, str], body: bytes) -> dict:
     """What the body says, without its random parts."""
     if not body:
@@ -107,7 +144,7 @@ def _body_shape(status: int, method: str, headers: dict[str, str], body: bytes) 
             code = root.findtext("{*}Code") or root.findtext("Code") or ""
             message = root.findtext("{*}Message") or root.findtext("Message") or ""
             return {"kind": "s3-error", "code": code, "message": normalize_message(message)}
-        return {"kind": "xml", "root": tag, "elements": sorted({el.tag.rpartition("}")[2] for el in root.iter()})}
+        return {"kind": "xml", "root": tag, "leaves": _xml_leaves(root)}
     if text_start.startswith((b"{", b"[")):
         try:
             parsed = json.loads(body)

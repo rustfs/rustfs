@@ -54,6 +54,8 @@ uv run --python 3.12 --no-project scripts/test/sse_blackbox/suite.py cross --wri
 
 ## Checking that the suite can fail
 
+`suite.py selftest` needs no server. It checks the suite's own judgment: that an observation changes when a listed part size, count or order changes and does not change with upload ids or timestamps, that a known deviation tolerates only its one documented difference, and that `diff` reports what it must. Run it after changing `observe.py`, `diffing.py` or `framework.py`.
+
 Two switches exist only to prove that a green run means something:
 
 ```bash

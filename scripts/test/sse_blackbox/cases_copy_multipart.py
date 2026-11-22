@@ -92,10 +92,8 @@ def mp_03(c: Ctx) -> None:
     triple, want = h.ssec(KEY_A), h.projection_c(KEY_A)
     create_response, complete_response = _upload(c, bucket, "object", parts, triple, triple, triple)
     for name, response in (("CreateMultipartUpload", create_response), ("CompleteMultipartUpload", complete_response)):
-        got = h.projection(response)
-        c.check(want.items() <= got.items(), f"{name}: SSE headers {got} lack the SSE-C projection {want}")
         # Both multipart responses also carry `x-amz-server-side-encryption: AES256`, which belongs to SSE-S3.
-        c.known_deviation(got == want, f"{name} answers an SSE-C upload with exactly {sorted(want)} (today: {sorted(got)})")
+        c.projection_with_known_extra(response, want, {h.SSE: "AES256"}, name)
     c.read_back(bucket, "object", data, triple, want, "completed object")
     c.refused(h.get(c.site, bucket, "object"), 400, "InvalidRequest", "GET without the customer key")
     c.stored(bucket, "object")

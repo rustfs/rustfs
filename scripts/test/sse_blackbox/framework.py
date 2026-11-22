@@ -153,6 +153,19 @@ class Ctx:
         got = h.projection(headers)
         self.check(got == want, f"{what}: SSE headers {got}, expected exactly {want}")
 
+    def projection_with_known_extra(self, headers: dict[str, str], want: dict[str, str], extra: dict[str, str],
+                                    what: str) -> None:
+        """The SSE headers are exactly `want`; today's product adds exactly `extra`, which is the known deviation.
+
+        Only that one documented difference is tolerated. Any other header set is a failure, so an unrelated
+        regression cannot hide behind the deviation.
+        """
+        got = h.projection(headers)
+        if got == {**want, **extra}:
+            self.known_deviation(False, f"{what}: SSE headers are exactly {want}; today the response also carries {extra}")
+        elif self.check(got == want, f"{what}: SSE headers {got}, expected exactly {want} (known deviation: also {extra})"):
+            self.known_deviation(True, f"{what}: SSE headers are exactly {want}")
+
     def no_sse_headers(self, headers: dict[str, str], what: str) -> None:
         self.projection(headers, {}, what)
 

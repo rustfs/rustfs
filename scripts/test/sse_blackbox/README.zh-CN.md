@@ -54,6 +54,8 @@ uv run --python 3.12 --no-project scripts/test/sse_blackbox/suite.py cross --wri
 
 ## 证明套件会失败
 
+`suite.py selftest` 不需要服务端。它检查套件自己的判断力：列举结果里分段的大小、数量或顺序变了，观测必须跟着变，而上传 ID 与时间戳变了不能跟着变；已知偏差只容忍它登记的那一处差异；`diff` 该报的都会报。改动 `observe.py`、`diffing.py` 或 `framework.py` 之后要跑一遍。
+
 有两个开关只用来证明"全绿"是有意义的：
 
 ```bash
