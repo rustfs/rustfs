@@ -5531,8 +5531,8 @@ mod tests {
             .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
             .expect("test bucket");
         let payload = Bytes::from_static(b"diagnostic PUT context");
-        let input = put_bytes(bucket.clone(), "object.bin", payload.clone());
-        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let slot = crate::app::runtime_sources::ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
@@ -5540,9 +5540,12 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             request.in_scope(|| {
                 runtime.block_on(async {
-                    Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
-                        .await
-                        .expect("S3 PUT must commit");
+                    let gateway = crate::server::TestGateway::over(&context, slot);
+                    let response =
+                        Box::pin(gateway.signed(Method::PUT, &format!("/{bucket}/object.bin"), vec![], payload.clone()))
+                            .await
+                            .expect("signed PUT request");
+                    assert_eq!(response.status(), http::StatusCode::OK, "S3 PUT must commit");
                     assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
                     assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
                 })
