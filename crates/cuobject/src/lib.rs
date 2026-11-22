@@ -668,7 +668,8 @@ impl CuObjectServer {
                     return Err(transfer.submission_failed(error));
                 }
                 let capacity = Arc::clone(&transfer.capacity);
-                let (transfer, status) = retain_until_completion(transfer, capacity, await_completion(&completions)).await?;
+                let (transfer, status) =
+                    retain_until_completion(transfer, capacity, await_completion(&completions, sdk::CompletionFd::drain)).await?;
                 drop(completions);
                 if status < 0 {
                     return Err(CuObjectError::Transfer {
@@ -747,17 +748,21 @@ impl CachedChannel {
         }
         self.completion = None;
         let Some(fd) = self.channel.fd() else { return Ok(None) };
-        // SAFETY: the SDK owns the fd. This exclusive channel keeps it valid
-        // across successful transfers and deregisters it before releasing the ID.
-        #[allow(unsafe_code)]
-        let fd = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|e| CuObjectError::Os {
-            op: "completion fd",
-            source: e.into_parts().1,
-        })?;
+        let fd = register_completion_fd(fd)?;
         let fd = Arc::new(fd);
         self.completion = Some((runtime, Arc::clone(&fd)));
         Ok(Some(fd))
     }
+}
+
+// Both callers own or hold an exclusive lease on a stable, nonblocking descriptor.
+fn register_completion_fd<F: std::os::fd::AsRawFd>(fd: F) -> Result<AsyncFd<F>, CuObjectError> {
+    // SAFETY: the descriptor remains open until the registration is dropped.
+    #[allow(unsafe_code)]
+    unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|e| CuObjectError::Os {
+        op: "completion fd",
+        source: e.into_parts().1,
+    })
 }
 
 struct ChannelPool {
@@ -915,26 +920,35 @@ fn retain_until_completion<T>(
     }
 }
 
-async fn await_completion(fd: &AsyncFd<sdk::CompletionFd>) -> Result<isize, CuObjectError> {
+async fn await_completion<F: std::os::fd::AsRawFd>(
+    fd: &AsyncFd<F>,
+    mut drain: impl FnMut(&F, &mut [sdk::Completion]) -> std::io::Result<usize>,
+) -> Result<isize, CuObjectError> {
     let mut events = [sdk::Completion::default(); 8];
     loop {
         let mut ready = fd.readable().await.map_err(|source| CuObjectError::Os {
             op: "completion wait",
             source,
         })?;
+        let mut status = None;
         loop {
-            let n = fd.get_ref().drain(&mut events).map_err(|source| CuObjectError::Os {
+            let n = drain(fd.get_ref(), &mut events).map_err(|source| CuObjectError::Os {
                 op: "process completions",
                 source,
             })?;
             if let Some(done) = events[..n].iter().find(|e| e.handle == 1) {
-                return Ok(done.status);
+                status = Some(done.status);
             }
             if n < events.len() {
                 break;
             }
         }
+        // The SDK rearms the CQ and a short batch confirms it was drained.
+        // Consume this readiness before the exclusive channel is reused.
         ready.clear_ready();
+        if let Some(status) = status {
+            return Ok(status);
+        }
     }
 }
 
@@ -960,6 +974,42 @@ pub fn fill_chunk(chunk: &mut StagingChunk, data: &Bytes) -> Result<(), CuObject
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_completion_fd_waits_for_a_new_notification() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            use std::io::{Read, Write};
+            use std::os::unix::net::UnixStream;
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let fd = register_completion_fd(reader).unwrap();
+            writer.write_all(&[1]).unwrap();
+            let mut calls = 0;
+            let status = await_completion(&fd, |mut socket, events| {
+                calls += 1;
+                if calls == 1 {
+                    socket.read_exact(&mut [0])?;
+                    events[0] = sdk::Completion { handle: 1, status: 17 };
+                    return Ok(events.len());
+                }
+                Ok(0)
+            })
+            .await
+            .unwrap();
+            assert_eq!((status, calls), (17, 2));
+            let next = await_completion(&fd, |mut socket, events| {
+                calls += 1;
+                socket.read_exact(&mut [0])?;
+                events[0] = sdk::Completion { handle: 1, status: 23 };
+                Ok(1)
+            });
+            tokio::pin!(next);
+            assert!(tokio::time::timeout(Duration::from_millis(10), &mut next).await.is_err());
+            writer.write_all(&[2]).unwrap();
+            assert_eq!(next.await.unwrap(), 23);
+        });
+    }
 
     #[test]
     fn token_parses_dc_routing_and_rejects_malformed_fields() {

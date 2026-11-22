@@ -780,15 +780,6 @@ pub(crate) async fn serve_get_over_rdma(
 
 type StagedRead = JoinHandle<Result<StagingChunk, CuObjectError>>;
 
-/// The staged bytes of `chunk`: with `zero_copy`, a `Bytes` that owns the
-/// chunk (it returns to the pool when the last clone drops), otherwise a copy.
-fn staged_bytes(chunk: StagingChunk, zero_copy: bool) -> io::Result<Bytes> {
-    if zero_copy {
-        return Ok(Bytes::from_owner(chunk));
-    }
-    Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
-}
-
 struct PutReads {
     server: Arc<CuObjectServer>,
     object: String,
@@ -841,14 +832,8 @@ impl PutReads {
 /// buffer (`x-amz-rdma-token`, empty HTTP body). The object length is the
 /// token's buffer length. Returns the body and that length.
 ///
-/// The consumer decides whether it can retain staging chunks using the chosen
-/// server's chunk size. Cacheable or multi-chunk eager bodies need independent bytes.
-pub(crate) fn rdma_put_body(
-    bucket: &str,
-    key: &str,
-    token: &RdmaToken,
-    retain_staging: impl FnOnce(usize) -> bool,
-) -> S3Result<(Body, u64)> {
+/// Each completed frame owns its staging chunk until the consumer releases it.
+pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken) -> S3Result<(Body, u64)> {
     let service = SERVICE
         .get()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma put is not enabled"))?;
@@ -856,7 +841,6 @@ pub(crate) fn rdma_put_body(
     let read_ahead = service.put_read_ahead;
     let total = token.buffer_len;
     let length = usize::try_from(total).map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?;
-    let zero_copy = retain_staging(server.chunk_bytes());
     let mut reads = PutReads {
         server,
         object: format!("{bucket}/{key}"),
@@ -868,7 +852,7 @@ pub(crate) fn rdma_put_body(
     reads.prefetch();
     let stream = futures::stream::try_unfold(reads, move |mut reads| async move {
         let Some(chunk) = reads.next().await? else { return Ok(None) };
-        Ok::<_, io::Error>(Some((staged_bytes(chunk, zero_copy)?, reads)))
+        Ok::<_, io::Error>(Some((Bytes::from_owner(chunk), reads)))
     });
     Ok((super::native_body::from_io_stream_with_length(stream, Some(length)), total))
 }

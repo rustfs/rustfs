@@ -85,7 +85,7 @@ the NIXL client treats a reply without `x-amz-rdma-reply` as declined.
 
 For PUT, read-ahead reserves chunks in object order. A request that may
 populate the object cache, or whose eager reader can retain multiple chunks
-before storage starts, copies the completed frames out of the registered
+before storage starts, copies the retained frames out of the registered
 pool. A single-chunk, non-cacheable PUT can hand its registered frame to
 storage directly.
 
