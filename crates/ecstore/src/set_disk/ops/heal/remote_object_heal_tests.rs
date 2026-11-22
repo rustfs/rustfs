@@ -20,6 +20,15 @@ use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 
 #[tokio::test]
 async fn heal_restores_transitioned_object_missing_from_one_drive() {
+    assert_remote_heal(true).await;
+}
+
+#[tokio::test]
+async fn heal_restores_transitioned_object_without_a_data_directory() {
+    assert_remote_heal(false).await;
+}
+
+async fn assert_remote_heal(keep_data_dir: bool) {
     let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(4, 0, 2).await;
     let bucket = "remote-heal";
     let object = "transitioned";
@@ -46,6 +55,9 @@ async fn heal_restores_transitioned_object_missing_from_one_drive() {
         info.transition_tier = "WARM".to_owned();
         info.transitioned_objname = "remote/transitioned".to_owned();
         let data_dir = info.data_dir.expect("external shard directory");
+        if !keep_data_dir {
+            info.data_dir = None;
+        }
         disk.write_metadata("", bucket, object, info)
             .await
             .expect("publish remote metadata");
@@ -79,6 +91,7 @@ async fn heal_restores_transitioned_object_missing_from_one_drive() {
         .await
         .expect("healed drive publishes metadata");
     assert!(healed.is_remote());
+    assert_eq!(healed.data_dir.is_some_and(|id| !id.is_nil()), keep_data_dir);
     assert_eq!(healed.transitioned_objname, "remote/transitioned");
 
     for dir in &dirs {
