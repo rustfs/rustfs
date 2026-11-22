@@ -588,8 +588,15 @@ impl DefaultMultipartUsecase {
         // Storage has authorized the actual source or committed replay candidate
         // before comparing checksums/parts, recovery publication or replay effects.
         let encryption_metadata = upload_user_defined.as_ref().unwrap_or(obj_info.user_defined.as_ref());
+        let ssec_algorithm = encryption_metadata
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .cloned();
+        // SSE-C metadata also records `x-amz-server-side-encryption: AES256`, but
+        // that header names a managed algorithm; an SSE-C upload answers with its
+        // customer-key headers only.
         let server_side_encryption = encryption_metadata
             .get("x-amz-server-side-encryption")
+            .filter(|_| ssec_algorithm.is_none())
             .map(|s| ServerSideEncryption::custom(s.clone()));
         let ssekms_key_id = match server_side_encryption.as_ref() {
             Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS.as_str() => encryption_metadata
@@ -597,9 +604,6 @@ impl DefaultMultipartUsecase {
                 .cloned(),
             _ => None,
         };
-        let ssec_algorithm = encryption_metadata
-            .get("x-amz-server-side-encryption-customer-algorithm")
-            .cloned();
         let ssec_key_md5 = encryption_metadata
             .get("x-amz-server-side-encryption-customer-key-md5")
             .cloned();
