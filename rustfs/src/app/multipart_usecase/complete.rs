@@ -948,21 +948,72 @@ mod tests {
 
     #[tokio::test]
     async fn execute_complete_multipart_upload_rejects_missing_parts_payload() {
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
+
         let input = CompleteMultipartUploadInput::builder()
             .bucket("bucket".to_string())
             .key("object".to_string())
             .upload_id("upload-id".to_string())
             .build()
             .unwrap();
-        let req = build_request(input, Method::POST);
-
-        let err = Box::pin(make_usecase().complete_for_s3s_request(req)).await.unwrap_err();
+        let mut s3s_input = input;
+        let has_upload = s3s_input.multipart_upload.is_some();
+        s3s_input.multipart_upload.get_or_insert_with(Default::default);
+        let tags: Vec<Option<String>> = s3s_input
+            .multipart_upload
+            .iter_mut()
+            .flat_map(|upload| upload.parts.iter_mut().flatten())
+            .map(|part| {
+                part.part_number.get_or_insert(0);
+                part.e_tag.take().map(|tag| tag.value().to_owned())
+            })
+            .collect();
+        for checksum in [
+            &mut s3s_input.checksum_crc32,
+            &mut s3s_input.checksum_crc32c,
+            &mut s3s_input.checksum_crc64nvme,
+            &mut s3s_input.checksum_md5,
+            &mut s3s_input.checksum_sha1,
+            &mut s3s_input.checksum_sha256,
+            &mut s3s_input.checksum_sha512,
+            &mut s3s_input.checksum_xxhash128,
+            &mut s3s_input.checksum_xxhash3,
+            &mut s3s_input.checksum_xxhash64,
+        ] {
+            *checksum = None;
+        }
+        let err = match complete_multipart_upload::input_from_s3s(s3s_input) {
+            Err(error) => crate::app::dto_values::seam_error(error),
+            Ok(mut owned) => {
+                for (part, tag) in owned.multipart_upload.parts.iter_mut().zip(tags) {
+                    part.e_tag = tag.map(rustfs_gateway_types::ETag::from_stored);
+                }
+                let taken = std::mem::take(&mut owned.multipart_upload);
+                let parts = has_upload.then_some(taken);
+                let result = match parts {
+                    Some(parts) => {
+                        owned.multipart_upload = parts;
+                        Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), owned)).await
+                    }
+                    None => {
+                        Box::pin(make_usecase().execute_complete_multipart_upload_parts(
+                            owned_envelope(Method::POST),
+                            owned,
+                            None,
+                        ))
+                        .await
+                    }
+                };
+                result.unwrap_err()
+            }
+        };
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
     }
 
     #[tokio::test]
     async fn execute_complete_multipart_upload_rejects_missing_parts_list() {
         use crate::app::storage_api::s3::xml::Deserialize as _;
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
 
         let mut deserializer = crate::app::storage_api::s3::xml::Deserializer::new(b"<CompleteMultipartUpload/>");
         let multipart_upload =
@@ -979,11 +1030,57 @@ mod tests {
             .multipart_upload(Some(multipart_upload))
             .build()
             .expect("complete multipart input should build");
-        let req = build_request(input, Method::POST);
-
-        let err = Box::pin(make_usecase().complete_for_s3s_request(req))
-            .await
-            .expect_err("missing parts list must be rejected");
+        let mut s3s_input = input;
+        let has_upload = s3s_input.multipart_upload.is_some();
+        s3s_input.multipart_upload.get_or_insert_with(Default::default);
+        let tags: Vec<Option<String>> = s3s_input
+            .multipart_upload
+            .iter_mut()
+            .flat_map(|upload| upload.parts.iter_mut().flatten())
+            .map(|part| {
+                part.part_number.get_or_insert(0);
+                part.e_tag.take().map(|tag| tag.value().to_owned())
+            })
+            .collect();
+        for checksum in [
+            &mut s3s_input.checksum_crc32,
+            &mut s3s_input.checksum_crc32c,
+            &mut s3s_input.checksum_crc64nvme,
+            &mut s3s_input.checksum_md5,
+            &mut s3s_input.checksum_sha1,
+            &mut s3s_input.checksum_sha256,
+            &mut s3s_input.checksum_sha512,
+            &mut s3s_input.checksum_xxhash128,
+            &mut s3s_input.checksum_xxhash3,
+            &mut s3s_input.checksum_xxhash64,
+        ] {
+            *checksum = None;
+        }
+        let err = match complete_multipart_upload::input_from_s3s(s3s_input) {
+            Err(error) => crate::app::dto_values::seam_error(error),
+            Ok(mut owned) => {
+                for (part, tag) in owned.multipart_upload.parts.iter_mut().zip(tags) {
+                    part.e_tag = tag.map(rustfs_gateway_types::ETag::from_stored);
+                }
+                let taken = std::mem::take(&mut owned.multipart_upload);
+                let parts = has_upload.then_some(taken);
+                let result = match parts {
+                    Some(parts) => {
+                        owned.multipart_upload = parts;
+                        Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), owned)).await
+                    }
+                    None => {
+                        Box::pin(make_usecase().execute_complete_multipart_upload_parts(
+                            owned_envelope(Method::POST),
+                            owned,
+                            None,
+                        ))
+                        .await
+                    }
+                };
+                result.expect_err("missing parts list must be rejected")
+            }
+        };
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1129,10 +1226,9 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("ssec-completion-checksums", || async {
             let (_store, bucket) =
                 crate::app::gating_test_env::durable_quota_test_bucket("ssec-completion-checksums", 16_384).await;
-            let versioning_req = build_request((), Method::PUT);
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
                 .execute_put_bucket_versioning(
-                    RequestEnvelope::from_s3s(&versioning_req),
+                    super::super::test_support::owned_envelope(Method::PUT),
                     &bucket,
                     Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
                         status: Some("Enabled".to_owned()),
@@ -1309,16 +1405,13 @@ mod tests {
 
         let bucket_usecase = crate::app::bucket_usecase::DefaultBucketUsecase::from_global();
         // Listings carry neither the SSE-C key nor a per-object decryption request.
-        let versions_req = build_request(
-            ListObjectVersionsInput {
-                bucket: bucket.to_string(),
-                prefix: Some(key.to_string()),
-                ..Default::default()
-            },
-            Method::GET,
-        );
-        let versions_env = RequestEnvelope::from_s3s(&versions_req);
-        let versions_in = list_object_versions::input_from_s3s(versions_req.input).expect("convert ListObjectVersionsInput");
+        let versions_input = ListObjectVersionsInput {
+            bucket: bucket.to_string(),
+            prefix: Some(key.to_string()),
+            ..Default::default()
+        };
+        let versions_env = super::super::test_support::owned_envelope(Method::GET);
+        let versions_in = list_object_versions::input_from_s3s(versions_input).expect("convert ListObjectVersionsInput");
         let versions = list_object_versions::output_to_s3s(
             bucket_usecase
                 .execute_list_object_versions(versions_env, versions_in)
@@ -1333,16 +1426,13 @@ mod tests {
         assert_eq!(entries[0].e_tag.as_ref(), Some(etag));
         assert_xml_etag(&versions, etag);
 
-        let v1_req = build_request(
-            ListObjectsInput {
-                bucket: bucket.to_string(),
-                prefix: Some(key.to_string()),
-                ..Default::default()
-            },
-            Method::GET,
-        );
-        let v1_env = RequestEnvelope::from_s3s(&v1_req);
-        let v1_in = list_objects::input_from_s3s(v1_req.input).expect("convert ListObjectsInput");
+        let v1_input = ListObjectsInput {
+            bucket: bucket.to_string(),
+            prefix: Some(key.to_string()),
+            ..Default::default()
+        };
+        let v1_env = super::super::test_support::owned_envelope(Method::GET);
+        let v1_in = list_objects::input_from_s3s(v1_input).expect("convert ListObjectsInput");
         let v1 = list_objects::output_to_s3s(
             bucket_usecase
                 .execute_list_objects(v1_env, v1_in)
@@ -1416,7 +1506,6 @@ mod tests {
                 .await
                 .expect("create versioned Object Lock bucket");
             let key = "kms-encrypted";
-            let enc_req = build_request((), Method::PUT);
             let enc_cfg = crate::app::storage_api::s3::dto::ServerSideEncryptionConfiguration {
                 rules: vec![crate::app::storage_api::s3::dto::ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(
@@ -1430,7 +1519,7 @@ mod tests {
             };
             let prepared = crate::storage::persisted_from_s3s(&enc_cfg).map_err(Into::into);
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
-                .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&enc_req), &bucket, prepared)
+                .execute_put_bucket_encryption(super::super::test_support::owned_envelope(Method::PUT), &bucket, prepared)
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();
@@ -2156,6 +2245,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_complete_multipart_upload_allows_duplicate_part_numbers_by_using_last_occurrence() {
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
+
         let multipart_upload = CompletedMultipartUpload {
             parts: Some(vec![
                 CompletedPart {
@@ -2175,9 +2266,60 @@ mod tests {
             .multipart_upload(Some(multipart_upload))
             .build()
             .unwrap();
-        let req = build_request(input, Method::POST);
-
-        let err = Box::pin(make_usecase().complete_for_s3s_request(req)).await.unwrap_err();
+        let mut s3s_input = input;
+        let has_upload = s3s_input.multipart_upload.is_some();
+        s3s_input.multipart_upload.get_or_insert_with(Default::default);
+        let tags: Vec<Option<String>> = s3s_input
+            .multipart_upload
+            .iter_mut()
+            .flat_map(|upload| upload.parts.iter_mut().flatten())
+            .map(|part| {
+                part.part_number.get_or_insert(0);
+                part.e_tag.take().map(|tag| tag.value().to_owned())
+            })
+            .collect();
+        for checksum in [
+            &mut s3s_input.checksum_crc32,
+            &mut s3s_input.checksum_crc32c,
+            &mut s3s_input.checksum_crc64nvme,
+            &mut s3s_input.checksum_md5,
+            &mut s3s_input.checksum_sha1,
+            &mut s3s_input.checksum_sha256,
+            &mut s3s_input.checksum_sha512,
+            &mut s3s_input.checksum_xxhash128,
+            &mut s3s_input.checksum_xxhash3,
+            &mut s3s_input.checksum_xxhash64,
+        ] {
+            *checksum = None;
+        }
+        let err = match complete_multipart_upload::input_from_s3s(s3s_input) {
+            Err(error) => crate::app::dto_values::seam_error(error),
+            Ok(mut owned) => {
+                for (part, tag) in owned.multipart_upload.parts.iter_mut().zip(tags) {
+                    part.e_tag = tag.map(rustfs_gateway_types::ETag::from_stored);
+                }
+                let taken = std::mem::take(&mut owned.multipart_upload);
+                let parts = has_upload.then_some(taken);
+                let result = match parts {
+                    Some(parts) => {
+                        owned.multipart_upload = parts;
+                        Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), owned)).await
+                    }
+                    None => {
+                        Box::pin(make_usecase().execute_complete_multipart_upload_parts(
+                            owned_envelope(Method::POST),
+                            owned,
+                            None,
+                        ))
+                        .await
+                    }
+                };
+                match result {
+                    Err(error) => error,
+                    Ok(_output) => panic!("duplicate part numbers must not succeed before the order check"),
+                }
+            }
+        };
         assert_ne!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 

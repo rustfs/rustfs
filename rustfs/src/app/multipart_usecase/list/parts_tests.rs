@@ -14,7 +14,7 @@
 
 //! ListParts execution against real multipart metadata and the native claim exchange.
 
-use super::super::test_support::{Method, build_request};
+use super::super::test_support::{Method, build_request, owned_envelope};
 use super::*;
 use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore_and_disk_paths};
 use crate::app::storage_api::multipart_usecase::access::{AuthorizationRequest, load_bucket_generation_from_store};
@@ -81,7 +81,7 @@ fn list_parts_resolves_real_owners_and_retains_storage_errors() {
         let key = "fixture/one";
         let foreign_key = "fixture/two";
         let opts = ObjectOptions::default();
-        let envelope = || RequestEnvelope::from_s3s(&build_request((), Method::GET));
+        let envelope = || owned_envelope(Method::GET);
         for name in [&bucket, &foreign_bucket] {
             store
                 .make_bucket(name, &MakeBucketOptions::default())
