@@ -941,6 +941,32 @@ mod tests {
         let (envelope, input) = crate::app::object_usecase::CopyObjectWriteInput::from_test_request(req);
         usecase.execute_copy_object_owned(envelope, input).await.map_err(Into::into)
     }
+
+    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
+    fn method_only_copy_envelope() -> crate::app::RequestEnvelope {
+        crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        )
+    }
+
+    async fn copy_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: CopyObjectInput,
+    ) -> crate::app::storage_api::s3::S3Result<crate::app::object_usecase::CopyObjectWriteOutput> {
+        let input = crate::app::object_usecase::CopyObjectWriteInput::from_legacy(input);
+        usecase
+            .execute_copy_object_owned(method_only_copy_envelope(), input)
+            .await
+            .map_err(Into::into)
+    }
     use crate::app::storage_api::s3::S3ErrorCode;
     use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderValue, Method};
@@ -1068,10 +1094,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1087,7 +1112,7 @@ mod tests {
             .key(".rustfs-table/metadata/current.json".to_string())
             .build()
             .unwrap();
-        let error = copy_owned(&DefaultObjectUsecase::without_context(), build_request(input, Method::PUT))
+        let error = copy_method_only(&DefaultObjectUsecase::without_context(), input)
             .await
             .expect_err("reserved catalog destination must fail closed without bucket metadata");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
@@ -1108,10 +1133,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -1129,10 +1153,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         // Self-copy with explicit storage class change must pass the self-copy guard.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
@@ -1257,10 +1280,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         // Tiered self-copy with STANDARD storage class must pass all validation checks.
         // The call fails at store init (no store in unit tests), not at validation.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -1282,10 +1304,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         // Must not be rejected by the self-copy guard; it fails later at store init instead.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
@@ -1461,7 +1482,7 @@ mod tests {
             .key(destination.to_string())
             .build()
             .expect("directory copy input should build");
-        let response = copy_owned(&DefaultObjectUsecase::with_context(Some(context)), build_request(input, Method::PUT))
+        let response = copy_method_only(&DefaultObjectUsecase::with_context(Some(context)), input)
             .await
             .expect("copying to a directory marker should succeed");
 
@@ -1497,10 +1518,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1518,10 +1538,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -1640,7 +1659,7 @@ mod tests {
             .expect("copy input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(copy_owned(&usecase, build_request(input, Method::PUT)))
+        let err = Box::pin(copy_method_only(&usecase, input))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the copy");
 
