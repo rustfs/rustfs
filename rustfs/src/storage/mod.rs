@@ -52,8 +52,6 @@ mod sse_test;
 pub(crate) mod storage_api;
 
 pub(crate) use s3_support::*;
-#[cfg(test)]
-pub(crate) use storage_api::persisted_from_s3s;
 #[allow(unused_imports)]
 pub(crate) use storage_api::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,

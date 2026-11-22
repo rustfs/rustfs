@@ -15,8 +15,8 @@
 //! Regression tests for the HeadObject response facts and their HTTP and legacy projections.
 //! The existing completion probe exposes the AuditEntry before asynchronous delivery.
 
-use super::tests::head_input;
 use super::*;
+use crate::app::test_seams::{head_envelope, head_object_input};
 use http::Method;
 
 #[test]
@@ -253,16 +253,22 @@ fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEta
                         .expect("store the exact ETag fixture");
                     let stored = store.get_object_info(bucket, &key, &ObjectOptions::default()).await.unwrap();
                     assert_eq!(stored.etag.as_deref(), Some(row.stored), "fixture must reach HEAD unchanged");
-                    let mut request = head_input(bucket, &key, None);
-                    request.extensions.insert(ReqInfo {
+                    let mut envelope = head_envelope(http::HeaderMap::new(), http::Extensions::new());
+                    envelope.install_req_info(ReqInfo {
                         bucket: Some(bucket.to_owned()),
                         object: Some(key.clone()),
                         ..Default::default()
                     });
-                    let internal = crate::app::test_seams::head_object(&usecase, request)
+                    let input = head_object_input(bucket, &key, None);
+                    let internal = crate::app::test_seams::head_object_gateway(&usecase, envelope, input)
                         .await
-                        .expect("unencoded legacy response");
-                    let typed = internal.output.e_tag.expect("internal caller retains the ETag");
+                        .expect("unencoded HEAD response");
+                    let typed = internal
+                        .output
+                        .into_s3s()
+                        .expect("legacy response projection")
+                        .e_tag
+                        .expect("internal caller retains the ETag");
                     assert_eq!(typed.value(), row.opaque, "{}", row.stored);
                     assert_eq!(typed.as_weak().is_some(), row.weak, "{}", row.stored);
                     expected_audits.push((Some("s3:HeadObject".to_owned()), Some("success".to_owned()), Some(200)));

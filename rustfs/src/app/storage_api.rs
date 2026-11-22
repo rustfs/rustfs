@@ -66,9 +66,9 @@ pub(crate) mod s3 {
         ObjectLockRetention,
     };
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
+    pub(crate) use s3s::dto::{GetObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput};
+    pub(crate) use s3s::dto::{GetObjectOutput, PutObjectInput};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
     pub(crate) use s3s::header;

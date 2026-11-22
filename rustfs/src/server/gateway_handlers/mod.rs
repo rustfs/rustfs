@@ -31,6 +31,8 @@ mod envelope;
 mod error;
 
 mod bucket_access;
+#[cfg(test)]
+pub(crate) use bucket_access::prepare_notification_configuration;
 mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;

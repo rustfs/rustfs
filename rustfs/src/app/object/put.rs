@@ -2619,9 +2619,11 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput, ObjectLockRetentionMode};
+    use crate::app::storage_api::s3::dto::{GetObjectInput, ObjectLockRetentionMode};
+    use crate::app::test_seams::{head_envelope, head_object_input};
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
+    use rustfs_gateway_types::SseCustomerKey;
     use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
 
     /// PutObject through the owned entry point the gateway handler calls, its error in the s3s
@@ -4909,22 +4911,22 @@ mod tests {
                 "x-amz-server-side-encryption-customer-key-md5",
                 HeaderValue::from_str(&key_md5).expect("customer key MD5 is a valid header"),
             );
-            let head_input = HeadObjectInput::builder()
-                .bucket(bucket.clone())
-                .key("ledger.csv".to_string())
-                .sse_customer_algorithm(Some("AES256".to_string()))
-                .sse_customer_key(Some(encoded_key.clone()))
-                .sse_customer_key_md5(Some(key_md5.clone()))
-                .build()
-                .expect("SSE-C HEAD input must build");
-            let mut head_request = build_request(head_input, Method::HEAD);
-            head_request.headers = read_headers.clone();
-            let head = Box::pin(crate::app::test_seams::head_object(&usecase, head_request))
-                .await
-                .expect("matching SSE-C key must authorize HEAD");
-            assert_eq!(head.output.server_side_encryption, None);
-            assert_eq!(head.output.sse_customer_algorithm.as_deref(), Some("AES256"));
-            assert_eq!(head.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            let head_input = rustfs_gateway_types::dto::HeadObjectInput {
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(SseCustomerKey::new(encoded_key.clone())),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..head_object_input(&bucket, "ledger.csv", None)
+            };
+            let head = Box::pin(crate::app::test_seams::head_object_gateway(
+                &usecase,
+                head_envelope(read_headers.clone(), http::Extensions::new()),
+                head_input,
+            ))
+            .await
+            .expect("matching SSE-C key must authorize HEAD");
+            assert_eq!(head.output.dto.server_side_encryption, None);
+            assert_eq!(head.output.dto.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(head.output.dto.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
 
             let get_input = GetObjectInput::builder()
                 .bucket(bucket.clone())
