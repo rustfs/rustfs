@@ -1320,23 +1320,22 @@ mod tests {
                         };
                         for (index, expected_key) in ["a&local", "z-local"].into_iter().enumerate() {
                             let request_marker = input.marker.clone().unwrap_or_default();
-                            let list_req = S3Request {
-                                input: input.clone(),
-                                method: http::Method::GET,
-                                uri: http::Uri::from_static("/"),
-                                headers: HeaderMap::new(),
-                                extensions: http::Extensions::new(),
-                                credentials: None,
-                                region: None,
-                                service: None,
-                                trailing_headers: None,
-                            };
-                            let envelope = crate::app::RequestEnvelope::from_s3s(&list_req);
                             let gateway_input =
                                 rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects::input_from_s3s(
-                                    list_req.input,
+                                    input.clone(),
                                 )
                                 .expect("convert ListObjectsInput");
+                            let envelope = crate::app::RequestEnvelope::from_parts(
+                                crate::app::RequestHead {
+                                    method: http::Method::GET,
+                                    uri: http::Uri::from_static("/"),
+                                    headers: HeaderMap::new(),
+                                    credentials: None,
+                                    region: None,
+                                    service: None,
+                                },
+                                http::Extensions::new(),
+                            );
                             let gateway_output = tokio::time::timeout(
                                 Duration::from_secs(10),
                                 DefaultBucketUsecase::from_global().execute_list_objects(envelope, gateway_input),

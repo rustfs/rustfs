@@ -170,6 +170,8 @@ pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::SCANNER_PUBLICATION_LEASE_TTL_MS as ECSTORE_SCANNER_PUBLICATION_LEASE_TTL_MS;
 #[cfg(test)]
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks as ecstore_init_local_disks;
+#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, ScannerDataMovementPauseStatus as EcstoreScannerDataMovementPauseStatus,
@@ -410,9 +412,9 @@ pub(crate) mod scan {
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO, StorageAdminApi};
     pub use super::storage_contracts::{
-        SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
-        SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
-        SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
+        SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION,
+        SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES, SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+        SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE, SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
     };
     #[cfg(test)]
     pub(crate) use super::{
@@ -460,6 +462,9 @@ pub(crate) trait ScannerStorage:
     + storage_contracts::NamespaceLocking<Error = EcstoreErrorType, NamespaceLock = NamespaceLockWrapper>
 {
     fn scanner_topology_digest(&self) -> [u8; 32];
+    fn scanner_local_node_name(&self) -> Option<String> {
+        None
+    }
     fn scanner_namespace_mutation_generation(&self) -> u64;
     async fn scanner_data_movement_activity(&self) -> (bool, bool, u64);
     async fn scanner_data_usage_publication_blocked(&self) -> bool;
@@ -510,6 +515,15 @@ impl ScannerStorage for EcstoreStore {
 
     fn scanner_topology_digest(&self) -> [u8; 32] {
         crate::scanner::scanner_topology_digest(self)
+    }
+
+    fn scanner_local_node_name(&self) -> Option<String> {
+        self.endpoints()
+            .0
+            .iter()
+            .flat_map(|pool| pool.endpoints.as_ref().iter())
+            .find(|endpoint| endpoint.is_local)
+            .map(|endpoint| endpoint.grid_host())
     }
 
     fn scanner_namespace_mutation_generation(&self) -> u64 {

@@ -86,7 +86,7 @@ fn corrupt_legacy_frame_cannot_emit_bytes_when_writer_is_dropped() {
 
 #[test]
 fn seekable_offsets_past_eof_keep_vec_length_within_capacity() {
-    use zstd::zstd_safe::seekable::{Seekable, SeekableCStream};
+    use zstd_safe::seekable::{Seekable, SeekableCStream};
 
     let source = b"seekable frame fixture with enough data for several independent frames";
     let mut encoded = [0; 1024];
