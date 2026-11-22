@@ -868,6 +868,7 @@ pub struct FolderScanner {
     raw_enumeration_progress: Vec<RawEnumerationProgress>,
     directory_checkpoints: HashMap<String, HashMap<String, directory_cursor::Saved>>,
     size_ledger_index: SizeLedgerIndex,
+    unobserved_size_scopes: HashSet<String>,
     pending_size_reconciliation_keys: HashSet<String>,
     pending_size_reconciliation_scopes: HashSet<String>,
     pending_size_reconciliation_truncated: bool,
@@ -1311,6 +1312,7 @@ impl FolderScanner {
 
         for scope in &summary.reconciliation_scopes {
             let scope = size_reconciliation_scope_key(&scope.bucket, &scope.object);
+            self.unobserved_size_scopes.remove(&scope);
             if self.size_ledger_index.by_scope.contains_key(&scope) {
                 self.pending_size_reconciliation_scopes.insert(scope);
             }
@@ -4018,6 +4020,7 @@ pub(crate) async fn scan_data_folder_scoped(
         raw_enumeration_progress: Vec::new(),
         directory_checkpoints,
         size_ledger_index: SizeLedgerIndex::default(),
+        unobserved_size_scopes: HashSet::new(),
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -4033,6 +4036,9 @@ pub(crate) async fn scan_data_folder_scoped(
 
     let now = FolderScanner::now_secs();
     scanner.size_ledger_index = SizeLedgerIndex::from_persisted(&mut scanner.new_cache.info.size_reconciliation, now);
+    scanner
+        .unobserved_size_scopes
+        .extend(scanner.size_ledger_index.by_scope.keys().cloned());
 
     // Check if context is cancelled
     if ctx.is_cancelled() && scanner.local_stop.as_ref().is_none_or(|stop| stop.reason().is_none()) {
@@ -4056,6 +4062,9 @@ pub(crate) async fn scan_data_folder_scoped(
         crate::workload_admission::with_scanner_physical_disk(physical, scanner.scan_folder(ctx.clone(), folder, &mut root)).await
     }
     .await;
+    if outcome.is_ok() && !scanner.coverage_gap && scanner.prefix_scan_scope.is_none() {
+        scanner.retire_confirmed_absent_sizes(&ctx, checkpoint_endpoints).await;
+    }
     // A source failure is a retry of the physical walk, never a failed object.
     // Reuse the interrupted-drive checkpoint path, including its EOF and identity fences.
     if matches!(&outcome, Err(ScannerError::SourceUnavailable(_)))

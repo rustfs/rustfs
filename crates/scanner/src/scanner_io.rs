@@ -1837,9 +1837,9 @@ pub enum ScannerDiskScanOutcome {
 }
 
 /// A published checkpoint belongs to configured endpoint slots, even while their
-/// handles are unavailable. A walk without checkpoint identity needs no membership set.
+/// handles are unavailable. Size-debt retirement also requires the complete configured membership.
 pub(crate) fn scanner_checkpoint_endpoints(set: &SetDisks, cache: &DataUsageCache) -> Option<HashSet<String>> {
-    (cache.info.scan_identity.is_some() && cache.info.scan_progress.is_some())
+    (cache.info.scan_identity.is_some() && (cache.info.scan_progress.is_some() || !cache.info.size_reconciliation.is_empty()))
         .then(|| set.set_endpoints.iter().map(ToString::to_string).collect())
 }
 

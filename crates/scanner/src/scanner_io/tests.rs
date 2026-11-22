@@ -1086,6 +1086,167 @@ pub(crate) async fn wait_for_namespace_commit_tails(store: &ECStore) {
     .expect("namespace commit tails should drain before the scanner fixture runs");
 }
 
+fn add_unknown_size_debt(cache: &mut DataUsageCache, bucket: &str, object: &str) -> String {
+    let key = format!("{}:{bucket}|{}:{object}|0:|0:|21:invalid_declared_size", bucket.len(), object.len());
+    cache.info.size_reconciliation.insert(
+        key.clone(),
+        crate::data_usage_define::SizeReconciliationEntry {
+            key: key.clone(),
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            reason: "invalid_declared_size".to_owned(),
+            physical_size: Some(4096),
+            ..Default::default()
+        },
+    );
+    key
+}
+
+#[tokio::test]
+#[serial]
+async fn deleted_size_debt_uses_single_drive_owner_without_a_peer_inventory() {
+    let (_temp, store) = setup_local_scanner_store(1, 1).await;
+    let bucket = "single-drive-debt";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    let set = &store.pools[0].disk_set[0];
+    let mut cache = DataUsageCache::default();
+    cache.info.name = bucket.to_owned();
+    cache.info.source = Some(DataUsageCacheSource::new(0, 0));
+    cache.info.scan_identity = scanner_bucket_checkpoint_identity(set, bucket, 0, 7, HealScanMode::Normal)
+        .await
+        .expect("lookup identity");
+    add_unknown_size_debt(&mut cache, bucket, "removed");
+    let configured = scanner_checkpoint_endpoints(set, &cache).expect("configured single drive");
+    let disk = set.disks.read().await[0].as_ref().unwrap().clone();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let verified = crate::scanner_folder::scan_data_folder_scoped(
+        ctx,
+        budget,
+        Vec::new(),
+        disk,
+        cache,
+        None,
+        HealScanMode::Normal,
+        crate::sleeper::DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest),
+        None,
+        Some(&configured),
+        None,
+        None,
+    )
+    .await
+    .expect("single owner confirms absence");
+    assert!(verified.info.snapshot_complete);
+    assert!(verified.info.size_reconciliation.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn deleted_size_debt_requires_absence_on_every_configured_drive() {
+    use crate::storage_api::owner::EcstoreDiskAPI;
+    use crate::storage_api::owner::ObjectOperations as _;
+
+    let (temp, store) = setup_local_scanner_store(1, 4).await;
+    let bucket = "debt-retirement";
+    let object = "removed";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    let set = &store.pools[0].disk_set[0];
+    let mut reader = ScannerPutObjReader::from_vec(vec![1; 4096]);
+    set.put_object(bucket, object, &mut reader, &ScannerObjectOptions::default())
+        .await
+        .expect("write object");
+    wait_for_namespace_commit_tails(&store).await;
+    let path = temp
+        .path()
+        .join("pool0-disk3")
+        .join(bucket)
+        .join(object)
+        .join(crate::STORAGE_FORMAT_FILE);
+    let metadata = std::fs::read(&path).expect("last drive has committed metadata");
+    set.delete_object(bucket, object, ScannerObjectOptions::default())
+        .await
+        .expect("delete object");
+    wait_for_namespace_commit_tails(&store).await;
+    std::fs::create_dir_all(path.parent().unwrap()).expect("recreate lagging shard directory");
+    std::fs::write(&path, metadata).expect("restore one real shard's metadata");
+    let mut input = DataUsageCache::default();
+    input.info.name = bucket.to_owned();
+    input.info.source = Some(DataUsageCacheSource::new(0, 0));
+    input.info.scan_identity = scanner_bucket_checkpoint_identity(set, bucket, 0, 7, HealScanMode::Normal)
+        .await
+        .expect("lookup identity");
+    assert!(input.info.scan_identity.is_some());
+    let key = add_unknown_size_debt(&mut input, bucket, object);
+    let configured = scanner_checkpoint_endpoints(set, &input).expect("complete configured membership");
+    let disks: Vec<_> = set.disks.read().await.iter().flatten().cloned().collect();
+    assert_eq!(configured.len(), 4);
+    assert!(
+        disks
+            .iter()
+            .all(|disk| EcstoreDiskAPI::get_disk_location(disk.as_ref()).valid())
+    );
+    let scan = |cache: DataUsageCache, slots: usize| {
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, Default::default());
+        crate::scanner_folder::scan_data_folder_scoped(
+            ctx,
+            budget,
+            disks[..slots].to_vec(),
+            disks[0].clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            crate::sleeper::DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest),
+            None,
+            Some(&configured),
+            None,
+            None,
+        )
+    };
+    let Err(crate::ScannerError::PartialCache(partial)) = scan(input, 4).await else {
+        panic!("a remaining shard must retain its debt")
+    };
+    assert!(partial.info.size_reconciliation.contains_key(&key));
+    std::fs::remove_file(&path).expect("all copies are now deleted");
+    let reloaded = DataUsageCache::unmarshal(&partial.marshal_msg().expect("persist debt")).expect("restart");
+    let Err(crate::ScannerError::PartialCache(partial)) = scan(reloaded, 3).await else {
+        panic!("three handles cannot speak for four configured drives")
+    };
+    assert!(partial.info.size_reconciliation.contains_key(&key));
+    let mut unfenced = partial.as_ref().clone();
+    unfenced.info.scan_identity = None;
+    assert!(matches!(scan(unfenced, 4).await, Err(crate::ScannerError::PartialCache(_))));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&path, &path).expect("create inaccessible metadata on last drive");
+        let mut mixed = partial.as_ref().clone();
+        let absent_key = add_unknown_size_debt(&mut mixed, bucket, "independently-absent");
+        let Err(crate::ScannerError::PartialCache(checked)) = scan(mixed, 4).await else {
+            panic!("a read error leaves the affected object unresolved");
+        };
+        assert!(checked.info.size_reconciliation.contains_key(&key));
+        assert!(!checked.info.size_reconciliation.contains_key(&absent_key));
+        std::fs::remove_file(&path).expect("remove fixture symlink");
+    }
+    let mut hashed = partial.as_ref().clone();
+    let mut record = hashed.info.size_reconciliation.remove(&key).unwrap();
+    record.key = format!("{}:{bucket}|hash:513:{}|0:|0:|21:invalid_declared_size", bucket.len(), "a".repeat(64));
+    record.object = format!("sha256:{}", "a".repeat(64));
+    hashed.info.size_reconciliation.insert(record.key.clone(), record);
+    assert!(matches!(scan(hashed, 4).await, Err(crate::ScannerError::PartialCache(_))));
+    let verified = scan(*partial, 4).await.expect("all four formatted drives confirm absence");
+    assert!(verified.info.snapshot_complete);
+    assert!(verified.info.size_reconciliation.is_empty());
+    let root = verified.checked_flatten(bucket).expect("verified empty bucket");
+    assert_eq!((root.objects, root.size), (0, 0));
+}
+
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_bucket_identity_uses_its_set_instance_owner() {
