@@ -1822,13 +1822,16 @@ mod tests {
             .expect_err("create multipart upload with If-None-Match: * on existing key must fail");
         assert_eq!(create_err.code(), &crate::app::storage_api::s3::S3ErrorCode::PreconditionFailed);
 
-        let second_upload_id = usecase
-            .execute_create_multipart_upload_from_s3s(build_request(create_input, Method::POST))
+        let second_created = usecase
+            .execute_create_multipart_upload(
+                owned_envelope(Method::POST),
+                super::super::CreateMultipartUploadFields::from_legacy(create_input),
+                None,
+            )
             .await
-            .expect("unconditional create multipart upload should succeed")
-            .output
-            .upload_id
-            .expect("second create response should contain upload id");
+            .expect("unconditional create multipart upload should succeed");
+        let second_upload_id = second_created.upload_id;
+        assert!(!second_upload_id.is_empty(), "second create response should contain upload id");
         let mut second_reader = PutObjReader::from_vec(b"replacement multipart body".to_vec());
         let second_part = store
             .put_object_part(&bucket, object, &second_upload_id, 1, &mut second_reader, &ObjectOptions::default())
