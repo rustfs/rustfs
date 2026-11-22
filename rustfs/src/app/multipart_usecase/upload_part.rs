@@ -402,7 +402,8 @@ impl DefaultMultipartUsecase {
                 }
             };
             write_plan = write_plan.with_encryption(ssec_write);
-            (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
+            // An SSE-C part answers with its customer-key headers only.
+            (None, None)
         } else if let Some(server_side_encryption) = server_side_encryption {
             // Reuse the stored envelope after authorizing this caller against its
             // pinned destination key above.

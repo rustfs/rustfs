@@ -436,7 +436,9 @@ impl DefaultMultipartUsecase {
             bucket,
             key,
             upload_id,
-            server_side_encryption: effective_sse,
+            // `x-amz-server-side-encryption` names a managed algorithm; an SSE-C
+            // upload answers with its customer-key headers only.
+            server_side_encryption: effective_sse.filter(|_| sse_customer_algorithm.is_none()),
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id: effective_kms_key_id,
