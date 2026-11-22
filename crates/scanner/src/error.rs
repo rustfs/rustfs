@@ -65,6 +65,10 @@ pub enum ScannerError {
     #[error("scanner directory changed during traversal")]
     DirectoryChanged,
 
+    /// A cross-disk recheck could not establish whether a previously observed child still exists.
+    #[error("scanner could not verify a previously observed subtree")]
+    AbandonedChildUnverified,
+
     /// Partial data usage cache produced before the scanner stopped.
     #[error("Scanner stopped with partial data usage cache")]
     PartialCache(Box<DataUsageCache>),

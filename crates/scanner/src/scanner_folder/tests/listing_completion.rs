@@ -6,16 +6,32 @@ use super::*;
 #[test]
 #[serial]
 fn abandoned_listing_drains_candidate_buffered_before_finished() {
-    isolated_listing_fixture("abandoned_listing_drains_candidate_buffered_before_finished", false);
+    isolated_listing_fixture(
+        "abandoned_listing_drains_candidate_buffered_before_finished",
+        run_abandoned_listing_overflow_case(false),
+    );
 }
 
 #[test]
 #[serial]
 fn abandoned_listing_admits_versions_beyond_first_1024_across_frames() {
-    isolated_listing_fixture("abandoned_listing_admits_versions_beyond_first_1024_across_frames", true);
+    isolated_listing_fixture(
+        "abandoned_listing_admits_versions_beyond_first_1024_across_frames",
+        run_abandoned_listing_overflow_case(true),
+    );
 }
 
-fn isolated_listing_fixture(name: &str, multiple_frames: bool) {
+#[cfg(unix)]
+#[test]
+#[serial]
+fn abandoned_child_quorum_failure_retains_counts_until_verified_deletion() {
+    isolated_listing_fixture(
+        "abandoned_child_quorum_failure_retains_counts_until_verified_deletion",
+        run_abandoned_child_quorum_loss(),
+    );
+}
+
+fn isolated_listing_fixture(name: &str, run: impl std::future::Future<Output = ()>) {
     use std::io::{Read, Seek, SeekFrom};
     use std::process::{Command, Stdio};
 
@@ -27,7 +43,7 @@ fn isolated_listing_fixture(name: &str, multiple_frames: bool) {
             .enable_all()
             .build()
             .expect("fixture runtime")
-            .block_on(run_abandoned_listing_overflow_case(multiple_frames));
+            .block_on(run);
         println!("{MARKER}");
         return;
     }
@@ -260,4 +276,94 @@ async fn run_abandoned_listing_overflow_case(multiple_frames: bool) {
     for (path, metadata) in original_metadata {
         assert_eq!(tokio::fs::read(path).await.expect("retained metadata"), metadata);
     }
+}
+
+#[cfg(unix)]
+async fn run_abandoned_child_quorum_loss() {
+    crate::storage_api::ecstore_bootstrap_ctx()
+        .update_erasure_type(crate::storage_api::EcstoreSetupType::Erasure)
+        .await;
+    assert!(crate::scanner_is_erasure().await);
+    let temp = tempfile::tempdir().expect("four local disk roots");
+    let mut disks = Vec::new();
+    let mut faulty_paths = Vec::new();
+    for index in 0..4 {
+        let root = temp.path().join(format!("disk-{index}"));
+        let bucket = root.join("bucket");
+        std::fs::create_dir_all(&bucket).expect("create bucket on every disk");
+        if index != 0 {
+            let path = bucket.join("old");
+            symlink("old", &path).expect("inject path resolution failure on sibling");
+            faulty_paths.push(path);
+        }
+        let mut endpoint = Endpoint::try_from(root.to_str().expect("local path")).expect("disk endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(index);
+        disks.push(
+            new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("local disk"),
+        );
+    }
+    let (_commands, mut rx) = rustfs_heal_contracts::heal_channel::init_heal_channels().expect("isolated heal channel");
+    let responder = tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            let _ = command
+                .response_tx
+                .send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
+                    result: HealAdmissionResult::Accepted,
+                    task_id: command.request.id,
+                }));
+        }
+    });
+    let mut input = DataUsageCache::default();
+    input.info.name = "bucket".to_owned();
+    input.info.snapshot_complete = true;
+    input.replace(
+        "bucket/old",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            size: 4096,
+            ..Default::default()
+        },
+    );
+    let scan = |cache: DataUsageCache| {
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, Default::default());
+        scan_data_folder(
+            ctx,
+            budget,
+            disks.clone(),
+            disks[0].clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest),
+        )
+    };
+    let Err(ScannerError::PartialCache(partial)) = scan(input).await else {
+        panic!("unavailable quorum must return uncertified inventory")
+    };
+    assert!(!partial.info.snapshot_complete);
+    let cache = DataUsageCache::unmarshal(&partial.marshal_msg().expect("persist retry")).expect("reload retry");
+    let retained = cache.checked_flatten("bucket").expect("retained parent and child");
+    assert_eq!((retained.objects, retained.size), (1, 4096));
+    assert!(cache.find("bucket/old").is_some());
+    for path in faulty_paths {
+        std::fs::remove_file(path).expect("restore readable missing prefix");
+    }
+    let verified = scan(cache).await.expect("all drives confirm removal");
+    assert!(verified.info.snapshot_complete);
+    let totals = verified.checked_flatten("bucket").expect("verified empty bucket");
+    assert_eq!((totals.objects, totals.size), (0, 0));
+    assert!(verified.find("bucket/old").is_none());
+    responder.abort();
 }

@@ -5719,7 +5719,10 @@ async fn check_replication_maintenance_refreshes_compacted_stats(same_cycle: boo
         .await
         .expect("load complete bucket cache");
     assert!(cache.info.snapshot_complete);
-    assert!(cache.info.replication.is_some(), "the first scan must persist its live replication policy");
+    assert!(
+        cache.info.replication.is_some(),
+        "the first scan must persist its live replication policy"
+    );
     // A complete compacted prefix is eligible for normal usage sampling.
     let mut compacted = cache.checked_flatten(bucket).expect("complete cached usage");
     compacted.children.clear();

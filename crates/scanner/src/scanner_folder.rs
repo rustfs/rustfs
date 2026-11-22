@@ -3215,7 +3215,7 @@ impl FolderScanner {
                             outcome
                         }
                         Err(e) => {
-                            if matches!(&e, ScannerError::DirectoryChanged) {
+                            if matches!(&e, ScannerError::DirectoryChanged | ScannerError::AbandonedChildUnverified) {
                                 return Err(e);
                             }
                             if ctx.is_cancelled()
@@ -3388,13 +3388,14 @@ impl FolderScanner {
                 #[cfg(test)]
                 let list_path_raw_options_observer = self.list_path_raw_options_observer.clone();
 
-                tokio::spawn(async move {
+                let listing = tokio::spawn(async move {
                     let options = ListPathRawOptions {
                         disks,
                         bucket: bucket_clone.clone(),
                         path: prefix_clone.clone(),
                         recursive: true,
-                        report_not_found: true,
+                        // Each absent copy contributes an empty stream to this union.
+                        report_not_found: false,
                         min_disks: disks_quorum,
                         agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                             let entry_name = entry.name.clone();
@@ -3458,13 +3459,13 @@ impl FolderScanner {
                             options.walkdir_stall_timeout,
                         ));
                     }
-                    if let Err(e) = crate::storage_api::ecstore_with_background_disk_io(
+                    let result = crate::storage_api::ecstore_with_background_disk_io(
                         child_ctx_clone.clone(),
                         list_path_raw(child_ctx_clone.clone(), options),
                     )
-                    .await
-                    {
-                        if is_missing_path_disk_error(&e) {
+                    .await;
+                    if let Err(e) = &result {
+                        if is_missing_path_disk_error(e) {
                             debug!(
                                 target: "rustfs::scanner::folder",
                                 event = EVENT_SCANNER_FOLDER_STATE,
@@ -3490,6 +3491,7 @@ impl FolderScanner {
                             );
                         }
                     }
+                    result
                 });
 
                 let mut found_objects = false;
@@ -3691,6 +3693,18 @@ impl FolderScanner {
                     }
                 }
 
+                if ctx.is_cancelled() {
+                    return Err(ScannerError::Other("Operation cancelled".to_owned()));
+                }
+                if child_ctx.is_cancelled() {
+                    return Err(ScannerError::AbandonedChildUnverified);
+                }
+                match listing.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if is_missing_path_disk_error(&error) => {}
+                    _ => return Err(ScannerError::AbandonedChildUnverified),
+                }
+
                 if found_objects {
                     let folder_item = CachedFolder {
                         name: name.clone(),
@@ -3720,7 +3734,7 @@ impl FolderScanner {
                             )
                             .await
                         {
-                            if matches!(&e, ScannerError::DirectoryChanged) {
+                            if matches!(&e, ScannerError::DirectoryChanged | ScannerError::AbandonedChildUnverified) {
                                 return Err(e);
                             }
                             if ctx.is_cancelled()
@@ -3741,7 +3755,7 @@ impl FolderScanner {
                                 error = %e,
                                 "Scanner heal child folder scan failed"
                             );
-                            continue;
+                            return Err(ScannerError::AbandonedChildUnverified);
                         }
                         tokio::task::yield_now().await;
 
@@ -4070,7 +4084,9 @@ pub(crate) async fn scan_data_folder_scoped(
     // A changed directory invalidates the speculative traversal, not the disk.
     // Keep the input tree as an uncertified value. The incomplete-sweep path
     // discards every cursor and parks no work from the raced generation.
-    let outcome = if matches!(outcome, Err(ScannerError::DirectoryChanged)) {
+    // Preserve the cached child links needed to repeat an inconclusive cross-disk listing.
+    let retry_abandoned_child = matches!(outcome, Err(ScannerError::AbandonedChildUnverified));
+    let outcome = if retry_abandoned_child || matches!(outcome, Err(ScannerError::DirectoryChanged)) {
         scanner.coverage_gap = true;
         scanner.new_cache.cache = std::mem::take(&mut scanner.old_cache.cache);
         scanner.new_cache.info.scan_bucket_observations.clear();
@@ -4087,7 +4103,9 @@ pub(crate) async fn scan_data_folder_scoped(
             let coverage_gap = scanner.coverage_gap;
             scanner.reconcile_failed_objects_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
-            new_cache.force_compact(force_compact_limit_for_sweep(false));
+            if !retry_abandoned_child {
+                new_cache.force_compact(force_compact_limit_for_sweep(false));
+            }
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap

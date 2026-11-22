@@ -158,9 +158,11 @@ pub(crate) use rustfs_ecstore::api::rpc::{
     ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket, ScannerPublicationLease as EcstoreScannerPublicationLease,
 };
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
-#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::set_object_store_resolver as ecstore_set_object_store_resolver;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::runtime::{
+    InstanceContext as EcstoreInstanceContext, bootstrap_ctx as ecstore_bootstrap_ctx,
+};
 pub(crate) use rustfs_ecstore::api::runtime::{
     expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
     object_store_handle as ecstore_resolve_object_store_handle, setup_is_erasure as ecstore_is_erasure,
