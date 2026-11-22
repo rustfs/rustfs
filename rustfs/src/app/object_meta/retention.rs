@@ -150,7 +150,7 @@ impl ObjectMetaUsecase {
 
         // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_metadata_replication(object_info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(object_info.clone(), store.clone(), dsc, opts.expected_bucket_incarnation_id).await;
         }
 
         let output = PutObjectRetentionOutput {
@@ -265,22 +265,27 @@ mod tests {
         ] {
             let retention = stored_retention(&stored(value)).expect("representable retention instant");
             assert_eq!(retention.mode.as_ref().expect("mode").as_str(), "COMPLIANCE");
+            // The response codec writes RetainUntilDate as ISO 8601.
+            let serialized = retention
+                .retain_until_date
+                .expect("stored retention date")
+                .render(rustfs_gateway_types::TimestampFormat::Iso8601)
+                .expect("serialize the response timestamp");
+            let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
+            let stored_at = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
+            assert_eq!(returned.unix_timestamp(), stored_at.unix_timestamp(), "stored date {value}");
             let output = get_object_retention::output_to_s3s(GetObjectRetentionOutput {
                 retention: Some(retention),
             })
             .expect("convert the response");
-            let mut serialized = Vec::new();
-            output
-                .retention
-                .expect("retention")
-                .retain_until_date
-                .expect("stored retention date")
-                .format(s3s::dto::TimestampFormat::DateTime, &mut serialized)
-                .expect("serialize the response timestamp");
-            let serialized = String::from_utf8(serialized).expect("UTF-8 timestamp");
-            let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
-            let stored = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
-            assert_eq!(returned.unix_timestamp(), stored.unix_timestamp(), "stored date {value}");
+            let seam = OffsetDateTime::from(
+                output
+                    .retention
+                    .expect("retention")
+                    .retain_until_date
+                    .expect("stored retention date"),
+            );
+            assert_eq!(seam.unix_timestamp(), stored_at.unix_timestamp(), "stored date {value}");
         }
     }
 

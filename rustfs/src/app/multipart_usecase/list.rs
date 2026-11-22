@@ -295,7 +295,7 @@ mod tests {
 
     async fn list_uploads(input: gateway_dto::ListMultipartUploadsInput) -> rustfs_s3_types::S3Error {
         make_usecase()
-            .execute_list_multipart_uploads(RequestEnvelope::from_s3s(&build_request((), Method::GET)), input)
+            .execute_list_multipart_uploads(owned_envelope(Method::GET), input)
             .await
             .expect_err("refused")
     }
@@ -393,7 +393,7 @@ mod tests {
             max_parts,
         };
         make_usecase()
-            .execute_list_parts(RequestEnvelope::from_s3s(&build_request((), Method::GET)), fields)
+            .execute_list_parts(owned_envelope(Method::GET), fields)
             .await
             .expect_err("refused")
     }

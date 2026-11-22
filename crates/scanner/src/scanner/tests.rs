@@ -567,6 +567,72 @@ async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_a_budget_deadline_before_the_first_worker_poll() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    budget.wait_for_stop().await;
+    advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+    let worker = std::future::poll_fn(|_| panic!("expired drain must win before polling the worker"));
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, worker, std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("dropped attempt");
+    assert_eq!(
+        (attempt.epoch, attempt.cycle, attempt.result, attempt.partial_reason),
+        (9, 40, "partial", Some("runtime"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_lock_loss_cancellation_and_cooperative_completion() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, std::future::pending(), std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics.scanner_node_observation().await.last_attempt.expect("lost lock");
+    assert_eq!(attempt.result, "lock_lost");
+    assert!(attempt.duration >= SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    ctx.cancel();
+    let wait = await_observed_scanner_cycle(&metrics, 9, 41, &ctx, &budget, std::future::pending(), std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Cancelled);
+    assert_eq!(
+        metrics
+            .scanner_node_observation()
+            .await
+            .last_attempt
+            .expect("cancelled attempt")
+            .result,
+        "cancelled"
+    );
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let worker = std::future::ready(ScannerCycleOutcome::Completed);
+    let wait = await_observed_scanner_cycle(&metrics, 9, 42, &ctx, &budget, worker, std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("cooperative result");
+    assert_eq!((attempt.cycle, attempt.result), (42, "success"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn cycle_budget_fences_late_writer_after_timeout() {
     let cycle_ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new(
@@ -899,7 +965,7 @@ async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
         .await
         .expect("initial cache revisions");
     checkpoint
-        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0, CancellationToken::new())
         .await
         .expect("publish the current checkpoint into the fenced store");
     let cache_path = rustfs_utils::path::path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name]);
@@ -1632,6 +1698,94 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
     ));
     assert!(!global_metrics().report().await.current_cycle_active);
 
+    global_metrics().set_cycle(None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn single_drive_cycle_persists_usage_and_advances_with_healing_marker() {
+    use crate::scanner_io::{clear_dirty_usage_buckets_for_tests, tests::wait_for_namespace_commit_tails};
+    use crate::storage_api::scan::{HEALING_MARKER_PATH, MakeBucketOptions};
+
+    clear_dirty_usage_buckets_for_tests();
+    let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
+    let store = setup_scanner_cycle_store_at_path_with_layout(temp_dir.path(), true, 1, 1, 1).await;
+    let bucket = "marked-drive-bucket";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("fixture bucket should be created");
+    let mut reader = PutObjReader::from_vec(vec![7; 16]);
+    store
+        .put_object(bucket, "object", &mut reader, &ObjectOptions::default())
+        .await
+        .expect("fixture object should persist");
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+
+    let marker = temp_dir
+        .path()
+        .join("pool0/disk0")
+        .join(RUSTFS_META_BUCKET)
+        .join(HEALING_MARKER_PATH);
+    let marker_contents = b"leftover marker";
+    tokio::fs::write(&marker, marker_contents)
+        .await
+        .expect("fixture healing marker should persist");
+    let set = &store.pools[0].disk_set[0];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !set.get_online_disks_with_healing(true).await.1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("disk info should observe the marker after its cache expires");
+
+    let ctx = CancellationToken::new();
+    let mut cycle_info = CurrentCycle {
+        next: 1,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    let leader_epoch = 11;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, leader_epoch),
+    )
+    .await
+    .expect("scanner cycle should finish");
+    assert!(
+        matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ),
+        "unexpected cycle outcome: {outcome:?}",
+    );
+
+    let mut set_snapshot = DataUsageCache::default();
+    set_snapshot
+        .load_with_revisions(Arc::clone(set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("set usage snapshot should be readable");
+    assert!(set_snapshot.info.snapshot_complete);
+    assert_eq!(set_snapshot.info.next_cycle, 1);
+
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("global usage snapshot should be durable");
+    let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("global usage snapshot should decode");
+    assert!(usage.usage_snapshot_complete);
+    assert!(usage.last_update.is_some());
+    assert_eq!(usage.buckets_usage[bucket].objects_count, 1);
+
+    let persisted_cycle = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("scanner cycle cursor should be durable");
+    let (persisted_cycle, persisted_epoch) =
+        decode_scanner_cycle_state(&persisted_cycle).expect("scanner cycle cursor should decode");
+    assert_eq!(persisted_epoch, leader_epoch);
+    assert_eq!(persisted_cycle.next, 2);
+    assert_eq!(tokio::fs::read(marker).await.expect("healing marker should remain"), marker_contents);
+    clear_dirty_usage_buckets_for_tests();
     global_metrics().set_cycle(None).await;
 }
 
@@ -8947,7 +9101,7 @@ fn clean_idle_backoff_grows_to_cap() {
 }
 
 #[test]
-fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
+fn retry_backoff_grows_caps_and_resets_after_convergence() {
     let mut backoff = ScannerRetryBackoff::default();
     assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
 
@@ -8971,7 +9125,7 @@ fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
 }
 
 #[test]
-fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
+fn retry_backoff_respects_a_faster_configured_cycle() {
     let mut backoff = ScannerRetryBackoff::default();
     backoff.record_retryable_cycle(true);
 
@@ -8983,7 +9137,7 @@ fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
 }
 
 #[test]
-fn superseded_retry_backoff_grows_from_the_default_cycle() {
+fn retry_backoff_grows_from_the_default_cycle() {
     let mut backoff = ScannerRetryBackoff::default();
     // The first race after a write burst retries in seconds, not a whole
     // cycle, while repeated supersedes still climb toward the cap.
@@ -9003,7 +9157,7 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ..Default::default()
     };
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &default_config, ScannerMaintenanceFeatures::default()),
+        scanner_superseded_retry_interval(backoff, &default_config),
         Some(SCANNER_RETRY_BASE_INTERVAL),
         "the default adaptive cadence must retain fast convergence"
     );
@@ -9013,24 +9167,24 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ScannerRuntimeConfigSource::Config,
         ScannerRuntimeConfigSource::ScannerCompatConfig,
     ] {
-        let runtime_config = ScannerRuntimeConfig {
-            cycle_interval: Duration::from_secs(6 * 60 * 60),
-            cycle_interval_source: source,
-            ..Default::default()
-        };
-
-        for features in [
-            ScannerMaintenanceFeatures::default(),
-            ScannerMaintenanceFeatures {
-                lifecycle: true,
+        for cycle_secs in [1, 3, 600, 6 * 60 * 60] {
+            let runtime_config = ScannerRuntimeConfig {
+                cycle_interval: Duration::from_secs(cycle_secs),
+                cycle_interval_source: source,
                 ..Default::default()
-            },
-        ] {
-            assert_eq!(
-                scanner_superseded_retry_interval(backoff, &runtime_config, features),
-                Some(runtime_config.cycle_interval),
-                "{source:?} cycle cadence must not be shortened by convergence retries"
-            );
+            };
+            let mut backoff = ScannerRetryBackoff::default();
+            assert_eq!(scanner_superseded_retry_interval(backoff, &runtime_config), None);
+            for _ in 0..40 {
+                backoff.record_retryable_cycle(true);
+                assert_eq!(
+                    scanner_superseded_retry_interval(backoff, &runtime_config),
+                    Some(runtime_config.cycle_interval),
+                    "{source:?} cycle cadence must hold throughout convergence retries"
+                );
+            }
+            backoff.record_retryable_cycle(false);
+            assert_eq!(scanner_superseded_retry_interval(backoff, &runtime_config), None);
         }
     }
 }
@@ -9051,7 +9205,7 @@ fn superseded_retry_does_not_delay_required_maintenance() {
     for consecutive_cycles in 1..=12 {
         backoff.record_retryable_cycle(true);
         assert_eq!(
-            scanner_superseded_retry_interval(backoff, &config, features),
+            scanner_superseded_retry_interval(backoff, &config),
             Some(config.cycle_interval),
             "superseded cycle {consecutive_cycles} must preserve regular maintenance"
         );
@@ -9137,19 +9291,50 @@ fn scope_fallback_retry_preserves_explicit_and_fast_cycle_cadence() {
 }
 
 #[test]
-fn superseded_retry_only_caps_regular_maintenance() {
+fn superseded_retry_caps_at_the_default_cycle_and_resets_after_convergence() {
     let config = ScannerRuntimeConfig {
         cycle_interval: Duration::from_secs(60),
         ..Default::default()
     };
     let mut backoff = ScannerRetryBackoff::default();
-    for _ in 0..6 {
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), None);
+    for expected in [5, 10, 20, 40, 60, 60, 60, 60] {
+        backoff.record_retryable_cycle(true);
+        assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(Duration::from_secs(expected)));
+    }
+    backoff.consecutive_cycles = u32::MAX;
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(config.cycle_interval));
+    backoff.record_retryable_cycle(true);
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(config.cycle_interval));
+    backoff.record_retryable_cycle(false);
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), None);
+}
+
+#[test]
+fn superseded_retry_caps_fast_cycles_without_changing_the_generic_retry_cap() {
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..40 {
         backoff.record_retryable_cycle(true);
     }
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &config, ScannerMaintenanceFeatures::default()),
-        Some(Duration::from_secs(160)),
+        backoff.retry_interval(Duration::from_secs(60)),
+        Some(Duration::from_secs(30 * 60)),
+        "deferred and transient retries must retain the generic cap"
     );
+    for cycle_secs in [0, 1, 3, 60, 6 * 60 * 60] {
+        let config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(cycle_secs),
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_superseded_retry_interval(backoff, &config),
+            Some(Duration::from_secs(cycle_secs.max(1))),
+        );
+    }
+}
+
+#[test]
+fn superseded_retry_timer_keeps_required_maintenance_full_scans() {
     for features in [
         ScannerMaintenanceFeatures {
             lifecycle: true,
@@ -9164,28 +9349,23 @@ fn superseded_retry_only_caps_regular_maintenance() {
             ..Default::default()
         },
     ] {
-        assert_eq!(scanner_superseded_retry_interval(backoff, &config, features), Some(config.cycle_interval));
-        assert_eq!(scanner_superseded_retry_interval(ScannerRetryBackoff::default(), &config, features), None);
+        assert!(features.requires_full_scan(Some(7), 7, ScannerCycleWakeReason::Timer, true));
     }
 }
 
 #[tokio::test(start_paused = true)]
 #[serial]
-async fn superseded_maintenance_wait_keeps_convergence_fencing() {
+async fn superseded_retry_wait_keeps_convergence_fencing_at_the_default_cycle() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let config = ScannerRuntimeConfig {
         cycle_interval: Duration::from_secs(60),
-        ..Default::default()
-    };
-    let features = ScannerMaintenanceFeatures {
-        lifecycle: true,
         ..Default::default()
     };
     let mut backoff = ScannerRetryBackoff::default();
     for _ in 0..12 {
         backoff.record_retryable_cycle(true);
     }
-    let interval = scanner_superseded_retry_interval(backoff, &config, features);
+    let interval = scanner_superseded_retry_interval(backoff, &config);
     assert_eq!(interval, Some(config.cycle_interval));
     let generations = ScannerCycleObservedGenerations::for_wait(
         &config,
@@ -9200,19 +9380,28 @@ async fn superseded_maintenance_wait_keeps_convergence_fencing() {
     let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
     let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
     let started = tokio::time::Instant::now();
-    let reason = wait_for_next_scanner_cycle_with_activity(
+    let mut wait = Box::pin(wait_for_next_scanner_cycle_with_activity(
         &ctx,
-        interval.expect("maintenance must retain its convergence interval"),
+        interval.expect("superseded retry must retain its convergence interval"),
         Some(Duration::from_secs(1)),
         &mut seen,
         generations,
         || false,
         || std::future::ready(Ok(changed.clone())),
-    )
-    .await;
+    ));
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    crate::scanner_io::record_dirty_usage_bucket("photos");
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    }
+    let reason = wait.await;
     assert_eq!(reason, ScannerCycleWakeReason::Timer);
     assert_eq!(started.elapsed(), config.cycle_interval);
     assert_eq!(seen, Some(changed));
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }
 
 #[test]
@@ -10357,6 +10546,7 @@ async fn recovery_wake_interrupts_normal_cycle_wait() {
 
 fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_generation: u64) -> ScannerNodeActivity {
     ScannerNodeActivity {
+        checkpoint_instance_id: None,
         instance_id: epoch.to_string(),
         namespace_generation,
         maintenance_generation,
@@ -10377,7 +10567,10 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
     let remote = after.get_mut("remote").expect("remote activity should exist");
     remote.dirty_usage_generation += 1;
     remote.dirty_usage_pending = true;
-    assert_eq!(scanner_activity_structural_digest(&before), scanner_activity_structural_digest(&after));
+    assert_eq!(
+        scanner_activity_structural_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&after, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
     let old_plan = crate::scanner_io::checkpoint_fixture_bucket_digest(
         DataUsageScanPlanDigest(scanner_activity_snapshot_digest(&before)),
         None,
@@ -10419,6 +10612,7 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
                 tier_registry_generation: None,
                 checkpoint_identity: None,
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         ),
         crate::scanner_io::DataUsageCacheScanState::Prepared {
@@ -10608,6 +10802,14 @@ fn scanner_activity_snapshot_fences_data_movement() {
     assert!(scanner_activity_allows_usage_publication(&idle));
     assert!(!scanner_activity_allows_usage_publication(&moving));
     assert_ne!(scanner_activity_snapshot_digest(&idle), scanner_activity_snapshot_digest(&moving));
+    let mut v7 = idle;
+    v7.get_mut("node-2").expect("node").protocol_version = crate::SCANNER_ACTIVITY_V7_PROTOCOL_VERSION;
+    assert!(
+        scanner_activity_allows_usage_publication(&v7),
+        "v7 still authenticates terminal movement state"
+    );
+    v7.get_mut("node-2").expect("node").protocol_version = crate::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
+    assert!(!scanner_activity_allows_usage_publication(&v7));
 }
 
 #[test]
@@ -10636,8 +10838,8 @@ fn scanner_activity_structural_digest_ignores_regular_bucket_writes() {
 
     assert_ne!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&written));
     assert_eq!(
-        scanner_activity_structural_digest(&baseline),
-        scanner_activity_structural_digest(&written),
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&written, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
         "bucket writes are refreshed through the dirty-bucket scope rather than invalidating every cache"
     );
 }
@@ -10659,18 +10861,24 @@ fn scanner_activity_structural_digest_fences_restart_and_maintenance_but_not_pub
     // maintenance rule needs a maintenance pass, so both invalidate every
     // reusable result (the baseline and the set caches).
     assert_ne!(
-        scanner_activity_structural_digest(&baseline),
-        scanner_activity_structural_digest(&restarted)
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&restarted, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
     );
     assert_ne!(
-        scanner_activity_structural_digest(&baseline),
-        scanner_activity_structural_digest(&maintained)
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&maintained, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
     );
     // A publication pause describes nothing about the heap: it vetoes the
     // cycle it moves in and is part of no identity.
-    assert_eq!(scanner_activity_structural_digest(&baseline), scanner_activity_structural_digest(&paused));
+    assert_eq!(
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&paused, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
     assert_eq!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&paused));
-    assert_eq!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&paused));
+    assert_eq!(
+        scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_coverage_digest(&paused, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
     assert_eq!(
         scanner_activity_guardrail_veto(&baseline, &paused).map(|veto| veto.field),
         Some("publication_blocked")
@@ -10699,8 +10907,8 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
             let mut changed = baseline.clone();
             mutate(changed.get_mut(host).expect("host should be present"));
             assert_eq!(
-                scanner_activity_coverage_digest(&baseline),
-                scanner_activity_coverage_digest(&changed),
+                scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_coverage_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} on {host} must not change the coverage identity"
             );
             assert_eq!(
@@ -10719,8 +10927,8 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
         let mut changed = baseline.clone();
         mutate(changed.get_mut(LOCAL_SCANNER_ACTIVITY_NODE).expect("local activity"));
         assert_eq!(
-            scanner_activity_coverage_digest(&baseline),
-            scanner_activity_coverage_digest(&changed),
+            scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+            scanner_activity_coverage_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
             "local {field} is certified per bucket through the bucket's own dirty generation"
         );
         // A peer's generations stay in: its dirty buckets are acknowledged
@@ -10729,8 +10937,8 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
         let mut peer_changed = baseline.clone();
         mutate(peer_changed.get_mut("node-2").expect("peer activity"));
         assert_ne!(
-            scanner_activity_coverage_digest(&baseline),
-            scanner_activity_coverage_digest(&peer_changed),
+            scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+            scanner_activity_coverage_digest(&peer_changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
             "remote {field} must change the coverage identity"
         );
     }
@@ -10745,20 +10953,63 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
             let mut changed = baseline.clone();
             mutate(changed.get_mut(host).expect("host should be present"));
             assert_ne!(
-                scanner_activity_coverage_digest(&baseline),
-                scanner_activity_coverage_digest(&changed),
+                scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_coverage_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} on {host} must change the coverage identity"
             );
             assert_ne!(
-                scanner_activity_structural_digest(&baseline),
-                scanner_activity_structural_digest(&changed),
+                scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_structural_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} on {host} must change the reuse identity"
             );
         }
     }
     let mut peer_lost = baseline.clone();
     peer_lost.remove("node-2");
-    assert_ne!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&peer_lost));
+    assert_ne!(
+        scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_coverage_digest(&peer_lost, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
+}
+
+#[test]
+fn scanner_checkpoint_coverage_survives_clean_leader_rotation() {
+    let first = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("leader-a", 0, 0)),
+        ("node-b".to_string(), scanner_node_activity("peer-b", 0, 0)),
+        ("node-c".to_string(), scanner_node_activity("peer-c", 0, 0)),
+    ]);
+    let second = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("leader-b", 0, 0)),
+        ("node-a".to_string(), scanner_node_activity("peer-a", 0, 0)),
+        ("node-c".to_string(), scanner_node_activity("peer-c", 0, 0)),
+    ]);
+    assert_eq!(
+        scanner_activity_coverage_digest(&first, "node-a"),
+        scanner_activity_coverage_digest(&second, "node-b"),
+        "a quiet namespace must retain checkpoint coverage when a different node becomes leader"
+    );
+    assert_ne!(
+        scanner_activity_structural_digest(&first, "node-a"),
+        scanner_activity_structural_digest(&second, "node-b"),
+        "restarted processes must invalidate completed results even with reset mutation counters"
+    );
+    let mut rotated = first.clone();
+    let previous_leader = rotated.remove(LOCAL_SCANNER_ACTIVITY_NODE).expect("previous leader");
+    let next_leader = rotated.remove("node-b").expect("next leader");
+    rotated.insert("node-a".to_string(), previous_leader);
+    rotated.insert(LOCAL_SCANNER_ACTIVITY_NODE.to_string(), next_leader);
+    assert_eq!(
+        scanner_activity_structural_digest(&first, "node-a"),
+        scanner_activity_structural_digest(&rotated, "node-b"),
+        "a leadership change alone must retain completed coverage"
+    );
+    rotated.get_mut("node-a").expect("previous leader").namespace_generation += 1;
+    assert_ne!(
+        scanner_activity_coverage_digest(&first, "node-a"),
+        scanner_activity_coverage_digest(&rotated, "node-b"),
+        "a write on the previous coordinator must invalidate its completed coverage"
+    );
 }
 
 #[test]
@@ -10790,10 +11041,18 @@ fn bucket_checkpoint_plan_survives_a_coordinator_restart() {
     // restarted coordinator requests, or every resumed sweep restarts as
     // mixed coverage and the bucket can never certify (rustfs/rustfs#8494).
     // The reuse plan does change: finished results are walked again.
-    let coverage_plan =
-        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_coverage_digest(snapshot));
-    let reuse_plan =
-        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_structural_digest(snapshot));
+    let coverage_plan = |snapshot| {
+        crate::scanner_io::scanner_bucket_plan_digest(
+            &buckets,
+            scanner_activity_coverage_digest(snapshot, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        )
+    };
+    let reuse_plan = |snapshot| {
+        crate::scanner_io::scanner_bucket_plan_digest(
+            &buckets,
+            scanner_activity_structural_digest(snapshot, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        )
+    };
     assert_eq!(coverage_plan(&before), coverage_plan(&restarted));
     assert_ne!(reuse_plan(&before), reuse_plan(&restarted));
 
@@ -10801,7 +11060,10 @@ fn bucket_checkpoint_plan_survives_a_coordinator_restart() {
     extra_bucket.push(bucket_info("gamma"));
     assert_ne!(
         coverage_plan(&before),
-        crate::scanner_io::scanner_bucket_plan_digest(&extra_bucket, scanner_activity_coverage_digest(&before)),
+        crate::scanner_io::scanner_bucket_plan_digest(
+            &extra_bucket,
+            scanner_activity_coverage_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+        ),
         "the bucket list stays part of the plan"
     );
 }
@@ -10997,8 +11259,8 @@ fn generation_movement_shades_buckets_without_a_guardrail_veto() {
             assert_eq!(scanner_activity_guardrail_veto(&before, &after), None, "{field} on {host} must not veto");
             assert!(SCANNER_ACTIVITY_SHADE_FIELDS.contains(field));
             assert_eq!(
-                scanner_activity_structural_digest(&before),
-                scanner_activity_structural_digest(&after),
+                scanner_activity_structural_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_structural_digest(&after, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} must stay outside the structural digest"
             );
         }

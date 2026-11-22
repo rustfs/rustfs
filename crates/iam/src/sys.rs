@@ -593,7 +593,7 @@ impl<T: Store> IamSys<T> {
 
     pub async fn info_policy(&self, name: &str) -> Result<rustfs_madmin::PolicyInfo> {
         let d = self.store.get_policy_doc(name).await?;
-        let pdata = serde_json::to_value(&d.policy)?;
+        let pdata = d.policy.to_export_value()?;
 
         Ok(rustfs_madmin::PolicyInfo {
             policy_name: name.to_string(),
@@ -1421,11 +1421,11 @@ impl<T: Store> IamSys<T> {
         access_key: &str,
         secret_key: &str,
     ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
-        self.rotate_user_secret_key_checked(access_key, secret_key, None).await
+        self.rotate_user_secret_key_checked(access_key, secret_key, None, None).await
     }
 
-    /// Change an enabled regular caller's secret only if its signing secret is
-    /// still current under the parent mutation lock. Status and policies are kept.
+    /// Change an enabled regular user's secret only if the supplied current
+    /// secret still matches under the parent mutation lock. Status and policies are kept.
     /// Persistence and revocation continue after caller cancellation.
     pub async fn change_own_secret_key(
         &self,
@@ -1433,7 +1433,27 @@ impl<T: Store> IamSys<T> {
         expected_secret: &str,
         secret_key: &str,
     ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
-        self.rotate_user_secret_key_checked(access_key, secret_key, Some(expected_secret))
+        self.rotate_user_secret_key_checked(access_key, secret_key, Some(expected_secret), None)
+            .await
+    }
+
+    /// Change a local IAM password using an authenticated STS session and its parent password.
+    ///
+    /// The parent and session mutation locks protect revalidation through the secret write.
+    /// Persistence and session revocation continue after request cancellation.
+    /// A revocation failure is returned after the new secret has been persisted.
+    ///
+    /// # Errors
+    /// Returns `IAMActionNotAllowed` for inactive sessions, parent mismatches, or an
+    /// incorrect current password. Storage and revocation errors are propagated.
+    pub async fn change_own_secret_key_from_session(
+        &self,
+        access_key: &str,
+        expected_secret: &str,
+        secret_key: &str,
+        session: &Credentials,
+    ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
+        self.rotate_user_secret_key_checked(access_key, secret_key, Some(expected_secret), Some(session))
             .await
     }
 
@@ -1442,16 +1462,18 @@ impl<T: Store> IamSys<T> {
         access_key: &str,
         secret_key: &str,
         expected_secret: Option<&str>,
+        session: Option<&Credentials>,
     ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
         let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
         let iam = self.clone();
         let access_key = access_key.to_string();
         let secret_key = secret_key.to_string();
         let expected_secret = expected_secret.map(str::to_string);
+        let session = session.cloned();
         #[cfg(test)]
         let notification_probe = crate::LOAD_USER_NOTIFICATION_PROBE.try_with(Arc::clone).ok();
         let operation = async move {
-            iam.rotate_user_secret_key_inner(&access_key, &secret_key, expected_secret.as_deref())
+            iam.rotate_user_secret_key_inner(&access_key, &secret_key, expected_secret.as_deref(), session.as_ref())
                 .await
         };
         #[cfg(test)]
@@ -1471,6 +1493,7 @@ impl<T: Store> IamSys<T> {
         access_key: &str,
         secret_key: &str,
         expected_secret: Option<&str>,
+        session: Option<&Credentials>,
     ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength);
@@ -1482,7 +1505,7 @@ impl<T: Store> IamSys<T> {
 
         let (updated_at, status, parent_guard) = self
             .store
-            .update_user_secret_key_with_guard(access_key, secret_key, expected_secret)
+            .update_user_secret_key_with_guard(access_key, secret_key, expected_secret, session)
             .await?;
         let revoked = self.revoke_sts_sessions_for_parent(access_key).await?;
         drop(parent_guard);
@@ -4813,6 +4836,160 @@ mod tests {
             .await
             .expect("upgrade parent generation atomically");
         assert!(matches!(issuer.check_key(&legacy.access_key).await, Ok((None, false))));
+    }
+
+    #[tokio::test]
+    async fn own_secret_change_revalidates_the_presenting_session_under_the_parent_lock() {
+        ensure_test_global_credentials();
+        for mutation in ["revoke", "expire", "disable", "parent", "secret", "token", "generation"] {
+            let store = StsTestMockStore::new(false);
+            let iam = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM")));
+            let parent = "session-change-parent";
+            let password = "currentParentSecret123";
+            iam.create_user(
+                parent,
+                &AddOrUpdateUserReq {
+                    secret_key: password.to_string(),
+                    policy: None,
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create parent");
+            let session = rotation_test_session(parent, "password-session");
+            let owner = iam.get_user(parent).await.expect("parent").credentials;
+            iam.set_temp_user_from_parent(&session, &owner)
+                .await
+                .expect("publish session");
+
+            let guard = iam.store.cache.parent_mutation_lock(parent).lock_owned().await;
+            let pending = {
+                let iam = Arc::clone(&iam);
+                let session = session.clone();
+                tokio::spawn(async move {
+                    iam.change_own_secret_key_from_session(parent, password, "replacementParentSecret123", &session)
+                        .await
+                })
+            };
+            if mutation == "revoke" {
+                iam.delete_temp_account(&session.access_key, false)
+                    .await
+                    .expect("revoke presenting session");
+            } else {
+                let mut saved = store.saved_sts_users.lock().expect("saved identities");
+                let current = saved.get_mut(&session.access_key).expect("durable session");
+                match mutation {
+                    "expire" => current.credentials.expiration = Some(OffsetDateTime::UNIX_EPOCH),
+                    "disable" => current.credentials.status = "off".to_string(),
+                    "parent" => current.credentials.parent_user = "another-parent".to_string(),
+                    "secret" => current.credentials.secret_key = "replacementSessionSecret123".to_string(),
+                    "token" => current.credentials.session_token = "replacement-token".to_string(),
+                    "generation" => {
+                        assert!(current.sts_generation.take().is_some());
+                    }
+                    _ => unreachable!("known fixture mutation"),
+                }
+            }
+            drop(guard);
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+                .await
+                .expect("queued rotation finishes")
+                .expect("rotation task")
+                .expect_err("stale session must fail");
+            assert_eq!(error, Error::IAMActionNotAllowed, "{mutation}");
+            let saved = store.saved_sts_users.lock().expect("saved identities");
+            assert_eq!(saved.get(parent).expect("parent survives").credentials.secret_key, password, "{mutation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_secret_change_uses_the_durable_parent_password_with_a_stale_cache() {
+        let iam = test_iam_sys().await;
+        let parent = "stale-password-parent";
+        iam.create_user(
+            parent,
+            &AddOrUpdateUserReq {
+                secret_key: "cachedParentSecret123".to_string(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent");
+        let session = rotation_test_session(parent, "fresh-password-session");
+        let owner = iam.get_user(parent).await.expect("cached parent").credentials;
+        iam.set_temp_user_from_parent(&session, &owner)
+            .await
+            .expect("publish session");
+        iam.store
+            .api
+            .saved_sts_users
+            .lock()
+            .expect("saved identities")
+            .get_mut(parent)
+            .expect("durable parent")
+            .credentials
+            .secret_key = "durableParentSecret123".to_string();
+        assert_eq!(
+            iam.store
+                .get_user(parent)
+                .await
+                .expect("stale cached parent")
+                .credentials
+                .secret_key,
+            "cachedParentSecret123"
+        );
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+        crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(
+                probe,
+                iam.change_own_secret_key_from_session(parent, "durableParentSecret123", "replacementParentSecret123", &session),
+            )
+            .await
+            .expect("durable current password authorizes the change");
+        assert_eq!(
+            iam.get_user(parent).await.expect("updated parent").credentials.secret_key,
+            "replacementParentSecret123"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_session_can_change_its_parent_secret_and_revoke_itself() {
+        let iam = test_iam_sys().await;
+        let parent = "current-session-parent";
+        let password = "currentParentSecret123";
+        iam.create_user(
+            parent,
+            &AddOrUpdateUserReq {
+                secret_key: password.to_string(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent");
+        let session = rotation_test_session(parent, "current-password-session");
+        let owner = iam.get_user(parent).await.expect("parent").credentials;
+        iam.set_temp_user_from_parent(&session, &owner)
+            .await
+            .expect("publish session");
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+        let (_, _, revoked) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::LOAD_USER_NOTIFICATION_PROBE.scope(
+                probe,
+                iam.change_own_secret_key_from_session(parent, password, "replacementParentSecret123", &session),
+            ),
+        )
+        .await
+        .expect("rotation must release its session lock before revocation")
+        .expect("rotate current session");
+        assert_eq!(revoked, 1);
+        assert!(iam.get_user(&session.access_key).await.is_none());
+        assert_eq!(
+            iam.get_user(parent).await.expect("rotated parent").credentials.secret_key,
+            "replacementParentSecret123"
+        );
     }
 
     #[tokio::test]

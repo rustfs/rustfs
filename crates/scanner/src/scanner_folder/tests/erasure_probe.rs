@@ -774,6 +774,7 @@ async fn erasure_candidate_covered_namespace_reuses_totals_after_classification(
         },
     );
     scanner.budget = budget.clone();
+    let before = global_metrics().scan_observation().snapshot();
     scanner
         .scan_folder(
             budget.token(),
@@ -790,6 +791,15 @@ async fn erasure_candidate_covered_namespace_reuses_totals_after_classification(
     assert_eq!(budget.progress(), (0, 1), "only the parent consumes namespace quota");
     assert_eq!(charged_ops(&root), 4, "list both directories once without re-reading covered metadata");
     assert_eq!(scanner.new_cache.find(&folder.name).expect("reused candidate").objects, 1);
+    let observed = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        observed.cache_reuse["classified_namespace"].count,
+        before.cache_reuse["classified_namespace"].count + 1
+    );
+    assert_eq!(
+        observed.metadata_reads.attempts, before.metadata_reads.attempts,
+        "classification retains the existing zero metadata read path"
+    );
 }
 
 #[tokio::test]
@@ -869,6 +879,7 @@ async fn erasure_candidate_preserves_compacted_namespace_sampling_after_classifi
         },
     );
     scanner.budget = budget.clone();
+    let before = global_metrics().scan_observation().snapshot();
     scanner
         .scan_folder(
             budget.token(),
@@ -889,6 +900,15 @@ async fn erasure_candidate_preserves_compacted_namespace_sampling_after_classifi
         "sampling still requires full current classification, without metadata re-read"
     );
     assert_eq!(scanner.new_cache.find(&folder.name).expect("sampled candidate").objects, 1);
+    let observed = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        observed.cache_reuse["classified_namespace"].count,
+        before.cache_reuse["classified_namespace"].count + 1
+    );
+    assert_eq!(
+        observed.metadata_reads.attempts, before.metadata_reads.attempts,
+        "classification retains the existing zero metadata read path"
+    );
 }
 
 #[tokio::test]

@@ -943,11 +943,8 @@ pub(crate) static ERR_TIER_NOT_FOUND: AdminErrorRef = AdminErrorRef(|| &ecstore_
 pub(crate) static ERR_TIER_RESERVED_NAME: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_RESERVED_NAME);
 
 pub(crate) mod data_usage {
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::verified_account_bucket_usage;
     use std::sync::Arc;
-
-    pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
-    }
 
     pub(crate) async fn load_data_usage_from_backend(
         store: Arc<crate::storage::storage_api::ECStore>,
@@ -959,6 +956,12 @@ pub(crate) mod data_usage {
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+    }
+
+    pub(crate) async fn load_admin_data_usage_with_memory_overlay(
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_with_memory_overlay(store).await
     }
 }
 
@@ -1083,20 +1086,10 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod s3 {
-    // Keep auth types behind the existing s3 facade so test-only callers do
-    // not widen the repository's direct s3s import footprint.
+    pub(crate) use http::header;
     pub(crate) use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
-    #[allow(unused_imports)]
-    pub(crate) use s3s::auth;
-    pub(crate) use s3s::header;
 
-    /// Build an `S3Error` without reaching for the `s3s` error macro.
-    ///
-    /// The macro expands to the very constructor this calls, but it puts an
-    /// `s3s` dependency in every file that reports an error. Routing the
-    /// construction through here keeps that dependency in this facade, which is
-    /// the boundary the s3gate migration replaces
-    /// (`scripts/check_s3s_footprint.sh`, rustfs/backlog#1677 F1).
+    /// Build an owned `S3Error` from a code and a message.
     pub(crate) fn error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
         S3Error::with_message(code, message)
     }

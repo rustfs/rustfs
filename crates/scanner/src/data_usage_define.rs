@@ -206,6 +206,32 @@ pub(crate) struct DataUsageCacheRevisions {
     backup: Option<DataUsageCacheRevision>,
 }
 
+/// In-memory provenance of the decoded cache and the revisions observed by its loader.
+#[derive(Clone, Debug)]
+pub(crate) struct DataUsageCacheBaselineRevisions {
+    revisions: DataUsageCacheRevisions,
+    loaded_from_main: bool,
+}
+
+impl DataUsageCacheBaselineRevisions {
+    pub(crate) fn revisions(&self) -> &DataUsageCacheRevisions {
+        &self.revisions
+    }
+
+    /// A backup may catch up to an unchanged primary without changing the decoded baseline.
+    /// Both reads must have decoded that primary; an ETag on a corrupt primary is insufficient.
+    pub(crate) fn permits_unchanged_baseline_since(&self, initial: &Self) -> bool {
+        if self.revisions == initial.revisions {
+            return true;
+        }
+        self.loaded_from_main
+            && initial.loaded_from_main
+            && matches!(&initial.revisions.main, DataUsageCacheRevision::Etag(etag) if !etag.is_empty())
+            && self.revisions.main == initial.revisions.main
+            && self.revisions.backup.as_ref() == Some(&self.revisions.main)
+    }
+}
+
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{BUCKET_META_PREFIX}"));
 
@@ -933,8 +959,8 @@ pub struct DataUsageCacheInfo {
     #[serde(default)]
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
     /// Full activity and inventory scope of a set scan; only a complete
-    /// snapshot proves coverage. Bucket caches bind this scope into their
-    /// opaque scan plan digest instead.
+    /// snapshot proves coverage. A completed bucket stores its checkpoint
+    /// coverage plan here until the authoritative aggregate includes it.
     #[serde(default)]
     pub scan_coverage_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]

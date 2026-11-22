@@ -30,12 +30,11 @@ doctest = false
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-rio/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-rio/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-rio/hotpath-cpu"]
+hotpath = ["rustfs-rio/hotpath"]
+hotpath-alloc = ["hotpath", "rustfs-rio/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "rustfs-rio/hotpath-cpu"]
 
 [dependencies]
-hotpath.workspace = true
 async-compression = { workspace = true, features = [
     "tokio",
     "bzip2",

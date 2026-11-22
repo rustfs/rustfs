@@ -18,6 +18,7 @@ use super::*;
 use crate::app::storage_api::s3::S3Request;
 pub(super) use crate::app::storage_api::s3::dto::CompletedMultipartUpload;
 pub(super) use crate::app::storage_api::s3::dto::StorageClass;
+use crate::app::{RequestEnvelope, RequestHead};
 pub(super) use http::Extensions;
 pub(super) use http::Method;
 pub(super) use rustfs_filemeta::ObjectPartInfo;
@@ -48,6 +49,21 @@ pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         service: None,
         trailing_headers: None,
     }
+}
+
+/// The envelope of a request that carries nothing but `method`.
+pub(super) fn owned_envelope(method: Method) -> RequestEnvelope {
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        Extensions::new(),
+    )
 }
 
 pub(super) fn make_usecase() -> DefaultMultipartUsecase {

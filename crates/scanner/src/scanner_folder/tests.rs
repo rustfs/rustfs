@@ -377,6 +377,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
+        notification_bucket_incarnation: None,
         usage_updates: None,
         checkpoint_tx: None,
         checkpoint_ancestors: Vec::new(),
@@ -392,6 +393,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
         local_disk: disk,
+        local_stop: None,
         tier_registry: crate::TierRegistrySnapshot {
             generation: 0,
             names: Arc::new([]),
@@ -782,6 +784,7 @@ fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_CORRUPT_ERROR));
 
@@ -814,6 +817,7 @@ fn test_classify_get_size_failure_records_transient_metadata_error_without_heal(
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     let err = StorageError::other(format!("{}: temporary read failure", crate::scanner_io::SCANNER_METADATA_TRANSIENT_ERROR));
 
@@ -871,6 +875,7 @@ async fn test_heal_replication_skips_only_unversioned_data_versions() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     // An unversioned listing carries no version id: nothing can be replicated
     // from it, so it never reaches replication admission.
@@ -2274,6 +2279,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
         heal_enabled: true,
         heal_bitrot: true,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     let object_info = ObjectInfo {
         bucket: "bucket".to_string(),
@@ -3105,6 +3111,112 @@ async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
 
 #[tokio::test]
 #[serial]
+async fn cache_reuse_gates_report_only_the_first_production_condition() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.old_cache.replace(
+        "bucket/child",
+        "bucket",
+        DataUsageEntry {
+            compacted: true,
+            objects: 2,
+            ..Default::default()
+        },
+    );
+    let hash = hash_path("bucket/child");
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let child = CachedFolder {
+        name: "bucket/child".to_string(),
+        parent: Some(hash_path("bucket")),
+        object_heal_prob_div: 1,
+    };
+    let abandoned = HashSet::from([hash.0.clone()]);
+    let before = global_metrics().scan_observation().snapshot();
+
+    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child, &hash, &abandoned));
+    let missing_scope = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        missing_scope.reuse_decisions["clean_prefix"].not_evaluated["missing_scope"],
+        before.reuse_decisions["clean_prefix"].not_evaluated["missing_scope"] + 1
+    );
+    scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
+    scanner.is_erasure_mode = true;
+    assert!(!scanner.should_reuse_clean_root_child(&folder, &DataUsageEntry::default(), &child, &hash, &abandoned));
+    let erasure = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        erasure.reuse_decisions["clean_prefix"].blocked["erasure_health_required"],
+        before.reuse_decisions["clean_prefix"].blocked["erasure_health_required"] + 1
+    );
+    assert_eq!(erasure.erasure_clean_prefix_walks, before.erasure_clean_prefix_walks + 1);
+
+    assert!(!scanner.can_reuse_covered_namespace("bucket/child", true));
+    scanner.old_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+        started_plan: crate::DataUsageScanPlanDigest([1; 32]),
+        requested_plan: crate::DataUsageScanPlanDigest([1; 32]),
+    });
+    assert!(!scanner.can_reuse_covered_namespace("bucket/child", true));
+    assert!(!scanner.can_reuse_covered_namespace("bucket/child", false));
+    scanner.resume_frontier = Some("bucket/child".to_string());
+    scanner.resume_failed_paths = vec!["bucket/child/failed".to_string()];
+    assert!(!scanner.can_reuse_covered_namespace("bucket/child", false));
+    scanner.resume_failed_paths.clear();
+    assert!(scanner.can_reuse_covered_namespace("bucket/child", false));
+    let covered = global_metrics().scan_observation().snapshot();
+    let reasons = &covered.reuse_decisions["covered_namespace"];
+    let prior = &before.reuse_decisions["covered_namespace"];
+    assert_eq!(reasons.not_evaluated["no_resume_sweep"], prior.not_evaluated["no_resume_sweep"] + 1);
+    assert_eq!(reasons.blocked["compacted_parent"], prior.blocked["compacted_parent"] + 1);
+    assert_eq!(reasons.blocked["missing_coverage"], prior.blocked["missing_coverage"] + 1);
+    assert_eq!(reasons.blocked["cached_failures"], prior.blocked["cached_failures"] + 1);
+    assert_eq!(reasons.eligible, prior.eligible + 1);
+
+    with_var(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, Some("16"), || {
+        scanner.scan_mode = HealScanMode::Deep;
+        assert_eq!(scanner.sampled_namespace_reuse(&hash, true, true), None);
+        scanner.scan_mode = HealScanMode::Normal;
+        assert_eq!(scanner.sampled_namespace_reuse(&hash, true, true), None);
+        let replication: ReplicationConfig = serde_json::from_value(serde_json::json!({
+            "config": { "role": "", "rules": [{ "destination": { "bucket": "arn:test" }, "id": "status", "prefix": "", "priority": 1, "status": "Enabled" }] },
+            "remotes": crate::storage_api::EcstoreBucketTargets::default(),
+        })).expect("active replication fixture");
+        scanner.old_cache.info.replication = Some(Arc::new(replication));
+        assert_eq!(scanner.sampled_namespace_reuse(&hash, true, false), None);
+        scanner.old_cache.info.replication = None;
+        assert_eq!(scanner.sampled_namespace_reuse(&hash, true, false), None);
+        let rescan_cycle = (0..16)
+            .find(|cycle| hash.mod_(*cycle, 16))
+            .expect("hash is visited in one sampling cycle");
+        scanner.old_cache.info.next_cycle = u64::from(rescan_cycle);
+        assert_eq!(scanner.sampled_namespace_reuse(&hash, false, false), Some(false));
+        scanner.old_cache.info.next_cycle = u64::from((rescan_cycle + 1) % 16);
+        assert_eq!(scanner.sampled_namespace_reuse(&hash, false, false), Some(true));
+    });
+    let after = global_metrics().scan_observation().snapshot();
+    let reasons = &after.reuse_decisions["namespace_sampling"];
+    let prior = &before.reuse_decisions["namespace_sampling"];
+    for label in ["deep_scan", "forward_sweep", "active_replication"] {
+        assert_eq!(
+            reasons.not_evaluated[label],
+            prior.not_evaluated[label] + 1,
+            "first sampling condition {label}"
+        );
+    }
+    assert_eq!(reasons.blocked["compacted_parent"], prior.blocked["compacted_parent"] + 1);
+    assert_eq!(reasons.blocked["selected_for_walk"], prior.blocked["selected_for_walk"] + 1);
+    assert_eq!(reasons.eligible, prior.eligible + 1);
+    for (kind, reuse) in &after.cache_reuse {
+        assert_eq!(reuse.count, before.cache_reuse[kind].count, "gate admission alone does not copy {kind}");
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -3144,11 +3256,20 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
         parent: None,
         object_heal_prob_div: 1,
     };
+    let before = global_metrics().scan_observation().snapshot();
     let mut root = DataUsageEntry::default();
     scanner
         .scan_folder(CancellationToken::new(), folder, &mut root)
         .await
         .expect("scoped root scan should finish successfully");
+
+    let observed = global_metrics().scan_observation().snapshot();
+    assert_eq!(observed.cache_reuse["clean_prefix"].count, before.cache_reuse["clean_prefix"].count + 1);
+    assert_eq!(observed.erasure_clean_prefix_walks, before.erasure_clean_prefix_walks);
+    assert_eq!(
+        observed.reuse_decisions["clean_prefix"].eligible,
+        before.reuse_decisions["clean_prefix"].eligible + 1
+    );
 
     let clean = scanner
         .new_cache
@@ -3165,6 +3286,78 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
         .size_recursive("bucket")
         .expect("bucket root should include reused and rescanned entries");
     assert_eq!((bucket.size, bucket.objects), (17, 3));
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_cache_observations_distinguish_checkpoint_and_periodic_sampling() {
+    for covered in [true, false] {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+        tokio::fs::create_dir_all(temp_dir.join("bucket/child"))
+            .await
+            .expect("create cached namespace");
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+        scanner.old_cache.replace(
+            "bucket/child",
+            "bucket",
+            DataUsageEntry {
+                size: 17,
+                objects: 5,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+        let kind = if covered {
+            scanner.old_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+                started_plan: crate::DataUsageScanPlanDigest([1; 32]),
+                requested_plan: crate::DataUsageScanPlanDigest([1; 32]),
+            });
+            scanner.resume_frontier = Some("bucket/child".to_string());
+            "covered_namespace"
+        } else {
+            let hash = hash_path("bucket/child");
+            let cycle = (0..data_usage_update_dir_cycles())
+                .find(|cycle| !hash.mod_(*cycle, data_usage_update_dir_cycles()))
+                .expect("a cycle samples other work");
+            scanner.old_cache.info.next_cycle = u64::from(cycle);
+            "sampled_namespace"
+        };
+        let before = global_metrics().scan_observation().snapshot();
+        let mut root = DataUsageEntry::default();
+        scanner
+            .scan_folder(
+                CancellationToken::new(),
+                CachedFolder {
+                    name: "bucket".to_string(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &mut root,
+            )
+            .await
+            .expect("cached namespace reuses accounting");
+        let summary = scanner.new_cache.size_recursive("bucket").expect("complete bucket totals");
+        assert_eq!((summary.size, summary.objects), (17, 5));
+        let after = global_metrics().scan_observation().snapshot();
+        for label in [
+            "clean_prefix",
+            "covered_namespace",
+            "sampled_namespace",
+            "classified_namespace",
+        ] {
+            assert_eq!(
+                after.cache_reuse[label].count,
+                before.cache_reuse[label].count + u64::from(label == kind),
+                "reuse reason {label}"
+            );
+        }
+        assert_eq!(after.metadata_reads.attempts, before.metadata_reads.attempts);
+        let gate = if covered { "covered_namespace" } else { "namespace_sampling" };
+        assert_eq!(after.reuse_decisions[gate].eligible, before.reuse_decisions[gate].eligible + 1);
+    }
 }
 
 async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<String>) {
@@ -3278,6 +3471,7 @@ async fn scoped_root_scan_preserves_erasure_health_walks() {
         parent: None,
         object_heal_prob_div: 1,
     };
+    let before = global_metrics().scan_observation().snapshot();
     let mut root = DataUsageEntry::default();
     scanner
         .scan_folder(CancellationToken::new(), folder, &mut root)
@@ -3289,6 +3483,9 @@ async fn scoped_root_scan_preserves_erasure_health_walks() {
         .size_recursive("bucket/clean")
         .expect("erasure scan should visit the clean entry");
     assert_eq!((clean.size, clean.objects), (0, 0));
+    let observed = global_metrics().scan_observation().snapshot();
+    assert_eq!(observed.erasure_clean_prefix_walks, before.erasure_clean_prefix_walks + 1);
+    assert_eq!(observed.cache_reuse["clean_prefix"].count, before.cache_reuse["clean_prefix"].count);
 }
 
 #[tokio::test]

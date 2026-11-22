@@ -31,7 +31,7 @@
     "deviceName": { "type": "string", "pattern": "^organizations/[0-9a-f-]{36}/clusters/[0-9a-f-]{36}/clusterDevices/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
     "createTime": { "type": "string", "format": "date-time" },
     "expireTime": { "type": "string", "format": "date-time" },
-    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "nonce": { "type": "string", "minLength": 43, "maxLength": 43, "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$" },
     "requiredCapabilities": {
       "type": "array",
       "prefixItems": [{ "enum": ["health.check.service@1", "profile.cpu@1", "profile.memory.service@1", "profile.threads@1", "performance.drive@1", "performance.network@1", "top.api@1", "top.disk@1", "top.locks@1", "top.rpc@1"] }],
@@ -86,8 +86,8 @@
       "required": ["algorithm", "keyId", "value"],
       "properties": {
         "algorithm": { "const": "Ed25519" },
-        "keyId": { "type": "string", "minLength": 1 },
-        "value": { "type": "string", "minLength": 43 }
+        "keyId": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$" },
+        "value": { "type": "string", "minLength": 86, "maxLength": 86, "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$" }
       }
     }
   },
@@ -151,13 +151,19 @@
           },
           "limits": {
             "type": "object",
-            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+            "properties": {
+              "timeoutSeconds": { "const": 30 },
+              "maxOutputBytes": { "const": 524288 },
+              "maxMemoryBytes": { "const": 67108864 },
+              "maxCpuMillis": { "const": 5000 }
+            }
           },
           "parameters": {
             "type": "object",
             "required": ["targetAlias", "scratchBytes", "blockBytes"],
             "properties": {
               "durationMillis": { "const": 5000 },
+              "samplePeriodMicros": { "const": 10000 },
               "targetAlias": { "const": "drive-1" },
               "scratchBytes": { "const": 524288 },
               "blockBytes": { "const": 65536 }
@@ -198,7 +204,10 @@
           },
           "limits": {
             "type": "object",
-            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+            "properties": {
+              "maxCpuMillis": { "type": "integer", "maximum": 5000 },
+              "maxMemoryBytes": { "type": "integer", "minimum": 1048576 }
+            }
           },
           "parameters": {
             "type": "object",
@@ -295,7 +304,10 @@
           },
           "limits": {
             "type": "object",
-            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+            "properties": {
+              "maxCpuMillis": { "type": "integer", "maximum": 5000 },
+              "maxMemoryBytes": { "type": "integer", "minimum": 1048576 }
+            }
           },
           "parameters": {
             "type": "object",
@@ -350,7 +362,10 @@
           },
           "limits": {
             "type": "object",
-            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+            "properties": {
+              "maxCpuMillis": { "type": "integer", "maximum": 5000 },
+              "maxMemoryBytes": { "type": "integer", "minimum": 1048576 }
+            }
           },
           "parameters": {
             "type": "object",
@@ -376,7 +391,10 @@
           },
           "limits": {
             "type": "object",
-            "properties": { "maxCpuMillis": { "type": "integer", "maximum": 5000 } }
+            "properties": {
+              "maxCpuMillis": { "type": "integer", "maximum": 5000 },
+              "maxMemoryBytes": { "type": "integer", "minimum": 1048576 }
+            }
           },
           "parameters": {
             "type": "object",

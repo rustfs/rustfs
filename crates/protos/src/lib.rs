@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+mod channel_reset_tests;
 pub mod compat_manifest;
 // SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
 // scoped to that module so generated internals do not relax lints elsewhere.
@@ -707,6 +709,21 @@ pub fn canonical_scanner_activity_v7_response_body(
 pub mod scoped_dirty_usage;
 pub mod usage_watch;
 
+/// Binds checkpoint continuity independently of the fresh RPC process ID.
+pub fn canonical_scanner_activity_v8_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = canonical_scanner_activity_v7_response_body(challenge, response)?;
+    body.extend_from_slice(b"rustfs-scanner-checkpoint-continuity-v1\0");
+    body.push(u8::from(response.checkpoint_instance_id.is_some()));
+    if let Some(instance) = &response.checkpoint_instance_id {
+        body.extend_from_slice(&u64::try_from(instance.len())?.to_be_bytes());
+        body.extend_from_slice(instance.as_bytes());
+    }
+    Ok(body)
+}
+
 pub fn canonical_scanner_dirty_usage_snapshot_request_body(
     request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -876,7 +893,11 @@ struct CanonicalBodyBuilder {
 
 impl CanonicalBodyBuilder {
     fn new(domain: &'static [u8]) -> Self {
-        let mut body = Vec::with_capacity(domain.len() + 128);
+        Self::with_capacity(domain, domain.len() + 128)
+    }
+
+    fn with_capacity(domain: &'static [u8], capacity: usize) -> Self {
+        let mut body = Vec::with_capacity(capacity.max(domain.len()));
         body.extend_from_slice(domain);
         Self { body }
     }
@@ -1183,10 +1204,36 @@ pub fn canonical_rename_data_request_body(
     Ok(body.finish())
 }
 
+const RENAME_DATA_BATCH_CANONICAL_DOMAIN: &[u8] = b"rustfs-rename-data-batch-request-v1\0";
+
+fn rename_data_batch_canonical_body_capacity(request: &proto_gen::node_service::RenameDataBatchRequest) -> Option<usize> {
+    request
+        .src_volume
+        .len()
+        .checked_add(request.src_path.len())
+        .and_then(|capacity| capacity.checked_add(request.dst_volume.len()))
+        .and_then(|capacity| capacity.checked_add(request.dst_path.len()))
+        .and_then(|capacity| capacity.checked_add(RENAME_DATA_BATCH_CANONICAL_DOMAIN.len() + 5 * std::mem::size_of::<u64>()))
+        .and_then(|capacity| {
+            request.items.iter().try_fold(capacity, |capacity, item| {
+                capacity
+                    .checked_add(std::mem::size_of::<u32>() + 2 * std::mem::size_of::<u64>())?
+                    .checked_add(item.disk.len())?
+                    .checked_add(item.file_info_msgpack.len())
+            })
+        })
+}
+
 pub fn canonical_rename_data_batch_request_body(
     request: &proto_gen::node_service::RenameDataBatchRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-data-batch-request-v1\0");
+    let exact_capacity = rename_data_batch_canonical_body_capacity(request);
+    let mut body = exact_capacity.map_or_else(
+        || CanonicalBodyBuilder::new(RENAME_DATA_BATCH_CANONICAL_DOMAIN),
+        |capacity| CanonicalBodyBuilder::with_capacity(RENAME_DATA_BATCH_CANONICAL_DOMAIN, capacity),
+    );
+    #[cfg(debug_assertions)]
+    let initial_capacity = exact_capacity.map(|_| body.body.capacity());
     body.push_str(&request.src_volume)?;
     body.push_str(&request.src_path)?;
     body.push_str(&request.dst_volume)?;
@@ -1196,6 +1243,14 @@ pub fn canonical_rename_data_batch_request_body(
         body.push_u32(item.item_index);
         body.push_str(&item.disk)?;
         body.push_bytes(&item.file_info_msgpack)?;
+    }
+    #[cfg(debug_assertions)]
+    if let Some(initial_capacity) = initial_capacity {
+        debug_assert_eq!(
+            body.body.capacity(),
+            initial_capacity,
+            "exact rename batch capacity must avoid buffer growth"
+        );
     }
     Ok(body.finish())
 }
@@ -1920,6 +1975,29 @@ mod disk_mutation_canonical_tests {
     }
 
     #[test]
+    fn rename_data_batch_canonical_capacity_covers_real_inline_shapes() {
+        for (width, payload_bytes) in [(4, 512), (4, 2_763), (4, 8_566), (4, 32_768), (16, 2_763), (16, 8_566)] {
+            let request = RenameDataBatchRequest {
+                src_volume: "bucket".into(),
+                src_path: "tmp/source/xl.meta".into(),
+                dst_volume: "bucket".into(),
+                dst_path: "object/xl.meta".into(),
+                items: (0..width)
+                    .map(|slot| RenameDataBatchItem {
+                        item_index: u32::try_from(slot).expect("fixture slot fits u32"),
+                        disk: format!("http://node-{slot}:9000/data/rustfs{slot}"),
+                        file_info_msgpack: vec![0x5a; payload_bytes].into(),
+                    })
+                    .collect(),
+            };
+            let expected_capacity = rename_data_batch_canonical_body_capacity(&request).expect("fixture capacity fits usize");
+            let body = canonical_rename_data_batch_request_body(&request).expect("fixture body length fits u64");
+
+            assert_eq!(body.len(), expected_capacity, "width={width}, payload_bytes={payload_bytes}");
+        }
+    }
+
+    #[test]
     fn delete_version_canonical_body_binds_every_field() {
         let baseline = DeleteVersionRequest {
             bucket_incarnation_id: Default::default(),
@@ -2498,9 +2576,9 @@ mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
         canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
-        canonical_scanner_dirty_usage_snapshot_request_body, canonical_scanner_dirty_usage_snapshot_response_body,
-        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
-        canonical_scanner_publication_lease_response_body,
+        canonical_scanner_activity_v8_response_body, canonical_scanner_dirty_usage_snapshot_request_body,
+        canonical_scanner_dirty_usage_snapshot_response_body, canonical_scanner_publication_lease_release_request_body,
+        canonical_scanner_publication_lease_request_body, canonical_scanner_publication_lease_response_body,
         proto_gen::node_service::{
             ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshotRequest,
             ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
@@ -2652,6 +2730,7 @@ mod scanner_activity_tests {
     #[test]
     fn canonical_scanner_activity_response_binds_challenge_and_every_status_field() {
         let response = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -2735,8 +2814,35 @@ mod scanner_activity_tests {
     }
 
     #[test]
+    fn scanner_activity_v8_authenticates_checkpoint_continuity() {
+        let response = ScannerActivityResponse {
+            protocol_version: 8,
+            instance_id: "1".repeat(32),
+            checkpoint_instance_id: Some("2".repeat(32)),
+            ..Default::default()
+        };
+        let baseline = canonical_scanner_activity_v8_response_body(&[1; 16], &response).expect("v8 body");
+        for checkpoint_instance_id in [None, Some("3".repeat(32))] {
+            let changed = ScannerActivityResponse {
+                checkpoint_instance_id,
+                ..response.clone()
+            };
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_v8_response_body(&[1; 16], &changed).expect("changed body")
+            );
+            assert_eq!(
+                canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("v7 body"),
+                canonical_scanner_activity_v7_response_body(&[1; 16], &changed).expect("v7 compatibility"),
+                "v7 does not authenticate continuity and its decoder must reject this field"
+            );
+        }
+    }
+
+    #[test]
     fn scanner_activity_v4_response_canonicalization_ignores_v5_fields() {
         let response = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -3733,9 +3839,9 @@ fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bo
 pub const INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT: usize = 64;
 
 // Quorum reads cancel surplus metadata RPCs in bursts. Keep bounded reset state
-// for their in-flight replies without spending the connection's protocol-error
-// budget (h2 remembers only 50 resets by default).
-const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
+// for their in-flight replies through the HTTP/2 grace period without spending
+// the connection's protocol-error budget (h2 remembers only 50 resets by default).
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 8192;
 
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {

@@ -1742,6 +1742,29 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     service_account_secret_key: &str,
     expected_incarnation_id: Uuid,
 ) -> S3Result<bool> {
+    let transaction = metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(bucket, expected_incarnation_id)
+        .await
+        .map_err(ApiError::from)?;
+    validate_site_replication_bucket_runtime(state, &load_site_replication_state().await?)?;
+    ensure_site_replication_bucket_targets_under_transaction(
+        bucket,
+        state,
+        local_peer,
+        config,
+        service_account_secret_key,
+        &transaction,
+    )
+    .await
+}
+
+async fn ensure_site_replication_bucket_targets_under_transaction(
+    bucket: &str,
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    config: Option<&PersistedReplicationConfiguration>,
+    service_account_secret_key: &str,
+    transaction: &metadata_sys::BucketMetadataMutationGuard,
+) -> S3Result<bool> {
     let existing = match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => targets,
         Err(StorageError::ConfigNotFound) => BucketTargets::default(),
@@ -1764,7 +1787,7 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     if json_targets == existing_json {
         return Ok(false);
     }
-    metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
+    metadata_sys::update_under_transaction_lock(transaction, bucket, BUCKET_TARGETS_FILE, json_targets)
         .await
         .map_err(ApiError::from)?;
     Ok(true)
@@ -1781,12 +1804,12 @@ pub(crate) async fn bucket_replication_config_for_target_refresh(
 }
 
 /// Returns whether the replication configuration was rewritten.
-pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runtime(
+async fn ensure_site_replication_bucket_replication_config_under_transaction(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
-    expected_incarnation_id: Uuid,
+    transaction: &metadata_sys::BucketMetadataMutationGuard,
 ) -> S3Result<bool> {
     let existing = match metadata_sys::get_replication_config(bucket).await {
         Ok((existing, _)) => Some(existing),
@@ -1833,7 +1856,7 @@ pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runti
 
     let data = serialize(&PersistedReplicationConfiguration { role, rules })
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
-    metadata_sys::update_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
+    metadata_sys::update_under_transaction_lock(transaction, bucket, BUCKET_REPLICATION_CONFIG, data)
         .await
         .map_err(ApiError::from)?;
 
@@ -1855,28 +1878,47 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
     runtime: &SiteReplicationRuntime,
     expected_incarnation_id: Uuid,
 ) -> S3Result<()> {
+    // Bucket transaction -> short state read -> metadata writes. A removal
+    // commits topology first and then waits on this same transaction for cleanup.
+    // An old runtime either finishes before cleanup or observes the new topology.
     let targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let transaction = metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(bucket, expected_incarnation_id)
+        .await
+        .map_err(ApiError::from)?;
+    let current = load_site_replication_state().await?;
+    validate_site_replication_bucket_runtime(&runtime.state, &current)?;
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
-    let targets_written = ensure_site_replication_bucket_targets_with_runtime(
+    let targets_written = ensure_site_replication_bucket_targets_under_transaction(
         bucket,
         &runtime.state,
         &runtime.local_peer,
         config.as_ref(),
         &runtime.service_account_secret_key,
-        expected_incarnation_id,
+        &transaction,
     )
     .await?;
-    let config_written = ensure_site_replication_bucket_replication_config_with_runtime(
+    let config_written = ensure_site_replication_bucket_replication_config_under_transaction(
         bucket,
         &runtime.state,
         &runtime.local_peer,
         &runtime.service_account_secret_key,
-        expected_incarnation_id,
+        &transaction,
     )
     .await?;
+    drop(transaction);
     drop(targets_guard);
     if targets_written || config_written {
         reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_setup", config_written).await;
+    }
+    Ok(())
+}
+
+fn validate_site_replication_bucket_runtime(snapshot: &SiteReplicationState, current: &SiteReplicationState) -> S3Result<()> {
+    if current.pending_remove_v2.is_some()
+        || current.updated_at != snapshot.updated_at
+        || current.peers.keys().ne(snapshot.peers.keys())
+    {
+        return Err(s3_error!(PreconditionFailed, "site replication topology changed before bucket setup"));
     }
     Ok(())
 }

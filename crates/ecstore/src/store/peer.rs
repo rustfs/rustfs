@@ -261,6 +261,7 @@ impl ECStore {
     }
 
     /// Execute on this instance's active local disk through the physical owner.
+    /// A verified scanner publication uses the receiver's background disk admission.
     pub async fn rename_local_data(
         &self,
         disk_ref: &str,
@@ -278,7 +279,7 @@ impl ECStore {
         } else {
             None
         };
-        rename_local_data_with_ctx(
+        let rename = rename_local_data_with_ctx(
             &self.ctx,
             disk_ref,
             source,
@@ -289,8 +290,12 @@ impl ECStore {
                 external_guard,
                 namespace_owner: None,
             },
-        )
-        .await
+        );
+        if scanner_token.is_some() {
+            crate::disk::with_background_disk_io(tokio_util::sync::CancellationToken::new(), rename).await
+        } else {
+            rename.await
+        }
     }
 
     /// Recovery stays bound to this admitted instance even after RPC cancellation.
@@ -338,10 +343,24 @@ async fn write_local_format_control_with_ctx(
 }
 
 async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<(DiskStore, Option<Uuid>)> {
+    local_disk_candidate_with_admission(ctx, disk_ref, RpcDiskAdmission::Immediate).await
+}
+
+#[derive(Clone, Copy)]
+enum RpcDiskAdmission {
+    Immediate,
+    ScannerPreflight,
+}
+
+async fn local_disk_candidate_with_admission(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    admission: RpcDiskAdmission,
+) -> DiskResult<(DiskStore, Option<Uuid>)> {
     let map = ctx.local_disk_map();
     let path_disk = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned();
     if let Some(disk) = path_disk {
-        admit_rpc_disk(&disk)?;
+        admit_rpc_disk(&disk, admission).await?;
         return Ok((disk, None));
     }
     let disk_id = Uuid::parse_str(disk_ref).map_err(|_| DiskError::DiskNotFound)?;
@@ -351,7 +370,7 @@ async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> Dis
         if let Some(disk) = cached_disk
             && matches!(disk.as_ref(), Disk::Local(_))
         {
-            admit_rpc_disk(&disk)?;
+            admit_rpc_disk(&disk, admission).await?;
             if disk.get_disk_id().await? == Some(disk_id) {
                 return Ok((disk, None));
             }
@@ -370,13 +389,24 @@ async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> Dis
     Err(DiskError::DiskNotFound)
 }
 
-fn admit_rpc_disk(disk: &DiskStore) -> DiskResult<()> {
+async fn local_scanner_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<(DiskStore, Option<Uuid>)> {
+    let (disk, id) = local_disk_candidate_with_admission(ctx, disk_ref, RpcDiskAdmission::ScannerPreflight).await?;
+    // A queued preflight must not resume on a replaced or quarantined attachment.
+    admit_local_disk(ctx, &disk, id, false, None).await?;
+    Ok((disk, id))
+}
+
+async fn admit_rpc_disk(disk: &DiskStore, admission: RpcDiskAdmission) -> DiskResult<()> {
     use crate::disk::remote_io_admission;
     if remote_io_admission::active() {
         let binding = disk
             .physical_admission()
             .ok_or_else(|| DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
-        remote_io_admission::admit(&binding).map_err(DiskError::Io)?;
+        match admission {
+            RpcDiskAdmission::Immediate => remote_io_admission::admit(&binding),
+            RpcDiskAdmission::ScannerPreflight => remote_io_admission::admit_scanner_preflight(&binding).await,
+        }
+        .map_err(DiskError::Io)?;
     }
     Ok(())
 }
@@ -564,6 +594,17 @@ pub async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> DiskResult<Option
         return Ok(find_local_disk_by_ref(disk_ref).await);
     }
     let (disk, _) = local_disk_candidate(&crate::runtime::global::current_ctx(), disk_ref).await?;
+    Ok(Some(disk))
+}
+
+/// Resolve an authenticated namespace scan before its storage locks, waiting for
+/// initial background capacity. The caller must bound the wait with a deadline.
+/// Cancellation returns queued capacity; unknown or replaced targets are rejected.
+pub async fn find_local_disk_by_ref_for_scanner_rpc(disk_ref: &str) -> DiskResult<Option<DiskStore>> {
+    if !crate::disk::remote_io_admission::active() {
+        return Ok(find_local_disk_by_ref(disk_ref).await);
+    }
+    let (disk, _) = local_scanner_disk_candidate(&crate::runtime::global::current_ctx(), disk_ref).await?;
     Ok(Some(disk))
 }
 
@@ -1042,6 +1083,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_target_lookup_waits_for_busy_preflight_capacity() {
+        use crate::disk::{RemoteBackgroundIo, with_remote_background_io};
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+        };
+        use std::num::NonZeroU16;
+
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("scanner target directory");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        disk.physical_admission()
+            .expect("local binding")
+            .set_test_capacity(vec![gate.clone()])
+            .expect("physical device");
+        let node = NodeAdmission::new(NonZeroU16::MIN);
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        let held = gate.try_acquire().expect("concurrent scanner operation");
+        let path = disk.endpoint().to_string();
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            let lookup = local_scanner_disk_candidate(&ctx, &path);
+            tokio::pin!(lookup);
+            assert!(
+                futures_util::poll!(lookup.as_mut()).is_pending(),
+                "a namespace preflight must wait for busy capacity before storage locks, not fail the bucket"
+            );
+            assert_eq!(node.snapshot().active, 0, "waiting for the disk must not reserve node capacity");
+            drop(held);
+            let (selected, _) = tokio::time::timeout(std::time::Duration::from_secs(5), lookup)
+                .await
+                .expect("capacity release wakes namespace preflight")
+                .expect("namespace target admission");
+            assert!(Arc::ptr_eq(&selected, &disk));
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [1, 1]);
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+        assert_eq!([node.completed(), gate.completed()], [Some(0), Some(0)]);
+    }
+
+    #[tokio::test]
+    async fn namespace_target_wait_rejects_quarantined_or_replaced_disk() {
+        use crate::disk::{RemoteBackgroundIo, with_remote_background_io};
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+        };
+        use std::num::NonZeroU16;
+
+        for replace in [false, true] {
+            let ctx = Arc::new(InstanceContext::new());
+            let root = tempfile::tempdir().expect("target directory");
+            let id = Uuid::new_v4();
+            let disk = target_disk(&ctx, root.path(), id).await;
+            assert!(record_local_disk_id_if_active(&ctx, &disk, id).await);
+            let replacement = if replace {
+                let replacement = target_disk(&ctx, root.path(), id).await;
+                ctx.local_disk_map()
+                    .write()
+                    .await
+                    .insert(disk.endpoint().to_string(), Some(disk.clone()));
+                Some(replacement)
+            } else {
+                None
+            };
+            let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            disk.physical_admission()
+                .expect("local binding")
+                .set_test_capacity(vec![gate.clone()])
+                .expect("physical device");
+            let node = NodeAdmission::new(NonZeroU16::MIN);
+            node.update(
+                &mut FeedbackController::new(),
+                Some(FeedbackObservation {
+                    generation: 1,
+                    max_concurrency: 1,
+                    pressure: ResourcePressure::Unknown,
+                    completed_units: None,
+                }),
+            );
+            let held = gate.try_acquire().expect("busy disk");
+            // Both lookup forms must revalidate the registry after queueing.
+            let disk_ref = if replace {
+                id.to_string()
+            } else {
+                disk.endpoint().to_string()
+            };
+            with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+                let lookup = local_scanner_disk_candidate(&ctx, &disk_ref);
+                tokio::pin!(lookup);
+                assert!(futures_util::poll!(&mut lookup).is_pending());
+                if let Some(replacement) = replacement {
+                    assert!(!Arc::ptr_eq(&replacement, &disk));
+                    ctx.local_disk_map()
+                        .write()
+                        .await
+                        .insert(disk.endpoint().to_string(), Some(replacement));
+                } else {
+                    ctx.local_disk_map().write().await.insert(disk.endpoint().to_string(), None);
+                }
+                drop(held);
+                assert!(matches!(lookup.await, Err(DiskError::DiskNotFound)));
+            })
+            .await;
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+            assert_eq!([node.completed(), gate.completed()], [Some(0), Some(0)]);
+        }
+    }
+
+    #[tokio::test]
     async fn target_uuid_cache_cannot_admit_a_different_format_at_the_same_path() {
         let ctx = Arc::new(InstanceContext::new());
         let root = tempfile::tempdir().expect("root");
@@ -1384,6 +1542,10 @@ mod tests {
             .await
             .expect("bounded physical entry");
             let at_entry = (ctx.namespace_commits_pending(), ctx.namespace_commit_generation());
+            let Disk::Local(wrapper) = disk.as_ref() else {
+                panic!("fixture must use a local disk");
+            };
+            assert!(!wrapper.background_io_active_for_tests(), "an ordinary rename stays foreground");
             assert!(!rename.is_finished(), "caller must still await the paused physical rename");
             rename.abort();
             let cancelled = tokio::time::timeout(Duration::from_secs(5), &mut rename)
@@ -1502,7 +1664,18 @@ mod tests {
         })
         .await
         .expect("bounded physical entry");
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        assert!(
+            wrapper.background_io_active_for_tests(),
+            "a verified scanner publication must retain background admission on the receiving disk"
+        );
         drop(rename);
+        assert!(
+            wrapper.background_io_active_for_tests(),
+            "native publication keeps admission after RPC cancellation"
+        );
         assert!(
             !store.scanner_data_usage_publication_blocked().await,
             "a pending namespace commit is not a local publication barrier"

@@ -16,8 +16,8 @@
 
 use super::*;
 use crate::app::RequestEnvelope;
-use crate::app::object::BodyChunks;
 use crate::app::object::request_body::{DemandReader, UploadChunks, guard_native_upload_progress};
+use crate::app::object::{BodyChunks, upload_frame_reader};
 use crate::app::storage_api::multipart_usecase::access::AuthorizationRequest;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOwner;
@@ -205,10 +205,9 @@ impl DefaultMultipartUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(req.headers()) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                let (body, total) =
-                    crate::app::object::cuobject::rdma_put_body(bucket, key, &token, true).map_err(S3Error::from)?;
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(bucket, key, &token).map_err(S3Error::from)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
-                (Some(crate::app::object::legacy_put_body(body)), Some(total), Some(total))
+                (Some(body), Some(total), Some(total))
             }
             _ => (body, content_length, None),
         };
@@ -290,7 +289,7 @@ impl DefaultMultipartUsecase {
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
+            upload_frame_reader(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
         );
 
         // An SSE-C passthrough session stores ciphertext parts verbatim: a
@@ -402,7 +401,8 @@ impl DefaultMultipartUsecase {
                 }
             };
             write_plan = write_plan.with_encryption(ssec_write);
-            (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
+            // An SSE-C part answers with its customer-key headers only.
+            (None, None)
         } else if let Some(server_side_encryption) = server_side_encryption {
             // Reuse the stored envelope after authorizing this caller against its
             // pinned destination key above.
@@ -741,9 +741,13 @@ mod tests {
             .part_number(1)
             .build()
             .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+        let err = match make_usecase()
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+            .await
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("missing body must be rejected"),
+        };
         assert_eq!(err.code(), &LegacyErrorCode::IncompleteBody);
     }
 
@@ -765,9 +769,13 @@ mod tests {
                 .content_length(Some(declared))
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            let err = match make_usecase()
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("declared part must be rejected"),
+            };
             if expect_too_large {
                 assert_eq!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
@@ -787,9 +795,13 @@ mod tests {
                 .part_number(part_number)
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            let err = match make_usecase()
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("invalid part number must be rejected"),
+            };
             assert_eq!(err.code(), &LegacyErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
@@ -971,10 +983,13 @@ mod tests {
             .build()
             .expect("upload part input should build");
 
-        let err = usecase
-            .execute_upload_part(build_request(input, Method::PUT))
+        let err = match usecase
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
-            .expect_err("full foreground write admission should reject before body ingest");
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("full foreground write admission should reject before body ingest"),
+        };
         assert_eq!(err.code(), &LegacyErrorCode::SlowDown);
         drop(held);
     }
