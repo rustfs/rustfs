@@ -1223,9 +1223,24 @@ pub(super) fn inspection_with_markers_bounded(
     Ok((inspection, has_physical_data_dirs_or_markers))
 }
 
+pub(super) enum PreopenedDeleteDir {
+    #[cfg(target_os = "linux")]
+    Opened(Arc<std::fs::File>),
+    #[cfg(target_os = "linux")]
+    MissingOrNotDir,
+    Unopened,
+}
+
+pub(super) struct PrevalidatedDeleteContext {
+    pub(super) bucket_path: PathBuf,
+    pub(super) file_path: PathBuf,
+    pub(super) preopened_dir: PreopenedDeleteDir,
+    pub(super) metadata_lock: os::MetadataMutationLockHandle,
+    pub(super) volume_lock: Option<Arc<tokio::sync::RwLock<()>>>,
+}
+
 #[derive(Clone)]
 struct PreparedDeleteReceiptEntry {
-    object_path: PathBuf,
     bucket_path: PathBuf,
     file_path: PathBuf,
     staging_root: PathBuf,
@@ -1238,11 +1253,12 @@ struct PreparedDeleteReceiptEntry {
     // Stage 1's directory scan consumes this FD's directory stream (`f_pos` at EOF);
     // downstream stages must only use it for `*at` operations and `fsync`, never re-scanning.
     file_path_dir: Option<Arc<std::fs::File>>,
+    metadata_lock: os::MetadataMutationLockHandle,
+    volume_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Clone)]
 struct PublishedDeleteReceiptEntry {
-    object_path: PathBuf,
     bucket_path: PathBuf,
     file_path: PathBuf,
     staging_root: PathBuf,
@@ -1252,6 +1268,9 @@ struct PublishedDeleteReceiptEntry {
     // Stage 1's directory scan consumes this FD's directory stream (`f_pos` at EOF);
     // downstream stages must only use it for `*at` operations and `fsync`, never re-scanning.
     file_path_dir: Option<Arc<std::fs::File>>,
+    metadata_lock: os::MetadataMutationLockHandle,
+    volume_lock: Arc<tokio::sync::RwLock<()>>,
+    receipt_namespace_lock: os::NamespaceMutationLockHandle,
 }
 
 /// Holds the per-disk Stage 2 published receipt entry across the Stage 2 -> Stage 3
@@ -3045,7 +3064,7 @@ impl LocalDisk {
         opts: &DeleteOptions,
         transaction: Uuid,
         owner: Option<Arc<dyn Send + Sync>>,
-        prevalidated_paths: Option<(PathBuf, PathBuf, PathBuf)>,
+        prevalidated_paths: Option<PrevalidatedDeleteContext>,
     ) -> Result<Option<()>> {
         if !opts.recoverable_delete
             || opts.undo_write
@@ -3058,13 +3077,24 @@ impl LocalDisk {
         self.reject_multipart_delete_recovery_mutation(volume, object)?;
         self.wait_for_startup_cleanup().await;
 
-        let (object_path, bucket_path, file_path) = match prevalidated_paths {
-            Some(paths) => paths,
+        let (bucket_path, file_path, preopened_dir, metadata_lock, volume_lock) = match prevalidated_paths {
+            Some(ctx) => {
+                #[cfg(target_os = "linux")]
+                if matches!(ctx.preopened_dir, PreopenedDeleteDir::MissingOrNotDir) {
+                    return Ok(None);
+                }
+                let volume_lock = ctx
+                    .volume_lock
+                    .unwrap_or_else(|| os::disk_volume_mutation_lock(&self.root, volume));
+                (ctx.bucket_path, ctx.file_path, ctx.preopened_dir, ctx.metadata_lock, volume_lock)
+            }
             None => {
                 let obj = self.get_object_path(volume, object)?;
                 let (b, f) = self.io_get_bucket_and_object_path(volume, object)?;
                 check_path_length(f.to_string_lossy().as_ref())?;
-                (obj, b, f)
+                let metadata_lock = os::lookup_metadata_mutation_lock(&obj);
+                let volume_lock = os::disk_volume_mutation_lock(&self.root, volume);
+                (b, f, PreopenedDeleteDir::Unopened, metadata_lock, volume_lock)
             }
         };
         let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
@@ -3076,7 +3106,7 @@ impl LocalDisk {
         };
         let sync = effective_durability(volume).syncs_recovery_protocol_state();
         let incarnation = opts.delete_recovery_bucket_incarnation;
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
+        let lease = os::acquire_namespace_mutation_lease_with_queue(&destination, self.blocking_queue.clone(), owner).await;
         let fi_clone = fi.clone();
         let volume_str = volume.to_owned();
         let object_str = object.to_owned();
@@ -3089,15 +3119,24 @@ impl LocalDisk {
             sync,
             move || -> std::io::Result<Result<FusedStage1Outcome>> {
                 #[cfg(unix)]
-                let file_path_dir = match open_dir_fd(&file_path) {
-                    Ok(dir) => Some(Arc::new(dir)),
-                    Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                        return Ok(Ok(None));
-                    }
-                    Err(_) => None,
+                let file_path_dir = match preopened_dir {
+                    #[cfg(target_os = "linux")]
+                    PreopenedDeleteDir::Opened(dir) => Some(dir),
+                    #[cfg(target_os = "linux")]
+                    PreopenedDeleteDir::MissingOrNotDir => return Ok(Ok(None)),
+                    PreopenedDeleteDir::Unopened => match open_dir_fd(&file_path) {
+                        Ok(dir) => Some(Arc::new(dir)),
+                        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                            return Ok(Ok(None));
+                        }
+                        Err(_) => None,
+                    },
                 };
                 #[cfg(not(unix))]
-                let file_path_dir: Option<Arc<std::fs::File>> = None;
+                let file_path_dir: Option<Arc<std::fs::File>> = {
+                    let _ = preopened_dir;
+                    None
+                };
                 let buf = match read_child_regular_bytes(file_path_dir.as_deref(), STORAGE_FORMAT_FILE, &xl_path) {
                     Ok(buf) => buf,
                     Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Ok(None)),
@@ -3372,7 +3411,6 @@ impl LocalDisk {
                     old_dir.filter(|_| had_old_data_dir),
                     destination,
                     PreparedDeleteReceiptEntry {
-                        object_path,
                         bucket_path,
                         file_path,
                         staging_root,
@@ -3383,6 +3421,8 @@ impl LocalDisk {
                         prepared_synced: sync,
                         rollback_dir_fd,
                         file_path_dir,
+                        metadata_lock,
+                        volume_lock,
                     },
                 ))))
             },
@@ -3435,12 +3475,13 @@ impl LocalDisk {
             None
         };
         let cached_prepared = rollback_open_path.as_deref().and_then(take_prepared_delete_receipt);
-        let (object_path, bucket_path, root, staging_root, cached_receipt) = match cached_prepared {
+        let (bucket_path, root, staging_root, metadata_lock, volume_lock, cached_receipt) = match cached_prepared {
             Some(entry) => (
-                entry.object_path,
                 Some(entry.bucket_path),
                 entry.file_path,
                 entry.staging_root,
+                entry.metadata_lock,
+                entry.volume_lock,
                 Some((
                     entry.journal_raw,
                     entry.journal,
@@ -3457,22 +3498,29 @@ impl LocalDisk {
                     return Err(DiskError::InvalidPath);
                 }
                 let obj_path = self.get_object_path(volume, object)?;
+                let metadata_lock = os::lookup_metadata_mutation_lock(&obj_path);
+                let volume_lock = os::disk_volume_mutation_lock(&self.root, volume);
                 (
-                    obj_path,
                     None,
                     self.io_get_object_path(volume, object)?,
                     self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?,
+                    metadata_lock,
+                    volume_lock,
                     None,
                 )
             }
         };
-        let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
-        let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+        // Lock ordering: metadata_lock -> volume_lock -> namespace_lock.
+        let metadata_owner = os::acquire_metadata_mutation_lease_with_lock(&metadata_lock, namespace_owner).await;
+        let volume_guard = volume_lock.clone().read_owned().await;
         let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
         let rollback = root.join(transaction.to_string());
         let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
         let sync = effective_durability(volume).syncs_recovery_protocol_state();
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
+        let receipt_namespace_lock = os::lookup_namespace_mutation_lock(&receipt_path);
+        let lease =
+            os::acquire_namespace_mutation_lease_with_lock_and_queue(&receipt_namespace_lock, self.blocking_queue.clone(), owner)
+                .await;
         let volume_str = volume.to_owned();
         let object_str = object.to_owned();
 
@@ -3554,7 +3602,6 @@ impl LocalDisk {
                         (
                             rollback,
                             PublishedDeleteReceiptEntry {
-                                object_path,
                                 bucket_path,
                                 file_path: root,
                                 staging_root,
@@ -3562,6 +3609,9 @@ impl LocalDisk {
                                 had_old_data_dir,
                                 rollback_dir_fd,
                                 file_path_dir,
+                                metadata_lock,
+                                volume_lock,
+                                receipt_namespace_lock,
                             },
                         )
                     });
@@ -3719,7 +3769,6 @@ impl LocalDisk {
             }
         };
         let (
-            object_path,
             bucket_path,
             staging_root,
             root,
@@ -3727,9 +3776,11 @@ impl LocalDisk {
             cached_had_old_data_dir,
             mut rollback_dir_fd,
             mut file_path_dir,
+            metadata_lock,
+            volume_lock,
+            cached_receipt_namespace_lock,
         ) = match cached_published {
             Some(entry) => (
-                entry.object_path,
                 entry.bucket_path,
                 entry.staging_root,
                 entry.file_path,
@@ -3737,6 +3788,9 @@ impl LocalDisk {
                 Some(entry.had_old_data_dir),
                 entry.rollback_dir_fd,
                 entry.file_path_dir,
+                entry.metadata_lock,
+                entry.volume_lock,
+                Some(entry.receipt_namespace_lock),
             ),
             None => {
                 self.reject_multipart_delete_recovery_mutation(volume, object)?;
@@ -3744,8 +3798,9 @@ impl LocalDisk {
                     return Err(DiskError::InvalidPath);
                 }
                 let obj_path = self.get_object_path(volume, object)?;
+                let metadata_lock = os::lookup_metadata_mutation_lock(&obj_path);
+                let volume_lock = os::disk_volume_mutation_lock(&self.root, volume);
                 (
-                    obj_path,
                     self.io_get_bucket_path(volume)?,
                     self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?,
                     self.io_get_object_path(volume, object)?,
@@ -3753,11 +3808,15 @@ impl LocalDisk {
                     None,
                     None,
                     None,
+                    metadata_lock,
+                    volume_lock,
+                    None,
                 )
             }
         };
-        let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
-        let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+        // Lock ordering: metadata_lock -> volume_lock -> namespace_lock.
+        let metadata_owner = os::acquire_metadata_mutation_lease_with_lock(&metadata_lock, namespace_owner).await;
+        let volume_guard = volume_lock.read_owned().await;
         let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
         let rollback = root.join(transaction.to_string());
         let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
@@ -3787,7 +3846,11 @@ impl LocalDisk {
         let has_original = journal.original_digest.is_some();
         let has_target = journal.target_digest.is_some();
         let journal_for_receipt = cached_journal_raw.is_none().then(|| journal.clone());
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
+        let receipt_namespace_lock =
+            cached_receipt_namespace_lock.unwrap_or_else(|| os::lookup_namespace_mutation_lock(&receipt_path));
+        let lease =
+            os::acquire_namespace_mutation_lease_with_lock_and_queue(&receipt_namespace_lock, self.blocking_queue.clone(), owner)
+                .await;
         let prune_paths: Vec<_> = if has_target {
             vec![rollback.clone()]
         } else {
@@ -9425,6 +9488,151 @@ mod tests {
                     .expect("finalize tx4")
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_version_preopened_dir_rejects_symlinks_and_reuses_lock_handles() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, disk, info, _) = fixture().await;
+        let opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            recoverable_delete: true,
+            ..Default::default()
+        };
+
+        // 1. Leaf symlink at `<bucket>/<object>` pointing to an existing directory must return InvalidPath
+        // on both the fused and non-fused paths.
+        let outside = tempfile::tempdir().expect("outside target dir");
+        let sentinel = outside.path().join("xl.meta");
+        fs::write(&sentinel, b"outside-sentinel").await.expect("write sentinel");
+        let symlink_obj_path = temp.path().join("recovery").join("symlink-leaf");
+        symlink(outside.path(), &symlink_obj_path).expect("create leaf symlink");
+        for check_opts in [opts.clone(), DeleteOptions::default()] {
+            assert_eq!(
+                disk.delete_version("recovery", "symlink-leaf", info.clone(), false, check_opts)
+                    .await
+                    .expect_err("leaf symlink must be rejected"),
+                DiskError::InvalidPath
+            );
+        }
+        assert_eq!(fs::read(&sentinel).await.expect("sentinel must survive"), b"outside-sentinel");
+
+        // 2. Dangling leaf symlink at `<bucket>/<object>` must return InvalidPath.
+        let dangling_obj_path = temp.path().join("recovery").join("dangling-leaf");
+        symlink(outside.path().join("nonexistent-target"), &dangling_obj_path).expect("create dangling symlink");
+        assert_eq!(
+            disk.delete_version("recovery", "dangling-leaf", info.clone(), false, opts.clone())
+                .await
+                .expect_err("dangling leaf symlink must be rejected"),
+            DiskError::InvalidPath
+        );
+
+        // 3. Symlinked bucket directory `<bucket>` must return InvalidPath.
+        let symlink_bucket_path = temp.path().join("symlink-bucket");
+        symlink(outside.path(), &symlink_bucket_path).expect("create bucket symlink");
+        assert_eq!(
+            disk.delete_version("symlink-bucket", "object", info.clone(), false, opts.clone())
+                .await
+                .expect_err("symlinked bucket must be rejected"),
+            DiskError::InvalidPath
+        );
+
+        // 4. Regular file at `<bucket>/<object>` must fall back cleanly to FileAccessDenied (ENOTDIR on xl.meta).
+        let regular_obj_path = temp.path().join("recovery").join("regular-file-obj");
+        fs::write(&regular_obj_path, b"not-a-directory")
+            .await
+            .expect("create regular file at object path");
+        assert_eq!(
+            disk.delete_version("recovery", "regular-file-obj", info.clone(), false, opts.clone())
+                .await
+                .expect_err("regular file at object path must fail with FileAccessDenied"),
+            DiskError::FileAccessDenied
+        );
+
+        // 5. Missing object at `<bucket>/<object>` must return FileVersionNotFound (when version_id is Some)
+        // and FileNotFound (when version_id is None).
+        assert_eq!(
+            disk.delete_version("recovery", "missing-object-key", info.clone(), false, opts.clone())
+                .await
+                .expect_err("missing versioned object must fail with FileVersionNotFound"),
+            DiskError::FileVersionNotFound
+        );
+        let mut unversioned_info = info.clone();
+        unversioned_info.version_id = None;
+        assert_eq!(
+            disk.delete_version("recovery", "missing-object-key", unversioned_info, false, opts.clone())
+                .await
+                .expect_err("missing unversioned object must fail with FileNotFound"),
+            DiskError::FileNotFound
+        );
+
+        // 6. Verify Stage 1 -> Stage 2 -> Stage 3 receipt entries preserve exact lock handle identity.
+        let tx = Uuid::new_v4();
+        let stage1_opts = DeleteOptions {
+            old_data_dir: Some(tx),
+            recoverable_delete: true,
+            ..Default::default()
+        };
+        disk.delete_version("recovery", "object", info.clone(), false, stage1_opts)
+            .await
+            .expect("Stage 1 via delete_version must succeed");
+        let tx_open_path = disk
+            .io_get_object_open_path("recovery", "object")
+            .expect("open path")
+            .join(tx.to_string());
+        let prepared_entry = take_prepared_delete_receipt(&tx_open_path).expect("Stage 1 must cache prepared receipt");
+        let object_path = disk.get_object_path("recovery", "object").expect("object path");
+        let expected_meta_lock = os::lookup_metadata_mutation_lock(&object_path);
+        let expected_vol_lock = os::disk_volume_mutation_lock(&disk.root, "recovery");
+        assert!(
+            prepared_entry.metadata_lock.ptr_eq(&expected_meta_lock),
+            "cached prepared metadata_lock must match registry lock"
+        );
+        assert!(
+            Arc::ptr_eq(&prepared_entry.volume_lock, &expected_vol_lock),
+            "cached prepared volume_lock must match registry lock"
+        );
+        put_prepared_delete_receipt(&tx_open_path, prepared_entry);
+
+        let (journal, _, _) = disk
+            .try_publish_prepared_delete_local("recovery", "object", tx, None)
+            .await
+            .expect("Stage 2 publish must succeed")
+            .expect("Stage 2 must return journal");
+        let published_entry = take_published_delete_receipt(&tx_open_path).expect("Stage 2 must cache published receipt");
+        let receipt_path = disk
+            .io_get_object_path("recovery", "object")
+            .expect("io object path")
+            .join(tx.to_string())
+            .join(DELETE_QUORUM_COMMITTED_FILE);
+        let expected_ns_lock = os::lookup_namespace_mutation_lock(&receipt_path);
+        assert!(
+            published_entry.metadata_lock.ptr_eq(&expected_meta_lock),
+            "cached published metadata_lock must match registry lock"
+        );
+        assert!(
+            Arc::ptr_eq(&published_entry.volume_lock, &expected_vol_lock),
+            "cached published volume_lock must match registry lock"
+        );
+        assert!(
+            published_entry.receipt_namespace_lock.ptr_eq(&expected_ns_lock),
+            "cached published receipt_namespace_lock must match registry lock"
+        );
+        let path_lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, None).await;
+        assert!(
+            Arc::ptr_eq(&disk.blocking_queue, &path_lease.blocking_queue_for_test()),
+            "disk.blocking_queue must match path-resolved blocking queue for receipt_path"
+        );
+        drop(path_lease);
+        put_published_delete_receipt(&tx_open_path, published_entry);
+
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", tx, &journal, None)
+                .await
+                .expect("Stage 3 finalize must succeed")
+        );
     }
 
     #[test]

@@ -3307,6 +3307,37 @@ fn disk_namespace_mutation_lock_by_key(key: &[u8]) -> Arc<NamespaceMutationLock>
 static DISK_METADATA_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
     LazyLock::new(ShardedPathLockRegistry::new);
 
+/// Distinct handle for the per-object metadata mutation lock domain so callers
+/// cannot accidentally swap metadata and namespace lock handles across stages.
+#[derive(Clone)]
+pub(crate) struct MetadataMutationLockHandle(Arc<NamespaceMutationLock>);
+
+impl MetadataMutationLockHandle {
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Distinct handle for the per-path namespace mutation lock domain.
+#[derive(Clone)]
+pub(in crate::disk) struct NamespaceMutationLockHandle(Arc<NamespaceMutationLock>);
+
+impl NamespaceMutationLockHandle {
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+pub(crate) fn lookup_metadata_mutation_lock(object: &Path) -> MetadataMutationLockHandle {
+    MetadataMutationLockHandle(DISK_METADATA_MUTATION_LOCKS.get_or_create(object, || AsyncMutex::new(())))
+}
+
+pub(in crate::disk) fn lookup_namespace_mutation_lock(path: &Path) -> NamespaceMutationLockHandle {
+    NamespaceMutationLockHandle(disk_namespace_mutation_lock(path))
+}
+
 /// Serializes the complete xl.meta read/modify/commit transaction. This domain
 /// precedes namespace/volume publication locks, whose narrower syscall leases
 /// may retain it after cancellation of the async caller.
@@ -3319,9 +3350,16 @@ pub(crate) async fn acquire_metadata_mutation_lease(
     object: &Path,
     owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<MetadataMutationLease> {
-    let lock = DISK_METADATA_MUTATION_LOCKS.get_or_create(object, || AsyncMutex::new(()));
+    let lock = lookup_metadata_mutation_lock(object);
+    acquire_metadata_mutation_lease_with_lock(&lock, owner).await
+}
+
+pub(crate) async fn acquire_metadata_mutation_lease_with_lock(
+    lock: &MetadataMutationLockHandle,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<MetadataMutationLease> {
     Arc::new(MetadataMutationLease {
-        _guard: lock.lock_owned().await,
+        _guard: lock.0.clone().lock_owned().await,
         _owner: owner,
     })
 }
@@ -3358,8 +3396,25 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
     let blocking_queue = disk_blocking_queue_for_path(path);
+    acquire_namespace_mutation_lease_with_queue(path, blocking_queue, namespace_owner).await
+}
+
+pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_queue(
+    path: &Path,
+    blocking_queue: Arc<DiskBlockingQueue>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
+    let lock = lookup_namespace_mutation_lock(path);
+    acquire_namespace_mutation_lease_with_lock_and_queue(&lock, blocking_queue, namespace_owner).await
+}
+
+pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_lock_and_queue(
+    lock: &NamespaceMutationLockHandle,
+    blocking_queue: Arc<DiskBlockingQueue>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
     Arc::new(NamespaceMutationLease {
-        _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
+        _namespace_guard: lock.0.clone().lock_owned().await,
         _staging_guard: None,
         _volume_guard: None,
         external_guard: Mutex::new(None),

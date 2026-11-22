@@ -10098,25 +10098,52 @@ impl LocalDisk {
                 .await;
         }
 
-        let (volume_dir, file_path) = self.io_get_bucket_and_object_path(volume, path)?;
-
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
         #[cfg(target_os = "linux")]
-        let object_path = {
+        let (volume_dir, file_path, object_path) = {
+            let (volume_dir, file_path) = build_local_disk_object_path(self.io_root(), volume, path);
+            check_local_disk_object_path_components(self.io_root(), &volume_dir, &file_path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
             let (root_bucket, object_path) = build_local_disk_object_path(&self.root, volume, path);
             check_local_disk_object_path_components(&self.root, &root_bucket, &object_path)?;
-            object_path
+            (volume_dir, file_path, object_path)
         };
         #[cfg(not(target_os = "linux"))]
-        let object_path = self.get_object_path(volume, path)?;
+        let (volume_dir, file_path, object_path) = {
+            let (volume_dir, file_path) = self.io_get_bucket_and_object_path(volume, path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+            let object_path = self.get_object_path(volume, path)?;
+            (volume_dir, file_path, object_path)
+        };
+
+        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+        // Lock ordering: metadata_lock -> volume_lock -> namespace_lock.
+        let metadata_lock = os::lookup_metadata_mutation_lock(&object_path);
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> =
-            Some(os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await);
+            Some(os::acquire_metadata_mutation_lease_with_lock(&metadata_lock, namespace_owner).await);
+        let mut volume_lock_opt = None;
         if opts.recoverable_delete || (opts.undo_write && opts.undo_delete) {
-            let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+            let volume_lock = os::disk_volume_mutation_lock(&self.root, volume);
+            let volume_guard = volume_lock.clone().read_owned().await;
+            volume_lock_opt = Some(volume_lock);
             namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
         }
+        #[cfg(target_os = "linux")]
+        let preopened_delete_dir = {
+            let fused_eligible = opts.old_data_dir.is_some()
+                && opts.recoverable_delete
+                && !opts.undo_write
+                && opts.expected_delete_marker.is_none()
+                && !pool_meta_native::is_object(&self.root, volume, path)
+                && !has_delete_version_test_failpoints();
+            if fused_eligible {
+                validate_and_open_local_disk_object_dir_at(self.io_root(), &self.mount_lease, &file_path)?
+            } else {
+                reject_local_disk_symlink_components_at(self.io_root(), &self.mount_lease, &file_path)?;
+                delete_recovery::PreopenedDeleteDir::Unopened
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let preopened_delete_dir = delete_recovery::PreopenedDeleteDir::Unopened;
         if pool_meta_native::is_object(&self.root, volume, path) {
             self.check_pool_meta_undo(&mut fi, &opts, &file_path).await?;
         }
@@ -10144,7 +10171,13 @@ impl LocalDisk {
                     &opts,
                     rollback_dir,
                     namespace_owner.clone(),
-                    Some((object_path, volume_dir.clone(), file_path.clone())),
+                    Some(delete_recovery::PrevalidatedDeleteContext {
+                        bucket_path: volume_dir.clone(),
+                        file_path: file_path.clone(),
+                        preopened_dir: preopened_delete_dir,
+                        metadata_lock,
+                        volume_lock: volume_lock_opt,
+                    }),
                 )
                 .await?
         {
@@ -14185,6 +14218,48 @@ fn reject_local_disk_symlink_components_at(root: &Path, root_fd: &std::fs::File,
         Err(LocalDiskPathValidationAtError::InvalidPath) => Err(DiskError::InvalidPath),
         Err(LocalDiskPathValidationAtError::Io(err)) => Err(to_file_error(err).into()),
     }
+}
+
+/// Validate `path` beneath `root_fd` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`
+/// and open the object directory (`O_RDONLY | O_DIRECTORY | O_CLOEXEC`) in a
+/// single `openat2` syscall when it already exists as a directory.
+///
+/// Must be called after `metadata_mutation_lease` (and `volume_guard` for
+/// recoverable deletes) has been acquired so the returned directory descriptor
+/// cannot reference a pre-lease stale directory inode.
+#[cfg(target_os = "linux")]
+fn validate_and_open_local_disk_object_dir_at(
+    root: &Path,
+    root_fd: &std::fs::File,
+    path: &Path,
+) -> Result<delete_recovery::PreopenedDeleteDir> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+
+    let path = normalize_path_cow(path);
+    let relative = disk_path_strip_prefix_normalized(&path, root)?;
+    if relative.as_os_str().is_empty() {
+        return Ok(delete_recovery::PreopenedDeleteDir::Unopened);
+    }
+    let has_dotdot = rustfs_utils::path::unix_path_has_dotdot_segment(relative.as_os_str().as_encoded_bytes());
+    if !has_dotdot {
+        match openat2(
+            root_fd,
+            relative,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => {
+                return Ok(delete_recovery::PreopenedDeleteDir::Opened(Arc::new(std::fs::File::from(fd))));
+            }
+            Err(Errno::LOOP | Errno::XDEV) => return Err(DiskError::InvalidPath),
+            Err(Errno::NOENT) => return Ok(delete_recovery::PreopenedDeleteDir::MissingOrNotDir),
+            Err(_) => {}
+        }
+    }
+    reject_local_disk_symlink_components_at(root, root_fd, &path)?;
+    Ok(delete_recovery::PreopenedDeleteDir::Unopened)
 }
 
 #[cfg(target_os = "linux")]
