@@ -205,6 +205,18 @@ impl DataUsageCache {
             },
             objects: accepted.map(|(objects, _)| u64::try_from(objects)).transpose().ok()?,
             size: accepted.map(|(_, size)| u64::try_from(size)).transpose().ok()?,
+            blocker: (completed.is_none()).then(|| {
+                self.info
+                    .scan_checkpoint
+                    .as_ref()
+                    .map_or("unknown", |checkpoint| match checkpoint.reason {
+                        DataUsageScanCheckpointReason::Runtime => "runtime_budget",
+                        DataUsageScanCheckpointReason::Objects => "object_budget",
+                        DataUsageScanCheckpointReason::Directories => "directory_budget",
+                        DataUsageScanCheckpointReason::Unknown => "unknown",
+                    })
+                    .to_owned()
+            }),
         })
     }
 
@@ -249,6 +261,7 @@ impl DataUsageCache {
         // previous accepted sample and its original time until it has another
         // measured range. This is a whole observation, never an added delta.
         let sample = previous
+            .as_ref()
             .filter(|previous| {
                 sample.objects.is_none()
                     && previous.objects.is_some()
@@ -262,7 +275,29 @@ impl DataUsageCache {
                     && previous.set_layout == sample.set_layout
                     && (previous.scanner_epoch, previous.scanner_cycle) <= (sample.scanner_epoch, sample.scanner_cycle)
             })
+            .cloned()
             .unwrap_or(sample);
+        // Idempotent per durable position: repeated checkpoints at the same
+        // cycle, epoch and accepted values must not churn the shared object.
+        // A later turn in the same cycle still replaces it when the sample
+        // grew, and completion always publishes the final authoritative value.
+        if let Some(previous) = &previous
+            && previous.matches(
+                &sample.bucket,
+                &sample.bucket_incarnation,
+                (sample.pool_index, sample.set_index),
+                movement_generation,
+            )
+            && previous.set_layout == sample.set_layout
+            && previous.scanner_epoch == sample.scanner_epoch
+            && previous.scanner_cycle == sample.scanner_cycle
+            && previous.stage == sample.stage
+            && previous.objects == sample.objects
+            && previous.size == sample.size
+            && previous.blocker == sample.blocker
+        {
+            return None;
+        }
         Some((path, serde_json::to_vec(&sample).ok()?, revision))
     }
 

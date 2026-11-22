@@ -206,6 +206,7 @@ mod tests {
             },
             objects: Some(objects),
             size: Some(objects * 11),
+            blocker: None,
         };
         let partial: BoxStream<'static, ProgressEvent> = futures::stream::iter([
             futures::future::ready(("partial".into(), sample("partial", 0, 7, false))).boxed(),
@@ -271,6 +272,7 @@ mod tests {
             stage: BucketScanStage::Scanning,
             objects: Some(7),
             size: Some(71),
+            blocker: None,
         };
         (dirs, store, sample)
     }

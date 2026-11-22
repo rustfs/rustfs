@@ -426,6 +426,15 @@ pub struct BucketScanProgress {
     pub size: Option<u64>,
     pub sources_observed: u64,
     pub sources_total: u64,
+    /// True while the sample is not an authoritative complete sweep.
+    #[serde(default)]
+    pub partial: bool,
+    /// True only when every expected source completed and agrees.
+    #[serde(default)]
+    pub converged: bool,
+    /// The dominant incomplete stage, when the writer reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

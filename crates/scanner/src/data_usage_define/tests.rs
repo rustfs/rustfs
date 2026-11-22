@@ -3613,7 +3613,13 @@ fn durable_progress_rejects_reset_regression_and_uncommitted_discovery() {
     assert!(!before.advanced_from(&committed), "a reset is not progress");
     let mut replaced = committed.clone();
     replaced.identity.as_mut().expect("identity").publication_epoch += 1;
-    assert!(!replaced.advanced_from(&before));
+    assert!(
+        replaced.advanced_from(&before),
+        "a process-local publication epoch change is not cursor regression"
+    );
+    let mut replaced = committed.clone();
+    replaced.identity.as_mut().expect("identity").bucket_incarnation = uuid::Uuid::from_u128(8);
+    assert!(!replaced.advanced_from(&before), "a changed bucket scope is not progress");
     replaced = committed;
     replaced.started_plan = Some(DataUsageScanPlanDigest([99; 32]));
     assert!(!replaced.advanced_from(&before), "plan changes alone cannot earn another turn");
