@@ -1913,6 +1913,7 @@ async fn scanner_item_object_lock_uses_cached_config() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
     let resolved = object_lock_config_for_scanner_item(&item)
@@ -5242,6 +5243,7 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
     let before = global_metrics().scan_observation().snapshot().metadata_reads;
@@ -5322,6 +5324,7 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
     let before = global_metrics().scan_observation().snapshot().metadata_reads;
@@ -5416,6 +5419,7 @@ async fn get_size_counts_delete_markers_separately_from_versions() {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
 
     let before = global_metrics().scan_observation().snapshot().metadata_reads;

@@ -475,6 +475,7 @@ async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     disk.get_size(item).await.expect("scanner get_size should succeed");
 }
@@ -513,6 +514,7 @@ async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
+        notification_bucket_incarnation: None,
     };
     disk.get_size(item).await.expect("scanner get_size should succeed");
 }

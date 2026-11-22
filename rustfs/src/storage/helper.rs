@@ -52,6 +52,7 @@ use tracing::{Instrument, info_span, warn};
 
 /// The request fields used to build an audit entry, shared by both request edges.
 pub(crate) struct AuditRequestView<'a> {
+    bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     headers: &'a HeaderMap,
     uri: &'a Uri,
     pub(crate) req_info: Option<&'a ReqInfo>,
@@ -64,6 +65,12 @@ impl<'a> AuditRequestView<'a> {
     #[cfg(test)]
     pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
         Self {
+            bucket_generation: super::authorization::PendingDeleteBucketGenerationGuard::resolve_generation(
+                req.extensions.get(),
+                req.extensions.get(),
+            )
+            .ok()
+            .flatten(),
             headers: &req.headers,
             uri: &req.uri,
             req_info: req.extensions.get::<ReqInfo>(),
@@ -84,8 +91,10 @@ impl<'a> AuditRequestView<'a> {
         client_info: Option<&'a ClientInfo>,
         remote_addr: Option<SocketAddr>,
         request_context: Option<&'a RequestContext>,
+        bucket_generation: Option<&'a super::authorization::BucketGenerationGuard>,
     ) -> Self {
         Self {
+            bucket_generation,
             headers,
             uri,
             req_info,
@@ -502,7 +511,12 @@ impl OperationHelper {
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = if notify_enabled {
+            let incarnation_id = req
+                .bucket_generation
+                .filter(|guard| guard.bucket == bucket)
+                .map(|guard| guard.incarnation_id);
             let mut event_builder = EventArgsBuilder::new(event, bucket, convert_ecstore_object_info(event_object))
+                .bucket_incarnation_id(incarnation_id)
                 .host(get_request_host(req.headers))
                 .port(get_request_port(req.headers))
                 .user_agent(get_request_user_agent(req.headers))
@@ -550,6 +564,25 @@ impl OperationHelper {
             Self::Enabled(state) => state.event_builder.clone().map(|builder| builder.build()),
             Self::Disabled => None,
         }
+    }
+
+    pub(crate) fn with_bucket_incarnation_id(mut self, incarnation: Option<uuid::Uuid>) -> Self {
+        if let Self::Enabled(helper) = &mut self
+            && let Some(builder) = helper.event_builder.take()
+        {
+            helper.event_builder = Some(builder.bucket_incarnation_id(incarnation));
+        }
+        self
+    }
+
+    pub(crate) fn with_bucket_removed_targets(mut self, targets: rustfs_notify::rules::TargetIdSet) -> Self {
+        if let Self::Enabled(state) = &mut self {
+            state.event_builder = state
+                .event_builder
+                .take()
+                .map(|builder| builder.bucket_removed_targets(targets));
+        }
+        self
     }
 
     /// Sets the ObjectInfo for event notification.
@@ -1070,6 +1103,48 @@ mod tests {
             Some("s3:DeleteObject")
         );
         assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[test]
+    fn notification_view_uses_the_generation_validated_for_deferred_deletes() {
+        use crate::storage::authorization::{BucketGenerationGuard, PendingDeleteBucketGenerationGuard};
+
+        let ordinary = uuid::Uuid::new_v4();
+        let deleted = uuid::Uuid::new_v4();
+        let mut request = build_request((), Method::DELETE, "/bucket/object".parse().expect("delete URI"));
+        request.extensions.insert(BucketGenerationGuard {
+            bucket: "bucket".to_string(),
+            incarnation_id: ordinary,
+        });
+        request
+            .extensions
+            .insert(PendingDeleteBucketGenerationGuard::Ready(BucketGenerationGuard {
+                bucket: "bucket".to_string(),
+                incarnation_id: deleted,
+            }));
+        assert_eq!(
+            super::AuditRequestView::legacy(&request)
+                .bucket_generation
+                .map(|guard| guard.incarnation_id),
+            Some(deleted),
+            "delete notifications must use the deferred guard that storage validates"
+        );
+        request.extensions.insert(PendingDeleteBucketGenerationGuard::Failed {
+            code: rustfs_s3_types::S3ErrorCode::NoSuchBucket,
+            message: "bucket generation unavailable".to_string(),
+        });
+        assert!(
+            super::AuditRequestView::legacy(&request).bucket_generation.is_none(),
+            "a failed deferred capture must not fall back to another generation"
+        );
+        request.extensions.remove::<PendingDeleteBucketGenerationGuard>();
+        assert_eq!(
+            super::AuditRequestView::legacy(&request)
+                .bucket_generation
+                .map(|guard| guard.incarnation_id),
+            Some(ordinary),
+            "ordinary operations retain their original generation"
+        );
     }
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {

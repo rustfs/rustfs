@@ -62,7 +62,8 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::L
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState as EcstoreExpiryState;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
-    apply_expiry_rule as ecstore_apply_expiry_rule, apply_transition_rule as ecstore_apply_transition_rule,
+    apply_expiry_rule as ecstore_apply_expiry_rule,
+    apply_transition_rule_with_incarnation as ecstore_apply_transition_rule_with_incarnation,
     lifecycle_version_delete_target as ecstore_lifecycle_version_delete_target,
 };
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::object_opts_from_object_info as ecstore_object_opts_from_object_info;
@@ -244,9 +245,9 @@ pub(crate) mod owner {
         EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
         EcstoreVersioningApi, EcstoreVersioningConfiguration, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY,
         ScannerPublicationCommitScope, ScannerPublicationCommitState, ScannerReplicationHealObject, ScannerReplicationHealResult,
-        ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle,
-        ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
-        ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
+        ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule_with_incarnation,
+        ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
+        ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
         ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure, ecstore_is_reserved_or_invalid_bucket,
         ecstore_lifecycle_version_delete_target, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
         ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,

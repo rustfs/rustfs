@@ -72,10 +72,11 @@ pub mod bucket {
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
                 ManualTransitionRunReport, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
-                apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
-                enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
-                enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
+                apply_transition_rule, apply_transition_rule_with_incarnation, enqueue_expiry_for_existing_objects,
+                enqueue_transition_for_existing_objects, enqueue_transition_for_existing_objects_scoped,
+                enqueue_transition_for_existing_objects_scoped_with_cancel, enqueue_transition_immediate,
+                expire_transitioned_object, get_global_expiry_state, get_global_transition_state, init_background_expiry,
+                lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
                 run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
@@ -348,7 +349,7 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args, check_object_args,
             check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
             has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };

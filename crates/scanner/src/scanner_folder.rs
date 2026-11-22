@@ -209,13 +209,21 @@ fn scanner_alert_emission_allows(kind: ScannerAlertKind, bucket: &str, object: &
 /// Emit a scanner alert as an S3 notification event through the standard
 /// dispatch pipeline. Fire-and-forget: the notify layer owns delivery,
 /// retry, and target filtering; the scanner never waits on it.
-fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: i64, details: &[(&str, String)]) {
+fn emit_scanner_alert_event(
+    event_name: &str,
+    bucket: &str,
+    object: &str,
+    size: i64,
+    bucket_incarnation_id: Option<uuid::Uuid>,
+    details: &[(&str, String)],
+) {
     let mut req_params = HashMap::with_capacity(details.len());
     for (key, value) in details {
         req_params.insert((*key).to_string(), value.clone());
     }
     ecstore_send_event(EcstoreEventArgs {
         event_name: event_name.to_string(),
+        bucket_incarnation_id,
         bucket_name: bucket.to_string(),
         object: crate::ScannerObjectInfo {
             bucket: bucket.to_string(),
@@ -839,6 +847,9 @@ pub struct FolderScanner {
     budget: Arc<ScannerCycleBudget>,
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
+    /// Identity captured at the start of this bucket scan. Events produced by
+    /// the scan remain unbound when the identity cannot be established.
+    pub(crate) notification_bucket_incarnation: Option<uuid::Uuid>,
     local_stop: Option<Arc<crate::scanner_io::ScannerLocalStop>>,
     /// Tier registry frozen for this folder scan. A refresh applies to the
     /// next scan and cannot mix generations in one aggregate.
@@ -1661,6 +1672,7 @@ impl FolderScanner {
                 &self.root,
                 folder,
                 0,
+                self.notification_bucket_incarnation,
                 &[("folders", total_folders.to_string()), ("threshold", threshold.to_string())],
             );
         }
@@ -2417,6 +2429,7 @@ impl FolderScanner {
                     heal_bitrot: self.scan_mode == HealScanMode::Deep,
                     debug: self.data_usage_scanner_debug,
                     file_type: entry_type,
+                    notification_bucket_incarnation: self.notification_bucket_incarnation,
                 };
 
                 // Keep failed paths visible to this scan so repair success can
@@ -3505,6 +3518,10 @@ pub(crate) async fn scan_data_folder_scoped(
         global_metrics().record_scanner_checkpoint_used();
     }
     let bucket_name = clone_cache_value(&cache.info.name);
+    let notification_bucket_incarnation = match crate::storage_api::ecstore_resolve_object_store_handle() {
+        Some(store) => store.bucket_incarnation_id(&bucket_name).await.ok(),
+        None => None,
+    };
     let object_metadata_visits = metrics::counter!(
         "rustfs_scanner_object_metadata_visits_total",
         "bucket" => bucket_name.clone(),
@@ -3563,6 +3580,7 @@ pub(crate) async fn scan_data_folder_scoped(
         budget: budget.clone(),
         skip_heal,
         local_disk,
+        notification_bucket_incarnation,
         local_stop,
         tier_registry,
         pending_heals_changed: false,

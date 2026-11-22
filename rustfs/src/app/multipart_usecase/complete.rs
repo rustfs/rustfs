@@ -557,13 +557,18 @@ impl DefaultMultipartUsecase {
                         }
                     }
 
-                    enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+                    enqueue_transition_immediate(
+                        &obj_info,
+                        LcEventSrc::S3CompleteMultipartUpload,
+                        opts.expected_bucket_incarnation_id,
+                    )
+                    .await;
 
                     if let Some(decision) = completion_replication_decision
                         && decision.replicate_any()
                     {
                         warn!("need multipart replication");
-                        schedule_object_replication(obj_info.clone(), store, decision).await;
+                        schedule_object_replication(obj_info.clone(), store, decision, opts.expected_bucket_incarnation_id).await;
                     }
 
                     rustfs_scanner::record_dirty_usage_object_from_producer(
