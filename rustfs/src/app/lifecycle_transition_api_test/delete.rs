@@ -16,13 +16,18 @@
 
 use super::common::*;
 use super::*;
+use crate::app::object_usecase::{DeleteBatchEntry, DeleteBatchInput};
 use crate::app::test_seams;
 use rustfs_s3_types::S3ErrorCode as OwnedErrorCode;
 
 fn owner_delete_envelope(headers: HeaderMap) -> crate::app::RequestEnvelope {
+    owner_envelope(Method::DELETE, headers)
+}
+
+fn owner_envelope(method: Method, headers: HeaderMap) -> crate::app::RequestEnvelope {
     use super::super::storage_api::test::ReqInfo;
 
-    let mut envelope = request_envelope(Method::DELETE, headers);
+    let mut envelope = request_envelope(method, headers);
     envelope.install_req_info(ReqInfo {
         cred: Some(rustfs_credentials::Credentials::default()),
         is_owner: true,
@@ -261,8 +266,8 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
 #[serial]
 #[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
 async fn delete_objects_resolves_bucket_versioning_once_per_request() {
+    use super::super::storage_api::test::VERSIONING_CONFIG_LOOKUPS;
     use super::super::storage_api::test::bucket::replication::DELETE_CONFIG_SNAPSHOT_LOADS;
-    use super::super::storage_api::test::{ReqInfo, VERSIONING_CONFIG_LOOKUPS};
     use std::sync::atomic::Ordering;
 
     let (_disk_paths, ecstore) = setup_test_env().await;
@@ -276,37 +281,26 @@ async fn delete_objects_resolves_bucket_versioning_once_per_request() {
         upload_test_object(&ecstore, bucket.as_str(), key, b"delete objects versioning payload").await;
     }
 
-    let input = DeleteObjectsInput::builder()
-        .bucket(bucket.clone())
-        .delete(Delete {
-            objects: keys
-                .iter()
-                .map(|key| ObjectIdentifier {
-                    key: key.to_string(),
-                    version_id: None,
-                    ..Default::default()
-                })
-                .collect(),
-            quiet: None,
-        })
-        .build()
-        .expect("delete objects input should build");
-
-    let mut req = build_request(input, Method::POST);
-    req.extensions.insert(ReqInfo {
-        cred: Some(rustfs_credentials::Credentials::default()),
-        is_owner: true,
-        ..Default::default()
-    });
+    let input = DeleteBatchInput {
+        bucket: bucket.clone(),
+        objects: keys
+            .iter()
+            .map(|key| DeleteBatchEntry {
+                key: key.to_string(),
+                version_id: None,
+                ..Default::default()
+            })
+            .collect(),
+        quiet: None,
+    };
 
     let lookups_before = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst);
     let snapshots_before = DELETE_CONFIG_SNAPSHOT_LOADS.load(Ordering::SeqCst);
-    let response = usecase
-        .execute_delete_objects_from_s3s(req)
+    let output = usecase
+        .execute_delete_objects(owner_envelope(Method::POST, HeaderMap::new()), input)
         .await
         .expect("delete objects should succeed");
 
-    let output = response.output;
     let errors = output.errors.unwrap_or_default();
     assert!(errors.is_empty(), "DeleteObjects reported per-key errors: {errors:?}");
     assert_eq!(
@@ -330,8 +324,6 @@ async fn delete_objects_resolves_bucket_versioning_once_per_request() {
 #[serial]
 #[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
 async fn delete_objects_treats_empty_directory_version_as_absent() {
-    use super::super::storage_api::test::ReqInfo;
-
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
     let bucket = format!("test-delobjs-empty-version-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -339,33 +331,21 @@ async fn delete_objects_treats_empty_directory_version_as_absent() {
     create_test_bucket(&ecstore, &bucket).await;
     upload_test_object(&ecstore, &bucket, object, b"").await;
 
-    let input = DeleteObjectsInput::builder()
-        .bucket(bucket)
-        .delete(Delete {
-            objects: vec![ObjectIdentifier {
-                key: object.to_string(),
-                version_id: Some(" \t ".to_string()),
-                ..Default::default()
-            }],
-            quiet: None,
-        })
-        .build()
-        .expect("delete objects input should build");
-    let mut req = build_request(input, Method::POST);
-    req.extensions.insert(ReqInfo {
-        cred: Some(rustfs_credentials::Credentials::default()),
-        is_owner: true,
-        ..Default::default()
-    });
+    let input = DeleteBatchInput {
+        bucket,
+        objects: vec![DeleteBatchEntry {
+            key: object.to_string(),
+            version_id: Some(" \t ".to_string()),
+            ..Default::default()
+        }],
+        quiet: None,
+    };
 
-    let response = usecase
-        .execute_delete_objects_from_s3s(req)
+    let output = usecase
+        .execute_delete_objects(owner_envelope(Method::POST, HeaderMap::new()), input)
         .await
         .expect("empty VersionId should be treated as an absent version");
-    let deleted = response
-        .output
-        .deleted
-        .expect("delete response should contain the directory entry");
+    let deleted = output.deleted.expect("delete response should contain the directory entry");
 
     assert_eq!(deleted.len(), 1);
     assert_eq!(
@@ -379,8 +359,6 @@ async fn delete_objects_treats_empty_directory_version_as_absent() {
 #[serial]
 #[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
 async fn delete_objects_preserves_explicit_null_directory_version() {
-    use super::super::storage_api::test::ReqInfo;
-
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
     let bucket = format!("test-delobjs-null-version-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -388,33 +366,21 @@ async fn delete_objects_preserves_explicit_null_directory_version() {
     create_test_bucket(&ecstore, &bucket).await;
     upload_test_object(&ecstore, &bucket, object, b"").await;
 
-    let input = DeleteObjectsInput::builder()
-        .bucket(bucket)
-        .delete(Delete {
-            objects: vec![ObjectIdentifier {
-                key: object.to_string(),
-                version_id: Some("null".to_string()),
-                ..Default::default()
-            }],
-            quiet: None,
-        })
-        .build()
-        .expect("delete objects input should build");
-    let mut req = build_request(input, Method::POST);
-    req.extensions.insert(ReqInfo {
-        cred: Some(rustfs_credentials::Credentials::default()),
-        is_owner: true,
-        ..Default::default()
-    });
+    let input = DeleteBatchInput {
+        bucket,
+        objects: vec![DeleteBatchEntry {
+            key: object.to_string(),
+            version_id: Some("null".to_string()),
+            ..Default::default()
+        }],
+        quiet: None,
+    };
 
-    let response = usecase
-        .execute_delete_objects_from_s3s(req)
+    let output = usecase
+        .execute_delete_objects(owner_envelope(Method::POST, HeaderMap::new()), input)
         .await
         .expect("explicit null VersionId should delete the directory's null version");
-    let deleted = response
-        .output
-        .deleted
-        .expect("delete response should contain the directory entry");
+    let deleted = output.deleted.expect("delete response should contain the directory entry");
 
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].delete_marker, None);
@@ -718,8 +684,6 @@ async fn replica_delete_replication_config_failure_leaves_object_intact() {
 #[tokio::test]
 #[serial]
 async fn delete_objects_replication_config_failure_does_not_call_storage_delete() {
-    use super::super::storage_api::test::ReqInfo;
-
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
     let bucket = format!("test-delete-repls-fail-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -729,31 +693,22 @@ async fn delete_objects_replication_config_failure_does_not_call_storage_delete(
     upload_test_object(&ecstore, &bucket, object, payload).await;
     install_malformed_replication_config(&bucket).await;
 
-    let input = DeleteObjectsInput::builder()
-        .bucket(bucket.clone())
-        .delete(Delete {
-            objects: vec![ObjectIdentifier {
-                key: object.to_string(),
-                version_id: None,
-                ..Default::default()
-            }],
-            quiet: None,
-        })
-        .build()
-        .expect("delete objects input should build");
-    let mut req = build_request(input, Method::POST);
-    req.extensions.insert(ReqInfo {
-        cred: Some(rustfs_credentials::Credentials::default()),
-        is_owner: true,
-        ..Default::default()
-    });
+    let input = DeleteBatchInput {
+        bucket: bucket.clone(),
+        objects: vec![DeleteBatchEntry {
+            key: object.to_string(),
+            version_id: None,
+            ..Default::default()
+        }],
+        quiet: None,
+    };
 
     let err = usecase
-        .execute_delete_objects_from_s3s(req)
+        .execute_delete_objects(owner_envelope(Method::POST, HeaderMap::new()), input)
         .await
         .expect_err("replication config failure must reject DeleteObjects");
 
-    assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    assert_eq!(err.code(), &OwnedErrorCode::InternalError);
     assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
 }
 

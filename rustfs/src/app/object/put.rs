@@ -2639,19 +2639,32 @@ mod tests {
             .map_err(S3Error::from)
     }
 
-    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
-    fn method_only_put_envelope() -> crate::app::RequestEnvelope {
-        crate::app::RequestEnvelope::from_parts(
+    fn put_envelope(uri: http::Uri, headers: HeaderMap, extensions: http::Extensions) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
             crate::app::RequestHead {
                 method: Method::PUT,
-                uri: http::Uri::from_static("/"),
-                headers: HeaderMap::new(),
+                uri,
+                headers,
                 credentials: None,
                 region: None,
                 service: None,
             },
-            http::Extensions::new(),
+            extensions,
         )
+    }
+
+    fn method_only_put_envelope() -> RequestEnvelope {
+        put_envelope(http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new())
+    }
+
+    fn put_bytes(bucket: String, key: &str, bytes: Bytes) -> PutObjectWriteInput {
+        PutObjectWriteInput {
+            bucket,
+            key: key.to_owned(),
+            content_length: Some(i64::try_from(bytes.len()).expect("test payload length must fit i64")),
+            body: Some(NativeBody::from_bytes(bytes)),
+            ..Default::default()
+        }
     }
 
     async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
@@ -3055,10 +3068,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_content_length_stream_rejects_the_first_chunk_over_limit() {
-        let inner = StreamingBlob::wrap(futures::stream::iter([
-            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"1234")),
-            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"56")),
-        ]));
+        let inner = futures::stream::iter([Ok(Bytes::from_static(b"1234")), Ok(Bytes::from_static(b"56"))]);
         let mut limited = MaxContentLengthStream {
             inner,
             limit: 5,
@@ -3074,7 +3084,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_content_length_stream_allows_exact_limit() {
-        let inner = StreamingBlob::from_bytes(Bytes::from_static(b"12345"));
+        let inner = futures::stream::iter([Ok(Bytes::from_static(b"12345"))]);
         let mut limited = MaxContentLengthStream {
             inner,
             limit: 5,
@@ -3319,15 +3329,12 @@ mod tests {
         let post_store_resume = Arc::new(tokio::sync::Barrier::new(2));
         install_put_post_store_test_hook(bucket.clone(), Arc::clone(&post_store_entered), Arc::clone(&post_store_resume));
         let payload = Bytes::from_static(b"replacement");
-        let put_input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key(object.to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("PUT input must build");
+        let put_input = put_bytes(bucket, object, payload.clone());
         let put_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let put = tokio::spawn(async move { put_method_only(&put_usecase, put_input).await });
+        let put =
+            tokio::spawn(
+                async move { Box::pin(put_usecase.execute_put_object_owned(method_only_put_envelope(), put_input)).await },
+            );
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.snapshot().write_stalled {
                 tokio::task::yield_now().await;
@@ -3377,17 +3384,14 @@ mod tests {
         install_put_post_store_test_hook(bucket.clone(), Arc::clone(&post_store_entered), Arc::clone(&post_store_resume));
 
         let payload = Bytes::from_static(b"published despite caller cancellation");
-        let put_input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("PUT input must build");
+        let put_input = put_bytes(bucket.clone(), object, payload.clone());
         let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let mut request = build_request(put_input, Method::PUT);
-        request.uri = format!("/{bucket}/{object}").parse().expect("PUT URI");
-        let put = tokio::spawn(async move { put_owned(&put_usecase, request).await });
+        let envelope = put_envelope(
+            format!("/{bucket}/{object}").parse().expect("PUT URI"),
+            HeaderMap::new(),
+            http::Extensions::new(),
+        );
+        let put = tokio::spawn(async move { Box::pin(put_usecase.execute_put_object_owned(envelope, put_input)).await });
 
         tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
             .await
@@ -3421,16 +3425,13 @@ mod tests {
             .expect("cancelled request's owned commit must still publish the object");
         assert_eq!(recovered.size, i64::try_from(payload.len()).expect("test payload length must fit i64"));
         probe.wait_for(1, 1).await;
-        let normal_input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("normal.bin".to_owned())
-            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"normal")))))
-            .content_length(Some(6))
-            .build()
-            .expect("normal PUT");
-        let mut normal_request = build_request(normal_input, Method::PUT);
-        normal_request.uri = format!("/{bucket}/normal.bin").parse().expect("URI");
-        put_owned(&DefaultObjectUsecase::with_context(Some(context)), normal_request)
+        let normal_input = put_bytes(bucket.clone(), "normal.bin", Bytes::from_static(b"normal"));
+        let envelope = put_envelope(
+            format!("/{bucket}/normal.bin").parse().expect("URI"),
+            HeaderMap::new(),
+            http::Extensions::new(),
+        );
+        Box::pin(DefaultObjectUsecase::with_context(Some(context)).execute_put_object_owned(envelope, normal_input))
             .await
             .expect("normal response completion");
         let audits = probe.audits.lock().expect("audits");
@@ -3457,20 +3458,17 @@ mod tests {
             .expect("buffered PUT progress bucket must be created");
 
         let extra_body_object = "zero-byte-extra.bin";
-        let extra_body_input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(extra_body_object.to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"x")))))
-            .content_length(Some(88))
-            .build()
-            .expect("zero-byte extra-body PUT input must build");
+        let extra_body_input = PutObjectWriteInput {
+            content_length: Some(88),
+            ..put_bytes(bucket.clone(), extra_body_object, Bytes::from_static(b"x"))
+        };
         let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let mut extra_body_request = build_request(extra_body_input, Method::PUT);
-        extra_body_request.headers = streaming_headers(Some("0"));
-        let extra_body_err = put_owned(&extra_body_usecase, extra_body_request)
+        let extra_body_envelope =
+            put_envelope(http::Uri::from_static("/"), streaming_headers(Some("0")), http::Extensions::new());
+        let extra_body_err = Box::pin(extra_body_usecase.execute_put_object_owned(extra_body_envelope, extra_body_input))
             .await
             .expect_err("decoded zero-byte PUT with body data must fail");
-        assert_eq!(extra_body_err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(extra_body_err.code(), &OwnedS3ErrorCode::UnexpectedContent);
         assert!(!object_traffic_health.snapshot().write_stalled);
         let lookup_err = store
             .get_object_info(&bucket, extra_body_object, &ObjectOptions::default())
@@ -3488,22 +3486,22 @@ mod tests {
             .expect("zero-byte PUT namespace lock must be held");
         let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
         let (body_release_tx, body_release_rx) = tokio::sync::oneshot::channel();
-        let pending_zero_body = StreamingBlob::wrap(futures::stream::once(async move {
+        let pending_zero_body = super::super::native_body::from_io_stream(futures::stream::once(async move {
             body_polled_tx.send(()).expect("zero-byte body poll signal must be received");
             body_release_rx.await.expect("zero-byte body EOF must be released");
             Ok::<Bytes, std::io::Error>(Bytes::new())
         }));
-        let zero_input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(zero_object.to_string())
-            .body(Some(pending_zero_body))
-            .content_length(Some(87))
-            .build()
-            .expect("zero-byte PUT input must build");
+        let zero_input = PutObjectWriteInput {
+            bucket: bucket.clone(),
+            key: zero_object.to_string(),
+            body: Some(pending_zero_body),
+            content_length: Some(87),
+            ..Default::default()
+        };
         let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let mut zero_request = build_request(zero_input, Method::PUT);
-        zero_request.headers = streaming_headers(Some("0"));
-        let zero_put = tokio::spawn(async move { put_owned(&zero_usecase, zero_request).await });
+        let zero_envelope = put_envelope(http::Uri::from_static("/"), streaming_headers(Some("0")), http::Extensions::new());
+        let zero_put =
+            tokio::spawn(async move { Box::pin(zero_usecase.execute_put_object_owned(zero_envelope, zero_input)).await });
 
         tokio::time::timeout(Duration::from_secs(30), body_polled_rx)
             .await
@@ -3547,15 +3545,11 @@ mod tests {
             .get_write_lock(Duration::from_secs(30))
             .await
             .expect("zero-copy PUT namespace lock must be held");
-        let zero_copy_input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key(zero_copy_object.to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(zero_copy_payload))))
-            .content_length(Some(zero_copy_size))
-            .build()
-            .expect("zero-copy PUT input must build");
+        let zero_copy_input = put_bytes(bucket, zero_copy_object, zero_copy_payload);
         let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let zero_copy_put = tokio::spawn(async move { put_method_only(&zero_copy_usecase, zero_copy_input).await });
+        let zero_copy_put = tokio::spawn(async move {
+            Box::pin(zero_copy_usecase.execute_put_object_owned(method_only_put_envelope(), zero_copy_input)).await
+        });
 
         tokio::time::timeout(Duration::from_secs(30), async {
             while !object_traffic_health.snapshot().write_stalled {
@@ -3582,8 +3576,8 @@ mod tests {
     async fn put_object_body_read_timeout_guard_aborts_on_stall() {
         // Inner stream never yields and never reports EOF (a proxy that forwarded
         // a partial body then went silent while holding the connection open).
-        let inner = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
+        let inner: UploadChunks = Box::new(futures::stream::pending());
+        let (mut guarded, _) = super::super::request_body::guard_native_upload_progress(
             inner,
             Duration::from_millis(1),
             "test-bucket",
@@ -3612,7 +3606,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_preserves_length_and_passes_through() {
-        let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"hello world")));
+        let body = StreamingBlob::from_bytes(Bytes::from_static(b"hello world"));
         assert_eq!(body.remaining_length().exact(), Some(11));
 
         let (mut guarded, _) = super::super::request_body::guard_upload_progress(
@@ -3635,9 +3629,15 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_disabled_passthrough() {
-        let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"data")));
-        let (mut guarded, _) =
-            super::super::request_body::guard_upload_progress(body, Duration::ZERO, "test-bucket", "ok-object", "req-3", 4);
+        let (body, _) = super::super::native_body::BodyChunks::new(NativeBody::from_bytes(Bytes::from_static(b"data")));
+        let (mut guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(body),
+            Duration::ZERO,
+            "test-bucket",
+            "ok-object",
+            "req-3",
+            4,
+        );
 
         let mut collected = Vec::new();
         while let Some(chunk) = guarded.next().await {
@@ -4028,7 +4028,7 @@ mod tests {
         use super::super::request_body::{BodyReadControl, ObservedBody};
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
         use http_body::Frame;
-        use http_body_util::StreamBody;
+        use http_body_util::{BodyExt, StreamBody};
         use tokio_stream::wrappers::UnboundedReceiverStream;
         let (store, context) = real_store_test_context().await;
         let bucket = format!("put-progress-{}", Uuid::new_v4().simple());
@@ -4036,27 +4036,28 @@ mod tests {
         for size in [8192, 2 * 1024 * 1024, 32 * 1024 * 1024] {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, std::io::Error>>();
             let control = BodyReadControl::default();
-            let body = StreamingBlob::from(s3s::Body::http_body_unsync(ObservedBody::new(
-                StreamBody::new(UnboundedReceiverStream::new(receiver)),
-                control.clone(),
-            )));
+            let observed = ObservedBody::new(StreamBody::new(UnboundedReceiverStream::new(receiver)), control.clone());
+            let body = super::super::native_body::from_io_stream(
+                observed.into_data_stream().map(|chunk| chunk.map_err(std::io::Error::other)),
+            );
             let key = format!("object-{size}.bin");
-            let input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(key.clone())
-                .body(Some(body))
-                .content_length(Some(size))
-                .build()
-                .unwrap();
-            let mut request = build_request(input, Method::PUT);
-            request.extensions.insert(control.clone());
+            let input = PutObjectWriteInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                body: Some(body),
+                content_length: Some(size),
+                ..Default::default()
+            };
+            let mut extensions = http::Extensions::new();
+            extensions.insert(control.clone());
+            let envelope = put_envelope(http::Uri::from_static("/"), HeaderMap::new(), extensions);
             let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-            let owner = tokio::spawn(async move { put_owned(&usecase, request).await });
+            let owner = tokio::spawn(async move { Box::pin(usecase.execute_put_object_owned(envelope, input)).await });
             control.wait_until_pending_for_test().await;
             control.advance_wait_for_test(Duration::from_secs(60));
             sender.send(Ok(Frame::data(Bytes::new()))).unwrap();
             let error = owner.await.unwrap().expect_err("stalled eager/zero-copy/streaming body");
-            assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
+            assert_eq!(error.code(), &OwnedS3ErrorCode::RequestTimeout);
             assert!(is_err_object_not_found(
                 &store
                     .get_object_info(&bucket, &key, &ObjectOptions::default())
@@ -4082,8 +4083,9 @@ mod tests {
             small_max: 1,
             ..Default::default()
         }));
-        let (body, control) = super::super::request_body::guard_upload_progress(
-            StreamingBlob::from(s3s::Body::from(Bytes::from(vec![7; 8192]))),
+        let (chunks, _) = super::super::native_body::BodyChunks::new(NativeBody::from_bytes(Bytes::from(vec![7; 8192])));
+        let (body, control) = super::super::request_body::guard_native_upload_progress(
+            Box::new(chunks),
             Duration::ZERO,
             &bucket,
             "object",
@@ -4143,8 +4145,11 @@ mod tests {
             ..Default::default()
         });
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
-        let (body, _control) = super::super::request_body::guard_upload_progress(
-            StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
+        let (chunks, _) = super::super::native_body::BodyChunks::new(super::super::native_body::from_io_stream(
+            UnboundedReceiverStream::new(receiver),
+        ));
+        let (body, _control) = super::super::request_body::guard_native_upload_progress(
+            Box::new(chunks),
             Duration::ZERO,
             "bucket",
             "object",
@@ -4876,19 +4881,15 @@ mod tests {
                 base64_simd::STANDARD.encode_to_string(hasher.finalize())
             };
             let payload = Bytes::from_static(b"customer-key protected payload");
-            let input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key("ledger.csv".to_string())
-                .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-                .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-                .sse_customer_algorithm(Some("AES256".to_string()))
-                .sse_customer_key(Some(base64_simd::STANDARD.encode_to_string(customer_key)))
-                .sse_customer_key_md5(Some(key_md5.clone()))
-                .build()
-                .expect("SSE-C PUT input must build");
+            let input = PutObjectWriteInput {
+                sse_customer_algorithm: Some("AES256".to_string()),
+                sse_customer_key: Some(base64_simd::STANDARD.encode_to_string(customer_key)),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..put_bytes(bucket.clone(), "ledger.csv", payload.clone())
+            };
 
             let usecase = DefaultObjectUsecase::from_global();
-            let response = put_method_only(&usecase, input)
+            let response = Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
                 .await
                 .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
             assert_eq!(response.server_side_encryption, None);
@@ -5096,29 +5097,17 @@ mod tests {
             .expect("bootstrap authoritative quota usage");
 
         let payload = Bytes::from(vec![0x42; 1024]);
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("fits".to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("PUT input should build");
-        put_method_only(&DefaultObjectUsecase::from_global(), input)
+        let input = put_bytes(bucket.clone(), "fits", payload.clone());
+        Box::pin(DefaultObjectUsecase::from_global().execute_put_object_owned(method_only_put_envelope(), input))
             .await
             .expect("a ledger-admitted bucket must accept a write without scanner usage");
 
         let too_large = Bytes::from(vec![0x42; (LIMIT + 1) as usize]);
-        let input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key("too-large".to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(too_large.clone()))))
-            .content_length(Some(i64::try_from(too_large.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("PUT input should build");
-        let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
+        let input = put_bytes(bucket, "too-large", too_large.clone());
+        let err = Box::pin(DefaultObjectUsecase::from_global().execute_put_object_owned(method_only_put_envelope(), input))
             .await
             .expect_err("the ledger must still reject a write above the quota limit");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]
@@ -5509,20 +5498,14 @@ mod tests {
         install_unreadable_bucket_sse_config(&bucket).await;
 
         let payload = Bytes::from_static(b"an operator mandated encryption for this bucket");
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("PUT input must build");
+        let input = put_bytes(bucket.clone(), object, payload.clone());
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(put_method_only(&usecase, input))
+        let err = Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the write");
 
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
@@ -5548,13 +5531,7 @@ mod tests {
             .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
             .expect("test bucket");
         let payload = Bytes::from_static(b"diagnostic PUT context");
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("object.bin".to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("payload length")))
-            .build()
-            .expect("PUT input");
+        let input = put_bytes(bucket.clone(), "object.bin", payload.clone());
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -5563,7 +5540,9 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             request.in_scope(|| {
                 runtime.block_on(async {
-                    Box::pin(put_method_only(&usecase, input)).await.expect("S3 PUT must commit");
+                    Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
+                        .await
+                        .expect("S3 PUT must commit");
                     assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
                     assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
                 })
@@ -5619,16 +5598,10 @@ mod tests {
             .expect("plaintext PUT bucket must be created");
 
         let payload = Bytes::from_static(b"no default encryption is configured for this bucket");
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("PUT input must build");
+        let input = put_bytes(bucket.clone(), object, payload.clone());
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        Box::pin(put_method_only(&usecase, input))
+        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
             .await
             .expect("a bucket without default encryption must still accept a plaintext write");
 
@@ -5663,22 +5636,18 @@ mod tests {
         install_unreadable_bucket_sse_config(&bucket).await;
 
         let payload = Bytes::from_static(b"archive bytes that must never be unpacked in plaintext");
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("archive.tar".to_string())
-            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
-            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
-            .build()
-            .expect("extract PUT input must build");
-        let mut req = build_request(input, Method::PUT);
-        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+        let input = put_bytes(bucket.clone(), "archive.tar", payload.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(put_owned(&usecase, req))
-            .await
-            .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
+        let err = Box::pin(
+            usecase.execute_put_object_owned(put_envelope(http::Uri::from_static("/"), headers, http::Extensions::new()), input),
+        )
+        .await
+        .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
 
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, "archive.tar", &ObjectOptions::default())
             .await

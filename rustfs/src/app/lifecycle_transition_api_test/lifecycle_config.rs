@@ -131,18 +131,14 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
 
     assert!(backend.contains(&remote_object).await);
 
-    let req = build_request(
-        DeleteObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .unwrap(),
-        Method::DELETE,
-    );
-
-    Box::pin(usecase.execute_delete_object_from_s3s(req))
-        .await
-        .expect("Failed to issue versioned delete after compensation-driven transition");
+    Box::pin(usecase.execute_delete_object_fields(
+        request_envelope(Method::DELETE, HeaderMap::new()),
+        bucket.clone(),
+        object.to_owned(),
+        None,
+    ))
+    .await
+    .expect("Failed to issue versioned delete after compensation-driven transition");
 
     assert!(
         wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,

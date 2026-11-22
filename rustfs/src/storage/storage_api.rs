@@ -100,8 +100,6 @@ pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::ListPartsInfo;
-        #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
@@ -435,14 +433,8 @@ pub(crate) mod s3_api_consumer {
         pub(crate) mod contract {
             pub(crate) mod multipart {
                 pub(crate) use super::super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
-
-                #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, PartInfo};
             }
         }
-
-        #[cfg(test)]
-        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod tagging {
@@ -2368,15 +2360,6 @@ pub(crate) fn decode_tags_to_map(tags: &str) -> std::collections::HashMap<String
     ecstore_bucket::tagging::decode_tags_to_map(tags)
 }
 
-/// Writes an s3s response body for test assertions. Bucket configurations go
-/// through `ecstore_bucket::utils::serialize`, which owns their persisted form.
-#[cfg(test)]
-pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    val.serialize(&mut s3s::xml::Serializer::new(&mut buf))?;
-    Ok(buf)
-}
-
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
 }
@@ -2655,11 +2638,6 @@ where
 
 pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
     ecstore_set_disk::is_valid_storage_class(storage_class)
-}
-
-#[cfg(test)]
-pub(crate) fn effective_storage_class<'a>(stored_class: Option<&'a str>, completed_transition_tier: Option<&'a str>) -> &'a str {
-    ecstore_config::storageclass::effective_class(stored_class, completed_transition_tier)
 }
 
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool
