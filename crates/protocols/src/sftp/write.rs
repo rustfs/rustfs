@@ -336,7 +336,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             open_attrs,
             phase: WritePhase::Buffering { part_buffer: Vec::new() },
         })?;
-        Ok(Handle { id, handle })
+        Ok(Handle {
+            id,
+            handle: handle.into(),
+        })
     }
 
     /// Upload the buffered bytes to S3 with a single PutObject call.
@@ -2105,7 +2108,7 @@ mod tests {
         )
         .await
         .expect("WRITE | CREATE | TRUNCATE on a missing file must allocate a handle");
-        assert!(!handle.handle.is_empty());
+        assert!(!handle.handle.as_bytes().is_empty());
         assert!(backend.head_object_calls().is_empty(), "the non-EXCL accept path must not HEAD");
     }
 
@@ -2130,7 +2133,7 @@ mod tests {
         )
         .await
         .expect("WRITE | CREATE | TRUNCATE on an existing file must allocate a handle");
-        assert!(!handle.handle.is_empty());
+        assert!(!handle.handle.as_bytes().is_empty());
         assert!(backend.head_object_calls().is_empty(), "the non-EXCL accept path must not HEAD");
     }
 
@@ -2177,7 +2180,7 @@ mod tests {
         )
         .await
         .expect("EXCL on a missing key must allow creation");
-        assert!(!handle.handle.is_empty());
+        assert!(!handle.handle.as_bytes().is_empty());
         assert_eq!(backend.head_object_calls().len(), 1, "EXCL must HEAD exactly once");
     }
 
