@@ -51,8 +51,55 @@ CONFIGS = {
     # Local KMS backend, per-key authorization enforced.
     "e2e": lambda site: {**_local_kms(site), "RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY": "true"},
 }
-KMS_CONFIGS = ("e2", "e2e")
-CONFIG_ORDER = ("e0", "e1x-text", "e1x-short", "e1", "e2", "e2e")
+CONFIG_ORDER = ["e0", "e1x-text", "e1x-short", "e1", "e2", "e2e"]
+
+
+def _prepare_local_kms(site: h.Site) -> None:
+    h.write_local_key_file(site.key_dir, h.DEFAULT_KEY)
+
+
+def _provision_kms(site: h.Site) -> None:
+    h.wait_kms_healthy(site)
+    for name in (h.KEY_1, h.KEY_2):
+        h.ensure_key(site, name)
+
+
+# What a configuration needs before its process starts (key files, an external service) and once it answers
+# (waiting for KMS, creating the named keys). A configuration without an entry needs nothing.
+CONFIG_PREPARE = {"e2": _prepare_local_kms, "e2e": _prepare_local_kms}
+CONFIG_PROVISION = {"e2": _provision_kms, "e2e": _provision_kms}
+# Called once after the last configuration, to stop what a `prepare` step started.
+CONFIG_TEARDOWN: list = []
+
+
+def register_config(name: str, env, prepare=None, provision=None, teardown=None) -> None:
+    """Add a process configuration from a case module. `env(site)` returns the environment overrides.
+
+    `prepare(site)` runs before the process starts and raises `EnvError` when a dependency is missing;
+    `provision(site)` runs once the site answers; `teardown()` runs once at the end of the run.
+    """
+    CONFIGS[name] = env
+    if name not in CONFIG_ORDER:
+        CONFIG_ORDER.append(name)
+    if prepare:
+        CONFIG_PREPARE[name] = prepare
+    if provision:
+        CONFIG_PROVISION[name] = provision
+    if teardown and teardown not in CONFIG_TEARDOWN:
+        CONFIG_TEARDOWN.append(teardown)
+
+
+def start_configured(site: h.Site, binary, config: str) -> None:
+    """Start `site` as `config`: prepare, start, provision."""
+    if config in CONFIG_PREPARE:
+        CONFIG_PREPARE[config](site)
+    h.start_site(site, binary, CONFIGS[config](site))
+    if config in CONFIG_PROVISION:
+        CONFIG_PROVISION[config](site)
+
+
+class Skip(Exception):
+    """The case does not apply here: the backend's static capability table says it cannot do this."""
 
 
 @dataclass
@@ -64,17 +111,32 @@ class Case:
     configs: tuple[str, ...]
     fn: object
     last: bool = False
+    isolated: bool = False
 
 
 CASES: list[Case] = []
+# Checks over a whole run (scans of everything it saw). Each is `fn(run_dir, results, observations)` and returns
+# result records to append; register with `post_run`.
+POST_RUN: list = []
 
 
-def case(case_id: str, title: str, configs, level: str = "p0", layer: str = "L1", last: bool = False):
-    """Register a case. `last` moves it to the end of its configuration, for cases that change process state."""
+def case(case_id: str, title: str, configs, level: str = "p0", layer: str = "L1", last: bool = False,
+         isolated: bool = False):
+    """Register a case.
+
+    `last` moves it to the end of its configuration, for cases that change process state but restore it.
+    `isolated` gives it a site of its own on a fresh data directory, for cases that restart the process or
+    leave it in a state other cases must not see.
+    """
     def register(fn):
-        CASES.append(Case(case_id, title, level, layer, tuple(configs), fn, last))
+        CASES.append(Case(case_id, title, level, layer, tuple(configs), fn, last, isolated))
         return fn
     return register
+
+
+def post_run(fn):
+    POST_RUN.append(fn)
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +150,9 @@ class Ctx:
     case_id: str
     # False for a binary older than the `sse_local_master_key` startup event; the event is then recorded, not asserted.
     master_key_event: bool = True
+    # The server binary under test and the build it was registered as; a case needs them to restart the site.
+    binary: object = None
+    build: str = "default"
     failures: list[str] = field(default_factory=list)
     known: list[str] = field(default_factory=list)
     fixed: list[str] = field(default_factory=list)
@@ -181,6 +246,22 @@ class Ctx:
         """A refused write left nothing behind."""
         status, _ = h.head(self.site, bucket, key, headers=headers, label="HeadObject(residue)")
         self.check(status == 404, f"{what}: HEAD after the refused write is {status}, expected 404 (nothing may be stored)")
+
+    # -- process control (isolated cases only) -----------------------------
+
+    def restart(self, config: str | None = None, env: dict[str, str] | None = None) -> None:
+        """Stop the site and start it again on the same data directory.
+
+        With `config` it starts as that configuration, including its prepare and provision steps; with `env` it
+        starts with exactly those overrides; with neither it reuses the environment it last started with. Only an
+        isolated case may call this: a shared site must stay as its configuration describes it.
+        """
+        last = dict(self.site.env)
+        h.stop_site(self.site)
+        if config is not None:
+            start_configured(self.site, self.binary, config)
+        else:
+            h.start_site(self.site, self.binary, last if env is None else env)
 
     # -- common flows ------------------------------------------------------
 

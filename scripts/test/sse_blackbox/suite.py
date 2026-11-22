@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import datetime
 import fcntl
 import json
@@ -21,17 +22,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import cases_copy_multipart  # noqa: F401
-import cases_negative_authz  # noqa: F401
-import cases_roundtrip  # noqa: F401
-import cases_state  # noqa: F401
+import importlib
+import os
+
 import diffing
 import framework as fw
 import harness as h
 import observe
 import selftest
 
-BIN_DIR = h.STATE_DIR / "bin"
+# Every `cases_*.py` next to this file registers its cases and configurations on import. The order is by file
+# name, so it is the same on every machine.
+for _module in sorted(p.stem for p in h.HERE.glob("cases_*.py")):
+    importlib.import_module(_module)
+
+BIN_DIR = Path(os.environ.get("SSE_BB_BIN_DIR", h.STATE_DIR / "bin"))
 RUNS_DIR = h.STATE_DIR / "runs"
 KEEP_RUNS = 5
 
@@ -88,15 +93,10 @@ def _prune_runs() -> None:
         shutil.rmtree(old / "sites", ignore_errors=True)
 
 
-def _provision(site: h.Site, config: str) -> None:
-    if config in fw.KMS_CONFIGS:
-        h.wait_kms_healthy(site)
-        for name in (h.KEY_1, h.KEY_2):
-            h.ensure_key(site, name)
-
-
-def _run_case(case: fw.Case, site: h.Site, config: str, identity: dict) -> tuple[dict, list[dict], list[dict]]:
-    ctx = fw.Ctx(site=site, config=config, case_id=case.case_id, master_key_event=identity.get("master_key_event", True))
+def _run_case(case: fw.Case, site: h.Site, config: str, identity: dict, binary: Path | None = None
+              ) -> tuple[dict, list[dict], list[dict]]:
+    ctx = fw.Ctx(site=site, config=config, case_id=case.case_id, master_key_event=identity.get("master_key_event", True),
+                 binary=binary, build=identity.get("build", "default"))
     started = time.monotonic()
     verdict, reasons = fw.PASS, []
     observe.begin_case(config, case.case_id)
@@ -105,6 +105,8 @@ def _run_case(case: fw.Case, site: h.Site, config: str, identity: dict) -> tuple
             raise h.EnvError(f"{site.name} is not running")
         case.fn(ctx)
         reasons = list(ctx.failures)
+    except fw.Skip as skip:
+        verdict, reasons = fw.SKIP, [str(skip)]
     except h.EnvError as err:
         verdict, reasons = fw.ENV_ERROR, [str(err)]
     except h.CheckFailed as err:
@@ -113,7 +115,7 @@ def _run_case(case: fw.Case, site: h.Site, config: str, identity: dict) -> tuple
         reasons = [*ctx.failures, "unexpected exception:\n" + traceback.format_exc(limit=6)]
     finally:
         observe.end_case()
-    if verdict != fw.ENV_ERROR:
+    if verdict not in (fw.ENV_ERROR, fw.SKIP):
         if reasons:
             verdict = fw.FAIL
         elif ctx.fixed:
@@ -123,8 +125,29 @@ def _run_case(case: fw.Case, site: h.Site, config: str, identity: dict) -> tuple
     base = {"config": config, "case": case.case_id, "level": case.level, "layer": case.layer}
     result = {**base, "row": "", "title": case.title, "verdict": verdict, "reasons": reasons,
               "seconds": round(time.monotonic() - started, 2)}
-    rows = [] if verdict == fw.ENV_ERROR else [{**base, **row} for row in ctx.rows]
+    rows = [] if verdict in (fw.ENV_ERROR, fw.SKIP) else [{**base, **row} for row in ctx.rows]
     return result, rows, observe.drain()
+
+
+def _env_error_result(case: fw.Case, config: str, reason: str) -> dict:
+    return {"config": config, "case": case.case_id, "level": case.level, "layer": case.layer, "row": "",
+            "title": case.title, "verdict": fw.ENV_ERROR, "reasons": [reason], "seconds": 0.0}
+
+
+def _run_isolated(case: fw.Case, config: str, env_config: str, run_dir: Path, port: int, binary: Path, identity: dict
+                  ) -> tuple[dict, list[dict], list[dict]]:
+    """Run a case on a site of its own: a fresh data directory, started as the configuration, stopped afterwards."""
+    site = h.Site(name=f"{config}-{case.case_id.lower()}", root=run_dir / "sites" / f"{config}-{case.case_id.lower()}",
+                  port=port)
+    atexit.register(h.stop_site, site)
+    try:
+        fw.start_configured(site, binary, env_config)
+        return _run_case(case, site, config, identity, binary)
+    except h.EnvError as err:
+        return _env_error_result(case, config, str(err)), [], []
+    finally:
+        with contextlib.suppress(h.EnvError):
+            h.stop_site(site)
 
 
 def _build_self_check(identity: dict, observations: list[dict]) -> str | None:
@@ -167,11 +190,13 @@ def cmd_run(args) -> int:
             "harness": {p.name: h.sha256_hex(p.read_bytes())[:16] for p in sorted(h.HERE.glob("*.py"))}}
     print(f"run {run_id}: binary {identity['name']} ({identity['version']}, build {identity['build']}), port {args.port}")
 
+    h.RUN_DIR = run_dir
     results, observations = [], []
     for config in configs:
-        cases = [c for c in fw.CASES if config in c.configs and c.level == args.level
+        cases = [c for c in fw.CASES if config in c.configs and args.level in ("all", c.level)
                  and (selected is None or c.case_id in selected)]
-        cases.sort(key=lambda c: c.last)
+        # Shared-site cases first, state-changing ones at their end, then the cases that need a site of their own.
+        cases.sort(key=lambda c: (c.isolated, c.last))
         if not cases:
             continue
         site = h.Site(name=config, root=run_dir / "sites" / config, port=args.port)
@@ -179,31 +204,41 @@ def cmd_run(args) -> int:
         env_config = run_as.get(config, config)
         print(f"-- {config}" + (f" (started as {env_config})" if env_config != config else ""))
         startup_error = None
-        try:
-            if env_config in fw.KMS_CONFIGS:
-                h.write_local_key_file(site.key_dir, h.DEFAULT_KEY)
-            h.start_site(site, binary, fw.CONFIGS[env_config](site))
-            _provision(site, env_config)
-            if args.sabotage == "kill-site":
-                h.stop_site(site)
-        except h.EnvError as err:
-            startup_error = str(err)
-            print(f"   environment error: {startup_error.splitlines()[0]}")
+        if any(not c.isolated for c in cases):
+            try:
+                fw.start_configured(site, binary, env_config)
+                if args.sabotage == "kill-site":
+                    h.stop_site(site)
+            except h.EnvError as err:
+                startup_error = str(err)
+                print(f"   environment error: {startup_error.splitlines()[0]}")
         for case in cases:
-            if startup_error is not None:
-                result = {"config": config, "case": case.case_id, "level": case.level, "layer": case.layer, "row": "",
-                          "title": case.title, "verdict": fw.ENV_ERROR, "reasons": [startup_error], "seconds": 0.0}
-                rows, obs = [], []
+            if case.isolated:
+                # Isolated cases are sorted last, so the shared site is done; its port goes to the case's own site.
+                h.stop_site(site)
+                result, rows, obs = _run_isolated(case, config, env_config, run_dir, args.port, binary, identity)
+            elif startup_error is not None:
+                result, rows, obs = _env_error_result(case, config, startup_error), [], []
             else:
-                result, rows, obs = _run_case(case, site, config, identity)
+                result, rows, obs = _run_case(case, site, config, identity, binary)
             results.extend([result, *rows])
             observations.extend(obs)
             print(f"   {result['verdict']:9} {case.case_id:8} {case.title}  ({result['seconds']}s)")
             for reason in result["reasons"][:6]:
                 print(f"             - {reason.splitlines()[0][:260]}")
-            if args.fail_fast and result["verdict"] not in (fw.PASS, fw.KNOWN):
+            if args.fail_fast and result["verdict"] not in (fw.PASS, fw.KNOWN, fw.SKIP):
                 break
         h.stop_site(site)
+    for teardown in fw.CONFIG_TEARDOWN:
+        teardown()
+    for check in fw.POST_RUN:
+        extra = check(run_dir, results, observations)
+        results.extend(extra)
+        for result in extra:
+            if result.get("row", "") == "":
+                print(f"   {result['verdict']:9} {result['case']:8} {result.get('title', '')}")
+                for reason in result.get("reasons", [])[:6]:
+                    print(f"             - {reason.splitlines()[0][:260]}")
 
     self_check = _build_self_check(identity, observations)
     case_results = [r for r in results if r["row"] == ""]
@@ -312,16 +347,15 @@ def cmd_cross(args) -> int:
 
         case.fn = read_all
         try:
-            if config in fw.KMS_CONFIGS:
-                h.write_local_key_file(site.key_dir, h.DEFAULT_KEY)
-            h.start_site(site, writer, fw.CONFIGS[config](site))
-            _provision(site, config)
+            fw.start_configured(site, writer, config)
             h.make_bucket(site, bucket)
             _cross_write(site, bucket, objects)
             h.stop_site(site)
+            # The key files and the data directory are the writer's; only the process changes.
             h.start_site(site, reader, fw.CONFIGS[config](site))
-            _provision(site, config)
-            result, rows, obs = _run_case(case, site, config, reader_identity)
+            if config in fw.CONFIG_PROVISION:
+                fw.CONFIG_PROVISION[config](site)
+            result, rows, obs = _run_case(case, site, config, reader_identity, reader)
         except h.EnvError as err:
             result = {"config": config, "case": case.case_id, "level": "p1", "layer": "L1", "row": "", "title": case.title,
                       "verdict": fw.ENV_ERROR, "reasons": [str(err)], "seconds": 0.0}
@@ -391,7 +425,7 @@ def main() -> int:
 
     run = sub.add_parser("run", help="run the cases against a registered binary")
     run.add_argument("--binary", required=True)
-    run.add_argument("--level", default="p0", choices=("p0",))
+    run.add_argument("--level", default="p0", choices=("p0", "p1", "all"))
     run.add_argument("--configs", help="comma-separated subset of: " + ", ".join(fw.CONFIG_ORDER))
     run.add_argument("--cases", help="comma-separated case ids")
     run.add_argument("--port", type=int, default=h.DEFAULT_PORT)

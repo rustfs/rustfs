@@ -30,6 +30,11 @@ import observe
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 STATE_DIR = Path(os.environ.get("SSE_BB_STATE_DIR", REPO_ROOT / "target" / "sse-bb"))
+# The directory of the run in progress, set by the driver; modules that keep per-run files write below it.
+RUN_DIR: Path | None = None
+# Called with every signed exchange, in or out of a case: request and response in full. For modules that keep
+# what a run saw (an archive for leak scans); the comparison between runs uses `observe`, not these.
+EXCHANGE_HOOKS: list = []
 
 ADMIN_PREFIX = "/rustfs/admin/v3"
 REGION = "us-east-1"
@@ -41,6 +46,9 @@ ACCESS_KEY = "rustfsadmin"
 SECRET_KEY = "rustfsadmin"
 # The port is a local-development choice; CI and other machines override it.
 DEFAULT_PORT = int(os.environ.get("SSE_BB_PORT", "20105"))
+# Helpers the suite starts next to the site under test. Each is a local-development choice like the site port.
+AUX_PORT = int(os.environ.get("SSE_BB_AUX_PORT", "20108"))      # audit receiver or fake KMS endpoint
+VAULT_PORT = int(os.environ.get("SSE_BB_VAULT_PORT", "20109"))  # Vault or OpenBao
 
 STARTUP_TIMEOUT = 90.0
 STOP_GRACE = 10.0
@@ -214,6 +222,10 @@ def signed_request(
         url += f"?{query}"
     status, response_headers, response_body = _http(url, method, body, all_headers, timeout)
     observe.exchange(label, method, path, query, status, response_headers, response_body)
+    for hook in EXCHANGE_HOOKS:
+        hook({"site": s.name, "label": label or method, "method": method, "path": path, "query": query,
+              "request_headers": all_headers, "request_body": body, "status": status,
+              "response_headers": response_headers, "response_body": response_body})
     if status == 0 and observe.in_case():
         raise EnvError(f"{method} {path}: no HTTP response ({response_body[:160].decode(errors='replace')})")
     return status, response_headers, response_body
