@@ -193,6 +193,9 @@ impl ScannerIODisk for Disk {
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome> {
+        if !self.is_local() {
+            return Err(Error::other("native namespace scan requires a local disk"));
+        }
         let ScannerDiskScanOptions {
             checkpoint_endpoints,
             scan_mode,

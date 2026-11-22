@@ -1595,20 +1595,19 @@ fn namespace_scanner_workers<T>(
             .into_iter()
             .map(|disk| (disk, NamespaceScannerWorkerMode::Coordinator)),
     );
-    workers.extend(remote_disks.into_iter().map(|(disk, capabilities)| {
-        let mode = if remote_namespace_scanner_supports_budget(budget) {
-            NamespaceScannerWorkerMode::RemoteV4(capabilities)
-        } else {
-            NamespaceScannerWorkerMode::Coordinator
-        };
-        (disk, mode)
-    }));
+    if remote_namespace_scanner_supports_budget(budget) {
+        workers.extend(
+            remote_disks
+                .into_iter()
+                .map(|(disk, capabilities)| (disk, NamespaceScannerWorkerMode::RemoteV4(capabilities))),
+        );
+    }
     workers
 }
 
 /// The current remote request and progress wire account for time, objects,
-/// and directories only. Keep raw-entry/name-byte limits on the coordinator,
-/// where the existing RemoteDisk traversal charges every owning budget.
+/// and directories only. A native directory walk requires the owning node;
+/// select only local disks when the remote wire cannot enforce the budget.
 fn remote_namespace_scanner_supports_budget(budget: &ScannerCycleBudgetConfig) -> bool {
     budget.max_entries.is_none() && budget.max_entry_name_bytes.is_none()
 }
