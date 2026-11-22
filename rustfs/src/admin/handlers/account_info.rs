@@ -86,6 +86,9 @@ fn admin_scan_progress(progress: rustfs_data_usage::BucketScanProgress) -> rustf
         size,
         sources_observed,
         sources_total,
+        partial,
+        converged,
+        blocker,
     } = progress;
 
     rustfs_madmin::BucketScanProgress {
@@ -100,6 +103,9 @@ fn admin_scan_progress(progress: rustfs_data_usage::BucketScanProgress) -> rustf
         size,
         sources_observed,
         sources_total,
+        partial,
+        converged,
+        blocker,
     }
 }
 
@@ -482,6 +488,9 @@ mod tests {
                 size: counts.map(|(_, size)| size),
                 sources_observed: 1,
                 sources_total: 2,
+                partial: stage != Completed,
+                converged: stage == Completed,
+                blocker: (stage != Completed).then(|| "runtime_budget".to_string()),
             };
             let expected = serde_json::to_value(&progress).unwrap();
             let mut bucket = rustfs_madmin::BucketAccessInfo {
@@ -495,6 +504,13 @@ mod tests {
             apply_usage_to_bucket_access_info(&mut bucket, Some(&usage));
             let wire = serde_json::to_value(&bucket).unwrap();
             assert_eq!(wire["scan_progress"], expected);
+            assert_eq!(wire["scan_progress"]["partial"], stage != Completed);
+            assert_eq!(wire["scan_progress"]["converged"], stage == Completed);
+            if stage == Completed {
+                assert!(wire["scan_progress"].get("blocker").is_none(), "a converged sample has no blocker");
+            } else {
+                assert_eq!(wire["scan_progress"]["blocker"], "runtime_budget");
+            }
             assert_eq!(wire["usage_value_state"], serde_json::to_value(state).unwrap());
             let decoded: rustfs_madmin::BucketAccessInfo = serde_json::from_value(wire).unwrap();
             assert_eq!(decoded.scan_progress, bucket.scan_progress);
@@ -513,6 +529,9 @@ mod tests {
                 size: Some(71),
                 sources_observed: 1,
                 sources_total: 2,
+                partial: true,
+                converged: false,
+                blocker: Some("object_budget".to_string()),
             })),
             ..Default::default()
         };

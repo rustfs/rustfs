@@ -576,10 +576,6 @@ fn checkpoint_fixture_identity_changes_and_future_state_fail_closed() {
             ..identity
         },
         crate::DataUsageScanIdentity {
-            publication_epoch: 1,
-            ..identity
-        },
-        crate::DataUsageScanIdentity {
             tier_registry_generation: 8,
             ..identity
         },
@@ -613,6 +609,22 @@ fn checkpoint_fixture_identity_changes_and_future_state_fail_closed() {
         assert_eq!(handed_off.info.leader_epoch, 8);
         assert_eq!(handed_off.validated_scan_frontier(), Some("bucket/static"));
         assert_eq!(retained(&handed_off), 3);
+    }
+    // A cold restart or a leader handoff moves the process-local publication
+    // epoch. The durable bucket scope is unchanged, so the cursor is adopted.
+    let restarted_identity = crate::DataUsageScanIdentity {
+        publication_epoch: identity.publication_epoch + 7,
+        ..identity
+    };
+    for (cycle, epoch) in [(12, 7), (12, 8), (13, 8)] {
+        let mut restarted = cache.clone();
+        assert_eq!(
+            restarted.prepare_bucket_checkpoint("bucket", cycle, epoch, SOURCE, PLAN, restarted_identity),
+            crate::DataUsageCachePrepareOutcome::Reused,
+            "publication epoch must not fence a durable cursor"
+        );
+        assert_eq!(restarted.validated_scan_frontier(), Some("bucket/static"));
+        assert_eq!(retained(&restarted), 3);
     }
 
     let mut unverified = cache.clone();
@@ -660,6 +672,53 @@ fn checkpoint_fixture_identity_changes_and_future_state_fail_closed() {
         );
         assert!(next.cache.is_empty(), "unsupported identity must not retain coverage");
     }
+}
+
+#[test]
+fn checkpoint_fixture_cursor_without_receipt_survives_leadership_change() {
+    let (mut cache, identity) = bound_checkpoint();
+    // A partial sweep that stopped before any child completed has a durable
+    // cursor but no receipt signing the prefix. The cursor must still resume;
+    // the missing receipt only forbids treating the prefix as covered.
+    cache.info.scan_coverage_receipt = None;
+    assert!(cache.validated_scan_frontier().is_none());
+    assert_eq!(cache.validated_scan_resume_after(), Some("bucket/static"));
+    let next_identity = crate::DataUsageScanIdentity {
+        publication_epoch: identity.publication_epoch + 3,
+        ..identity
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 12, 8, SOURCE, PLAN, next_identity),
+        crate::DataUsageCachePrepareOutcome::Reused,
+        "an unproven prefix must not discard a valid enumeration cursor"
+    );
+    assert_eq!(cache.info.scan_resume_after.as_deref(), Some("bucket/static"));
+    assert_eq!(
+        cache
+            .info
+            .scan_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.resume_after.as_str()),
+        Some("bucket/static")
+    );
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "adoption must not turn a cursor into coverage proof"
+    );
+    assert_eq!(retained(&cache), 3);
+
+    // Caches written before the checkpoint envelope persisted only the resume
+    // hint. Its format and namespace are still a valid position.
+    let (mut legacy, _) = bound_checkpoint();
+    legacy.info.scan_coverage_receipt = None;
+    legacy.info.scan_checkpoint = None;
+    assert_eq!(legacy.validated_scan_resume_after(), Some("bucket/static"));
+    assert_eq!(
+        legacy.prepare_bucket_checkpoint("bucket", 12, 8, SOURCE, PLAN, next_identity),
+        crate::DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(legacy.info.scan_resume_after.as_deref(), Some("bucket/static"));
+    assert_eq!(retained(&legacy), 3);
 }
 
 #[test]

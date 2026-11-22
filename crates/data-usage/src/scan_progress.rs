@@ -46,6 +46,10 @@ pub struct BucketScanProgressSource {
     /// Accepted logical object usage; enumeration alone leaves both absent.
     pub objects: Option<u64>,
     pub size: Option<u64>,
+    /// Why this sample has not completed its sweep, when the writer knows.
+    /// Display-only; it never authorizes reuse or quota admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
 }
 
 /// Response-only progress, deliberately separate from a bucket's total usage.
@@ -57,6 +61,15 @@ pub struct BucketScanProgress {
     pub size: Option<u64>,
     pub sources_observed: u64,
     pub sources_total: u64,
+    /// True while this sample is not an authoritative complete sweep.
+    #[serde(default)]
+    pub partial: bool,
+    /// True only when every expected source completed and agrees.
+    #[serde(default)]
+    pub converged: bool,
+    /// The dominant incomplete stage, or `unknown` when no writer reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
 }
 
 impl BucketScanProgressSource {
@@ -114,6 +127,21 @@ pub fn aggregate_bucket_scan_progress(
         }
     }
     let complete = selected.len() == expected.len() && selected.values().all(|s| s.stage == BucketScanStage::Completed);
+    let blockers = selected
+        .values()
+        .filter_map(|sample| sample.blocker.as_deref())
+        .filter(|blocker| !blocker.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    let blocker = if complete {
+        None
+    } else {
+        match blockers.len() {
+            // Samples written before the blocker field existed remain readable.
+            0 => Some("unknown".to_owned()),
+            1 => blockers.first().map(|blocker| (*blocker).to_owned()),
+            _ => Some("multiple".to_owned()),
+        }
+    };
     Some(BucketScanProgress {
         stage: if complete {
             BucketScanStage::Completed
@@ -129,6 +157,9 @@ pub fn aggregate_bucket_scan_progress(
         size,
         sources_observed: u64::try_from(selected.len()).ok()?,
         sources_total: u64::try_from(expected.len()).ok()?,
+        partial: !complete,
+        converged: complete,
+        blocker,
     })
 }
 
@@ -152,6 +183,7 @@ mod tests {
             stage: BucketScanStage::Scanning,
             objects: Some(7),
             size: Some(77),
+            blocker: None,
         }
     }
 
@@ -200,6 +232,43 @@ mod tests {
         let mut huge = sample(1);
         huge.size = Some(u64::MAX);
         assert!(aggregate_bucket_scan_progress([sample(0), huge], &[(0, 0), (0, 1)]).is_none());
+    }
+
+    #[test]
+    fn partial_progress_reports_blocker_and_completion_converges() {
+        let mut scanning = sample(0);
+        scanning.blocker = Some("object_budget".into());
+        let partial = aggregate_bucket_scan_progress([scanning], &[(0, 0)]).expect("partial progress");
+        assert!(partial.partial);
+        assert!(!partial.converged);
+        assert_eq!(partial.blocker.as_deref(), Some("object_budget"));
+
+        let mut one = sample(0);
+        one.stage = BucketScanStage::Completed;
+        one.blocker = None;
+        let mut two = sample(1);
+        two.stage = BucketScanStage::Completed;
+        two.blocker = None;
+        let done = aggregate_bucket_scan_progress([one, two], &[(0, 0), (0, 1)]).expect("completed progress");
+        assert!(!done.partial);
+        assert!(done.converged);
+        assert_eq!(done.blocker, None);
+    }
+
+    #[test]
+    fn aggregate_progress_defaults_new_state_for_old_readers() {
+        let decoded: BucketScanProgress = serde_json::from_value(serde_json::json!({
+            "stage": "scanning",
+            "updated_at": 1000,
+            "objects": 7,
+            "size": 77,
+            "sources_observed": 1,
+            "sources_total": 2
+        }))
+        .expect("legacy aggregate progress");
+        assert!(!decoded.partial);
+        assert!(!decoded.converged);
+        assert_eq!(decoded.blocker, None);
     }
 
     #[test]

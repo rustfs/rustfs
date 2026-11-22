@@ -27,7 +27,11 @@ impl Scope {
     fn may_adopt(&self, current: &Self) -> bool {
         self.bucket == current.bucket
             && self.source == current.source
-            && self.identity == current.identity
+            // The publication epoch is process-local and moves across leader
+            // handoff/restart; the physical directory work it guards does not.
+            && self.identity.is_valid()
+            && current.identity.is_valid()
+            && self.identity.same_checkpoint_scope(&current.identity)
             && self.mode == current.mode
             && self.prefixes == current.prefixes
             && self.progress.started_plan == current.progress.started_plan
@@ -218,7 +222,9 @@ impl DirectoryCheckpoint {
         self.version == 1
             && self.scope.bucket == info.name
             && self.scope.identity.is_valid()
-            && Some(self.scope.identity) == info.scan_identity
+            && info
+                .scan_identity
+                .is_some_and(|identity| identity.is_valid() && self.scope.identity.same_checkpoint_scope(&identity))
             && Some(self.scope.source) == info.source
             && info
                 .scan_progress

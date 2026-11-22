@@ -542,6 +542,22 @@ impl DataUsageScanIdentity {
             && !self.bucket_incarnation.is_nil()
             && matches!(self.scan_mode, HealScanMode::Normal | HealScanMode::Deep)
     }
+
+    /// Whether two identities fence the same bucket checkpoint scope.
+    ///
+    /// `publication_epoch` is a process-local data-movement counter. It moves
+    /// on leader handoff and cold restart without changing the namespace a
+    /// checkpoint traverses, so it must not decide whether a durable cursor is
+    /// adoptable. The bucket incarnation, set layout, tier generation and scan
+    /// mode all describe the namespace or the way it is walked and still fence
+    /// a checkpoint exactly.
+    pub(crate) fn same_checkpoint_scope(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.bucket_incarnation == other.bucket_incarnation
+            && self.set_layout == other.set_layout
+            && self.tier_registry_generation == other.tier_registry_generation
+            && self.scan_mode == other.scan_mode
+    }
 }
 
 /// A forward coverage sweep may span budgets, but not authorize mixed mutation generations.
@@ -665,7 +681,13 @@ impl DataUsageDurableProgress {
             || self.source.is_none()
             || self.source != previous.source
             || !self.identity.is_some_and(|identity| identity.is_valid())
-            || self.identity != previous.identity
+            // A leader handoff or cold restart changes only the process-local
+            // publication epoch. Cursor movement remains durable progress under
+            // the same bucket scope, so compare the stable checkpoint fields.
+            || !self
+                .identity
+                .zip(previous.identity)
+                .is_some_and(|(current, previous)| current.same_checkpoint_scope(&previous))
             || self.started_plan.is_none()
             || self.started_plan != previous.started_plan
         {
@@ -1465,31 +1487,97 @@ impl DataUsageCache {
             .filter(|(bucket, observation)| bucket == name && observation.matches(source, identity))
             .collect();
         // A checkpoint is a durable traversal frontier, not a publication
-        // result.  A newer leader may adopt it only when the frontier is
-        // independently fenced by the bucket identity and has a validated
-        // cursor/coverage receipt.  Caches without that proof still take the
-        // normal rebuild path; this keeps an old, incomplete writer from
-        // authorizing a new leader to skip namespace coverage.
+        // result. A newer leader may adopt it when the frontier is fenced by
+        // the stable bucket scope and has a validated cursor/coverage receipt.
+        // The process-local publication epoch is deliberately not part of that
+        // scope: leader handoff and cold restart change it while the traversal
+        // position remains valid. Caches without a validated position still
+        // take the normal rebuild path.
         // Cycle deadlines advance both counters, so a validated frontier from
         // an earlier cycle must remain eligible for adoption.
+        let checkpoint_identity_matches = self
+            .info
+            .scan_identity
+            .is_some_and(|saved| saved.is_valid() && saved.same_checkpoint_scope(&identity));
+        // Receipt validation hashes the covered prefix; compute it once and
+        // reuse the result across every adoption decision below.
+        let trusted_frontier = self.validated_scan_frontier().map(clone_cache_value);
+        let has_validated_frontier = trusted_frontier.is_some();
+        let receipt_matches = self.info.scan_coverage_receipt.is_none() || has_validated_frontier;
+        let has_validated_resume = self.validated_scan_resume_after_with(receipt_matches).is_some();
         let cross_epoch_checkpoint = self.info.leader_epoch < leader_epoch
-            && self.info.scan_identity == Some(identity)
-            && (self.validated_scan_frontier().is_some()
+            && checkpoint_identity_matches
+            && (has_validated_frontier
+                || has_validated_resume
                 || self.validated_raw_enumeration_cursor().is_some()
                 || self.validated_raw_enumeration_page_index().is_some()
                 || self.info.scan_directory_work.iter().any(|d| d.is_bound_to(&self.info)));
-        let handoff_frontier = cross_epoch_checkpoint
-            .then(|| self.validated_scan_frontier().map(clone_cache_value))
-            .flatten();
+        // The receipt digest binds the identity tuple. Re-sign a trusted
+        // prefix whenever the adopted identity differs, including a same-cycle
+        // publication-epoch move, or the frontier would stop validating after
+        // the new identity is stored.
+        let handoff_frontier = if has_validated_frontier
+            && (cross_epoch_checkpoint || (checkpoint_identity_matches && self.info.scan_identity != Some(identity)))
+        {
+            trusted_frontier
+        } else {
+            None
+        };
         let reusable = identity.is_valid()
             && name != DATA_USAGE_ROOT
             && self.info.name == name
             && self.info.source == Some(source)
             && (self.info.leader_epoch == leader_epoch || cross_epoch_checkpoint)
             && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
-            && self.info.scan_identity == Some(identity)
+            && checkpoint_identity_matches
             && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
             && (self.cache.is_empty() || self.checked_flatten_complete_scope(name).is_some());
+        if reusable && self.has_scan_position() {
+            if self
+                .info
+                .scan_progress
+                .is_some_and(|progress| progress.requested_plan != checkpoint_plan_digest)
+            {
+                // A changed activity/coverage plan makes this sweep mixed, so
+                // the checkpoint stays resumable but certification needs one
+                // full pass under the new plan. It is not a reason to discard
+                // durable traversal work.
+                counter!(
+                    "rustfs_scanner_checkpoint_decisions_total",
+                    "decision" => "adopted",
+                    "reason" => "plan_changed"
+                )
+                .increment(1);
+                debug!(
+                    target: "rustfs::scanner::data_usage",
+                    event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_CACHE,
+                    state = "checkpoint_plan_changed",
+                    bucket = %name,
+                    "Scanner resumed a checkpoint under a newer coverage plan"
+                );
+            }
+            if has_validated_resume && !has_validated_frontier {
+                counter!(
+                    "rustfs_scanner_checkpoint_decisions_total",
+                    "decision" => "adopted",
+                    "reason" => "cursor_without_receipt"
+                )
+                .increment(1);
+            } else {
+                counter!(
+                    "rustfs_scanner_checkpoint_decisions_total",
+                    "decision" => "adopted",
+                    "reason" => if self.info.leader_epoch == leader_epoch {
+                        "same_epoch"
+                    } else {
+                        "cross_epoch"
+                    }
+                )
+                .increment(1);
+            }
+        }
         if reusable
             && self.info.snapshot_complete
             && self.info.scan_progress.is_none()
@@ -1510,15 +1598,23 @@ impl DataUsageCache {
                     "source_mismatch"
                 } else if self.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT {
                     "key_format_mismatch"
-                } else if self.info.scan_identity != Some(identity)
-                    || self.info.tier_registry_generation != Some(identity.tier_registry_generation)
-                {
+                } else if self.info.tier_registry_generation != Some(identity.tier_registry_generation) {
+                    "tier_generation_mismatch"
+                } else if !checkpoint_identity_matches {
                     "identity_mismatch"
                 } else if self.info.leader_epoch != leader_epoch && !cross_epoch_checkpoint {
                     "unvalidated_handoff"
+                } else if !self.has_validated_scan_position() {
+                    "invalid_cursor"
                 } else {
                     "incomplete_cache_scope"
                 };
+                counter!(
+                    "rustfs_scanner_checkpoint_decisions_total",
+                    "decision" => "reset",
+                    "reason" => reason
+                )
+                .increment(1);
                 warn!(
                     target: "rustfs::scanner::data_usage",
                     event = EVENT_SCANNER_CACHE_LOAD_STATE,
@@ -1566,7 +1662,11 @@ impl DataUsageCache {
         self.info.scan_directory_work = directory_work.into_iter().filter(|d| d.is_bound_to(&self.info)).collect();
         let cursor_is_valid = !self.has_scan_position()
             || !self.info.scan_directory_work.is_empty()
-            || self.validated_scan_frontier().is_some()
+            || has_validated_frontier
+            // A durable folder cursor is a traversal position even when no
+            // coverage receipt proves the prefix it passed. Keeping it resumes
+            // the walk; the missing receipt only forbids skipping that prefix.
+            || has_validated_resume
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some();
         if !cursor_is_valid {
@@ -1742,6 +1842,62 @@ impl DataUsageCache {
                 || self.v2_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
                 || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
         .then_some(receipt.through.as_str())
+    }
+
+    /// A durable folder cursor that can resume a sweep without claiming that
+    /// the prefix before it was covered.
+    ///
+    /// `validated_scan_frontier` additionally requires a coverage receipt that
+    /// signs the cached prefix. A checkpoint written before the first child
+    /// completed has no such receipt, yet its cursor is still a safe place to
+    /// continue. Older writers may persist only `scan_resume_after`. Neither
+    /// form proves the prefix that was already walked, so callers must not use
+    /// this position to skip an unproven prefix.
+    ///
+    /// Older writers may persist only `scan_resume_after`. Its format and
+    /// bucket namespace are enough to resume ordered traversal; neither form
+    /// proves the prefix that was already walked.
+    pub(crate) fn validated_scan_resume_after(&self) -> Option<&str> {
+        // A receipt is only written together with its own frontier. If one is
+        // present but does not validate, the pair is inconsistent (tampered or
+        // half-written), so the cursor fails closed. A cursor with no receipt
+        // at all resumes without claiming coverage.
+        let receipt_matches = self.info.scan_coverage_receipt.is_none() || self.validated_scan_frontier().is_some();
+        self.validated_scan_resume_after_with(receipt_matches)
+    }
+
+    fn validated_scan_resume_after_with(&self, receipt_matches: bool) -> Option<&str> {
+        let resume_after = self.info.scan_resume_after.as_deref()?;
+        // A checkpoint envelope must use the current version and name the
+        // same cursor. A bare legacy resume hint has no envelope to check.
+        let checkpoint_matches = self.info.scan_checkpoint.as_ref().is_none_or(|checkpoint| {
+            checkpoint.version == DATA_USAGE_SCAN_CHECKPOINT_VERSION && checkpoint.resume_after == resume_after
+        });
+        (checkpoint_matches
+            && receipt_matches
+            && self.info.scan_progress.is_some()
+            && self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            && self.info.source.is_some()
+            && self.info.name != DATA_USAGE_ROOT
+            && !resume_after.is_empty()
+            && resume_after.len() <= DATA_USAGE_SCAN_CURSOR_MAX_BYTES
+            && path_is_in_bucket_scope(&self.info.name, resume_after)
+            // A cursor that no retained node can resolve is stale: the next
+            // sweep starts at the first entry instead of trusting a forged or
+            // already-compacted-away position.
+            && self.find(resume_after).is_some())
+        .then_some(resume_after)
+    }
+
+    /// Whether any durable position survived preparation and can resume the
+    /// sweep. This is broader than `validated_scan_frontier`: a cursor alone
+    /// resumes traversal but never authorizes skipping covered prefixes.
+    pub(crate) fn has_validated_scan_position(&self) -> bool {
+        self.validated_scan_frontier().is_some()
+            || self.validated_scan_resume_after().is_some()
+            || self.validated_raw_enumeration_cursor().is_some()
+            || self.validated_raw_enumeration_page_index().is_some()
+            || self.info.scan_directory_work.iter().any(|d| d.is_bound_to(&self.info))
     }
 
     pub(crate) fn validated_raw_enumeration_cursor(&self) -> Option<&DataUsageRawEnumerationCursor> {

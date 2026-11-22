@@ -3938,7 +3938,10 @@ pub(crate) async fn scan_data_folder_scoped(
     cache.info.tier_registry_generation = Some(tier_registry.generation);
 
     let resume_frontier = cache.validated_scan_frontier().map(clone_cache_value);
-    if resume_frontier.is_some() {
+    // `scan_checkpoint_used` means a durable position was adopted, not that a
+    // receipt proved the whole prefix. Directory work and cursor-only resumes
+    // still continue this bucket, so they must be visible to operators.
+    if cache.has_validated_scan_position() {
         global_metrics().record_scanner_checkpoint_used();
     }
     let bucket_name = clone_cache_value(&cache.info.name);
