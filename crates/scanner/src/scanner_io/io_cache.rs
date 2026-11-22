@@ -624,7 +624,10 @@ impl ScannerIOCache for SetDisks {
             .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
         }
 
-        let (disks, healing) = self.get_online_disks_with_healing(false).await;
+        let single_drive = self.set_drive_count == 1;
+        // A single-drive set has no alternate scan source. A heal marker
+        // still disables scanner heals, but must not exclude its only usage walk.
+        let (disks, healing) = self.get_online_disks_with_healing(single_drive).await;
         #[cfg(test)]
         let disks = super::tests::usage_remote_drain::walker_disks(&self, &buckets, disks);
         if disks.is_empty() {
@@ -761,7 +764,18 @@ impl ScannerIOCache for SetDisks {
             let _ = updates.send(incomplete_scope).await;
             return Ok(ScannerSourceTurnReceipt::default());
         }
-        let set_disk_inventory = Arc::new(scanner_set_disk_inventory(self.as_ref()).await);
+        // Coordinator workers need the full inventory only for cross-drive
+        // healing. Remote workers own their disk inventory on the peer.
+        let heal_disk_inventory = if !single_drive
+            && !healing
+            && workers
+                .iter()
+                .any(|(_, mode)| *mode == NamespaceScannerWorkerMode::Coordinator)
+        {
+            Some(Arc::new(scanner_set_disk_inventory(self.as_ref()).await))
+        } else {
+            None
+        };
         if unsupported_remote_disks > 0 {
             debug!(
                 target: "rustfs::scanner::io",
@@ -1014,7 +1028,6 @@ impl ScannerIOCache for SetDisks {
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone = bucket_result_tx.clone();
             let bucket_observations_clone = bucket_observations.clone();
-            let set_disk_inventory_clone = set_disk_inventory.clone();
             let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             let queued_disk_bucket_scans_clone = queued_disk_bucket_scans.clone();
             let active_disk_bucket_scans_clone = active_disk_bucket_scans.clone();
@@ -1030,6 +1043,7 @@ impl ScannerIOCache for SetDisks {
             let worker_retired_buckets = retired_buckets.clone();
             #[cfg(feature = "e2e-test-hooks")]
             let worker_incarnations = current_bucket_incarnations.clone();
+            let heal_disk_inventory = heal_disk_inventory.clone();
             #[cfg(test)]
             let worker_index = futs.len();
             futs.push(AbortOnDropHandle::new(tokio::spawn(async move {
@@ -1083,9 +1097,9 @@ impl ScannerIOCache for SetDisks {
                     let slot = previous_walker.insert(slot);
                     let disk = slot.walker.disk.clone();
                     let local_admission = &slot.walker.local_admission;
-                    let remote_capabilities = match slot.walker.mode {
-                        NamespaceScannerWorkerMode::RemoteV4(capabilities) => Some(capabilities),
-                        NamespaceScannerWorkerMode::Coordinator => None,
+                    let (remote_capabilities, current_heal_inventory) = match slot.walker.mode {
+                        NamespaceScannerWorkerMode::RemoteV4(capabilities) => (Some(capabilities), None),
+                        NamespaceScannerWorkerMode::Coordinator => (None, heal_disk_inventory.as_deref()),
                     };
                     // Prefix hints are process-local. Never hand one to a
                     // remote or legacy-coordinator disk path.
@@ -1702,7 +1716,7 @@ impl ScannerIOCache for SetDisks {
                     let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         bucket_budget.clone(),
-                        set_disk_inventory_clone.as_ref().clone(),
+                        current_heal_inventory.cloned().unwrap_or_default(),
                         cache,
                         None,
                         ScannerDiskScanOptions {

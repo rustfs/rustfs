@@ -11638,6 +11638,7 @@ version = "1.0.5"
 dependencies = [
  "async-compression",
  "futures",
+ "liblzma",
  "rustfs-rio",
  "rustfs-tokio-tar",
  "serde",

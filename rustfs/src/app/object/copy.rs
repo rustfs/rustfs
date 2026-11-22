@@ -904,7 +904,9 @@ impl DefaultObjectUsecase {
             last_modified: oi.mod_time,
             copy_source_version_id,
             version_id: dest_version,
-            server_side_encryption: effective_sse,
+            // `x-amz-server-side-encryption` names a managed algorithm; an SSE-C
+            // destination answers with its customer-key headers only.
+            server_side_encryption: effective_sse.filter(|_| sse_customer_algorithm.is_none()),
             ssekms_key_id: effective_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -940,6 +942,32 @@ mod tests {
     ) -> crate::app::storage_api::s3::S3Result<crate::app::object_usecase::CopyObjectWriteOutput> {
         let (envelope, input) = crate::app::object_usecase::CopyObjectWriteInput::from_test_request(req);
         usecase.execute_copy_object_owned(envelope, input).await.map_err(Into::into)
+    }
+
+    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
+    fn method_only_copy_envelope() -> crate::app::RequestEnvelope {
+        crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        )
+    }
+
+    async fn copy_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: CopyObjectInput,
+    ) -> crate::app::storage_api::s3::S3Result<crate::app::object_usecase::CopyObjectWriteOutput> {
+        let input = crate::app::object_usecase::CopyObjectWriteInput::from_legacy(input);
+        usecase
+            .execute_copy_object_owned(method_only_copy_envelope(), input)
+            .await
+            .map_err(Into::into)
     }
     use crate::app::storage_api::s3::S3ErrorCode;
     use crate::app::storage_api::s3::dto::ServerSideEncryption;
@@ -1068,10 +1096,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1087,7 +1114,7 @@ mod tests {
             .key(".rustfs-table/metadata/current.json".to_string())
             .build()
             .unwrap();
-        let error = copy_owned(&DefaultObjectUsecase::without_context(), build_request(input, Method::PUT))
+        let error = copy_method_only(&DefaultObjectUsecase::without_context(), input)
             .await
             .expect_err("reserved catalog destination must fail closed without bucket metadata");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
@@ -1108,10 +1135,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -1129,10 +1155,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         // Self-copy with explicit storage class change must pass the self-copy guard.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
@@ -1257,10 +1282,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         // Tiered self-copy with STANDARD storage class must pass all validation checks.
         // The call fails at store init (no store in unit tests), not at validation.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -1282,10 +1306,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         // Must not be rejected by the self-copy guard; it fails later at store init instead.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
@@ -1461,7 +1484,7 @@ mod tests {
             .key(destination.to_string())
             .build()
             .expect("directory copy input should build");
-        let response = copy_owned(&DefaultObjectUsecase::with_context(Some(context)), build_request(input, Method::PUT))
+        let response = copy_method_only(&DefaultObjectUsecase::with_context(Some(context)), input)
             .await
             .expect("copying to a directory marker should succeed");
 
@@ -1483,6 +1506,74 @@ mod tests {
             .expect("directory copy test bucket should be removed");
     }
 
+    // `x-amz-server-side-encryption` names a managed algorithm. A copy to an SSE-C destination
+    // answers with its customer-key headers only, as PutObject does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_object_to_ssec_destination_answers_with_the_customer_key_headers_only() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("SSE-C copy test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-ssec-response-{}", Uuid::new_v4());
+        let customer_key_md5 = "SaaDheEjzuynJH8eW6AEpQ==";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("SSE-C copy test bucket should be created");
+        store
+            .put_object(
+                &bucket,
+                "source.bin",
+                &mut PutObjReader::from_vec(b"copy source".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("plaintext copy source should be written");
+
+        let mut input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: "source.bin".into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key("customer-encrypted.bin".to_string())
+            .build()
+            .expect("SSE-C copy input should build");
+        input.sse_customer_algorithm = Some("AES256".to_string());
+        input.sse_customer_key = Some("KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=".to_string());
+        input.sse_customer_key_md5 = Some(customer_key_md5.to_string());
+        let response = copy_owned(&DefaultObjectUsecase::with_context(Some(context)), build_request(input, Method::PUT))
+            .await
+            .expect("copying to an SSE-C destination should succeed");
+
+        assert_eq!(
+            (
+                response.server_side_encryption.as_deref(),
+                response.ssekms_key_id.as_deref(),
+                response.sse_customer_algorithm.as_deref(),
+                response.sse_customer_key_md5.as_deref(),
+            ),
+            (None, None, Some("AES256"), Some(customer_key_md5))
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("SSE-C copy test bucket should be removed");
+    }
+
     #[tokio::test]
     async fn execute_copy_object_allows_self_copy_of_null_version() {
         // A "null" source version id is a restore of the null version, not a no-op self-copy.
@@ -1497,10 +1588,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1518,10 +1608,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -1640,7 +1729,7 @@ mod tests {
             .expect("copy input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(copy_owned(&usecase, build_request(input, Method::PUT)))
+        let err = Box::pin(copy_method_only(&usecase, input))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the copy");
 
