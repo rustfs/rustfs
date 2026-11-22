@@ -1800,10 +1800,54 @@ mod tests {
             .multipart_upload(Some(completed_parts.clone()))
             .build()
             .expect("DTO-only complete multipart input should build");
-        let dto_complete_err = usecase
-            .complete_for_s3s_request(build_request(dto_only_complete_input, Method::POST))
-            .await
-            .expect_err("DTO-only If-None-Match: * on existing key must fail");
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
+
+        let mut s3s_input = dto_only_complete_input;
+        let has_upload = s3s_input.multipart_upload.is_some();
+        s3s_input.multipart_upload.get_or_insert_with(Default::default);
+        let tags: Vec<Option<String>> = s3s_input
+            .multipart_upload
+            .iter_mut()
+            .flat_map(|upload| upload.parts.iter_mut().flatten())
+            .map(|part| {
+                part.part_number.get_or_insert(0);
+                part.e_tag.take().map(|tag| tag.value().to_owned())
+            })
+            .collect();
+        for checksum in [
+            &mut s3s_input.checksum_crc32,
+            &mut s3s_input.checksum_crc32c,
+            &mut s3s_input.checksum_crc64nvme,
+            &mut s3s_input.checksum_md5,
+            &mut s3s_input.checksum_sha1,
+            &mut s3s_input.checksum_sha256,
+            &mut s3s_input.checksum_sha512,
+            &mut s3s_input.checksum_xxhash128,
+            &mut s3s_input.checksum_xxhash3,
+            &mut s3s_input.checksum_xxhash64,
+        ] {
+            *checksum = None;
+        }
+        let rejected = match complete_multipart_upload::input_from_s3s(s3s_input) {
+            Err(error) => Err(crate::app::dto_values::seam_error(error)),
+            Ok(mut owned) => {
+                for (part, tag) in owned.multipart_upload.parts.iter_mut().zip(tags) {
+                    part.e_tag = tag.map(rustfs_gateway_types::ETag::from_stored);
+                }
+                let taken = std::mem::take(&mut owned.multipart_upload);
+                let parts = has_upload.then_some(taken);
+                match parts {
+                    Some(parts) => {
+                        owned.multipart_upload = parts;
+                        Box::pin(usecase.execute_complete_multipart_upload(owned_envelope(Method::POST), owned)).await
+                    }
+                    None => {
+                        Box::pin(usecase.execute_complete_multipart_upload_parts(owned_envelope(Method::POST), owned, None)).await
+                    }
+                }
+            }
+        };
+        let dto_complete_err = rejected.expect_err("DTO-only If-None-Match: * on existing key must fail");
         assert_eq!(dto_complete_err.code(), &S3ErrorCode::PreconditionFailed);
 
         for condition in [ETag::Weak(committed_etag.clone()), ETag::Strong("different-etag".to_string())] {
