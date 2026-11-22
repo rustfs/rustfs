@@ -80,6 +80,18 @@ Do not commit one-shot plans, trackers, migration ledgers, benchmark snapshots, 
 
 Select checks from the final task-owned diff. Scoped `AGENTS.md` files may add a concrete path-specific check, but must not replace this tiering with a generic full-workspace gate.
 
+### Issue Fixes and External Regression Coverage
+
+After fixing a bug tracked by an issue and running the applicable local checks, ask the developer once per fixed issue whether to cover it in [rustfs/auto-testing](https://github.com/rustfs/auto-testing). Ask before opening or updating the fix PR, or before reporting completion if there is no PR. Reuse a choice already made for that fix. Investigation alone and documentation-only changes do not trigger this prompt.
+
+When presenting the three choices, describe the failing scenario and the assertion that would catch it.
+
+- **Add or extend a case.** Prefer extending an existing scenario when it can exercise the regression. Record the resulting case ID or auto-testing PR link.
+- **Already covered.** Cite the existing auto-testing case ID or path and the assertion that would catch this bug.
+- **Skip.** Record the developer's one-line reason and continue with the fix.
+
+Record the choice in the PR's Verification section or in the completion report for work without a PR. All three choices retain the applicable RustFS verification requirements below.
+
 ### Documentation and Instructions
 
 For prose, comments, agent instructions, and skill metadata that cannot affect runtime/build output:

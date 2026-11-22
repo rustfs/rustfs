@@ -144,6 +144,59 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
     assert_eq!(value["measured"], true);
     assert_eq!(value["rx_bytes"], 7);
 
+    // Exercise the largest declared body allowed by the legacy claimed-route profile.
+    let payload = Bytes::from(vec![b'x'; 1024 * 1024]);
+    let size = payload.len();
+    let response = signed_admin_request(
+        &client,
+        &endpoint,
+        Method::POST,
+        "/minio/admin/v3/speedtest/client/devnull",
+        server.access_key(),
+        server.secret_key(),
+        &sha256_hex(&payload),
+    )
+    .body(payload)
+    .send()
+    .await
+    .expect("signed streaming upload through the MinIO alias");
+    let status = response.status();
+    let body = response.text().await.expect("streaming response");
+    assert!(status.is_success(), "unexpected upload status {status}: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("streaming upload JSON");
+    assert_eq!(value["rx_bytes"], size);
+
+    let anonymous = client
+        .post(format!("{endpoint}/rustfs/admin/v3/speedtest/client/devnull"))
+        .header("content-length", 1)
+        .body(reqwest::Body::wrap_stream(stream::pending::<Result<Bytes, std::io::Error>>()))
+        .send()
+        .await
+        .expect("anonymous upload must be rejected before reading the body");
+    assert_eq!(anonymous.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let bad_digest = signed_admin_request(
+        &client,
+        &endpoint,
+        Method::POST,
+        "/rustfs/admin/v3/speedtest/client/devnull",
+        server.access_key(),
+        server.secret_key(),
+        &sha256_hex(b"y"),
+    )
+    .body("x")
+    .send()
+    .await
+    .expect("mismatched body must receive a response");
+    assert_eq!(bad_digest.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        bad_digest
+            .text()
+            .await
+            .expect("digest error body")
+            .contains("XAmzContentSHA256Mismatch")
+    );
+
     let oversized = signed_admin_request(
         &client,
         &endpoint,
@@ -174,11 +227,11 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
         DEVNULL_PATH,
         server.access_key(),
         server.secret_key(),
-        &sha256_hex(b"x"),
+        &sha256_hex(b"xy"),
     )
     .build()
     .expect("signed stalled upload headers");
-    let mut head = format!("POST {DEVNULL_PATH} HTTP/1.1\r\nContent-Length: 1\r\nExpect: 100-continue\r\n");
+    let mut head = format!("POST {DEVNULL_PATH} HTTP/1.1\r\nContent-Length: 2\r\nExpect: 100-continue\r\n");
     for (name, value) in request.headers() {
         write!(head, "{name}: {}\r\n", value.to_str().expect("ASCII signing header")).expect("write request head");
     }
@@ -195,6 +248,7 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
             let mut status = String::new();
             socket.read_line(&mut status).await.expect("read stalled upload status");
             assert_eq!(status, "HTTP/1.1 100 Continue\r\n");
+            socket.write_all(b"x").await.expect("send partial upload body");
             stalled.push(socket);
         }
         stalled
