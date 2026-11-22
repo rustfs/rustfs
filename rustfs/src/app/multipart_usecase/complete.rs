@@ -1446,20 +1446,17 @@ mod tests {
                     let version_id = response.version_id.expect("completed object version");
                     assert_ne!(version_id, "null");
                     assert_multipart_etag_listings(&bucket, key, &etag, &version_id).await;
-                    let head = crate::app::test_seams::head_object(
+                    let head = crate::app::test_seams::head_object_method_only(
                         &crate::app::object::DefaultObjectUsecase::from_global(),
-                        build_request(
-                            crate::app::storage_api::s3::dto::HeadObjectInput {
-                                bucket: bucket.clone(),
-                                key: key.to_string(),
-                                version_id: Some(version_id.clone()),
-                                sse_customer_algorithm: Some("AES256".to_string()),
-                                sse_customer_key: Some(customer_key.to_string()),
-                                sse_customer_key_md5: Some(customer_md5.to_string()),
-                                ..Default::default()
-                            },
-                            Method::HEAD,
-                        ),
+                        crate::app::storage_api::s3::dto::HeadObjectInput {
+                            bucket: bucket.clone(),
+                            key: key.to_string(),
+                            version_id: Some(version_id.clone()),
+                            sse_customer_algorithm: Some("AES256".to_string()),
+                            sse_customer_key: Some(customer_key.to_string()),
+                            sse_customer_key_md5: Some(customer_md5.to_string()),
+                            ..Default::default()
+                        },
                     )
                     .await
                     .expect("authorized HEAD of completed encrypted version");
@@ -1531,16 +1528,13 @@ mod tests {
                 .expect("keyless V1 listing"),
         )
         .expect("convert ListObjectsOutput");
-        let v2 = crate::app::test_seams::list_objects_v2(
+        let v2 = crate::app::test_seams::list_objects_v2_method_only(
             &bucket_usecase,
-            build_request(
-                ListObjectsV2Input {
-                    bucket: bucket.to_string(),
-                    prefix: Some(key.to_string()),
-                    ..Default::default()
-                },
-                Method::GET,
-            ),
+            ListObjectsV2Input {
+                bucket: bucket.to_string(),
+                prefix: Some(key.to_string()),
+                ..Default::default()
+            },
         )
         .await
         .expect("keyless V2 listing")
@@ -1717,17 +1711,14 @@ mod tests {
                 let version_id = response.version_id.expect("KMS completed version");
                 assert_ne!(version_id, "null");
                 assert_multipart_etag_listings(&bucket, key, &etag, &version_id).await;
-                let head = crate::app::test_seams::head_object(
+                let head = crate::app::test_seams::head_object_method_only(
                     &crate::app::object::DefaultObjectUsecase::from_global(),
-                    build_request(
-                        crate::app::storage_api::s3::dto::HeadObjectInput {
-                            bucket: bucket.clone(),
-                            key: key.to_string(),
-                            version_id: Some(version_id.clone()),
-                            ..Default::default()
-                        },
-                        Method::HEAD,
-                    ),
+                    crate::app::storage_api::s3::dto::HeadObjectInput {
+                        bucket: bucket.clone(),
+                        key: key.to_string(),
+                        version_id: Some(version_id.clone()),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .expect("HEAD of completed KMS version")
