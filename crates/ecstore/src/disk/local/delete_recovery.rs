@@ -841,7 +841,8 @@ fn explicit_delete_plan_bounded(
 /// `Uuid::parse_str` also accepts simple, braced and URN forms, which can only
 /// name independent child keys here.
 fn canonical_uuid(name: &str) -> Option<Uuid> {
-    Uuid::parse_str(name).ok().filter(|id| name == id.hyphenated().to_string())
+    let id = Uuid::parse_str(name).ok()?;
+    (name == id.hyphenated().encode_lower(&mut Uuid::encode_buffer())).then_some(id)
 }
 
 pub(super) fn missing_marker_preserves_child_prefix(journal: &DeleteRecoveryJournal) -> bool {
@@ -854,6 +855,12 @@ pub(super) fn missing_marker_preserves_child_prefix(journal: &DeleteRecoveryJour
             .requests
             .iter()
             .all(|request| request.deleted && request.version_id.is_some_and(|id| !id.is_nil()))
+}
+
+enum RecoveryDataDirectory {
+    Journal,
+    Original,
+    Current,
 }
 
 pub(super) fn inspection_with_markers_bounded(
@@ -941,12 +948,23 @@ pub(super) fn inspection_with_markers_bounded(
     }
     let current_meta = current.as_deref().map(FileMeta::load).transpose()?;
     let before_meta = before.as_deref().map(FileMeta::load).transpose()?;
-    let mut owned_dirs = HashSet::from([transaction]);
+    // A live reference identifies this key's directory but cannot authorize a
+    // staged shard. Journal provenance also detects overlap with a later generation.
+    let mut data_dirs = HashMap::new();
     if let Some(journal) = &journal {
-        owned_dirs.extend(journal.data_dirs.iter().copied());
+        data_dirs.extend(journal.data_dirs.iter().map(|&id| (id, RecoveryDataDirectory::Journal)));
     }
-    for meta in before_meta.iter().chain(current_meta.iter()) {
-        owned_dirs.extend(meta.get_data_dirs()?.into_iter().flatten());
+    if let Some(meta) = &before_meta {
+        for id in meta.get_data_dirs()?.into_iter().flatten() {
+            data_dirs.entry(id).or_insert(RecoveryDataDirectory::Original);
+        }
+    }
+    let mut current_references_journal_dirs = false;
+    if let Some(meta) = &current_meta {
+        for id in meta.get_data_dirs()?.into_iter().flatten() {
+            let owner = data_dirs.entry(id).or_insert(RecoveryDataDirectory::Current);
+            current_references_journal_dirs |= matches!(owner, RecoveryDataDirectory::Journal);
+        }
     }
     let marker_names = [
         DELETE_DATA_DIR_MARKER_PREFIX,
@@ -979,14 +997,15 @@ pub(super) fn inspection_with_markers_bounded(
                 return Err(DiskError::InvalidPath);
             }
             let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-            let id = canonical_uuid(&name);
-            if kind.is_dir() && id.is_none() {
-                // A non-UUID directory is only a prefix of independent child
-                // keys, which settle under their own exact-key locks and may
-                // vanish or appear concurrently. Settlement never touches it.
-                continue;
-            }
-            if kind.is_dir() && id.is_some_and(|id| !owned_dirs.contains(&id)) {
+            let id = if kind.is_dir() {
+                // Non-UUID prefixes belong to independent child keys.
+                let Some(id) = canonical_uuid(&name) else { continue };
+                Some(id)
+            } else {
+                None
+            };
+            let is_transaction = id == Some(transaction);
+            if id.is_some_and(|id| !is_transaction && !data_dirs.contains_key(&id)) {
                 let path = entry.path();
                 // A UUID child with its own xl.meta is an independent object unless
                 // this transaction also has evidence here. Keep ambiguous residue
@@ -1002,82 +1021,59 @@ pub(super) fn inspection_with_markers_bounded(
                 }
             }
             descriptions.push((name.clone(), kind.is_dir(), entry.metadata().map_err(to_file_error)?.len()));
-            if kind.is_dir() && id.is_some_and(|id| !id.is_nil()) {
-                has_other_uuid_dir |= id != Some(transaction);
-                for child in recovery_entries(std::fs::read_dir(entry.path()).map_err(to_file_error)?, budget) {
-                    let child = child.map_err(to_file_error)?;
-                    let kind = child.file_type().map_err(to_file_error)?;
-                    if !kind.is_dir() && !kind.is_file() {
-                        return Err(DiskError::InvalidPath);
-                    }
-                    let child_name = child.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-                    let metadata = child.metadata().map_err(to_file_error)?;
-                    descriptions.push((format!("{name}/{child_name}"), kind.is_dir(), metadata.len()));
-                    if kind.is_file()
-                        && [
-                            DELETE_DATA_DIR_MARKER_PREFIX,
-                            RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
-                            RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
-                        ]
-                        .iter()
-                        .any(|prefix| child_name == format!("{prefix}{transaction}"))
-                    {
-                        any_marker = true;
-                    }
-                    let staged_id = canonical_uuid(&child_name);
-                    let known_staged = kind.is_dir()
-                        && staged_id.is_some_and(|dir| {
-                            journal.as_ref().is_some_and(|journal| journal.data_dirs.contains(&dir))
-                                || before_meta
-                                    .as_ref()
-                                    .is_some_and(|metadata| metadata.get_data_dirs().is_ok_and(|dirs| dirs.contains(&Some(dir))))
-                        });
-                    if name == transaction.to_string()
-                        && !(kind.is_dir() && known_staged)
-                        && !(journal.is_none() && kind.is_file() && is_metadata_less_data_dir_entry(&child_name))
-                        && (kind.is_dir()
-                            || ![
-                                PREPARED,
-                                TARGET,
-                                FINISHED,
-                                STORAGE_FORMAT_FILE_BACKUP,
-                                DELETE_MARKER_ROLLBACK_FILE,
-                                DELETE_QUORUM_COMMITTED_FILE,
-                            ]
-                            .contains(&child_name.as_str()))
-                    {
+            if id.is_none_or(|id| id.is_nil()) {
+                continue;
+            }
+            has_other_uuid_dir |= !is_transaction;
+            for child in recovery_entries(std::fs::read_dir(entry.path()).map_err(to_file_error)?, budget) {
+                let child = child.map_err(to_file_error)?;
+                let kind = child.file_type().map_err(to_file_error)?;
+                if !kind.is_dir() && !kind.is_file() {
+                    return Err(DiskError::InvalidPath);
+                }
+                let child_name = child.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
+                let metadata = child.metadata().map_err(to_file_error)?;
+                descriptions.push((format!("{name}/{child_name}"), kind.is_dir(), metadata.len()));
+                any_marker = any_marker || (kind.is_file() && marker_names.contains(&child_name));
+                if !is_transaction {
+                    continue;
+                }
+                if kind.is_dir() {
+                    let owner = canonical_uuid(&child_name).and_then(|id| data_dirs.get(&id));
+                    if !matches!(owner, Some(RecoveryDataDirectory::Journal | RecoveryDataDirectory::Original)) {
                         return Err(DiskError::FileCorrupt);
                     }
-                    if name == transaction.to_string() && kind.is_dir() {
-                        has_staged_dir = true;
-                        for file in recovery_entries(std::fs::read_dir(child.path()).map_err(to_file_error)?, budget) {
-                            let file = file.map_err(to_file_error)?;
-                            let kind = file.file_type().map_err(to_file_error)?;
-                            let file_name = file.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-                            if !kind.is_file()
-                                || (!delete_recovery_part_file(&file_name)
-                                    && ![
-                                        DELETE_DATA_DIR_MARKER_PREFIX,
-                                        RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
-                                        RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
-                                    ]
-                                    .iter()
-                                    .any(|prefix| file_name == format!("{prefix}{transaction}")))
-                            {
-                                return Err(DiskError::FileCorrupt);
-                            }
-                            descriptions.push((
-                                format!("{name}/{child_name}/{file_name}"),
-                                false,
-                                file.metadata().map_err(to_file_error)?.len(),
-                            ));
+                    has_staged_dir = true;
+                    for file in recovery_entries(std::fs::read_dir(child.path()).map_err(to_file_error)?, budget) {
+                        let file = file.map_err(to_file_error)?;
+                        let kind = file.file_type().map_err(to_file_error)?;
+                        let file_name = file.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
+                        if !kind.is_file() || (!delete_recovery_part_file(&file_name) && !marker_names.contains(&file_name)) {
+                            return Err(DiskError::FileCorrupt);
                         }
+                        descriptions.push((
+                            format!("{name}/{child_name}/{file_name}"),
+                            false,
+                            file.metadata().map_err(to_file_error)?.len(),
+                        ));
                     }
+                } else if !([
+                    PREPARED,
+                    TARGET,
+                    FINISHED,
+                    STORAGE_FORMAT_FILE_BACKUP,
+                    DELETE_MARKER_ROLLBACK_FILE,
+                    DELETE_QUORUM_COMMITTED_FILE,
+                ]
+                .contains(&child_name.as_str())
+                    || (journal.is_none() && is_metadata_less_data_dir_entry(&child_name)))
+                {
+                    return Err(DiskError::FileCorrupt);
                 }
             }
         }
     }
-    descriptions.sort();
+    descriptions.sort_unstable();
     fingerprint.update(serde_json::to_vec(&descriptions)?);
     let mut rollback_data_complete = false;
     let mut commit_data_safe = false;
@@ -1115,8 +1111,9 @@ pub(super) fn inspection_with_markers_bounded(
                     rollback_data_complete = false;
                     continue;
                 };
-                rollback_data_complete &=
-                    complete_part_sources(&root.join(data_dir.to_string()), &rollback.join(data_dir.to_string()), &info)?;
+                let mut dir_buffer = Uuid::encode_buffer();
+                let dir: &str = data_dir.hyphenated().encode_lower(&mut dir_buffer);
+                rollback_data_complete &= complete_part_sources(&root.join(dir), &rollback.join(dir), &info)?;
             }
         }
         commit_data_safe = current_digest == journal.original_digest || current_digest == journal.target_digest;
@@ -1126,8 +1123,7 @@ pub(super) fn inspection_with_markers_bounded(
             // but cannot itself authorize an undecided transaction.
             commit_data_safe = (committed && current.is_none())
                 || current_meta.as_ref().is_some_and(|meta| {
-                    meta.get_data_dirs()
-                        .is_ok_and(|dirs| !dirs.into_iter().flatten().any(|dir| journal.data_dirs.contains(&dir)))
+                    !current_references_journal_dirs
                         && !meta.versions.iter().any(|version| {
                             version
                                 .header
@@ -6614,6 +6610,31 @@ mod tests {
             }
             assert!(alias.is_dir(), "legacy={legacy}: a non-canonical spelling is not this key's data dir");
         }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_current_generation_cannot_authorize_staged_data() {
+        let (_temp, disk, _info, _original) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").expect("object path");
+        let transaction = Uuid::new_v4();
+        apply(&disk, transaction).await;
+
+        let data_dir = Uuid::new_v4();
+        let current = test_meta(test_file_info("object", Uuid::new_v4(), Some(data_dir), None));
+        fs::write(root.join(STORAGE_FORMAT_FILE), &current)
+            .await
+            .expect("new live version");
+        let staged = root.join(transaction.to_string()).join(data_dir.to_string());
+        fs::create_dir(&staged).await.expect("unexpected staged directory");
+        fs::write(staged.join("part.1"), b"staged shard")
+            .await
+            .expect("unexpected staged shard");
+        assert!(matches!(
+            disk.inspect_delete_transaction("recovery", "object", transaction).await,
+            Err(DiskError::FileCorrupt)
+        ));
+        assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("live generation"), current);
+        assert_eq!(fs::read(staged.join("part.1")).await.expect("staged evidence"), b"staged shard");
     }
 
     #[tokio::test]

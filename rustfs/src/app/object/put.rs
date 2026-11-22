@@ -2624,6 +2624,35 @@ mod tests {
             .map_err(S3Error::from)
     }
 
+    /// Method-only envelope. `build_request` leaves the URI as `/`, the headers empty, and the trailing headers absent.
+    fn method_only_put_envelope() -> crate::app::RequestEnvelope {
+        crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        )
+    }
+
+    async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
+        let input = PutObjectWriteInput::from_legacy(input, None);
+        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
+            .await
+            .map_err(S3Error::from)
+    }
+
+    async fn put_extract_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
+        let input = PutObjectWriteInput::from_legacy(input, None);
+        Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input))
+            .await
+            .map_err(S3Error::from)
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn s3_put_uses_tail_drained_completion_before_acknowledgement() {
@@ -2647,7 +2676,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let (response, observed) = PUT_STORAGE_TEST_COMPLETION
             .scope(std::cell::Cell::new(None), async {
-                let response = Box::pin(put_owned(&usecase, build_request(input, Method::PUT))).await;
+                let response = Box::pin(put_method_only(&usecase, input)).await;
                 (response, PUT_STORAGE_TEST_COMPLETION.with(std::cell::Cell::get))
             })
             .await;
@@ -2712,31 +2741,28 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let request = |invalid_class: bool| {
-            let input = PutObjectInput {
-                bucket: bucket.clone(),
-                key: "counted".to_owned(),
-                body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
-                content_length: Some(5),
-                storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
-                ..Default::default()
-            };
-            build_request(input, Method::PUT)
+        let input = |invalid_class: bool| PutObjectInput {
+            bucket: bucket.clone(),
+            key: "counted".to_owned(),
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
+            content_length: Some(5),
+            storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
+            ..Default::default()
         };
         let baseline = official_count();
         let mut observed = 0;
         metrics::with_local_recorder(&recorder, || {
-            drop(put_owned(&usecase, request(false)));
+            drop(put_method_only(&usecase, input(false)));
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "constructing a future does not count a PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
             let error = runtime
-                .block_on(Box::pin(put_owned(&usecase, request(true))))
+                .block_on(Box::pin(put_method_only(&usecase, input(true))))
                 .expect_err("invalid class");
             assert_eq!(error.code(), &S3ErrorCode::InvalidStorageClass);
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count a refused PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
             runtime
-                .block_on(Box::pin(put_owned(&usecase, request(false))))
+                .block_on(Box::pin(put_method_only(&usecase, input(false))))
                 .expect("successful PUT");
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count an accepted PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
@@ -2746,7 +2772,7 @@ mod tests {
                 ..Default::default()
             };
             let error = runtime
-                .block_on(Box::pin(put_extract_owned(&usecase, build_request(input, Method::PUT))))
+                .block_on(Box::pin(put_extract_method_only(&usecase, input)))
                 .expect_err("missing archive body");
             assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
             assert_eq!(
@@ -2795,7 +2821,7 @@ mod tests {
                 // The gateway's dispatch names the operation before the use case runs.
                 Box::pin(async {
                     rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
-                    put_owned(&usecase, build_request(input, Method::PUT)).await
+                    put_method_only(&usecase, input).await
                 }),
             ));
             runtime.block_on(std::future::poll_fn(|cx| {
@@ -2935,9 +2961,8 @@ mod tests {
                 .content_length(Some(14))
                 .build()
                 .expect("capacity PUT input must build");
-            let request = build_request(input, Method::PUT);
             let error = PUT_STORAGE_TEST_FAILURE
-                .scope((PutStorageTestStage::Commit, failure), put_owned(&usecase, request))
+                .scope((PutStorageTestStage::Commit, failure), put_method_only(&usecase, input))
                 .await
                 .expect_err("capacity refusal must fail PUT");
             assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
@@ -3221,9 +3246,8 @@ mod tests {
             .build()
             .expect("metadata GET input must build");
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let metadata_get = tokio::spawn(async move {
-            crate::app::test_seams::get_object(&metadata_usecase, build_request(metadata_input, Method::GET)).await
-        });
+        let metadata_get =
+            tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&metadata_usecase, metadata_input).await });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
             .expect("GET must enter the bucket metadata stage");
@@ -3251,10 +3275,7 @@ mod tests {
             .build()
             .expect("GET input must build");
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get =
-            tokio::spawn(
-                async move { crate::app::test_seams::get_object(&get_usecase, build_request(get_input, Method::GET)).await },
-            );
+        let get = tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&get_usecase, get_input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -3291,7 +3312,7 @@ mod tests {
             .build()
             .expect("PUT input must build");
         let put_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let put = tokio::spawn(async move { put_owned(&put_usecase, build_request(put_input, Method::PUT)).await });
+        let put = tokio::spawn(async move { put_method_only(&put_usecase, put_input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.snapshot().write_stalled {
                 tokio::task::yield_now().await;
@@ -3519,8 +3540,7 @@ mod tests {
             .build()
             .expect("zero-copy PUT input must build");
         let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
-        let zero_copy_put =
-            tokio::spawn(async move { put_owned(&zero_copy_usecase, build_request(zero_copy_input, Method::PUT)).await });
+        let zero_copy_put = tokio::spawn(async move { put_method_only(&zero_copy_usecase, zero_copy_input).await });
 
         tokio::time::timeout(Duration::from_secs(30), async {
             while !object_traffic_health.snapshot().write_stalled {
@@ -4495,10 +4515,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
         assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
     }
@@ -4596,10 +4615,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
+        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4821,7 +4839,7 @@ mod tests {
                 .expect("SSE-C PUT input must build");
 
             let usecase = DefaultObjectUsecase::from_global();
-            let response = put_owned(&usecase, build_request(input, Method::PUT))
+            let response = put_method_only(&usecase, input)
                 .await
                 .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
             assert_eq!(response.server_side_encryption, None);
@@ -4990,7 +5008,7 @@ mod tests {
             .build()
             .expect("legacy quota PUT input should build");
 
-        let err = put_owned(&DefaultObjectUsecase::from_global(), build_request(input, Method::PUT))
+        let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect_err("4 GiB used plus a 2 GiB PUT must exceed a 5 GiB legacy quota");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -5036,7 +5054,7 @@ mod tests {
             .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
             .build()
             .expect("PUT input should build");
-        put_owned(&DefaultObjectUsecase::from_global(), build_request(input, Method::PUT))
+        put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect("a ledger-admitted bucket must accept a write without scanner usage");
 
@@ -5048,7 +5066,7 @@ mod tests {
             .content_length(Some(i64::try_from(too_large.len()).expect("test payload length must fit i64")))
             .build()
             .expect("PUT input should build");
-        let err = put_owned(&DefaultObjectUsecase::from_global(), build_request(input, Method::PUT))
+        let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
             .expect_err("the ledger must still reject a write above the quota limit");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -5451,7 +5469,7 @@ mod tests {
             .expect("PUT input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
+        let err = Box::pin(put_method_only(&usecase, input))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the write");
 
@@ -5496,9 +5514,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             request.in_scope(|| {
                 runtime.block_on(async {
-                    Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
-                        .await
-                        .expect("S3 PUT must commit");
+                    Box::pin(put_method_only(&usecase, input)).await.expect("S3 PUT must commit");
                     assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
                     assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
                 })
@@ -5563,7 +5579,7 @@ mod tests {
             .expect("PUT input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        Box::pin(put_owned(&usecase, build_request(input, Method::PUT)))
+        Box::pin(put_method_only(&usecase, input))
             .await
             .expect("a bucket without default encryption must still accept a plaintext write");
 

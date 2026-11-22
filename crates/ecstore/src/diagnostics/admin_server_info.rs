@@ -50,6 +50,8 @@ const EVENT_SERVER_INFO: &str = "server_info";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DIAGNOSTICS: &str = "diagnostics";
 
+mod inventory;
+
 use shadow_rs::shadow;
 
 shadow!(build);
@@ -276,6 +278,14 @@ fn collect_runtime_server_stats() -> (MemStats, u64, u64) {
 }
 
 pub async fn get_server_info(get_pools: bool) -> InfoMessage {
+    get_server_info_with_inventory(get_pools, false).await.0
+}
+
+pub async fn get_server_info_with_inventory(
+    get_pools: bool,
+    include_inventory: bool,
+) -> (InfoMessage, Option<rustfs_madmin::ClusterInventory>) {
+    let mut inventory = include_inventory.then(rustfs_madmin::ClusterInventory::default);
     let started = tracing::enabled!(tracing::Level::TRACE).then(Instant::now);
 
     let local = get_local_server_property().await;
@@ -301,25 +311,24 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
 
     if let Some(store) = runtime_sources::object_store_handle() {
         mode = ITEM_ONLINE;
-        apply_data_usage_result(
-            load_server_info_usage_snapshot(store.clone()).await,
-            &mut buckets,
-            &mut objects,
-            &mut versions,
-            &mut delete_markers,
-            &mut usage,
-        );
+        let namespace_options = BucketOptions {
+            cached: true,
+            no_metadata: true,
+            ..Default::default()
+        };
+        let load_snapshot = load_server_info_usage_snapshot(store.clone());
+        let (snapshot, namespace) = if include_inventory {
+            let (snapshot, namespace, measured) =
+                inventory::collect(&store, load_snapshot, store.list_bucket_for_scanner(&namespace_options)).await;
+            inventory = Some(measured);
+            (snapshot, Some(namespace))
+        } else {
+            (load_snapshot.await, None)
+        };
+        apply_data_usage_result(snapshot, &mut buckets, &mut objects, &mut versions, &mut delete_markers, &mut usage);
         if buckets.error.is_some() {
-            apply_bucket_namespace_count(
-                store
-                    .list_bucket_for_scanner(&BucketOptions {
-                        cached: true,
-                        no_metadata: true,
-                        ..Default::default()
-                    })
-                    .await,
-                &mut buckets,
-            );
+            let listing = inventory::namespace_or_fallback(namespace, store.list_bucket_for_scanner(&namespace_options)).await;
+            apply_bucket_namespace_count(listing, &mut buckets);
         }
 
         let backend_info = StorageAdminApi::backend_info(store.as_ref()).await;
@@ -375,7 +384,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         );
     }
 
-    InfoMessage {
+    let info = InfoMessage {
         mode: Some(mode.to_string()),
         domain: None,
         region: None,
@@ -390,7 +399,8 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         services: Some(services),
         servers: Some(servers),
         pools: Some(pools),
-    }
+    };
+    (info, inventory)
 }
 
 fn is_online_drive_state(state: &str) -> bool {

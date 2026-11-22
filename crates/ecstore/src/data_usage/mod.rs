@@ -14,6 +14,9 @@
 
 // #730: scanner/data-usage state is partially migrated and still owns staged cache helpers.
 
+mod admin_bucket_identity;
+pub(crate) use admin_bucket_identity::current_admin_bucket_incarnations;
+pub use admin_bucket_identity::verified_account_bucket_usage;
 pub mod local_snapshot;
 
 use crate::storage_api_contracts::{
@@ -57,7 +60,7 @@ const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 const ADMIN_USAGE_INCARNATION_CONCURRENCY: usize = 4;
-const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
 // A scanner save invalidates only the saving process's snapshot cache; every
 // other node sees it only after reloading. A fail-closed usage lookup for a
 // bucket the cached snapshot does not mention at all may reload a copy this
@@ -1471,51 +1474,23 @@ async fn project_admin_data_usage_for_current_buckets(
     mut response: DataUsageInfo,
     with_memory_overlay: bool,
 ) -> DataUsageInfo {
-    use futures::StreamExt as _;
     if !(response.is_complete_bucket_usage_snapshot() || response.is_valid_partial_snapshot()) {
         return DataUsageInfo::default();
     }
 
     let overlay_authoritative = with_memory_overlay && !runtime_sources::setup_is_dist_erasure().await;
     let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
-    let mut incarnations = HashMap::new();
-    {
-        // Identity reads happen after releasing snapshot and refresh locks,
-        // including on cache hits. Metadata transaction reads linearize each
-        // bucket against creation/deletion without relying on peer notices.
-        // The common deadline cancels unfinished work and bounds added latency.
-        let mut buckets = response
-            .buckets_usage
-            .keys()
-            .chain(response.usage_snapshot_bucket_observations.keys())
-            .cloned()
-            .collect::<HashSet<_>>();
-        if overlay_authoritative {
-            // Copy only names while holding the memory lock, then release it
-            // before storage I/O. A later new entry has no identity proof and
-            // will remain unknown in this response.
-            buckets.extend(memory_cache().read().await.keys().cloned());
-        }
-        let mut identities = futures::stream::iter(buckets)
-            .map(move |bucket| {
-                let store = store.clone();
-                async move {
-                    let identity = store.bucket_incarnation_id_from_disk(&bucket).await;
-                    (bucket, identity)
-                }
-            })
-            .buffer_unordered(ADMIN_USAGE_INCARNATION_CONCURRENCY);
-        while tokio::time::Instant::now() < deadline {
-            let Ok(Some((bucket, identity))) = tokio::time::timeout_at(deadline, identities.next()).await else {
-                break;
-            };
-            if let Ok(incarnation) = identity
-                && !incarnation.is_nil()
-            {
-                incarnations.insert(bucket, incarnation.to_string());
-            }
-        }
+    let mut buckets = response
+        .buckets_usage
+        .keys()
+        .chain(response.usage_snapshot_bucket_observations.keys())
+        .cloned()
+        .collect::<HashSet<_>>();
+    if overlay_authoritative {
+        // Copy names under the memory lock, then release it before storage I/O.
+        buckets.extend(memory_cache().read().await.keys().cloned());
     }
+    let incarnations = current_admin_bucket_incarnations(store, buckets.into_iter().collect(), deadline).await;
     response.project_bucket_observations_for_admin(&incarnations);
     if apply_bucket_usage_memory_overlay_if_authoritative(&mut response, overlay_authoritative).await {
         response.usage_snapshot_complete = false;

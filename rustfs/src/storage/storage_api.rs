@@ -497,7 +497,7 @@ pub(crate) mod test_consumer {
 }
 
 pub(crate) mod ecstore_admin {
-    pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info};
+    pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info_with_inventory};
 }
 
 pub(crate) mod ecstore_bucket {
@@ -551,7 +551,7 @@ pub(crate) mod ecstore_data_usage {
         load_admin_data_usage_with_memory_overlay, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
         lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
-        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
+        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend, verified_account_bucket_usage,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
