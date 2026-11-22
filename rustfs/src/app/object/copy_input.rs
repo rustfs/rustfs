@@ -35,6 +35,7 @@ impl CopySourceCondition {
 }
 
 // Deliberately no Debug: these fields may contain customer encryption keys.
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct CopyObjectWriteInput {
     pub(crate) bucket: String,
     pub(crate) key: String,
