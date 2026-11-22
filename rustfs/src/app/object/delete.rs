@@ -2268,10 +2268,10 @@ mod tests {
                             .version_id(requested_version)
                             .build()
                             .expect("HEAD request");
-                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("marker GET");
-                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
                             .await
                             .expect_err("marker HEAD");
                         for (method, error) in [("GET", get_error), ("HEAD", head_error)] {
@@ -2318,7 +2318,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical GET request");
-                    let response = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                    let response = crate::app::test_seams::get_object_method_only(&usecase, get)
                         .await
                         .expect("historical GET");
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
@@ -2334,7 +2334,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical HEAD request");
-                    let response = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                    let response = crate::app::test_seams::head_object_method_only(&usecase, head)
                         .await
                         .expect("historical HEAD");
                     assert_eq!(response.output.content_length, Some(i64::try_from(payload.len()).unwrap()));
@@ -2354,10 +2354,10 @@ mod tests {
                             .version_id(version)
                             .build()
                             .expect("missing HEAD request");
-                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("missing GET");
-                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
                             .await
                             .expect_err("missing HEAD");
                         for error in [get_error, head_error] {
@@ -2452,7 +2452,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let get_err = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
+                    let get_err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
                         .await
                         .expect_err("GET of a marker remains forbidden");
                     assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2462,7 +2462,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let head_err = Box::pin(crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD)))
+                    let head_err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, head))
                         .await
                         .expect_err("HEAD of a marker remains forbidden");
                     assert_eq!(head_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2538,7 +2538,7 @@ mod tests {
                         .version_id(Some(marker_id))
                         .build()
                         .unwrap();
-                    let missing = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(removed, Method::GET)))
+                    let missing = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, removed))
                         .await
                         .expect_err("the marker version must actually be gone");
                     assert_eq!(
@@ -2551,7 +2551,7 @@ mod tests {
                         .key(key.to_string())
                         .build()
                         .unwrap();
-                    let response = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
+                    let response = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
                         .await
                         .expect("GET restores the historical payload");
                     let mut body = response.output.body.expect("GET body");
