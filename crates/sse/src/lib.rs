@@ -172,26 +172,6 @@ pub const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
 const SUPPORT_SSE_ALGORITHMS: &[&str] = &[DEFAULT_SSE_ALGORITHM];
 
-// check sse type
-#[allow(unused)]
-pub fn get_sse_type(
-    server_side_encryption: Option<&str>,
-    customer_algorithm: Option<&String>,
-    customer_key: Option<&String>,
-    customer_key_md5: Option<&String>,
-) -> Option<SSEType> {
-    if customer_algorithm.is_some() && customer_key.is_some() && customer_key_md5.is_some() {
-        return Some(SSEType::SseC);
-    }
-
-    let sse = server_side_encryption?;
-    match sse {
-        AMZ_ENCRYPTION_AES => Some(SSEType::SseS3),
-        AMZ_ENCRYPTION_KMS => Some(SSEType::SseKms),
-        _ => None,
-    }
-}
-
 /// SSE configuration resolved from request and bucket defaults
 #[derive(Debug)]
 pub struct SseConfiguration {
@@ -350,13 +330,6 @@ impl std::fmt::Debug for SseTypeV2 {
     }
 }
 
-impl SseTypeV2 {
-    #[allow(unused)]
-    pub fn to_metadata(&self) -> HashMap<String, String> {
-        sse_configuration_to_metadata(self)
-    }
-}
-
 pub async fn prepare_sse_configuration_v2(
     host: &dyn SseHost,
     bucket: &str,
@@ -386,32 +359,6 @@ pub async fn prepare_sse_configuration_v2(
     }
 
     Ok(None)
-}
-
-#[allow(unused)]
-pub fn sse_configuration_to_metadata(sse_configuration: &SseTypeV2) -> HashMap<String, String> {
-    let mut metadata = HashMap::new();
-    match sse_configuration {
-        SseTypeV2::SseS3(sse) => {
-            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
-        }
-        SseTypeV2::SseKms(sse, kms_key_id) => {
-            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
-            if let Some(kms_key_id) = kms_key_id {
-                metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.to_string());
-            }
-        }
-        SseTypeV2::SseC(algorithm, _key, key_md5) => {
-            metadata.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                algorithm.as_str().to_string(),
-            );
-            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5.to_string());
-        }
-    }
-
-    metadata
 }
 
 // ============================================================================
