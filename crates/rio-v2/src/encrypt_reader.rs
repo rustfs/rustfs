@@ -334,14 +334,23 @@ where
         }
     }
 
+    /// See [`Self::new_multipart_with_sequence`] for the `multipart_parts` contract.
     pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], multipart_parts: Vec<usize>) -> Self {
         Self::new_multipart_with_sequence(inner, key, base_nonce, multipart_parts, 0)
     }
 
+    /// See [`Self::new_multipart_with_object_key_and_sequence`] for the `multipart_parts` contract.
     pub fn new_multipart_with_object_key(inner: R, object_key: [u8; 32], multipart_parts: Vec<usize>) -> Self {
         Self::new_multipart_with_object_key_and_sequence(inner, object_key, multipart_parts, 0)
     }
 
+    /// Decrypts the concatenated package sequences of `multipart_parts`, in
+    /// order, starting at package `sequence_number` of the first one.
+    ///
+    /// List only the parts that stored bytes: an empty part has no package on
+    /// disk, and reading fails with [`io::ErrorKind::UnexpectedEof`] when the
+    /// stream ends before a listed part's final package, including on the
+    /// boundary before a listed part.
     pub fn new_multipart_with_sequence(
         inner: R,
         key: [u8; 32],
@@ -373,6 +382,14 @@ where
         }
     }
 
+    /// Decrypts the concatenated package sequences of `multipart_parts`, in
+    /// order, deriving each part key from `object_key` and starting at package
+    /// `sequence_number` of the first one.
+    ///
+    /// List only the parts that stored bytes: an empty part has no package on
+    /// disk, and reading fails with [`io::ErrorKind::UnexpectedEof`] when the
+    /// stream ends before a listed part's final package, including on the
+    /// boundary before a listed part.
     pub fn new_multipart_with_object_key_and_sequence(
         inner: R,
         object_key: [u8; 32],
@@ -466,15 +483,24 @@ where
                                 // with `finalized == false` (the finalized case is consumed at the
                                 // loop top). If at least one package of the current part has been
                                 // decrypted (`ref_nonce.is_some()`) but we never saw a final-flagged
-                                // package, the final package is missing => DARE truncation. Zero
-                                // decrypted packages (`ref_nonce.is_none()`) is a legitimately empty
-                                // object (encrypt emits no packages for empty plaintext), so accept.
+                                // package, the final package is missing => DARE truncation.
                                 if this.ref_nonce.is_some() {
                                     return Poll::Ready(Err(io::Error::new(
                                         io::ErrorKind::UnexpectedEof,
                                         "DARE stream truncated before a finalized package",
                                     )));
                                 }
+                                // Zero decrypted packages. A listed part always carries at least
+                                // one package, so the stream ended before that part: without this
+                                // a stream cut exactly on a part boundary reads as complete.
+                                if let Some(missing_part) = this.multipart_parts.get(*this.current_part_index) {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        format!("DARE stream ended before multipart part {missing_part}"),
+                                    )));
+                                }
+                                // No part is expected here: a legitimately empty object (encrypt
+                                // emits no packages for empty plaintext), so accept.
                                 *this.finished = true;
                                 return Poll::Ready(Ok(()));
                             }
@@ -986,6 +1012,48 @@ mod tests {
             .await
             .expect_err("multipart stream truncated within a part must fail");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn multipart_decrypt_reader_rejects_a_stream_missing_a_listed_part() {
+        let object_key = [0x64u8; 32];
+        let part_plaintexts = [vec![0xA1; DARE_PAYLOAD_SIZE + 31], vec![0xB2; DARE_PAYLOAD_SIZE * 2 + 7]];
+        let mut encrypted_parts = Vec::new();
+        for (part_number, part_plaintext) in (1u32..).zip(&part_plaintexts) {
+            let mut encrypted = Vec::new();
+            EncryptReader::new_multipart_with_object_key(Cursor::new(part_plaintext.clone()), object_key, part_number)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypt multipart part");
+            encrypted_parts.push(encrypted);
+        }
+
+        // Every stream below ends on a part boundary, right after a
+        // final-flagged package, with a listed part still undelivered.
+        for (stream, listed_parts) in [
+            (encrypted_parts[0].clone(), vec![1, 2]),
+            (encrypted_parts.concat(), vec![1, 2, 3]),
+            (Vec::new(), vec![1]),
+        ] {
+            let mut sink = Vec::new();
+            let outcome = DecryptReader::new_multipart_with_object_key(Cursor::new(stream), object_key, listed_parts.clone())
+                .read_to_end(&mut sink)
+                .await;
+            match outcome {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "parts {listed_parts:?}: {err}"),
+                Ok(read) => panic!("parts {listed_parts:?}: a stream missing a listed part read {read} bytes as a clean EOF"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_decrypt_reader_accepts_an_empty_stream_without_listed_parts() {
+        let mut decrypted = Vec::new();
+        DecryptReader::new_multipart_with_object_key(Cursor::new(Vec::new()), [0x64u8; 32], Vec::new())
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("an object whose parts all stored no bytes is empty, not truncated");
+        assert!(decrypted.is_empty());
     }
 
     /// A bounded pipe whose producer lags the consumer: it hands out at most
