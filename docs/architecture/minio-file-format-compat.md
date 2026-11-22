@@ -1,7 +1,7 @@
 # MinIO On-Disk Format Interoperability
 
 **Use this when:** deciding whether a MinIO drive set, bucket-metadata blob, or SSE object can be read or imported by a given RustFS build, or before touching any constant or codec listed under Version Anchors.
-**Source of truth:** `crates/filemeta/src/filemeta.rs`, `crates/filemeta/src/filemeta/codec.rs`, `crates/ecstore/src/bucket/metadata.rs`, `crates/ecstore/src/bucket/migration.rs`, `crates/sse/src/lib.rs`, `rustfs/Cargo.toml` `[features]`, `.github/workflows/ci.yml`, `.github/workflows/minio-interop.yml`.
+**Source of truth:** `crates/filemeta/src/filemeta.rs`, `crates/filemeta/src/filemeta/codec.rs`, `crates/ecstore/src/bucket/metadata.rs`, `crates/ecstore/src/bucket/migration.rs`, `crates/sse/src/core/`, `crates/sse/src/kms/`, `rustfs/Cargo.toml` `[features]`, `.github/workflows/ci.yml`, `.github/workflows/minio-interop.yml`.
 
 This is an interop contract, not a plan. Migration is one-way (MinIO to RustFS). Erasure-coding internals are owned by [erasure-coding.md](erasure-coding.md); this document owns the interop claim, the fixture evidence, and the out-of-scope list.
 
@@ -81,7 +81,7 @@ The `xl.meta` around a MinIO SSE object parses in every build, so such objects l
 
 ### Seams
 
-The cryptography (DARE v2 stream format, object-key derivation, sealing) was never the gap. Three metadata seams above it rejected MinIO objects; all are closed in `rio-v2` builds. Symbols are in `crates/sse/src/lib.rs` unless noted.
+The cryptography (DARE v2 stream format, object-key derivation, sealing) was never the gap. Three metadata seams above it rejected MinIO objects; all are closed in `rio-v2` builds. Symbols are under `crates/sse/src/core/` unless noted.
 
 | Seam | Resolution |
 |---|---|
@@ -116,7 +116,7 @@ Inventory the source first: bucket default encryption means objects can be encry
 | Pull-request coverage | `test-and-lint-rio-v2` in `.github/workflows/ci.yml`: clippy plus `cargo nextest` for `rustfs`, `rustfs-ecstore`, and `rustfs-sse` with `--features rio-v2`. This is the cfg-seam guard; it keeps the feature compiling and its unit suite green on every pull request. |
 | Full-suite lane | `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` in `ci.yml` run only on the nightly schedule and manual dispatch (`cache-warm.yml` keeps the `ci-feat-rio` cache warm so the scheduled build fits its timeout). |
 | Interop evidence | `.github/workflows/minio-interop.yml` (nightly plus manual) regenerates real MinIO backend trees via `crates/rio-v2/tests/minio_fixture_lab/` and runs the `#[ignore]` reader tests in `rustfs/src/storage/minio_generated_read_test.rs` with `--features rio-v2`. Its freshness is tracked in `.github/scheduled-validations.json`. |
-| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `rio-v2` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the cfg seams in `crates/sse/src/lib.rs`, the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
+| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `rio-v2` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the cfg seams under `crates/sse/src/`, the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
 
 ## Fixture Evidence
 

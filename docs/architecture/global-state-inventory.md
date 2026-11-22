@@ -47,7 +47,7 @@ RustFS-side statics that matter architecturally because other modules are tempte
 | `KEYSTONE_AUTH`, `KEYSTONE_MAPPER`, `KEYSTONE_CONFIG` | `rustfs/src/auth_keystone.rs` | Keystone provider, mapper, and config stay private to the Keystone owner. |
 | `DEADLOCK_DETECTOR` | `rustfs/src/storage/deadlock_detector.rs` | Detector lifecycle stays private to the storage deadlock detector. |
 | `CONCURRENCY_MANAGER` | `rustfs/src/storage/concurrency/manager.rs` | Storage concurrency scheduler state stays inside the concurrency owner. |
-| `GLOBAL_KMS_DEK_PROVIDER`, `GLOBAL_SSE_DEK_PROVIDER` | `crates/sse/src/lib.rs` | DEK provider caches stay private to the SSE owner. |
+| `GLOBAL_KMS_DEK_PROVIDER`, `GLOBAL_SSE_DEK_PROVIDER` | `crates/sse/src/kms/provider.rs` | DEK provider caches stay private to the SSE owner. |
 | `ECSTORE_EVENT_DISPATCH_HOOK` | `rustfs/src/server/event.rs` | Event bridge registration goes through the storage facade. |
 | `AUDIT_MODULE_ENABLED`, `NOTIFY_MODULE_ENABLED` | `rustfs/src/module_switches.rs` | Module toggles are read through module-switch helpers; `MODULE_SWITCH_RMW_LOCK` (`rustfs/src/server/module_switch.rs`) serializes persisted updates. |
 | `RUNTIME_CONFIG_RELOAD_MUTEX` | `rustfs/src/admin/service/config.rs` | Serializes dynamic config reload fanout. |

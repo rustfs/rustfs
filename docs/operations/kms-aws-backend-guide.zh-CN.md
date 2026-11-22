@@ -1,7 +1,7 @@
 # AWS KMS 后端：接入、验证与运维
 
 **适用场景：** 首次把 RustFS 接入 AWS KMS、验证已有的 AWS 后端部署、从 1.0.4 或 1.0.5 升级，或者规划如何运维并保护 RustFS 所依赖的 AWS 密钥。
-**事实来源：** `crates/kms/src/backends/aws.rs`（后端行为及其差异）、`crates/kms/src/config.rs`（`ENV_KMS_AWS_*`）、`crates/kms/src/policy.rs`（重试、超时与熔断）、`crates/sse/src/lib.rs`（SSE 数据面）。English: [kms-aws-backend-guide.md](kms-aws-backend-guide.md)。
+**事实来源：** `crates/kms/src/backends/aws.rs`（后端行为及其差异）、`crates/kms/src/config.rs`（`ENV_KMS_AWS_*`）、`crates/kms/src/policy.rs`（重试、超时与熔断）、`crates/sse/src/core/`（SSE 数据面）。English: [kms-aws-backend-guide.md](kms-aws-backend-guide.md)。
 
 本页关于行为的描述，均来自对真实 AWS KMS 服务（区域 `eu-north-1`）的实测；对于无法让 AWS 按需产生的故障，则使用一个实现了 AWS KMS 线上协议的本机替身来实测。属于未经实测的建议之处，文中会明确标注。AWS 与其它后端在契约层面的差异，见 [KMS backend security properties](kms-backend-security.md#aws-kms-deviations-from-the-shared-backend-contract)。
 
