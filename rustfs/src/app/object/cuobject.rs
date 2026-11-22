@@ -27,7 +27,6 @@ use crate::app::storage_api::object_usecase::runtime::get_global_endpoints_opt;
 #[cfg(not(feature = "nixl"))]
 use crate::app::storage_api::object_usecase::runtime::global_rustfs_port;
 use bytes::Bytes;
-use futures::Stream;
 use http::HeaderMap;
 use rustfs_config::{
     DEFAULT_ERASURE_SHARD_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET,
@@ -56,9 +55,8 @@ pub(crate) mod transport {
     };
 }
 use crate::app::storage_api::object_usecase::rdma::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
-use crate::app::storage_api::s3::dto::StreamingBlob;
-use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
+use rustfs_gateway_stream::Body;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u64, get_env_usize};
 use std::collections::VecDeque;
 use std::io;
@@ -780,36 +778,6 @@ pub(crate) async fn serve_get_over_rdma(
     Ok(moved)
 }
 
-/// Request body of a cuObject PUT: the object bytes are RDMA-read from the
-/// client's buffer into staging, one chunk ahead of the consumer, and handed
-/// to the normal PUT pipeline as an ordinary byte stream.
-struct RdmaPutBody {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static>>,
-    remaining: usize,
-}
-
-impl Stream for RdmaPutBody {
-    type Item = Result<Bytes, StdError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let next = self.inner.as_mut().poll_next(cx);
-        if let Poll::Ready(Some(Ok(bytes))) = &next {
-            self.remaining = self.remaining.saturating_sub(bytes.len());
-        }
-        next
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ByteStream for RdmaPutBody {
-    fn remaining_length(&self) -> RemainingLength {
-        RemainingLength::new_exact(self.remaining)
-    }
-}
-
 type StagedRead = JoinHandle<Result<StagingChunk, CuObjectError>>;
 
 /// The staged bytes of `chunk`: with `zero_copy`, a `Bytes` that owns the
@@ -846,13 +814,14 @@ fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaTok
 /// consumer that keeps a chunk keeps it out of the pool: only callers whose
 /// body is consumed and dropped with the request (UploadPart) may set it.
 /// PutObject may hand its body to the object data cache, so it copies.
-pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_copy: bool) -> S3Result<(StreamingBlob, u64)> {
+pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_copy: bool) -> S3Result<(Body, u64)> {
     let service = SERVICE
         .get()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma put is not enabled"))?;
     let server = Arc::clone(service.pick());
     let read_ahead = service.put_read_ahead;
     let total = token.buffer_len;
+    let length = usize::try_from(total).map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?;
     let chunk_bytes = server.chunk_bytes();
     let object = format!("{bucket}/{key}");
     let token = token.clone();
@@ -893,13 +862,7 @@ pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_cop
             Ok::<_, io::Error>(Some((bytes, (pending, next_offset))))
         }
     });
-    let stream = futures::TryStreamExt::map_err(stream, |error: io::Error| -> StdError { Box::new(error) });
-    let body = RdmaPutBody {
-        inner: Box::pin(stream),
-        remaining: usize::try_from(total)
-            .map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?,
-    };
-    Ok((StreamingBlob::new(body), total))
+    Ok((super::native_body::from_io_stream_with_length(stream, Some(length)), total))
 }
 
 /// State shared by the segment writers of one RDMA GET: the server, the

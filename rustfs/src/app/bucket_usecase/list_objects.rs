@@ -372,13 +372,12 @@ fn list_objects_next_marker(info: &ListObjectsV2Info, cursor: Option<&str>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use rustfs_gateway_types::BucketName;
 
     #[test]
     #[serial_test::serial]
     fn list_apis_report_storage_read_quorum_as_unavailable() {
-        use crate::app::bucket_usecase::test_support::owned_envelope;
         use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
         run_large_stack_test("list-quorum-surface", || async {
             let usecase = DefaultBucketUsecase::with_context(Some(shared_gating_ambient().await));
@@ -485,7 +484,7 @@ mod tests {
     }
 
     fn envelope() -> RequestEnvelope {
-        RequestEnvelope::from_s3s(&build_request((), http::Method::GET))
+        owned_envelope(http::Method::GET)
     }
 
     #[test]

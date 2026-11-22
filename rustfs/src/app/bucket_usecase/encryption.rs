@@ -203,7 +203,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::storage_api::s3::dto::{self, PutBucketEncryptionInput, ServerSideEncryption};
     use http::Method;
     use rustfs_gateway_types::persistence::{
@@ -292,20 +292,19 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
-        let prepared = crate::storage::persisted_from_s3s(&req.input.server_side_encryption_configuration);
+        let prepared = crate::storage::persisted_from_s3s(&input.server_side_encryption_configuration);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&req), &req.input.bucket, prepared.map_err(Into::into))
+            .execute_put_bucket_encryption(owned_envelope(Method::PUT), &input.bucket, prepared.map_err(Into::into))
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
 
         let err = usecase
             .execute_put_bucket_encryption(
-                RequestEnvelope::from_s3s(&req),
-                &req.input.bucket,
+                owned_envelope(Method::PUT),
+                &input.bucket,
                 Ok(PersistedBucketEncryptionConfiguration { rules: vec![] }),
             )
             .await

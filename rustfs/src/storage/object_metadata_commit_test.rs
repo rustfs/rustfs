@@ -175,6 +175,7 @@ fn lock_write_rejects_bucket_replacement(write: LockWrite) {
         bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions},
         object::{ObjectIO, ObjectOperations},
     };
+    use crate::storage::storage_api::ecstore_object::WriteCompletion;
     use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
     use rustfs_scanner::{SegmentInvalidationProducerIdentity, set_scanner_dirty_usage_mutation_observer};
     use std::sync::{Arc, Mutex};
@@ -205,6 +206,8 @@ fn lock_write_rejects_bucket_replacement(write: LockWrite) {
                         &mut StoragePutObjReader::from_vec(body.to_vec()),
                         &StorageObjectOptions {
                             versioned: true,
+                            // The test snapshots every disk immediately after this write.
+                            write_completion: WriteCompletion::TailDrained,
                             ..Default::default()
                         },
                     )
