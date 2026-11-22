@@ -18,7 +18,7 @@ use super::*;
 use crate::app::storage_api::bucket_usecase::contract::list::ListOperations as _;
 use crate::app::storage_api::s3::dto::{
     CommonPrefix, DeleteMarkerEntry, EncodingType, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, MetadataEntry, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
+    ListObjectsV2Output, MetadataEntry, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
     UserMetadata,
 };
 use crate::app::storage_api::s3::xml::{SerResult, SerializeContent};
@@ -373,6 +373,15 @@ async fn collect_list_objects_metadata_permissions(
     Ok(permissions)
 }
 
+/// List metadata XML still carries the legacy owner shape. The id and display name are the owned identity.
+fn legacy_list_owner() -> Owner {
+    let owner = super::rustfs_owner();
+    Owner {
+        display_name: owner.display_name,
+        id: owner.id,
+    }
+}
+
 fn build_list_object_versions_metadata_output(
     object_infos: ListObjectVersionsInfo,
     bucket: &str,
@@ -380,7 +389,7 @@ fn build_list_object_versions_metadata_output(
     encoding_type: Option<&EncodingType>,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
 ) -> ListObjectVersionsMetadataOutput {
-    let owner = rustfs_owner();
+    let owner = legacy_list_owner();
     let common_prefixes = object_infos
         .prefixes
         .into_iter()
@@ -508,7 +517,7 @@ fn build_list_objects_v2_metadata_output(
     fetch_owner: bool,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
 ) -> ListObjectsV2MetadataOutput {
-    let owner = rustfs_owner();
+    let owner = legacy_list_owner();
 
     let contents = object_infos
         .objects

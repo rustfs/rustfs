@@ -41,9 +41,25 @@ pub(crate) struct ListMultipartUploadsParams {
 }
 
 #[cfg(test)]
+fn legacy_owner(owner: rustfs_gateway_types::dto::Owner) -> s3s::dto::Owner {
+    s3s::dto::Owner {
+        display_name: owner.display_name,
+        id: owner.id,
+    }
+}
+
+#[cfg(test)]
+fn legacy_initiator(initiator: rustfs_gateway_types::dto::Initiator) -> s3s::dto::Initiator {
+    s3s::dto::Initiator {
+        display_name: initiator.display_name,
+        id: initiator.id,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
-    let owner = rustfs_owner();
-    let initiator = rustfs_initiator();
+    let owner = legacy_owner(rustfs_owner());
+    let initiator = legacy_initiator(rustfs_initiator());
     let transformed_parts = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
         || res
             .user_defined
@@ -213,8 +229,8 @@ mod tests {
         assert_eq!(parts[0].part_number, Some(1));
         assert_eq!(parts[0].size, Some(11));
         assert_eq!(parts[0].e_tag, Some(to_s3s_xml_etag("etag-1")));
-        assert_eq!(output.owner, Some(rustfs_owner()));
-        assert_eq!(output.initiator, Some(rustfs_initiator()));
+        assert_eq!(output.owner, Some(super::legacy_owner(rustfs_owner())));
+        assert_eq!(output.initiator, Some(super::legacy_initiator(rustfs_initiator())));
     }
 
     #[test]

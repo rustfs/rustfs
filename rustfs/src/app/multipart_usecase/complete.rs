@@ -1124,10 +1124,9 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("ssec-completion-checksums", || async {
             let (_store, bucket) =
                 crate::app::gating_test_env::durable_quota_test_bucket("ssec-completion-checksums", 16_384).await;
-            let versioning_req = build_request((), Method::PUT);
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
                 .execute_put_bucket_versioning(
-                    RequestEnvelope::from_s3s(&versioning_req),
+                    super::super::test_support::owned_envelope(Method::PUT),
                     &bucket,
                     Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
                         status: Some("Enabled".to_owned()),
@@ -1304,16 +1303,13 @@ mod tests {
 
         let bucket_usecase = crate::app::bucket_usecase::DefaultBucketUsecase::from_global();
         // Listings carry neither the SSE-C key nor a per-object decryption request.
-        let versions_req = build_request(
-            ListObjectVersionsInput {
-                bucket: bucket.to_string(),
-                prefix: Some(key.to_string()),
-                ..Default::default()
-            },
-            Method::GET,
-        );
-        let versions_env = RequestEnvelope::from_s3s(&versions_req);
-        let versions_in = list_object_versions::input_from_s3s(versions_req.input).expect("convert ListObjectVersionsInput");
+        let versions_input = ListObjectVersionsInput {
+            bucket: bucket.to_string(),
+            prefix: Some(key.to_string()),
+            ..Default::default()
+        };
+        let versions_env = super::super::test_support::owned_envelope(Method::GET);
+        let versions_in = list_object_versions::input_from_s3s(versions_input).expect("convert ListObjectVersionsInput");
         let versions = list_object_versions::output_to_s3s(
             bucket_usecase
                 .execute_list_object_versions(versions_env, versions_in)
@@ -1328,16 +1324,13 @@ mod tests {
         assert_eq!(entries[0].e_tag.as_ref(), Some(etag));
         assert_xml_etag(&versions, etag);
 
-        let v1_req = build_request(
-            ListObjectsInput {
-                bucket: bucket.to_string(),
-                prefix: Some(key.to_string()),
-                ..Default::default()
-            },
-            Method::GET,
-        );
-        let v1_env = RequestEnvelope::from_s3s(&v1_req);
-        let v1_in = list_objects::input_from_s3s(v1_req.input).expect("convert ListObjectsInput");
+        let v1_input = ListObjectsInput {
+            bucket: bucket.to_string(),
+            prefix: Some(key.to_string()),
+            ..Default::default()
+        };
+        let v1_env = super::super::test_support::owned_envelope(Method::GET);
+        let v1_in = list_objects::input_from_s3s(v1_input).expect("convert ListObjectsInput");
         let v1 = list_objects::output_to_s3s(
             bucket_usecase
                 .execute_list_objects(v1_env, v1_in)
@@ -1411,7 +1404,6 @@ mod tests {
                 .await
                 .expect("create versioned Object Lock bucket");
             let key = "kms-encrypted";
-            let enc_req = build_request((), Method::PUT);
             let enc_cfg = crate::app::storage_api::s3::dto::ServerSideEncryptionConfiguration {
                 rules: vec![crate::app::storage_api::s3::dto::ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(
@@ -1425,7 +1417,7 @@ mod tests {
             };
             let prepared = crate::storage::persisted_from_s3s(&enc_cfg).map_err(Into::into);
             crate::app::bucket_usecase::DefaultBucketUsecase::from_global()
-                .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&enc_req), &bucket, prepared)
+                .execute_put_bucket_encryption(super::super::test_support::owned_envelope(Method::PUT), &bucket, prepared)
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();

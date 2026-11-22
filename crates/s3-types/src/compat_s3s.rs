@@ -133,6 +133,16 @@ impl From<S3Error> for legacy_s3s::S3Error {
     }
 }
 
+impl S3Error {
+    /// The pinned legacy serializer's XML response. Call sites stay on this type.
+    /// DELETE BY T4.2 with the rest of this file.
+    pub fn to_http_response(self) -> Result<http::Response<crate::Body>, Self> {
+        let response = legacy_s3s::S3Error::from(self).to_http_response().map_err(Self::from)?;
+        let (parts, body) = response.into_parts();
+        Ok(http::Response::from_parts(parts, crate::Body::from(body)))
+    }
+}
+
 impl From<legacy_s3s::S3Error> for S3Error {
     fn from(error: legacy_s3s::S3Error) -> Self {
         let code: S3ErrorCode = error.code().clone().into();

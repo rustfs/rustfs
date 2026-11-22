@@ -1021,6 +1021,33 @@ impl<T> S3Router<T> {
     }
 }
 
+#[cfg(test)]
+impl<T: OwnedOperation> S3Router<T> {
+    /// Dispatches one legacy admin request. Callers keep their assertions and do not name s3s.
+    pub(crate) async fn call_legacy(
+        &self,
+        method: Method,
+        uri: &str,
+        extensions: http::Extensions,
+    ) -> s3s::S3Result<S3Response<Body>> {
+        S3Route::call(
+            self,
+            S3Request {
+                input: Body::empty(),
+                method,
+                uri: uri.parse().expect("test URI"),
+                headers: HeaderMap::new(),
+                extensions,
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            },
+        )
+        .await
+    }
+}
+
 impl<T> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
