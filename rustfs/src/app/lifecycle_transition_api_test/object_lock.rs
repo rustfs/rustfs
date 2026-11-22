@@ -52,8 +52,19 @@ async fn object_lock_handlers_schedule_replication() {
         .expect("Failed to create object-lock bucket");
     upload_test_object(&ecstore, bucket.as_str(), object, b"worm payload").await;
 
-    let req = build_request((), Method::PUT);
-    let envelope = || RequestEnvelope::from_s3s(&req);
+    let envelope = || {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            Extensions::new(),
+        )
+    };
 
     // A bucket without a replication configuration can skip the decision.
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);

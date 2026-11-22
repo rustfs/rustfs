@@ -333,7 +333,7 @@ root = Path(sys.argv[1])
 records = [(path, json.loads(path.read_text())) for path in (root / "requests").glob("*.timing.json")]
 assert len(records) == 5, records
 assert len({row["clock_id"] for _, row in records}) == 1
-assert len({row["start_ns"] for _, row in records}) == 5
+# Concurrent requests can start in the same monotonic clock tick.
 for _, row in records:
     assert 0 < row["start_ns"] < row["end_ns"]
     assert row["start_unix_ns"] > 0 and row["end_unix_ns"] > 0

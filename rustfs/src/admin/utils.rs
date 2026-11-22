@@ -49,8 +49,7 @@ pub(crate) async fn read_compatible_admin_body(
     path: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
-    // Legacy handlers still hand over the s3s body; owned handlers pass the
-    // RustFS body. Both read through the owned type so one limit applies.
+    // Callers pass an owned body. One length limit applies to every read.
     let mut input: rustfs_s3_types::Body = input.into();
     let body = input.store_all_limited(max_len).await.map_err(|e| {
         if e.is::<rustfs_s3_types::BodyTooLarge>() {
@@ -241,13 +240,6 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
-
-        let legacy_body = s3s::Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
-        let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
-            .await
-            .expect_err("legacy streaming bodies retain the same limit error");
-        assert_eq!(legacy_err.code(), err.code());
-        assert_eq!(legacy_err.message(), err.message());
 
         let exact =
             read_compatible_admin_body(rustfs_s3_types::Body::from("12345678"), 8, "/rustfs/admin/v3/list-users", "secret")

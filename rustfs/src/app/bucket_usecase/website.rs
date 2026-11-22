@@ -81,7 +81,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::super::{BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG};
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
+    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, owned_envelope};
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::object_usecase::helper::MutationCompletionProbe;
@@ -190,22 +190,21 @@ mod tests {
             let ambient = shared_gating_ambient().await;
             let usecase = DefaultBucketUsecase::with_context(Some(ambient));
             let bucket = format!("core-config-missing-{}", uuid::Uuid::new_v4().simple());
-            let request = build_request((), http::Method::PUT);
             let mut converted = [false; 3];
             let accelerate = usecase
-                .execute_put_bucket_accelerate_configuration(RequestEnvelope::from_s3s(&request), &bucket, || {
+                .execute_put_bucket_accelerate_configuration(owned_envelope(http::Method::PUT), &bucket, || {
                     converted[0] = true;
                     Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid acceleration"))
                 })
                 .await;
             let payment = usecase
-                .execute_put_bucket_request_payment(RequestEnvelope::from_s3s(&request), &bucket, || {
+                .execute_put_bucket_request_payment(owned_envelope(http::Method::PUT), &bucket, || {
                     converted[1] = true;
                     Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid request payment"))
                 })
                 .await;
             let website = usecase
-                .execute_put_bucket_website(RequestEnvelope::from_s3s(&request), &bucket, || {
+                .execute_put_bucket_website(owned_envelope(http::Method::PUT), &bucket, || {
                     converted[2] = true;
                     Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid website"))
                 })

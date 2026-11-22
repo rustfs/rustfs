@@ -635,6 +635,7 @@ mod tests {
             tier_registry_generation: None,
             checkpoint_identity: None,
             checkpoint_plan_digest: None,
+            completed_checkpoint_cycle_floor: None,
         };
         assert!(matches!(
             current_cache_root_or_prepare_with_generation(&mut cache.clone(), "cold-bucket", source, 7, 11, old_plan, options()),
