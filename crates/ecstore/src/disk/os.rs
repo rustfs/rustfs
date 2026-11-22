@@ -2689,6 +2689,7 @@ pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
+const FSYNC_IDLE_YIELD_ITERS: usize = 2;
 const DEFAULT_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 256;
 const MAX_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
@@ -2993,6 +2994,18 @@ impl DiskBlockingQueue {
                         }
                         std::hint::spin_loop();
                         spun += 1;
+                    }
+                    if lane == DiskBlockingLane::Fsync
+                        && spin_iters > 0
+                        && spun == spin_iters
+                        && !queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        for _ in 0..FSYNC_IDLE_YIELD_ITERS {
+                            std::thread::yield_now();
+                            if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
                     }
                     if let Some(metrics) = spin_metrics {
                         metrics.finish(spun);

@@ -2101,19 +2101,16 @@ impl DefaultObjectUsecase {
             } else {
                 let streaming_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let collector = fill_on_put_collector.clone();
-                let body = tokio::io::BufReader::with_capacity(
-                    buffer_size,
-                    upload_frame_reader(body.map(move |f| {
-                        let f = f.map_err(s3s_body_error_to_io);
-                        if let (Some(collector), Ok(frame)) = (&collector, &f) {
-                            collector
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push(retained_put_frame(frame.clone(), registered_body));
-                        }
-                        f
-                    })),
-                );
+                let body = upload_frame_reader(body.map(move |f| {
+                    let f = f.map_err(s3s_body_error_to_io);
+                    if let (Some(collector), Ok(frame)) = (&collector, &f) {
+                        collector
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(retained_put_frame(frame.clone(), registered_body));
+                    }
+                    f
+                }));
                 let reader = HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
                     .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(

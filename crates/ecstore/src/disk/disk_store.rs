@@ -2455,7 +2455,14 @@ impl LocalDiskWrapper {
         transaction: uuid::Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
-    ) -> Result<Option<(crate::disk::DeleteRecoveryJournal, bool, bool)>> {
+    ) -> Result<
+        Option<(
+            crate::disk::DeleteRecoveryJournal,
+            bool,
+            bool,
+            Option<super::local::delete_recovery::LocalPublishedDeleteState>,
+        )>,
+    > {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
             DiskMetricMutation::Delete,
@@ -2471,6 +2478,7 @@ impl LocalDiskWrapper {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
         &self,
         volume: &str,
@@ -2479,6 +2487,7 @@ impl LocalDiskWrapper {
         journal: &crate::disk::DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
+        published_state: Option<super::local::delete_recovery::LocalPublishedDeleteState>,
     ) -> Result<bool> {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
@@ -2493,6 +2502,7 @@ impl LocalDiskWrapper {
                             journal,
                             namespace_owner,
                             work_budget,
+                            published_state,
                         )
                         .await
                 })
