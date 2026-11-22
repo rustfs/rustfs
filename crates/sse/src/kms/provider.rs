@@ -197,10 +197,14 @@ pub(crate) async fn get_sse_dek_provider<'a>(host: &'a dyn SseHost) -> Result<Ar
         return Ok(Arc::new(KmsSseDekProvider::new(host).await?));
     }
 
-    get_local_sse_dek_provider().await
+    get_local_sse_dek_provider()
 }
 
-pub(crate) async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, SseError> {
+/// Get the local data-key provider, loading and caching it on first use.
+///
+/// Startup calls this to check the local master key ahead of traffic; a request
+/// that arrives without that step loads it the same way and gets the same error.
+pub(crate) fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, SseError> {
     // An explicitly injected test provider overrides both the cache and the
     // environment-based selection below.
     #[cfg(any(test, feature = "test-util"))]

@@ -383,7 +383,7 @@ use tokio::sync::Mutex;
 static SSE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static SSE_TEST_KMS_KEY_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
-async fn lock_sse_test_state() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn lock_sse_test_state() -> tokio::sync::MutexGuard<'static, ()> {
     SSE_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
 

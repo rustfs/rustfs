@@ -40,6 +40,8 @@
 //!   [`classify_sse_read_response`] derives the response headers without unwrapping a key.
 //! - [`rewrap_object_encryption_metadata`] moves a stored data key onto the current
 //!   version of its KMS key.
+//! - [`startup::init`] settles the environment-driven configuration once per process
+//!   and reports it; calling it is optional.
 //!
 //! ```rust,ignore
 //! let request = EncryptionRequest {
@@ -64,6 +66,7 @@ mod core;
 mod error;
 mod host;
 mod kms;
+pub mod startup;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 #[cfg(test)]
@@ -81,9 +84,7 @@ pub use crate::core::request::SseKmsPrincipal;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::core::request::TestAuthorizationHooks;
 pub use crate::core::rewrap::{ObjectDekRewrapOutcome, rewrap_object_encryption_metadata};
-pub use crate::core::s3::authorization::{
-    authorize_sse_kms_multipart_write, authorize_sse_kms_object_read, log_sse_kms_key_policy_mode,
-};
+pub use crate::core::s3::authorization::{authorize_sse_kms_multipart_write, authorize_sse_kms_object_read};
 pub use crate::core::s3::headers::{
     SseReadResponseHeaders, SsecParamsFromHeaders, build_ssec_read_headers, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, project_sse_read_response_headers,

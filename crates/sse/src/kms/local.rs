@@ -46,6 +46,21 @@ pub struct LocalSseDekProvider {
 
 pub(crate) const LOCAL_SSE_DEK_FORMAT_VERSION: u8 = 1;
 
+/// Environment variable that carries the local SSE-S3 master key.
+pub(crate) const ENV_SSE_S3_MASTER_KEY: &str = "RUSTFS_SSE_S3_MASTER_KEY";
+
+/// The configured local master key, still encoded; `None` when unset or blank.
+fn local_master_key_env_value() -> Option<String> {
+    get_env_opt_str(ENV_SSE_S3_MASTER_KEY).filter(|value| !value.trim().is_empty())
+}
+
+/// Whether the operator configured a local SSE-S3 master key at all.
+///
+/// Says nothing about whether the value is usable; loading it decides that.
+pub(crate) fn local_master_key_configured() -> bool {
+    local_master_key_env_value().is_some()
+}
+
 #[cfg(feature = "rio-v2")]
 /// Returns true when a managed-SSE data key is one RustFS itself wrote.
 ///
@@ -156,7 +171,7 @@ impl LocalSseDekProvider {
             }
         }
 
-        let Some(raw_value) = get_env_opt_str("RUSTFS_SSE_S3_MASTER_KEY").filter(|value| !value.trim().is_empty()) else {
+        let Some(raw_value) = local_master_key_env_value() else {
             return Err(sse_not_configured(
                 "SSE-S3 requires RUSTFS_SSE_S3_MASTER_KEY to be set to a base64-encoded 32-byte key when KMS is not configured",
             ));
@@ -171,7 +186,6 @@ impl LocalSseDekProvider {
             sse_not_configured("RUSTFS_SSE_S3_MASTER_KEY must decode to exactly 32 bytes for SSE-S3 when KMS is not configured")
         })?;
 
-        tracing::info!("Using RUSTFS_SSE_S3_MASTER_KEY for SSE-S3 (KMS not configured)");
         Ok(Self { master_key })
     }
 

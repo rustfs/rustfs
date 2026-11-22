@@ -19,13 +19,11 @@ use crate::core::request::SseKmsPrincipal;
 use crate::error::SseError;
 use crate::host::SseHost;
 use crate::{LOG_COMPONENT_STORAGE, LOG_SUBSYSTEM_SSE};
-use rustfs_config::{DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY, ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY};
+use rustfs_config::ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY;
 use rustfs_policy::policy::action::KmsAction;
 use rustfs_s3_types::S3ErrorCode;
-use rustfs_utils::get_env_bool;
 use rustfs_utils::http::object_encryption_keys::{SSEType, stored_managed_encryption_key};
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use tracing::debug;
 
 /// Ask the authorizer that decides for `principal`: the host's, unless a test overrode it.
@@ -52,38 +50,7 @@ fn sse_kms_key_policy_enforced(principal: Option<&SseKmsPrincipal>) -> bool {
     #[cfg(not(any(test, feature = "test-util")))]
     let _ = principal;
 
-    static ENFORCED: LazyLock<bool> =
-        LazyLock::new(|| get_env_bool(ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY, DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY));
-    *ENFORCED
-}
-
-/// Report the configured SSE-KMS authorization mode once, at startup.
-///
-/// The disabled case warns rather than logs: while enforcement is off, any identity
-/// allowed to write an object can encrypt it under any key, and operators should hear
-/// about that even though disabled is the long-term default.
-pub fn log_sse_kms_key_policy_mode() {
-    if sse_kms_key_policy_enforced(None) {
-        tracing::info!(
-            component = LOG_COMPONENT_STORAGE,
-            subsystem = LOG_SUBSYSTEM_SSE,
-            event = "sse_kms_key_policy_mode",
-            enforced = true,
-            "SSE-KMS requests are authorized against the resolved KMS key (kms:GenerateDataKey / kms:Decrypt)"
-        );
-        return;
-    }
-
-    tracing::warn!(
-        component = LOG_COMPONENT_STORAGE,
-        subsystem = LOG_SUBSYSTEM_SSE,
-        event = "sse_kms_key_policy_mode",
-        enforced = false,
-        "SSE-KMS requests are not authorized against the KMS key they name; any identity allowed to \
-         write an object may encrypt it under any key, and any identity allowed to read it may have it \
-         decrypted. Grant kms:GenerateDataKey and kms:Decrypt on the keys your workloads use, then set \
-         {ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY}=true."
-    );
+    crate::startup::key_policy_enforced()
 }
 
 /// The principal whose KMS key permissions this operation must satisfy, if any.

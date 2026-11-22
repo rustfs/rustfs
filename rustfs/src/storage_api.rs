@@ -435,7 +435,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod sse {
-        pub(crate) use crate::storage::storage_api::sse_consumer::log_sse_kms_key_policy_mode;
+        pub(crate) use crate::storage::storage_api::sse_consumer::init_sse_startup;
     }
 
     pub(crate) mod notification {

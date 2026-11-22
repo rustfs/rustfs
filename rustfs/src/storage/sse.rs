@@ -49,13 +49,14 @@ use std::sync::Arc;
 
 #[cfg(all(test, feature = "rio-v2"))]
 pub(crate) use rustfs_sse::reset_sse_dek_provider;
+pub(crate) use rustfs_sse::startup::init as init_sse_startup;
 #[cfg(test)]
 pub(crate) use rustfs_sse::testing::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
 pub(crate) use rustfs_sse::{
     DecryptionMaterial, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest, KmsRequestAuditScope,
     ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal, SseReadResponseHeaders, SsecParamsFromHeaders,
-    build_ssec_read_headers, contains_managed_encryption_metadata, log_sse_kms_key_policy_mode,
-    mark_encrypted_multipart_metadata, stored_ssec_metadata, strip_managed_encryption_metadata,
+    build_ssec_read_headers, contains_managed_encryption_metadata, mark_encrypted_multipart_metadata, stored_ssec_metadata,
+    strip_managed_encryption_metadata,
 };
 #[cfg(test)]
 pub(crate) use rustfs_sse::{SseDekProvider, TestAuthorizationHooks, TestSseDekProvider};

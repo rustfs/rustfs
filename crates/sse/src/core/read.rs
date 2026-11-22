@@ -490,7 +490,7 @@ async fn apply_managed_decryption_material_inner(
         Some(
             decrypt_unenveloped_sealed_dek(
                 bare_kms.clone(),
-                get_local_sse_dek_provider().await,
+                get_local_sse_dek_provider(),
                 &encrypted_data_key,
                 &kms_key_id,
                 &object_context,
@@ -511,7 +511,7 @@ async fn apply_managed_decryption_material_inner(
             } else if let Some(kms_provider) = bare_kms {
                 kms_provider
             } else {
-                get_local_sse_dek_provider().await?
+                get_local_sse_dek_provider()?
             };
             #[cfg(feature = "rio-v2")]
             let decrypted_data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
