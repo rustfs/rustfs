@@ -2395,6 +2395,8 @@ impl ObjectInfo {
         // FileInfo for the reader, but never expose the internal marker as
         // ordinary S3 metadata.
         rustfs_utils::http::metadata_compat::remove_str(&mut metadata, crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX);
+        // Earlier metadata-only writes could persist the response projection.
+        rustfs_utils::http::metadata_compat::remove_str(&mut metadata, crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX);
         let ec_block_size = (!fi.deleted && !is_remote && fi.erasure.block_size > 0).then_some(fi.erasure.block_size);
 
         let storage_class = Some(
@@ -3375,6 +3377,11 @@ mod tests {
         let mut fi = FileInfo::new("bucket/object", 4, 2);
         fi.size = 1;
         fi.erasure.block_size = 64 * 1024;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX,
+            "1".into(),
+        );
 
         let info = ObjectInfo::from_file_info(&fi, "bucket", "object", false);
 
