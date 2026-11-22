@@ -544,10 +544,17 @@ mod tests {
                 .key(key.to_owned())
                 .build()
                 .expect("valid create request DTO");
-            let error = make_usecase()
-                .execute_create_multipart_upload_from_s3s(build_request(create, Method::POST))
+            let error = match make_usecase()
+                .execute_create_multipart_upload(
+                    owned_envelope(Method::POST),
+                    super::create_values::CreateMultipartUploadFields::from_legacy(create),
+                    None,
+                )
                 .await
-                .expect_err("reserved key must be rejected before accessing storage");
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("reserved key must be rejected before accessing storage"),
+            };
             assert_eq!(error.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
 
             let complete = CompleteMultipartUploadInput::builder()
@@ -557,9 +564,15 @@ mod tests {
                 .multipart_upload(Some(CompletedMultipartUpload::default()))
                 .build()
                 .expect("valid complete request DTO");
-            let error = Box::pin(make_usecase().complete_for_s3s_request(build_request(complete, Method::POST)))
-                .await
-                .expect_err("uploads created before the fix must not publish reserved keys");
+            let error =
+                match rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload::input_from_s3s(
+                    complete,
+                ) {
+                    Err(error) => crate::app::dto_values::seam_error(error),
+                    Ok(input) => Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), input))
+                        .await
+                        .expect_err("uploads created before the fix must not publish reserved keys"),
+                };
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         }
     }

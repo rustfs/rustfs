@@ -740,9 +740,13 @@ mod tests {
             .part_number(1)
             .build()
             .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+        let err = match make_usecase()
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+            .await
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("missing body must be rejected"),
+        };
         assert_eq!(err.code(), &LegacyErrorCode::IncompleteBody);
     }
 
@@ -764,9 +768,13 @@ mod tests {
                 .content_length(Some(declared))
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            let err = match make_usecase()
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("declared part must be rejected"),
+            };
             if expect_too_large {
                 assert_eq!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
@@ -786,9 +794,13 @@ mod tests {
                 .part_number(part_number)
                 .build()
                 .unwrap();
-            let req = build_request(input, Method::PUT);
-
-            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            let err = match make_usecase()
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .await
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("invalid part number must be rejected"),
+            };
             assert_eq!(err.code(), &LegacyErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
@@ -970,10 +982,13 @@ mod tests {
             .build()
             .expect("upload part input should build");
 
-        let err = usecase
-            .execute_upload_part(build_request(input, Method::PUT))
+        let err = match usecase
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
-            .expect_err("full foreground write admission should reject before body ingest");
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("full foreground write admission should reject before body ingest"),
+        };
         assert_eq!(err.code(), &LegacyErrorCode::SlowDown);
         drop(held);
     }
