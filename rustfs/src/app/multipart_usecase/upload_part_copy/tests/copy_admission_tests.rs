@@ -268,7 +268,32 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
             .upload_id(cancelled_upload.upload_id.clone())
             .build()
             .expect("cancelled copy request");
-        let mut cancelled_copy = Box::pin(usecase.execute_upload_part_copy(build_request(cancelled_input, Method::PUT)));
+        let condition = |value| match value {
+            crate::app::storage_api::s3::dto::ETagCondition::Any => CopySourceCondition::Any,
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+            crate::app::storage_api::s3::dto::ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+        };
+        let mut cancelled_copy = Box::pin(usecase.execute_upload_part_copy_with_audit(
+            owned_envelope(Method::PUT),
+            UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: cancelled_input.bucket,
+                    key: cancelled_input.key,
+                    upload_id: cancelled_input.upload_id,
+                },
+                part_number: cancelled_input.part_number,
+                copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(cancelled_input.copy_source),
+                copy_source_range: cancelled_input.copy_source_range,
+                copy_source_if_match: cancelled_input.copy_source_if_match.map(&condition),
+                copy_source_if_none_match: cancelled_input.copy_source_if_none_match.map(&condition),
+                sse_customer_algorithm: cancelled_input.sse_customer_algorithm,
+                sse_customer_key: cancelled_input.sse_customer_key,
+                sse_customer_key_md5: cancelled_input.sse_customer_key_md5,
+                copy_source_sse_customer_algorithm: cancelled_input.copy_source_sse_customer_algorithm,
+                copy_source_sse_customer_key: cancelled_input.copy_source_sse_customer_key,
+                copy_source_sse_customer_key_md5: cancelled_input.copy_source_sse_customer_key_md5,
+            },
+        ));
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
                 biased;
@@ -277,7 +302,10 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                         tokio::task::yield_now().await;
                     }
                 } => {}
-                result = &mut cancelled_copy => panic!("copy completed before cancellation: {result:?}"),
+                result = &mut cancelled_copy => match result {
+                    Ok(_) => panic!("copy completed before cancellation"),
+                    Err(error) => panic!("copy completed before cancellation: {error:?}"),
+                },
             }
         })
         .await
