@@ -249,13 +249,13 @@ const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 /// otherwise idle instance whose clean-idle backoff had doubled a 60 s
 /// interval), which defeats the fast path it is meant to protect.
 ///
-/// The exponential growth in [`ScannerRetryBackoff::retry_interval`] is
-/// what protects against a persistently hot bucket driving an unbroken
-/// full-scan loop, so it can start small: 5 s, 10 s, 20 s … capped by
-/// [`SCANNER_RETRY_MAX_INTERVAL`]. A one-off race recovers in seconds; a
-/// genuinely hot bucket still reaches minute-scale backoff within a handful of
-/// cycles. Preflight deferrals use the same bounded schedule so a temporarily
-/// unavailable peer cannot drive a tight retry loop.
+/// The exponential growth in [`ScannerRetryBackoff::retry_interval`] protects
+/// against a persistently hot bucket driving an unbroken full-scan loop, so
+/// retries can start small: 5 s, 10 s, 20 s … Superseded retries cap this
+/// schedule at the ordinary cycle interval and preserve an operator-selected
+/// nominal cadence. Preflight deferrals retain the generic
+/// [`SCANNER_RETRY_MAX_INTERVAL`] cap so a temporarily unavailable peer cannot
+/// drive a tight retry loop.
 const SCANNER_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
 const SCANNER_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Probe cadence while data movement pauses the scanner. Recovery retries use
@@ -3643,8 +3643,7 @@ where
         ));
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
-        let superseded_retry_interval =
-            scanner_superseded_retry_interval(superseded_backoff, &runtime_config, maintenance_features);
+        let superseded_retry_interval = scanner_superseded_retry_interval(superseded_backoff, &runtime_config);
         let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
         let scope_fallback_retry_interval = scanner_scope_fallback_retry_interval(scope_fallback_backoff, &runtime_config);
         let mut convergence_retry_interval = superseded_retry_interval

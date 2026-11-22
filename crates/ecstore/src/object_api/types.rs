@@ -1259,6 +1259,11 @@ pub struct ObjectOptions {
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
+    /// Bucket incarnation that was admitted for an externally visible event.
+    /// This is kept separate from the storage fence because recovered work may
+    /// be allowed to commit while its notification provenance remains unknown.
+    #[doc(hidden)]
+    pub notification_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
     /// Require complete participant observations for internal multipart size decisions.
     /// This transient flag is never derived from client input or stored on disk.

@@ -75,6 +75,7 @@ struct DataUsageCacheLoadResult {
     main_revision: DataUsageCacheRevision,
     backup_revision: Option<DataUsageCacheRevision>,
     damaged_pages: DamagedPages,
+    loaded_from_main: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +112,18 @@ impl DataUsageCache {
         store: Arc<S>,
         name: &str,
     ) -> StorageResult<DataUsageCacheRevisions> {
+        self.load_with_baseline_revisions(store, name)
+            .await
+            .map(|baseline| baseline.revisions)
+    }
+
+    /// Loads cache revisions with provenance for unchanged-primary backup reconciliation.
+    /// Missing or rebuilt caches and a decoded backup do not establish a decoded primary.
+    pub(crate) async fn load_with_baseline_revisions<S: ScannerObjectIO>(
+        &mut self,
+        store: Arc<S>,
+        name: &str,
+    ) -> StorageResult<DataUsageCacheBaselineRevisions> {
         let loaded = Self::load_cache(store.clone(), name).await?;
         let backup = match loaded.backup_revision {
             Some(revision) => Some(revision),
@@ -119,10 +132,13 @@ impl DataUsageCache {
         let main = loaded.main_revision;
         *self = loaded.cache;
 
-        Ok(DataUsageCacheRevisions {
-            main,
-            backup,
-            damaged_pages: loaded.damaged_pages,
+        Ok(DataUsageCacheBaselineRevisions {
+            revisions: DataUsageCacheRevisions {
+                main,
+                backup,
+                damaged_pages: loaded.damaged_pages,
+            },
+            loaded_from_main: loaded.loaded_from_main,
         })
     }
 
@@ -173,11 +189,14 @@ impl DataUsageCache {
                     cache,
                     revision: Some(main_revision),
                 } => {
+                    // Legacy-location fallback carries Missing for the primary path.
+                    let loaded_from_main = matches!(&main_revision, DataUsageCacheRevision::Etag(_));
                     return Ok(DataUsageCacheLoadResult {
                         cache: *cache,
                         main_revision,
                         backup_revision: None,
                         damaged_pages: DamagedPages::default(),
+                        loaded_from_main,
                     });
                 }
                 DataUsageCacheLoadAttempt::Loaded { revision: None, .. } => {
@@ -224,6 +243,7 @@ impl DataUsageCache {
                                 main: main_state == DataUsageCacheLoadState::Corrupt,
                                 backup: false,
                             },
+                            loaded_from_main: false,
                         });
                     }
                     DataUsageCacheLoadState::Loaded
@@ -251,6 +271,7 @@ impl DataUsageCache {
                             main: main_state == DataUsageCacheLoadState::Corrupt,
                             backup: backup_state == DataUsageCacheLoadState::Corrupt,
                         },
+                        loaded_from_main: false,
                     });
                 }
                 (DataUsageCacheLoadState::Corrupt, DataUsageCacheLoadState::Missing)
@@ -274,6 +295,7 @@ impl DataUsageCache {
                             main: main_state == DataUsageCacheLoadState::Corrupt,
                             backup: backup_state == DataUsageCacheLoadState::Corrupt,
                         },
+                        loaded_from_main: false,
                     });
                 }
                 _ => {}

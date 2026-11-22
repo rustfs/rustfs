@@ -125,6 +125,9 @@ pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifec
 }
 
 #[cfg(test)]
+pub(crate) use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::bucket::metadata::BucketMetadata;

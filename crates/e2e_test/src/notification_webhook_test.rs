@@ -864,6 +864,70 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_webhook_subscriptions_follow_bucket_incarnation() -> TestResult {
+    init_logging();
+
+    let (endpoint, mut rx, collector) = spawn_event_collector().await?;
+    let allowed_origin = endpoint_origin(&endpoint)?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str())])
+        .await?;
+    enable_notify_module(&env).await?;
+    let target = "incarnation";
+    configure_webhook_target(&env, target, &endpoint).await?;
+    wait_for_target_registered(&env, target).await?;
+
+    let client = env.create_s3_client();
+    let bucket = "notify-incarnation";
+    let control_bucket = "notify-incarnation-control";
+    for name in [bucket, control_bucket] {
+        client.create_bucket().bucket(name).send().await?;
+        put_notification_config(&client, name, target, "events/", ".txt").await?;
+    }
+    let put = |bucket, key| {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"event fixture"))
+            .send()
+    };
+    let wait = Duration::from_secs(20);
+    let original_key = "events/original.txt";
+    put(bucket, original_key).await?;
+    wait_for_event(&mut rx, original_key, "s3:ObjectCreated:", wait).await?;
+
+    assert!(client.delete_bucket().bucket(bucket).send().await.is_err());
+    let after_failed_delete = "events/retained.txt";
+    put(bucket, after_failed_delete).await?;
+    wait_for_event(&mut rx, after_failed_delete, "s3:ObjectCreated:", wait).await?;
+
+    for key in [original_key, after_failed_delete] {
+        client.delete_object().bucket(bucket).key(key).send().await?;
+    }
+    client.delete_bucket().bucket(bucket).send().await?;
+    client.create_bucket().bucket(bucket).send().await?;
+    let config = client.get_bucket_notification_configuration().bucket(bucket).send().await?;
+    assert!(config.queue_configurations().is_empty());
+
+    let new_key = "events/fresh.txt";
+    let sentinel_key = "events/sentinel.txt";
+    put(bucket, new_key).await?;
+    put(control_bucket, sentinel_key).await?;
+    let events = collect_until(&mut rx, sentinel_key, wait, Duration::from_secs(2)).await;
+    assert!(events.iter().any(|event| event_key(event).as_deref() == Some(sentinel_key)));
+    assert!(events.iter().all(|event| event_key(event).as_deref() != Some(new_key)));
+
+    put_notification_config(&client, bucket, target, "events/", ".txt").await?;
+    let subscribed_key = "events/subscribed.txt";
+    put(bucket, subscribed_key).await?;
+    wait_for_event(&mut rx, subscribed_key, "s3:ObjectCreated:", wait).await?;
+    env.stop_server();
+    collector.abort();
+    Ok(())
+}
+
 /// An event queued while the target endpoint rejects delivery survives on the
 /// durable store and is redelivered once the endpoint comes back.
 #[tokio::test]
@@ -960,5 +1024,103 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
 
     env.stop_server();
     handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_webhook_metadata_mutations_keep_verified_bucket_identity() -> TestResult {
+    init_logging();
+    let (endpoint, mut rx, collector) = spawn_event_collector().await?;
+    let allowed_origin = endpoint_origin(&endpoint)?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str())])
+        .await?;
+    enable_notify_module(&env).await?;
+    let target = "metadata-events";
+    configure_webhook_target(&env, target, &endpoint).await?;
+    wait_for_target_registered(&env, target).await?;
+    let client = env.create_s3_client();
+    let bucket = "metadata-event-identity";
+    let key = "object";
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"metadata"))
+        .send()
+        .await?;
+    let queue = QueueConfiguration::builder()
+        .id("metadata-events")
+        .queue_arn(target_arn(target))
+        .events(Event::from("s3:ObjectTagging:*"))
+        .events(Event::from("s3:ObjectAcl:Put"))
+        .events(Event::from("s3:BucketRemoved:*"))
+        .build()?;
+    client
+        .put_bucket_notification_configuration()
+        .bucket(bucket)
+        .notification_configuration(NotificationConfiguration::builder().queue_configurations(queue).build())
+        .send()
+        .await?;
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(aws_sdk_s3::types::Tag::builder().key("kind").value("test").build()?)
+        .build()?;
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .tagging(tagging)
+        .send()
+        .await?;
+    assert_eq!(
+        client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?
+            .tag_set()
+            .len(),
+        1
+    );
+    wait_for_event(&mut rx, key, "s3:ObjectTagging:Put", Duration::from_secs(20)).await?;
+    client.delete_object_tagging().bucket(bucket).key(key).send().await?;
+    assert!(
+        client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?
+            .tag_set()
+            .is_empty()
+    );
+    wait_for_event(&mut rx, key, "s3:ObjectTagging:Delete", Duration::from_secs(20)).await?;
+    client
+        .put_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::Private)
+        .send()
+        .await?;
+    wait_for_event(&mut rx, key, "s3:ObjectAcl:Put", Duration::from_secs(20)).await?;
+    client.delete_object().bucket(bucket).key(key).send().await?;
+    client.delete_bucket().bucket(bucket).send().await?;
+    let removed = timeout(Duration::from_secs(20), async {
+        loop {
+            let event = rx.recv().await.expect("bucket-event collector remains open");
+            if event["EventName"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("s3:BucketRemoved:"))
+            {
+                break event;
+            }
+        }
+    })
+    .await?;
+    assert_eq!(removed["Records"][0]["s3"]["bucket"]["name"].as_str(), Some(bucket));
+    env.stop_server();
+    collector.abort();
     Ok(())
 }

@@ -90,15 +90,6 @@ pub trait NotifyInterface: Send + Sync {
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError>;
-
-    async fn add_event_specific_rules(
-        &self,
-        bucket_name: &str,
-        region: &str,
-        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
-    ) -> Result<(), NotificationError>;
-
-    async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError>;
 }
 
 /// Notification system handle interface for admin peer orchestration.

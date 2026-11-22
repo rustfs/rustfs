@@ -188,11 +188,15 @@ pub(crate) mod access_consumer {
         MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
     };
+    pub(crate) use super::ecstore_bucket::utils::check_object_args;
 }
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
+    pub(crate) use super::super::access_owned::object_meta::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
+    };
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
     pub(crate) use super::super::authorization::parity_test_support;
     pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
@@ -547,8 +551,8 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_compression_total_memory_from_backend,
-        load_admin_data_usage_from_backend_cached, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
+        get_bucket_usage_memory, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
+        load_admin_data_usage_with_memory_overlay, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
         lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend, verified_account_bucket_usage,
@@ -556,8 +560,8 @@ pub(crate) mod ecstore_data_usage {
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached,
-        seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
+        apply_bucket_usage_memory_overlay, compute_bucket_usage, live_bucket_usage_computations,
+        load_data_usage_from_backend_cached, seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 }
 

@@ -48,9 +48,9 @@ use super::storage_api::bucket_usecase::bucket::{
     utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::bucket_usecase::contract::bucket::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::contract::bucket::DeleteBucketOptions;
+use super::storage_api::bucket_usecase::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };

@@ -18,6 +18,8 @@ use super::replication_bandwidth_boundary::ReplicationBucketMonitor;
 use super::replication_pool::DynReplicationPool;
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::ReplicationObjectStore;
+#[cfg(test)]
+pub(crate) use crate::runtime::global::set_object_layer as set_test_object_layer;
 use crate::runtime::sources;
 pub use crate::runtime::sources::{
     ScannerDirtyUsageMutationObserver, ScannerDirtyUsageMutationSource, set_scanner_dirty_usage_mutation_observer,

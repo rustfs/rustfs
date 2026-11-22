@@ -9138,7 +9138,7 @@ fn clean_idle_backoff_grows_to_cap() {
 }
 
 #[test]
-fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
+fn retry_backoff_grows_caps_and_resets_after_convergence() {
     let mut backoff = ScannerRetryBackoff::default();
     assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
 
@@ -9162,7 +9162,7 @@ fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
 }
 
 #[test]
-fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
+fn retry_backoff_respects_a_faster_configured_cycle() {
     let mut backoff = ScannerRetryBackoff::default();
     backoff.record_retryable_cycle(true);
 
@@ -9174,7 +9174,7 @@ fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
 }
 
 #[test]
-fn superseded_retry_backoff_grows_from_the_default_cycle() {
+fn retry_backoff_grows_from_the_default_cycle() {
     let mut backoff = ScannerRetryBackoff::default();
     // The first race after a write burst retries in seconds, not a whole
     // cycle, while repeated supersedes still climb toward the cap.
@@ -9194,7 +9194,7 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ..Default::default()
     };
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &default_config, ScannerMaintenanceFeatures::default()),
+        scanner_superseded_retry_interval(backoff, &default_config),
         Some(SCANNER_RETRY_BASE_INTERVAL),
         "the default adaptive cadence must retain fast convergence"
     );
@@ -9204,24 +9204,24 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ScannerRuntimeConfigSource::Config,
         ScannerRuntimeConfigSource::ScannerCompatConfig,
     ] {
-        let runtime_config = ScannerRuntimeConfig {
-            cycle_interval: Duration::from_secs(6 * 60 * 60),
-            cycle_interval_source: source,
-            ..Default::default()
-        };
-
-        for features in [
-            ScannerMaintenanceFeatures::default(),
-            ScannerMaintenanceFeatures {
-                lifecycle: true,
+        for cycle_secs in [1, 3, 600, 6 * 60 * 60] {
+            let runtime_config = ScannerRuntimeConfig {
+                cycle_interval: Duration::from_secs(cycle_secs),
+                cycle_interval_source: source,
                 ..Default::default()
-            },
-        ] {
-            assert_eq!(
-                scanner_superseded_retry_interval(backoff, &runtime_config, features),
-                Some(runtime_config.cycle_interval),
-                "{source:?} cycle cadence must not be shortened by convergence retries"
-            );
+            };
+            let mut backoff = ScannerRetryBackoff::default();
+            assert_eq!(scanner_superseded_retry_interval(backoff, &runtime_config), None);
+            for _ in 0..40 {
+                backoff.record_retryable_cycle(true);
+                assert_eq!(
+                    scanner_superseded_retry_interval(backoff, &runtime_config),
+                    Some(runtime_config.cycle_interval),
+                    "{source:?} cycle cadence must hold throughout convergence retries"
+                );
+            }
+            backoff.record_retryable_cycle(false);
+            assert_eq!(scanner_superseded_retry_interval(backoff, &runtime_config), None);
         }
     }
 }
@@ -9242,7 +9242,7 @@ fn superseded_retry_does_not_delay_required_maintenance() {
     for consecutive_cycles in 1..=12 {
         backoff.record_retryable_cycle(true);
         assert_eq!(
-            scanner_superseded_retry_interval(backoff, &config, features),
+            scanner_superseded_retry_interval(backoff, &config),
             Some(config.cycle_interval),
             "superseded cycle {consecutive_cycles} must preserve regular maintenance"
         );
@@ -9328,19 +9328,50 @@ fn scope_fallback_retry_preserves_explicit_and_fast_cycle_cadence() {
 }
 
 #[test]
-fn superseded_retry_only_caps_regular_maintenance() {
+fn superseded_retry_caps_at_the_default_cycle_and_resets_after_convergence() {
     let config = ScannerRuntimeConfig {
         cycle_interval: Duration::from_secs(60),
         ..Default::default()
     };
     let mut backoff = ScannerRetryBackoff::default();
-    for _ in 0..6 {
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), None);
+    for expected in [5, 10, 20, 40, 60, 60, 60, 60] {
+        backoff.record_retryable_cycle(true);
+        assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(Duration::from_secs(expected)));
+    }
+    backoff.consecutive_cycles = u32::MAX;
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(config.cycle_interval));
+    backoff.record_retryable_cycle(true);
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(config.cycle_interval));
+    backoff.record_retryable_cycle(false);
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), None);
+}
+
+#[test]
+fn superseded_retry_caps_fast_cycles_without_changing_the_generic_retry_cap() {
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..40 {
         backoff.record_retryable_cycle(true);
     }
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &config, ScannerMaintenanceFeatures::default()),
-        Some(Duration::from_secs(160)),
+        backoff.retry_interval(Duration::from_secs(60)),
+        Some(Duration::from_secs(30 * 60)),
+        "deferred and transient retries must retain the generic cap"
     );
+    for cycle_secs in [0, 1, 3, 60, 6 * 60 * 60] {
+        let config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(cycle_secs),
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_superseded_retry_interval(backoff, &config),
+            Some(Duration::from_secs(cycle_secs.max(1))),
+        );
+    }
+}
+
+#[test]
+fn superseded_retry_timer_keeps_required_maintenance_full_scans() {
     for features in [
         ScannerMaintenanceFeatures {
             lifecycle: true,
@@ -9355,28 +9386,23 @@ fn superseded_retry_only_caps_regular_maintenance() {
             ..Default::default()
         },
     ] {
-        assert_eq!(scanner_superseded_retry_interval(backoff, &config, features), Some(config.cycle_interval));
-        assert_eq!(scanner_superseded_retry_interval(ScannerRetryBackoff::default(), &config, features), None);
+        assert!(features.requires_full_scan(Some(7), 7, ScannerCycleWakeReason::Timer, true));
     }
 }
 
 #[tokio::test(start_paused = true)]
 #[serial]
-async fn superseded_maintenance_wait_keeps_convergence_fencing() {
+async fn superseded_retry_wait_keeps_convergence_fencing_at_the_default_cycle() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let config = ScannerRuntimeConfig {
         cycle_interval: Duration::from_secs(60),
-        ..Default::default()
-    };
-    let features = ScannerMaintenanceFeatures {
-        lifecycle: true,
         ..Default::default()
     };
     let mut backoff = ScannerRetryBackoff::default();
     for _ in 0..12 {
         backoff.record_retryable_cycle(true);
     }
-    let interval = scanner_superseded_retry_interval(backoff, &config, features);
+    let interval = scanner_superseded_retry_interval(backoff, &config);
     assert_eq!(interval, Some(config.cycle_interval));
     let generations = ScannerCycleObservedGenerations::for_wait(
         &config,
@@ -9391,19 +9417,28 @@ async fn superseded_maintenance_wait_keeps_convergence_fencing() {
     let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
     let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
     let started = tokio::time::Instant::now();
-    let reason = wait_for_next_scanner_cycle_with_activity(
+    let mut wait = Box::pin(wait_for_next_scanner_cycle_with_activity(
         &ctx,
-        interval.expect("maintenance must retain its convergence interval"),
+        interval.expect("superseded retry must retain its convergence interval"),
         Some(Duration::from_secs(1)),
         &mut seen,
         generations,
         || false,
         || std::future::ready(Ok(changed.clone())),
-    )
-    .await;
+    ));
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    crate::scanner_io::record_dirty_usage_bucket("photos");
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    }
+    let reason = wait.await;
     assert_eq!(reason, ScannerCycleWakeReason::Timer);
     assert_eq!(started.elapsed(), config.cycle_interval);
     assert_eq!(seen, Some(changed));
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }
 
 #[test]
