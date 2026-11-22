@@ -11,8 +11,6 @@ mod target;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-use crate::vector::protocol::Operation;
 use crate::{
     app::{
         RequestEnvelope,
@@ -30,7 +28,7 @@ use crate::{
     vector::{
         access_core::{BoundVectorRequest, BucketAuthorizationFacts, VectorAccessError, VectorTarget},
         lance::ManifestIoLimits,
-        protocol::{ErrorCode, ProtocolError, Request, Response, dto, gateway::VectorGatewayService},
+        protocol::{ErrorCode, Operation, ProtocolError, Request, Response, dto, gateway::VectorGatewayService},
         service::{VectorExecution, VectorRequestId, VectorService, VectorServiceError},
     },
 };
@@ -254,7 +252,7 @@ impl DefaultVectorUsecase {
                 match VectorService::new(catalog, self.limits, self.max_write_attempts)
                     .execute(&context)
                     .await
-                    .map_err(service_error)?
+                    .map_err(|error| service_error_for_operation(request.operation(), error))?
                 {
                     VectorExecution::Complete(response) => Ok(response),
                     VectorExecution::GetVectors(prepared) => Ok(Response::GetVectors(dto::GetVectorsOutput {
@@ -385,6 +383,29 @@ fn catalog_error_ref(error: &TableCatalogStoreError) -> ProtocolError {
         _ => ErrorCode::InternalServer,
     };
     ProtocolError::new(code, "Vector Catalog operation failed")
+}
+fn service_error_for_operation(operation: Operation, error: VectorServiceError) -> ProtocolError {
+    if matches!(operation, Operation::CreateIndex | Operation::PutVectors) {
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if matches!(
+                source.downcast_ref::<crate::app::storage_api::vector_usecase::StorageError>(),
+                Some(crate::app::storage_api::vector_usecase::StorageError::QuotaExceeded { .. })
+            ) {
+                return ProtocolError::new(ErrorCode::ServiceQuotaExceeded, "Vector storage quota exceeded");
+            }
+            let next = if let Some(error) = source.downcast_ref::<std::io::Error>() {
+                error.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+            } else {
+                source.source()
+            };
+            let Some(next) = next else {
+                break;
+            };
+            source = next;
+        }
+    }
+    service_error(error)
 }
 fn service_error(error: VectorServiceError) -> ProtocolError {
     let mut source: &(dyn std::error::Error + 'static) = &error;

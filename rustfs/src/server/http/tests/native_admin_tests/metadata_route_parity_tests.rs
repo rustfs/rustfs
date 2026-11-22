@@ -39,7 +39,7 @@ const TABLES: &str = "parity-tables";
 
 /// The gateway stack over a store holding the website bucket, an empty bucket and a table bucket,
 /// with two IAM users: `list-allowed` may list buckets and versions, `list-none` has no policy.
-async fn stack() -> (rustfs_test_utils::TestECStoreEnv, S3EdgeService) {
+async fn stack() -> (rustfs_test_utils::TestECStoreEnv, GatewayS3Service) {
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .prefix("metadata_route_gateway")
         .disk_count(1)
@@ -179,6 +179,7 @@ async fn seed_table_bucket(env: &rustfs_test_utils::TestECStoreEnv) {
         .put_table_bucket(TableBucketEntry {
             version: TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: TABLES.to_owned(),
+            vector_bucket_binding: None,
             catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_owned(),
             warehouse_root: format!("s3://{TABLES}/"),
             state: TableCatalogEntryState::Active,
@@ -210,6 +211,8 @@ async fn seed_table_bucket(env: &rustfs_test_utils::TestECStoreEnv) {
             table: "orders".to_owned(),
             table_id: "table-id".to_owned(),
             table_uuid: uuid::Uuid::new_v4().to_string(),
+            vector_head_binding: None,
+            vector_index_definition: None,
             format: "ICEBERG".to_owned(),
             format_version: 2,
             warehouse_location: format!("s3://{TABLES}/tables/table-id"),

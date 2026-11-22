@@ -168,7 +168,7 @@ impl MultipartOrigin {
         opts: &mut ObjectOptions,
     ) -> rustfs_s3_types::S3Result<()> {
         match self {
-            Self::Request => apply_bucket_generation_guard(request, bucket, opts).map_err(rustfs_s3_types::S3Error::from),
+            Self::Request => apply_bucket_generation_guard(request, bucket, opts),
             Self::Managed {
                 context,
                 lifecycle_guard,

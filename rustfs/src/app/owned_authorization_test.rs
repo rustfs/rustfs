@@ -1962,27 +1962,40 @@ async fn vector_bucket_denied_by_generic_and_owned_authorization() {
             S3Action::AbortMultipartUploadAction,
             S3Action::ListMultipartUploadPartsAction,
         ] {
-            let mut request = build_request((), Method::GET);
-            request.extensions.insert(ReqInfo {
-                cred: Some(Credentials {
-                    access_key: "managed-isolation-user".to_owned(),
+            let request = || {
+                let mut extensions = Extensions::new();
+                extensions.insert(ReqInfo {
+                    cred: Some(Credentials {
+                        access_key: "managed-isolation-user".to_owned(),
+                        ..Default::default()
+                    }),
+                    is_owner,
+                    bucket: Some("rustfs-v-reserved-even-without-metadata".to_owned()),
+                    object: Some("indexes/private/object".to_owned()),
                     ..Default::default()
-                }),
-                is_owner,
-                bucket: Some("rustfs-v-reserved-even-without-metadata".to_owned()),
-                object: Some("indexes/private/object".to_owned()),
-                ..Default::default()
-            });
-            let mut generic = envelope_from_request(&request);
-            let mut owned = envelope_from_request(&request);
+                });
+                RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::GET,
+                        uri: Uri::from_static("/"),
+                        headers: HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                )
+            };
+            let mut generic = request();
+            let mut owned = request();
             let action = Action::S3Action(action);
             let error = crate::app::storage_api::object_usecase::access::authorize_request(&mut generic, action)
                 .await
-                .expect_err("ordinary generic access must reject managed storage");
+                .expect_err("authorize_request must reject Vector storage");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
             let error = crate::app::authorize_owned_request(&mut owned, action, None)
                 .await
-                .expect_err("ordinary owned access must reject managed storage");
+                .expect_err("authorize_owned_request must reject Vector storage");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
         }
     }

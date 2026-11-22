@@ -42,8 +42,7 @@ impl VerifiedVectorRequest {
             presigned: scheme.location() == SigLocation::Query,
         };
         let envelope = RequestEnvelope::from_gateway(context, &server, signature).map_err(s3_error)?;
-        admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)
-            .map_err(|error| s3_error(error.into()))?;
+        admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature).map_err(s3_error)?;
         Ok(Self {
             server,
             envelope,
@@ -89,7 +88,7 @@ impl VerifiedVectorRequest {
             self.envelope.request_context().cloned(),
         )
         .await
-        .map_err(|error| s3_error(error.into()))?;
+        .map_err(s3_error)?;
         match RequestTarget::resolve(&self.request, &self.region)? {
             RequestTarget::Service => {}
             RequestTarget::NewBucket(bucket) | RequestTarget::Bucket(bucket) => info.bucket = Some(bucket),

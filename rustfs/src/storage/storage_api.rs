@@ -205,7 +205,7 @@ pub(crate) mod owned_parity_consumer {
     };
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
     pub(crate) use super::super::authorization::parity_test_support;
-    pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
+    pub(crate) use super::super::authorization::{AuthorizationRequest, authorize_request, replication_request_authorized};
     pub(crate) use super::super::authorization::{
         authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers,
         authorize_staged_multipart_part, authorize_write_etag_condition,

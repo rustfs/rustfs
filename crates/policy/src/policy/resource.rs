@@ -23,7 +23,12 @@ use std::{
     ops::Deref,
 };
 
-use super::{Error as IamError, Validator, function::key_name::KeyName, utils::path, variables::PolicyVariableResolver};
+use super::{
+    Error as IamError, Validator,
+    function::key_name::KeyName,
+    utils::{path, wildcard},
+    variables::PolicyVariableResolver,
+};
 
 #[derive(Clone, Default, Debug)]
 pub struct ResourceSet(pub Vec<Resource>);

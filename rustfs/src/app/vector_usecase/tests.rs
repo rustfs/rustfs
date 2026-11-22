@@ -44,7 +44,7 @@ impl Fixture {
             .await
             .unwrap();
         let iam = app.iam().handle();
-        let user = format!("vector-app-{suffix}");
+        let user = format!("vector-app-user-{suffix}");
         iam.create_user(
             &user,
             &AddOrUpdateUserReq {
@@ -218,6 +218,68 @@ fn vector_application_requires_tag_permission_before_creating_bucket() {
                 .is_err()
         );
     });
+}
+
+#[test]
+fn vector_service_quota_uses_typed_storage_cause_for_modeled_writes() {
+    for operation in [Operation::CreateIndex, Operation::PutVectors] {
+        for wrapper in ["api", "managed", "s3"] {
+            for io_wrapped in [false, true] {
+                let api = crate::error::ApiError::from(crate::app::storage_api::vector_usecase::StorageError::QuotaExceeded {
+                    current: 5,
+                    limit: 4,
+                });
+                let source: Box<dyn std::error::Error + Send + Sync> = match wrapper {
+                    "api" => Box::new(api),
+                    "managed" => Box::new(crate::app::object::ManagedObjectError::Api(api)),
+                    "s3" => Box::new(crate::app::object::ManagedObjectError::from(rustfs_s3_types::S3Error::from(api))),
+                    _ => unreachable!(),
+                };
+                let source: Box<dyn std::error::Error + Send + Sync> = if io_wrapped {
+                    Box::new(std::io::Error::other(source))
+                } else {
+                    source
+                };
+                let error = VectorServiceError::Manifest(crate::vector::lance::LanceManifestError::Storage {
+                    operation: "create managed manifest",
+                    source,
+                });
+                let response = service_error_for_operation(operation, error).into_response();
+                assert_eq!(response.status(), http::StatusCode::PAYMENT_REQUIRED);
+                assert_eq!(response.headers()["x-amzn-errortype"], "ServiceQuotaExceededException");
+                let body: Value = serde_json::from_slice(response.body()).unwrap();
+                assert_eq!(body["__type"], "ServiceQuotaExceededException");
+                assert_eq!(body["message"], "Vector storage quota exceeded");
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_service_quota_preserves_other_refusals_and_operations() {
+    let invalid_request = VectorServiceError::Bridge {
+        operation: "validate request",
+        source: Box::new(crate::error::ApiError {
+            code: rustfs_s3_types::S3ErrorCode::InvalidRequest,
+            message: "quota words without a typed quota cause".to_owned(),
+            source: None,
+        }),
+    };
+    let error = service_error_for_operation(Operation::PutVectors, invalid_request);
+    assert_eq!(error.code(), ErrorCode::Validation);
+    assert_eq!(error.status_code(), http::StatusCode::BAD_REQUEST);
+
+    for operation in [Operation::DeleteVectors, Operation::QueryVectors, Operation::GetVectors] {
+        let quota = || {
+            VectorServiceError::Manifest(crate::vector::lance::LanceManifestError::Storage {
+                operation: "create managed manifest",
+                source: Box::new(crate::app::object::ManagedObjectError::Api(crate::error::ApiError::from(
+                    crate::app::storage_api::vector_usecase::StorageError::QuotaExceeded { current: 5, limit: 4 },
+                ))),
+            })
+        };
+        assert_eq!(service_error_for_operation(operation, quota()), service_error(quota()));
+    }
 }
 
 #[test]

@@ -727,6 +727,156 @@ fn vector_aws_sdk_deletes_empty_bucket() {
 
 #[test]
 #[serial_test::serial]
+fn vector_aws_sdk_quota_refusal_preserves_current_vectors_and_catalog() {
+    use crate::app::storage_api::test::{
+        StorageObjectOptions,
+        bucket::quota::{BucketQuota, checker::QuotaChecker},
+        contract::{list::ListOperations as _, object::ObjectOperations as _},
+        data_usage::quota_object_size,
+        set_disk::initialize_quota_ledger_for_test,
+    };
+    use crate::app::vector_usecase::{RequestTarget, index_namespace};
+    use crate::vector::protocol::Request;
+
+    run_large_stack_test("vector-aws-sdk-quota", || async {
+        let fixture = Fixture::new().await;
+        let server = SdkServer::new(&fixture).await;
+        let client = &server.client;
+        let bucket = format!("sdk-quota-{}", Uuid::new_v4().simple());
+        let metadata_sys = crate::app::storage_api::test::get_global_bucket_metadata_sys().unwrap();
+        let mut quota_checker = QuotaChecker::new(metadata_sys);
+        let mut quota_bucket = None;
+        let result = AssertUnwindSafe(async {
+            client
+                .create_vector_bucket()
+                .vector_bucket_name(&bucket)
+                .send()
+                .await
+                .unwrap();
+            let created = client
+                .create_index()
+                .vector_bucket_name(&bucket)
+                .index_name("quota.index")
+                .data_type(DataType::Float32)
+                .dimension(2)
+                .distance_metric(DistanceMetric::Euclidean)
+                .send()
+                .await
+                .unwrap();
+            let index_arn = created.index_arn().unwrap();
+            client
+                .put_vectors()
+                .index_arn(index_arn)
+                .vectors(vector("alpha", [1.0, 2.0], "original"))
+                .vectors(vector("beta", [3.0, 4.0], "retained"))
+                .send()
+                .await
+                .unwrap();
+
+            let request = Request::GetVectors(serde_json::from_value(json!({"indexArn":index_arn,"keys":["alpha"]})).unwrap());
+            let admitted = fixture.service.admit(fixture.verified(request)).await.unwrap();
+            let handle = admitted.bucket.as_ref().unwrap().clone();
+            let catalog = admitted.catalog.as_ref().unwrap().clone();
+            let RequestTarget::Index { index, .. } = &admitted.target else {
+                panic!("quota fixture requires an Index target");
+            };
+            let index = index.clone();
+            drop(admitted);
+            let current_head = async || {
+                let (_guard, entry) = catalog
+                    .begin_vector_operation(&handle, &index_namespace().unwrap(), &index)
+                    .await
+                    .unwrap();
+                (entry.head().metadata().clone(), entry.head().generation().get())
+            };
+            let before = current_head().await;
+            let store = fixture.app.object_store();
+            let storage_bucket = handle.storage_bucket_id().as_str();
+            quota_bucket = Some(storage_bucket.to_owned());
+            let page = store
+                .clone()
+                .list_objects_v2(storage_bucket, "", None, None, 1000, false, None, false)
+                .await
+                .unwrap();
+            assert!(!page.is_truncated, "the fixture must account for every existing object");
+            let mut current_bytes = 0_u64;
+            for object in page.objects {
+                let info = store
+                    .get_object_info(storage_bucket, &object.name, &StorageObjectOptions::default())
+                    .await
+                    .unwrap();
+                current_bytes = current_bytes.checked_add(quota_object_size(&info).unwrap()).unwrap();
+            }
+            assert!(current_bytes > 1);
+
+            for limit in [current_bytes, 1] {
+                quota_checker
+                    .set_quota_config(storage_bucket, BucketQuota::new(Some(limit)))
+                    .await
+                    .unwrap();
+                initialize_quota_ledger_for_test(store.clone(), storage_bucket).await.unwrap();
+                assert_sdk_error!(
+                    client
+                        .put_vectors()
+                        .index_arn(index_arn)
+                        .vectors(vector("alpha", [9.0, 9.0], "replaced"))
+                        .vectors(vector("gamma", [5.0, 6.0], "inserted"))
+                        .send()
+                        .await,
+                    "ServiceQuotaExceededException",
+                    402
+                );
+                assert_eq!(current_head().await, before);
+                let read = client
+                    .get_vectors()
+                    .index_arn(index_arn)
+                    .keys("alpha")
+                    .keys("beta")
+                    .keys("gamma")
+                    .return_data(true)
+                    .return_metadata(true)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(read.vectors().len(), 2);
+                for (key, data, group) in [("alpha", [1.0, 2.0], "original"), ("beta", [3.0, 4.0], "retained")] {
+                    let retained = read.vectors().iter().find(|item| item.key() == key).unwrap();
+                    assert_eq!(retained.data().unwrap().as_float32().unwrap(), &data);
+                    assert_eq!(retained.metadata(), Some(&metadata(group)));
+                }
+            }
+            assert_eq!(
+                server
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item.uri.path() == "/PutVectors" && item.status == http::StatusCode::PAYMENT_REQUIRED)
+                    .count(),
+                2
+            );
+            quota_checker
+                .set_quota_config(storage_bucket, BucketQuota::new(None))
+                .await
+                .unwrap();
+            quota_bucket = None;
+            client.delete_index().index_arn(index_arn).send().await.unwrap();
+        })
+        .catch_unwind()
+        .await;
+        if let Some(bucket) = quota_bucket {
+            quota_checker.set_quota_config(&bucket, BucketQuota::new(None)).await.unwrap();
+        }
+        server.finish().await;
+        cleanup_iam(&fixture).await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn vector_aws_sdk_permission_denials_preserve_resources() {
     run_large_stack_test("vector-aws-sdk-permissions", || permission_case(false));
 }
