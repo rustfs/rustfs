@@ -656,8 +656,7 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("mpu-kms-current-caller", || async {
             use crate::app::storage_api::s3::S3ErrorCode;
             use crate::app::storage_api::s3::dto::{
-                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, CopySource, StreamingBlob,
-                UploadPartCopyInput, UploadPartInput,
+                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, StreamingBlob, UploadPartInput,
             };
             use crate::app::storage_api::test::ReqInfo;
             use crate::app::storage_api::test::sse::{
@@ -727,24 +726,37 @@ mod tests {
                 .err()
                 .expect("denied part");
             assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let copy = UploadPartCopyInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .part_number(1)
-                .copy_source(CopySource::Bucket {
-                    bucket: bucket.clone().into(),
-                    key: "source".into(),
-                    version_id: None,
-                })
-                .build()
-                .expect("copy");
-            let copy_req = denied_request(copy, authorizer.clone());
+            let copy_envelope = crate::app::RequestEnvelope::from_s3s(&denied_request((), authorizer.clone()));
             let error = usecase
-                .execute_upload_part_copy(copy_req)
+                .execute_upload_part_copy_with_audit(
+                    copy_envelope,
+                    UploadPartCopyWriteInput {
+                        target: UploadPartTarget::Legacy {
+                            bucket: bucket.clone(),
+                            key: key.to_string(),
+                            upload_id: upload.upload_id.clone(),
+                        },
+                        part_number: 1,
+                        copy_source: rustfs_gateway_types::CopySourceValue::Bucket {
+                            bucket: bucket.clone(),
+                            key: "source".to_owned(),
+                            version_id: None,
+                        },
+                        copy_source_range: None,
+                        copy_source_if_match: None,
+                        copy_source_if_none_match: None,
+                        sse_customer_algorithm: None,
+                        sse_customer_key: None,
+                        sse_customer_key_md5: None,
+                        copy_source_sse_customer_algorithm: None,
+                        copy_source_sse_customer_key: None,
+                        copy_source_sse_customer_key_md5: None,
+                    },
+                )
                 .await
-                .expect_err("denied destination copy");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                .err()
+                .expect("denied destination copy");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
             let complete = CompleteMultipartUploadInput::builder()
                 .bucket(bucket.clone())
                 .key(key.to_string())
