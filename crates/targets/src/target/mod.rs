@@ -722,7 +722,7 @@ pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedP
 where
     E: PluginEvent,
 {
-    build_queued_payload_with_records(event, vec![event.data.clone()])
+    build_queued_payload_with_records(event, vec![&event.data])
 }
 
 pub(crate) fn build_queued_payload_with_records<E, R>(

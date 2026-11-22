@@ -22,6 +22,8 @@
 //! Upstream: the legacy `S3Access::check` hook and the gateway edge's `access::admit`.
 //! Downstream: `ReqInfo` readers and the use cases that read the installed markers.
 
+mod request_validation;
+
 #[cfg(test)]
 use crate::auth::AuthType;
 use crate::auth::{
@@ -149,19 +151,24 @@ fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -
 }
 
 /// The operation-aware admission every S3 request passes after its caller is resolved and before
-/// its own authorization: a signed upload-size capability is refused on any operation but the one
-/// it is scoped to, and the license must be valid.
+/// its own authorization. It checks ACL deletion, POST metadata, signed upload-size capabilities,
+/// and the license.
 ///
 /// # Errors
 ///
-/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
-/// `InternalError` when the license cannot be checked.
+/// `MethodNotAllowed` for ACL deletion, `InvalidRequest` for a misplaced capability query,
+/// `AccessDenied` for out-of-form POST metadata or a refused license, and `InternalError` when
+/// the license cannot be checked.
 pub(crate) fn admit_operation(
+    method: &http::Method,
     headers: &HeaderMap,
     raw_query: Option<&str>,
     operation: &str,
     signature: VerifiedSignature,
 ) -> S3Result<()> {
+    request_validation::validate_method_subresource(method, raw_query).map_err(|violation| match violation {
+        request_validation::RequestViolation::DeleteAcl => S3Error::new(S3ErrorCode::MethodNotAllowed),
+    })?;
     if operation == "PostObject" {
         validate_post_object_metadata(headers, raw_query)?;
     }
@@ -197,6 +204,21 @@ mod access_phase_tests {
     use super::{
         AccessMarkers, AuthType, MultipartStagingOperation, VerifiedPresignedRequest, VerifiedSigV4Request, VerifiedSignature,
     };
+
+    #[test]
+    fn admission_rejects_delete_acl_before_operation_authorization() {
+        for operation in ["DeleteObject", "DeleteBucket", "DeleteObjectTagging", "AbortMultipartUpload"] {
+            let error = super::admit_operation(
+                &http::Method::DELETE,
+                &http::HeaderMap::new(),
+                Some("%61cl&versionId=version-1"),
+                operation,
+                VerifiedSignature::default(),
+            )
+            .expect_err("ACL DELETE must be refused by the shared admission phase");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::MethodNotAllowed);
+        }
+    }
 
     #[test]
     fn post_object_metadata_checks_only_out_of_form_object_properties() {

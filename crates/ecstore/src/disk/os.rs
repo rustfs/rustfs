@@ -2887,6 +2887,11 @@ impl DiskBlockingQueue {
         self.lanes.iter().map(|lane| lane.state.lock().submitted_jobs).sum()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn submitted_fsync_jobs_for_test(&self) -> usize {
+        self.lane(DiskBlockingLane::Fsync).state.lock().submitted_jobs
+    }
+
     #[inline]
     fn foreground_lane() -> DiskBlockingLane {
         if is_isolated_io_thread() {

@@ -524,6 +524,30 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/agent-v1-protocol-regression.yml",
+      "name": "Agent v1 protocol regression",
+      "roles": [
+        "pr",
+        "push",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "push",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "agent-v1-protocol-regression.yml",
+      "disposition": "validates Agent v1 schemas and fixture integrity",
+      "monitor_reason": "Runs on changes to the Agent v1 contract and on request.",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/connect-diagnostic-schedule-acceptance.yml",
       "name": "Connect diagnostic scheduler receipt acceptance",
       "roles": [

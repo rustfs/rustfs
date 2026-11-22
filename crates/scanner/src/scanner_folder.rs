@@ -2772,8 +2772,14 @@ impl FolderScanner {
                         }
                     }
                     FolderScanSource::Existing => {
-                        // Usage sampling is not proof that a Deep check ran.
-                        if let Some(reuse) = self.sampled_namespace_reuse(&h, into.compacted, forward_sweep) {
+                        // Lifecycle evaluation must still visit matching prefixes between usage samples.
+                        let has_lifecycle_work = active_life_cycle.as_ref().is_some_and(|config| {
+                            let (_, prefix) = path2_bucket_object_with_base_path(&self.root, &folder_item.name);
+                            config.has_active_rules(&prefix)
+                        });
+                        if !has_lifecycle_work
+                            && let Some(reuse) = self.sampled_namespace_reuse(&h, into.compacted, forward_sweep)
+                        {
                             if reuse {
                                 if child_mode == FolderScanMode::Namespace {
                                     let started = Instant::now();

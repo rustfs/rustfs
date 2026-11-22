@@ -744,7 +744,7 @@ impl LocalDisk {
             }
         }
         if dst_volume == crate::disk::RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(dst_volume, dst_path);
         }
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
