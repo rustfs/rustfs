@@ -5670,12 +5670,13 @@ pub(crate) async fn acquire_file_sync_admission(disk_permits: Arc<Semaphore>) ->
 /// Keep the disk admission and namespace lease with the blocking syscall if
 /// the async waiter is cancelled. The process-wide admission remains with the
 /// waiter so cancellation cannot starve healthy disks.
+#[cfg(any(unix, test))]
 pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     admission: &FileSyncAdmission,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    run_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
+    run_cancellable_blocking_namespace_file_sync_operation(lease, admission, move |_| operation()).await
 }
 
 pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Send + 'static>(
@@ -5684,16 +5685,6 @@ pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Se
     operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
-}
-
-async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
-    lease: Arc<NamespaceMutationLease>,
-    admission: &FileSyncAdmission,
-    global_permits: &Semaphore,
-    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, global_permits, move |_| operation())
-        .await
 }
 
 async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
@@ -12583,11 +12574,16 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let waiter_global_permits = global_permits.clone();
         let waiter = tokio::spawn(async move {
-            run_blocking_namespace_file_sync_operation_with_global(lease, &admission, waiter_global_permits.as_ref(), move || {
-                entered_tx.send(()).expect("signal blocking work");
-                release_rx.recv().expect("wait for blocking work release");
-                Ok(())
-            })
+            run_cancellable_blocking_namespace_file_sync_operation_with_global(
+                lease,
+                &admission,
+                waiter_global_permits.as_ref(),
+                move |_| {
+                    entered_tx.send(()).expect("signal blocking work");
+                    release_rx.recv().expect("wait for blocking work release");
+                    Ok(())
+                },
+            )
             .await
         });
 
