@@ -175,7 +175,7 @@ async fn tag_dependent_access_hooks_preserve_local_miss_for_replication_proxy() 
     check(&envelope);
 
     let mut envelope = request(Method::PUT).req_info().server_context(&slot).build();
-    authorize_put_object_tagging(&mut envelope, &bucket, "missing", None, RequestedObjectTags(Vec::new()))
+    authorize_put_object_tagging(&mut envelope, &slot, &bucket, "missing", None, RequestedObjectTags(Vec::new()))
         .await
         .expect("local miss does not match the tag deny");
     check(&envelope);

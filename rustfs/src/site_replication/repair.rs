@@ -711,22 +711,27 @@ pub(crate) async fn execute_site_replication_repair(
 ) -> S3Result<(StatusCode, HeaderMap, rustfs_s3_types::Body)> {
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(
-        store,
-        SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(),
-        move |_write_guard| async move { execute_site_replication_repair_locked(request).await },
-    )
+    let admission_store = store.clone();
+    with_config_object_read_lock(admission_store, SITE_REMOVE_V2_ADMISSION_LOCK.to_string(), move || async move {
+        with_config_object_write_lock(
+            store,
+            SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(),
+            move |_write_guard| async move { execute_site_replication_repair_locked(request).await },
+        )
+        .await
+        .map_err(|_| {
+            S3Error::with_message(S3ErrorCode::ClientTokenConflict, "another site replication repair is active".to_string())
+        })?
+    })
     .await
-    .map_err(|_| {
-        S3Error::with_message(S3ErrorCode::ClientTokenConflict, "another site replication repair is active".to_string())
-    })?
+    .map_err(|_| s3_error!(ClientTokenConflict, "site decommission admission is unavailable"))?
 }
 
 pub(crate) async fn execute_site_replication_repair_locked(
     request: SiteReplicationRepairExecutionRequest,
 ) -> S3Result<(StatusCode, HeaderMap, rustfs_s3_types::Body)> {
     let state = load_site_replication_state().await?;
-    if !state.enabled() || state.service_account_access_key.is_empty() {
+    if state.pending_remove_v2.is_some() || !state.enabled() || state.service_account_access_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "site replication is not configured"));
     }
     let info = build_sr_info(&state, &request.local_peer).await?;

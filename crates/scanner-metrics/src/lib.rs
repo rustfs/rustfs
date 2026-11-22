@@ -15,6 +15,7 @@
 pub mod init_time;
 pub mod last_minute;
 pub mod metrics;
+pub mod scan_observation;
 pub mod startup;
 pub mod usage_candidate;
 

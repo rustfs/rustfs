@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The shared access phase of the gateway edge: what the legacy `S3Access::check` runs for every
-//! operation, fed from the gateway's verdict.
+//! The access phase for S3 operations served by the gateway.
 //!
 //! Responsible for: [`admit`], which builds the envelope with the access markers, installs the
-//! caller and runs the operation-aware admission, each through the function the legacy check
-//! calls (`storage/access.rs`).
+//! caller and runs the operation-aware admission checks.
 //! Also the gateway-edge form of the one authorization shape several families share:
 //! [`authorize_bucket_config_mutation`].
 //! NOT responsible for: an operation's own authorization (`Served::authorize`), or verifying the
@@ -42,7 +40,7 @@ use zeroize::Zeroizing;
 ///
 /// # Errors
 ///
-/// What the legacy access check answers: the credential refusals of the key lookup,
+/// Credential errors from the key lookup, `MethodNotAllowed` for ACL deletion,
 /// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
 /// `InternalError` when IAM or the license cannot be read or the request cannot be read back.
 pub(super) fn admit<'a>(
@@ -76,7 +74,7 @@ pub(super) fn admit<'a>(
             resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?
         };
         envelope.install_req_info(req_info);
-        admit_operation(envelope.headers(), envelope.uri().query(), operation, signature)?;
+        admit_operation(envelope.method(), envelope.headers(), envelope.uri().query(), operation, signature)?;
         Ok(envelope)
     }
 }

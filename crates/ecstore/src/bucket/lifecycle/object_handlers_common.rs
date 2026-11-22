@@ -128,7 +128,7 @@ pub async fn delete_object_versions(
                 // order and admission; the event is derived from the committed
                 // result, and a send failure never rolls back a delete that
                 // already happened (backlog#2202).
-                emit_noncurrent_expiration_event(bucket, target, deleted_obj, false);
+                emit_noncurrent_expiration_event(bucket, target, deleted_obj, false, bucket_incarnation_id);
             }
             if !deleted_obj
                 .replication_state
@@ -137,7 +137,7 @@ pub async fn delete_object_versions(
             {
                 continue;
             }
-            replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
+            replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone(), Some(bucket_incarnation_id)).await;
         }
 
         for (i, err) in errors.iter().enumerate() {

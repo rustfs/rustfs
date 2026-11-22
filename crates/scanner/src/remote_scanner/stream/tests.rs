@@ -614,6 +614,7 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
             scan_mode: HealScanMode::Normal,
             prefix_scan_scope: None,
             checkpoint_tx: None,
+            local_stop: None,
         },
     )
     .await
@@ -642,6 +643,7 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
             scan_mode: HealScanMode::Normal,
             prefix_scan_scope: None,
             checkpoint_tx: None,
+            local_stop: None,
         },
     )
     .await

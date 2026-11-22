@@ -13,12 +13,9 @@ either can be enabled on its own.
 
 ## Build
 
-The feature links NVIDIA's cuObject *server* library (`libcuobjserver`, part
-of the CUDA apt repository as `libcuobjserver` / `libcuobjserver-dev`) through
-the [`cuobject`](https://crates.io/crates/cuobject) bindings; their
-`cuobject-sys` build script generates the FFI with bindgen (needs libclang)
-and compiles a C++ wrapper over the library. It is off by default and
-Linux-only:
+The optional Linux `cuobject` feature enables `rustfs-cuobject` for buffer and transfer management. Its dependency `rustfs-cuobject-sys` compiles the C++17 bridge against `cuobjserver.h` and links NVIDIA's `libcuobjserver`. Install `libcuobjserver`,
+`libcuobjserver-dev` and the RDMA development headers for the target
+architecture. A default build does not require the NVIDIA SDK.
 
 ```bash
 # CUOBJSERVER_ROOT points at a prefix holding include/cuobjserver.h and lib/libcuobjserver.so
@@ -60,11 +57,12 @@ and `Content-Length: 0`, plus:
 - `x-amz-rdma-bytes-transferred`: bytes written into the client buffer; absent
   when zero.
 
-Writes are pipelined: chunk N is written by its own task while the decoder
-fills chunk N+1; completions are collected in issue order. Each chunk is
-owned by its blocking write until the DMA returns, so on a failure the GET
-waits for the outstanding writes before their chunks return to the pool;
-a staging slot is never reused while the NIC may still read it.
+A GET can fill a staging chunk while an earlier chunk is being sent. Each
+transfer holds its own channel and source until DMA completes. Successful
+transfers return the channel to the per-server pool. An asynchronous GET
+also reuses the channel's completion descriptor registration on the same
+Tokio runtime. If completion becomes uncertain, the channel and the
+registered source stay reserved.
 
 A malformed token is ignored (the GET is served over HTTP); the client treats
 the missing reply header as "declined". A token buffer smaller than the
@@ -84,6 +82,12 @@ when enabled). The response is the usual one plus `x-amz-rdma-reply: 200`
 and `x-amz-rdma-bytes-transferred`. A malformed token is ignored and the
 empty body is stored as an empty object, exactly as without the feature;
 the NIXL client treats a reply without `x-amz-rdma-reply` as declined.
+
+For PUT, read-ahead reserves chunks in object order. A streaming PUT or
+UploadPart consumes the registered frames directly and returns each staging
+slot after its last byte is consumed. An eager reader retaining multiple
+frames copies them out of the pool before reserving more. A cache fill also
+keeps its retained bytes independently of the staging pool.
 
 ## Validation
 

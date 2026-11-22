@@ -27,6 +27,12 @@ pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
     resolve_notify_object_store_handle_from_backend()
 }
 
+pub(crate) async fn refresh_notify_bucket_metadata(store: Arc<NotifyStore>, bucket: &str) -> bool {
+    rustfs_ecstore::api::bucket::metadata_sys::reload_bucket_metadata(store, bucket)
+        .await
+        .is_ok()
+}
+
 pub(crate) type NotifyServerConfigSnapshot = rustfs_ecstore::api::config::com::ServerConfigSnapshot;
 
 pub(crate) async fn read_notify_server_config_snapshot(store: Arc<NotifyStore>) -> Result<NotifyServerConfigSnapshot, String> {
@@ -72,7 +78,7 @@ pub(crate) mod crate_boundary {
 }
 
 pub(crate) mod bucket_metadata {
-    pub(crate) use super::NotifyStore;
+    pub(crate) use super::{NotifyStore, refresh_notify_bucket_metadata};
     pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::utils::deserialize as deserialize_bucket_config;
