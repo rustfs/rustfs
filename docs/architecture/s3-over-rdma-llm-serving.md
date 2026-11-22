@@ -19,7 +19,7 @@ This document describes the design and the invariants of RustFS's S3-over-RDMA d
 
 | Layer | Code | Role |
 |---|---|---|
-| Client last hop, cuObject | `crates/cuobject/src/lib.rs`, `rustfs/src/app/object/cuobject.rs` | First transport: `x-amz-rdma-token`, NVIDIA cuObject server library through the `cuobject` bindings from crates.io. Kept as a compile-time alternative. |
+| Client last hop, cuObject | `rustfs/src/app/object/cuobject.rs`, `crates/cuobject`, `crates/cuobject-sys` | The `cuobject` feature enables `x-amz-rdma-token` transfers. `rustfs-cuobject` manages registered buffers and transfers. `rustfs-cuobject-sys` builds the C++ bridge and links the NVIDIA server SDK. |
 | Client last hop, NIXL | `crates/nixl/src/lib.rs` (`RdmaToken::from_headers`), `crates/nixl/src/remotes.rs`, `crates/nixl/src/mem.rs` | NIXL/UCX transport selected by the `nixl` feature. The client names a registered `dram` or `vram` buffer; the server WRITEs (GET) or READs (PUT) it. |
 | Shared pipeline | `rustfs/src/app/object/cuobject.rs` | Segment fan-out of large GETs, staging chunks, shard arena, completion handling. The same pipeline serves both transports; only the transfer layer differs. |
 | Device health | `crates/nixl/src/devices.rs` | Startup check that leaves out RDMA devices that are down, slow or flapping. |
