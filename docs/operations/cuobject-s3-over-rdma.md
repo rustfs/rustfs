@@ -57,11 +57,12 @@ and `Content-Length: 0`, plus:
 - `x-amz-rdma-bytes-transferred`: bytes written into the client buffer; absent
   when zero.
 
-Writes are pipelined: chunk N is written by its own task while the decoder
-fills chunk N+1; completions are collected in issue order. Each chunk is
-owned by its blocking write until the DMA returns, so on a failure the GET
-waits for the outstanding writes before their chunks return to the pool;
-a staging slot is never reused while the NIC may still read it.
+A GET can fill a staging chunk while an earlier chunk is being sent. Each
+transfer holds its own channel and source until DMA completes. Successful
+transfers return the channel to the per-server pool. An asynchronous GET
+also reuses the channel's completion descriptor registration on the same
+Tokio runtime. If completion becomes uncertain, the channel and the
+registered source stay reserved.
 
 A malformed token is ignored (the GET is served over HTTP); the client treats
 the missing reply header as "declined". A token buffer smaller than the
@@ -81,6 +82,12 @@ when enabled). The response is the usual one plus `x-amz-rdma-reply: 200`
 and `x-amz-rdma-bytes-transferred`. A malformed token is ignored and the
 empty body is stored as an empty object, exactly as without the feature;
 the NIXL client treats a reply without `x-amz-rdma-reply` as declined.
+
+For PUT, read-ahead reserves chunks in object order. A request that may
+populate the object cache, or whose eager reader can retain multiple chunks
+before storage starts, copies the completed frames out of the registered
+pool. A single-chunk, non-cacheable PUT can hand its registered frame to
+storage directly.
 
 ## Validation
 

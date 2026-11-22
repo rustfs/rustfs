@@ -403,6 +403,12 @@ fn zero_copy_eager_put_path_status_with_max_size(
     PUT_EAGER_STATUS_ELIGIBLE
 }
 
+#[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+fn rdma_put_retains_staging(total: i64, chunk_bytes: usize, eager_limit: i64, may_cache: bool) -> bool {
+    // An eager reader retains every frame until it has the whole object.
+    !may_cache && (u64::try_from(total).is_ok_and(|len| len <= chunk_bytes as u64) || total > eager_limit)
+}
+
 fn zero_copy_eager_put_max_size_bytes() -> i64 {
     let configured = *CACHED_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES.get_or_init(|| {
         rustfs_utils::get_env_usize(ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES, DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES)
@@ -1415,12 +1421,11 @@ impl DefaultObjectUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match super::cuobject::rdma_token_for_request(envelope.headers()) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                // Zero-copy only when the body cannot outlive the request in the
-                // object data cache (fill-on-put keeps it).
-                let zero_copy =
-                    !i64::try_from(token.buffer_len).is_ok_and(|size| put_body_may_fill_cache(&self.object_data_cache(), size));
-                let (body, total) = super::cuobject::rdma_put_body(&bucket, &key, &token, zero_copy)?;
-                let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                let total = i64::try_from(token.buffer_len).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                let cache = put_body_may_fill_cache(&self.object_data_cache(), total);
+                let (body, _) = super::cuobject::rdma_put_body(&bucket, &key, &token, |chunk_bytes| {
+                    rdma_put_retains_staging(total, chunk_bytes, zero_copy_eager_put_max_size_bytes(), cache)
+                })?;
                 (Some(body), Some(total), Some(total))
             }
             _ => (body, content_length, None),
@@ -3787,6 +3792,18 @@ mod tests {
         let (path, _, _, small_eager) = select_put_path_with_concurrency(256 * 1024, &headers, false, false, false, 256);
         assert_eq!(path, "streaming");
         assert!(!small_eager);
+    }
+
+    #[test]
+    fn eager_rdma_put_releases_staging_for_the_next_chunk() {
+        let chunk = 4 << 20;
+        let limit = 16 << 20;
+        assert!(!rdma_put_retains_staging(12 << 20, chunk, limit, false));
+        assert!(!rdma_put_retains_staging(limit, chunk, limit, false));
+        assert!(rdma_put_retains_staging(4 << 20, chunk, limit, false));
+        assert!(rdma_put_retains_staging(limit + 1, chunk, limit, false));
+        assert!(!rdma_put_retains_staging(4 << 20, chunk, limit, true));
+        assert!(!rdma_put_retains_staging(limit + 1, chunk, limit, true));
     }
 
     #[test]

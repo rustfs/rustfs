@@ -206,7 +206,7 @@ impl DefaultMultipartUsecase {
         let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(req.headers()) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
                 let (body, total) =
-                    crate::app::object::cuobject::rdma_put_body(bucket, key, &token, true).map_err(S3Error::from)?;
+                    crate::app::object::cuobject::rdma_put_body(bucket, key, &token, |_| true).map_err(S3Error::from)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
                 (Some(body), Some(total), Some(total))
             }
