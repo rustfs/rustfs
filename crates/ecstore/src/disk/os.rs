@@ -428,6 +428,24 @@ pub(crate) mod prepared_publication_test_hooks {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_rename_hooks(source: &Path, destination: &Path) -> bool {
+        let before_publication = {
+            let guard = BEFORE_PUBLICATION.lock();
+            !guard.is_empty()
+                && (guard.contains_key(&(Stage::Rename, source.to_path_buf()))
+                    || guard.contains_key(&(Stage::Rename, destination.to_path_buf())))
+        };
+        #[cfg(test)]
+        {
+            before_publication || RENAME_DESTINATIONS.lock().contains_key(source)
+        }
+        #[cfg(not(test))]
+        {
+            before_publication
+        }
+    }
+
     #[cfg(test)]
     type RenameDestinationHook = Box<dyn FnOnce(&Path) + Send>;
     #[cfg(test)]
@@ -5308,11 +5326,11 @@ pub(crate) async fn rename_all_with_prepared_source(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
-    guard.directories.prepare_destination().map_err(to_file_error)?;
-    #[cfg(test)]
-    prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(any(test, feature = "test-util"))]
-    {
+    if prepared_publication_test_hooks::has_rename_hooks(source, destination) {
+        guard.directories.prepare_destination().map_err(to_file_error)?;
+        #[cfg(test)]
+        prepared_publication_test_hooks::run_rename_destination(source, destination);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
     }
