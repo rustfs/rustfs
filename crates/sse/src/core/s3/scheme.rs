@@ -14,11 +14,13 @@
 
 //! Which SSE scheme and which key a request resolves to: the request first, then the bucket default.
 
+use crate::core::s3::headers::validate_sse_headers_for_write;
 use crate::error::SseError;
 use crate::host::SseHost;
 use crate::{LOG_COMPONENT_STORAGE, LOG_SUBSYSTEM_SSE};
 use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
 use rustfs_utils::http::object_encryption_keys::SSEType;
+use std::collections::HashMap;
 use tracing::debug;
 
 pub const DEFAULT_SSE_ALGORITHM: &str = "AES256";
@@ -167,52 +169,86 @@ where
     requested_kms_key_id.or_else(bucket_default_kms_key_id)
 }
 
-#[derive(Clone)]
-pub enum SseTypeV2 {
-    SseS3(String),
-    SseKms(String, Option<String>),
-    SseC(String, String, String),
+/// The SSE headers of a write request, as the S3 layer received them.
+pub(crate) struct WriteSchemeHeaders<'a> {
+    pub(crate) server_side_encryption: Option<String>,
+    pub(crate) ssekms_key_id: Option<String>,
+    pub(crate) ssekms_context: Option<&'a HashMap<String, String>>,
+    pub(crate) sse_customer_algorithm: Option<String>,
+    pub(crate) sse_customer_key: Option<String>,
+    pub(crate) sse_customer_key_md5: Option<String>,
 }
 
-impl std::fmt::Debug for SseTypeV2 {
+/// The scheme a write resolved to, in S3's terms.
+#[derive(Clone)]
+pub(crate) enum WriteScheme {
+    /// `AES256`: the server chooses the wrapping key and the caller names none.
+    SseS3,
+    /// `aws:kms`, under the key the request or the bucket default named, if either did.
+    SseKms { key_id: Option<String> },
+    /// A key the client supplies; only its MD5 is ever stored.
+    SseC {
+        algorithm: String,
+        key: String,
+        key_md5: String,
+    },
+}
+
+impl std::fmt::Debug for WriteScheme {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::SseS3(_) => "SseS3(..)",
-            Self::SseKms(_, _) => "SseKms(..)",
-            Self::SseC(_, _, _) => "SseC(..)",
+            Self::SseS3 => "SseS3",
+            Self::SseKms { .. } => "SseKms(..)",
+            Self::SseC { .. } => "SseC(..)",
         })
     }
 }
 
-pub(crate) async fn prepare_sse_configuration_v2(
+/// Decide the scheme of a write: validate the headers, then the request first and the
+/// bucket default second.
+///
+/// Every write goes through here, an object and a multipart session alike, so the two
+/// cannot resolve the same headers differently.
+pub(crate) async fn resolve_write_scheme(
     host: &dyn SseHost,
     bucket: &str,
-    server_side_encryption: Option<String>,
-    customer_algorithm: Option<String>,
-    customer_key: Option<String>,
-    customer_key_md5: Option<String>,
-    ssekms_key_id: Option<String>,
-) -> Result<Option<SseTypeV2>, SseError> {
-    if let Some(customer_algorithm) = customer_algorithm
-        && let Some(customer_key_md5) = customer_key_md5
+    headers: WriteSchemeHeaders<'_>,
+) -> Result<Option<WriteScheme>, SseError> {
+    validate_sse_headers_for_write(
+        headers.server_side_encryption.as_deref(),
+        headers.ssekms_key_id.as_ref(),
+        headers.ssekms_context,
+        headers.sse_customer_algorithm.as_ref(),
+        headers.sse_customer_key.as_ref(),
+        headers.sse_customer_key_md5.as_ref(),
+        true,
+    )?;
+
+    // Validation admits SSE-C headers only as a complete set, and never beside the
+    // managed ones, so their presence alone decides.
+    if let (Some(algorithm), Some(key), Some(key_md5)) =
+        (headers.sse_customer_algorithm, headers.sse_customer_key, headers.sse_customer_key_md5)
     {
-        // if create_multipart_upload request, customer_key is not provided
-        let customer_key = customer_key.unwrap_or_default();
-
-        return Ok(Some(SseTypeV2::SseC(customer_algorithm, customer_key, customer_key_md5)));
+        return Ok(Some(WriteScheme::SseC { algorithm, key, key_md5 }));
     }
 
-    let sse_config = prepare_sse_configuration(host, bucket, server_side_encryption, ssekms_key_id).await?;
+    let Some(config) = prepare_sse_configuration(host, bucket, headers.server_side_encryption, headers.ssekms_key_id).await?
+    else {
+        return Ok(None);
+    };
 
-    if let Some(sse_config) = sse_config {
-        return match sse_config.effective_sse.as_str() {
-            AMZ_ENCRYPTION_AES => Ok(Some(SseTypeV2::SseS3(sse_config.effective_sse))),
-            AMZ_ENCRYPTION_KMS => Ok(Some(SseTypeV2::SseKms(sse_config.effective_sse.clone(), sse_config.effective_kms_key_id))),
-            _ => Ok(None),
-        };
-    }
-
-    Ok(None)
+    Ok(match config.effective_sse.as_str() {
+        AMZ_ENCRYPTION_AES => {
+            // Validation admits a key id only beside `aws:kms`, and the bucket default's
+            // key is consulted only for `aws:kms`.
+            debug_assert!(config.effective_kms_key_id.is_none(), "SSE-S3 never names a KMS key");
+            Some(WriteScheme::SseS3)
+        }
+        AMZ_ENCRYPTION_KMS => Some(WriteScheme::SseKms {
+            key_id: config.effective_kms_key_id,
+        }),
+        _ => None,
+    })
 }
 
 /// Scheme a managed-SSE header names, defaulting to SSE-S3 the same way the

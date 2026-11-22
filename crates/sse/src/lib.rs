@@ -90,7 +90,7 @@ pub use crate::core::s3::headers::{
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, project_sse_read_response_headers,
     validate_sse_headers_for_read, validate_sse_headers_for_write,
 };
-pub use crate::core::s3::scheme::{DEFAULT_SSE_ALGORITHM, SseTypeV2, bucket_default_write_sse};
+pub use crate::core::s3::scheme::{DEFAULT_SSE_ALGORITHM, bucket_default_write_sse};
 pub use crate::core::s3::ssec::{ssec_invalid_request, validate_ssec_for_read};
 pub use crate::core::write::{EncryptionRequest, PrepareEncryptionRequest, sse_encryption, sse_prepare_encryption};
 pub use crate::error::{KMS_KEY_NOT_FOUND_ERROR_CODE, SseError, data_plane_kms_error};

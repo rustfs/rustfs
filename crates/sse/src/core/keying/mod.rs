@@ -20,3 +20,28 @@ pub(crate) mod material;
 pub(crate) mod metadata;
 #[cfg(feature = "rio-v2")]
 pub(crate) mod object;
+
+use crate::core::keying::material::{EncryptionKeyKind, ManagedSealedKey};
+
+/// The key a new object is encrypted with, in the mode this build writes.
+pub(crate) struct NewObjectKey {
+    /// Key handed to the stream cipher.
+    pub(crate) key_bytes: [u8; 32],
+    /// Base nonce the stream cipher derives its block nonces from.
+    pub(crate) base_nonce: [u8; 12],
+    /// The mode `key_bytes` belongs to.
+    pub(crate) key_kind: EncryptionKeyKind,
+    /// The sealed form to store, in a mode that seals a separate object key.
+    pub(crate) sealed_key: Option<ManagedSealedKey>,
+}
+
+// The mode new objects are written in. Every build reads every mode it can
+// recognize; writing picks exactly one, and this is the only place that says which.
+#[cfg(not(feature = "rio-v2"))]
+pub(crate) use direct::{
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
+};
+#[cfg(feature = "rio-v2")]
+pub(crate) use object::{
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
+};

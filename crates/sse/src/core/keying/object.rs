@@ -14,7 +14,8 @@
 
 //! Object keying: a derived object key, sealed in the MinIO-compatible format.
 
-use crate::core::keying::material::ManagedSealedKey;
+use crate::core::keying::NewObjectKey;
+use crate::core::keying::material::{EncryptionKeyKind, ManagedSealedKey};
 use crate::error::SseError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -22,6 +23,7 @@ use base64_simd::STANDARD as BASE64_STANDARD;
 use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
 use rand::RngExt;
+use rustfs_kms::DataKey;
 use rustfs_utils::http::object_encryption_keys::{
     INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
     MINIO_INTERNAL_ENCRYPTION_IV_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
@@ -272,4 +274,57 @@ pub(crate) fn parse_minio_managed_sealed_key(
     };
 
     Ok(Some(ManagedSealedKey { iv, sealed_key }))
+}
+
+/// Whether a multipart session needs the customer key when it is created.
+///
+/// Object mode seals the session's object key under the customer key, so the key
+/// has to be present, and valid, at that point.
+pub(crate) const SESSION_KEY_NEEDS_CUSTOMER_KEY: bool = true;
+
+/// Derive a fresh object key from `external_key` and seal it under the same key.
+fn new_sealed_object_key(external_key: [u8; 32], sse_type: SSEType, bucket: &str, key: &str) -> Result<NewObjectKey, SseError> {
+    let object_key = derive_object_key(external_key)?;
+    let sealed_key = seal_object_key(object_key, external_key, sse_type, bucket, key)?;
+    Ok(NewObjectKey {
+        key_bytes: object_key,
+        base_nonce: [0; 12],
+        key_kind: EncryptionKeyKind::Object,
+        sealed_key: Some(sealed_key),
+    })
+}
+
+/// SSE-C object: an object key sealed under the customer key.
+pub(crate) fn new_key_under_customer_key(customer_key: [u8; 32], bucket: &str, key: &str) -> Result<NewObjectKey, SseError> {
+    new_sealed_object_key(customer_key, SSEType::SseC, bucket, key)
+}
+
+/// SSE-C multipart session: an object key sealed under the customer key.
+///
+/// A session created without its customer key has nothing to seal and records a
+/// placeholder instead.
+pub(crate) fn new_session_key_under_customer_key(
+    customer_key: Option<[u8; 32]>,
+    bucket: &str,
+    key: &str,
+) -> Result<NewObjectKey, SseError> {
+    match customer_key {
+        Some(customer_key) => new_sealed_object_key(customer_key, SSEType::SseC, bucket, key),
+        None => Ok(NewObjectKey {
+            key_bytes: [0; 32],
+            base_nonce: [0; 12],
+            key_kind: EncryptionKeyKind::Direct,
+            sealed_key: None,
+        }),
+    }
+}
+
+/// Managed SSE: an object key sealed under the data key.
+pub(crate) fn new_key_under_data_key(
+    data_key: &DataKey,
+    sse_type: SSEType,
+    bucket: &str,
+    key: &str,
+) -> Result<NewObjectKey, SseError> {
+    new_sealed_object_key(data_key.plaintext_key, sse_type, bucket, key)
 }

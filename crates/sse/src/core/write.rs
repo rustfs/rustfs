@@ -16,26 +16,24 @@
 
 use crate::core::audit::{envelope_master_key_version, record_managed_kms_outcome};
 use crate::core::keying::context::{build_object_encryption_context, reject_kms_context_location_override};
-use crate::core::keying::material::{EncryptionKeyKind, EncryptionMaterial};
-#[cfg(feature = "rio-v2")]
-use crate::core::keying::object::{derive_object_key, seal_object_key};
+use crate::core::keying::material::EncryptionMaterial;
+use crate::core::keying::{
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
+};
 use crate::core::request::SseKmsPrincipal;
 use crate::core::s3::authorization::authorize_sse_kms_key;
-use crate::core::s3::headers::validate_sse_headers_for_write;
 use crate::core::s3::scheme::{
-    DEFAULT_SSE_ALGORITHM, SseTypeV2, is_managed_sse, managed_sse_type, prepare_sse_configuration, prepare_sse_configuration_v2,
+    DEFAULT_SSE_ALGORITHM, WriteScheme, WriteSchemeHeaders, is_managed_sse, managed_sse_type, resolve_write_scheme,
 };
 use crate::core::s3::ssec::{SsecParams, ssec_invalid_request, validate_ssec_params, verify_ssec_key_match};
 use crate::error::SseError;
 use crate::host::SseHost;
 use crate::kms::provider::get_sse_dek_provider;
 use base64_simd::STANDARD as BASE64_STANDARD;
-#[cfg(not(feature = "rio-v2"))]
-use rand::Rng;
 use rustfs_kms::KmsUnavailableError;
 use rustfs_policy::policy::action::KmsAction;
 use rustfs_s3_types::S3ErrorCode;
-use rustfs_utils::http::headers::AMZ_ENCRYPTION_AES;
+use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
 use rustfs_utils::http::object_encryption_keys::SSEType;
 use std::collections::HashMap;
 
@@ -179,50 +177,45 @@ impl EncryptionRequest<'_> {
 /// }
 /// ```
 pub async fn sse_encryption(host: &dyn SseHost, request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, SseError> {
-    validate_sse_headers_for_write(
-        request.server_side_encryption.as_deref(),
-        request.ssekms_key_id.as_ref(),
-        request.ssekms_context.as_ref(),
-        request.sse_customer_algorithm.as_ref(),
-        request.sse_customer_key.as_ref(),
-        request.sse_customer_key_md5.as_ref(),
-        true,
-    )?;
+    let scheme = resolve_write_scheme(
+        host,
+        request.bucket,
+        WriteSchemeHeaders {
+            server_side_encryption: request.server_side_encryption,
+            ssekms_key_id: request.ssekms_key_id,
+            ssekms_context: request.ssekms_context.as_ref(),
+            sse_customer_algorithm: request.sse_customer_algorithm,
+            sse_customer_key: request.sse_customer_key,
+            sse_customer_key_md5: request.sse_customer_key_md5,
+        },
+    )
+    .await?;
 
-    // Priority 1: SSE-C (customer-provided key)
-    if let (Some(algorithm), Some(key), Some(key_md5)) =
-        (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
-    {
-        return apply_ssec_encryption_material(request.bucket, request.key, algorithm, key, key_md5, request.content_size)
-            .await
-            .map(Some);
-    }
+    let (server_side_encryption, kms_key_id) = match scheme {
+        None => return Ok(None),
+        Some(WriteScheme::SseC { algorithm, key, key_md5 }) => {
+            return apply_ssec_encryption_material(request.bucket, request.key, algorithm, key, key_md5, request.content_size)
+                .await
+                .map(Some);
+        }
+        Some(WriteScheme::SseS3) => (String::from(AMZ_ENCRYPTION_AES), None),
+        Some(WriteScheme::SseKms { key_id }) => (String::from(AMZ_ENCRYPTION_KMS), key_id),
+    };
 
-    // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
-    let sse_config =
-        prepare_sse_configuration(host, request.bucket, request.server_side_encryption, request.ssekms_key_id).await?;
-
-    if let Some(sse_config) = sse_config
-        && is_managed_sse(&sse_config.effective_sse)
-    {
-        return apply_managed_encryption_material(
-            host,
-            ManagedEncryptionRequest {
-                bucket: request.bucket,
-                key: request.key,
-                server_side_encryption: sse_config.effective_sse,
-                kms_key_id: sse_config.effective_kms_key_id,
-                ssekms_context: request.ssekms_context,
-                content_size: request.content_size,
-                principal: request.principal,
-            },
-        )
-        .await
-        .map(Some);
-    }
-
-    // No encryption requested
-    Ok(None)
+    apply_managed_encryption_material(
+        host,
+        ManagedEncryptionRequest {
+            bucket: request.bucket,
+            key: request.key,
+            server_side_encryption,
+            kms_key_id,
+            ssekms_context: request.ssekms_context,
+            content_size: request.content_size,
+            principal: request.principal,
+        },
+    )
+    .await
+    .map(Some)
 }
 
 /// **Core API**: Apply encryption based on request parameters
@@ -257,67 +250,46 @@ pub async fn sse_prepare_encryption(
     host: &dyn SseHost,
     request: PrepareEncryptionRequest<'_>,
 ) -> Result<Option<EncryptionMaterial>, SseError> {
-    validate_sse_headers_for_write(
-        request.server_side_encryption.as_deref(),
-        request.ssekms_key_id.as_ref(),
-        request.ssekms_context.as_ref(),
-        request.sse_customer_algorithm.as_ref(),
-        request.sse_customer_key.as_ref(),
-        request.sse_customer_key_md5.as_ref(),
-        true,
-    )?;
-
-    let sse_type = prepare_sse_configuration_v2(
+    let scheme = resolve_write_scheme(
         host,
         request.bucket,
-        request.server_side_encryption,
-        request.sse_customer_algorithm,
-        request.sse_customer_key.clone(),
-        request.sse_customer_key_md5,
-        request.ssekms_key_id,
+        WriteSchemeHeaders {
+            server_side_encryption: request.server_side_encryption,
+            ssekms_key_id: request.ssekms_key_id,
+            ssekms_context: request.ssekms_context.as_ref(),
+            sse_customer_algorithm: request.sse_customer_algorithm,
+            sse_customer_key: request.sse_customer_key,
+            sse_customer_key_md5: request.sse_customer_key_md5,
+        },
     )
     .await?;
 
-    // apply encryption material
-    let material = match sse_type {
-        Some(SseTypeV2::SseS3(sse)) => {
-            apply_managed_encryption_material(
-                host,
-                ManagedEncryptionRequest {
-                    bucket: request.bucket,
-                    key: request.key,
-                    server_side_encryption: sse,
-                    kms_key_id: None,
-                    ssekms_context: request.ssekms_context,
-                    content_size: 0,
-                    principal: request.principal,
-                },
-            )
-            .await?
-        }
-        Some(SseTypeV2::SseKms(sse, kms_key_id)) => {
-            apply_managed_encryption_material(
-                host,
-                ManagedEncryptionRequest {
-                    bucket: request.bucket,
-                    key: request.key,
-                    server_side_encryption: sse,
-                    kms_key_id,
-                    ssekms_context: request.ssekms_context,
-                    content_size: 0,
-                    principal: request.principal,
-                },
-            )
-            .await?
-        }
-        Some(SseTypeV2::SseC(algorithm, _, key_md5)) => {
-            apply_ssec_prepare_encryption_material(request.bucket, request.key, algorithm, request.sse_customer_key, key_md5)
-                .await?
-        }
+    let (server_side_encryption, kms_key_id) = match scheme {
         None => return Ok(None),
+        Some(WriteScheme::SseC { algorithm, key, key_md5 }) => {
+            return apply_ssec_prepare_encryption_material(request.bucket, request.key, algorithm, Some(key), key_md5)
+                .await
+                .map(Some);
+        }
+        Some(WriteScheme::SseS3) => (String::from(AMZ_ENCRYPTION_AES), None),
+        Some(WriteScheme::SseKms { key_id }) => (String::from(AMZ_ENCRYPTION_KMS), key_id),
     };
 
-    Ok(Some(material))
+    // A session records no plaintext size: the parts decide it.
+    apply_managed_encryption_material(
+        host,
+        ManagedEncryptionRequest {
+            bucket: request.bucket,
+            key: request.key,
+            server_side_encryption,
+            kms_key_id,
+            ssekms_context: request.ssekms_context,
+            content_size: 0,
+            principal: request.principal,
+        },
+    )
+    .await
+    .map(Some)
 }
 
 async fn apply_ssec_prepare_encryption_material(
@@ -327,47 +299,35 @@ async fn apply_ssec_prepare_encryption_material(
     sse_key: Option<String>,
     sse_key_md5: String,
 ) -> Result<EncryptionMaterial, SseError> {
-    #[cfg(feature = "rio-v2")]
-    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = if let Some(sse_key) = sse_key {
-        let validated = validate_ssec_params(SsecParams {
-            algorithm: algorithm.clone(),
-            key: sse_key,
-            key_md5: sse_key_md5.clone(),
-        })?;
-        let object_key = derive_object_key(validated.key_bytes)?;
-        let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
-        (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
-    } else {
-        ([0; 32], [0; 12], EncryptionKeyKind::Direct, None)
+    // The customer key is validated here only in a mode that seals the session's
+    // key under it. Otherwise it is validated per part, against what the session
+    // records.
+    let customer_key = match sse_key {
+        Some(sse_key) if SESSION_KEY_NEEDS_CUSTOMER_KEY => Some(
+            validate_ssec_params(SsecParams {
+                algorithm: algorithm.clone(),
+                key: sse_key,
+                key_md5: sse_key_md5.clone(),
+            })?
+            .key_bytes,
+        ),
+        _ => None,
     };
-
-    #[cfg(not(feature = "rio-v2"))]
-    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let _ = (bucket, key, sse_key);
-        // Generate a real random nonce for the multipart session and persist it (see
-        // `encryption_material_to_metadata`). Every part of this upload reads the same
-        // persisted nonce back via `apply_ssec_decryption_material`, so all parts share one
-        // nonce without reintroducing the deterministic (bucket, key) reuse hazard.
-        // key_bytes stays a placeholder here: it is neither used for encryption nor persisted;
-        // the real customer key is validated per part on upload.
-        let mut base_nonce = [0u8; 12];
-        rand::rng().fill_bytes(&mut base_nonce);
-        ([0; 32], base_nonce, EncryptionKeyKind::Direct, None)
-    };
+    let object_key = new_session_key_under_customer_key(customer_key, bucket, key)?;
 
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
         server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
         kms_key_id: None,
         algorithm,
-        key_bytes,
-        base_nonce,
+        key_bytes: object_key.key_bytes,
+        base_nonce: object_key.base_nonce,
         encrypted_data_key: None,
         customer_key_md5: Some(sse_key_md5),
         original_size: None,
-        key_kind,
+        key_kind: object_key.key_kind,
         managed_kms_context: None,
-        managed_sealed_key,
+        managed_sealed_key: object_key.sealed_key,
     })
 }
 
@@ -386,26 +346,7 @@ async fn apply_ssec_encryption_material(
     };
 
     let validated = validate_ssec_params(params)?;
-
-    #[cfg(feature = "rio-v2")]
-    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(validated.key_bytes)?;
-        let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
-        (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
-    };
-
-    #[cfg(not(feature = "rio-v2"))]
-    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        // Use a fresh random nonce per encryption. A deterministic nonce derived from
-        // (bucket, key) would repeat whenever the same object is overwritten under the same
-        // SSE-C key, reusing an identical (key, nonce) pair and catastrophically breaking
-        // AES-256-GCM. The nonce is persisted (see `encryption_material_to_metadata`) and read
-        // back on decrypt (see `apply_ssec_decryption_material`).
-        let _ = (bucket, key);
-        let mut base_nonce = [0u8; 12];
-        rand::rng().fill_bytes(&mut base_nonce);
-        (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct, None)
-    };
+    let object_key = new_key_under_customer_key(validated.key_bytes, bucket, key)?;
 
     // Build metadata
     Ok(EncryptionMaterial {
@@ -413,14 +354,14 @@ async fn apply_ssec_encryption_material(
         server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
         kms_key_id: None,
         algorithm: validated.algorithm,
-        key_bytes,
-        base_nonce,
+        key_bytes: object_key.key_bytes,
+        base_nonce: object_key.base_nonce,
         encrypted_data_key: None,
         customer_key_md5: Some(validated.key_md5),
         original_size: Some(content_size),
-        key_kind,
+        key_kind: object_key.key_kind,
         managed_kms_context: None,
-        managed_sealed_key,
+        managed_sealed_key: object_key.sealed_key,
     })
 }
 
@@ -568,30 +509,21 @@ pub(crate) async fn apply_managed_encryption_material_inner(
     let (data_key, encrypted_data_key) = provider.generate_sse_dek(&object_context, &kms_key_to_use).await?;
 
     let algorithm = server_side_encryption.as_str().to_string();
-    #[cfg(feature = "rio-v2")]
-    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(data_key.plaintext_key)?;
-        let sealed_key = seal_object_key(object_key, data_key.plaintext_key, encryption_type, bucket, key)?;
-        (object_key, [0u8; 12], EncryptionKeyKind::Object, Some(sealed_key))
-    };
-
-    #[cfg(not(feature = "rio-v2"))]
-    let (key_bytes, base_nonce, key_kind, managed_sealed_key) =
-        (data_key.plaintext_key, data_key.nonce, EncryptionKeyKind::Direct, None);
+    let object_key = new_key_under_data_key(&data_key, encryption_type, bucket, key)?;
 
     Ok(EncryptionMaterial {
         sse_type: encryption_type,
         server_side_encryption,
         kms_key_id: Some(kms_key_to_use),
         algorithm,
-        key_bytes,
-        base_nonce,
+        key_bytes: object_key.key_bytes,
+        base_nonce: object_key.base_nonce,
         encrypted_data_key: Some(encrypted_data_key),
         customer_key_md5: None,
         original_size: Some(content_size),
-        key_kind,
+        key_kind: object_key.key_kind,
         managed_kms_context: matches!(encryption_type, SSEType::SseKms).then_some(ssekms_context.unwrap_or_default()),
-        managed_sealed_key,
+        managed_sealed_key: object_key.sealed_key,
     })
 }
 

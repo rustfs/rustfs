@@ -1127,11 +1127,11 @@ fn native_material_debug_withholds_decryption_keys() {
 
 #[test]
 fn native_material_debug_withholds_customer_key() {
-    let material = crate::core::s3::scheme::SseTypeV2::SseC(
-        "AES256".to_owned(),
-        "fixture-key-must-stay-private".to_owned(),
-        "fixture-md5".to_owned(),
-    );
+    let material = crate::core::s3::scheme::WriteScheme::SseC {
+        algorithm: "AES256".to_owned(),
+        key: "fixture-key-must-stay-private".to_owned(),
+        key_md5: "fixture-md5".to_owned(),
+    };
     let diagnostic = format!("{material:?}");
     assert!(
         !diagnostic.contains("fixture-key-must-stay-private"),
