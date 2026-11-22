@@ -1614,20 +1614,20 @@ mod tests {
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();
-            let upload_id = usecase
-                .execute_create_multipart_upload_from_s3s(build_request(
-                    CreateMultipartUploadInput {
+            let created = usecase
+                .execute_create_multipart_upload(
+                    owned_envelope(Method::POST),
+                    super::super::CreateMultipartUploadFields::from_legacy(CreateMultipartUploadInput {
                         bucket: bucket.clone(),
                         key: key.to_string(),
                         ..Default::default()
-                    },
-                    Method::POST,
-                ))
+                    }),
+                    None,
+                )
                 .await
-                .expect("create KMS multipart upload")
-                .output
-                .upload_id
-                .expect("KMS upload id");
+                .expect("create KMS multipart upload");
+            let upload_id = created.upload_id;
+            assert!(!upload_id.is_empty(), "KMS upload id");
             let part = usecase
                 .execute_upload_part(build_request(
                     UploadPartInput {
