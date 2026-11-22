@@ -14,6 +14,7 @@
 use super::*;
 /// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
 use crate::data_usage_define::clone_cache_value;
+use rustfs_scanner_metrics::scan_observation::{ScannerBucketReuseKind, ScannerScanObservation};
 
 pub(super) async fn collect_completed_bucket_results(
     ctx: CancellationToken,
@@ -142,6 +143,32 @@ pub(super) struct PreparedScopedSetScan {
     pub(super) buckets: Vec<BucketInfo>,
     pub(super) cache: DataUsageCache,
     pub(super) cold_bucket_reuse_proof: Option<ScopedColdBucketReuseProof>,
+    cold_bucket_reuse_count: u64,
+    cold_bucket_reuse_elapsed: Duration,
+}
+
+impl PreparedScopedSetScan {
+    pub(super) fn record_cold_bucket_reuse(&self, observation: &ScannerScanObservation) {
+        observation.record_bucket_reuse(
+            ScannerBucketReuseKind::ScopedColdBucket,
+            self.cold_bucket_reuse_count,
+            self.cold_bucket_reuse_elapsed,
+        );
+    }
+}
+
+/// Counts only roots delivered to the collector; cancellation or channel failure is not reuse.
+pub(super) async fn send_current_cache_root_entry(
+    bucket_result_tx: &mpsc::Sender<DataUsageEntryInfo>,
+    root: DataUsageEntryInfo,
+    cache: &DataUsageCache,
+    pending_maintenance_work: &AtomicBool,
+    observation: &ScannerScanObservation,
+) -> std::result::Result<(), ScannerError> {
+    let started = Instant::now();
+    send_cache_root_entry(bucket_result_tx, root, cache, pending_maintenance_work).await?;
+    observation.record_bucket_reuse(ScannerBucketReuseKind::CurrentRoot, 1, started.elapsed());
+    Ok(())
 }
 
 pub(super) struct ScopedColdBucketReuseProof {
@@ -225,6 +252,8 @@ pub(super) fn prepare_scoped_set_scan(
     };
     cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
     let mut current_bucket_names = HashSet::with_capacity(all_buckets.len());
+    let mut cold_bucket_reuse_count = 0u64;
+    let mut cold_bucket_reuse_elapsed = Duration::ZERO;
     for bucket in all_buckets {
         if !current_bucket_names.insert(bucket.name.as_str()) {
             return None;
@@ -233,11 +262,14 @@ pub(super) fn prepare_scoped_set_scan(
             cache.info.scan_bucket_value_origins.remove(&bucket.name);
             cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
         } else {
+            let started = Instant::now();
             cache.copy_with_children(
                 old_cache,
                 &rustfs_data_usage::hash_path(&bucket.name),
                 &Some(rustfs_data_usage::hash_path(DATA_USAGE_ROOT)),
             );
+            cold_bucket_reuse_count = cold_bucket_reuse_count.saturating_add(1);
+            cold_bucket_reuse_elapsed = cold_bucket_reuse_elapsed.saturating_add(started.elapsed());
         }
     }
 
@@ -249,6 +281,8 @@ pub(super) fn prepare_scoped_set_scan(
             .collect(),
         cache,
         cold_bucket_reuse_proof,
+        cold_bucket_reuse_count,
+        cold_bucket_reuse_elapsed,
     })
 }
 
@@ -426,7 +460,10 @@ impl ScannerIOCache for SetDisks {
                 .ok_or_else(|| StorageError::other("scanner cache publication is blocked by data movement"))?,
         };
         let mut old_cache = DataUsageCache::default();
-        let initial_revisions = match old_cache.load_with_revisions(self.clone(), DATA_USAGE_CACHE_NAME).await {
+        let initial_revisions = match old_cache
+            .load_with_baseline_revisions(self.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+        {
             Ok(revisions) => Some(revisions),
             Err(e) => {
                 warn!(
@@ -556,6 +593,8 @@ impl ScannerIOCache for SetDisks {
                 })
         });
         let mut scoped_cache = scoped_scan.map(|mut prepared| {
+            // The copies are completed work even if this turn later fails publication.
+            prepared.record_cold_bucket_reuse(global_metrics().scan_observation());
             buckets = prepared.buckets;
             prepared.cache.info.scan_coverage_digest = Some(bucket_coverage_digest);
             prepared.cache
@@ -1603,8 +1642,14 @@ impl ScannerIOCache for SetDisks {
                             }
                             record_completed_usage_watch(&usage_watch_completions_clone, source, &bucket.name, bucket_usage_watch.as_ref()).await;
                             if let Err(e) =
-                                send_cache_root_entry(&bucket_result_tx_clone, *root, &cache, &pending_maintenance_work_clone)
-                                    .await
+                                send_current_cache_root_entry(
+                                    &bucket_result_tx_clone,
+                                    *root,
+                                    &cache,
+                                    &pending_maintenance_work_clone,
+                                    global_metrics().scan_observation(),
+                                )
+                                .await
                             {
                                 record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                                 error!(
