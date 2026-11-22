@@ -436,7 +436,9 @@ impl DefaultMultipartUsecase {
             bucket,
             key,
             upload_id,
-            server_side_encryption: effective_sse,
+            // `x-amz-server-side-encryption` names a managed algorithm; an SSE-C
+            // upload answers with its customer-key headers only.
+            server_side_encryption: effective_sse.filter(|_| sse_customer_algorithm.is_none()),
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id: effective_kms_key_id,
@@ -545,10 +547,17 @@ mod tests {
                 .object_lock_retain_until_date(date.map(Timestamp::from))
                 .build()
                 .expect("direct fixture DTO");
-            let error = make_usecase()
-                .execute_create_multipart_upload_from_s3s(build_request(input, Method::POST))
+            let error = match make_usecase()
+                .execute_create_multipart_upload(
+                    owned_envelope(Method::POST),
+                    CreateMultipartUploadFields::from_legacy(input),
+                    None,
+                )
                 .await
-                .expect_err("direct fixture does not create an upload");
+            {
+                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Ok(_) => panic!("direct fixture does not create an upload"),
+            };
             assert_eq!(
                 (error.code().as_str(), error.message()),
                 (expected.0, Some(expected.1)),
@@ -590,12 +599,13 @@ mod tests {
             .storage_class(Some(StorageClass::from("invalid".to_string())))
             .build()
             .unwrap();
-        let req = build_request(input, Method::POST);
-
-        let err = make_usecase()
-            .execute_create_multipart_upload_from_s3s(req)
+        let err = match make_usecase()
+            .execute_create_multipart_upload(owned_envelope(Method::POST), CreateMultipartUploadFields::from_legacy(input), None)
             .await
-            .unwrap_err();
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("invalid storage class must be rejected"),
+        };
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 

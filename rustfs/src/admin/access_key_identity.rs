@@ -240,10 +240,13 @@ pub(crate) async fn build_info_service_account_resp<T: IamStore>(
             if policy.version.is_empty() {
                 policy.version = DEFAULT_VERSION.to_owned();
             }
-            serde_json::to_string_pretty(&policy).map_err(|e| {
-                debug!("marshal policy failed, e: {:?}", e);
-                s3_error!(InternalError, "marshal policy failed")
-            })
+            policy
+                .to_export_value()
+                .and_then(|document| serde_json::to_string_pretty(&document))
+                .map_err(|e| {
+                    debug!("marshal policy failed, e: {:?}", e);
+                    s3_error!(InternalError, "marshal policy failed")
+                })
         })
         .transpose()?;
 
@@ -894,10 +897,10 @@ mod tests {
         assert_eq!(resp.open_id_specific_info.display_name.as_deref(), Some("RustFS User"));
         assert_eq!(resp.open_id_specific_info.display_name_claim.as_deref(), Some("name"));
         assert_eq!(resp.open_id_specific_info.config_name, None);
-        assert_eq!(
-            resp.info.policy,
-            Some("{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": []\n}".to_string())
-        );
+        let expected_policy = json!({"Version": "2012-10-17", "Statement": []});
+        let policy: serde_json::Value =
+            serde_json::from_str(resp.info.policy.as_deref().expect("STS policy is present")).expect("STS policy is JSON");
+        assert_eq!(policy, expected_policy);
 
         let body = serde_json::to_value(&resp).expect("serialize openid sts response");
         assert_eq!(body.get("userType").and_then(|v| v.as_str()), Some("STS"));
@@ -933,9 +936,12 @@ mod tests {
         assert_eq!(body.get("accountStatus").and_then(|v| v.as_str()), Some("on"));
         assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("OIDC STS"));
         assert_eq!(body.get("description").and_then(|v| v.as_str()), Some("openid derived temporary account"));
-        assert_eq!(
-            body.get("policy").and_then(|v| v.as_str()),
-            Some("{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": []\n}")
-        );
+        let policy: serde_json::Value = serde_json::from_str(
+            body.get("policy")
+                .and_then(|v| v.as_str())
+                .expect("STS response policy string"),
+        )
+        .expect("STS response policy is JSON");
+        assert_eq!(policy, expected_policy);
     }
 }

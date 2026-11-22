@@ -6418,15 +6418,12 @@ mod tests {
             assert_eq!(error.code(), &S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("HEAD validators")["etag"], format!("\"{etag}\""));
 
-            let req = build_request(
-                GetObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(object.to_owned())
-                    .build()
-                    .expect("GET input"),
-                Method::GET,
-            );
-            if let Ok(mut response) = usecase.execute_get_object_from_s3s(req).await {
+            let input = GetObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_owned())
+                .build()
+                .expect("GET input");
+            if let Ok(mut response) = crate::app::test_seams::get_object_method_only(&usecase, input).await {
                 let mut body = response.output.body.take().expect("body for damaged GET");
                 let mut failed = false;
                 while let Some(chunk) = body.next().await {
@@ -7715,8 +7712,7 @@ mod tests {
             assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
         }
 
-        let mut response = usecase
-            .execute_get_object_from_s3s(build_request(input, Method::GET))
+        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
             .await
             .expect("positive-control GET");
         let mut body = response.output.body.take().expect("body");
@@ -7791,13 +7787,11 @@ mod tests {
             .build()
             .expect("real cold-fill rejection GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            usecase.execute_get_object_from_s3s(build_request(input, Method::GET)),
-        )
-        .await
-        .expect("rejected real GET must not wait for a cold-fill session")
-        .expect_err("rejected real GET must return an S3 error");
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), crate::app::test_seams::get_object_method_only(&usecase, input))
+                .await
+                .expect("rejected real GET must not wait for a cold-fill session")
+                .expect_err("rejected real GET must return an S3 error");
         *COLD_FILL_READER_OPEN_PROBE
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -9970,8 +9964,7 @@ mod tests {
             .expect("resume failure-path GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let attempts_before = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed);
-        let mut response = usecase
-            .execute_get_object_from_s3s(build_request(input, Method::GET))
+        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
             .await
             .expect("the GET commits a response; the body fails mid-stream");
         let mut response_body = response.output.body.take().expect("GET response must include a body");
@@ -10063,8 +10056,7 @@ mod tests {
             .build()
             .expect("multi-pool resume GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let mut response = usecase
-            .execute_get_object_from_s3s(build_request(input, Method::GET))
+        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
             .await
             .expect("multi-pool GET must commit its response");
         let mut response_body = response
@@ -12243,18 +12235,23 @@ mod tests {
                 ..Default::default()
             };
 
-            let input = GetObjectInput::builder()
-                .bucket("test-bucket".to_string())
-                .key("path/raw".to_string())
-                .build()
-                .unwrap();
-            let req = build_request(input, Method::GET);
+            let envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::GET,
+                    uri: http::Uri::from_static("/"),
+                    headers: HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                http::Extensions::new(),
+            );
             let usecase = DefaultObjectUsecase::without_context();
             let queue_status = concurrency::IoQueueStatus::default();
 
             let context = usecase
                 .build_get_object_output_context(
-                    &RequestEnvelope::from_s3s(&req),
+                    &envelope,
                     #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
                     None,
                     get_concurrency_manager(),
@@ -12325,10 +12322,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
+        let err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -12406,10 +12404,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
+        let err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }

@@ -27,6 +27,7 @@ mod hybrid;
 mod layer;
 mod legacy_compat;
 mod module_switch;
+mod post_object_location;
 mod prefix;
 pub mod rate_limit;
 mod readiness;
