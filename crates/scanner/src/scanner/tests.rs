@@ -4682,15 +4682,40 @@ fn scanner_startup_treats_incomplete_usage_snapshot_as_cold() {
     legacy.usage_snapshot_complete = false;
 
     assert!(data_usage_info_is_cold(&legacy));
-    assert!(!data_usage_info_is_cold(&complete_usage_with_bucket_count(
-        Some(std::time::SystemTime::now()),
-        1,
-    )));
+    let mut certified = complete_usage_with_bucket_count(Some(std::time::SystemTime::now()), 1);
+    certified
+        .buckets_usage
+        .get_mut("bucket-0")
+        .expect("test bucket should be present")
+        .bucket_incarnation = Some(Uuid::from_u128(1).to_string());
+    assert!(!data_usage_info_is_cold(&certified));
     assert!(!data_usage_info_is_cold(&DataUsageInfo {
         last_update: Some(std::time::SystemTime::now()),
         usage_snapshot_complete: true,
         ..Default::default()
     }));
+}
+
+#[test]
+fn scanner_startup_treats_legacy_bucket_identity_as_cold() {
+    let legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::now()), 1);
+    assert!(data_usage_info_is_cold(&legacy));
+    assert!(usage_cache_needs_prompt_scan(&legacy, None));
+
+    let mut invalid = legacy.clone();
+    invalid
+        .buckets_usage
+        .get_mut("bucket-0")
+        .expect("test bucket should be present")
+        .bucket_incarnation = Some("not-a-uuid".to_owned());
+    assert!(data_usage_info_is_cold(&invalid));
+
+    let mut nil = legacy;
+    nil.buckets_usage
+        .get_mut("bucket-0")
+        .expect("test bucket should be present")
+        .bucket_incarnation = Some(Uuid::nil().to_string());
+    assert!(data_usage_info_is_cold(&nil));
 }
 
 #[test]

@@ -653,7 +653,20 @@ where
 }
 
 fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
-    !info.is_complete_bucket_usage_snapshot()
+    if !info.is_complete_bucket_usage_snapshot() {
+        return true;
+    }
+
+    // A complete snapshot from before bucket incarnations were persisted is
+    // readable, but it is not safe to reuse after a cold restart. The admin
+    // projection intentionally drops those values when it cannot bind them
+    // to the current storage identity, so force a scan to recertify them.
+    info.buckets_usage.values().any(|usage| {
+        usage
+            .bucket_incarnation
+            .as_deref()
+            .is_none_or(|incarnation| Uuid::parse_str(incarnation).map_or(true, |id| id.is_nil()))
+    })
 }
 
 pub(super) fn data_usage_info_has_persisted_baseline_identity(info: &DataUsageInfo) -> bool {
