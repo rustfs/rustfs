@@ -983,10 +983,13 @@ mod tests {
             .build()
             .expect("upload part input should build");
 
-        let err = usecase
-            .execute_upload_part(build_request(input, Method::PUT))
+        let err = match usecase
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
-            .expect_err("full foreground write admission should reject before body ingest");
+        {
+            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Ok(_) => panic!("full foreground write admission should reject before body ingest"),
+        };
         assert_eq!(err.code(), &LegacyErrorCode::SlowDown);
         drop(held);
     }
