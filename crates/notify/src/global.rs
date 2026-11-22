@@ -77,7 +77,18 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
 
     let task_system = system.clone();
     tokio::spawn(async move {
-        let result = task_system.set_targets_enabled(true, Some(config)).await;
+        // The one-shot API keeps its strict contract: report an activation that
+        // left quarantined targets so the caller can retry with a fixed config.
+        // The reconciliation path quarantines instead and stays admin-usable.
+        let result = task_system.set_targets_enabled(true, Some(config)).await.and_then(|()| {
+            if task_system.runtime_lifecycle_all_targets_activated() {
+                Ok(())
+            } else {
+                Err(NotificationError::Initialization(
+                    "one or more notification targets failed to activate".to_string(),
+                ))
+            }
+        });
         let mut legacy = LEGACY_INITIALIZATION.lock().unwrap_or_else(|err| err.into_inner());
         if matches!(
             legacy.as_ref(),

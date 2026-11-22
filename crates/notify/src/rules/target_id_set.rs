@@ -14,9 +14,13 @@
 
 use hashbrown::HashSet;
 use rustfs_targets::arn::TargetID;
+use std::sync::Arc;
 
 /// TargetIDSet - A collection representation of TargetID.
-pub type TargetIdSet = HashSet<TargetID>;
+///
+/// Shared by `Arc` so matching an object key collects reference-count bumps
+/// instead of cloning the two Strings inside every `TargetID`.
+pub type TargetIdSet = HashSet<Arc<TargetID>>;
 
 // HashSet has built-in clone, union, difference and other operations.
 // But the Go version of the method returns a new Set, and the HashSet method is usually iterator or modify itself.

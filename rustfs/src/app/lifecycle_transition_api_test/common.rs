@@ -15,6 +15,8 @@
 //! Shared fixtures for the lifecycle integration tests; owned by no operation batch.
 
 use super::*;
+use crate::app::object_usecase::PutObjectWriteInput;
+use rustfs_gateway_stream::Body;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 
@@ -268,6 +270,30 @@ pub(super) async fn wait_for_delete_marker(ecstore: &Arc<ECStore>, bucket: &str,
     }
 }
 
+pub(super) fn put_input(bucket: &str, key: &str, body: Bytes) -> PutObjectWriteInput {
+    PutObjectWriteInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        content_length: Some(body.len() as i64),
+        body: Some(Body::from_bytes(body)),
+        ..Default::default()
+    }
+}
+
+pub(super) fn request_envelope(method: Method, headers: HeaderMap) -> crate::app::RequestEnvelope {
+    crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method,
+            uri: Uri::from_static("/"),
+            headers,
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        Extensions::new(),
+    )
+}
+
 pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     S3Request {
         input,
@@ -280,11 +306,6 @@ pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         service: None,
         trailing_headers: None,
     }
-}
-
-pub(super) fn streaming_blob_from_bytes(data: &[u8]) -> StreamingBlob {
-    let body = Bytes::copy_from_slice(data);
-    StreamingBlob::wrap::<_, Infallible>(stream::once(async move { Ok(body) }))
 }
 
 pub(super) async fn read_object_bytes(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> Vec<u8> {

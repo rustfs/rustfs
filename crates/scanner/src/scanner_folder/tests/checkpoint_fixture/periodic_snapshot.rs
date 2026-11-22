@@ -820,6 +820,11 @@ async fn periodic_nested_snapshot_adoption_records_checkpoint_used_on_real_scan_
         .await
         .expect("create the real cached subtree directory");
     let (mut cache, _) = bound_checkpoint();
+    cache.info.scan_directory_source = Some(
+        directory_cursor::physical_source(&scanner.local_disk)
+            .await
+            .expect("fixture disk source"),
+    );
     cache.info.skip_healing = true;
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -854,6 +859,80 @@ async fn periodic_nested_snapshot_adoption_records_checkpoint_used_on_real_scan_
     );
     assert_eq!(budget.progress().1, 1, "adoption must avoid entering the completed subtree");
     assert_eq!(budget.reason(), None);
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_compacted_checkpoint_survives_a_crash_inside_the_first_quantum() {
+    use super::super::{enumeration_restart::seed_flat_bucket, fair_prefix_quantum::run_until_finished};
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    // seed_flat_bucket creates its directory; retain the allocated native
+    // disk and initialize this already-created bucket in the same shape.
+    let template = tempfile::tempdir().expect("fixture directory");
+    let cache = seed_flat_bucket(&template.path().join("initial"), 0).await;
+    for index in 0..40 {
+        write_checkpoint_object(&root, &format!("object-{index:04}"), &[(Some(Uuid::from_u128(index + 1)), 3)]).await;
+    }
+    prepare_scanner(&mut scanner, cache);
+    let (tx, mut rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(tx);
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL - 1;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("checkpoint interval");
+    let ctx = CancellationToken::new();
+    scanner.budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, Default::default());
+    let mut entry = DataUsageEntry::default();
+    super::super::super::TEST_FORCE_COMPACTION_WIDTH
+        .scope(16, async {
+            let checkpoint = {
+                let scan = scanner.scan_folder(
+                    ctx.clone(),
+                    CachedFolder {
+                        name: "bucket".to_owned(),
+                        parent: None,
+                        object_heal_prob_div: 1,
+                    },
+                    &mut entry,
+                );
+                tokio::pin!(scan);
+                tokio::select! {
+                    checkpoint=rx.recv()=>checkpoint.expect("compacted owner emitted a periodic checkpoint"),
+                    result=&mut scan=>panic!("scan returned before it checkpointed a completed compacted child: {result:?}"),
+                }
+            };
+            assert!(!ctx.is_cancelled());
+            assert!(!checkpoint.info.snapshot_complete);
+            assert!(
+                checkpoint
+                    .info
+                    .scan_directory_work
+                    .iter()
+                    .any(|receipt| receipt.progress(&checkpoint.info).is_some())
+            );
+            let total = checkpoint.checked_flatten("bucket").expect("connected partial root");
+            assert!((1..40).contains(&total.objects));
+            assert_eq!(total.size, total.objects * 3);
+            let bytes = checkpoint.marshal_msg().expect("persist running checkpoint");
+            drop(scanner);
+            let durable = DataUsageCache::unmarshal(&bytes).expect("reload checkpoint after crash");
+            let resumed = run_until_finished(
+                &root,
+                durable,
+                ScannerCycleBudgetConfig {
+                    max_objects: Some(6),
+                    ..Default::default()
+                },
+                12,
+            )
+            .await;
+            let complete = resumed.checked_flatten("bucket").expect("restarted compacted root");
+            assert_eq!((complete.objects, complete.size, complete.versions), (40, 120, 40));
+        })
+        .await;
 }
 
 #[tokio::test]

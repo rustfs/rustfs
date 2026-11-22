@@ -1102,6 +1102,22 @@ struct RenameAdmissionGrant {
     batch: bool,
 }
 
+struct QuarantinedRenamePermit {
+    permit: Option<OwnedSemaphorePermit>,
+    batch: bool,
+    items: usize,
+}
+
+impl Drop for QuarantinedRenamePermit {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        drop(permit);
+        rustfs_io_metrics::record_ecstore_rename_quarantine_released(self.batch, self.items);
+    }
+}
+
 impl RenameAdmissionGrant {
     fn release_one(&mut self) -> bool {
         self.permit.as_mut().is_some_and(|permit| permit.split(1).is_some())
@@ -1111,7 +1127,7 @@ impl RenameAdmissionGrant {
         drop(self.permit.take());
     }
 
-    fn quarantine_until(mut self, deadline: tokio::time::Instant) {
+    fn quarantine_after_ambiguity(mut self) {
         let Some(permit) = self.permit.take() else {
             return;
         };
@@ -1119,19 +1135,26 @@ impl RenameAdmissionGrant {
         if items == 0 {
             return;
         }
-        let hold = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // The RPC deadline has already expired when timeout ambiguity is
+        // detected. Hold admission for another operation timeout so detached
+        // server-side disk work cannot immediately be replaced by new work.
+        let hold = get_max_timeout_duration();
+        let release_at = tokio::time::Instant::now() + hold;
         rustfs_io_metrics::record_ecstore_rename_quarantine(self.batch, items, hold);
-        let batch = self.batch;
+        let permit = QuarantinedRenamePermit {
+            permit: Some(permit),
+            batch: self.batch,
+            items,
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                tokio::time::sleep_until(deadline).await;
+                tokio::time::sleep_until(release_at).await;
                 drop(permit);
-                rustfs_io_metrics::record_ecstore_rename_quarantine_released(batch, items);
             });
         } else {
             // Without a runtime there is no safe deadline task. Leaking until
             // process exit is safer than admitting work over a still-running mutation.
-            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(batch, items);
+            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(self.batch, items);
             std::mem::forget(permit);
         }
     }
@@ -1187,7 +1210,7 @@ impl Drop for RenameBatchCallGuard {
         if self.dispatch_state == RenameAdmissionDispatchState::MayHavePublished
             && let Some(admission) = self.admission.take()
         {
-            admission.quarantine_until(self.deadline);
+            admission.quarantine_after_ambiguity();
         }
     }
 }
@@ -1228,7 +1251,7 @@ impl RemoteRenameBatchStream {
         }
         self.terminal = true;
         if let Some(admission) = self.admission.take() {
-            admission.quarantine_until(self.deadline);
+            admission.quarantine_after_ambiguity();
         }
         error
     }
@@ -1302,7 +1325,7 @@ impl Drop for RemoteRenameBatchStream {
             rustfs_io_metrics::record_ecstore_rename_batch_terminal_missing(missing);
         }
         if let Some(admission) = self.admission.take() {
-            admission.quarantine_until(self.deadline);
+            admission.quarantine_after_ambiguity();
         }
     }
 }
@@ -2816,7 +2839,12 @@ impl RemoteDisk {
         {
             Ok(Ok(permit)) => (Ok(permit), false),
             Ok(Err(_)) => (Err(Error::RemoteClientUnavailable("internode rename admission closed".to_owned())), false),
-            Err(_) => (Err(DiskError::DiskOngoingReq), true),
+            Err(_) => {
+                if started.is_none() {
+                    rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, Duration::ZERO, true);
+                }
+                (Err(DiskError::DiskOngoingReq), true)
+            }
         };
         if let Some(started) = started {
             rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, started.elapsed(), timed_out);
@@ -2883,7 +2911,11 @@ fn encode_delete_options_msgpack(value: &DeleteOptions) -> Result<Vec<u8>> {
 }
 
 fn encode_file_info_msgpack(value: &FileInfo) -> Result<Vec<u8>> {
-    encode_msgpack_with_capacity(value, FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
+    // Inline shards dominate the encoded payload. Reserving their known size
+    // avoids repeated growth while retaining the bounded base hint for metadata.
+    let inline_bytes = value.data.as_ref().map_or(0, Bytes::len);
+    let capacity = FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT.saturating_add(inline_bytes);
+    encode_msgpack_with_capacity(value, capacity)
 }
 
 fn encode_file_info_versions_msgpack(value: &FileInfoVersions) -> Result<Vec<u8>> {
@@ -6599,7 +6631,9 @@ mod tests {
         );
         assert_eq!(
             remote
-                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Probe {})
+                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Inspect {
+                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                })
                 .await,
             Err(DiskError::UnsupportedDisk),
         );
@@ -6610,7 +6644,7 @@ mod tests {
                 "/node_service.NodeService/UndoPoolMetaWrite",
                 "/node_service.NodeService/PoolMetaNativeRecovery"
             ],
-            "protected mutations and capability probes must never fall back to legacy RPCs",
+            "protected mutations and native inspection must never fall back to legacy RPCs",
         );
         peer.stop().await;
     }
@@ -8151,6 +8185,38 @@ mod tests {
             named_msgpack.len(),
             json.len()
         );
+    }
+
+    #[test]
+    fn rename_data_inline_file_info_msgpack_reserves_known_payloads() {
+        for (object_size, inline_len) in [(32 * 1024, 2_763), (100 * 1024, 8_566), (12 * (32 * 1024 - 32), 32 * 1024)] {
+            let mut file_info = sample_rename_data_file_info();
+            file_info.size = object_size;
+            file_info.erasure.data_blocks = 12;
+            file_info.erasure.parity_blocks = 4;
+            file_info.erasure.distribution = (1..=16).collect();
+            file_info.data = Some(Bytes::from(vec![0x5a; inline_len]));
+
+            let fixed_hint = encode_msgpack_with_capacity(&file_info, FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
+                .expect("fixed-hint inline file info should encode");
+            assert!(
+                fixed_hint.capacity() > Vec::<u8>::with_capacity(FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT).capacity(),
+                "the fixed hint must grow for the representative inline shard"
+            );
+            let encoded = encode_file_info_msgpack(&file_info).expect("inline file info should encode");
+            let reserved = FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT + inline_len;
+            assert!(
+                encoded.len() <= reserved,
+                "the payload-aware capacity must cover a representative inline shard"
+            );
+            assert_eq!(
+                encoded.capacity(),
+                Vec::<u8>::with_capacity(reserved).capacity(),
+                "encoding the inline shard must not grow the initial buffer"
+            );
+            let decoded: FileInfo = rmp_serde::from_slice(&encoded).expect("inline file info should decode");
+            assert_eq!(decoded, file_info);
+        }
     }
 
     #[test]
@@ -13474,26 +13540,145 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn rename_admission_quarantine_holds_until_absolute_deadline() {
+    #[serial_test::serial(rename_admission_metrics)]
+    async fn rename_admission_timeout_is_visible_without_stage_metrics() {
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+            let disk = remote_disk_for_addr("http://127.0.0.1:59989").await;
+            let gate = Arc::clone(disk.rename_admission.as_ref().expect("configured rename admission"));
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+            let admission = disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("available admission succeeds")
+                .expect("rename admission is enabled");
+            drop(admission);
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                0
+            );
+
+            let held = Arc::clone(&gate)
+                .acquire_many_owned(
+                    u32::try_from(rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT)
+                        .expect("rename admission limit fits u32"),
+                )
+                .await
+                .expect("hold every rename admission permit");
+            let error = match disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("exhausted admission must time out"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DiskError::DiskOngoingReq));
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                1
+            );
+
+            drop(held);
+            gate.close();
+            let error = match disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("closed admission must fail without a timeout"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DiskError::RemoteClientUnavailable(_)));
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                1
+            );
+            disk.cancel_token.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_admission_quarantine_holds_after_ambiguity() {
         let gate = peer_rename_admission("http://rename-quarantine-peer", true).expect("enabled rename gate");
         let permit = Arc::clone(&gate)
             .acquire_many_owned(4)
             .await
             .expect("weighted batch admission");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         RenameAdmissionGrant {
             permit: Some(permit),
             batch: true,
         }
-        .quarantine_until(deadline);
+        .quarantine_after_ambiguity();
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
 
-        tokio::time::advance(Duration::from_millis(999)).await;
+        let hold = get_max_timeout_duration();
+        assert!(!hold.is_zero(), "the test requires a bounded positive ambiguity hold");
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
-        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_nanos(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[test]
+    fn rename_admission_quarantine_metrics_release_when_runtime_stops() {
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let gate = peer_rename_admission("http://rename-quarantine-runtime-stop-peer", true).expect("enabled rename gate");
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("quarantine runtime");
+            runtime.block_on(async {
+                let permit = Arc::clone(&gate)
+                    .acquire_many_owned(4)
+                    .await
+                    .expect("weighted batch admission");
+                RenameAdmissionGrant {
+                    permit: Some(permit),
+                    batch: true,
+                }
+                .quarantine_after_ambiguity();
+                assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+            });
+            drop(runtime);
+        });
+
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+        let rows = snapshotter.snapshot().into_vec();
+        let metric_value = |name: &str, kind: MetricKind| {
+            &rows
+                .iter()
+                .find(|(composite, _, _, _)| {
+                    composite.kind() == kind
+                        && composite.key().name() == name
+                        && composite
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "mode" && label.value() == "batch")
+                })
+                .unwrap_or_else(|| panic!("missing batch quarantine metric {name}"))
+                .3
+        };
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_events_total", MetricKind::Counter),
+            DebugValue::Counter(1)
+        ));
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_released_items_total", MetricKind::Counter),
+            DebugValue::Counter(4)
+        ));
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_active_items", MetricKind::Gauge),
+            DebugValue::Gauge(value) if value.into_inner() == 0.0
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -13523,7 +13708,7 @@ mod tests {
         guard.mark_dispatched();
         drop(guard);
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(get_max_timeout_duration()).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
 
@@ -13541,6 +13726,123 @@ mod tests {
         };
         guard.mark_dispatched();
         guard.release_without_quarantine();
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_call_guard_timeout_starts_a_fresh_ambiguity_hold() {
+        let gate = peer_rename_admission("http://rename-expired-call-guard-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("dispatched permits");
+        let mut guard = RenameBatchCallGuard {
+            admission: Some(RenameAdmissionGrant {
+                permit: Some(permit),
+                batch: true,
+            }),
+            deadline: tokio::time::Instant::now(),
+            dispatch_state: RenameAdmissionDispatchState::NotDispatched,
+        };
+        guard.mark_dispatched();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_permits(),
+            rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4,
+            "an RPC timeout must not immediately readmit work over detached mutations"
+        );
+
+        let hold = get_max_timeout_duration();
+        assert!(!hold.is_zero(), "the test requires a bounded positive ambiguity hold");
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_batch_stream_incomplete_eof_quarantines_only_missing_items() {
+        use tonic::codec::Codec;
+
+        let gate = peer_rename_admission("http://rename-incomplete-stream-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("batch permits");
+        let mut admission = RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: true,
+        };
+        assert!(admission.release_one(), "the completed first item releases its permit");
+        let mut codec = tonic_prost::ProstCodec::<RenameDataBatchResult, RenameDataBatchResult>::default();
+        let inner = Streaming::new_empty(codec.decoder(), http_body_util::Empty::<Bytes>::new());
+        let mut stream = RemoteRenameBatchStream {
+            inner,
+            expected_mask: 0b1111,
+            seen_mask: 0b0001,
+            admission: Some(admission),
+            deadline: tokio::time::Instant::now(),
+            terminal: false,
+            stream_started_at: None,
+            first_item_at: None,
+        };
+
+        let error = match stream.next_outcome().await {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete EOF must be commit-ambiguous"),
+        };
+        assert!(matches!(error, DiskError::Unexpected));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_permits(),
+            rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+            "only the three missing item permits remain quarantined"
+        );
+
+        let hold = get_max_timeout_duration();
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_batch_stream_drop_quarantines_only_missing_items() {
+        use tonic::codec::Codec;
+
+        let gate = peer_rename_admission("http://rename-dropped-stream-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("batch permits");
+        let mut admission = RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: true,
+        };
+        assert!(admission.release_one(), "the completed first item releases its permit");
+        let mut codec = tonic_prost::ProstCodec::<RenameDataBatchResult, RenameDataBatchResult>::default();
+        let inner = Streaming::new_empty(codec.decoder(), http_body_util::Empty::<Bytes>::new());
+        let stream = RemoteRenameBatchStream {
+            inner,
+            expected_mask: 0b1111,
+            seen_mask: 0b0001,
+            admission: Some(admission),
+            deadline: tokio::time::Instant::now(),
+            terminal: false,
+            stream_started_at: None,
+            first_item_at: None,
+        };
+
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_permits(),
+            rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+            "dropping an active stream quarantines only the three missing item permits"
+        );
+
+        let hold = get_max_timeout_duration();
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
     }
 

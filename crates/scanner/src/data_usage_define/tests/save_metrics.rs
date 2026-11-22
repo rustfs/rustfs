@@ -88,6 +88,7 @@ async fn check_save(store: BackupFallbackStore, revisions: Option<DataUsageCache
 fn revisions(backup: bool) -> DataUsageCacheRevisions {
     DataUsageCacheRevisions {
         main: DataUsageCacheRevision::Missing,
+        damaged_pages: DamagedPages::default(),
         backup: backup.then_some(DataUsageCacheRevision::Missing),
     }
 }

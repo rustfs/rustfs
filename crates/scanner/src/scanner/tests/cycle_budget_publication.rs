@@ -253,6 +253,9 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
     .await;
     assert!(matches!(outcome, ScannerCycleOutcome::Partial));
     assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
+    let report = global_metrics().report().await;
+    assert_eq!(report.last_cycle_partial_reason, "objects");
+    assert_eq!(report.last_cycle_partial_stage.as_deref(), Some("object_budget"));
     assert!(budget.progress().0 > 0);
     assert!(budget.cycle_state_persisted());
     assert_eq!(cycle.next, 353);
@@ -410,6 +413,16 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
                 super::cycle_persist_failure::fail_saves(1, false, SCANNER_PERSIST_CAS_RETRIES + 1)
             }
         });
+        use tracing::instrument::WithSubscriber as _;
+        let error_log = tempfile::NamedTempFile::new().expect("error log");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(error_log.reopen().expect("error log writer"))
+            .finish();
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let tail_outcome = run_data_scanner_cycle_with_budget(
             &ctx,
             &store,
@@ -423,7 +436,23 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
                 scope_fallback: None,
             },
         )
+        .with_subscriber(subscriber)
         .await;
+        let error_events = std::fs::read_to_string(error_log.path()).expect("read error log");
+        let event = error_events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON error event"))
+            .find(|event| event["fields"]["state"] == "incomplete" && event["fields"]["cycle"] == 353)
+            .expect("unbudgeted incomplete observation should be visible at error level");
+        assert_eq!(event["fields"]["leader_epoch"], 1);
+        assert_eq!(event["fields"]["partial_stage"], "mixed_plan_recertification_pending");
+        let report = global_metrics().report().await;
+        assert_eq!(report.last_cycle_partial_reason, "unknown");
+        if fail_cycle_save == Some(false) {
+            assert_eq!(report.last_cycle_partial_stage.as_deref(), Some("cycle_state_not_durable"));
+        } else {
+            assert_eq!(report.last_cycle_partial_stage.as_deref(), Some("mixed_plan_recertification_pending"));
+        }
         assert!(!tail_budget.budget_elapsed(), "this is not the budget-exhaustion fast path");
         checkpoint.load(set, &cache_name).await.expect("reload the saved mixed tail");
         assert!(!checkpoint.info.snapshot_complete);
@@ -525,6 +554,22 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
     }
     global_metrics().set_cycle(None).await;
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+fn partial_diagnostics_keep_the_activity_fence_distinct_from_checkpoint_progress() {
+    let observation =
+        ScannerCycleResult::new(ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable), None)
+            .with_usage_update_emitted(true);
+    assert_eq!(
+        partial_cycle_diagnostic(&observation),
+        ("activity_unverified_observation", "activity_baseline_unverified")
+    );
+    let checkpoint = ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_partial_bucket_progress(true);
+    assert_eq!(
+        partial_cycle_diagnostic(&checkpoint),
+        ("saved_bucket_progress", "bucket_checkpoint_saved")
+    );
 }
 
 #[test]

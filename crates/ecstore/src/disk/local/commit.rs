@@ -744,7 +744,7 @@ impl LocalDisk {
             }
         }
         if dst_volume == crate::disk::RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(dst_volume, dst_path);
         }
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
@@ -982,18 +982,26 @@ impl LocalDisk {
                         Box::new(fi_moved),
                     ));
                 }
+                let version_id = fi_moved.version_id.unwrap_or_default();
                 let mut xlmeta = FileMeta::new();
                 let mut dst_meta_unparsable = false;
                 if let Some(ref old_file) = old_destination_file {
                     if FileMeta::is_xl2_v1_format(&old_file.bytes)
-                        && let Ok(nmeta) = FileMeta::load(&old_file.bytes)
+                        && let Ok((mut nmeta, old_inline_buf)) = FileMeta::load_with_borrowed_inline_data(&old_file.bytes)
                     {
+                        if !old_inline_buf.is_empty()
+                            && nmeta
+                                .versions
+                                .iter()
+                                .any(|v| v.header.version_id.unwrap_or_default() != version_id)
+                        {
+                            nmeta.data.update(old_inline_buf);
+                        }
                         xlmeta = nmeta;
                     } else {
                         dst_meta_unparsable = true;
                     }
                 }
-                let version_id = fi_moved.version_id.unwrap_or_default();
                 let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
                 let rollback_data_dir = has_old_data_dir.or_else(|| {
                     if old_destination_file.is_some() && xlmeta.find_version(Some(version_id)).is_ok() {

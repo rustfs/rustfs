@@ -74,6 +74,7 @@ jiff = { workspace = true, features = ["serde"] }
 percent-encoding = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+uuid = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 starshard = { workspace = true, features = ["rayon", "async", "serde"] }
 thiserror = { workspace = true }

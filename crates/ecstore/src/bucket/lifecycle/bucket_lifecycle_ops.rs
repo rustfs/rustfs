@@ -117,9 +117,9 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
-const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
+pub(super) const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+pub(super) const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+pub(super) const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
 const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_compensation";
 const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
 const METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL: &str = "rustfs_stale_multipart_cleanup_blocked_total";
@@ -1566,7 +1566,12 @@ pub(super) async fn enqueue_recovered_free_version_with_cancel(
     queued
 }
 
+type TransitionKey = (Option<Uuid>, String, String, String);
+
 struct TransitionTask {
+    // Captured with the source object; recovery without this provenance must
+    // never bind notification authority from the bucket name at execution.
+    notification_bucket_incarnation: Option<Uuid>,
     obj_info: ObjectInfo,
     src: LcEventSrc,
     event: lifecycle::Event,
@@ -1606,12 +1611,12 @@ pub struct TransitionState {
     compensation_scheduled_tasks: AtomicI64,
     compensation_running_tasks: AtomicI64,
     compensation_buckets: Arc<Mutex<HashSet<String>>>,
-    // (bucket, object, version) currently queued or being transitioned. A single
+    // (incarnation, bucket, object, version) currently queued or being transitioned. A single
     // PUT can enqueue the same object twice (immediate transition + startup
     // compensation backfill); without this guard the duplicates run concurrently,
     // and the loser races the winner's source cleanup — reading data the winner
     // already removed and logging a spurious NotFound failure (rustfs/backlog#1268).
-    in_flight_transitions: Arc<Mutex<HashSet<(String, String, String)>>>,
+    in_flight_transitions: Arc<Mutex<HashSet<TransitionKey>>>,
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
 }
 
@@ -1677,28 +1682,29 @@ impl TransitionState {
         })
     }
 
-    fn transition_key(oi: &ObjectInfo) -> (String, String, String) {
+    fn transition_key(oi: &ObjectInfo, incarnation: Option<Uuid>) -> TransitionKey {
         (
+            incarnation,
             oi.bucket.clone(),
             oi.name.clone(),
             oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
         )
     }
 
-    /// Try to claim a transition for this exact (bucket, object, version). Returns
+    /// Try to claim a transition for this exact (incarnation, bucket, object, version). Returns
     /// `false` when one is already queued or running, so the caller can skip the
     /// duplicate enqueue (rustfs/backlog#1268). The claim is released in the
     /// worker once the transition finishes, or here if the enqueue fails.
-    fn reserve_transition(&self, oi: &ObjectInfo) -> bool {
-        let key = Self::transition_key(oi);
+    fn reserve_transition(&self, oi: &ObjectInfo, incarnation: Option<Uuid>) -> bool {
+        let key = Self::transition_key(oi, incarnation);
         match self.in_flight_transitions.lock() {
             Ok(mut set) => set.insert(key),
             Err(poisoned) => poisoned.into_inner().insert(key),
         }
     }
 
-    fn release_transition(&self, oi: &ObjectInfo) {
-        let key = Self::transition_key(oi);
+    fn release_transition(&self, oi: &ObjectInfo, incarnation: Option<Uuid>) {
+        let key = Self::transition_key(oi, incarnation);
         match self.in_flight_transitions.lock() {
             Ok(mut set) => set.remove(&key),
             Err(poisoned) => poisoned.into_inner().remove(&key),
@@ -1902,6 +1908,7 @@ impl TransitionState {
         event: &lifecycle::Event,
         src: &LcEventSrc,
         manual_job_id: Option<Uuid>,
+        notification_bucket_incarnation: Option<Uuid>,
     ) -> TransitionEnqueueOutcome {
         if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
             self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
@@ -1914,7 +1921,7 @@ impl TransitionState {
         // released by the worker after the transition finishes (rustfs/backlog#1268).
         // This is a no-op, not a new enqueue, so it must not touch the enqueue
         // counters (the first enqueue already counted this object).
-        if !self.reserve_transition(oi) {
+        if !self.reserve_transition(oi, notification_bucket_incarnation) {
             self.record_scanner_transition_state();
             return TransitionEnqueueOutcome::AlreadyInFlight;
         }
@@ -1923,7 +1930,7 @@ impl TransitionState {
             manual_job_id.map(|_| manual_transition_worker_result_task_key(&oi.bucket, &oi.name, oi.version_id));
         if let (Some(job_id), Some(result_key)) = (manual_job_id, manual_result_key.as_deref()) {
             let Some(api) = api else {
-                self.release_transition(oi);
+                self.release_transition(oi, notification_bucket_incarnation);
                 warn!(
                     event = EVENT_LIFECYCLE_WORKER_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1948,7 +1955,7 @@ impl TransitionState {
             )
             .with_object_metadata(oi.etag.clone(), oi.mod_time, oi.size, oi.is_latest);
             if let Err(err) = save_manual_transition_task_if_absent(api, &task_record).await {
-                self.release_transition(oi);
+                self.release_transition(oi, notification_bucket_incarnation);
                 warn!(
                     event = EVENT_LIFECYCLE_WORKER_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1967,6 +1974,7 @@ impl TransitionState {
         }
 
         let task = TransitionTask {
+            notification_bucket_incarnation,
             obj_info: oi.clone(),
             src: src.clone(),
             event: event.clone(),
@@ -2010,7 +2018,7 @@ impl TransitionState {
             };
             let queued = outcome == TransitionEnqueueOutcome::Queued;
             if !queued {
-                self.release_transition(oi);
+                self.release_transition(oi, notification_bucket_incarnation);
             }
             record_scanner_transition_enqueue_result(src, 1, queued);
             self.record_scanner_transition_state();
@@ -2063,7 +2071,7 @@ impl TransitionState {
         };
         let queued = outcome == TransitionEnqueueOutcome::Queued;
         if !queued {
-            self.release_transition(oi);
+            self.release_transition(oi, notification_bucket_incarnation);
         }
         record_scanner_transition_enqueue_result(src, 1, queued);
         self.record_scanner_transition_state();
@@ -2071,7 +2079,7 @@ impl TransitionState {
     }
 
     pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
-        self.queue_transition_task_outcome(None, oi, event, src, None)
+        self.queue_transition_task_outcome(None, oi, event, src, None, None)
             .await
             .is_handled()
     }
@@ -2166,9 +2174,10 @@ impl TransitionState {
                             ..Default::default()
                         };
 
-                        if let Err(err) =
-                            transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone()))
-                                .await
+                        let (incarnation_id, transition_result) =
+                            transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone()), task.notification_bucket_incarnation)
+                                .await;
+                        if let Err(err) = transition_result
                         {
                             if let (Some(job_id), Some(result_key)) = (task.manual_job_id, task.manual_result_key.as_deref()) {
                                 record_manual_transition_worker_result_for_task_with_reason(
@@ -2195,7 +2204,7 @@ impl TransitionState {
                                     "Lifecycle tier operation failed"
                                 );
                             }
-                            emit_transition_failed_event(obj_info_for_event);
+                            emit_transition_failed_event(obj_info_for_event, incarnation_id);
                         } else {
                             if let (Some(job_id), Some(result_key)) = (task.manual_job_id, task.manual_result_key.as_deref()) {
                                 record_manual_transition_worker_result_for_task(
@@ -2217,11 +2226,11 @@ impl TransitionState {
                             }
                             transition_state.add_lastday_stats(&task.event.storage_class, ts);
 
-                            emit_transition_complete_event(obj_info_for_event);
+                            emit_transition_complete_event(obj_info_for_event, incarnation_id);
                         }
                         // Release the dedup claim so a later lifecycle pass can
                         // re-transition this object if needed (rustfs/backlog#1268).
-                        transition_state.release_transition(&task.obj_info);
+                        transition_state.release_transition(&task.obj_info, task.notification_bucket_incarnation);
                         TransitionState::add_counter(&transition_state.active_tasks, -1);
                         transition_state.record_scanner_transition_state();
                     }
@@ -2826,7 +2835,7 @@ async fn replay_manual_transition_pending_tasks(
         };
 
         match transition_state
-            .queue_transition_task_outcome(Some(api.clone()), &object, &event, &LcEventSrc::Scanner, Some(job_id))
+            .queue_transition_task_outcome(Some(api.clone()), &object, &event, &LcEventSrc::Scanner, Some(job_id), None)
             .await
         {
             TransitionEnqueueOutcome::Queued | TransitionEnqueueOutcome::AlreadyInFlight => {
@@ -3084,6 +3093,7 @@ async fn recover_configured_tier_free_versions(
             next_object_marker: None,
             scanned_entries: 0,
             buckets_scanned: 0,
+            unreadable_objects: 0,
             truncated: false,
         });
     }
@@ -3223,6 +3233,7 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
                     scanned = stats.scanned,
                     scanned_entries = stats.scanned_entries,
                     buckets_scanned = stats.buckets_scanned,
+                    unreadable_objects = stats.unreadable_objects,
                     enqueued = stats.enqueued,
                     failed = stats.failed,
                     truncated = stats.truncated,
@@ -4059,9 +4070,11 @@ fn transitioned_cleanup_tuple(oi: &ObjectInfo) -> Result<(&str, &str, &str), std
     Ok((&transitioned.name, &transitioned.version_id, &transitioned.tier))
 }
 
-pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
+/// Queue a committed object with its storage-validated bucket identity.
+/// `None` permits the transition but withholds external notifications.
+pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc, notification_bucket_incarnation: Option<Uuid>) {
     if let Some(lc) = runtime_sources::bucket_lifecycle_config(&oi.bucket).await {
-        enqueue_transition_with_lifecycle(oi, &lc, &src).await;
+        enqueue_transition_with_lifecycle(oi, &lc, &src, notification_bucket_incarnation).await;
     }
 }
 
@@ -4534,10 +4547,20 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
     let deadline = options.max_duration.map(|duration| tokio::time::Instant::now() + duration);
 
     loop {
-        let page = api
-            .clone()
-            .list_object_versions(bucket, &options.prefix, marker.clone(), version_marker.clone(), None, LIST_PAGE_SIZE)
-            .await?;
+        let (page, bucket_incarnation_id) = {
+            // Lock order: lifecycle read -> metadata transaction -> listing locks.
+            // Release the lifecycle fence before enqueue or progress persistence.
+            let guard = api.acquire_bucket_lifecycle_read_lock(bucket).await?;
+            let incarnation = api.bucket_incarnation_id_from_disk(bucket).await?;
+            let page = api
+                .clone()
+                .list_object_versions(bucket, &options.prefix, marker.clone(), version_marker.clone(), None, LIST_PAGE_SIZE)
+                .await?;
+            if guard.is_lock_lost() {
+                return Err(Error::other("bucket lifecycle lock was lost while listing transition candidates"));
+            }
+            (page, incarnation)
+        };
 
         for (index, object) in page.objects.iter().enumerate() {
             if manual_transition_cancel_requested(&options).await {
@@ -4559,7 +4582,16 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
                 return Ok(report);
             }
             report.scanned = report.scanned.saturating_add(1);
-            enqueue_transition_with_lifecycle_report(Some(api.clone()), object, &lc, &src, &options, &mut report).await;
+            enqueue_transition_with_lifecycle_report(
+                Some(api.clone()),
+                object,
+                &lc,
+                &src,
+                &options,
+                &mut report,
+                Some(bucket_incarnation_id),
+            )
+            .await;
             if report.has_enqueue_backpressure() {
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
@@ -4865,6 +4897,7 @@ async fn enqueue_transition_with_lifecycle_report(
     src: &LcEventSrc,
     options: &ManualTransitionRunOptions,
     report: &mut ManualTransitionRunReport,
+    notification_bucket_incarnation: Option<Uuid>,
 ) -> bool {
     if oi.transitioned_object.status == TRANSITION_COMPLETE {
         if options
@@ -4917,7 +4950,7 @@ async fn enqueue_transition_with_lifecycle_report(
                 return true;
             }
             let outcome = runtime_sources::transition_state_handle()
-                .queue_transition_task_outcome(api.clone(), oi, &event, src, options.job_id)
+                .queue_transition_task_outcome(api.clone(), oi, &event, src, options.job_id, notification_bucket_incarnation)
                 .await;
             report.record_enqueue_outcome(outcome);
             return outcome.is_handled();
@@ -4927,7 +4960,12 @@ async fn enqueue_transition_with_lifecycle_report(
     false
 }
 
-async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &PersistedLifecycleConfiguration, src: &LcEventSrc) -> bool {
+async fn enqueue_transition_with_lifecycle(
+    oi: &ObjectInfo,
+    lc: &PersistedLifecycleConfiguration,
+    src: &LcEventSrc,
+    notification_bucket_incarnation: Option<Uuid>,
+) -> bool {
     let event = lc.eval(&oi.to_lifecycle_opts()).await;
     match event.action {
         IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
@@ -4938,8 +4976,9 @@ async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &PersistedLifecy
                 return false;
             }
             runtime_sources::transition_state_handle()
-                .queue_transition_task(oi, &event, src)
+                .queue_transition_task_outcome(None, oi, &event, src, None, notification_bucket_incarnation)
                 .await
+                .is_handled()
         }
         _ => false,
     }
@@ -5121,7 +5160,7 @@ async fn expire_transitioned_object_with_lock_lost_signal(
         }
     };
 
-    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj, bucket_incarnation_id).await;
 
     // The transitioned version is gone; evict any cached body for this object
     // so it does not linger until TTL (ODC-26).
@@ -5134,7 +5173,7 @@ async fn expire_transitioned_object_with_lock_lost_signal(
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
-    emit_transitioned_expiration_event(oi, &dobj);
+    emit_transitioned_expiration_event(oi, &dobj, bucket_incarnation_id);
 
     Ok(dobj)
 }
@@ -5152,12 +5191,22 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     Ok(obj)
 }
 
-pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
+async fn transition_object(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lae: LcAuditEvent,
+    notification_bucket_incarnation: Option<Uuid>,
+) -> (Option<Uuid>, Result<(), Error>) {
     let time_ilm = Metrics::time_ilm(lae.event.action);
 
-    let (publication_guard, bucket_incarnation_id) = lifecycle_transition_publication_guard(&api, oi)
-        .await
-        .ok_or_else(|| Error::other("lifecycle transition is not allowed for this bucket"))?;
+    let Some((publication_guard, bucket_incarnation_id)) =
+        lifecycle_transition_publication_guard(&api, oi, notification_bucket_incarnation).await
+    else {
+        return (
+            notification_bucket_incarnation,
+            Err(Error::other("lifecycle transition is not allowed for this bucket")),
+        );
+    };
 
     let etag = if let Some(etag) = &oi.etag { etag } else { "" };
     let etag = etag.to_string();
@@ -5175,12 +5224,13 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         mod_time: oi.mod_time,
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+        notification_bucket_incarnation_id: notification_bucket_incarnation,
         ..Default::default()
     };
     opts.add_namespace_lock_guard(&publication_guard);
     let result = api.transition_object(&oi.bucket, &oi.name, &opts).await;
     time_ilm(1)();
-    result
+    (notification_bucket_incarnation, result)
 }
 
 #[allow(
@@ -5791,12 +5841,22 @@ fn lifecycle_replication_blocks_action(oi: &ObjectInfo) -> bool {
 }
 
 pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    apply_transition_rule_with_incarnation(event, src, oi, None).await
+}
+
+pub async fn apply_transition_rule_with_incarnation(
+    event: &lifecycle::Event,
+    src: &LcEventSrc,
+    oi: &ObjectInfo,
+    notification_bucket_incarnation: Option<Uuid>,
+) -> bool {
     if oi.delete_marker || oi.is_dir {
         return false;
     }
     runtime_sources::transition_state_handle()
-        .queue_transition_task(oi, event, src)
+        .queue_transition_task_outcome(None, oi, event, src, None, notification_bucket_incarnation)
         .await
+        .is_handled()
 }
 
 async fn acquire_lifecycle_publication_guard(api: &ECStore, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard, Error> {
@@ -5845,10 +5905,14 @@ pub(crate) async fn lifecycle_expiry_publication_guard(
 async fn lifecycle_transition_publication_guard(
     api: &ECStore,
     oi: &ObjectInfo,
+    expected_incarnation: Option<Uuid>,
 ) -> Option<(rustfs_lock::NamespaceLockGuard, Uuid)> {
     let result: std::result::Result<(rustfs_lock::NamespaceLockGuard, Uuid), Error> = async {
         let guard = acquire_lifecycle_publication_guard(api, &oi.bucket).await?;
         let configs = metadata_boundary::get_expiry_configs(api, &oi.bucket).await?;
+        if expected_incarnation.is_some_and(|expected| expected != configs.bucket_incarnation_id) {
+            return Err(Error::PreconditionFailed);
+        }
         Ok((guard, configs.bucket_incarnation_id))
     }
     .await;
@@ -6034,7 +6098,7 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     {
         accounting.commit(size).await;
     }
-    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj, bucket_incarnation_id).await;
 
     // The object (or all its versions, for delete_all) was expired; evict any
     // cached body so dead bytes do not sit resident until TTL (ODC-26). The
@@ -6050,7 +6114,7 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    emit_non_transitioned_expiration_event(lc_event.action, oi, dobj);
+    emit_non_transitioned_expiration_event(lc_event.action, oi, dobj, bucket_incarnation_id);
 
     if lc_event.action != IlmAction::NoneAction {
         let mut num_versions = 1_u64;
@@ -6202,12 +6266,12 @@ fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject
     }
 }
 
-async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo) {
+async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo, bucket_incarnation_id: Uuid) {
     let delete_object = lifecycle_deleted_object(oi, dobj);
     if delete_object.replication_state.is_none() {
         return;
     }
-    replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
+    replication_sink::schedule_delete(oi.bucket.clone(), delete_object, Some(bucket_incarnation_id)).await;
 }
 
 async fn lifecycle_delete_config_snapshot(api: &ECStore, oi: &ObjectInfo) -> Result<DeleteReplicationConfigSnapshot, Error> {
@@ -6597,6 +6661,7 @@ mod tests {
             next_object_marker: truncated.then(|| "object".to_string()),
             scanned_entries: 1,
             buckets_scanned: 1,
+            unreadable_objects: 0,
             truncated,
         }
     }
@@ -9115,6 +9180,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transition_dedup_keeps_recreated_bucket_admissions_independent() {
+        let state = TransitionState::new_with_capacity(2);
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "same-key".to_string(),
+            ..Default::default()
+        };
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let event = lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+        for identity in [first, second] {
+            assert_eq!(
+                state
+                    .queue_transition_task_outcome(None, &object, &event, &LcEventSrc::Scanner, None, Some(identity))
+                    .await,
+                TransitionEnqueueOutcome::Queued
+            );
+        }
+        state.release_transition(&object, Some(first));
+        assert!(
+            !state.reserve_transition(&object, Some(second)),
+            "finishing the old incarnation must retain the new claim"
+        );
+        assert!(state.reserve_transition(&object, Some(first)), "only the old claim was released");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_transition_notifications_keep_the_admitted_bucket_incarnation() {
+        use super::metadata_boundary::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::services::event_notification::test_recorder;
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "queued-transition-notification-origin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create original bucket");
+        let original = store.bucket_incarnation_id(bucket).await.expect("original identity");
+        let state = TransitionState::new_with_capacity(2);
+        let event = lifecycle::Event {
+            action: IlmAction::TransitionVersionAction,
+            storage_class: "missing-tier".to_string(),
+            ..Default::default()
+        };
+        for (name, identity) in [("known-old", Some(original)), ("unknown-replay", None)] {
+            let object = ObjectInfo {
+                bucket: bucket.to_string(),
+                name: name.to_string(),
+                version_id: Some(Uuid::new_v4()),
+                ..Default::default()
+            };
+            assert_eq!(
+                state
+                    .queue_transition_task_outcome(None, &object, &event, &LcEventSrc::Scanner, None, identity)
+                    .await,
+                TransitionEnqueueOutcome::Queued
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete original bucket");
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        let replacement = store.bucket_incarnation_id(bucket).await.expect("replacement identity");
+        assert_ne!(original, replacement);
+        test_recorder::install();
+        for expected in [Some(original), None] {
+            let task = state
+                .transition_rx
+                .recv()
+                .await
+                .expect("receive queued transition")
+                .expect("transition task");
+            assert_eq!(task.notification_bucket_incarnation, expected);
+            let (identity, result) = super::transition_object(
+                store.clone(),
+                &task.obj_info,
+                super::LcAuditEvent::new(task.event, task.src),
+                task.notification_bucket_incarnation,
+            )
+            .await;
+            assert!(result.is_err(), "the old version cannot transition in the replacement");
+            assert_eq!(identity, expected);
+            super::emit_transition_failed_event(task.obj_info, identity);
+        }
+        let events = test_recorder::recorded_for_bucket(bucket);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].bucket_incarnation_id, Some(original));
+        assert_eq!(events[1].bucket_incarnation_id, None);
+        assert!(events.iter().all(|event| event.bucket_incarnation_id != Some(replacement)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn successful_recovered_transition_keeps_unknown_notification_origin_unbound() {
+        use super::metadata_boundary::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::services::event_notification::test_recorder;
+        use crate::services::tier::test_util::register_mock_tier;
+        use rustfs_s3_types::EventName;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("recovered-notify-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create transition bucket");
+        let mut reader = PutObjReader::from_vec(b"transition payload".to_vec());
+        store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("seed transition object");
+        let object_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read transition object");
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&store.tier_config_mgr(), &tier).await;
+        test_recorder::install();
+
+        let (origin, result) = super::transition_object(
+            store,
+            &object_info,
+            super::LcAuditEvent::new(
+                lifecycle::Event {
+                    action: IlmAction::TransitionAction,
+                    storage_class: tier,
+                    ..Default::default()
+                },
+                LcEventSrc::Scanner,
+            ),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "recovered transition should complete: {result:?}");
+        assert_eq!(origin, None);
+
+        let events = test_recorder::recorded_for_bucket(&bucket);
+        let transition = events
+            .iter()
+            .find(|event| event.event_name == EventName::LifecycleTransition.as_str())
+            .expect("successful transition should emit its native lifecycle event");
+        assert_eq!(transition.bucket_incarnation_id, None);
+    }
+
+    #[tokio::test]
     #[serial]
     async fn scanner_transition_enqueue_reports_full_queue() {
         let state = TransitionState::new_with_capacity(1);
@@ -9181,7 +9400,7 @@ mod tests {
             .await
             .expect("queue should remain open")
             .expect("first queued transition task should be present");
-        state.release_transition(&first_task.obj_info);
+        state.release_transition(&first_task.obj_info, first_task.notification_bucket_incarnation);
 
         assert!(
             deferred.await,
@@ -9940,8 +10159,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(state.reserve_transition(&oi), "first claim must succeed");
-        assert!(!state.reserve_transition(&oi), "duplicate claim must be rejected");
+        assert!(state.reserve_transition(&oi, None), "first claim must succeed");
+        assert!(!state.reserve_transition(&oi, None), "duplicate claim must be rejected");
 
         // A different object is independent.
         let other = ObjectInfo {
@@ -9950,11 +10169,11 @@ mod tests {
             version_id: None,
             ..Default::default()
         };
-        assert!(state.reserve_transition(&other), "distinct object must claim independently");
+        assert!(state.reserve_transition(&other, None), "distinct object must claim independently");
 
         // After release, the same object can be re-claimed (later lifecycle pass).
-        state.release_transition(&oi);
-        assert!(state.reserve_transition(&oi), "re-claim after release must succeed");
+        state.release_transition(&oi, None);
+        assert!(state.reserve_transition(&oi, None), "re-claim after release must succeed");
     }
 
     #[tokio::test]
@@ -9996,10 +10215,10 @@ mod tests {
         };
 
         let first = state
-            .queue_transition_task_outcome(None, &object, &event, &LcEventSrc::Scanner, None)
+            .queue_transition_task_outcome(None, &object, &event, &LcEventSrc::Scanner, None, None)
             .await;
         let second = state
-            .queue_transition_task_outcome(None, &object, &event, &LcEventSrc::Scanner, None)
+            .queue_transition_task_outcome(None, &object, &event, &LcEventSrc::Scanner, None, None)
             .await;
 
         assert_eq!(first, TransitionEnqueueOutcome::Queued);
@@ -10027,10 +10246,10 @@ mod tests {
         };
 
         let first = state
-            .queue_transition_task_outcome(None, &first_object, &event, &LcEventSrc::Scanner, None)
+            .queue_transition_task_outcome(None, &first_object, &event, &LcEventSrc::Scanner, None, None)
             .await;
         let second = state
-            .queue_transition_task_outcome(None, &second_object, &event, &LcEventSrc::Scanner, None)
+            .queue_transition_task_outcome(None, &second_object, &event, &LcEventSrc::Scanner, None, None)
             .await;
 
         assert_eq!(first, TransitionEnqueueOutcome::Queued);
@@ -10063,7 +10282,7 @@ mod tests {
         let task_key = manual_transition_worker_result_task_key(&object.bucket, &object.name, object.version_id);
 
         let outcome = state
-            .queue_transition_task_outcome(Some(ecstore.clone()), &object, &event, &LcEventSrc::Scanner, Some(job_id))
+            .queue_transition_task_outcome(Some(ecstore.clone()), &object, &event, &LcEventSrc::Scanner, Some(job_id), None)
             .await;
 
         assert_eq!(outcome, TransitionEnqueueOutcome::Queued);
@@ -10100,14 +10319,14 @@ mod tests {
         };
 
         let failed = state
-            .queue_transition_task_outcome(Some(ecstore.clone()), &object, &event, &LcEventSrc::Scanner, Some(Uuid::nil()))
+            .queue_transition_task_outcome(Some(ecstore.clone()), &object, &event, &LcEventSrc::Scanner, Some(Uuid::nil()), None)
             .await;
 
         assert_eq!(failed, TransitionEnqueueOutcome::TaskJournalFailed);
         assert_eq!(state.transition_rx.len(), 0);
 
         let retried = state
-            .queue_transition_task_outcome(Some(ecstore), &object, &event, &LcEventSrc::Scanner, Some(Uuid::new_v4()))
+            .queue_transition_task_outcome(Some(ecstore), &object, &event, &LcEventSrc::Scanner, Some(Uuid::new_v4()), None)
             .await;
         assert_eq!(retried, TransitionEnqueueOutcome::Queued);
         assert_eq!(state.transition_rx.len(), 1);
@@ -10608,7 +10827,7 @@ mod tests {
         let lc = latest_transition_lifecycle();
         let object = current_object(ReplicationStatusType::Pending);
 
-        let queued = enqueue_transition_with_lifecycle(&object, &lc, &LcEventSrc::Scanner).await;
+        let queued = enqueue_transition_with_lifecycle(&object, &lc, &LcEventSrc::Scanner, None).await;
 
         assert!(!queued);
     }
@@ -10624,7 +10843,7 @@ mod tests {
         let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
 
         let handled =
-            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report, None).await;
 
         assert!(handled);
         assert_eq!(report.eligible, 1);
@@ -10646,7 +10865,7 @@ mod tests {
         let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
 
         let handled =
-            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report, None).await;
 
         assert!(!handled);
         assert_eq!(report.eligible, 0);
@@ -10665,7 +10884,7 @@ mod tests {
         let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
 
         let handled =
-            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report, None).await;
 
         assert!(!handled);
         assert_eq!(report.eligible, 0);
@@ -10680,7 +10899,7 @@ mod tests {
         let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
 
         let handled =
-            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report, None).await;
 
         assert!(!handled);
         assert_eq!(report.eligible, 0);
@@ -10793,7 +11012,7 @@ mod tests {
         let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
 
         let handled =
-            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+            enqueue_transition_with_lifecycle_report(None, &object, &lc, &LcEventSrc::Scanner, &options, &mut report, None).await;
 
         assert!(!handled);
         assert_eq!(report.eligible, 0);
@@ -14138,7 +14357,7 @@ mod tests {
         let admission_store = ecstore.clone();
         let admission_object = object_info.clone();
         let mut admission =
-            tokio::spawn(async move { lifecycle_transition_publication_guard(&admission_store, &admission_object).await });
+            tokio::spawn(async move { lifecycle_transition_publication_guard(&admission_store, &admission_object, None).await });
         assert!(
             tokio::time::timeout(StdDuration::from_millis(100), &mut admission)
                 .await
@@ -14957,6 +15176,37 @@ mod tests {
         }
     }
 
+    async fn seed_corrupt_free_version(disk_paths: &[PathBuf], bucket: &str, object: &str) -> Vec<u8> {
+        use rustfs_utils::http::metadata_compat::{SUFFIX_TRANSITIONED_VERSION_STATE, insert_bytes};
+
+        seed_recoverable_free_version(disk_paths, bucket, object, None, None).await;
+        let path = PathBuf::from(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let original = fs::read(disk_paths[0].join(&path))
+            .await
+            .expect("read the seeded free version");
+        let mut metadata = FileMeta::load(&original).expect("load the seeded metadata");
+        let mut version = metadata.versions[0].parse_version_meta().expect("decode the seeded version");
+        let marker = version.delete_marker.as_mut().expect("the free version is a delete marker");
+        insert_bytes(&mut marker.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, b"invalid".to_vec());
+        metadata.versions[0] = version
+            .try_into()
+            .expect("encode the malformed marker with a consistent header");
+        let encoded = metadata.marshal_msg().expect("encode the metadata with a valid checksum");
+        let reloaded = FileMeta::load(&encoded).expect("the metadata envelope must remain readable");
+        assert_eq!(
+            reloaded
+                .get_file_info_versions(bucket, object, false)
+                .expect_err("decoding the marker must fail"),
+            rustfs_filemeta::Error::FileCorrupt
+        );
+        for disk in disk_paths {
+            fs::write(disk.join(&path), &encoded)
+                .await
+                .expect("persist the same malformed marker on every disk");
+        }
+        encoded
+    }
+
     async fn remove_seeded_free_version(disk_paths: &[PathBuf], bucket: &str, object: &str) {
         for disk_path in disk_paths {
             fs::remove_dir_all(disk_path.join(bucket).join(object))
@@ -15029,6 +15279,7 @@ mod tests {
                 next_object_marker: None,
                 scanned_entries: 0,
                 buckets_scanned: 0,
+                unreadable_objects: 0,
                 truncated: false,
             }
         );
@@ -15225,12 +15476,14 @@ mod tests {
         );
         assert_eq!(check.reasons.len(), 1);
         assert_eq!(check.reasons[0].kind, crate::services::tier::tier::TierDeletionReasonKind::CleanupPending);
+        seed_corrupt_free_version(&disks, &bucket, "corrupt").await;
         let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
             .await
             .expect("retry should enqueue durable cleanup");
         assert_eq!(report.status, TierCleanupRetryStatus::Accepted);
         assert_eq!(report.enqueued, 1);
         assert_eq!(report.failed, 0);
+        assert_eq!(report.unreadable_objects, 1);
         let rx = Arc::clone(&state.read().await.tasks_rx[0]);
         let task = rx.lock().await.try_recv().expect("cleanup was queued").expect("queue item");
         let task = task
@@ -15250,21 +15503,27 @@ mod tests {
         let other = retry_tier_free_version_cleanup(api.clone(), "OTHER")
             .await
             .expect("other tier retry should be bounded");
+        assert_eq!(other.status, TierCleanupRetryStatus::Accepted);
         assert_eq!(other.enqueued, 0, "retry must not enqueue a different tier's marker");
+        assert_eq!(other.failed, 0);
+        let json = serde_json::to_value(&other).expect("serialize the public retry report");
+        assert_eq!(json["unreadableObjects"], 1, "unreadable keys cannot be attributed to a tier");
         assert!(rx.lock().await.try_recv().is_err());
-        api.tier_config_mgr()
-            .write()
-            .await
-            .remove("OTHER", true)
-            .await
-            .expect("remove other mock tier");
         reset_runtime_expiry_state(&api).await;
         let failed = retry_tier_free_version_cleanup(api.clone(), "WARM")
             .await
             .expect("queue failure remains retryable");
         assert_eq!(failed.failed, 1);
         assert_eq!(failed.enqueued, 0);
+        assert_eq!(failed.unreadable_objects, 1);
         assert_eq!(crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await, 1);
+        remove_seeded_free_version(&disks, &bucket, "corrupt").await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("OTHER", true)
+            .await
+            .expect("remove other mock tier");
         remove_seeded_free_version(&disks, &bucket, "owned").await;
         api.tier_config_mgr()
             .write()
@@ -15482,6 +15741,121 @@ mod tests {
             .await
             .expect("empty recovery test bucket should be removed");
         reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_enqueues_past_a_corrupt_free_version() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let prefix = format!("zzzz-recovery-corrupt-{}", Uuid::new_v4().simple());
+        let first_bucket = format!("{prefix}-a");
+        let second_bucket = format!("{prefix}-b");
+        for bucket in [&first_bucket, &second_bucket] {
+            create_test_bucket(&ecstore, bucket).await;
+        }
+        let healthy = [
+            (first_bucket.as_str(), "a"),
+            (first_bucket.as_str(), "c"),
+            (second_bucket.as_str(), "d"),
+        ];
+        for (bucket, object) in healthy {
+            seed_recoverable_free_version(&disk_paths, bucket, object, None, None).await;
+        }
+        let corrupt = seed_corrupt_free_version(&disk_paths, &first_bucket, "b").await;
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, healthy.len()).await;
+
+        let stats = recover_tier_free_versions_with_cancel(
+            Arc::clone(&ecstore),
+            healthy.len() + 1,
+            Some(first_bucket.clone()),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a corrupt free version must not discard other recovery candidates");
+        assert!(!stats.truncated);
+        assert_eq!(stats.enqueued, healthy.len());
+        let receiver = Arc::clone(&state.read().await.tasks_rx[0]);
+        let mut receiver = receiver.lock().await;
+        for (bucket, object) in healthy {
+            let task = receiver
+                .try_recv()
+                .expect("receive a healthy cleanup task")
+                .expect("the queue carries a task");
+            let task = task
+                .as_any()
+                .downcast_ref::<FreeVersionTask>()
+                .expect("a free-version cleanup task");
+            assert_eq!((task.0.bucket.as_str(), task.0.name.as_str()), (bucket, object));
+        }
+        drop(receiver);
+        reset_runtime_expiry_state(&ecstore).await;
+        for disk in &disk_paths {
+            let stored = fs::read(disk.join(&first_bucket).join("b").join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("discovery must preserve the unreadable marker");
+            assert_eq!(stored, corrupt);
+        }
+        for (bucket, object) in healthy.into_iter().chain([(first_bucket.as_str(), "b")]) {
+            remove_seeded_free_version(&disk_paths, bucket, object).await;
+        }
+        for bucket in [&first_bucket, &second_bucket] {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("delete the empty test bucket");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_counts_a_corrupt_boundary_once_per_sweep() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("zzzz-recovery-boundary-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_corrupt_free_version(&disk_paths, &bucket, "b").await;
+        seed_recoverable_free_version(&disk_paths, &bucket, "c", None, None).await;
+        let page_from = |marker| {
+            list_tier_free_versions_with_budget(
+                Arc::clone(&ecstore),
+                2,
+                Some(bucket.clone()),
+                marker,
+                CancellationToken::new(),
+                RecoveryWorkBudget {
+                    max_objects: 1,
+                    max_buckets: 1,
+                },
+            )
+        };
+
+        let first = page_from(None)
+            .await
+            .expect("the unreadable key should consume the first page");
+        assert!(first.items.is_empty());
+        assert_eq!(first.unreadable_objects, 1);
+        assert!(first.truncated);
+        assert_eq!(first.next_bucket_marker.as_deref(), Some(bucket.as_str()));
+        assert_eq!(first.next_object_marker.as_deref(), Some("b"));
+
+        let second = page_from(first.next_object_marker)
+            .await
+            .expect("resume past the unreadable boundary");
+        assert_eq!(second.unreadable_objects, 0);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].name, "c");
+
+        let next_sweep = page_from(None).await.expect("a later sweep must revisit the unreadable key");
+        assert_eq!(next_sweep.unreadable_objects, 1);
+        assert_eq!(next_sweep.next_object_marker.as_deref(), Some("b"));
+
+        for object in ["b", "c"] {
+            remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the empty test bucket");
     }
 
     #[tokio::test]

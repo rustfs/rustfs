@@ -188,6 +188,7 @@ async fn run_overwritten_unversioned_generation_observation() {
         heal_bitrot: true,
         heal_scope: Some(rustfs_scanner::data_usage_define::DataUsageCacheSource::new(0, 0)),
         debug: false,
+        notification_bucket_incarnation: None,
     };
     temp_env::async_with_vars([("RUSTFS_SCANNER_DEEP_VERIFY_COOLDOWN_SECS", Some("0"))], async {
         scanner

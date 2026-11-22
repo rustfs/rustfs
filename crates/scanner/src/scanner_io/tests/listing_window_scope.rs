@@ -183,9 +183,11 @@ async fn dirty_entry_removed_during_listing_still_forces_a_full_scan() {
     );
     assert_eq!(second.buckets_usage["hot-bucket"].objects_count, 2);
     assert_eq!(second.buckets_usage["cold-bucket"].objects_count, 2);
-    let freshness = global_metrics().report().await.usage_freshness;
+    let report = global_metrics().report().await;
+    let freshness = report.usage_freshness;
     assert_eq!(freshness.scope_fallback_total, fallbacks_before + 1);
     assert_eq!(freshness.last_scope_fallback_reason, "dirty_snapshot_incomplete");
+    assert_eq!(report.scan_observation.scope_fallbacks["dirty_snapshot_incomplete"], 1);
     clear_dirty_usage_buckets_for_tests();
 }
 
@@ -199,11 +201,53 @@ async fn required_full_scan_is_not_reported_as_a_scope_fallback() {
     wait_for_namespace_commit_tails(store.as_ref()).await;
     super::io_cycle::set_bucket_listing_window_hook_for_tests(|| record_dirty_usage_bucket("created-after-listing"));
 
+    let before = global_metrics().scan_observation().snapshot();
     let (result, _, scope) = run_cycle(&store, 2, Some(baseline), true).await;
 
     assert!(scope.is_default());
     assert_eq!(result.pending_dirty_usage_buckets(), 1);
     assert_eq!(result.scope_fallback(), None, "scheduled maintenance walks are not degradations");
     assert_eq!(result.completed_scope_fallback(), None);
+    let after = global_metrics().scan_observation().snapshot();
+    assert_eq!(after.scope_fallbacks, before.scope_fallbacks);
+    assert_eq!(after.prefix_scope_resolution.evaluated, before.prefix_scope_resolution.evaluated);
+    assert_eq!(after.prefix_cycle_completion.evaluated, before.prefix_cycle_completion.evaluated + 1);
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn baseline_unavailable_cycle_records_real_scope_and_baseline_rejections_once() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    let _baseline = converged_baseline(&store).await;
+    put_fixture_object(&store, "hot-bucket", "second").await;
+    record_dirty_usage_bucket("hot-bucket");
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+    let before = global_metrics().scan_observation().snapshot();
+    let (result, snapshot, scope) = run_cycle(&store, 2, Some(Bytes::from_static(b"not-json")), false).await;
+    assert!(scope.is_default());
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(result.scope_fallback(), Some(ScannerScopeFallbackReason::BaselineUnavailable));
+    assert_eq!(snapshot.buckets_usage["hot-bucket"].objects_count, 2);
+    let after = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        after.scope_fallbacks["baseline_unavailable"],
+        before.scope_fallbacks["baseline_unavailable"] + 1
+    );
+    assert_eq!(
+        after.authoritative_baseline_rejections["decode"],
+        before.authoritative_baseline_rejections["decode"] + 1
+    );
+    assert_eq!(
+        after.observed_baseline_rejections, before.observed_baseline_rejections,
+        "an undecodable authority never admits an observation"
+    );
+    assert_eq!(after.prefix_scope_resolution.evaluated, before.prefix_scope_resolution.evaluated + 1);
+    assert_eq!(after.prefix_scope_resolution.activated, before.prefix_scope_resolution.activated);
+    assert_eq!(
+        after.prefix_scope_resolution.blockers["missing_cold_zero_walk_oracle"],
+        before.prefix_scope_resolution.blockers["missing_cold_zero_walk_oracle"] + 1
+    );
+    assert_eq!(after.prefix_cycle_completion.evaluated, before.prefix_cycle_completion.evaluated + 1);
     clear_dirty_usage_buckets_for_tests();
 }

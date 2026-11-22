@@ -1,12 +1,12 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
-//! A bucket whose walk stops early without exhausting the cycle budget (here
-//! a sweep resumed under a newer plan, the `mixed_coverage` case of
-//! rustfs/rustfs#8494) no longer makes the whole cycle `Incomplete`. The set
-//! publishes the bucket's last certified value, the cycle completes with the
-//! bucket pending, and the next cycle walks it again. A bucket that never
-//! certified keeps the cycle incomplete.
+//! A bucket whose walk stops early can publish its last certified value as
+//! pending. This fixture tests usage-scan status, not the outer scanner cycle
+//! outcome: budget exhaustion may leave complete validated usage while the
+//! coordinator records `Partial`. A continuation under a newer plan exercises
+//! `mixed_coverage` (rustfs/rustfs#8494). A bucket that never certified keeps
+//! the usage scan incomplete.
 
 use super::*;
 
@@ -38,8 +38,7 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
             ..Default::default()
         },
     );
-    // These cycles persist real bucket checkpoints and source caches. Keep
-    // CI storage latency inside the production drain window after a count stop.
+    // Real checkpoint commits need the runtime drain grace after the count budget stops the walk.
     budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
@@ -49,7 +48,7 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
             ScannerCycleRequest {
                 owner_ctx: ctx.clone(),
                 ctx: budget.token(),
-                budget,
+                budget: Arc::clone(&budget),
                 updates,
                 want_cycle: cycle,
                 leader_epoch: LEADER_EPOCH,
@@ -69,6 +68,13 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
     .await
     .expect("cycle should finish within the test deadline")
     .expect("cycle should succeed");
+    if options.max_objects.is_some() {
+        assert_eq!(
+            budget.reason(),
+            Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects),
+            "a count-limited fixture must stop for its object budget"
+        );
+    }
     let snapshot = receiver.recv().await;
     assert!(receiver.recv().await.is_none(), "a cycle publishes at most one terminal snapshot");
     (result, snapshot)
@@ -125,9 +131,8 @@ async fn partial_bucket_with_a_certified_value_completes_the_cycle_as_pending() 
     assert!(result.clear_verified_usage().is_empty());
     assert!(dirty_usage_buckets_for_tests().is_empty());
 
-    // Cycle 3: the object budget stops the hot bucket's walk and leaves a
-    // checkpoint under this cycle's plan. Its certified value is carried, so
-    // budget exhaustion leaves the bucket pending without blocking the cycle.
+    // Cycle 3: the budget stops the walk and saves a checkpoint. Usage can
+    // carry the certified value as pending; the outer coordinator records Partial.
     for object in ["p4/third", "p5/third"] {
         put_fixture_object(&store, "hot-bucket", object).await;
     }
@@ -144,12 +149,38 @@ async fn partial_bucket_with_a_certified_value_completes_the_cycle_as_pending() 
         },
     )
     .await;
-    let third = third.expect("a carried partial cycle publishes");
-    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(
+        result.status,
+        ScannerCycleStatus::Complete,
+        "certified carried usage remains complete after a budget stop"
+    );
+    let third = third.expect("validated carried usage publishes after the budget stop");
     assert_eq!(result.pending_dirty_usage_buckets(), 1);
+    assert!(!third.usage_snapshot_observational);
     assert_eq!(third.usage_snapshot_converged, Some(false));
     assert_eq!(third.usage_snapshot_pending_buckets, vec!["hot-bucket".to_string()]);
-    assert_eq!(third.buckets_usage["hot-bucket"].objects_count, 4);
+    assert_eq!(third.usage_snapshot_pending_bucket_count, 1);
+    assert!(third.is_complete_bucket_usage_snapshot());
+    let carried_hot = &third.buckets_usage["hot-bucket"];
+    let certified_hot = &second.buckets_usage["hot-bucket"];
+    assert_eq!(carried_hot.usage_value_state, Some(rustfs_data_usage::BucketUsageValueState::Carried));
+    assert!(certified_hot.usage_certification.is_some(), "cycle 2 certified the prior hot value");
+    assert_eq!(
+        carried_hot.usage_certification, certified_hot.usage_certification,
+        "carrying must not mint a new certificate"
+    );
+    assert_eq!(carried_hot.objects_count, 4);
+    assert_eq!(carried_hot.size, certified_hot.size);
+    assert_eq!(third.buckets_usage["cold-bucket"].objects_count, 1);
+    assert_eq!(third.buckets_usage["idle-bucket"].objects_count, 1);
+    assert_eq!(third.objects_total_count, 6);
+    // Only hot was dirty in this scoped scan; it received no fresh certification or ACK.
+    assert!(result.clear_verified_usage().is_empty());
+    assert_eq!(
+        dirty_usage_buckets_for_tests().keys().cloned().collect::<Vec<_>>(),
+        vec!["hot-bucket".to_string()],
+        "the budget-stopped hot bucket retains its dirty responsibility"
+    );
     let set = Arc::clone(&store.pools[0].disk_set[0]);
     let mut interrupted = DataUsageCache::default();
     interrupted
