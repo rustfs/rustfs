@@ -3246,9 +3246,8 @@ mod tests {
             .build()
             .expect("metadata GET input must build");
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let metadata_get = tokio::spawn(async move {
-            crate::app::test_seams::get_object(&metadata_usecase, build_request(metadata_input, Method::GET)).await
-        });
+        let metadata_get =
+            tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&metadata_usecase, metadata_input).await });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
             .expect("GET must enter the bucket metadata stage");
@@ -3276,10 +3275,7 @@ mod tests {
             .build()
             .expect("GET input must build");
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get =
-            tokio::spawn(
-                async move { crate::app::test_seams::get_object(&get_usecase, build_request(get_input, Method::GET)).await },
-            );
+        let get = tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&get_usecase, get_input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;

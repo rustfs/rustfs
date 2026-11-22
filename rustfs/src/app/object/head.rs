@@ -1514,10 +1514,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::HEAD);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(crate::app::test_seams::head_object(&usecase, req))
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, input))
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");
