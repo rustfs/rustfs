@@ -56,7 +56,6 @@ use super::storage_api::bucket_usecase::contract::list::{
 };
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,

@@ -1663,10 +1663,9 @@ pub(crate) mod helper {
     };
 }
 
+#[cfg(test)]
 pub(crate) mod object_utils {
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::to_s3s_etag;
-    pub(crate) use crate::storage::storage_api::to_s3s_xml_etag;
+    pub(crate) use crate::storage::storage_api::{to_s3s_etag, to_s3s_xml_etag};
 }
 
 pub(crate) mod io {
@@ -1778,7 +1777,7 @@ pub(crate) mod bucket_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
+    pub(crate) use super::{access, bucket, error, helper, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
         validate_website_configuration,

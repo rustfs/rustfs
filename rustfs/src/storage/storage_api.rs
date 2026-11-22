@@ -2547,6 +2547,7 @@ pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>
 /// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
 ///
 /// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
+#[cfg(test)]
 pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
     use s3s::dto::ETag;
 
@@ -2598,6 +2599,7 @@ mod to_s3s_etag_tests {
 /// The pinned s3s XML serializer writes ETag values as raw text. Escape only
 /// at XML response boundaries; HTTP headers and conditional comparisons keep
 /// the original stored value. Existing unsafe ETags must remain listable.
+#[cfg(test)]
 pub(crate) fn to_s3s_xml_etag(etag: &str) -> s3s::dto::ETag {
     let mut etag = to_s3s_etag(etag);
     let (s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut etag;

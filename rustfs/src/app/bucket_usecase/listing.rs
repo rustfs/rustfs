@@ -14,6 +14,7 @@
 
 //! Object and version listing use-case operations, including the metadata listing extension.
 
+use super::list_objects::listed_etag;
 use super::*;
 use crate::app::storage_api::bucket_usecase::contract::list::ListOperations as _;
 #[cfg(test)]
@@ -25,6 +26,7 @@ use crate::app::storage_api::s3::dto::{
 };
 use crate::app::storage_api::s3::xml::{SerResult, SerializeContent};
 use crate::app::storage_api::s3::{S3Result, xml};
+use rustfs_gateway_types::ETag;
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 
@@ -48,7 +50,7 @@ pub(crate) struct ObjectMetadataExtension {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ListObjectVersionMetadataEntry {
     DeleteMarker(DeleteMarkerEntry, ObjectMetadataExtension),
-    Version(ObjectVersion, ObjectMetadataExtension),
+    Version(ObjectMetadataEntry<ObjectVersion>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -58,15 +60,16 @@ pub(crate) struct ListObjectVersionsMetadataOutput {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct ObjectMetadataEntry {
-    pub object: Object,
+pub(crate) struct ObjectMetadataEntry<T> {
+    pub object: T,
+    pub e_tag: Option<ETag>,
     pub extension: ObjectMetadataExtension,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ListObjectsV2MetadataOutput {
     pub output: ListObjectsV2Output,
-    pub contents: Vec<ObjectMetadataEntry>,
+    pub contents: Vec<ObjectMetadataEntry<Object>>,
 }
 
 impl xml::Serialize for ListObjectVersionsMetadataOutput {
@@ -113,23 +116,12 @@ impl SerializeContent for ListObjectVersionsMetadataOutput {
         for entry in &self.entries {
             match entry {
                 ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
-                    s.content(
-                        "DeleteMarker",
-                        &VersionMetadataContent {
-                            value: marker,
-                            extension,
-                        },
-                    )?;
+                    s.element("DeleteMarker", |s| {
+                        marker.serialize_content(s)?;
+                        extension.serialize_content(s)
+                    })?;
                 }
-                ListObjectVersionMetadataEntry::Version(version, extension) => {
-                    s.content(
-                        "Version",
-                        &VersionMetadataContent {
-                            value: version,
-                            extension,
-                        },
-                    )?;
-                }
+                ListObjectVersionMetadataEntry::Version(entry) => s.content("Version", entry)?,
             }
         }
         Ok(())
@@ -184,20 +176,16 @@ impl SerializeContent for ListObjectsV2MetadataOutput {
     }
 }
 
-struct VersionMetadataContent<'a, T> {
-    value: &'a T,
-    extension: &'a ObjectMetadataExtension,
-}
-
-impl<T: SerializeContent> SerializeContent for VersionMetadataContent<'_, T> {
+impl<T: SerializeContent> SerializeContent for ObjectMetadataEntry<T> {
     fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
-        self.value.serialize_content(s)?;
-        self.extension.serialize_content(s)
-    }
-}
-
-impl SerializeContent for ObjectMetadataEntry {
-    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(etag) = &self.e_tag {
+            // Both strong and weak tags use literal quotes around XML-escaped text in listings.
+            s.element("ETag", |s| {
+                s.write_raw_text("\"")?;
+                etag.opaque_tag().serialize_content(s)?;
+                s.write_raw_text("\"")
+            })?;
+        }
         self.object.serialize_content(s)?;
         self.extension.serialize_content(s)
     }
@@ -451,18 +439,14 @@ fn build_list_object_versions_metadata_output(
                     extension,
                 )
             } else {
-                ListObjectVersionMetadataEntry::Version(
-                    ObjectVersion {
+                ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
+                    e_tag: listed_etag(&object),
+                    object: ObjectVersion {
                         key: Some(object_name),
                         last_modified: object.mod_time.map(Timestamp::from),
                         size: Some(object.size),
                         version_id: Some(version_id),
                         is_latest: Some(object.is_latest),
-                        e_tag: object
-                            .etag
-                            .as_ref()
-                            .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
-                            .map(|etag| to_s3s_xml_etag(etag)),
                         storage_class: Some(ObjectVersionStorageClass::from(
                             object
                                 .storage_class
@@ -472,7 +456,7 @@ fn build_list_object_versions_metadata_output(
                         ..Default::default()
                     },
                     extension,
-                )
+                })
             }
         })
         .collect::<Vec<_>>();
@@ -545,15 +529,11 @@ fn build_list_objects_v2_metadata_output(
             };
 
             ObjectMetadataEntry {
+                e_tag: listed_etag(object),
                 object: Object {
                     key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
                     last_modified: object.mod_time.map(Timestamp::from),
                     size: Some(object.get_actual_size_or_physical()),
-                    e_tag: object
-                        .etag
-                        .as_ref()
-                        .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
-                        .map(|etag| to_s3s_xml_etag(etag)),
                     storage_class: Some(ObjectStorageClass::from(
                         object
                             .storage_class
@@ -806,6 +786,20 @@ mod tests {
                 user_defined: Arc::new(HashMap::from([("x-rustfs-encryption-original-size".to_owned(), "10485760".to_owned())])),
                 ..Default::default()
             },
+            ObjectInfo {
+                name: "weak".to_owned(),
+                etag: Some(r#"W/"a&<b""#.to_owned()),
+                ..Default::default()
+            },
+            ObjectInfo {
+                name: "stored-entities".to_owned(),
+                etag: Some(r#"x"'<>&amp;"#.to_owned()),
+                ..Default::default()
+            },
+            ObjectInfo {
+                name: "no-etag".to_owned(),
+                ..Default::default()
+            },
         ];
         let listings = build_list_objects_v2_metadata_output(
             ListObjectsV2Info {
@@ -826,15 +820,13 @@ mod tests {
             false,
             &HashMap::new(),
         );
-        assert!(listings.contents[0].object.e_tag.is_none());
-        assert!(listings.contents[1].object.e_tag.is_some());
-        assert!(listings.contents[2].object.e_tag.is_some());
+        assert!(listings.contents[0].e_tag.is_none());
+        assert!(listings.contents[1].e_tag.is_some());
+        assert!(listings.contents[2].e_tag.is_some());
         assert_eq!(
-            listings.contents[3].object.e_tag,
-            Some(to_s3s_xml_etag("1b8a77dff5845270a8d81d86a28f38ea-2"))
+            listings.contents[3].e_tag.as_ref().map(ETag::opaque_tag),
+            Some("1b8a77dff5845270a8d81d86a28f38ea-2")
         );
-        let xml = String::from_utf8(serialize_s3s_response(&listings)).expect("UTF-8 objects");
-        assert!(!xml.contains(legacy_md5));
 
         let versions = build_list_object_versions_metadata_output(
             ListObjectVersionsInfo {
@@ -853,13 +845,41 @@ mod tests {
             &HashMap::new(),
         );
         for (index, entry) in versions.entries.iter().enumerate() {
-            let ListObjectVersionMetadataEntry::Version(version, _) = entry else {
+            let ListObjectVersionMetadataEntry::Version(version) = entry else {
                 panic!("expected object version");
             };
-            assert_eq!(version.e_tag, listings.contents[index].object.e_tag);
+            assert_eq!(version.e_tag, listings.contents[index].e_tag);
         }
-        let xml = String::from_utf8(serialize_s3s_response(&versions)).expect("UTF-8 versions");
-        assert!(!xml.contains(legacy_md5));
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            #[serde(rename = "Contents", alias = "Version")]
+            entries: Vec<Entry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            #[serde(rename = "ETag")]
+            e_tag: Option<String>,
+        }
+        for bytes in [serialize_s3s_response(&listings), serialize_s3s_response(&versions)] {
+            let xml = std::str::from_utf8(&bytes).expect("UTF-8 listing");
+            assert!(!xml.contains(legacy_md5));
+            assert!(xml.contains(r#"<ETag>"a&amp;&lt;b"</ETag>"#));
+            assert!(xml.contains(r#"<ETag>"x&quot;&apos;&lt;&gt;&amp;amp;"</ETag>"#));
+            let listing: Listing = quick_xml::de::from_str(xml).expect("well-formed listing");
+            let tags: Vec<_> = listing.entries.iter().map(|entry| entry.e_tag.as_deref()).collect();
+            assert_eq!(
+                tags,
+                [
+                    None,
+                    Some(r#""0123456789abcdef0123456789abcdef""#),
+                    Some(r#""9876543210abcdef9876543210abcdef""#),
+                    Some(r#""1b8a77dff5845270a8d81d86a28f38ea-2""#),
+                    Some(r#""a&<b""#),
+                    Some(r#""x"'<>&amp;""#),
+                    None,
+                ]
+            );
+        }
     }
 
     #[test]
@@ -941,7 +961,7 @@ mod tests {
             &permissions,
         );
         for (index, entry) in versions.entries.iter().enumerate() {
-            let ListObjectVersionMetadataEntry::Version(_, extension) = entry else {
+            let ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry { extension, .. }) = entry else {
                 panic!("expected version");
             };
             assert_eq!(extension.user_metadata.is_some(), index >= 2);
@@ -1025,7 +1045,11 @@ mod tests {
         assert_eq!(output.entries.len(), 2);
 
         match &output.entries[0] {
-            ListObjectVersionMetadataEntry::Version(version, extension) => {
+            ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
+                object: version,
+                extension,
+                ..
+            }) => {
                 assert_eq!(version.key.as_deref(), Some("obj-a"));
                 // A null version's synthesized nil UUID must surface as the
                 // literal `null`, never as `00000000-…` (issue #6745).
@@ -1107,7 +1131,11 @@ mod tests {
         assert_eq!(output.output.next_version_id_marker, None);
 
         match &output.entries[0] {
-            ListObjectVersionMetadataEntry::Version(version, extension) => {
+            ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
+                object: version,
+                extension,
+                ..
+            }) => {
                 assert_eq!(version.key.as_deref(), Some("logs%20and%20more%2Fobject%20one.txt"));
                 assert!(extension.user_metadata.is_none());
                 assert!(extension.user_tags.is_none());
