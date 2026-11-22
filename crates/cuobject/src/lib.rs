@@ -244,7 +244,7 @@ pub struct CuObjectServer {
     port: u16,
     /// One permit per library channel (DC initiator): a transfer waits here
     /// instead of failing with `EBUSY` when every channel is in use.
-    channels: Arc<ChannelCapacity>,
+    channels: Arc<ChannelPool>,
     async_transfers: bool,
 }
 
@@ -437,7 +437,7 @@ impl CuObjectServer {
         let buffer = sdk::register_buffer(server.clone(), chunks * config.chunk_bytes)
             .map_err(|e| CuObjectError::sdk("register staging memory", e))?;
         Ok(Arc::new(Self {
-            channels: Arc::new(ChannelCapacity::new(usize::try_from(config.num_dcis).unwrap_or(1).max(1))),
+            channels: Arc::new(ChannelPool::new(usize::try_from(config.num_dcis).unwrap_or(1).max(1))),
             async_transfers: config.async_transfers,
             server,
             staging: Staging {
@@ -610,10 +610,7 @@ impl CuObjectServer {
             };
             let transfer = Transfer {
                 capacity: Arc::clone(&server.channels),
-                channel: Channel::lease(&server.server).map_err(|source| CuObjectError::Os {
-                    op: "lease channel",
-                    source,
-                })?,
+                channel: server.channels.checkout(&server.server)?,
                 region,
                 keep: chunk,
                 _permit: channel_permit,
@@ -652,10 +649,7 @@ impl CuObjectServer {
         let prepare = move || -> Result<_, CuObjectError> {
             Ok(Transfer {
                 capacity: Arc::clone(&server.channels),
-                channel: Channel::lease(&server.server).map_err(|source| CuObjectError::Os {
-                    op: "lease channel",
-                    source,
-                })?,
+                channel: server.channels.checkout(&server.server)?,
                 region: server.region(&local)?,
                 keep,
                 _permit: permit,
@@ -668,17 +662,8 @@ impl CuObjectServer {
         }
         tokio::spawn(async move {
             let mut transfer = prepare()?;
-            if let Some(fd) = transfer.channel.fd() {
-                // SAFETY: the FD is owned by the SDK. The registered object holds
-                // its server and the channel remains leased until deregistration.
-                #[allow(unsafe_code)]
-                let completions =
-                    unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|e| CuObjectError::Os {
-                        op: "completion fd",
-                        source: e.into_parts().1,
-                    })?;
+            if let Some(completions) = transfer.channel.completions()? {
                 if let Err(error) = transfer.submit(&key, &token, remote_offset, Mode::AsyncGet) {
-                    // Deregister before the channel lease can be returned and its fd reused.
                     drop(completions);
                     return Err(transfer.submission_failed(error));
                 }
@@ -691,7 +676,8 @@ impl CuObjectServer {
                         source: sdk::errno(status),
                     });
                 }
-                return Ok((transfer.region.length as u64, transfer.keep));
+                let moved = transfer.region.length as u64;
+                return Ok(transfer.complete(moved));
             }
             tokio::task::spawn_blocking(move || transfer.blocking(&key, &token, remote_offset, Mode::Get))
                 .await
@@ -745,17 +731,62 @@ fn contiguous_range(ranges: &[(usize, usize)]) -> Option<(usize, usize)> {
     Some((start, end - start))
 }
 
-struct ChannelCapacity {
+/// The reactor registration must be dropped before the SDK can reuse the channel ID.
+struct CachedChannel {
+    completion: Option<(tokio::runtime::Id, Arc<AsyncFd<sdk::CompletionFd>>)>,
+    channel: Channel,
+}
+
+impl CachedChannel {
+    fn completions(&mut self) -> Result<Option<Arc<AsyncFd<sdk::CompletionFd>>>, CuObjectError> {
+        let runtime = tokio::runtime::Handle::current().id();
+        if let Some((owner, fd)) = &self.completion
+            && *owner == runtime
+        {
+            return Ok(Some(Arc::clone(fd)));
+        }
+        self.completion = None;
+        let Some(fd) = self.channel.fd() else { return Ok(None) };
+        // SAFETY: the SDK owns the fd. This exclusive channel keeps it valid
+        // across successful transfers and deregisters it before releasing the ID.
+        #[allow(unsafe_code)]
+        let fd = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|e| CuObjectError::Os {
+            op: "completion fd",
+            source: e.into_parts().1,
+        })?;
+        let fd = Arc::new(fd);
+        self.completion = Some((runtime, Arc::clone(&fd)));
+        Ok(Some(fd))
+    }
+}
+
+struct ChannelPool {
+    idle: parking_lot::Mutex<Vec<CachedChannel>>,
     permits: Arc<Semaphore>,
     usable: AtomicUsize,
 }
 
-impl ChannelCapacity {
+impl ChannelPool {
     fn new(count: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(count)),
             usable: AtomicUsize::new(count),
+            idle: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    fn checkout(&self, server: &ServerHandle) -> Result<CachedChannel, CuObjectError> {
+        if let Some(channel) = self.idle.lock().pop() {
+            return Ok(channel);
+        }
+        let channel = Channel::lease(server).map_err(|source| CuObjectError::Os {
+            op: "lease channel",
+            source,
+        })?;
+        Ok(CachedChannel {
+            channel,
+            completion: None,
+        })
     }
 
     fn retire(&self) {
@@ -811,8 +842,8 @@ impl Region {
 
 /// Owns every resource the SDK may access or the allocator could reissue.
 struct Transfer<T> {
-    capacity: Arc<ChannelCapacity>,
-    channel: Channel,
+    capacity: Arc<ChannelPool>,
+    channel: CachedChannel,
     region: Region,
     keep: T,
     _permit: OwnedSemaphorePermit,
@@ -825,7 +856,7 @@ impl<T> Transfer<T> {
         // The async caller retains it through CQ completion. An ambiguous SDK
         // exception retains the entire owner, including its channel permit.
         #[allow(unsafe_code)]
-        let outcome = unsafe { self.channel.submit(&self.region.buffer, op) };
+        let outcome = unsafe { self.channel.channel.submit(&self.region.buffer, op) };
         if outcome.uncertain {
             return Err(CuObjectError::SubmissionUnknown(sdk::errno(outcome.count)));
         }
@@ -849,7 +880,12 @@ impl<T> Transfer<T> {
             Err(error) => return Err(self.submission_failed(error)),
         };
         check_moved(moved, self.region.length as u64)?;
-        Ok((moved, self.keep))
+        Ok(self.complete(moved))
+    }
+
+    fn complete(self, moved: u64) -> (u64, T) {
+        self.capacity.idle.lock().push(self.channel);
+        (moved, self.keep)
     }
 }
 
@@ -857,10 +893,10 @@ impl<T> Transfer<T> {
 /// memory to be reused. Dropping the wait or losing the CQ leaves them pinned.
 fn retain_until_completion<T>(
     owner: T,
-    capacity: Arc<ChannelCapacity>,
+    capacity: Arc<ChannelPool>,
     event: impl Future<Output = Result<isize, CuObjectError>>,
 ) -> impl Future<Output = Result<(T, isize), CuObjectError>> {
-    struct RetireOnLoss(Option<Arc<ChannelCapacity>>);
+    struct RetireOnLoss(Option<Arc<ChannelPool>>);
     impl Drop for RetireOnLoss {
         fn drop(&mut self) {
             if let Some(capacity) = &self.0 {
@@ -988,7 +1024,7 @@ mod tests {
 
     #[test]
     fn retiring_the_last_channel_fails_existing_waiters() {
-        let capacity = ChannelCapacity::new(1);
+        let capacity = ChannelPool::new(1);
         let _used = capacity.permits.try_acquire().expect("first channel");
         let mut waiting = std::pin::pin!(capacity.permits.acquire());
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -1010,7 +1046,7 @@ mod tests {
             }
         }
         let freed = AtomicUsize::new(0);
-        let capacity = Arc::new(ChannelCapacity::new(3));
+        let capacity = Arc::new(ChannelPool::new(3));
         use std::task::{Context, Poll, Waker};
         let mut ctx = Context::from_waker(Waker::noop());
         drop(retain_until_completion(Owner(&freed), Arc::clone(&capacity), future::pending()));
@@ -1024,7 +1060,7 @@ mod tests {
         assert!(matches!(std::pin::pin!(refused).as_mut().poll(&mut ctx), Poll::Ready(Err(_))));
         assert_eq!(freed.load(Ordering::SeqCst), 0);
         assert!(capacity.permits.is_closed());
-        let capacity = Arc::new(ChannelCapacity::new(1));
+        let capacity = Arc::new(ChannelPool::new(1));
         for status in [0, -5] {
             let completed = retain_until_completion(Owner(&freed), Arc::clone(&capacity), future::ready(Ok(status)));
             let Poll::Ready(Ok((owner, observed))) = std::pin::pin!(completed).as_mut().poll(&mut ctx) else {
@@ -1054,6 +1090,27 @@ mod tests {
             },
         )
         .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
+        runtime.block_on(async {
+            let permit = server.channel_permit().await.unwrap();
+            let mut channel = server.channels.checkout(&server.server).unwrap();
+            let registration = channel.completions().unwrap().expect("native completion fd");
+            let transfer = Transfer {
+                capacity: Arc::clone(&server.channels),
+                channel,
+                region: Region {
+                    buffer: server.staging.buffer.clone(),
+                    offset: 0,
+                    length: 1,
+                },
+                keep: (),
+                _permit: permit,
+            };
+            transfer.complete(1);
+            let _permit = server.channel_permit().await.unwrap();
+            let mut reused = server.channels.checkout(&server.server).unwrap();
+            assert!(Arc::ptr_eq(&registration, &reused.completions().unwrap().unwrap()));
+        });
         let mut first = server.try_reserve().unwrap();
         let mut second = server.try_reserve().unwrap();
         assert!(server.try_reserve().is_none());
