@@ -5521,6 +5521,27 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name};
 
+        const TEST: &str = "app::object::put::tests::diagnostic_s3_put_preserves_api_through_app_owner_and_tier_lookup";
+        const CHILD: &str = "RUSTFS_TEST_PUT_DIAGNOSTIC_TIER_LOOKUP_CHILD";
+        // Local disks normally reuse the rename result. Select the separate source lookup
+        // before ecstore caches the setting, without changing other tests' write paths.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--test-threads=1", "--color=never"])
+                .env(CHILD, "1")
+                .env("RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA", "false")
+                .env("RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP", "false")
+                .output()
+                .expect("run isolated tier lookup");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed;")),
+                "isolated tier lookup failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
