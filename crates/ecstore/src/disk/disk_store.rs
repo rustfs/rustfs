@@ -1873,28 +1873,9 @@ impl LocalDiskWrapper {
     }
 
     async fn acquire_disk_io_permit(&self) -> Result<Option<crate::disk::io_admission::DiskIoPermit>> {
-        if let Some(context) = current_disk_io_context() {
-            if let Some(permit) = context.permit.as_ref()
-                && permit.is_for(&self.io_admission)
-            {
-                return Ok(Some(permit.clone()));
-            }
-            if context
-                .admission
-                .as_ref()
-                .is_some_and(|admission| Arc::ptr_eq(admission, &self.io_admission))
-            {
-                return Ok(None);
-            }
-            if context.class == DiskIoClass::Background {
-                return context
-                    .background_permit(&self.io_admission)
-                    .await
-                    .map(Some)
-                    .map_err(DiskError::Io);
-            }
-        }
-        Ok(Some(self.io_admission.foreground()))
+        crate::disk::io_admission::acquire_wrapper_disk_io_permit(&self.io_admission)
+            .await
+            .map_err(DiskError::Io)
     }
 
     pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {

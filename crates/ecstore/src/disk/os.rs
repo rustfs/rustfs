@@ -428,6 +428,24 @@ pub(crate) mod prepared_publication_test_hooks {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_rename_hooks(source: &Path, destination: &Path) -> bool {
+        let before_publication = {
+            let guard = BEFORE_PUBLICATION.lock();
+            !guard.is_empty()
+                && (guard.contains_key(&(Stage::Rename, source.to_path_buf()))
+                    || guard.contains_key(&(Stage::Rename, destination.to_path_buf())))
+        };
+        #[cfg(test)]
+        {
+            before_publication || RENAME_DESTINATIONS.lock().contains_key(source)
+        }
+        #[cfg(not(test))]
+        {
+            before_publication
+        }
+    }
+
     #[cfg(test)]
     type RenameDestinationHook = Box<dyn FnOnce(&Path) + Send>;
     #[cfg(test)]
@@ -2868,6 +2886,11 @@ impl DiskBlockingQueue {
     #[cfg(test)]
     pub(crate) fn submitted_jobs_for_test(&self) -> usize {
         self.lanes.iter().map(|lane| lane.state.lock().submitted_jobs).sum()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn submitted_fsync_jobs_for_test(&self) -> usize {
+        self.lane(DiskBlockingLane::Fsync).state.lock().submitted_jobs
     }
 
     #[inline]
@@ -5321,11 +5344,11 @@ pub(crate) async fn rename_all_with_prepared_source(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
-    guard.directories.prepare_destination().map_err(to_file_error)?;
-    #[cfg(test)]
-    prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(any(test, feature = "test-util"))]
-    {
+    if prepared_publication_test_hooks::has_rename_hooks(source, destination) {
+        guard.directories.prepare_destination().map_err(to_file_error)?;
+        #[cfg(test)]
+        prepared_publication_test_hooks::run_rename_destination(source, destination);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
     }
@@ -5683,12 +5706,13 @@ pub(crate) async fn acquire_file_sync_admission(disk_permits: Arc<Semaphore>) ->
 /// Keep the disk admission and namespace lease with the blocking syscall if
 /// the async waiter is cancelled. The process-wide admission remains with the
 /// waiter so cancellation cannot starve healthy disks.
+#[cfg(any(unix, test))]
 pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     admission: &FileSyncAdmission,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    run_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
+    run_cancellable_blocking_namespace_file_sync_operation(lease, admission, move |_| operation()).await
 }
 
 pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Send + 'static>(
@@ -5697,16 +5721,6 @@ pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Se
     operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
-}
-
-async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
-    lease: Arc<NamespaceMutationLease>,
-    admission: &FileSyncAdmission,
-    global_permits: &Semaphore,
-    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, global_permits, move |_| operation())
-        .await
 }
 
 async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
@@ -12596,11 +12610,16 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let waiter_global_permits = global_permits.clone();
         let waiter = tokio::spawn(async move {
-            run_blocking_namespace_file_sync_operation_with_global(lease, &admission, waiter_global_permits.as_ref(), move || {
-                entered_tx.send(()).expect("signal blocking work");
-                release_rx.recv().expect("wait for blocking work release");
-                Ok(())
-            })
+            run_cancellable_blocking_namespace_file_sync_operation_with_global(
+                lease,
+                &admission,
+                waiter_global_permits.as_ref(),
+                move |_| {
+                    entered_tx.send(()).expect("signal blocking work");
+                    release_rx.recv().expect("wait for blocking work release");
+                    Ok(())
+                },
+            )
             .await
         });
 

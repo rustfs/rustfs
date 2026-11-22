@@ -74,12 +74,27 @@ or the remote endpoint.
 
 ### `remove`
 
-The original topology and each peer acknowledgement are persisted before the
-operation finalizes. While peers remain in `pendingPeers`, restore access to
-them and wait for reconciliation. If a peer is permanently gone, a new remove
-request may remove all currently active unacknowledged peers; RustFS permits
-that request and then finalizes against the remaining topology. Removing the
-local site or all sites is also an explicit completion path.
+The original topology and each peer acknowledgement are persisted before the operation finalizes. Ordinary removal requires every original remote peer to acknowledge, including the removed peer. Repeating ordinary removal, including with `--all`, resumes the recorded operation and does not bypass that acknowledgement requirement.
+
+For a permanently retired peer, use durable decommissioning after upgrading every node in the surviving sites to support the v2 removal protocol:
+
+```bash
+rc admin replicate remove primary --site "Site 2" --force --yes
+```
+
+The CLI first requests a preview and binds execution to its operation ID, exact deployment identities, deletion scope, and current topology. Only the selected retired site is exempt from acknowledgement. Other participating sites must durably clean their local bucket replication rules and targets before acknowledging. There is no fallback to legacy removal when the server does not support the v2 route.
+
+To dissolve the group, explicitly name every permanently retired remote site whose acknowledgement may be skipped:
+
+```bash
+rc admin replicate remove primary --all --force --decommissioned-site "Site 2" --yes
+```
+
+An existing `pending_remove` can be converted only when the request preserves its original deletion scope; the server resolves removed identities from the recorded original topology. A `Partial` response remains pending across restarts and the heavyweight reconciler retries it. Resume it with the same selectors and `--operation-id <id>`. Never erase the pending state object manually.
+
+Decommissioning cleans site-derived rules, unreferenced site-derived targets, control-plane retries, and the removed targets' durable resync intents. Independent operator bucket replication rules and ILM targets remain. A successful response means configuration cleanup completed; it does not delete ordinary data, historical versions, or Object Lock protections. The scanner and deletion worker subsequently release versions already pending deletion when their removed target is no longer configured. Other active targets must still confirm their part of a pending purge. Use ordinary S3 version cleanup and bucket deletion afterwards.
+
+Completed v2 removal identities and the topology timestamp remain durable to fence delayed requests. Do not downgrade surviving nodes while a v2 removal is pending; older code does not understand its journal. A previously retired deployment may rejoin only through an explicit add after the removal completes. Decommissioning does not revoke shared site-replication credentials from a reachable former peer; isolate that peer before decommissioning and use the existing credential rotation procedure if credential revocation is required.
 
 Do not re-add a site merely to hide this marker. First compare the topology on
 all reachable peers. If the same operation ID makes no progress for more than

@@ -18,6 +18,7 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// PatternRules - Event rule that maps object name patterns to TargetID collections.
 /// `event.Rules` (map[string]TargetIDSet) in the Go code
@@ -39,7 +40,7 @@ impl PatternRules {
     /// * `pattern` - The object name pattern.
     /// * `target_id` - The TargetID to associate with the pattern.
     pub fn add(&mut self, pattern: String, target_id: TargetID) {
-        self.rules.entry(pattern).or_default().insert(target_id);
+        self.rules.entry(pattern).or_default().insert(Arc::new(target_id));
     }
 
     /// Checks if there are any rules that match the given object name.
