@@ -25,6 +25,7 @@ use rustfs_iam::sys::{
 };
 use rustfs_policy::policy::action::Action;
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case;
@@ -33,7 +34,6 @@ use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::auth::S3Auth;
 use s3s::auth::SecretKey;
-use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -131,33 +131,18 @@ pub enum AuthType {
     StreamingUnsignedTrailer,
 }
 
+#[derive(Clone)]
 pub struct IAMAuth {
-    simple_auth: SimpleAuth,
     access_key: String,
     secret_key: SecretKey,
     server_ctx: Option<std::sync::Arc<ServerContextSlot>>,
 }
 
-impl Clone for IAMAuth {
-    fn clone(&self) -> Self {
-        Self {
-            simple_auth: SimpleAuth::from_single(self.access_key.clone(), self.secret_key.clone()),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            server_ctx: self.server_ctx.clone(),
-        }
-    }
-}
-
 impl IAMAuth {
     pub fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
-        let access_key = ak.into();
-        let secret_key = sk.into();
-        let simple_auth = SimpleAuth::from_single(access_key.clone(), secret_key.clone());
         Self {
-            simple_auth,
-            access_key,
-            secret_key,
+            access_key: ak.into(),
+            secret_key: sk.into(),
             server_ctx: None,
         }
     }
@@ -204,10 +189,6 @@ impl S3Auth for IAMAuth {
 
         if access_key == self.access_key {
             return Ok(self.secret_key.clone());
-        }
-
-        if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
-            return Ok(key);
         }
 
         let iam_store = match &self.server_ctx {
@@ -1204,7 +1185,7 @@ pub(crate) fn parse_presigned_put_max_content_length(
     header: &HeaderMap,
     query: Option<&str>,
     verified_presigned: bool,
-) -> S3Result<Option<u64>> {
+) -> OwnedResult<Option<u64>> {
     let Some(query) = query else {
         return Ok(None);
     };
@@ -1215,16 +1196,13 @@ pub(crate) fn parse_presigned_put_max_content_length(
         decoded_query.push((name.to_string(), candidate.to_string()));
         if name == RUSTFS_MAX_CONTENT_LENGTH_QUERY {
             if value.is_some() {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must appear exactly once"),
-                ));
+                return Err(owned_error!(InvalidRequest, "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must appear exactly once"));
             }
             value = Some(candidate.into_owned());
         } else if name.eq_ignore_ascii_case(RUSTFS_MAX_CONTENT_LENGTH_QUERY) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("query parameter name must be exactly {RUSTFS_MAX_CONTENT_LENGTH_QUERY}"),
+            return Err(owned_error!(
+                InvalidRequest,
+                "query parameter name must be exactly {RUSTFS_MAX_CONTENT_LENGTH_QUERY}"
             ));
         }
     }
@@ -1255,18 +1233,15 @@ pub(crate) fn parse_presigned_put_max_content_length(
         || !is_complete_sigv4_query
         || !matches!(get_request_auth_type_with_query(header, Some(query)), AuthType::Presigned)
     {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} requires a SigV4 presigned request"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} requires a SigV4 presigned request"
         ));
     }
 
-    let limit = value.parse::<u64>().map_err(|_| {
-        S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must be a non-negative 64-bit integer"),
-        )
-    })?;
+    let limit = value
+        .parse::<u64>()
+        .map_err(|_| owned_error!(InvalidRequest, "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must be a non-negative 64-bit integer"))?;
 
     Ok(Some(limit))
 }
@@ -1277,11 +1252,11 @@ pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
     header: &HeaderMap,
     query: Option<&str>,
     verified_presigned: bool,
-) -> S3Result<()> {
+) -> OwnedResult<()> {
     if parse_presigned_put_max_content_length(header, query, verified_presigned)?.is_some() {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"
         ));
     }
     Ok(())
@@ -1295,7 +1270,7 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
     header: &HeaderMap,
     query: Option<&str>,
     verified_sigv4: bool,
-) -> S3Result<Option<u64>> {
+) -> OwnedResult<Option<u64>> {
     let Some(query) = query else {
         return Ok(None);
     };
@@ -1306,16 +1281,16 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
         decoded_query.push((name.to_string(), candidate.to_string()));
         if name == RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY {
             if value.is_some() {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must appear exactly once"),
+                return Err(owned_error!(
+                    InvalidRequest,
+                    "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must appear exactly once"
                 ));
             }
             value = Some(candidate.into_owned());
         } else if name.eq_ignore_ascii_case(RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("query parameter name must be exactly {RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}"),
+            return Err(owned_error!(
+                InvalidRequest,
+                "query parameter name must be exactly {RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}"
             ));
         }
     }
@@ -1345,16 +1320,16 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
 
     let authenticated = verified_sigv4 && (is_header_signed || (is_presigned && complete_presigned_query));
     if !authenticated {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} requires a verified SigV4 request"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} requires a verified SigV4 request"
         ));
     }
 
     value.parse::<u64>().map(Some).map_err(|_| {
-        S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must be a non-negative 64-bit integer"),
+        owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must be a non-negative 64-bit integer"
         )
     })
 }
@@ -1363,11 +1338,11 @@ pub(crate) fn reject_presigned_multipart_max_total_object_size_for_other_operati
     header: &HeaderMap,
     query: Option<&str>,
     verified_sigv4: bool,
-) -> S3Result<()> {
+) -> OwnedResult<()> {
     if parse_presigned_multipart_max_total_object_size(header, query, verified_sigv4)?.is_some() {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"
         ));
     }
     Ok(())
@@ -1541,8 +1516,8 @@ mod tests {
         let iam_auth = IAMAuth::new("test-ak", SecretKey::from("test-sk"));
         let cloned = iam_auth.clone();
 
-        let secret = cloned.get_secret_key("test-ak").await;
-        assert!(secret.is_ok());
+        let secret = cloned.get_secret_key("test-ak").await.expect("cloned root credentials");
+        assert_eq!(secret.expose(), "test-sk");
     }
 
     #[tokio::test]
@@ -2443,6 +2418,12 @@ mod tests {
         assert_eq!(result, Some("value=with=equals"));
     }
 
+    fn assert_invalid_capability(error: rustfs_s3_types::S3Error, message: &str) {
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(error.message(), Some(message));
+    }
+
     #[test]
     fn presigned_put_max_content_length_requires_exactly_one_signed_query_value() {
         let headers = HeaderMap::new();
@@ -2461,26 +2442,25 @@ mod tests {
         );
 
         let duplicate = format!("{query}&x-rustfs-max-content-length=1");
-        assert_eq!(
-            parse_presigned_put_max_content_length(&headers, Some(&duplicate), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(&duplicate), true).unwrap_err(),
+            "x-rustfs-max-content-length must appear exactly once",
         );
 
         let wrong_case = format!("{signed_prefix}&X-RustFS-Max-Content-Length=1");
-        assert_eq!(
-            parse_presigned_put_max_content_length(&headers, Some(&wrong_case), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(&wrong_case), true).unwrap_err(),
+            "query parameter name must be exactly x-rustfs-max-content-length",
         );
 
-        assert_eq!(
-            reject_presigned_put_max_content_length_for_other_operation(&headers, Some(&query), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            reject_presigned_put_max_content_length_for_other_operation(&headers, Some(&query), true).unwrap_err(),
+            "x-rustfs-max-content-length is only supported for presigned PutObject",
+        );
+        let overflow = format!("{signed_prefix}&x-rustfs-max-content-length=18446744073709551616");
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(&overflow), true).unwrap_err(),
+            "x-rustfs-max-content-length must be a non-negative 64-bit integer",
         );
     }
 
@@ -2749,11 +2729,9 @@ mod tests {
     fn presigned_put_max_content_length_rejects_unsigned_or_invalid_values() {
         let headers = HeaderMap::new();
         let forged = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/credential&X-Amz-Signature=fake&x-rustfs-max-content-length=1";
-        assert_eq!(
-            parse_presigned_put_max_content_length(&headers, Some(forged), false)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(forged), false).unwrap_err(),
+            "x-rustfs-max-content-length requires a SigV4 presigned request",
         );
         for query in [
             "x-rustfs-max-content-length=1",
@@ -2761,7 +2739,7 @@ mod tests {
             "X-Amz-Credential=test/credential&x-rustfs-max-content-length=18446744073709551616",
         ] {
             let error = parse_presigned_put_max_content_length(&headers, Some(query), true).unwrap_err();
-            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_invalid_capability(error, "x-rustfs-max-content-length requires a SigV4 presigned request");
         }
     }
 
@@ -2775,11 +2753,14 @@ mod tests {
             parse_presigned_multipart_max_total_object_size(&headers, Some(&query), true).unwrap(),
             Some(104_857_600)
         );
-        assert_eq!(
-            reject_presigned_multipart_max_total_object_size_for_other_operation(&headers, Some(&query), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            reject_presigned_multipart_max_total_object_size_for_other_operation(&headers, Some(&query), true).unwrap_err(),
+            "x-rustfs-max-total-object-size is only supported for CreateMultipartUpload",
+        );
+        let overflow = format!("{signed_prefix}&x-rustfs-max-total-object-size=18446744073709551616");
+        assert_invalid_capability(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&overflow), true).unwrap_err(),
+            "x-rustfs-max-total-object-size must be a non-negative 64-bit integer",
         );
     }
 
@@ -2787,27 +2768,31 @@ mod tests {
     fn multipart_max_total_object_size_rejects_tampering_and_invalid_values() {
         let headers = HeaderMap::new();
         let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
-        for query in [
-            "x-rustfs-max-total-object-size=1",
-            "X-RustFS-Max-Total-Object-Size=1",
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=1&x-rustfs-max-total-object-size=2",
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=-1",
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=18446744073709551616",
+        let auth_message = "x-rustfs-max-total-object-size requires a verified SigV4 request";
+        for (query, message) in [
+            ("x-rustfs-max-total-object-size=1", auth_message),
+            (
+                "X-RustFS-Max-Total-Object-Size=1",
+                "query parameter name must be exactly x-rustfs-max-total-object-size",
+            ),
+            (
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=1&x-rustfs-max-total-object-size=2",
+                "x-rustfs-max-total-object-size must appear exactly once",
+            ),
+            ("X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=-1", auth_message),
+            (
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=18446744073709551616",
+                auth_message,
+            ),
         ] {
-            assert_eq!(
-                parse_presigned_multipart_max_total_object_size(&headers, Some(query), true)
-                    .unwrap_err()
-                    .code(),
-                &S3ErrorCode::InvalidRequest
-            );
+            let error = parse_presigned_multipart_max_total_object_size(&headers, Some(query), true).unwrap_err();
+            assert_invalid_capability(error, message);
         }
 
         let forged = format!("{signed_prefix}&x-rustfs-max-total-object-size=1");
-        assert_eq!(
-            parse_presigned_multipart_max_total_object_size(&headers, Some(&forged), false)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&forged), false).unwrap_err(),
+            "x-rustfs-max-total-object-size requires a verified SigV4 request",
         );
     }
 
