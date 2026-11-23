@@ -30,7 +30,7 @@ use super::lifecycle::SessionDiag;
 use super::paths::{copy_source_value, parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
 use super::write::{build_write_tombstone, fstat_reported_size, rejects_excl_or_trunc_without_create, should_abort_on_drop};
-use crate::common::client::s3::StorageBackend;
+use crate::common::client::s3::{MultipartRequest, StorageBackend};
 use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 use russh_sftp::protocol::{
@@ -38,7 +38,7 @@ use russh_sftp::protocol::{
 };
 use rustfs_credentials::Credentials;
 use rustfs_gateway_types::dto::{AbortMultipartUploadInput, CopyObjectInput, ListObjectsV2Input};
-use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
+use rustfs_gateway_types::{BucketName, ObjectKey};
 use rustfs_utils::MaskedAccessKey;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -1127,11 +1127,10 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                     let input = AbortMultipartUploadInput::builder()
                         .bucket(BucketName::new(bucket.clone()).expect("validated bucket name"))
                         .key(ObjectKey::new(key.clone()).expect("validated object key"))
-                        .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
                         .build();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(backend_op_timeout_secs),
-                        storage.abort_multipart_upload(input, &credentials),
+                        storage.abort_multipart_upload(MultipartRequest::abort(input, upload_id.clone()), &credentials),
                     )
                     .await
                     {

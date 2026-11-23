@@ -13,6 +13,42 @@ def replace_once(source, old, new, path):
     return source.replace(old, new)
 
 
+# The original application entry point on the pre-conditional-read baseline.
+# Keep scenario generation, timing, response validation, and metrics in the shared harness.
+BASELINE_GET_API = """mod get_api {
+    use super::*;
+
+    pub(super) async fn get(
+        usecase: &DefaultObjectUsecase,
+        object: &str,
+        headers: HeaderMap,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let input = GetObjectInput::builder()
+            .bucket("conditional-bench".to_owned())
+            .key(object.to_owned())
+            .build()
+            .expect("benchmark input");
+        let mut request = build_request(input, http::Method::GET);
+        request.headers = headers;
+        usecase.execute_get_object(request).await
+    }
+
+    pub(super) async fn consume(mut body: StreamingBlob, actual: &mut Vec<u8>) {
+        while let Some(chunk) = body.next().await {
+            actual.extend_from_slice(&chunk.expect("benchmark body chunk"));
+        }
+    }
+}"""
+
+
+def baseline_harness(source):
+    harness, count = re.subn(r"^mod get_api \{\n.*?^\}", lambda _: BASELINE_GET_API,
+                             source, flags=re.MULTILINE | re.DOTALL)
+    if count != 1:
+        raise ValueError("expected one GET adapter module in the shared benchmark harness")
+    return harness
+
+
 def prepare(root, baseline, revision):
     if baseline.resolve() == root.resolve():
         raise ValueError("baseline must be a separate worktree")
@@ -56,7 +92,8 @@ def prepare(root, baseline, revision):
                  "crates/ecstore/src/set_disk/conditional_read_bench.rs"):
         if (baseline / path).exists():
             raise ValueError(f"baseline already contains {path}")
-        edits[path] = (root / path).read_text()
+        harness = (root / path).read_text()
+        edits[path] = baseline_harness(harness) if path.startswith("rustfs/") else harness
     # Resolve every anchor before writing; never apply a partial adapter.
     for path, source in edits.items():
         (baseline / path).write_text(source)

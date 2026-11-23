@@ -17,16 +17,15 @@
 
 use super::*;
 use crate::app::multipart_usecase::{DefaultMultipartUsecase, UploadPartCopyWriteInput, UploadPartCopyWriteOutput};
-use crate::app::storage_api::s3::S3Response;
 use rustfs_gateway_types::{CopySourceValue, UploadIdClaim, dto};
-use rustfs_protocols::common::client::s3::StorageBackend;
+use rustfs_protocols::common::client::s3::{MultipartRequest, StorageBackend};
 use rustfs_s3_types::S3Error;
 
-fn input(bucket: &str, upload: &str) -> dto::UploadPartCopyInput {
+fn input(bucket: &str) -> dto::UploadPartCopyInput {
     dto::UploadPartCopyInput {
         bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
         key: rustfs_gateway_types::ObjectKey::new("copy-target").expect("key"),
-        upload_id: UploadIdClaim::from_wire(upload),
+        upload_id: UploadIdClaim::default(),
         part_number: 1,
         copy_source: CopySourceValue::Bucket {
             bucket: bucket.into(),
@@ -118,8 +117,9 @@ fn protocol_upload_copy_original_refusal_order() {
             .await
             .expect("metadata");
         for case in 0..13 {
+            let upload_id = if case == 4 { "missing" } else { &upload.upload_id };
             let make = || {
-                let mut request = input(bucket, &upload.upload_id);
+                let mut request = input(bucket);
                 match case {
                     0 => {
                         request.part_number = 0;
@@ -143,10 +143,7 @@ fn protocol_upload_copy_original_refusal_order() {
                         request.copy_source_range = Some("bad-range".into());
                     }
                     3 => request.part_number = 0,
-                    4 => {
-                        request.upload_id = UploadIdClaim::from_wire("missing");
-                        request.copy_source_if_match = Some("missing".into());
-                    }
+                    4 => request.copy_source_if_match = Some("missing".into()),
                     5 => {
                         request.copy_source_if_match = Some("missing".into());
                         request.copy_source_range = Some("bytes=100-200".into());
@@ -175,7 +172,10 @@ fn protocol_upload_copy_original_refusal_order() {
             };
             let expected_count = if matches!(case, 0 | 8..=10) { 0 } else { 1 };
             let before_count = copy_count();
-            let actual = backend.upload_part_copy(make(), &root).await.expect_err("client refusal");
+            let actual = backend
+                .upload_part_copy(MultipartRequest::upload_part_copy(make(), upload_id), &root)
+                .await
+                .expect_err("client refusal");
             assert_eq!(copy_count() - before_count, expected_count);
             assert_eq!(
                 audit_operations(),
@@ -287,11 +287,14 @@ fn protocol_upload_copy_original_range_and_metadata() {
                     .get_multipart_info(bucket, "copy-target", &upload.upload_id, &options)
                     .await
                     .expect("metadata");
-                let mut request = input(bucket, &upload.upload_id);
+                let mut request = input(bucket);
                 request.copy_source_range = Some("bytes=2-6".into());
                 request.copy_source_if_match = Some(format!("\"{source_etag}\""));
                 let before_count = copy_count();
-                let output = backend.upload_part_copy(request, &root).await.expect("range copy");
+                let output = backend
+                    .upload_part_copy(MultipartRequest::upload_part_copy(request, &upload.upload_id), &root)
+                    .await
+                    .expect("range copy");
                 assert_eq!(copy_count() - before_count, 1);
                 let result = output;
                 assert!(result.last_modified.is_some());
@@ -384,7 +387,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             .new_multipart_upload(destination, "copy-target", &options)
             .await
             .expect("old upload");
-        let mut request = input(source, &upload.upload_id);
+        let mut request = input(source);
         request.bucket = rustfs_gateway_types::BucketName::new(destination).expect("destination name");
         let uri = build_object_uri(
             destination,
@@ -422,7 +425,8 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             )
             .await
             .expect("replacement bytes");
-        let (_, input) = multipart::prepare_upload_part_copy(request).expect("owned input");
+        let (_, input) = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(request, &upload.upload_id))
+            .expect("owned input");
         let result = backend
             .owned_multipart_usecase()
             .execute_upload_part_copy_with_audit(envelope, input)
@@ -451,7 +455,7 @@ fn owned_condition(value: Option<crate::app::object_usecase::CopySourceCondition
 fn protocol_upload_copy_input_matches_original_codec() {
     for case in 0..22 {
         let make = || {
-            let mut request = input("bucket", "upload ?&");
+            let mut request = input("bucket");
             match case {
                 0..=8 => {
                     let condition = [
@@ -507,10 +511,12 @@ fn protocol_upload_copy_input_matches_original_codec() {
         let expected = legacy_copy_source(make().copy_source)
             .map_err(|error| conversion_error("UploadPartCopy copy_source", error))
             .and_then(|source| {
-                gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(make(), source)
+                let mut legacy = make();
+                legacy.upload_id = UploadIdClaim::from_wire("upload ?&");
+                gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(legacy, source)
                     .map_err(|error| conversion_error("UploadPartCopy input", error))
             });
-        let actual = multipart::prepare_upload_part_copy(make());
+        let actual = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(make(), "upload ?&"));
         match (actual, expected) {
             (Err(actual), Err(expected)) => assert_eq!(error_facts(actual), error_facts(expected)),
             (Ok((uri, actual)), Ok(expected)) => {
@@ -594,42 +600,70 @@ fn output_facts(raw: Option<&str>) -> crate::app::multipart_usecase::UploadPartC
 
 #[test]
 fn protocol_upload_copy_output_matches_original_composed_codec() {
-    for raw in [
-        None,
-        Some("abc"),
-        Some("\"abc\""),
-        Some("W/\"abc\""),
-        Some("a&\"b"),
-        Some(""),
-        Some("\"\""),
-        Some("a\0b"),
+    let missing = "failed to convert UploadPartCopy output through the gateway compatibility seam: e_tag: the gateway shape requires this member";
+    let invalid = "failed to convert UploadPartCopy output through the gateway compatibility seam: e_tag: not an entity tag the gateway can write";
+    for (raw, expected) in [
+        (None, Err(missing)),
+        (Some("abc"), Ok(("abc", false))),
+        (Some("\"abc\""), Ok(("abc", false))),
+        (Some("W/\"abc\""), Ok(("abc", true))),
+        (Some("a&\"b"), Ok(("a&amp;&quot;b", false))),
+        (Some(""), Err(invalid)),
+        (Some("\"\""), Err(invalid)),
+        (Some("a\0b"), Err(invalid)),
     ] {
-        let fields = output_facts(raw);
-        let legacy = UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: raw.map(crate::app::storage_api::multipart_usecase::object_utils::to_s3s_xml_etag),
-                last_modified: fields.last_modified.map(Timestamp::from),
-                checksum_crc32: fields.checksum_crc32,
-                checksum_crc32c: fields.checksum_crc32c,
-                checksum_sha1: fields.checksum_sha1,
-                checksum_sha256: fields.checksum_sha256,
-                checksum_crc64nvme: fields.checksum_crc64nvme,
-                ..Default::default()
-            }),
-            copy_source_version_id: fields.copy_source_version_id,
-            server_side_encryption: fields.server_side_encryption.map(ServerSideEncryption::from),
-            ssekms_key_id: fields.ssekms_key_id,
-            sse_customer_algorithm: fields.sse_customer_algorithm,
-            sse_customer_key_md5: fields.sse_customer_key_md5,
-            ..Default::default()
-        };
-        let expected = gateway_s3s_compat::generated::ops::upload_part_copy::output_from_s3s(legacy)
-            .map(|output| format!("{output:?}"))
-            .map_err(|error| conversion_error("UploadPartCopy output", error).to_string());
-        let actual = multipart::upload_part_copy_output(output_facts(raw))
-            .map(|output| format!("{output:?}"))
-            .map_err(|error| error.to_string());
-        assert_eq!(actual, expected, "stored tag {raw:?}");
+        let result = multipart::upload_part_copy_output(output_facts(raw));
+        match expected {
+            Err(message) => {
+                let error = result.expect_err("unrepresentable stored ETag");
+                assert!(std::error::Error::source(&error).is_none());
+                assert_eq!(
+                    error_facts(error),
+                    (
+                        "InternalError".to_owned(),
+                        Some(message.to_owned()),
+                        Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                        None
+                    ),
+                    "{raw:?}"
+                );
+            }
+            Ok((opaque, weak)) => {
+                let output = result.expect("copy output");
+                let expected = dto::UploadPartCopyOutput {
+                    e_tag: if weak {
+                        rustfs_gateway_types::ETag::new_weak(opaque)
+                    } else {
+                        rustfs_gateway_types::ETag::new(opaque)
+                    }
+                    .expect("ETag"),
+                    last_modified: Some(
+                        rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000)
+                            .expect("millisecond timestamp"),
+                    ),
+                    copy_source_version_id: Some("null".into()),
+                    server_side_encryption: Some(dto::ServerSideEncryption::custom("aws:kms")),
+                    ssekms_key_id: Some("kms-id".into()),
+                    sse_customer_algorithm: Some("AES256".into()),
+                    sse_customer_key_md5: Some("digest".into()),
+                    checksum_crc32: Some("crc32".into()),
+                    checksum_crc32c: Some("crc32c".into()),
+                    checksum_crc64nvme: Some("crc64nvme".into()),
+                    checksum_sha1: Some("sha1".into()),
+                    checksum_sha256: Some("sha256".into()),
+                    bucket_key_enabled: None,
+                    request_charged: None,
+                    checksum_sha512: None,
+                    checksum_md5: None,
+                    checksum_xxhash64: None,
+                    checksum_xxhash3: None,
+                    checksum_xxhash128: None,
+                };
+                assert_eq!(format!("{output:?}"), format!("{expected:?}"), "{raw:?}");
+                assert_eq!(output.ssekms_key_id, expected.ssekms_key_id);
+                assert_eq!(output.sse_customer_key_md5, expected.sse_customer_key_md5);
+            }
+        }
     }
 }
 
@@ -659,14 +693,6 @@ fn protocol_upload_copy_error_keeps_explicit_message_headers_and_storage_cause()
 }
 
 // Keep construction of the large use-case futures outside the test's async frame.
-#[inline(never)]
-fn legacy_copy_future(
-    usecase: &DefaultMultipartUsecase,
-    request: S3Request<UploadPartCopyInput>,
-) -> impl std::future::Future<Output = S3Result<S3Response<UploadPartCopyOutput>>> + '_ {
-    Box::pin(usecase.execute_upload_part_copy(request))
-}
-
 #[inline(never)]
 fn owned_copy_future(
     usecase: &DefaultMultipartUsecase,
@@ -701,40 +727,44 @@ async fn protocol_upload_copy_capabilities_precede_part_validation() {
             "x-rustfs-max-total-object-size is only supported for CreateMultipartUpload",
         ),
     ] {
-        let make = || {
-            let mut request = input("bucket", "upload");
-            request.part_number = 0;
-            request
-        };
-        let source = legacy_copy_source(make().copy_source).expect("source");
-        let legacy = gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(make(), source).expect("legacy input");
-        let uri = format!("/bucket/copy-target?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=fixture/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=fixture{query}").parse().expect("URI");
-        let mut request = ProtocolStorageClient::create_request(
-            legacy,
+        let uri: http::Uri = format!("/bucket/copy-target?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=fixture/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=fixture{query}").parse().expect("URI");
+        let request = ProtocolStorageClient::create_envelope(
             Method::PUT,
-            uri,
+            uri.clone(),
             RequestParams {
                 bucket: Some("bucket".into()),
                 object: Some("copy-target".into()),
                 credentials: &credentials,
             },
-        )
-        .expect("request");
-        request.extensions.insert(crate::auth::VerifiedSigV4Request);
-        request.extensions.insert(crate::auth::VerifiedPresignedRequest);
-        let envelope = crate::app::RequestEnvelope::from_s3s(&request);
-        let usecase = crate::app::multipart_usecase::DefaultMultipartUsecase::without_context();
-        let expected = legacy_copy_future(&usecase, request)
-            .await
-            .err()
-            .map(S3Error::from)
-            .expect("legacy refusal");
-        let (_, input) = multipart::prepare_upload_part_copy(make()).expect("owned input");
+        );
+        let mut extensions = http::Extensions::new();
+        extensions.insert(request.req_info().expect("request identity").clone());
+        extensions.insert(crate::auth::VerifiedSigV4Request);
+        extensions.insert(crate::auth::VerifiedPresignedRequest);
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri,
+                headers: HeaderMap::new(),
+                credentials: request.credentials().cloned(),
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let usecase = DefaultMultipartUsecase::without_context();
+        let mut request = input("bucket");
+        request.part_number = 0;
+        let (_, input) =
+            multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(request, "upload")).expect("owned input");
         let actual = owned_copy_future(&usecase, envelope, input)
             .await
             .err()
             .expect("owned refusal");
-        assert_eq!((actual.code().as_str(), actual.message()), (code, Some(message)));
-        assert_eq!(error_facts(actual), error_facts(expected));
+        assert!(std::error::Error::source(&actual).is_none());
+        assert_eq!(
+            error_facts(actual),
+            (code.to_owned(), Some(message.to_owned()), Some(http::StatusCode::BAD_REQUEST), None)
+        );
     }
 }

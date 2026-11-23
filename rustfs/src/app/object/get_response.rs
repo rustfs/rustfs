@@ -36,6 +36,24 @@ pub(crate) struct GetObjectFields {
     pub(crate) sse_customer_key_md5: Option<String>,
 }
 
+impl From<dto::GetObjectInput> for GetObjectFields {
+    fn from(input: dto::GetObjectInput) -> Self {
+        use rustfs_gateway_types::RangeParse;
+        Self {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            version_id: input.version_id,
+            part_number: input.part_number,
+            range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
+                RangeParse::One(range) => Some(range),
+                _ => None,
+            }),
+            sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
 impl GetObjectFields {
     /// The conditional-read wire format permits a wildcard, a quoted tag, or a bare S3 tag.
     pub(crate) fn valid_etag_condition(value: &[u8]) -> bool {

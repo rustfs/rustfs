@@ -20,11 +20,12 @@ use super::*;
 use crate::app::RequestEnvelope;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
-use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
+#[cfg(test)]
+use crate::app::storage_api::s3::stream::ByteStream;
 use futures::FutureExt;
 use rustfs_gateway_stream::Body as NativeBody;
 use rustfs_rio::SharedTrailerSource;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, StdError};
 
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
@@ -123,22 +124,17 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
     let decoded_content_length = decoded_content_length_from_headers(headers)?;
     let aws_chunked = request_uses_aws_chunked(headers) || request_body_is_aws_chunked_framed(headers);
     let size = match (aws_chunked, decoded_content_length, content_length) {
-        (true, Some(decoded), _) => decoded,
+        (true, Some(decoded), _) => Some(decoded),
         // Declared aws-chunked without a streaming payload: the body is not framed (the auth
         // layer only de-frames STREAMING-* payloads, which always carry a decoded length), so
         // the wire Content-Length is the real object size.
-        (true, None, Some(raw)) if !request_body_is_aws_chunked_framed(headers) => raw,
-        (true, None, _) => return Err(s3_error!(UnexpectedContent)),
-        (false, _, Some(raw)) => raw,
-        (false, Some(decoded), None) => decoded,
-        (false, None, None) => return Err(s3_error!(UnexpectedContent)),
+        (true, None, raw) if !request_body_is_aws_chunked_framed(headers) => raw,
+        (true, None, _) => None,
+        (false, decoded, raw) => raw.or(decoded),
     };
 
-    if size < 0 {
-        return Err(s3_error!(UnexpectedContent));
-    }
-
-    Ok(size)
+    size.filter(|&size| size >= 0)
+        .ok_or_else(|| S3Error::with_default_message(S3ErrorCode::UnexpectedContent))
 }
 
 /// Reject a declared upload length above the single-request ceiling
@@ -147,8 +143,6 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
 /// Applies to `PutObject` and `UploadPart`. A negative or unknown length is
 /// left to the caller's existing validation.
 pub(crate) fn reject_oversize_single_upload(size: i64) -> rustfs_s3_types::S3Result<()> {
-    use rustfs_s3_types::{S3Error, S3ErrorCode};
-
     if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
         return Err(S3Error::with_message(
             S3ErrorCode::EntityTooLarge,
@@ -207,17 +201,6 @@ impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for MaxContentLen
         let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
         let (lower, upper) = self.inner.size_hint();
         (lower.min(remaining), upper.map(|upper| upper.min(remaining)))
-    }
-}
-
-impl<S: ByteStream<Item = Result<Bytes, StdError>> + Unpin> ByteStream for MaxContentLengthStream<S> {
-    fn remaining_length(&self) -> RemainingLength {
-        let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
-        let inner = self.inner.remaining_length();
-        inner
-            .exact()
-            .map(|exact| RemainingLength::new_exact(exact.min(remaining)))
-            .unwrap_or_else(RemainingLength::unknown)
     }
 }
 
@@ -1083,7 +1066,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1303,7 +1286,6 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
-        use rustfs_s3_types::{S3Error, S3ErrorCode};
         let start_time = std::time::Instant::now();
         let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
 
@@ -1601,7 +1583,6 @@ impl DefaultObjectUsecase {
         frame_trailers: Option<Arc<super::native_body::FrameTrailers>>,
         start_time: Instant,
     ) -> rustfs_s3_types::S3Result<PutObjectCommitted> {
-        use rustfs_s3_types::{S3Error, S3ErrorCode};
         let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
         let PutObjectWriteRequest {
             bucket,
@@ -2619,34 +2600,23 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::{GetObjectInput, ObjectLockRetentionMode};
-    use crate::app::test_seams::{head_envelope, head_object_input};
+    use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
+    use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
+    use crate::app::test_seams::{
+        get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input, read_get_body,
+    };
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
     use rustfs_gateway_types::SseCustomerKey;
     use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
 
-    /// PutObject through the owned entry point the gateway handler calls, its error in the s3s
-    /// form these tests compare.
-    async fn put_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
-        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
-        Box::pin(usecase.execute_put_object_owned(envelope, input))
-            .await
-            .map_err(S3Error::from)
-    }
-
-    /// As [`put_owned`], through the archive-extraction entry point.
-    async fn put_extract_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
-        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
-        Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
-            .await
-            .map_err(S3Error::from)
-    }
-
-    fn put_envelope(uri: http::Uri, headers: HeaderMap, extensions: http::Extensions) -> RequestEnvelope {
+    fn write_envelope(method: Method, uri: http::Uri, headers: HeaderMap, mut extensions: http::Extensions) -> RequestEnvelope {
+        if method == Method::POST {
+            extensions.insert(PostObjectRequestMarker);
+        }
         RequestEnvelope::from_parts(
             crate::app::RequestHead {
-                method: Method::PUT,
+                method,
                 uri,
                 headers,
                 credentials: None,
@@ -2658,7 +2628,7 @@ mod tests {
     }
 
     fn method_only_put_envelope() -> RequestEnvelope {
-        put_envelope(http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new())
+        write_envelope(Method::PUT, http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new())
     }
 
     fn put_bytes(bucket: String, key: &str, bytes: Bytes) -> PutObjectWriteInput {
@@ -2919,23 +2889,18 @@ mod tests {
         {
             for method in [Method::PUT, Method::POST] {
                 let key = format!("refused-{index}-{method}");
-                let input = PutObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(key.clone())
-                    .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"quorum probe"))))
-                    .content_length(Some(12))
-                    .build()
-                    .expect("quorum probe input must build");
+                let input = put_bytes(bucket.clone(), &key, Bytes::from_static(b"quorum probe"));
                 let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(&bucket);
-                let mut req = build_request(input, method.clone());
-                req.uri = format!("/{bucket}/{key}").parse().expect("PUT URI");
-                if method == Method::POST {
-                    req.extensions.insert(PostObjectRequestMarker);
-                }
+                let envelope = write_envelope(
+                    method.clone(),
+                    format!("/{bucket}/{key}").parse().expect("PUT URI"),
+                    HeaderMap::new(),
+                    http::Extensions::new(),
+                );
                 let err = PUT_STORAGE_TEST_FAILURE
                     .scope(
                         (stage, StorageError::InsufficientReadQuorum("bucket".into(), "object".into())),
-                        put_owned(&usecase, req),
+                        Box::pin(usecase.execute_put_object_owned(envelope, input)),
                     )
                     .await
                     .expect_err("read quorum failure must refuse the upload");
@@ -2947,7 +2912,7 @@ mod tests {
                     assert_eq!(audits[0].api.status_code, Some(503));
                     assert!(probe.events.lock().expect("events").is_empty());
                 }
-                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "stage {index}, method {method}");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::ServiceUnavailable, "stage {index}, method {method}");
                 assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
                 assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
                 assert!(matches!(
@@ -3113,7 +3078,7 @@ mod tests {
             duplicate_headers.append(header_name.clone(), HeaderValue::from_static("65536"));
             duplicate_headers.append(header_name.clone(), HeaderValue::from_static("262144"));
             let duplicate_error = extract_ec_block_size_hint(&duplicate_headers, None).expect_err("duplicate header");
-            assert_eq!(duplicate_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(duplicate_error.code(), &OwnedS3ErrorCode::InvalidArgument);
 
             let duplicate_metadata = HashMap::from([
                 (EC_BLOCK_SIZE_HINT_METADATA_KEY.to_string(), "65536".to_string()),
@@ -3121,12 +3086,12 @@ mod tests {
             ]);
             let metadata_error = extract_ec_block_size_hint(&HeaderMap::new(), Some(&duplicate_metadata))
                 .expect_err("case-variant metadata names");
-            assert_eq!(metadata_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(metadata_error.code(), &OwnedS3ErrorCode::InvalidArgument);
 
             let mut malformed_headers = HeaderMap::new();
             malformed_headers.insert(header_name, HeaderValue::from_static("65_536"));
             let malformed_error = extract_ec_block_size_hint(&malformed_headers, None).expect_err("malformed value");
-            assert_eq!(malformed_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(malformed_error.code(), &OwnedS3ErrorCode::InvalidArgument);
         });
 
         temp_env::with_vars(
@@ -3269,14 +3234,11 @@ mod tests {
             Arc::clone(&metadata_entered),
             Arc::clone(&metadata_resume),
         );
-        let metadata_input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("metadata GET input must build");
+        let metadata_input = get_object_input(&bucket, object, None);
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let metadata_get =
-            tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&metadata_usecase, metadata_input).await });
+        let metadata_get = tokio::spawn(async move {
+            get_object_gateway(&metadata_usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), metadata_input).await
+        });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
             .expect("GET must enter the bucket metadata stage");
@@ -3298,13 +3260,11 @@ mod tests {
             .get_write_lock(Duration::from_secs(5))
             .await
             .expect("read test namespace lock must be held");
-        let get_input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("GET input must build");
+        let get_input = get_object_input(&bucket, object, None);
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get = tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&get_usecase, get_input).await });
+        let get = tokio::spawn(async move {
+            get_object_gateway(&get_usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get_input).await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -3390,7 +3350,8 @@ mod tests {
         let payload = Bytes::from_static(b"published despite caller cancellation");
         let put_input = put_bytes(bucket.clone(), object, payload.clone());
         let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let envelope = put_envelope(
+        let envelope = write_envelope(
+            Method::PUT,
             format!("/{bucket}/{object}").parse().expect("PUT URI"),
             HeaderMap::new(),
             http::Extensions::new(),
@@ -3430,7 +3391,8 @@ mod tests {
         assert_eq!(recovered.size, i64::try_from(payload.len()).expect("test payload length must fit i64"));
         probe.wait_for(1, 1).await;
         let normal_input = put_bytes(bucket.clone(), "normal.bin", Bytes::from_static(b"normal"));
-        let envelope = put_envelope(
+        let envelope = write_envelope(
+            Method::PUT,
             format!("/{bucket}/normal.bin").parse().expect("URI"),
             HeaderMap::new(),
             http::Extensions::new(),
@@ -3467,8 +3429,12 @@ mod tests {
             ..put_bytes(bucket.clone(), extra_body_object, Bytes::from_static(b"x"))
         };
         let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let extra_body_envelope =
-            put_envelope(http::Uri::from_static("/"), streaming_headers(Some("0")), http::Extensions::new());
+        let extra_body_envelope = write_envelope(
+            Method::PUT,
+            http::Uri::from_static("/"),
+            streaming_headers(Some("0")),
+            http::Extensions::new(),
+        );
         let extra_body_err = Box::pin(extra_body_usecase.execute_put_object_owned(extra_body_envelope, extra_body_input))
             .await
             .expect_err("decoded zero-byte PUT with body data must fail");
@@ -3503,7 +3469,12 @@ mod tests {
             ..Default::default()
         };
         let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let zero_envelope = put_envelope(http::Uri::from_static("/"), streaming_headers(Some("0")), http::Extensions::new());
+        let zero_envelope = write_envelope(
+            Method::PUT,
+            http::Uri::from_static("/"),
+            streaming_headers(Some("0")),
+            http::Extensions::new(),
+        );
         let zero_put =
             tokio::spawn(async move { Box::pin(zero_usecase.execute_put_object_owned(zero_envelope, zero_input)).await });
 
@@ -3918,7 +3889,10 @@ mod tests {
     #[tokio::test]
     async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
         let body = StreamReader::new(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(s3s_body_error_to_io(Box::new(
-            UploadStreamError::Sha256Mismatch,
+            rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".into(),
+                calculated_sha256: "calculated".into(),
+            },
         )))]));
 
         let error = read_small_put_body_exact_direct(body, 1)
@@ -3930,7 +3904,10 @@ mod tests {
 
     #[tokio::test]
     async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
-        let body = futures::stream::iter(vec![Err::<Bytes, UploadStreamError>(UploadStreamError::Sha256Mismatch)]);
+        let body = futures::stream::iter([Err::<Bytes, _>(rustfs_rio::Sha256Mismatch {
+            expected_sha256: "expected".into(),
+            calculated_sha256: "calculated".into(),
+        })]);
 
         let error = match read_zero_copy_put_body_exact(body, 1, false).await {
             Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
@@ -4054,7 +4031,7 @@ mod tests {
             };
             let mut extensions = http::Extensions::new();
             extensions.insert(control.clone());
-            let envelope = put_envelope(http::Uri::from_static("/"), HeaderMap::new(), extensions);
+            let envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), HeaderMap::new(), extensions);
             let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
             let owner = tokio::spawn(async move { Box::pin(usecase.execute_put_object_owned(envelope, input)).await });
             control.wait_until_pending_for_test().await;
@@ -4443,31 +4420,30 @@ mod tests {
 
     #[tokio::test]
     async fn post_object_metadata_cannot_dispatch_legacy_archive_extraction() {
-        let mut req = build_request(PutObjectInput::default(), Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-        let err = Box::pin(put_extract_owned(&DefaultObjectUsecase::without_context(), req))
+        let input = PutObjectWriteInput::default();
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new());
+        let err = Box::pin(DefaultObjectUsecase::without_context().execute_put_object_extract_owned(envelope, input))
             .await
             .expect_err("a legacy form cannot authorize archive replay");
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .expect("POST-to-PUT input should build without conditional DTO fields");
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-        req.headers
-            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"different-etag\""));
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"different-etag\""));
 
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers, http::Extensions::new());
         let usecase = DefaultObjectUsecase::without_context();
-        let err = Box::pin(put_owned(&usecase, req))
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input))
             .await
             .expect_err("POST header-only ETag precondition must fail before storage access");
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
@@ -4483,7 +4459,18 @@ mod tests {
             let mut request = build_request(input, Method::POST);
             request.extensions.insert(PostObjectRequestMarker);
             request.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
-            let mut envelope = RequestEnvelope::from_s3s(&request);
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let mut envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: request.method.clone(),
+                    uri: request.uri.clone(),
+                    headers: request.headers.clone(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                request.extensions.clone(),
+            );
             assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
             envelope.mark_gateway_post();
             assert!(envelope.fork_for_authorization().is_gateway_post());
@@ -4506,56 +4493,54 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_input() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .server_side_encryption(Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)))
-            .build()
-            .unwrap();
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            server_side_encryption: Some(ServerSideEncryption::AWS_KMS.to_owned()),
+            ..Default::default()
+        };
 
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new());
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
     async fn execute_put_object_rejects_extract_sse_kms() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("archive.tar".to_string())
-            .server_side_encryption(Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)))
-            .build()
-            .unwrap();
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "archive.tar".to_owned(),
+            server_side_encryption: Some(ServerSideEncryption::AWS_KMS.to_owned()),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
-        let mut req = build_request(input, Method::PUT);
-        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
-
+        let envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), headers, http::Extensions::new());
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
     async fn execute_put_object_extract_rejects_invalid_storage_class() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("archive.tar".to_string())
-            .storage_class(Some(StorageClass::from_static("INVALID")))
-            .build()
-            .unwrap();
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "archive.tar".to_owned(),
+            storage_class: Some("INVALID".to_owned()),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
-        let mut req = build_request(input, Method::PUT);
-        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
-
+        let envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), headers, http::Extensions::new());
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::InvalidStorageClass);
     }
 
     /// issue #7596: a single PUT whose declared length exceeds the 5 GiB
@@ -4590,36 +4575,40 @@ mod tests {
         let framing_overhead = 1_000_000;
 
         for (decoded, expect_too_large) in [(ceiling, false), (ceiling + 1, true)] {
-            let (body, polls) = PollCountingBody::streaming_blob();
-            let input = PutObjectInput::builder()
-                .bucket("test-bucket".to_string())
-                .key("huge.bin".to_string())
-                .body(Some(body))
-                .content_length(Some(decoded + framing_overhead))
-                .build()
-                .unwrap();
-
-            let mut req = build_request(input, Method::PUT);
-            req.headers
-                .insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
-            req.headers.insert(
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let body_polls = Arc::clone(&polls);
+            let body = super::super::native_body::from_io_stream(futures::stream::repeat_with(move || {
+                body_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::from_static(b"x"))
+            }));
+            let input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "huge.bin".to_owned(),
+                body: Some(body),
+                content_length: Some(decoded + framing_overhead),
+                ..Default::default()
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+            headers.insert(
                 HeaderName::from_static("x-amz-content-sha256"),
                 HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
             );
-            req.headers.insert(
+            headers.insert(
                 HeaderName::from_static("x-amz-decoded-content-length"),
                 HeaderValue::from_str(&decoded.to_string()).unwrap(),
             );
+            let envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), headers, http::Extensions::new());
             let usecase = DefaultObjectUsecase::without_context();
 
-            let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
+            let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
             if expect_too_large {
-                assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge, "decoded {decoded}");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::EntityTooLarge, "decoded {decoded}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
             } else {
                 assert_ne!(
                     err.code(),
-                    &S3ErrorCode::EntityTooLarge,
+                    &OwnedS3ErrorCode::EntityTooLarge,
                     "framed wire length above the cap must not reject a decoded length at the cap"
                 );
             }
@@ -4628,40 +4617,36 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_headers() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("aws:kms"));
 
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-        req.headers
-            .insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("aws:kms"));
-
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers, http::Extensions::new());
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_key_id_header() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
 
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-        req.headers
-            .insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
-
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers, http::Extensions::new());
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_owned(&usecase, req)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
@@ -4746,12 +4731,12 @@ mod tests {
         let headers = streaming_headers(None);
         let err = resolve_put_object_authoritative_size(&headers, Some(1088))
             .expect_err("framed upload without decoded length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
 
         // ... even when the wire Content-Length is also absent.
         let err =
             resolve_put_object_authoritative_size(&headers, None).expect_err("framed upload without any length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[test]
@@ -4775,7 +4760,7 @@ mod tests {
         let headers = aws_chunked_headers(None);
         let err = resolve_put_object_authoritative_size(&headers, None)
             .expect_err("declared-only aws-chunked with no length at all must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[test]
@@ -4801,7 +4786,9 @@ mod tests {
     fn authoritative_size_rejects_unknown_length() {
         let headers = HeaderMap::new();
         let err = resolve_put_object_authoritative_size(&headers, None).expect_err("no length information must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
+        assert_eq!(err.message(), Some("This request does not support content."));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     #[test]
@@ -4810,12 +4797,12 @@ mod tests {
         let headers = aws_chunked_headers(Some("-1"));
         let err =
             resolve_put_object_authoritative_size(&headers, Some(64)).expect_err("negative decoded length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
 
         let plain = HeaderMap::new();
         let err =
             resolve_put_object_authoritative_size(&plain, Some(-100)).expect_err("negative Content-Length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[test]
@@ -4928,27 +4915,24 @@ mod tests {
             assert_eq!(head.output.dto.sse_customer_algorithm.as_deref(), Some("AES256"));
             assert_eq!(head.output.dto.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
 
-            let get_input = GetObjectInput::builder()
-                .bucket(bucket.clone())
-                .key("ledger.csv".to_string())
-                .sse_customer_algorithm(Some("AES256".to_string()))
-                .sse_customer_key(Some(encoded_key))
-                .sse_customer_key_md5(Some(key_md5.clone()))
-                .build()
-                .expect("SSE-C GET input must build");
-            let mut get_request = build_request(get_input, Method::GET);
-            get_request.headers = read_headers;
-            let get = Box::pin(crate::app::test_seams::get_object(&usecase, get_request))
-                .await
-                .expect("matching SSE-C key must authorize GET");
-            assert_eq!(get.output.server_side_encryption, None);
-            assert_eq!(get.output.sse_customer_algorithm.as_deref(), Some("AES256"));
-            assert_eq!(get.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
-            let mut body = get.output.body.expect("SSE-C GET must include the decrypted body");
-            let mut plaintext = Vec::new();
-            while let Some(chunk) = body.next().await {
-                plaintext.extend_from_slice(&chunk.expect("SSE-C body must decrypt completely"));
-            }
+            let get_input = rustfs_gateway_types::dto::GetObjectInput {
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(SseCustomerKey::new(encoded_key)),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..get_object_input(&bucket, "ledger.csv", None)
+            };
+            let get = Box::pin(get_object_gateway(
+                &usecase,
+                get_envelope(read_headers, http::Extensions::new()),
+                get_input,
+            ))
+            .await
+            .expect("matching SSE-C key must authorize GET");
+            assert_eq!(get.output.dto.server_side_encryption, None);
+            assert_eq!(get.output.dto.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(get.output.dto.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            let body = get.output.body.expect("SSE-C GET must include the decrypted body");
+            let plaintext = read_get_body(body).await;
             assert_eq!(plaintext, payload, "header classification must preserve the complete decrypted payload");
 
             let stored = store
@@ -4991,31 +4975,31 @@ mod tests {
             crate::app::gating_test_env::durable_quota_test_bucket("ciphertext-replication-early-reject", 4096).await;
         let body_polled = Arc::new(AtomicBool::new(false));
         let body_polled_in_stream = Arc::clone(&body_polled);
-        let body = StreamingBlob::wrap(futures::stream::once(async move {
+        let body = super::super::native_body::from_io_stream(futures::stream::once(async move {
             body_polled_in_stream.store(true, Ordering::Release);
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"ciphertext"))
         }));
-        let input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key("object".to_string())
-            .body(Some(body))
-            .content_length(Some(10))
-            .build()
-            .expect("ciphertext replication PUT input should build");
-        let mut request = build_request(input, Method::PUT);
-        insert_header(&mut request.headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        request
-            .headers
-            .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::req_info::ReqInfo {
+        let input = PutObjectWriteInput {
+            bucket,
+            key: "object".to_owned(),
+            body: Some(body),
+            content_length: Some(10),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        headers.insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
+        let mut extensions = http::Extensions::new();
+        extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
 
-        let err = put_owned(&DefaultObjectUsecase::from_global(), request)
+        let envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), headers, extensions);
+        let err = Box::pin(DefaultObjectUsecase::from_global().execute_put_object_owned(envelope, input))
             .await
             .expect_err("quota-enabled ciphertext replication should fail at ingress");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::InvalidRequest);
         assert!(!body_polled.load(Ordering::Acquire), "rejected ciphertext body must not be consumed");
     }
 
@@ -5669,9 +5653,10 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(
-            usecase.execute_put_object_owned(put_envelope(http::Uri::from_static("/"), headers, http::Extensions::new()), input),
-        )
+        let err = Box::pin(usecase.execute_put_object_owned(
+            write_envelope(Method::PUT, http::Uri::from_static("/"), headers, http::Extensions::new()),
+            input,
+        ))
         .await
         .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
 

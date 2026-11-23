@@ -17,6 +17,7 @@
 
 use super::ProtocolStorageClient;
 use rustfs_gateway_types::{ETag, Timestamp, dto};
+use rustfs_protocols::common::client::s3::MultipartRequest;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
 impl ProtocolStorageClient {
@@ -156,10 +157,10 @@ pub(super) fn complete_multipart_output(
     ] {
         if let Some(value) = value {
             http::HeaderValue::from_str(&value).map_err(|_| {
-                crate::app::dto_values::seam_error(rustfs_gateway_types::compat::ConversionError {
-                    field,
-                    reason: "not a header value",
-                })
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to convert through the gateway compatibility seam: {field}: not a header value"),
+                )
             })?;
         }
     }
@@ -294,8 +295,9 @@ pub(super) fn upload_part_error(error: S3Error) -> S3Error {
 }
 
 pub(super) fn prepare_upload_part_copy(
-    input: dto::UploadPartCopyInput,
+    request: MultipartRequest<dto::UploadPartCopyInput>,
 ) -> S3Result<(http::Uri, crate::app::multipart_usecase::UploadPartCopyWriteInput)> {
+    let (input, upload_id) = request.into_parts();
     super::owned::validate_copy_source(&input.copy_source, "UploadPartCopy copy_source")?;
     let copy_source_if_match =
         super::owned::copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match", "UploadPartCopy input")?;
@@ -314,7 +316,6 @@ pub(super) fn prepare_upload_part_copy(
         .copy_source_if_unmodified_since
         .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_unmodified_since"))
         .transpose()?;
-    let upload_id = super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
     let part_number = input.part_number.to_string();
     let uri = super::build_object_uri(
         input.bucket.as_str(),

@@ -24,11 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use super::super::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
 use bytes::Bytes;
 use md5::Digest as _;
 use md5::Md5;
 use moka::{future::Cache as AsyncCache, sync::Cache as SyncCache};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use time::OffsetDateTime;
 use tracing::debug;
 

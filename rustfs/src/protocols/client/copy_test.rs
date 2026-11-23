@@ -325,47 +325,9 @@ fn copy_output_facts(tag: Option<&str>) -> CopyObjectWriteOutput {
     }
 }
 
-/// Same facts `RequestEnvelope::from_s3s` copies: method, URI, headers, extensions, region, service, and credentials.
-fn envelope_from_legacy_copy_request(req: &s3s::S3Request<()>) -> crate::app::RequestEnvelope {
-    let credentials = req.credentials.as_ref().map(|credentials| {
-        let session_token = crate::auth::get_session_token(&req.uri, &req.headers).map(str::to_owned);
-        crate::app::RequestCredentials::new(
-            credentials.access_key.clone(),
-            credentials.secret_key.expose().to_owned(),
-            session_token.clone(),
-        )
-        .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
-    });
-    crate::app::RequestEnvelope::from_parts(
-        crate::app::RequestHead {
-            method: req.method.clone(),
-            uri: req.uri.clone(),
-            headers: req.headers.clone(),
-            credentials,
-            region: req.region.as_ref().map(|region| region.as_str().to_owned()),
-            service: req.service.clone(),
-        },
-        req.extensions.clone(),
-    )
-}
-
 #[test]
 fn protocol_copy_request_head_matches_legacy() {
-    fn facts(envelope: &crate::app::RequestEnvelope) -> serde_json::Value {
-        let info = envelope.req_info().expect("request info");
-        let credentials = envelope.credentials().expect("request credentials");
-        let identity = info.cred.as_ref().expect("request identity");
-        serde_json::json!({
-            "method":envelope.method().as_str(),"uri":envelope.uri().to_string(),"headers":format!("{:?}",envelope.headers()),
-            "credentials":[credentials.access_key(),credentials.secret_key(),credentials.session_token()],
-            "identity":[identity.access_key,identity.secret_key,identity.session_token],
-            "bucket":info.bucket,"object":info.object,"version":info.version_id,"owner":info.is_owner,
-            "keystone":info.keystone_session_present,"replication":info.replication_request_authorized,"region":info.region,
-            "request_context":info.request_context.is_some(),"suppress_log":info.suppress_denial_log,"suppress_audit":info.suppress_denial_audit,
-            "head_region":envelope.region(),"service":envelope.service(),"server":envelope.server_context().is_some(),"presigned":envelope.verified_presigned().is_some(),
-        })
-    }
-    for secret in ["copy-secret", ""] {
+    for (secret, expected_head_secret) in [("copy-secret", Some("copy-secret")), ("", None)] {
         let credentials = rustfs_credentials::Credentials {
             access_key: "copy-identity".into(),
             secret_key: secret.into(),
@@ -374,15 +336,44 @@ fn protocol_copy_request_head_matches_legacy() {
             ..Default::default()
         };
         let uri = build_object_uri("copy-target", "a ?&/%é", &[]).expect("request URI");
-        let params = || RequestParams {
-            bucket: Some("copy-target".to_owned()),
-            object: Some("a ?&/%é".to_owned()),
-            credentials: &credentials,
-        };
-        let old = ProtocolStorageClient::create_request((), Method::PUT, uri.clone(), params()).expect("legacy request");
-        let old = envelope_from_legacy_copy_request(&old);
-        let current = ProtocolStorageClient::create_envelope(Method::PUT, uri, params());
-        assert_eq!(facts(&current), facts(&old));
+        let envelope = ProtocolStorageClient::create_envelope(
+            Method::PUT,
+            uri,
+            RequestParams {
+                bucket: Some("copy-target".to_owned()),
+                object: Some("a ?&/%é".to_owned()),
+                credentials: &credentials,
+            },
+        );
+
+        assert_eq!(envelope.method(), &Method::PUT);
+        assert_eq!(envelope.uri().to_string(), "/copy-target/a%20%3F&/%25%C3%A9");
+        assert!(envelope.headers().is_empty());
+        assert!(envelope.region().is_none());
+        assert!(envelope.service().is_none());
+        assert!(envelope.server_context().is_none());
+        assert!(envelope.verified_presigned().is_none());
+
+        let head_credentials = envelope.credentials().expect("request credentials");
+        assert_eq!(head_credentials.access_key(), "copy-identity");
+        assert_eq!(head_credentials.secret_key(), expected_head_secret);
+        assert!(head_credentials.session_token().is_none());
+
+        let info = envelope.req_info().expect("request info");
+        let identity = info.cred.as_ref().expect("request identity");
+        assert_eq!(identity.access_key, "copy-identity");
+        assert_eq!(identity.secret_key, secret);
+        assert_eq!(identity.session_token, "identity-token");
+        assert_eq!(info.bucket.as_deref(), Some("copy-target"));
+        assert_eq!(info.object.as_deref(), Some("a ?&/%é"));
+        assert!(info.version_id.is_none());
+        assert!(!info.is_owner);
+        assert!(info.keystone_session_present.is_none());
+        assert!(!info.replication_request_authorized);
+        assert!(info.region.is_none());
+        assert!(info.request_context.is_some());
+        assert!(!info.suppress_denial_log);
+        assert!(!info.suppress_denial_audit);
     }
 }
 

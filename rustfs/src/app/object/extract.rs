@@ -18,15 +18,14 @@ use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::AuthorizationRequest;
+use crate::app::storage_api::object_usecase::bucket::object_lock::types::LegalHoldStatus;
 use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
-use crate::app::storage_api::s3::dto::{
-    ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, Timestamp, TimestampFormat,
-};
 use futures::stream::FuturesUnordered;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 use std::collections::HashSet;
 
 // One logical member can be preceded by local PAX, GNU long-name, and GNU
@@ -756,7 +755,7 @@ async fn complete_extract_member_post_commit(
             }
             None
         }
-        Err(err) => Some(err.into()),
+        Err(err) => Some(err),
     };
     let _ = invalidate_object_data_cache_after_put_success(&context.cache_adapter, &context.bucket, &key).await;
 
@@ -1715,16 +1714,12 @@ fn apply_extract_pax_overrides(
     let object_lock_mode = canonical_headers
         .get(AMZ_OBJECT_LOCK_MODE_LOWER)
         .map(|value| {
-            let value = value
+            value
                 .to_str()
-                .map(str::trim)
-                .map(str::to_ascii_uppercase)
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock mode"))?;
-            match value.as_str() {
-                ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::GOVERNANCE.to_owned()),
-                ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::COMPLIANCE.to_owned()),
-                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")),
-            }
+                .ok()
+                .and_then(|value| RetentionMode::parse(value.trim()))
+                .map(|value| value.as_str().to_owned())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))
         })
         .transpose()?;
     if let Some(mode) = object_lock_mode.as_ref() {
@@ -1737,8 +1732,7 @@ fn apply_extract_pax_overrides(
             let value = value.to_str().map(str::trim).map_err(|_| {
                 S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock retain-until date")
             })?;
-            Timestamp::parse(TimestampFormat::DateTime, value)
-                .map(OffsetDateTime::from)
+            OffsetDateTime::parse(value, &Rfc3339)
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
         })
         .transpose()?;
@@ -1753,14 +1747,12 @@ fn apply_extract_pax_overrides(
     let object_lock_legal_hold_status = canonical_headers
         .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
         .map(|value| {
-            let value = value.to_str().map(str::trim).map(str::to_ascii_uppercase).map_err(|_| {
-                S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock legal-hold status")
-            })?;
-            match value.as_str() {
-                ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::ON.to_owned()),
-                ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::OFF.to_owned()),
-                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status")),
-            }
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| LegalHoldStatus::parse(value.trim()))
+                .map(|value| value.as_str().to_owned())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
         })
         .transpose()?;
     if let Some(status) = object_lock_legal_hold_status.as_ref() {
@@ -2146,7 +2138,7 @@ impl DefaultObjectUsecase {
         );
         if effective_sse
             .as_ref()
-            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(AMZ_ENCRYPTION_KMS))
         {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
@@ -3661,9 +3653,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn archive_error_mapping_preserves_classified_body_errors() {
+    #[tokio::test]
+    async fn archive_error_mapping_preserves_classified_body_errors() {
         use crate::error::{ClientBodyReadTimeout, ServerSideSourceReadError, UploadLimitExceeded};
+        let mut body = rustfs_s3_types::Body::from(bytes::Bytes::from_static(b"abcdef"));
+        let too_large = body.store_all_limited(5).await.expect_err("six bytes exceed the limit");
         for (error, code) in [
             (
                 io::Error::other(ClientBodyReadTimeout {
@@ -3672,10 +3666,7 @@ mod tests {
                 }),
                 S3ErrorCode::RequestTimeout,
             ),
-            (
-                io::Error::other(crate::app::storage_api::s3::BodySizeLimitExceeded { size: 6, limit: 5 }),
-                S3ErrorCode::EntityTooLarge,
-            ),
+            (io::Error::other(too_large), S3ErrorCode::EntityTooLarge),
             (io::Error::other(UploadLimitExceeded { limit: 5 }), S3ErrorCode::EntityTooLarge),
             (
                 io::Error::other(ServerSideSourceReadError::new("CopyObject", io::Error::other("source unavailable"))),
@@ -3713,7 +3704,10 @@ mod tests {
         }
         let displays = Arc::new(AtomicUsize::new(0));
         let error = map_extract_archive_error(io::Error::other(DisplayProbe {
-            source: io::Error::other(UploadStreamError::Sha256Mismatch),
+            source: io::Error::other(rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".into(),
+                calculated_sha256: "calculated".into(),
+            }),
             displays: Arc::clone(&displays),
         }));
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");

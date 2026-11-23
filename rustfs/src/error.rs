@@ -18,8 +18,6 @@ use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use rustfs_lock::LockError;
 use rustfs_s3_types::S3ErrorCode;
-use s3s::S3Error as LegacyS3Error;
-use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
 
 const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
 const CONTENT_SHA256_MISMATCH_MESSAGE: &str = "The provided 'x-amz-content-sha256' header does not match what was computed.";
@@ -350,13 +348,7 @@ impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
 impl ApiErrorDiagnostic {
     pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut diagnostic = ApiErrorDiagnostic::default();
-        // S3Error retains its payload through an inherent accessor; its
-        // std::error::Error implementation does not expose that source.
-        let mut current = if let Some(error) = error.downcast_ref::<LegacyS3Error>() {
-            error.source().map(|source| source as &(dyn std::error::Error + 'static))
-        } else {
-            std::error::Error::source(error)
-        };
+        let mut current = error.source();
         for _ in 0..16 {
             let Some(error) = current else {
                 return diagnostic;
@@ -389,8 +381,6 @@ impl ApiErrorDiagnostic {
                 diagnostic.io_os_error = io.raw_os_error();
                 // io::Error::source can skip the wrapped error itself.
                 io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
-            } else if let Some(error) = error.downcast_ref::<LegacyS3Error>() {
-                error.source().map(|source| source as &(dyn std::error::Error + 'static))
             } else {
                 error.source()
             };
@@ -594,12 +584,10 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
     let mut server_source_failed = false;
     let mut client_body_timed_out = false;
     let mut body_size_exceeded = false;
-    let mut aws_chunked_error = None;
     let mut incomplete_body = false;
     let mut rpc_unavailable = false;
     let digest = error_chain_find(err, |error| {
-        let upload_error = error.downcast_ref::<UploadStreamError>();
-        if matches!(upload_error, Some(UploadStreamError::Sha256Mismatch)) || error.is::<rustfs_rio::Sha256Mismatch>() {
+        if error.is::<rustfs_rio::Sha256Mismatch>() {
             return Some(S3ErrorCode::Custom(CONTENT_SHA256_MISMATCH_CODE.into()));
         }
         if error.is::<rustfs_rio::ChecksumMismatch>() || error.is::<rustfs_rio::BadDigest>() {
@@ -617,15 +605,8 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
         upload_limit_exceeded |= error.is::<UploadLimitExceeded>();
         server_source_failed |= error.is::<ServerSideSourceReadError>();
         client_body_timed_out |= error.is::<ClientBodyReadTimeout>();
-        body_size_exceeded |= error.is::<s3s::BodySizeLimitExceeded>();
-        if let Some(chunked) = error.downcast_ref::<AwsChunkedStreamError>()
-            && !matches!(chunked, AwsChunkedStreamError::Underlying(_))
-        {
-            aws_chunked_error = Some(chunked.to_s3_error_code().into());
-        }
-        incomplete_body |= error.is::<rustfs_rio::IncompleteBody>()
-            || matches!(upload_error, Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete))
-            || is_hyper_body_eof(error);
+        body_size_exceeded |= error.is::<rustfs_s3_types::BodyTooLarge>();
+        incomplete_body |= error.is::<rustfs_rio::IncompleteBody>() || is_hyper_body_eof(error);
         None
     });
     digest.or({
@@ -637,8 +618,6 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
             Some(S3ErrorCode::RequestTimeout)
         } else if body_size_exceeded {
             Some(S3ErrorCode::EntityTooLarge)
-        } else if let Some(code) = aws_chunked_error {
-            Some(code)
         } else if incomplete_body {
             Some(S3ErrorCode::IncompleteBody)
         } else if rpc_unavailable {
@@ -737,11 +716,9 @@ impl From<ApiError> for rustfs_s3_types::S3Error {
     }
 }
 
-/// The s3s error for the legacy edge: the conversion above carried across
-/// with `From`, which yields field for field what the s3s constructor builds
-/// (code, message, explicit status, the cause itself), so both error types
-/// come from one mapping.
-impl From<ApiError> for LegacyS3Error {
+/// Project the native error into the pinned wire oracle.
+#[cfg(test)]
+impl From<ApiError> for s3s::S3Error {
     fn from(err: ApiError) -> Self {
         rustfs_s3_types::S3Error::from(err).into()
     }
@@ -969,8 +946,7 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
     use rustfs_s3_ops::S3Operation;
-    use rustfs_s3_types::S3ErrorCode;
-    use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
+    use rustfs_s3_types::{S3Error as OwnedS3Error, S3ErrorCode};
     use s3s::{S3Error, S3ErrorCode as LegacyS3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
 
@@ -1349,8 +1325,8 @@ mod tests {
             assert_eq!(diagnostic.storage_code, Some(StorageErrorCode::Lock));
             assert_eq!(diagnostic.lock_reason, Some(expected));
             assert!(!format!("{diagnostic:?}").contains("private"));
-            let s3: S3Error = api.into();
-            assert_eq!(s3.code(), &LegacyS3ErrorCode::ServiceUnavailable);
+            let s3 = OwnedS3Error::from(api);
+            assert_eq!(s3.code(), &S3ErrorCode::ServiceUnavailable);
             assert_eq!(super::ApiErrorDiagnostic::from_error(&s3).lock_reason, Some(expected));
         }
 
@@ -1395,7 +1371,7 @@ mod tests {
         let api = ApiError::from(StorageError::Io(IoError::from_raw_os_error(30)));
         let before = api.diagnostic();
         assert_eq!(before.io_os_error, Some(30));
-        let mut error: S3Error = api.into();
+        let mut error = OwnedS3Error::from(api);
         error.set_request_id("server-owned-request");
         let code = error.code().clone();
         let status = error.status_code();
@@ -1405,16 +1381,20 @@ mod tests {
         assert_eq!(error.status_code(), status);
         assert_eq!(error.message(), message.as_deref());
         assert_eq!(error.request_id(), Some("server-owned-request"));
-        assert!(error.source().is_some());
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&error).unwrap().is::<StorageError>());
 
-        let error: S3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
+        let legacy = S3Error::from(error);
+        assert!(legacy.source().unwrap().is::<StorageError>());
+        assert!(std::error::Error::source(&legacy).is_none());
+        assert_eq!(super::ApiErrorDiagnostic::from_error(&OwnedS3Error::from(legacy)), before);
+
+        let error: OwnedS3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
         assert_eq!(
             super::ApiErrorDiagnostic::from_error(&error).storage_code,
             Some(StorageErrorCode::ErasureReadQuorum)
         );
 
-        let nested: S3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
+        let nested: OwnedS3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
         let api = ApiError::from(StorageError::Io(IoError::other(nested)));
         assert_eq!(api.diagnostic().storage_code, Some(StorageErrorCode::ErasureReadQuorum));
     }
@@ -1440,12 +1420,12 @@ mod tests {
         };
         assert!(error.diagnostic().truncated);
         assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
-        let error: S3Error = error.into();
+        let error = OwnedS3Error::from(error);
         let diagnostic = super::ApiErrorDiagnostic::from_error(&error);
         assert!(diagnostic.truncated);
         assert!(!format!("{diagnostic:?}").contains("secret"));
 
-        let error = S3Error::from(ApiError {
+        let error = OwnedS3Error::from(ApiError {
             code: S3ErrorCode::ServiceUnavailable,
             message: "safe".into(),
             source: Some(Box::new(Cycle)),
@@ -1456,15 +1436,15 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MockS3sBodyStreamError(&'static str);
+    struct MessageOnlyBodyError(&'static str);
 
-    impl std::fmt::Display for MockS3sBodyStreamError {
+    impl std::fmt::Display for MessageOnlyBodyError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(self.0)
         }
     }
 
-    impl std::error::Error for MockS3sBodyStreamError {}
+    impl std::error::Error for MessageOnlyBodyError {}
 
     #[test]
     fn test_api_error_from_io_error() {
@@ -1502,36 +1482,33 @@ mod tests {
         }
     }
 
+    fn sha256_mismatch() -> rustfs_rio::Sha256Mismatch {
+        rustfs_rio::Sha256Mismatch {
+            expected_sha256: "expected".into(),
+            calculated_sha256: "calculated".into(),
+        }
+    }
+
     #[test]
     fn payload_sha256_mismatch_io_errors_map_to_content_sha256_mismatch() {
         for storage in [false, true] {
             for nested in [false, true] {
-                for error in [
-                    IoError::other(rustfs_rio::Sha256Mismatch {
-                        expected_sha256: "expected".to_string(),
-                        calculated_sha256: "calculated".to_string(),
-                    }),
-                    IoError::other(UploadStreamError::Sha256Mismatch),
-                ] {
-                    let error = if nested { IoError::other(error) } else { error };
-                    let api_error = if storage {
-                        ApiError::from(StorageError::Io(error))
-                    } else {
-                        ApiError::from(error)
-                    };
-                    assert_eq!(api_error.code.as_str(), "XAmzContentSHA256Mismatch");
-                    assert_eq!(
-                        api_error.message,
-                        "The provided 'x-amz-content-sha256' header does not match what was computed."
-                    );
-                    assert!(
-                        error_chain_has_type::<rustfs_rio::Sha256Mismatch>(&api_error)
-                            || error_chain_has_type::<UploadStreamError>(&api_error)
-                    );
-                    let s3_error = S3Error::from(api_error);
-                    assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
-                    assert!(s3_error.source().is_some());
-                }
+                let error = IoError::other(sha256_mismatch());
+                let error = if nested { IoError::other(error) } else { error };
+                let api_error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(api_error.code.as_str(), "XAmzContentSHA256Mismatch");
+                assert_eq!(
+                    api_error.message,
+                    "The provided 'x-amz-content-sha256' header does not match what was computed."
+                );
+                assert!(error_chain_has_type::<rustfs_rio::Sha256Mismatch>(&api_error));
+                let s3_error = OwnedS3Error::from(api_error);
+                assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+                assert!(s3_error.source().is_some());
             }
         }
     }
@@ -1565,45 +1542,19 @@ mod tests {
     }
 
     #[test]
-    fn underlying_upload_stream_errors_remain_internal() {
-        let api_error = ApiError::from(IoError::other(UploadStreamError::Underlying(Box::new(IoError::other(
-            "underlying body error",
-        )))));
-        assert_eq!(api_error.code, S3ErrorCode::InternalError);
-
-        let api_error = ApiError::from(StorageError::Io(IoError::other(UploadStreamError::Underlying(Box::new(
-            IoError::other("underlying body error"),
-        )))));
-        assert_eq!(api_error.code, S3ErrorCode::InternalError);
-    }
-
-    #[test]
-    fn s3s_incomplete_body_stream_errors_map_to_incomplete_body() {
-        for error in [UploadStreamError::LengthMismatch, UploadStreamError::Incomplete] {
-            let api_error = ApiError::from(IoError::other(error));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
-        }
-
-        for error in [UploadStreamError::LengthMismatch, UploadStreamError::Incomplete] {
-            let api_error = ApiError::from(StorageError::Io(IoError::other(error)));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
-        }
-
+    fn incomplete_body_stream_errors_map_to_incomplete_body() {
         for storage in [false, true] {
             for nested in [false, true] {
-                for error in [AwsChunkedStreamError::LengthMismatch, AwsChunkedStreamError::Incomplete] {
-                    let error = IoError::other(error);
-                    let error = if nested { IoError::other(error) } else { error };
-                    let api_error = if storage {
-                        ApiError::from(StorageError::Io(error))
-                    } else {
-                        ApiError::from(error)
-                    };
-                    assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
-                    assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
-                }
+                let error = IoError::other(rustfs_rio::IncompleteBody { remaining: 1 });
+                let error = if nested { IoError::other(error) } else { error };
+                let api_error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+                assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+                assert!(error_chain_has_type::<rustfs_rio::IncompleteBody>(&api_error));
             }
         }
     }
@@ -1614,74 +1565,51 @@ mod tests {
             "UploadStreamError: Sha256Mismatch",
             "UploadStreamError: Incomplete",
             "AwsChunkedStreamError: LengthMismatch",
+            "Incomplete body: 1 bytes were still expected",
+            "Bad sha256: Expected expected does not match calculated calculated",
         ] {
             for error in [
-                ApiError::from(IoError::other(MockS3sBodyStreamError(message))),
-                ApiError::from(StorageError::Io(IoError::other(MockS3sBodyStreamError(message)))),
+                ApiError::from(IoError::other(MessageOnlyBodyError(message))),
+                ApiError::from(StorageError::Io(IoError::other(MessageOnlyBodyError(message)))),
             ] {
                 assert_eq!(error.code, S3ErrorCode::InternalError);
             }
         }
     }
 
+    // The gateway's wire cases exercise the same codes on PUT and UploadPart.
     #[tokio::test]
-    async fn aws_chunked_named_errors_preserve_http_contract_across_io_boundaries() {
+    async fn legacy_aws_chunked_named_errors_pin_wire_codes_and_statuses() {
         use http_body_util::BodyExt as _;
+        use s3s::stream::aws_chunked_stream::AwsChunkedStreamError as Chunked;
 
-        for storage in [false, true] {
-            for nested in [false, true] {
-                for error in [
-                    AwsChunkedStreamError::SignatureMismatch,
-                    AwsChunkedStreamError::FormatError,
-                    AwsChunkedStreamError::Incomplete,
-                    AwsChunkedStreamError::LengthMismatch,
-                    AwsChunkedStreamError::ChunkMetaTooLarge(1025, 1024),
-                    AwsChunkedStreamError::ChunkDataTooLarge(257, 256),
-                    AwsChunkedStreamError::TrailersTooLarge(16385, 16384),
-                    AwsChunkedStreamError::TooManyTrailerHeaders(101, 100),
-                ] {
-                    let expected: S3ErrorCode = error.to_s3_error_code().into();
-                    let expected_status = if expected == S3ErrorCode::SignatureDoesNotMatch {
-                        StatusCode::FORBIDDEN
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    };
-                    let error = IoError::other(error);
-                    let error = if nested {
-                        IoError::other(AwsChunkedStreamError::Underlying(Box::new(IoError::other(error))))
-                    } else {
-                        error
-                    };
-                    let api_error = if storage {
-                        ApiError::from(StorageError::Io(error))
-                    } else {
-                        ApiError::from(error)
-                    };
-                    assert_eq!(api_error.code, expected);
-                    assert_eq!(api_error.message, ApiError::error_code_to_message(&expected));
-                    assert!(error_chain_has_type::<AwsChunkedStreamError>(&api_error));
-                    let response = S3Error::from(api_error).to_http_response().expect("serialize chunked error");
-                    assert_eq!(response.status(), expected_status);
-                    let body = response
-                        .into_body()
-                        .collect()
-                        .await
-                        .expect("read chunked error XML")
-                        .to_bytes();
-                    let xml = std::str::from_utf8(&body).expect("error XML is UTF-8");
-                    assert!(xml.contains(&format!("<Code>{}</Code>", expected.as_str())));
-                    assert!(!xml.contains("AwsChunkedStreamError"));
-                    assert!(!xml.contains("16385"));
-                }
-            }
+        for (error, expected, status) in [
+            (Chunked::SignatureMismatch, "SignatureDoesNotMatch", StatusCode::FORBIDDEN),
+            (Chunked::FormatError, "IncompleteBody", StatusCode::BAD_REQUEST),
+            (Chunked::Incomplete, "IncompleteBody", StatusCode::BAD_REQUEST),
+            (Chunked::LengthMismatch, "IncompleteBody", StatusCode::BAD_REQUEST),
+            (Chunked::ChunkMetaTooLarge(1025, 1024), "EntityTooLarge", StatusCode::BAD_REQUEST),
+            (Chunked::ChunkDataTooLarge(257, 256), "EntityTooLarge", StatusCode::BAD_REQUEST),
+            (Chunked::TrailersTooLarge(16385, 16384), "IncompleteBody", StatusCode::BAD_REQUEST),
+            (Chunked::TooManyTrailerHeaders(101, 100), "IncompleteBody", StatusCode::BAD_REQUEST),
+        ] {
+            let response = S3Error::new(error.to_s3_error_code())
+                .to_http_response()
+                .expect("serialize legacy refusal");
+            assert_eq!(response.status(), status);
+            let body = response.into_body().collect().await.expect("read legacy refusal").to_bytes();
+            let xml = std::str::from_utf8(&body).expect("error XML is UTF-8");
+            assert!(xml.contains(&format!("<Code>{expected}</Code>")));
+            assert!(!xml.contains("AwsChunkedStreamError"));
+            assert!(!xml.contains("16385"));
         }
     }
 
-    #[test]
-    fn aws_chunked_underlying_errors_retain_typed_marker_precedence() {
+    #[tokio::test]
+    async fn gateway_upstream_errors_retain_typed_marker_precedence() {
         for storage in [false, true] {
             for (inner, expected) in [
-                (IoError::other(UploadStreamError::Sha256Mismatch), CONTENT_SHA256_MISMATCH_CODE),
+                (IoError::other(sha256_mismatch()), CONTENT_SHA256_MISMATCH_CODE),
                 (IoError::other(UploadLimitExceeded { limit: 5 }), "EntityTooLarge"),
                 (
                     IoError::other(ClientBodyReadTimeout {
@@ -1690,10 +1618,10 @@ mod tests {
                     }),
                     "RequestTimeout",
                 ),
-                (IoError::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }), "EntityTooLarge"),
+                (body_limit_failure().await, "EntityTooLarge"),
                 (IoError::other("private underlying body diagnostic"), "InternalError"),
             ] {
-                let error = IoError::other(AwsChunkedStreamError::Underlying(Box::new(inner)));
+                let error = IoError::other(rustfs_gateway_stream::StreamError::upstream(Box::new(inner)));
                 let error = if storage {
                     ApiError::from(StorageError::Io(error))
                 } else {
@@ -1701,24 +1629,11 @@ mod tests {
                 };
                 assert_eq!(error.code.as_str(), expected);
             }
-            for chunked in [
-                AwsChunkedStreamError::SignatureMismatch,
-                AwsChunkedStreamError::FormatError,
-                AwsChunkedStreamError::ChunkDataTooLarge(257, 256),
-            ] {
-                let error = IoError::other(ServerSideSourceReadError::new("CopyObject", IoError::other(chunked)));
-                let error = if storage {
-                    ApiError::from(StorageError::Io(error))
-                } else {
-                    ApiError::from(error)
-                };
-                assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
-            }
         }
     }
 
     #[test]
-    fn aws_chunked_classification_does_not_format_private_diagnostics() {
+    fn body_error_classification_does_not_format_private_diagnostics() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1727,7 +1642,7 @@ mod tests {
         #[derive(Debug)]
         struct Diagnostic {
             displays: Arc<AtomicUsize>,
-            source: AwsChunkedStreamError,
+            source: rustfs_rio::Sha256Mismatch,
         }
         impl std::fmt::Display for Diagnostic {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1743,16 +1658,16 @@ mod tests {
         let displays = Arc::new(AtomicUsize::new(0));
         let error = ApiError::from(IoError::other(Diagnostic {
             displays: Arc::clone(&displays),
-            source: AwsChunkedStreamError::SignatureMismatch,
+            source: sha256_mismatch(),
         }));
         assert_eq!(
             displays.load(Ordering::Relaxed),
             0,
             "classified failures must not format discarded diagnostics"
         );
-        assert_eq!(error.code, S3ErrorCode::SignatureDoesNotMatch);
+        assert_eq!(error.code.as_str(), CONTENT_SHA256_MISMATCH_CODE);
         assert!(!error.message.contains("private"));
-        assert!(error_chain_has_type::<AwsChunkedStreamError>(&error));
+        assert!(error_chain_has_type::<rustfs_rio::Sha256Mismatch>(&error));
     }
 
     #[test]
@@ -1860,7 +1775,7 @@ mod tests {
             let source = || {
                 let mut status = tonic::Status::unavailable("private transport failure");
                 if sha256 {
-                    status.set_source(std::sync::Arc::new(UploadStreamError::Sha256Mismatch));
+                    status.set_source(std::sync::Arc::new(sha256_mismatch()));
                 } else {
                     status.set_source(std::sync::Arc::new(rustfs_rio::BadDigest {
                         expected_md5: "expected".into(),
@@ -1878,32 +1793,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn body_size_limit_exceeded_maps_to_entity_too_large_across_io_boundaries() {
-        // Shape observed in production (issue #7596):
-        // Custom { UnexpectedEof, Custom { Other, BodySizeLimitExceeded { size, limit } } }
-        let nested = || {
-            IoError::new(
-                ErrorKind::UnexpectedEof,
-                IoError::other(s3s::BodySizeLimitExceeded {
-                    size: 16384,
-                    limit: 6389,
-                }),
-            )
-        };
+    async fn body_limit_failure() -> IoError {
+        let mut body = rustfs_s3_types::Body::from("hello");
+        let error = body
+            .store_all_limited(4)
+            .await
+            .expect_err("five bytes exceed the four-byte budget");
+        assert!(error.is::<rustfs_s3_types::BodyTooLarge>());
+        IoError::other(error)
+    }
 
-        let direct: ApiError = nested().into();
+    #[tokio::test]
+    async fn body_size_limit_exceeded_maps_to_entity_too_large_across_io_boundaries() {
+        let direct: ApiError = body_limit_failure().await.into();
         assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
         assert_eq!(direct.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
 
-        let storage: ApiError = StorageError::Io(nested()).into();
+        let storage = ApiError::from(StorageError::Io(IoError::new(ErrorKind::UnexpectedEof, body_limit_failure().await)));
         assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
         assert!(storage.source.is_some());
 
         // An unrelated message that merely mentions a limit stays internal.
-        let other: ApiError = IoError::other(MockS3sBodyStreamError("limit exceeded for something else")).into();
+        let other: ApiError = IoError::other(MessageOnlyBodyError("limit exceeded for something else")).into();
         assert_eq!(other.code, S3ErrorCode::InternalError);
-        let impostor: ApiError = IoError::other(MockS3sBodyStreamError("body size 16384 exceeds limit 6389")).into();
+        let impostor: ApiError = IoError::other(MessageOnlyBodyError("body size 16384 exceeds limit 6389")).into();
         assert_eq!(impostor.code, S3ErrorCode::InternalError);
     }
 
@@ -1973,11 +1886,11 @@ mod tests {
         assert!(visits.load(Ordering::Relaxed) <= 64, "body classification must share one chain budget");
     }
 
-    #[test]
-    fn body_error_classification_preserves_nested_marker_precedence() {
+    #[tokio::test]
+    async fn body_error_classification_preserves_nested_marker_precedence() {
         for storage in [false, true] {
             for (inner, expected) in [
-                (IoError::other(UploadStreamError::Sha256Mismatch), CONTENT_SHA256_MISMATCH_CODE),
+                (IoError::other(sha256_mismatch()), CONTENT_SHA256_MISMATCH_CODE),
                 (
                     IoError::other(rustfs_rio::BadDigest {
                         expected_md5: "expected".into(),
@@ -1993,7 +1906,11 @@ mod tests {
                     }),
                     "ServiceUnavailable",
                 ),
-                (IoError::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }), "ServiceUnavailable"),
+                (body_limit_failure().await, "ServiceUnavailable"),
+                (
+                    IoError::other(rustfs_gateway_stream::StreamError::incomplete_body()),
+                    "ServiceUnavailable",
+                ),
             ] {
                 let error = IoError::other(ServerSideSourceReadError::new("CopyObject", inner));
                 let error = if storage {
@@ -2029,31 +1946,24 @@ mod tests {
         }
     }
 
-    /// Exercise the public error type through the actual body budget.
     #[tokio::test]
-    async fn real_s3s_body_size_limit_error_maps_to_entity_too_large() {
+    async fn legacy_and_native_body_budgets_accept_the_limit_and_reject_the_first_extra_byte() {
         use futures::StreamExt;
 
-        let real_error = || async {
-            let mut body = s3s::Body::from(bytes::Bytes::from_static(b"hello"));
-            body.set_limit(Some(4));
-            body.next()
-                .await
-                .expect("one frame")
-                .expect_err("five bytes must exceed a four-byte budget")
-        };
-
-        let err = real_error().await;
-        assert!(err.is::<s3s::BodySizeLimitExceeded>(), "unexpected body error: {err}");
-
-        let err = real_error().await;
-        let storage: ApiError = StorageError::Io(IoError::new(ErrorKind::UnexpectedEof, IoError::other(err))).into();
-        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
-        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
-
-        let err = real_error().await;
-        let direct: ApiError = IoError::other(err).into();
-        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+        for value in ["four", "fives"] {
+            let bytes = bytes::Bytes::from_static(value.as_bytes());
+            let mut legacy = s3s::Body::from(bytes.clone());
+            legacy.set_limit(Some(4));
+            let old = legacy.next().await.expect("one frame");
+            let native = rustfs_s3_types::Body::from(bytes.clone()).store_all_limited(4).await;
+            if bytes.len() == 4 {
+                assert_eq!(old.unwrap(), bytes);
+                assert_eq!(native.unwrap(), bytes);
+            } else {
+                assert!(old.unwrap_err().is::<s3s::BodySizeLimitExceeded>());
+                assert!(native.unwrap_err().is::<rustfs_s3_types::BodyTooLarge>());
+            }
+        }
     }
 
     /// Drive a real hyper HTTP/1 server so the test sees hyper's own body EOF
