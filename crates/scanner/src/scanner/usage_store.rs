@@ -1008,10 +1008,13 @@ where
                 )
                 .await;
                 drop(legacy_admission);
-                if let Some(scope) = scope {
-                    if scope.wait_for_completion().await != ScannerPublicationCommitState::Committed {
-                        return Err(EcstoreError::other("bucket history commit was not confirmed"));
-                    }
+                let commit_state = if let Some(scope) = scope {
+                    Some(scope.wait_for_completion().await)
+                } else {
+                    None
+                };
+                if !root_ack_write_is_confirmed(&saved, commit_state, saved.as_ref().ok().and_then(|info| info.etag.as_deref())) {
+                    return Err(EcstoreError::other("bucket history commit was not confirmed"));
                 }
                 saved?;
                 Ok(())
@@ -1027,7 +1030,10 @@ where
                     if let Some(bytes) = &data {
                         match serde_json::from_slice::<DataUsageInfo>(bytes) {
                             Ok(previous) if previous.is_certified_buckets_snapshot() => {
-                                data_usage_info.retain_prior_certified_buckets(&previous)
+                                if !data_usage_info.retain_prior_certified_buckets(&previous) {
+                                    outcome = DataUsagePersistOutcome::Failed;
+                                    continue;
+                                }
                             }
                             _ => {
                                 outcome = DataUsagePersistOutcome::Failed;
@@ -1297,6 +1303,11 @@ where
                             });
                     }
                     break DataUsagePersistOutcome::Saved;
+                }
+                Err(EcstoreError::PreconditionFailed) if certified_buckets => {
+                    // Rebuilding on the next cycle preserves the winner's
+                    // per-bucket certificates instead of retrying a stale merge.
+                    break DataUsagePersistOutcome::Current;
                 }
                 Err(EcstoreError::PreconditionFailed) if cas_retry < SCANNER_PERSIST_CAS_RETRIES => {
                     cas_retry += 1;

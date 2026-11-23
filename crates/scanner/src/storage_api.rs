@@ -49,6 +49,8 @@ pub(crate) use s3s::dto::{
     NoncurrentVersionExpiration,
 };
 
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::data_usage::load_admin_usage_snapshot as ecstore_load_admin_usage_snapshot;
 pub(crate) use rustfs_ecstore::api::data_usage::{
     MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
     ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,

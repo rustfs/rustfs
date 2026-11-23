@@ -135,6 +135,7 @@ async fn run_entry(
                 scan_mode: HealScanMode::Normal,
                 scan_scope: ScannerBucketScanScope::default(),
                 persisted_usage_baseline: root_before.0.clone().map(Bytes::from),
+                completed_bucket_baseline: Ok(None),
                 observed_usage_candidate: None,
                 requires_full_scan: false,
                 service_cohort: None,

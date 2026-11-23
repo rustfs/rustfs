@@ -733,10 +733,10 @@ impl DataUsageInfo {
             && scope.baseline_rebuild_generation == baseline.usage_snapshot_rebuild_generation
     }
     /// Keep earlier complete bucket values under the same persisted scope.
-    pub fn retain_prior_certified_buckets(&mut self, previous: &Self) {
+    pub fn retain_prior_certified_buckets(&mut self, previous: &Self) -> bool {
         let (Some(current), Some(old)) = (&self.usage_snapshot_certified_buckets, &previous.usage_snapshot_certified_buckets)
         else {
-            return;
+            return true;
         };
         if !previous.is_certified_buckets_snapshot()
             || current.baseline.last_update != old.baseline.last_update
@@ -748,15 +748,26 @@ impl DataUsageInfo {
             || current.movement_generation != old.movement_generation
             || current.sources != old.sources
         {
-            return;
+            return true;
         }
         for (bucket, usage) in &previous.buckets_usage {
             if usage.bucket_incarnation.as_ref() == current.bucket_incarnations.get(bucket) {
-                self.buckets_usage.entry(bucket.clone()).or_insert_with(|| usage.clone());
+                let replace = self.buckets_usage.get(bucket).is_none_or(|current| {
+                    match (usage.usage_certification, current.usage_certification) {
+                        (Some(old), Some(next)) => {
+                            (old.epoch, old.cycle, old.certified_at) > (next.epoch, next.cycle, next.certified_at)
+                        }
+                        (Some(_), None) => true,
+                        _ => false,
+                    }
+                });
+                if replace {
+                    self.buckets_usage.insert(bucket.clone(), usage.clone());
+                }
             }
         }
         self.buckets_count = u64::try_from(self.buckets_usage.len()).unwrap_or(u64::MAX);
-        self.calculate_totals();
+        self.checked_calculate_totals() && self.is_certified_buckets_snapshot()
     }
 
     /// Validate the independent bucket snapshot without granting whole-cycle
@@ -2510,6 +2521,24 @@ impl DataUsageInfo {
         }
     }
 
+    /// Update all scalar totals atomically, rejecting overflow without wrapping.
+    pub fn checked_calculate_totals(&mut self) -> bool {
+        let totals = self.buckets_usage.values().try_fold([0_u64; 4], |total, usage| {
+            Some([
+                total[0].checked_add(usage.objects_count)?,
+                total[1].checked_add(usage.size)?,
+                total[2].checked_add(usage.versions_count)?,
+                total[3].checked_add(usage.delete_markers_count)?,
+            ])
+        });
+        let Some([objects, size, versions, markers]) = totals else { return false };
+        self.objects_total_count = objects;
+        self.objects_total_size = size;
+        self.versions_total_count = versions;
+        self.delete_markers_total_count = markers;
+        true
+    }
+
     /// Merge another DataUsageInfo into this one
     pub fn merge(&mut self, other: &DataUsageInfo) {
         // Merge bucket usage
@@ -2778,6 +2807,43 @@ mod tests {
         let mut bad = data;
         bad.usage_snapshot_observational = true;
         assert!(!bad.is_certified_buckets_snapshot());
+    }
+
+    #[test]
+    fn completed_bucket_snapshot_retains_newer_sidecar_value_over_carried_primary_value() {
+        let (_, previous) = complete_bucket_sidecar();
+        let mut candidate = previous.clone();
+        candidate.scanner_cycle = Some(5);
+        let carried = candidate.buckets_usage.get_mut("bucket").expect("carried bucket");
+        carried.objects_count = 1;
+        carried.usage_certification.as_mut().expect("certificate").cycle = 3;
+        let id = "00000000-0000-0000-0000-000000000002".to_owned();
+        let mut next = BucketUsageInfo {
+            size: 20,
+            objects_count: 2,
+            bucket_incarnation: Some(id.clone()),
+            ..Default::default()
+        };
+        next.certify(crate::BucketUsageCertification {
+            epoch: 3,
+            cycle: 5,
+            certified_at: candidate.last_update.expect("timestamp"),
+        });
+        candidate
+            .usage_snapshot_certified_buckets
+            .as_mut()
+            .expect("scope")
+            .bucket_incarnations
+            .insert("new".into(), id);
+        candidate.buckets_usage.insert("new".into(), next);
+        assert!(candidate.retain_prior_certified_buckets(&previous));
+        assert_eq!(candidate.buckets_usage["bucket"].objects_count, 7);
+        assert_eq!(
+            candidate.buckets_usage["bucket"].usage_certification,
+            previous.buckets_usage["bucket"].usage_certification
+        );
+        assert_eq!((candidate.objects_total_count, candidate.objects_total_size), (9, 91));
+        assert_eq!(candidate.buckets_usage["new"].objects_count, 2);
     }
 
     #[derive(Deserialize)]

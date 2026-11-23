@@ -55,6 +55,7 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
                 scan_mode: HealScanMode::Normal,
                 scan_scope: ScannerBucketScanScope::default(),
                 persisted_usage_baseline: options.baseline,
+                completed_bucket_baseline: Ok(None),
                 observed_usage_candidate: None,
                 requires_full_scan: options.requires_full_scan,
                 service_cohort: None,

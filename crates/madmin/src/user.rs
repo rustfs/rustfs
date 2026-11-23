@@ -1183,6 +1183,7 @@ mod tests {
 
         let bucket_info = BucketAccessInfo {
             name: "test-bucket".to_string(),
+            initial_scan: None,
             scan_progress: None,
             usage_value_state: None,
             usage_updated_at: None,

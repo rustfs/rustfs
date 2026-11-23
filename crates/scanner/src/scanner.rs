@@ -692,7 +692,31 @@ pub(super) fn data_usage_info_is_bootstrap_pending(info: &DataUsageInfo) -> bool
         return false;
     };
 
-    info == &scanner_usage_bootstrap_marker(last_update, info.scanner_epoch)
+    if !matches!(info.usage_snapshot_initial_view_version, None | Some(1))
+        || (info.usage_snapshot_initial_bootstrap && info.usage_snapshot_initial_view_version != Some(1))
+        || info
+            .usage_snapshot_rebuild_generation
+            .as_deref()
+            .is_some_and(|generation| Uuid::parse_str(generation).map_or(true, |id| id.is_nil()))
+        || info
+            .usage_snapshot_noninitial_buckets
+            .iter()
+            .any(|(bucket, incarnation)| bucket.is_empty() || Uuid::parse_str(incarnation).map_or(true, |id| id.is_nil()))
+    {
+        return false;
+    }
+    let expected = DataUsageInfo {
+        last_update: Some(last_update),
+        scanner_epoch: info.scanner_epoch,
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        usage_snapshot_rebuild_generation: info.usage_snapshot_rebuild_generation.clone(),
+        usage_snapshot_initial_bootstrap: info.usage_snapshot_initial_bootstrap,
+        usage_snapshot_initial_view_version: info.usage_snapshot_initial_view_version,
+        usage_snapshot_noninitial_buckets: info.usage_snapshot_noninitial_buckets.clone(),
+        ..Default::default()
+    };
+    info == &expected
 }
 
 pub(super) fn scanner_usage_bootstrap_marker(last_update: std::time::SystemTime, scanner_epoch: Option<u64>) -> DataUsageInfo {
@@ -2089,6 +2113,16 @@ where
     let baseline_publication_epoch = baseline_publication_guard.epoch();
     let usage_persist_baseline_result = read_data_usage_persist_baseline(storeapi.clone()).await;
     let observed_usage_candidate_result = read_config(storeapi.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await;
+    let completed_bucket_baseline = match tokio::time::timeout(
+        Duration::from_secs(2),
+        read_config(storeapi.clone(), DATA_USAGE_CERTIFIED_BUCKETS_OBJ_NAME_PATH.as_str()),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => Ok(Some(Bytes::from(bytes))),
+        Ok(Err(EcstoreError::ConfigNotFound)) => Ok(None),
+        _ => Err(()),
+    };
     drop(baseline_publication_guard);
     let usage_persist_baseline = match usage_persist_baseline_result {
         Ok(baseline) => baseline,
@@ -2148,6 +2182,7 @@ where
             scan_mode,
             scan_scope: crate::scanner_io::ScannerBucketScanScope::default(),
             persisted_usage_baseline: usage_persist_baseline.data.clone(),
+            completed_bucket_baseline,
             observed_usage_candidate,
             requires_full_scan: scheduling.requires_full_scan,
             service_cohort: scheduling.service_cohort,

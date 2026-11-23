@@ -213,6 +213,7 @@ where
         scan_mode,
         scan_scope: ScannerBucketScanScope::default(),
         persisted_usage_baseline: None,
+        completed_bucket_baseline: Ok(None),
         observed_usage_candidate: None,
         requires_full_scan: true,
         service_cohort: None,
@@ -239,6 +240,8 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) scan_mode: HealScanMode,
     pub(crate) scan_scope: ScannerBucketScanScope,
     pub(crate) persisted_usage_baseline: Option<Bytes>,
+    /// A failed sidecar read must not be mistaken for absence of complete history.
+    pub(crate) completed_bucket_baseline: std::result::Result<Option<Bytes>, ()>,
     pub(crate) observed_usage_candidate: Option<Bytes>,
     /// Scheduled maintenance must visit clean buckets even with a valid dirty scope.
     pub(crate) requires_full_scan: bool,
@@ -254,6 +257,103 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) post_walk_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     #[cfg(test)]
     pub(crate) peer_observations: Option<ScannerCyclePeerObservations>,
+}
+
+fn current_source_layouts<S: ScannerStorage>(
+    store: &S,
+    expected: &HashSet<DataUsageCacheSource>,
+) -> Option<Vec<rustfs_data_usage::CertifiedBucketsSource>> {
+    let mut layouts = Vec::new();
+    for set in store.all_set_disks() {
+        if !expected.contains(&DataUsageCacheSource::new(set.pool_index, set.set_index)) {
+            return None;
+        }
+        let disks = set.format.erasure.sets.get(set.set_index)?;
+        if set.format.id.is_nil() || disks.is_empty() || disks.iter().any(uuid::Uuid::is_nil) {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(set.format.id.as_bytes());
+        for disk in disks {
+            digest.update(disk.as_bytes());
+        }
+        layouts.push(rustfs_data_usage::CertifiedBucketsSource {
+            pool_index: u64::try_from(set.pool_index).ok()?,
+            set_index: u64::try_from(set.set_index).ok()?,
+            layout: digest.finalize().into(),
+        });
+    }
+    layouts.sort_by_key(|source| (source.pool_index, source.set_index));
+    (layouts.len() == expected.len()).then_some(layouts)
+}
+
+fn completed_bucket_history(
+    primary: Option<&Bytes>,
+    sidecar: std::result::Result<Option<Bytes>, ()>,
+    movement: Option<u64>,
+    layouts: Option<&[rustfs_data_usage::CertifiedBucketsSource]>,
+) -> Result<DataUsageInfo> {
+    let mut history = match primary {
+        Some(bytes) => {
+            serde_json::from_slice::<DataUsageInfo>(bytes).map_err(|_| Error::other("invalid completed usage baseline"))?
+        }
+        None => DataUsageInfo::default(),
+    };
+    if history.is_complete_bucket_usage_snapshot()
+        && let Some(measured_at) = history.last_update
+    {
+        let certification = rustfs_data_usage::BucketUsageCertification {
+            epoch: history.scanner_epoch.unwrap_or_default(),
+            cycle: history.scanner_cycle.unwrap_or_default(),
+            certified_at: measured_at,
+        };
+        // A validated legacy complete root already supplies measurement
+        // provenance. Adoption retains that root's time, never this scan's time.
+        for usage in history.buckets_usage.values_mut() {
+            if usage.usage_certification.is_none()
+                && usage.usage_value_state.is_none()
+                && usage
+                    .bucket_incarnation
+                    .as_deref()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()))
+            {
+                usage.certify(certification);
+            }
+        }
+    }
+    let bytes = sidecar.map_err(|()| Error::other("completed bucket history is unavailable"))?;
+    if let Some(bytes) = bytes {
+        let sidecar: DataUsageInfo =
+            serde_json::from_slice(&bytes).map_err(|_| Error::other("invalid completed bucket history"))?;
+        if !sidecar.is_certified_buckets_snapshot() {
+            return Err(Error::other("unsupported completed bucket history"));
+        }
+        if sidecar.certified_buckets_match_baseline(&history) {
+            let scope = sidecar
+                .usage_snapshot_certified_buckets
+                .as_ref()
+                .ok_or_else(|| Error::other("missing bucket history scope"))?;
+            let movement = movement.ok_or_else(|| Error::other("bucket history movement is unavailable"))?;
+            let layouts = layouts.ok_or_else(|| Error::other("bucket history layout is unavailable"))?;
+            if scope.movement_generation == movement && scope.sources == layouts {
+                for (bucket, usage) in sidecar.buckets_usage {
+                    let replace = history.buckets_usage.get(&bucket).is_none_or(|previous| {
+                        match (usage.usage_certification, previous.usage_certification) {
+                            (Some(next), Some(old)) => {
+                                (next.epoch, next.cycle, next.certified_at) > (old.epoch, old.cycle, old.certified_at)
+                            }
+                            (Some(_), None) => true,
+                            _ => false,
+                        }
+                    });
+                    if replace {
+                        history.buckets_usage.insert(bucket, usage);
+                    }
+                }
+            }
+        }
+    }
+    Ok(history)
 }
 
 #[cfg(test)]
@@ -616,6 +716,7 @@ where
         scan_mode,
         scan_scope,
         persisted_usage_baseline,
+        completed_bucket_baseline,
         observed_usage_candidate,
         requires_full_scan,
         service_cohort,
@@ -1583,30 +1684,7 @@ where
             .as_ref()
             .and_then(|bytes| serde_json::from_slice::<DataUsageInfo>(bytes).ok());
         let movement = store.scanner_data_usage_movement_generation().await;
-        let mut layouts = Vec::new();
-        for set in store.all_set_disks() {
-            let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
-            if !expected_sources.contains(&source) {
-                continue;
-            }
-            if let Some(disks) = set.format.erasure.sets.get(set.set_index) {
-                if set.format.id.is_nil() || disks.is_empty() || disks.iter().any(uuid::Uuid::is_nil) {
-                    layouts.clear();
-                    break;
-                }
-                let mut digest = Sha256::new();
-                digest.update(set.format.id.as_bytes());
-                for disk in disks {
-                    digest.update(disk.as_bytes());
-                }
-                layouts.push(rustfs_data_usage::CertifiedBucketsSource {
-                    pool_index: u64::try_from(set.pool_index).unwrap_or(u64::MAX),
-                    set_index: u64::try_from(set.set_index).unwrap_or(u64::MAX),
-                    layout: digest.finalize().into(),
-                });
-            }
-        }
-        layouts.sort_by_key(|source| (source.pool_index, source.set_index));
+        let layouts = current_source_layouts(store, &expected_sources).unwrap_or_default();
         if let (Some(baseline), Some(movement)) = (baseline, movement) {
             let scope = ScannerSnapshotScope {
                 sources: &expected_sources,
@@ -1625,8 +1703,10 @@ where
                 &completions,
                 &uncertified_buckets,
                 &baseline,
-                layouts,
-                movement,
+                cache::CertifiedBucketPublicationScope {
+                    sources: layouts,
+                    movement_generation: movement,
+                },
                 &tier_registry.names,
             )
         } else {
@@ -1661,7 +1741,20 @@ where
         Vec::new()
     };
     let mut publication_expectation = None;
-    let usage_update_emitted = if let Some(candidate) = completed_usage {
+    let usage_update_emitted = if let Some(mut candidate) = completed_usage {
+        if cycle_status == ScannerCycleStatus::Complete && candidate.needs_completed_history(&pending_buckets) {
+            let layouts = current_source_layouts(store, &expected_sources);
+            let movement = store.scanner_data_usage_movement_generation().await;
+            let history = completed_bucket_history(
+                persisted_usage_baseline.as_ref(),
+                completed_bucket_baseline,
+                movement,
+                layouts.as_deref(),
+            )?;
+            if !candidate.retain_completed_certifications(&history, &pending_buckets) {
+                return Err(Error::other("completed usage history totals overflow"));
+            }
+        }
         let (data_usage_info, expectation) = candidate.prepare(cycle_status, &pending_buckets);
         publication_expectation = expectation;
         #[cfg(feature = "e2e-test-hooks")]

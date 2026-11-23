@@ -1743,8 +1743,11 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub scan_checkpoint_used: u64,
     /// Initial/display progress failures do not invalidate a saved checkpoint.
+    #[serde(default)]
     pub scan_progress_prepare_timeouts: u64,
+    #[serde(default)]
     pub scan_progress_writes: u64,
+    #[serde(default)]
     pub scan_progress_write_failures: u64,
     #[serde(default)]
     pub scan_checkpoint_cleared: u64,
@@ -6343,8 +6346,23 @@ mod tests {
         assert_eq!(report.usage_publication.pending_bucket_count, None);
         let mut legacy = serde_json::to_value(report).expect("serialize scanner report");
         legacy.as_object_mut().expect("report object").remove("usage_publication");
+        for field in [
+            "scan_progress_prepare_timeouts",
+            "scan_progress_writes",
+            "scan_progress_write_failures",
+        ] {
+            legacy.as_object_mut().expect("report object").remove(field);
+        }
         let legacy: ScannerMetricsReport = serde_json::from_value(legacy).expect("decode legacy report");
         assert_eq!(legacy.usage_publication, ScannerUsagePublicationStatus::default());
+        assert_eq!(
+            (
+                legacy.scan_progress_prepare_timeouts,
+                legacy.scan_progress_writes,
+                legacy.scan_progress_write_failures
+            ),
+            (0, 0, 0)
+        );
     }
 
     #[test]

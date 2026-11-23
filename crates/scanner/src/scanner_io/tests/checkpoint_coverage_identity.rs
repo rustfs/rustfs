@@ -55,6 +55,7 @@ async fn run_full_cycle(
                 persisted_usage_baseline: baseline.map(|snapshot| {
                     Bytes::from(serde_json::to_vec(snapshot).expect("the actual candidate must encode as a baseline"))
                 }),
+                completed_bucket_baseline: Ok(None),
                 observed_usage_candidate: None,
                 requires_full_scan: true,
                 service_cohort: None,

@@ -409,6 +409,49 @@ mod tests {
         assert_eq!(view.unmeasured_buckets, ["progress"]);
     }
 
+    #[tokio::test]
+    async fn strict_snapshot_never_returns_a_persisted_observed_row_as_completed_usage() {
+        let (_dirs, store, sample) = fixture().await;
+        save(&store, &sample).await;
+        let mut observed = BucketUsageInfo {
+            objects_count: 90,
+            size: 900,
+            bucket_incarnation: Some(sample.bucket_incarnation),
+            ..Default::default()
+        };
+        observed.mark_observed();
+        let mut baseline = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(9),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            usage_snapshot_initial_view_version: Some(1),
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_bucket_count: 1,
+            usage_snapshot_pending_buckets: vec!["progress".into()],
+            buckets_count: 1,
+            buckets_usage: HashMap::from([("progress".into(), observed)]),
+            ..Default::default()
+        };
+        assert!(baseline.checked_calculate_totals());
+        save_config(
+            store.clone(),
+            "buckets/.usage.v2.json",
+            serde_json::to_vec(&baseline).expect("observed root"),
+        )
+        .await
+        .expect("persist old pending root");
+        let view = super::super::load_admin_usage_snapshot(store, &["progress".into()])
+            .await
+            .expect("strict view");
+        assert!(view.usage.buckets_usage.is_empty());
+        assert_eq!(view.unmeasured_buckets, ["progress"]);
+        assert!(
+            view.initial_scan_progress.is_empty(),
+            "filtering an old row must not reopen initial fallback"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn display_progress_reloads_from_shared_storage_without_promoting_usage() {
         fn assert_send<T: Send>(value: T) -> T {

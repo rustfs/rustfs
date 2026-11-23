@@ -78,6 +78,7 @@ async fn run_cohort_cycle(
                 scan_mode: HealScanMode::Normal,
                 scan_scope: ScannerBucketScanScope::default(),
                 persisted_usage_baseline: None,
+                completed_bucket_baseline: Ok(None),
                 observed_usage_candidate: None,
                 requires_full_scan: false,
                 service_cohort: Some(cohort),

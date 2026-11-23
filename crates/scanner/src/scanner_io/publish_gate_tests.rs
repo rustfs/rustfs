@@ -163,6 +163,109 @@ fn completed_root_cache(bucket: &str, objects: usize, update_secs: u64, source: 
     cache
 }
 
+fn partial_bucket_snapshot_fixture() -> (DataUsageCache, DataUsageInfo, ScannerBucketCompletions) {
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut cache = completed_root_cache("small", 1, 10, source);
+    cache.info.snapshot_complete = false;
+    cache.info.next_cycle = 3;
+    cache.info.leader_epoch = 1;
+    let large_id = uuid::Uuid::from_u128(1);
+    let small_id = uuid::Uuid::from_u128(2);
+    cache.info.scan_bucket_incarnations = HashMap::from([("large".into(), large_id), ("small".into(), small_id)]);
+    let mut large = rustfs_data_usage::BucketUsageInfo {
+        objects_count: 10,
+        bucket_incarnation: Some(large_id.to_string()),
+        ..Default::default()
+    };
+    large.certify(rustfs_data_usage::BucketUsageCertification {
+        epoch: 1,
+        cycle: 2,
+        certified_at: SystemTime::UNIX_EPOCH,
+    });
+    let baseline = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH),
+        scanner_epoch: Some(1),
+        scanner_cycle: Some(2),
+        usage_snapshot_complete: true,
+        buckets_count: 1,
+        buckets_usage: HashMap::from([("large".into(), large)]),
+        ..Default::default()
+    };
+    let completions = HashMap::from([(source, HashMap::from([("small".into(), small_id)]))]);
+    (cache, baseline, completions)
+}
+
+fn partial_bucket_snapshot(
+    cache: DataUsageCache,
+    baseline: &DataUsageInfo,
+    completions: &ScannerBucketCompletions,
+) -> Option<DataUsageInfo> {
+    let source = DataUsageCacheSource::new(0, 0);
+    let sources = HashSet::from([source]);
+    let buckets = vec!["large".into(), "small".into()];
+    let scope = ScannerSnapshotScope {
+        sources: &sources,
+        buckets: &buckets,
+        identity: ScannerSnapshotIdentity {
+            cycle: 3,
+            leader_epoch: 1,
+            plan_digest: TEST_PLAN_DIGEST,
+            coverage_digest: TEST_COVERAGE_DIGEST,
+            tier_registry_generation: None,
+        },
+    };
+    cache::certified_buckets_candidate(
+        &[cache],
+        &scope,
+        completions,
+        &HashSet::new(),
+        baseline,
+        cache::CertifiedBucketPublicationScope {
+            sources: vec![rustfs_data_usage::CertifiedBucketsSource {
+                pool_index: 0,
+                set_index: 0,
+                layout: [1; 32],
+            }],
+            movement_generation: 0,
+        },
+        &[],
+    )
+}
+
+#[test]
+fn completed_bucket_snapshot_publishes_small_bucket_while_retaining_large_bucket_measurement() {
+    let (cache, baseline, completions) = partial_bucket_snapshot_fixture();
+    let snapshot = partial_bucket_snapshot(cache, &baseline, &completions).expect("small bucket is complete");
+    assert_eq!(snapshot.objects_total_count, 11);
+    assert_eq!(
+        snapshot.buckets_usage["large"].usage_certification,
+        baseline.buckets_usage["large"].usage_certification
+    );
+    assert_eq!(
+        snapshot.buckets_usage["small"]
+            .usage_certification
+            .expect("small certificate")
+            .cycle,
+        3
+    );
+    assert!(!snapshot.is_complete_bucket_usage_snapshot());
+}
+
+#[test]
+fn completed_bucket_snapshot_requires_actual_completion_and_matching_plan() {
+    let (mut cache, baseline, completions) = partial_bucket_snapshot_fixture();
+    assert!(partial_bucket_snapshot(cache.clone(), &baseline, &HashMap::new()).is_none());
+    cache.info.scan_plan_digest = Some(DataUsageScanPlanDigest([9; 32]));
+    assert!(partial_bucket_snapshot(cache, &baseline, &completions).is_none());
+}
+
+#[test]
+fn completed_bucket_snapshot_rejects_overflow_when_carrying_a_large_prior_bucket() {
+    let (cache, mut baseline, completions) = partial_bucket_snapshot_fixture();
+    baseline.buckets_usage.get_mut("large").expect("large baseline").objects_count = u64::MAX;
+    assert!(partial_bucket_snapshot(cache, &baseline, &completions).is_none());
+}
+
 fn completed_data_usage_info_for_test(
     results: &[DataUsageCache],
     all_buckets: &[String],

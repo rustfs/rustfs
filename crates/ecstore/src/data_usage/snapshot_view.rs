@@ -79,7 +79,17 @@ pub async fn load_admin_usage_snapshot(store: Arc<ECStore>, buckets: &[String]) 
             usage.buckets_usage.insert(bucket.clone(), value.clone());
         }
     }
-    if merged_completed_buckets {
+    let original_count = usage.buckets_usage.len();
+    usage.buckets_usage.retain(|_, usage| {
+        !matches!(
+            usage.usage_value_state,
+            Some(rustfs_data_usage::BucketUsageValueState::Observed | rustfs_data_usage::BucketUsageValueState::Unknown)
+        ) && (!matches!(
+            usage.usage_value_state,
+            Some(rustfs_data_usage::BucketUsageValueState::Certified | rustfs_data_usage::BucketUsageValueState::Carried)
+        ) || usage.usage_certification.is_some())
+    });
+    if merged_completed_buckets || usage.buckets_usage.len() != original_count {
         refresh_completed_snapshot_totals(&mut usage)?;
     }
     // A complete observation can be newer than the last certified value. This
@@ -108,19 +118,9 @@ pub async fn load_admin_usage_snapshot(store: Arc<ECStore>, buckets: &[String]) 
 }
 
 fn refresh_completed_snapshot_totals(usage: &mut DataUsageInfo) -> Result<(), Error> {
-    let totals = usage.buckets_usage.values().try_fold([0_u64; 4], |totals, bucket| {
-        Some([
-            totals[0].checked_add(bucket.objects_count)?,
-            totals[1].checked_add(bucket.size)?,
-            totals[2].checked_add(bucket.versions_count)?,
-            totals[3].checked_add(bucket.delete_markers_count)?,
-        ])
-    });
-    let [objects, size, versions, markers] = totals.ok_or_else(|| Error::other("completed snapshot totals overflow"))?;
-    usage.objects_total_count = objects;
-    usage.objects_total_size = size;
-    usage.versions_total_count = versions;
-    usage.delete_markers_total_count = markers;
+    if !usage.checked_calculate_totals() {
+        return Err(Error::other("completed snapshot totals overflow"));
+    }
     usage.buckets_count = u64::try_from(usage.buckets_usage.len()).map_err(Error::other)?;
     usage.bucket_sizes = usage
         .buckets_usage

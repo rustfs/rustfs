@@ -90,6 +90,7 @@ async fn usage_sealed_candidate_rejects_late_source_collector_updates() {
                 scan_mode: HealScanMode::Normal,
                 scan_scope: ScannerBucketScanScope::default(),
                 persisted_usage_baseline: None,
+                completed_bucket_baseline: Ok(None),
                 observed_usage_candidate: None,
                 requires_full_scan: true,
                 service_cohort: None,
