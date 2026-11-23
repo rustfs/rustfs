@@ -1314,6 +1314,24 @@ impl Operation for ListAccessKeysBulk {
     }
 }
 
+fn map_owner_service_account_delete_error(access_key: &str, err: rustfs_iam::error::Error) -> S3Error {
+    if matches!(err, rustfs_iam::error::Error::IAMActionNotAllowed) {
+        return s3_error!(AccessDenied, "access denied");
+    }
+    if is_err_no_such_service_account(&err) {
+        return s3_error!(InvalidRequest, "service account not exist");
+    }
+    debug!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+        event = "service_account_delete_failed",
+        access_key = %access_key,
+        error = ?err,
+        "Failed to delete service account"
+    );
+    s3_error!(InternalError, "delete service account failed")
+}
+
 pub struct DeleteServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for DeleteServiceAccount {
@@ -1355,13 +1373,10 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        // Keep lookup errors behind authorization so unauthorized callers cannot
-        // distinguish missing service accounts from forbidden ones.
-        let existing_account = iam_store.get_service_account(&query.access_key).await;
         let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
         let claims = cred.claims_or_empty();
 
-        if !iam_store
+        let deleted_at = if iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
                 groups: &cred.groups,
@@ -1375,6 +1390,29 @@ impl Operation for DeleteServiceAccount {
             })
             .await
         {
+            let existing_account = iam_store.get_service_account(&query.access_key).await;
+            if let Err(err) = &existing_account
+                && is_err_no_such_service_account(err)
+                && matches!(iam_store.get_service_account_revision(&query.access_key).await, Ok(None))
+            {
+                return Err(s3_error!(InvalidRequest, "service account not exist"));
+            }
+
+            iam_store
+                .delete_service_account_with_revision(&query.access_key, true)
+                .await
+                .map_err(|e| {
+                    debug!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                        event = "service_account_delete_failed",
+                        access_key = %query.access_key,
+                        error = ?e,
+                        "Failed to delete service account"
+                    );
+                    s3_error!(InternalError, "delete service account failed")
+                })?
+        } else {
             let no_explicit_deny = if cred.is_service_account() {
                 false
             } else {
@@ -1396,33 +1434,26 @@ impl Operation for DeleteServiceAccount {
             // Fail closed: a caller without RemoveServiceAccount may delete a
             // service account only when it is not itself a service account, has no
             // explicit Deny on RemoveServiceAccount, and owns the loaded target
-            // (backlog#806, #9514).
-            let target_parent = existing_account.as_ref().ok().map(|(v, _)| v.parent_user.as_str());
-            if !non_admin_may_access_owned_service_account(&cred, target_parent, no_explicit_deny) {
+            // (backlog#806, #9514). Bind deletion to the authorized target revision
+            // so concurrent replacement cannot be deleted under a stale check.
+            if !no_explicit_deny {
                 return Err(s3_error!(AccessDenied, "access denied"));
             }
-        }
 
-        if let Err(err) = existing_account
-            && is_err_no_such_service_account(&err)
-        {
-            return Err(s3_error!(InvalidRequest, "service account not exist"));
-        }
+            let Ok(Some((target_cred, revision))) = iam_store.get_service_account_revision(&query.access_key).await else {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            };
 
-        let deleted_at = iam_store
-            .delete_service_account_with_revision(&query.access_key, true)
-            .await
-            .map_err(|e| {
-                debug!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                    event = "service_account_delete_failed",
-                    access_key = %query.access_key,
-                    error = ?e,
-                    "Failed to delete service account"
-                );
-                s3_error!(InternalError, "delete service account failed")
-            })?;
+            if !non_admin_may_access_owned_service_account(&cred, Some(target_cred.parent_user.as_str()), no_explicit_deny) {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            }
+
+            let deleted_at = iam_store
+                .delete_service_account_if_revision(&query.access_key, &target_cred.parent_user, &revision, true)
+                .await
+                .map_err(|err| map_owner_service_account_delete_error(&query.access_key, err))?;
+            Some(deleted_at)
+        };
 
         if let Some(deleted_at) = deleted_at
             && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
@@ -1993,6 +2024,24 @@ mod tests {
         ] {
             assert_eq!(map_service_account_create_error(error).code(), &expected);
         }
+    }
+
+    #[test]
+    fn owner_service_account_delete_maps_revision_mismatch_to_access_denied() {
+        use rustfs_iam::error::Error;
+
+        assert_eq!(
+            map_owner_service_account_delete_error("sa-key", Error::IAMActionNotAllowed).code(),
+            &S3ErrorCode::AccessDenied
+        );
+        assert_eq!(
+            map_owner_service_account_delete_error("sa-key", Error::NoSuchServiceAccount("sa-key".into())).code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            map_owner_service_account_delete_error("sa-key", Error::Io(std::io::Error::other("storage unavailable"))).code(),
+            &S3ErrorCode::InternalError
+        );
     }
 
     #[test]
@@ -3023,6 +3072,82 @@ mod tests {
                     .await
                     .is_err_and(|err| is_err_no_such_service_account(&err)),
                 "authorized service account delete must remove the target service account"
+            );
+
+            // Unrestricted admin RemoveServiceAccount must still clean up corrupt on-disk
+            // service-account records, while non-admin owner fallback fails closed with AccessDenied.
+            let object_store =
+                crate::admin::runtime_sources::current_object_store_handle().expect("canonical object store must be initialized");
+            let corrupt_key = "corrupt-sa-9514";
+            let corrupt_identity_path = format!(
+                "{}{corrupt_key}/identity.json",
+                *rustfs_iam::store::object::IAM_CONFIG_SERVICE_ACCOUNTS_PREFIX
+            );
+            let corrupt_policy_path = format!(
+                "{}{corrupt_key}.json",
+                *rustfs_iam::store::object::IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX
+            );
+            crate::admin::storage_api::save_admin_config(
+                object_store.clone(),
+                &corrupt_identity_path,
+                b"{corrupt-service-account".to_vec(),
+            )
+            .await
+            .expect("seed corrupt service account identity");
+            crate::admin::storage_api::save_admin_config(
+                object_store.clone(),
+                &corrupt_policy_path,
+                br#"{"version":1,"policy":"readwrite"}"#.to_vec(),
+            )
+            .await
+            .expect("seed corrupt service account mapped policy");
+
+            let non_admin_corrupt_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={corrupt_key}").as_str(),
+            )
+            .credentials("alice-9514", secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(non_admin_corrupt_delete, Params::new())
+                    .await
+                    .expect_err("non-admin delete of corrupt record must fail closed")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            assert!(
+                iam.get_service_account_revision(corrupt_key).await.is_err(),
+                "corrupt service account record must survive rejected non-admin delete"
+            );
+
+            let admin_corrupt_delete = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={corrupt_key}").as_str(),
+            )
+            .credentials(&admin_sa.access_key, secret, None)
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(admin_corrupt_delete, Params::new())
+                    .await
+                    .expect("unrestricted admin must delete corrupt service account record")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            assert!(
+                iam.get_service_account_revision(corrupt_key)
+                    .await
+                    .expect("check cleaned corrupt record")
+                    .is_none(),
+                "corrupt service account identity must be removed by unrestricted admin delete"
+            );
+            assert!(
+                crate::admin::storage_api::read_admin_config(object_store, &corrupt_policy_path)
+                    .await
+                    .is_err(),
+                "corrupt service account mapped policy must be removed by unrestricted admin delete"
             );
         });
     }

@@ -1672,6 +1672,56 @@ where
         Ok(())
     }
 
+    pub async fn service_account_revision(&self, access_key: &str) -> Result<Option<(UserIdentity, String)>> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        self.api.service_account_revision(access_key).await
+    }
+
+    pub async fn delete_service_account_matching_revision(
+        &self,
+        access_key: &str,
+        expected_parent: &str,
+        expected_revision: &str,
+    ) -> Result<OffsetDateTime> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        if expected_parent.is_empty() || expected_revision.is_empty() || expected_revision == "*" {
+            return Err(Error::IAMActionNotAllowed);
+        }
+
+        let _service_account_guard = self.cache.service_account_mutation_lock().lock().await;
+        match self.api.service_account_revision(access_key).await? {
+            None => return Err(Error::NoSuchServiceAccount(access_key.to_owned())),
+            Some((current, current_rev)) => {
+                if current.credentials.parent_user != expected_parent || current_rev != expected_revision {
+                    return Err(Error::IAMActionNotAllowed);
+                }
+            }
+        }
+
+        self.api
+            .delete_service_account_revision(access_key, expected_revision)
+            .await?;
+
+        let deleted_at = OffsetDateTime::now_utc();
+        self.cache.with_write_lock(|cache| {
+            if cache
+                .state()
+                .users
+                .get(access_key)
+                .is_some_and(|u| u.credentials.is_service_account() && u.credentials.parent_user == expected_parent)
+            {
+                cache.delete_user_policy(access_key, deleted_at);
+                cache.delete_user(access_key, deleted_at);
+            }
+        });
+
+        Ok(deleted_at)
+    }
+
     pub async fn delete_service_account_with_revision(&self, access_key: &str) -> Result<OffsetDateTime> {
         self.delete_user_with_revision(access_key, UserType::Svc).await
     }
