@@ -14,7 +14,7 @@
 
 //! ListParts execution against real multipart metadata and the native claim exchange.
 
-use super::super::test_support::{Method, build_request, owned_envelope};
+use super::super::test_support::{Method, owned_envelope};
 use super::*;
 use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore_and_disk_paths};
 use crate::app::storage_api::multipart_usecase::access::{AuthorizationRequest, load_bucket_generation_from_store};
@@ -215,15 +215,34 @@ fn list_parts_applies_the_authorized_generation_before_lookup() {
                 .expect("create a fixture bucket");
         }
         let req = || {
-            let mut req = build_request((), Method::GET);
-            req.extensions.insert(slot.clone());
-            RequestEnvelope::from_s3s(&req)
+            let mut extensions = http::Extensions::new();
+            extensions.insert(slot.clone());
+            RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::GET,
+                    uri: http::Uri::from_static("/"),
+                    headers: http::HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            )
         };
         let capability = |query: &str| {
-            let mut request = build_request((), Method::GET);
-            request.extensions.insert(slot.clone());
-            request.uri = format!("/fixture?{query}").parse().expect("fixture URI");
-            RequestEnvelope::from_s3s(&request)
+            let mut extensions = http::Extensions::new();
+            extensions.insert(slot.clone());
+            RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::GET,
+                    uri: format!("/fixture?{query}").parse().expect("fixture URI"),
+                    headers: http::HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            )
         };
         for (query, first) in [
             (

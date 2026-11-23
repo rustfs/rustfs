@@ -240,7 +240,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
 
     #[tokio::test]
@@ -443,11 +443,21 @@ mod tests {
         assert_eq!(error.code(), &S3ErrorCode::MalformedXML);
         assert_eq!(error.message(), Some("persistence conversion"));
 
-        let mut request = build_request((), Method::PUT);
-        request.extensions.insert(crate::runtime_sources::ServerContextSlot::new());
+        let mut extensions = http::Extensions::new();
+        extensions.insert(crate::runtime_sources::ServerContextSlot::new());
         let error = usecase
             .execute_put_bucket_notification_configuration(
-                RequestEnvelope::from_s3s(&request),
+                RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                ),
                 bucket,
                 vec![destination("QueueConfiguration", &[(None, None)])],
                 Err(s3_error!(MalformedXML, "persistence conversion")),

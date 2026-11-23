@@ -2097,11 +2097,10 @@ impl SetDisks {
                                                 ),
                                             }
                                         }
-                                        if parts_metadata[index].is_remote() {
-                                            let rm_data_dir =
-                                                parts_metadata[index].data_dir.expect("operation should succeed").to_string();
-
-                                            let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
+                                        if parts_metadata[index].is_remote()
+                                            && let Some(data_dir) = parts_metadata[index].data_dir.filter(|id| !id.is_nil())
+                                        {
+                                            let d_path = Path::new(&encode_dir_object(object)).join(data_dir.to_string());
 
                                             if let Err(e) = disk
                                                 .delete(
@@ -11254,6 +11253,9 @@ mod heal_result_report_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod remote_object_heal_tests;
 
 #[cfg(test)]
 mod shard_integrity_rollout_tests;
