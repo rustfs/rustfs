@@ -53,5 +53,3 @@ The adapter tests live with the adapter:
 ```bash
 cargo nextest run -p rustfs --no-tests fail -E 'test(/^storage::sse::/)'
 ```
-
-A change that should leave client-visible behavior or the stored form untouched (a refactor, a move between layers) is checked against a real server: run `scripts/test/sse_blackbox/` on the binary before and after the change, compare the two runs, and cross-read their data directories. Its README has the commands.
