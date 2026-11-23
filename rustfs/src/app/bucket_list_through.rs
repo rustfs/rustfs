@@ -853,7 +853,9 @@ mod tests {
     fn encode_listing<O: OperationCodec>(output: O::Output, uri: &str) -> EncodedResponse {
         let request = http::Request::get(uri).header("host", "localhost").body(()).unwrap();
         let wire = WireRequest::accept(request, &Limits::default()).expect("valid list request");
-        let view = MetaView::of(&wire, TargetKind::Bucket).expect("bucket view");
+        let view = MetaView::of(&wire, TargetKind::Bucket)
+            .expect("bucket view")
+            .with_rustfs_response_layout();
         O::encode(output, &view, 200).expect("encode list response")
     }
 
