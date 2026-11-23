@@ -44,47 +44,31 @@ pub(crate) mod diagnostic {
     };
 }
 
-/// Legacy types used by the Linux RDMA transport and app-layer tests.
-#[cfg(any(test, all(target_os = "linux", any(feature = "cuobject", feature = "nixl"))))]
+/// Legacy wire types used by app-layer compatibility tests.
+#[cfg(test)]
 pub(crate) mod s3 {
-    #[cfg(test)]
     pub(crate) use rustfs_gateway_types::dto::Status;
-    #[cfg(test)]
     pub(crate) use rustfs_gateway_types::persistence::{
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
-    #[cfg(test)]
     pub(crate) use rustfs_s3_types::StdError;
-    #[cfg(test)]
     pub(crate) use s3s::Body;
-    #[cfg(test)]
     pub(crate) use s3s::TrailingHeaders;
-    #[cfg(test)]
     pub(crate) use s3s::auth::Credentials;
-    #[cfg(test)]
     pub(crate) use s3s::dto;
-    #[cfg(test)]
     pub(crate) use s3s::dto::PutObjectInput;
-    #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
         ObjectLockRetention,
     };
-    #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
-    #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
-    #[cfg(test)]
     pub(crate) use s3s::stream;
-    #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::UploadStreamError;
-    #[cfg(test)]
     pub(crate) use s3s::xml;
-    #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
-    #[cfg(test)]
     pub(crate) use s3s::{S3Request, S3Response};
 }
 
