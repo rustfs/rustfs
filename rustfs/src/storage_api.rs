@@ -227,7 +227,7 @@ pub(crate) mod server {
                 pub(crate) use crate::storage::storage_api::contract::bucket::{
                     BucketOperations, DeleteBucketOptions, MakeBucketOptions,
                 };
-                pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
+                pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations, PartInfo};
                 pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
                     StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
