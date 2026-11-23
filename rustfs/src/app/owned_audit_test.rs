@@ -637,6 +637,81 @@ async fn owned_audit_only_operation_matches_the_recorded_entries() {
     }
 }
 
+#[tokio::test]
+#[serial(owned_audit_probe)]
+async fn owned_operation_attaches_the_sse_kms_summary_to_the_audit_entry() {
+    use crate::app::storage_api::sse::{DecryptionRequest, SseKmsPrincipal, sse_decryption};
+    use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
+
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+            (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+        ],
+        async {
+            refresh_notify_module_enabled();
+            refresh_audit_module_enabled();
+
+            let bucket = "h2-kms-audit";
+            let probe = MutationCompletionProbe::install(bucket);
+            let mut headers = HeaderMap::new();
+            let mut extensions = Extensions::new();
+            common(&mut headers, &mut extensions, bucket, "ledger.csv");
+            extensions.insert(context("kms-tagged-request"));
+            let envelope = RequestEnvelope::from_parts(
+                RequestHead {
+                    method: Method::GET,
+                    uri: Uri::from_static("/h2-kms-audit/ledger.csv"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            );
+            let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
+
+            let wrapped_key = base64_simd::STANDARD.encode_to_string([7u8; 48]);
+            let metadata = std::collections::HashMap::from([
+                ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+                ("x-rustfs-encryption-key-id".to_string(), "finance-key".to_string()),
+                ("x-rustfs-encryption-key".to_string(), wrapped_key.clone()),
+                ("x-rustfs-encryption-algorithm".to_string(), "aws:kms".to_string()),
+            ]);
+            let principal = SseKmsPrincipal::from_request(&envelope).expect("authenticated request has a principal");
+            sse_decryption(DecryptionRequest {
+                bucket: "finance",
+                key: "ledger.csv",
+                metadata: &metadata,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                principal: Some(&principal),
+            })
+            .await
+            .expect_err("metadata without an IV cannot be unwrapped");
+
+            drop(helper.complete_owned(&Ok(()), StatusCode::OK, &HeaderMap::new()));
+            probe.wait_for(1, 0).await;
+            let audits = probe.audits.lock().expect("audit entries");
+            assert_eq!(audits.len(), 1);
+            let tags = audits[0]
+                .tags
+                .as_ref()
+                .expect("a request that used KMS must carry its summary");
+            assert_eq!(tags.get("sseType").and_then(Value::as_str), Some("SSE-KMS"));
+            assert_eq!(tags.get("kmsKeyId").and_then(Value::as_str), Some("finance-key"));
+            assert_eq!(tags.get("kmsOutcome").and_then(Value::as_str), Some("failure"));
+            assert!(tags.contains_key("kmsErrorClass"), "a failed KMS interaction must be classified");
+            assert!(
+                !serde_json::to_string(tags)
+                    .expect("audit tags serialize")
+                    .contains(&wrapped_key)
+            );
+        },
+    )
+    .await;
+}
+
 /// The one field the two edges record differently: for an error without a
 /// message the owned entry carries the code name, while the legacy entry carries
 /// whatever default message s3s stored for the code (its prose for a known code,
