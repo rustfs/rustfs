@@ -69,6 +69,7 @@ use rustfs_common::{
     GlobalReadiness,
     trace_bus::{TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit},
 };
+use rustfs_gateway::{LegacyDomainError, LegacyRustfsVirtualHosts};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
     INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
@@ -183,23 +184,23 @@ static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6
 static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
 
+fn validated_domains(variable: &str, domains: &[String]) -> Result<LegacyRustfsVirtualHosts> {
+    LegacyRustfsVirtualHosts::new(domains).map_err(|err| {
+        let reason = match err {
+            LegacyDomainError::NotADomain => "The domain is invalid",
+            LegacyDomainError::Overlapping => "Some subdomains overlap with each other",
+        };
+        Error::other(format!("invalid {variable} {domains:?}: {reason}"))
+    })
+}
+
 fn s3_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
     if config.server_domains.is_empty() || config.console_enable {
         return Ok(None);
     }
 
-    let mut domains = Vec::with_capacity(config.server_domains.len());
-    let mut seen = std::collections::HashSet::with_capacity(config.server_domains.len());
-    for domain in &config.server_domains {
-        if seen.insert(strip_valid_port_suffix(domain).to_string()) {
-            domains.push(domain.clone());
-        }
-    }
-
-    MultiDomain::new(&domains)
-        .map_err(|err| Error::other(format!("invalid RUSTFS_SERVER_DOMAINS {:?}: {err}", config.server_domains)))?;
-
-    Ok(Some(domains))
+    let hosts = validated_domains("RUSTFS_SERVER_DOMAINS", &config.server_domains)?;
+    Ok(Some(hosts.domains().map(str::to_owned).collect()))
 }
 
 fn website_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
@@ -230,7 +231,7 @@ fn website_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> 
     if domains.is_empty() {
         Ok(None)
     } else {
-        MultiDomain::new(&domains).map_err(|err| Error::other(format!("invalid RUSTFS_WEBSITE_DOMAINS {:?}: {err}", domains)))?;
+        validated_domains("RUSTFS_WEBSITE_DOMAINS", &domains)?;
         Ok(Some(domains))
     }
 }
@@ -8064,10 +8065,60 @@ mod tests {
 
         let err = s3_host_domains(&config).expect_err("real subdomain overlap must stay rejected");
 
-        let message = err.to_string();
-        assert!(message.contains("RUSTFS_SERVER_DOMAINS"), "{message}");
-        assert!(message.contains("example.com"), "{message}");
-        assert!(message.contains("s3.example.com"), "{message}");
+        assert_eq!(
+            err.to_string(),
+            r#"invalid RUSTFS_SERVER_DOMAINS ["example.com", "s3.example.com"]: Some subdomains overlap with each other"#
+        );
+    }
+
+    #[test]
+    fn s3_host_domains_reports_invalid_entries_before_later_overlaps() {
+        let config = test_config_with_domains(&["example.com:9000", "example.com", "bad_name", "s3.example.com"]);
+        assert_eq!(
+            s3_host_domains(&config).unwrap_err().to_string(),
+            r#"invalid RUSTFS_SERVER_DOMAINS ["example.com:9000", "example.com", "bad_name", "s3.example.com"]: The domain is invalid"#
+        );
+    }
+
+    #[test]
+    fn website_host_domains_preserves_startup_errors_and_normalization() {
+        let config = test_config_with_domains(&["s3.example:9000"]);
+        for (value, message) in [
+            (
+                "Site.Example, BAD_NAME",
+                r#"invalid RUSTFS_WEBSITE_DOMAINS ["site.example", "bad_name"]: The domain is invalid"#,
+            ),
+            (
+                "SITE.example,k.site.example",
+                r#"invalid RUSTFS_WEBSITE_DOMAINS ["site.example", "k.site.example"]: Some subdomains overlap with each other"#,
+            ),
+            ("site.example, SITE.example", "duplicate RUSTFS_WEBSITE_DOMAINS entry: SITE.example"),
+            ("website.s3.example", "website domain overlaps RUSTFS_SERVER_DOMAINS: website.s3.example"),
+            ("site.example:9000", "invalid RUSTFS_WEBSITE_DOMAINS entry: site.example:9000"),
+            ("site.example.", "invalid RUSTFS_WEBSITE_DOMAINS entry: site.example."),
+        ] {
+            temp_env::with_var("RUSTFS_WEBSITE_DOMAINS", Some(value), || {
+                assert_eq!(website_host_domains(&config).unwrap_err().to_string(), message);
+            });
+        }
+        temp_env::with_var("RUSTFS_WEBSITE_DOMAINS", Some("Z.Example, ,A.Example"), || {
+            assert_eq!(website_host_domains(&config).unwrap().unwrap(), ["z.example", "a.example"]);
+        });
+    }
+
+    #[test]
+    fn startup_host_domains_skip_empty_lists_and_console_configuration() {
+        let mut config = test_config_with_domains(&[]);
+        assert_eq!(s3_host_domains(&config).unwrap(), None);
+        temp_env::with_var("RUSTFS_WEBSITE_DOMAINS", Some(", ,"), || {
+            assert_eq!(website_host_domains(&config).unwrap(), None);
+        });
+        config.server_domains.push("bad_name".to_owned());
+        config.console_enable = true;
+        temp_env::with_var("RUSTFS_WEBSITE_DOMAINS", Some("bad_name"), || {
+            assert_eq!(s3_host_domains(&config).unwrap(), None);
+            assert_eq!(website_host_domains(&config).unwrap(), None);
+        });
     }
 
     #[test]
