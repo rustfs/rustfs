@@ -19,11 +19,10 @@ use super::*;
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, Timestamp};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 use rustfs_gateway_types::ChecksumAlgorithm;
 use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
-use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
@@ -165,7 +164,7 @@ pub(super) fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Resu
 
     match atoi::atoi::<i64>(val.as_bytes()) {
         Some(x) => Ok(Some(x)),
-        None => Err(s3_error!(UnexpectedContent)),
+        None => Err(S3Error::with_default_message(S3ErrorCode::UnexpectedContent)),
     }
 }
 
@@ -207,8 +206,6 @@ pub(crate) fn map_quota_check_outcome(
     bucket: &str,
     outcome: Result<QuotaCheckResult, QuotaError>,
 ) -> rustfs_s3_types::S3Result<QuotaCheckResult> {
-    use rustfs_s3_types::{S3Error, S3ErrorCode};
-
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -234,7 +231,7 @@ pub(crate) fn map_quota_check_outcome(
     }
 }
 
-pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaCheckResult) -> OwnedResult<()> {
+pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaCheckResult) -> S3Result<()> {
     if result.uses_durable_reservations {
         return Ok(());
     }
@@ -242,13 +239,10 @@ pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaChec
         return Ok(());
     };
     let Some(current_usage) = result.current_usage else {
-        return Err(owned_error!(
-            ServiceUnavailable,
-            "Bucket quota check temporarily unavailable, please retry"
-        ));
+        return Err(s3_error!(ServiceUnavailable, "Bucket quota check temporarily unavailable, please retry"));
     };
     if current_usage > quota_limit {
-        return Err(owned_error!(
+        return Err(s3_error!(
             InvalidRequest,
             "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
         ));
@@ -257,12 +251,12 @@ pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaChec
     Ok(())
 }
 
-pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_size: u64) -> OwnedResult<()> {
+pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_size: u64) -> S3Result<()> {
     let (Some(current_usage), Some(quota_limit)) = (result.current_usage, result.quota_limit) else {
         return Ok(());
     };
     if new_size > quota_limit {
-        return Err(owned_error!(
+        return Err(s3_error!(
             InvalidRequest,
             "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
         ));
@@ -270,7 +264,7 @@ pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_siz
     Ok(())
 }
 
-pub(crate) fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> OwnedResult<u64> {
+pub(crate) fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
     match quota_object_size(info) {
         Ok(size) => Ok(size),
         Err(err) if fail_closed => Err(ApiError::from(err).into()),
@@ -1086,7 +1080,7 @@ pub(crate) fn odm_source_unavailable_error(class: &'static str) -> S3Error {
 pub(crate) fn odm_source_error_response(policy: &PolicyConfig, class: &'static str) -> S3Error {
     match policy.source_error {
         SourceErrorPolicy::Propagate => odm_source_unavailable_error(class),
-        SourceErrorPolicy::NotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+        SourceErrorPolicy::NotFound => S3Error::with_default_message(S3ErrorCode::NoSuchKey),
     }
 }
 
@@ -1135,7 +1129,15 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
         user_defined: metadata.into(),
         ..Default::default()
     };
-    Ok(check_preconditions(headers, &info)?)
+    check_preconditions(headers, &info).map_err(|mut error| {
+        // The source-read response exposed the code's S3 message when the evaluator supplied none.
+        if error.message().is_none()
+            && let Some(message) = error.code().default_message()
+        {
+            error.set_message(message);
+        }
+        error
+    })
 }
 
 /// S3 documents write-side `If-None-Match` only as `*` (create-only).
@@ -1152,7 +1154,7 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bo
             })
         })
     {
-        return Err(S3Error::new(S3ErrorCode::NotImplemented));
+        return Err(S3Error::with_default_message(S3ErrorCode::NotImplemented));
     }
     Ok(())
 }
@@ -1168,11 +1170,25 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn decoded_content_length_has_the_original_error_message() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-decoded-content-length", HeaderValue::from_static("invalid"));
+        let error = decoded_content_length_from_headers(&headers).unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(error.message(), Some("This request does not support content."));
+    }
+
+    #[test]
     fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
         let headers = HeaderMap::new();
         assert!(reject_non_wildcard_write_if_none_match(false, &headers).is_ok());
         let err = reject_non_wildcard_write_if_none_match(true, &headers).expect_err("an ETag If-None-Match must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(
+            err.message(),
+            Some("A header you provided implies functionality that is not implemented.")
+        );
         assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
         assert_eq!(
             err.message(),
@@ -1265,6 +1281,13 @@ mod tests {
             version_id: Some(Uuid::new_v4()),
             ..Default::default()
         };
+        let mut bare = S3Error::new(S3ErrorCode::NoSuchKey);
+        bare.set_source(Box::new(io::Error::other("bare storage failure")));
+        let bare = with_delete_marker_read_headers(bare, &info, None);
+        assert_eq!(bare.message(), None);
+        assert!(bare.source().unwrap().is::<io::Error>());
+        assert_eq!(bare.headers().unwrap()[X_AMZ_DELETE_MARKER], "true");
+
         let mut original = S3Error::with_message(S3ErrorCode::NoSuchKey, "original local read failure");
         original.set_source(Box::new(io::Error::other("original storage cause")));
         original.set_request_id("request-id");
@@ -2501,6 +2524,7 @@ mod on_demand_migration_tests {
             ..Default::default()
         };
         let err = odm_source_error_response(&hide, "timeout");
+        assert_eq!(err.message(), Some("The specified key does not exist."));
         assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
         assert_eq!(err.status_code(), Some(StatusCode::NOT_FOUND));
     }
@@ -2547,6 +2571,7 @@ mod on_demand_migration_tests {
         )
         .expect_err("matching If-None-Match is 304");
         assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        assert_eq!(err.message(), Some("Not Modified"));
         assert_eq!(err.status_code(), Some(StatusCode::NOT_MODIFIED));
         let echoed = err.headers().expect("304 echoes validators");
         assert_eq!(
@@ -2563,6 +2588,7 @@ mod on_demand_migration_tests {
         let err = odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &head)
             .expect_err("mismatching If-Match is 412");
         assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+        assert_eq!(err.message(), Some("At least one of the preconditions you specified did not hold."));
         assert!(
             odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"0123456789abcdef0123456789abcdef\""), &head)
                 .is_ok()
