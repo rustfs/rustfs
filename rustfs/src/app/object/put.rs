@@ -20,7 +20,8 @@ use super::*;
 use crate::app::RequestEnvelope;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
-use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
+#[cfg(test)]
+use crate::app::storage_api::s3::stream::ByteStream;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use futures::FutureExt;
 use rustfs_gateway_stream::Body as NativeBody;
@@ -207,17 +208,6 @@ impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for MaxContentLen
         let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
         let (lower, upper) = self.inner.size_hint();
         (lower.min(remaining), upper.map(|upper| upper.min(remaining)))
-    }
-}
-
-impl<S: ByteStream<Item = Result<Bytes, StdError>> + Unpin> ByteStream for MaxContentLengthStream<S> {
-    fn remaining_length(&self) -> RemainingLength {
-        let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
-        let inner = self.inner.remaining_length();
-        inner
-            .exact()
-            .map(|exact| RemainingLength::new_exact(exact.min(remaining)))
-            .unwrap_or_else(RemainingLength::unknown)
     }
 }
 
