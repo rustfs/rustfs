@@ -19,7 +19,9 @@ use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::admin::storage_api::data_usage::{load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin};
+use crate::admin::storage_api::data_usage::{
+    load_admin_data_usage_with_memory_overlay, load_admin_usage_snapshot, load_bucket_scan_progress_for_admin,
+};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
@@ -52,6 +54,12 @@ pub struct AccountInfo {
 }
 
 pub struct AccountInfoHandler {}
+
+pub(super) fn requests_usage_snapshot(uri: &http::Uri) -> bool {
+    uri.query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(key, value)| key == "view" && value == "snapshot")
+    })
+}
 
 #[derive(Debug, Serialize)]
 struct AccountInfoResponse {
@@ -179,6 +187,7 @@ async fn bucket_quota_limit(bucket: &str) -> Option<u64> {
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let snapshot_view = requests_usage_snapshot(&req.uri);
         let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -321,42 +330,56 @@ impl Operation for AccountInfoHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        // Serve the last persisted scanner snapshot plus an authoritative
-        // single-process overlay. Distributed nodes must not promote their
-        // process-local absolute counters to cluster-wide bucket totals.
-        // This path never triggers a live full-version listing
-        // (rustfs/backlog#1306); freshness is owned by the scanner.
-        let data_usage_info = map_data_usage_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
-        account_info.usage_snapshot_converged = data_usage_info.usage_snapshot_converged;
-
-        for bucket in buckets.iter() {
+        let mut authorized_buckets = Vec::new();
+        for bucket in &buckets {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
-                let mut bucket_info = rustfs_madmin::BucketAccessInfo {
-                    name: bucket.name.clone(),
-                    details: Some(rustfs_madmin::BucketDetails {
-                        versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
-                        versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
-                        locking: bucket_locking_enabled(bucket.name.as_str()).await,
-                        replication: bucket_replication_enabled(bucket.name.as_str()).await,
-                        quota: bucket_quota_limit(bucket.name.as_str()).await,
-                    }),
-                    created: bucket.created,
-                    access: rustfs_madmin::AccountAccess { read: rd, write: wr },
-                    ..Default::default()
-                };
-                apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
-                account_info.buckets.push(bucket_info);
+                authorized_buckets.push((bucket, rd, wr));
             }
         }
-
-        let visible_buckets = account_info
-            .buckets
+        let visible_buckets = authorized_buckets
             .iter()
-            .map(|bucket| bucket.name.clone())
+            .map(|(bucket, _, _)| bucket.name.clone())
             .collect::<Vec<_>>();
-        let mut progress = load_bucket_scan_progress_for_admin(store, &visible_buckets, &data_usage_info).await;
+        let (data_usage_info, initial_progress) = if snapshot_view {
+            let view = load_admin_usage_snapshot(store.clone(), &visible_buckets)
+                .await
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, DATA_USAGE_LOAD_ERROR_MESSAGE))?;
+            (view.usage, Some(view.initial_scan_progress))
+        } else {
+            (
+                map_data_usage_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?,
+                None,
+            )
+        };
+        account_info.usage_snapshot_converged = data_usage_info.usage_snapshot_converged;
+
+        for (bucket, rd, wr) in authorized_buckets {
+            let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+                name: bucket.name.clone(),
+                details: Some(rustfs_madmin::BucketDetails {
+                    versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
+                    versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
+                    locking: bucket_locking_enabled(bucket.name.as_str()).await,
+                    replication: bucket_replication_enabled(bucket.name.as_str()).await,
+                    quota: bucket_quota_limit(bucket.name.as_str()).await,
+                }),
+                created: bucket.created,
+                access: rustfs_madmin::AccountAccess { read: rd, write: wr },
+                ..Default::default()
+            };
+            apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
+            account_info.buckets.push(bucket_info);
+        }
+
+        let mut progress = match initial_progress {
+            Some(progress) => progress,
+            None => load_bucket_scan_progress_for_admin(store, &visible_buckets, &data_usage_info).await,
+        };
         for bucket in &mut account_info.buckets {
+            if snapshot_view {
+                bucket.initial_scan = Some(progress.contains_key(&bucket.name));
+            }
             bucket.scan_progress = progress.remove(&bucket.name).map(admin_scan_progress);
         }
 

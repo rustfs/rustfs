@@ -31,6 +31,7 @@ use crate::admin::storage_api::bucket::replication::{
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
+use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
 use crate::admin::storage_api::storageclass as storage_class_contract;
 use crate::admin::utils::is_compat_admin_request;
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
@@ -1236,10 +1237,26 @@ impl Operation for DataUsageInfoHandler {
 
         authorize_admin_request(&req, data_usage_info_gate_actions()).await?;
 
-        let usecase = default_admin_usecase();
-        let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
-
-        let data = serde_json::to_vec(&info).map_err(|e| {
+        let data = if super::account_info::requests_usage_snapshot(&req.uri) {
+            let store = object_store_from_req(&req).ok_or_else(|| s3_error!(InternalError, "Object store unavailable"))?;
+            let buckets = store
+                .list_bucket(&BucketOptions {
+                    cached: true,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|_| s3_error!(InternalError, "Usage snapshot unavailable"))?;
+            let names = buckets.into_iter().map(|bucket| bucket.name).collect::<Vec<_>>();
+            let info = crate::admin::storage_api::data_usage::load_admin_usage_snapshot(store, &names)
+                .await
+                .map_err(|_| s3_error!(InternalError, "Usage snapshot unavailable"))?;
+            serde_json::to_vec(&info)
+        } else {
+            let usecase = default_admin_usecase();
+            let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
+            serde_json::to_vec(&info)
+        }
+        .map_err(|e| {
             log_system_request_failed!("query_data_usage_info", "serialize_data_usage_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed")
         })?;

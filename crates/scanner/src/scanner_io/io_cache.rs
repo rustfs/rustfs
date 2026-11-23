@@ -1095,7 +1095,9 @@ impl ScannerIOCache for SetDisks {
                             let bucket = receiver.recv().await?;
                             // Select while still owning FIFO admission, so the oldest bucket
                             // gets its preferred disk before later waiters can borrow it.
-                            let parked = crate::scanner_folder::parked_bucket_disks(&bucket.name);
+                            let parked = if cfg!(any(target_os = "linux", target_os = "macos")) {
+                                Vec::new()
+                            } else { crate::scanner_folder::parked_bucket_disks(&bucket.name) };
                             let slot = available_walkers.take_for_bucket(&bucket.name, |disk| {
                                 parked.iter().any(|owner| owner.ptr_eq(&Arc::downgrade(disk)))
                             });

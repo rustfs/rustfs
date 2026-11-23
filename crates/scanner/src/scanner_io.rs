@@ -1963,6 +1963,7 @@ fn scanner_activity_preflight(
 
 #[derive(Debug)]
 pub(crate) struct ScannerCycleResult {
+    certified_bucket_update: bool,
     usage_watch_proofs: Vec<ScannerUsageWatchProof>,
     usage_watch_retirements: Vec<ScannerUsageWatchProof>,
     pub(crate) status: ScannerCycleStatus,
@@ -1990,6 +1991,7 @@ pub(crate) struct ScannerCycleResult {
 impl ScannerCycleResult {
     pub(crate) fn new(status: ScannerCycleStatus, dirty_usage_clear: Option<DirtyUsageBuckets>) -> Self {
         Self {
+            certified_bucket_update: false,
             usage_watch_proofs: Vec::new(),
             usage_watch_retirements: Vec::new(),
             status,
@@ -2086,6 +2088,15 @@ impl ScannerCycleResult {
         self.publication_expectation = None;
         self.usage_update_emitted = emitted;
         self
+    }
+
+    fn with_certified_bucket_update(mut self, certified: bool) -> Self {
+        self.certified_bucket_update = certified;
+        self
+    }
+
+    pub(crate) fn has_certified_bucket_update(&self) -> bool {
+        self.certified_bucket_update
     }
 
     pub(crate) fn has_usage_update(&self) -> bool {

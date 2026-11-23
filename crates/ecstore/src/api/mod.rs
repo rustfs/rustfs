@@ -436,6 +436,7 @@ pub mod data_usage {
     };
     #[cfg(feature = "test-util")]
     pub use crate::data_usage::seed_bucket_usage_memory_for_test;
+    pub use crate::data_usage::{AdminUsageSnapshot, load_admin_usage_snapshot};
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,

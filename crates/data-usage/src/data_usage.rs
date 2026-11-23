@@ -54,6 +54,9 @@ pub const DATA_USAGE_OBJECT_NAME: &str = ".usage.v2.json";
 /// [`DATA_USAGE_OBJECT_NAME`], this object is never authoritative for quota
 /// admission because namespace activity may have raced the scan.
 pub const DATA_USAGE_OBSERVED_OBJECT_NAME: &str = ".usage.observed.json";
+/// Completed bucket measurements between full namespace snapshots. Older
+/// leaders keep reading the unchanged authoritative object during rollout.
+pub const DATA_USAGE_CERTIFIED_BUCKETS_OBJECT_NAME: &str = ".usage.buckets.json";
 
 /// Usage snapshot written by scanner implementations predating distributed
 /// leadership fencing. It is read only when neither authoritative snapshot
@@ -631,6 +634,21 @@ pub struct DataUsageInfo {
     /// authoritative usage snapshot yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub usage_snapshot_bootstrap_pending: bool,
+    /// Only an initial bootstrap can authorize display of first-scan progress.
+    /// Recovery, reset and older markers leave this false across restarts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_snapshot_initial_bootstrap: bool,
+    /// Present only on the independent completed-bucket snapshot object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_certified_buckets: Option<CertifiedBucketsScope>,
+    /// An older writer drops this opt-in, disabling initial fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_initial_view_version: Option<u16>,
+    /// Non-first barriers are durable before bucket-sidecar publication.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub usage_snapshot_noninitial_buckets: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_rebuild_generation: Option<String>,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
@@ -649,6 +667,25 @@ pub struct DataUsageSnapshotIdentity {
     pub last_update: Option<SystemTime>,
     pub scanner_cycle: Option<u64>,
     pub scanner_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CertifiedBucketsScope {
+    pub version: u16,
+    pub baseline_initial_bootstrap: bool,
+    pub baseline_bootstrap_pending: bool,
+    pub movement_generation: u64,
+    pub sources: Vec<CertifiedBucketsSource>,
+    pub bucket_incarnations: HashMap<String, String>,
+    pub baseline: DataUsageSnapshotIdentity,
+    pub baseline_rebuild_generation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CertifiedBucketsSource {
+    pub pool_index: u64,
+    pub set_index: u64,
+    pub layout: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -684,6 +721,120 @@ pub struct DataUsageSnapshotSetState {
 }
 
 impl DataUsageInfo {
+    /// Ownership fencing alone does not refresh a completed measurement.
+    pub fn certified_buckets_match_baseline(&self, baseline: &Self) -> bool {
+        let Some(scope) = &self.usage_snapshot_certified_buckets else { return false };
+        self.is_certified_buckets_snapshot()
+            && scope.baseline.last_update == baseline.last_update
+            && scope.baseline.scanner_cycle == baseline.scanner_cycle
+            && baseline.scanner_epoch >= scope.baseline.scanner_epoch
+            && scope.baseline_initial_bootstrap == baseline.usage_snapshot_initial_bootstrap
+            && scope.baseline_bootstrap_pending == baseline.usage_snapshot_bootstrap_pending
+            && scope.baseline_rebuild_generation == baseline.usage_snapshot_rebuild_generation
+    }
+    /// Keep earlier complete bucket values under the same persisted scope.
+    pub fn retain_prior_certified_buckets(&mut self, previous: &Self) -> bool {
+        let (Some(current), Some(old)) = (&self.usage_snapshot_certified_buckets, &previous.usage_snapshot_certified_buckets)
+        else {
+            return true;
+        };
+        if !previous.is_certified_buckets_snapshot()
+            || current.baseline.last_update != old.baseline.last_update
+            || current.baseline.scanner_cycle != old.baseline.scanner_cycle
+            || current.baseline.scanner_epoch < old.baseline.scanner_epoch
+            || current.baseline_rebuild_generation != old.baseline_rebuild_generation
+            || current.baseline_initial_bootstrap != old.baseline_initial_bootstrap
+            || current.baseline_bootstrap_pending != old.baseline_bootstrap_pending
+            || current.movement_generation != old.movement_generation
+            || current.sources != old.sources
+        {
+            return true;
+        }
+        for (bucket, usage) in &previous.buckets_usage {
+            if usage.bucket_incarnation.as_ref() == current.bucket_incarnations.get(bucket) {
+                let replace = self.buckets_usage.get(bucket).is_none_or(|current| {
+                    match (usage.usage_certification, current.usage_certification) {
+                        (Some(old), Some(next)) => {
+                            (old.epoch, old.cycle, old.certified_at) > (next.epoch, next.cycle, next.certified_at)
+                        }
+                        (Some(_), None) => true,
+                        _ => false,
+                    }
+                });
+                if replace {
+                    self.buckets_usage.insert(bucket.clone(), usage.clone());
+                }
+            }
+        }
+        self.buckets_count = u64::try_from(self.buckets_usage.len()).unwrap_or(u64::MAX);
+        self.checked_calculate_totals() && self.is_certified_buckets_snapshot()
+    }
+
+    /// Validate the independent bucket snapshot without granting whole-cycle
+    /// convergence, namespace completeness or dirty-usage acknowledgement.
+    pub fn is_certified_buckets_snapshot(&self) -> bool {
+        let Some(scope) = &self.usage_snapshot_certified_buckets else { return false };
+        let (Some(epoch), Some(cycle), Some(updated_at)) = (self.scanner_epoch, self.scanner_cycle, self.last_update) else {
+            return false;
+        };
+        if scope.version != 1
+            || scope.sources.is_empty()
+            || !scope
+                .sources
+                .windows(2)
+                .all(|pair| (pair[0].pool_index, pair[0].set_index) < (pair[1].pool_index, pair[1].set_index))
+            || scope.sources.iter().any(|source| source.layout == [0; 32])
+            || self.usage_snapshot_authoritative_baseline != Some(scope.baseline)
+            || scope.baseline.last_update.is_none()
+            || self.usage_snapshot_complete
+            || !self.usage_snapshot_partial
+            || self.usage_snapshot_observational
+            || self.usage_snapshot_admin_projection
+            || self.usage_snapshot_bootstrap_pending
+            || self.buckets_usage.is_empty()
+            || u64::try_from(self.buckets_usage.len()).ok() != Some(self.buckets_count)
+        {
+            return false;
+        }
+        let mut objects = 0_u64;
+        let mut bytes = 0_u64;
+        let mut versions = 0_u64;
+        let mut markers = 0_u64;
+        for (bucket, usage) in &self.buckets_usage {
+            let Some(certificate) = usage.usage_certification else { return false };
+            if usage.bucket_incarnation.as_ref() != scope.bucket_incarnations.get(bucket)
+                || usage.bucket_incarnation.is_none()
+                || !matches!(
+                    usage.usage_value_state,
+                    Some(crate::BucketUsageValueState::Certified | crate::BucketUsageValueState::Carried)
+                )
+                || (certificate.epoch, certificate.cycle) > (epoch, cycle)
+                || certificate.certified_at > updated_at
+            {
+                return false;
+            }
+            let (Some(next_objects), Some(next_bytes)) =
+                (objects.checked_add(usage.objects_count), bytes.checked_add(usage.size))
+            else {
+                return false;
+            };
+            objects = next_objects;
+            bytes = next_bytes;
+            let (Some(next_versions), Some(next_markers)) = (
+                versions.checked_add(usage.versions_count),
+                markers.checked_add(usage.delete_markers_count),
+            ) else {
+                return false;
+            };
+            versions = next_versions;
+            markers = next_markers;
+        }
+        objects == self.objects_total_count
+            && bytes == self.objects_total_size
+            && versions == self.versions_total_count
+            && markers == self.delete_markers_total_count
+    }
+
     pub fn snapshot_identity(&self) -> DataUsageSnapshotIdentity {
         DataUsageSnapshotIdentity {
             last_update: self.last_update,
@@ -2370,6 +2521,24 @@ impl DataUsageInfo {
         }
     }
 
+    /// Update all scalar totals atomically, rejecting overflow without wrapping.
+    pub fn checked_calculate_totals(&mut self) -> bool {
+        let totals = self.buckets_usage.values().try_fold([0_u64; 4], |total, usage| {
+            Some([
+                total[0].checked_add(usage.objects_count)?,
+                total[1].checked_add(usage.size)?,
+                total[2].checked_add(usage.versions_count)?,
+                total[3].checked_add(usage.delete_markers_count)?,
+            ])
+        });
+        let Some([objects, size, versions, markers]) = totals else { return false };
+        self.objects_total_count = objects;
+        self.objects_total_size = size;
+        self.versions_total_count = versions;
+        self.delete_markers_total_count = markers;
+        true
+    }
+
     /// Merge another DataUsageInfo into this one
     pub fn merge(&mut self, other: &DataUsageInfo) {
         // Merge bucket usage
@@ -2565,6 +2734,117 @@ pub struct CompressionTotalInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete_bucket_sidecar() -> (DataUsageInfo, DataUsageInfo) {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let baseline = DataUsageInfo {
+            last_update: Some(time),
+            scanner_epoch: Some(1),
+            scanner_cycle: Some(2),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let id = "00000000-0000-0000-0000-000000000001".to_owned();
+        let mut usage = BucketUsageInfo {
+            size: 71,
+            objects_count: 7,
+            versions_count: 8,
+            bucket_incarnation: Some(id.clone()),
+            ..Default::default()
+        };
+        usage.certify(crate::BucketUsageCertification {
+            epoch: 3,
+            cycle: 4,
+            certified_at: time,
+        });
+        let mut data = DataUsageInfo {
+            last_update: Some(time),
+            scanner_epoch: Some(3),
+            scanner_cycle: Some(4),
+            usage_snapshot_partial: true,
+            buckets_count: 1,
+            buckets_usage: HashMap::from([("bucket".into(), usage)]),
+            usage_snapshot_authoritative_baseline: Some(baseline.snapshot_identity()),
+            usage_snapshot_certified_buckets: Some(CertifiedBucketsScope {
+                version: 1,
+                baseline: baseline.snapshot_identity(),
+                baseline_initial_bootstrap: false,
+                baseline_bootstrap_pending: false,
+                baseline_rebuild_generation: None,
+                movement_generation: 0,
+                sources: vec![CertifiedBucketsSource {
+                    pool_index: 0,
+                    set_index: 0,
+                    layout: [1; 32],
+                }],
+                bucket_incarnations: HashMap::from([("bucket".into(), id)]),
+            }),
+            ..Default::default()
+        };
+        data.calculate_totals();
+        (baseline, data)
+    }
+
+    #[test]
+    fn completed_bucket_snapshot_is_not_whole_namespace_or_observational_usage() {
+        let (mut baseline, data) = complete_bucket_sidecar();
+        assert!(data.is_certified_buckets_snapshot());
+        assert!(!data.is_complete_bucket_usage_snapshot());
+        assert!(data.certified_buckets_match_baseline(&baseline));
+        baseline.scanner_epoch = Some(5);
+        assert!(
+            data.certified_buckets_match_baseline(&baseline),
+            "owner fencing must retain the original complete bucket value"
+        );
+        baseline.usage_snapshot_rebuild_generation = Some("reset".into());
+        assert!(!data.certified_buckets_match_baseline(&baseline));
+        let mut bad = data.clone();
+        bad.versions_total_count += 1;
+        assert!(!bad.is_certified_buckets_snapshot());
+        let mut bad = data.clone();
+        bad.buckets_usage.get_mut("bucket").expect("bucket").usage_certification = None;
+        assert!(!bad.is_certified_buckets_snapshot());
+        let mut bad = data;
+        bad.usage_snapshot_observational = true;
+        assert!(!bad.is_certified_buckets_snapshot());
+    }
+
+    #[test]
+    fn completed_bucket_snapshot_retains_newer_sidecar_value_over_carried_primary_value() {
+        let (_, previous) = complete_bucket_sidecar();
+        let mut candidate = previous.clone();
+        candidate.scanner_cycle = Some(5);
+        let carried = candidate.buckets_usage.get_mut("bucket").expect("carried bucket");
+        carried.objects_count = 1;
+        carried.usage_certification.as_mut().expect("certificate").cycle = 3;
+        let id = "00000000-0000-0000-0000-000000000002".to_owned();
+        let mut next = BucketUsageInfo {
+            size: 20,
+            objects_count: 2,
+            bucket_incarnation: Some(id.clone()),
+            ..Default::default()
+        };
+        next.certify(crate::BucketUsageCertification {
+            epoch: 3,
+            cycle: 5,
+            certified_at: candidate.last_update.expect("timestamp"),
+        });
+        candidate
+            .usage_snapshot_certified_buckets
+            .as_mut()
+            .expect("scope")
+            .bucket_incarnations
+            .insert("new".into(), id);
+        candidate.buckets_usage.insert("new".into(), next);
+        assert!(candidate.retain_prior_certified_buckets(&previous));
+        assert_eq!(candidate.buckets_usage["bucket"].objects_count, 7);
+        assert_eq!(
+            candidate.buckets_usage["bucket"].usage_certification,
+            previous.buckets_usage["bucket"].usage_certification
+        );
+        assert_eq!((candidate.objects_total_count, candidate.objects_total_size), (9, 91));
+        assert_eq!(candidate.buckets_usage["new"].objects_count, 2);
+    }
 
     #[derive(Deserialize)]
     struct LegacyUsageReader {

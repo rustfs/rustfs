@@ -259,6 +259,12 @@ pub static DATA_USAGE_RECOVERY_PATH: LazyLock<String> =
 
 pub static DATA_USAGE_OBSERVED_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBSERVED_OBJECT_NAME}"));
+pub static DATA_USAGE_CERTIFIED_BUCKETS_OBJ_NAME_PATH: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{}",
+        rustfs_data_usage::DATA_USAGE_CERTIFIED_BUCKETS_OBJECT_NAME
+    )
+});
 
 pub static LEGACY_DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{LEGACY_DATA_USAGE_OBJECT_NAME}"));

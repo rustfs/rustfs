@@ -48,6 +48,7 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+mod certified_bucket_snapshot;
 mod cycle_budget_publication;
 pub(super) mod cycle_persist_failure;
 mod gate_self_heal;
@@ -6123,6 +6124,26 @@ async fn scanner_usage_state_reset_bootstrap_survives_stale_cleanup_slots_after_
         persisted_usage_floor(store).await.is_err(),
         "bootstrap marker must still not become an authoritative usage floor"
     );
+}
+
+#[test]
+fn scanner_bootstrap_snapshot_recognizes_durable_generation_and_incarnation_history() {
+    let mut marker = scanner_usage_bootstrap_marker(std::time::SystemTime::UNIX_EPOCH, Some(9));
+    assert!(data_usage_info_is_bootstrap_pending(&marker));
+    marker.usage_snapshot_initial_bootstrap = true;
+    marker.usage_snapshot_initial_view_version = Some(1);
+    marker
+        .usage_snapshot_noninitial_buckets
+        .insert("small".into(), Uuid::from_u128(1).to_string());
+    let reopened: DataUsageInfo =
+        serde_json::from_slice(&serde_json::to_vec(&marker).expect("marker should encode")).expect("marker should reopen");
+    assert!(data_usage_info_is_bootstrap_pending(&reopened));
+    assert_eq!(reopened.usage_snapshot_rebuild_generation, marker.usage_snapshot_rebuild_generation);
+    let mut legacy = scanner_usage_bootstrap_marker(std::time::SystemTime::UNIX_EPOCH, Some(9));
+    legacy.usage_snapshot_rebuild_generation = None;
+    assert!(data_usage_info_is_bootstrap_pending(&legacy));
+    marker.objects_total_count = 1;
+    assert!(!data_usage_info_is_bootstrap_pending(&marker));
 }
 
 #[tokio::test]

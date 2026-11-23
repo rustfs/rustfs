@@ -40,7 +40,19 @@ pub async fn load_bucket_scan_progress_for_admin(
 ) -> HashMap<String, BucketScanProgress> {
     let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
     let read_deadline = deadline - ADMIN_USAGE_INCARNATION_TIMEOUT / 4;
-    tokio::time::timeout_at(deadline, load_progress(store, buckets, baseline, read_deadline))
+    tokio::time::timeout_at(deadline, load_progress(store, buckets, baseline, read_deadline, false))
+        .await
+        .unwrap_or_default()
+}
+
+pub(super) async fn load_initial_bucket_scan_progress(
+    store: Arc<ECStore>,
+    buckets: &[String],
+    baseline: &DataUsageInfo,
+) -> HashMap<String, BucketScanProgress> {
+    let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
+    let read_deadline = deadline - ADMIN_USAGE_INCARNATION_TIMEOUT / 4;
+    tokio::time::timeout_at(deadline, load_progress(store, buckets, baseline, read_deadline, true))
         .await
         .unwrap_or_default()
 }
@@ -50,6 +62,7 @@ async fn bucket_progress_sources(
     bucket: String,
     sets: Arc<Vec<Arc<SetDisks>>>,
     movement_generation: u64,
+    initial_baseline: Option<Arc<DataUsageInfo>>,
 ) -> BoxStream<'static, ProgressEvent> {
     let Some(incarnation) = store
         .bucket_incarnation_id_from_disk(&bucket)
@@ -59,6 +72,19 @@ async fn bucket_progress_sources(
     else {
         return futures::stream::empty().boxed();
     };
+    if initial_baseline.as_ref().is_some_and(|baseline| {
+        baseline
+            .usage_snapshot_noninitial_buckets
+            .get(&bucket)
+            .is_some_and(|previous| {
+                uuid::Uuid::parse_str(previous)
+                    .ok()
+                    .is_none_or(|previous| previous.is_nil() || previous == incarnation)
+            })
+            || !super::snapshot_view::initial_progress_allowed(baseline.buckets_usage.get(&bucket), incarnation)
+    }) {
+        return futures::stream::empty().boxed();
+    }
     let incarnation = incarnation.to_string();
     let path = bucket_scan_progress_path(&bucket);
     futures::stream::iter(0..sets.len())
@@ -124,6 +150,7 @@ async fn load_progress(
     buckets: &[String],
     baseline: &DataUsageInfo,
     read_deadline: tokio::time::Instant,
+    initial_only: bool,
 ) -> HashMap<String, BucketScanProgress> {
     let Some(epoch) = store.scanner_data_usage_publication_epoch().await else {
         return HashMap::new();
@@ -145,8 +172,9 @@ async fn load_progress(
     }
     // Emit each validated source immediately. A bucket waiting for another
     // source must not hide its healthy sample behind a whole-bucket future.
+    let initial_baseline = initial_only.then(|| Arc::new(baseline.clone()));
     let work = futures::stream::iter(buckets.iter().cloned())
-        .map(|bucket| bucket_progress_sources(store.clone(), bucket, sets.clone(), movement_generation))
+        .map(|bucket| bucket_progress_sources(store.clone(), bucket, sets.clone(), movement_generation, initial_baseline.clone()))
         .buffer_unordered(4)
         .flatten_unordered(4);
     let samples = collect_progress_until(read_deadline, work).await;
@@ -285,6 +313,143 @@ mod tests {
         )
         .await
         .expect("persist display sample on its source set");
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_allows_initial_progress_but_preserves_complete_values() {
+        let (_dirs, store, sample) = fixture().await;
+        save(&store, &sample).await;
+        let mut baseline = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            scanner_epoch: Some(9),
+            usage_snapshot_bootstrap_pending: true,
+            usage_snapshot_initial_bootstrap: true,
+            usage_snapshot_initial_view_version: Some(1),
+            ..Default::default()
+        };
+        let primary = "buckets/.usage.v2.json";
+        save_config(store.clone(), primary, serde_json::to_vec(&baseline).expect("initial marker"))
+            .await
+            .expect("persist initial marker");
+        let initial = super::super::load_admin_usage_snapshot(store.clone(), &["progress".into()])
+            .await
+            .expect("initial view");
+        assert!(initial.usage.buckets_usage.is_empty());
+        assert_eq!(initial.initial_scan_progress["progress"].objects, Some(7));
+        baseline.usage_snapshot_bootstrap_pending = false;
+        baseline.usage_snapshot_complete = true;
+        baseline.scanner_cycle = Some(10);
+        let mut complete = BucketUsageInfo {
+            size: 900,
+            objects_count: 90,
+            bucket_incarnation: Some(sample.bucket_incarnation.clone()),
+            ..Default::default()
+        };
+        complete.certify(rustfs_data_usage::BucketUsageCertification {
+            epoch: 9,
+            cycle: 10,
+            certified_at: baseline.last_update.expect("measurement time"),
+        });
+        baseline.buckets_usage.insert("progress".into(), complete);
+        baseline.buckets_count = 1;
+        baseline.calculate_totals();
+        save_config(store.clone(), primary, serde_json::to_vec(&baseline).expect("complete snapshot"))
+            .await
+            .expect("persist complete snapshot");
+        let view = super::super::load_admin_usage_snapshot(store.clone(), &["progress".into()])
+            .await
+            .expect("complete view");
+        assert_eq!(view.usage.buckets_usage["progress"].objects_count, 90);
+        assert!(view.initial_scan_progress.is_empty());
+        baseline.usage_snapshot_bootstrap_pending = true;
+        baseline.usage_snapshot_initial_bootstrap = false;
+        baseline.usage_snapshot_complete = false;
+        baseline.buckets_usage.clear();
+        baseline.buckets_count = 0;
+        baseline.calculate_totals();
+        save_config(store.clone(), primary, serde_json::to_vec(&baseline).expect("recovery marker"))
+            .await
+            .expect("persist recovery marker");
+        let recovered = super::super::load_admin_usage_snapshot(store, &["progress".into()])
+            .await
+            .expect("recovery view");
+        assert!(
+            recovered.initial_scan_progress.is_empty(),
+            "same incarnation does not become a first scan after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn noninitial_barrier_survives_a_missing_completed_bucket_sidecar() {
+        let (_dirs, store, sample) = fixture().await;
+        save(&store, &sample).await;
+        let baseline = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(9),
+            usage_snapshot_bootstrap_pending: true,
+            usage_snapshot_initial_bootstrap: true,
+            usage_snapshot_initial_view_version: Some(1),
+            usage_snapshot_noninitial_buckets: HashMap::from([("progress".into(), sample.bucket_incarnation)]),
+            ..Default::default()
+        };
+        save_config(
+            store.clone(),
+            "buckets/.usage.v2.json",
+            serde_json::to_vec(&baseline).expect("history marker"),
+        )
+        .await
+        .expect("persist history marker");
+        let view = super::super::load_admin_usage_snapshot(store, &["progress".into()])
+            .await
+            .expect("bounded missing view");
+        assert!(
+            view.initial_scan_progress.is_empty(),
+            "a lost sidecar cannot reopen initial-statistics fallback"
+        );
+        assert_eq!(view.unmeasured_buckets, ["progress"]);
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_never_returns_a_persisted_observed_row_as_completed_usage() {
+        let (_dirs, store, sample) = fixture().await;
+        save(&store, &sample).await;
+        let mut observed = BucketUsageInfo {
+            objects_count: 90,
+            size: 900,
+            bucket_incarnation: Some(sample.bucket_incarnation),
+            ..Default::default()
+        };
+        observed.mark_observed();
+        let mut baseline = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(9),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            usage_snapshot_initial_view_version: Some(1),
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_bucket_count: 1,
+            usage_snapshot_pending_buckets: vec!["progress".into()],
+            buckets_count: 1,
+            buckets_usage: HashMap::from([("progress".into(), observed)]),
+            ..Default::default()
+        };
+        assert!(baseline.checked_calculate_totals());
+        save_config(
+            store.clone(),
+            "buckets/.usage.v2.json",
+            serde_json::to_vec(&baseline).expect("observed root"),
+        )
+        .await
+        .expect("persist old pending root");
+        let view = super::super::load_admin_usage_snapshot(store, &["progress".into()])
+            .await
+            .expect("strict view");
+        assert!(view.usage.buckets_usage.is_empty());
+        assert_eq!(view.unmeasured_buckets, ["progress"]);
+        assert!(
+            view.initial_scan_progress.is_empty(),
+            "filtering an old row must not reopen initial fallback"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
