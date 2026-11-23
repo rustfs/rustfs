@@ -4213,7 +4213,7 @@ impl DefaultObjectUsecase {
                     Ok(moved) => moved,
                     Err(error) => {
                         lifecycle.finish_err();
-                        return Err(error.into());
+                        return Err(error);
                     }
                 };
                 lifecycle.finish_ok();

@@ -471,10 +471,6 @@ mod tests {
     use super::*;
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
-    use crate::app::storage_api::bucket_usecase::s3::{
-        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3ErrorCode as LegacyErrorCode, S3Request, S3Response,
-        S3Result as LegacyResult, XmlSerialize, XmlSerializer,
-    };
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
@@ -483,10 +479,15 @@ mod tests {
         SourceCredentials, TlsConfig,
     };
     use http::HeaderMap;
+    use rustfs_gateway::{
+        EncodedResponse, Limits, MetaView, OperationCodec, ResponseBody, TargetKind, WireRequest,
+        dto::{ListObjects, ListObjectsInput, ListObjectsV2, ListObjectsV2Input, ListObjectsV2Output},
+    };
+    use rustfs_gateway_types::OpaqueString;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    type ListResponse = LegacyResult<S3Response<ListObjectsV2Output>>;
+    type ListResponse = S3Result<crate::app::Answered<ListObjectsV2Output>>;
 
     fn token(local: Option<&str>, local_done: bool) -> ListThroughToken {
         ListThroughToken {
@@ -820,14 +821,14 @@ mod tests {
             base64_simd::STANDARD.encode_to_string(token.encode().as_bytes())
         });
         let input = ListObjectsV2Input {
-            bucket,
+            bucket: crate::app::dto_values::stored_bucket_name(&bucket).expect("fixture bucket"),
             max_keys: Some(2),
-            continuation_token,
+            continuation_token: continuation_token.map(OpaqueString::from),
             delimiter: filter_prefix.map(|_| "/".to_string()),
             encoding_type: None,
             expected_bucket_owner: None,
             fetch_owner: None,
-            optional_object_attributes: None,
+            optional_object_attributes: Vec::new(),
             prefix: None,
             request_payer: None,
             start_after: None,
@@ -835,39 +836,47 @@ mod tests {
         (state_guard, input)
     }
 
-    async fn execute_source_list(input: ListObjectsV2Input) -> ListResponse {
-        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2 as ops;
-
-        // Same facts this fixture's S3Request gave `list_objects_v2`: GET `/?list-type=2`,
-        // empty headers, empty extensions, and no credentials, region, or service.
-        let envelope = crate::app::RequestEnvelope::from_parts(
+    fn list_envelope(uri: &'static str, extensions: http::Extensions) -> crate::app::RequestEnvelope {
+        crate::app::RequestEnvelope::from_parts(
             crate::app::RequestHead {
                 method: http::Method::GET,
-                uri: http::Uri::from_static("/?list-type=2"),
+                uri: http::Uri::from_static(uri),
                 headers: HeaderMap::new(),
                 credentials: None,
                 region: None,
                 service: None,
             },
-            http::Extensions::new(),
-        );
-        tokio::time::timeout(Duration::from_secs(10), async move {
-            let input = ops::input_from_s3s(input).map_err(crate::app::dto_values::seam_error)?;
-            let mut output =
-                crate::app::test_seams::list_objects_v2_owned(&DefaultBucketUsecase::from_global(), envelope, input).await?;
-            let migration_list = output.rustfs_on_demand_migration_list.take();
-            let s3s_output = ops::output_to_s3s(output).map_err(crate::app::dto_values::seam_error)?;
-            let mut response = S3Response::new(s3s_output);
-            if let Some(value) = migration_list {
-                response.headers.insert(
-                    "x-rustfs-on-demand-migration-list",
-                    http::HeaderValue::from_str(&value).expect("valid migration list header"),
-                );
-            }
-            Ok(response)
-        })
+            extensions,
+        )
+    }
+
+    fn encode_listing<O: OperationCodec>(output: O::Output, uri: &str) -> EncodedResponse {
+        let request = http::Request::get(uri).header("host", "localhost").body(()).unwrap();
+        let wire = WireRequest::accept(request, &Limits::default()).expect("valid list request");
+        let view = MetaView::of(&wire, TargetKind::Bucket)
+            .expect("bucket view")
+            .with_rustfs_response_layout();
+        O::encode(output, &view, 200).expect("encode list response")
+    }
+
+    fn listed(output: ListObjectsV2Output) -> crate::app::Answered<ListObjectsV2Output> {
+        let encoded = encode_listing::<ListObjectsV2>(output.clone(), "/bucket?list-type=2");
+        crate::app::Answered {
+            output,
+            status: Some(encoded.status),
+            headers: encoded.headers,
+        }
+    }
+
+    async fn execute_source_list(input: ListObjectsV2Input) -> ListResponse {
+        let envelope = list_envelope("/?list-type=2", http::Extensions::new());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::app::test_seams::list_objects_v2_owned(&DefaultBucketUsecase::from_global(), envelope, input),
+        )
         .await
         .expect("listing must complete within its bounded source budget")
+        .map(listed)
     }
 
     async fn native_list_source(
@@ -986,7 +995,7 @@ mod tests {
         let (_state_guard, mut input) = source_policy_input(endpoint.clone(), policy, None, None).await;
         input.max_keys = Some(max_keys);
         let sys = OnDemandMigrationSys::get();
-        let installed = sys.state(&input.bucket).expect("installed source state");
+        let installed = sys.state(input.bucket.as_str()).expect("installed source state");
         let mut config = installed.config().clone();
         config.source = serde_json::from_value(serde_json::json!({
             "provider": provider,
@@ -996,9 +1005,9 @@ mod tests {
             "azure": if provider == Provider::Azure { serde_json::json!({ "account": "acct", "account_key": "c2VjcmV0LWtleQ==" }) } else { serde_json::Value::Null },
             "gcs": if provider == Provider::GcsNative { serde_json::json!({ "service_account_json": service_account }) } else { serde_json::Value::Null }
         })).expect("native source configuration");
-        sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&config))
+        sys.apply_for_incarnation(input.bucket.as_str(), installed.incarnation_id(), Some(&config))
             .await;
-        let state = sys.state(&input.bucket).expect("native source state");
+        let state = sys.state(input.bucket.as_str()).expect("native source state");
         state
             .client()
             .unwrap_or_else(|error| panic!("{provider:?} native client must build: {error:?}"));
@@ -1054,7 +1063,7 @@ mod tests {
                                     if policy == SourceErrorPolicy::Propagate {
                                         let err = result.expect_err("malformed native page must propagate");
                                         assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
-                                        assert_eq!(err.code(), &LegacyErrorCode::Custom("SourceUnavailable".into()));
+                                        assert_eq!(err.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
                                         assert_eq!(err.message(), Some("other"));
                                     } else {
                                         // Reuse the complete local-only assertions, including no
@@ -1124,25 +1133,24 @@ mod tests {
                                 Some("local_only")
                             );
                             let output = response.output;
-                            let objects = output.contents.expect("local and source objects");
+                            let objects = output.contents;
                             assert_eq!(
                                 objects
                                     .iter()
-                                    .map(|object| (object.key.as_deref(), object.size))
+                                    .map(|object| (object.key.as_str(), object.size))
                                     .collect::<Vec<_>>(),
-                                vec![(Some("z-local"), Some(1)), (Some("目录/空"), Some(0))]
+                                vec![("z-local", 1), ("目录/空", 0)]
                             );
                             assert_eq!(
                                 output
                                     .common_prefixes
-                                    .expect("native prefix")
                                     .into_iter()
                                     .map(|prefix| prefix.prefix)
                                     .collect::<Vec<_>>(),
-                                vec![Some("目录/子/".to_string())]
+                                vec!["目录/子/"]
                             );
-                            assert_eq!(output.key_count, Some(3));
-                            assert_eq!(output.is_truncated, Some(false));
+                            assert_eq!(output.key_count, 3);
+                            assert!(!output.is_truncated);
                             assert!(output.next_continuation_token.is_none());
                         }
                     }
@@ -1188,7 +1196,7 @@ mod tests {
                     let (endpoint, server, stop) = list_source(std::iter::repeat(source_xml(None, false, Some("source")))).await;
                     let (_guard, input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
                     let sys = OnDemandMigrationSys::get();
-                    let old = sys.state(&input.bucket).expect("original source state");
+                    let old = sys.state(input.bucket.as_str()).expect("original source state");
                     let store = shared_gating_ecstore().await;
                     let object_envelope = |method, extensions| {
                         crate::app::RequestEnvelope::from_parts(
@@ -1208,13 +1216,13 @@ mod tests {
                         super::super::storage_api::bucket_usecase::access::load_bucket_generation_from_store(
                             &store,
                             &get_env,
-                            &input.bucket,
+                            input.bucket.as_str(),
                         )
                         .await
                         .expect("capture the identity before authorization");
                     store
                         .delete_bucket(
-                            &input.bucket,
+                            input.bucket.as_str(),
                             &DeleteBucketOptions {
                                 force: true,
                                 ..Default::default()
@@ -1223,24 +1231,24 @@ mod tests {
                         .await
                         .expect("delete original bucket");
                     store
-                        .make_bucket(&input.bucket, &MakeBucketOptions::default())
+                        .make_bucket(input.bucket.as_str(), &MakeBucketOptions::default())
                         .await
                         .expect("recreate bucket");
                     let replacement = store
-                        .bucket_incarnation_id(&input.bucket)
+                        .bucket_incarnation_id(input.bucket.as_str())
                         .await
                         .expect("replacement identity");
                     assert_ne!(replacement, old.incarnation_id());
-                    sys.remove(&input.bucket);
+                    sys.remove(input.bucket.as_str());
                     let mut without_source_env = object_envelope(http::Method::GET, http::Extensions::new());
                     super::super::storage_api::bucket_usecase::access::prepare_odm_read_generation(
                         &store,
                         &mut without_source_env,
-                        &input.bucket,
+                        input.bucket.as_str(),
                     )
                     .await;
                     for state_incarnation in [old.incarnation_id(), replacement] {
-                        sys.apply_for_incarnation(&input.bucket, state_incarnation, Some(old.config()))
+                        sys.apply_for_incarnation(input.bucket.as_str(), state_incarnation, Some(old.config()))
                             .await;
                         // Both a stale runtime and a newly published replacement must reject
                         // requests already authorized for the deleted incarnation.
@@ -1258,19 +1266,9 @@ mod tests {
                             }
                             let get_envelope = object_envelope(http::Method::GET, extensions.clone());
                             let head_envelope = object_envelope(http::Method::HEAD, extensions.clone());
-                            let get = crate::app::test_seams::get_object_input(&input.bucket, "missing", None);
-                            let head = crate::app::test_seams::head_object_input(&input.bucket, "missing", None);
-                            let list = S3Request {
-                                input: input.clone(),
-                                method: http::Method::GET,
-                                uri: http::Uri::from_static("/?list-type=2"),
-                                headers: HeaderMap::new(),
-                                extensions,
-                                credentials: None,
-                                region: None,
-                                service: None,
-                                trailing_headers: None,
-                            };
+                            let get = crate::app::test_seams::get_object_input(input.bucket.as_str(), "missing", None);
+                            let head = crate::app::test_seams::head_object_input(input.bucket.as_str(), "missing", None);
+                            let list = list_envelope("/?list-type=2", extensions);
                             let usecase = crate::app::object::DefaultObjectUsecase::from_global();
                             let get_error = tokio::time::timeout(
                                 Duration::from_secs(10),
@@ -1290,12 +1288,16 @@ mod tests {
                             assert_eq!(head_error.code(), &rustfs_s3_types::S3ErrorCode::NoSuchKey);
                             let listing = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), list),
+                                crate::app::test_seams::list_objects_v2_owned(
+                                    &DefaultBucketUsecase::from_global(),
+                                    list,
+                                    input.clone(),
+                                ),
                             )
                             .await
                             .expect("LIST stays local")
                             .expect("replacement bucket lists locally");
-                            assert_eq!(listing.output.key_count, Some(0));
+                            assert_eq!(listing.key_count, 0);
                         }
                     }
                     stop.cancel();
@@ -1330,7 +1332,7 @@ mod tests {
                     let store = shared_gating_ecstore().await;
                     store
                         .put_object(
-                            &source_input.bucket,
+                            source_input.bucket.as_str(),
                             "a&local",
                             &mut StoragePutObjReader::from_vec(vec![1]),
                             &StorageObjectOptions::default(),
@@ -1347,43 +1349,25 @@ mod tests {
                         };
                         for (index, expected_key) in ["a&local", "z-local"].into_iter().enumerate() {
                             let request_marker = input.marker.clone().unwrap_or_default();
-                            let gateway_input =
-                                rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects::input_from_s3s(
-                                    input.clone(),
-                                )
-                                .expect("convert ListObjectsInput");
-                            let envelope = crate::app::RequestEnvelope::from_parts(
-                                crate::app::RequestHead {
-                                    method: http::Method::GET,
-                                    uri: http::Uri::from_static("/"),
-                                    headers: HeaderMap::new(),
-                                    credentials: None,
-                                    region: None,
-                                    service: None,
-                                },
-                                http::Extensions::new(),
-                            );
-                            let gateway_output = tokio::time::timeout(
+                            let envelope = list_envelope("/", http::Extensions::new());
+                            let output = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                DefaultBucketUsecase::from_global().execute_list_objects(envelope, gateway_input),
+                                DefaultBucketUsecase::from_global().execute_list_objects(envelope, input.clone()),
                             )
                             .await
                             .expect("v1 pagination must finish")
                             .expect("list-through must not change v1 listing");
-                            let output = rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects::output_to_s3s(
-                                gateway_output,
-                            )
-                            .expect("convert ListObjectsOutput");
-                            let contents = output.contents.as_ref().expect("local page contents");
+                            let contents = &output.contents;
                             assert_eq!(contents.len(), 1);
-                            assert_eq!(contents[0].key.as_deref(), Some(expected_key));
-                            assert_eq!(output.marker.as_deref(), Some(request_marker.as_str()));
-                            assert_eq!(output.is_truncated, Some(index == 0));
+                            assert_eq!(contents[0].key.as_str(), expected_key);
+                            assert_eq!(output.marker, request_marker);
+                            assert_eq!(output.is_truncated, index == 0);
                             assert_eq!(output.next_marker.as_deref(), (index == 0).then_some(expected_key));
 
-                            let mut xml = Vec::new();
-                            XmlSerialize::serialize(&output, &mut XmlSerializer::new(&mut xml))
-                                .expect("serialize the real v1 response");
+                            let ResponseBody::Complete(xml) = encode_listing::<ListObjects>(output.clone(), "/bucket").body
+                            else {
+                                panic!("v1 listing must encode an XML document");
+                            };
                             assert!(!xml.contains(&0), "XML 1.0 forbids NUL in NextMarker");
                             let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
                             loop {
@@ -1493,27 +1477,25 @@ mod tests {
                         let output = response.output;
                         let objects: Vec<_> = output
                             .contents
-                            .unwrap_or_default()
                             .into_iter()
-                            .map(|object| object.key.expect("listed object key"))
+                            .map(|object| object.key.as_str().to_owned())
                             .collect();
                         if filter_prefix.is_some() {
                             assert_eq!(objects, vec!["z-local"]);
                             assert_eq!(
                                 output
                                     .common_prefixes
-                                    .unwrap_or_default()
                                     .into_iter()
-                                    .map(|prefix| prefix.prefix.expect("rolled-up prefix"))
+                                    .map(|prefix| prefix.prefix)
                                     .collect::<Vec<_>>(),
                                 vec!["photos/"]
                             );
                         } else {
                             assert_eq!(objects, vec!["a-source", "z-local"]);
-                            assert!(output.common_prefixes.unwrap_or_default().is_empty());
+                            assert!(output.common_prefixes.is_empty());
                         }
-                        assert_eq!(output.key_count, Some(2));
-                        assert_eq!(output.is_truncated, Some(false));
+                        assert_eq!(output.key_count, 2);
+                        assert!(!output.is_truncated);
                         assert!(output.next_continuation_token.is_none());
                     }
                 },
@@ -1562,10 +1544,10 @@ mod tests {
                                     break Ok(response);
                                 }
                                 let output = response.output;
-                                assert!(output.contents.as_ref().is_none_or(Vec::is_empty));
-                                assert!(output.common_prefixes.as_ref().is_none_or(Vec::is_empty));
-                                assert_eq!(output.key_count, Some(0));
-                                assert_eq!(output.is_truncated, Some(true));
+                                assert!(output.contents.is_empty());
+                                assert!(output.common_prefixes.is_empty());
+                                assert_eq!(output.key_count, 0);
+                                assert!(output.is_truncated);
                                 let next = output
                                     .next_continuation_token
                                     .expect("a truncated page must carry its cursor");
@@ -1573,7 +1555,7 @@ mod tests {
                                     seen.insert(next.clone()),
                                     "a cross-request source cursor cycle must not return an identical empty merged token"
                                 );
-                                assert!(!decode_wire_token(&next).framed, "the budget switch cannot enable framing");
+                                assert!(!decode_wire_token(next.as_str()).framed, "the budget switch cannot enable framing");
                                 empty_pages += 1;
                                 input.continuation_token = Some(next);
                             }
@@ -1633,10 +1615,12 @@ mod tests {
                         for _ in 0..3 {
                             let response = execute_source_list(input.clone()).await.expect("reader-only v1 behavior");
                             assert!(!response.headers.contains_key("x-rustfs-on-demand-migration-list"));
-                            assert_eq!(response.output.key_count, Some(0));
-                            assert_eq!(response.output.is_truncated, Some(true));
+                            assert_eq!(response.output.key_count, 0);
+                            assert!(response.output.is_truncated);
                             let next = response.output.next_continuation_token.expect("resumable empty page");
-                            let raw = base64_simd::STANDARD.decode_to_vec(&next).expect("base64 continuation token");
+                            let raw = base64_simd::STANDARD
+                                .decode_to_vec(next.as_str())
+                                .expect("base64 continuation token");
                             let decoded = std::str::from_utf8(&raw).expect("JSON token");
                             let token = decode_list_cursor(Some(decoded)).expect("v1 reader").expect("merged token");
                             assert!(!token.framed, "explicit false must keep issuing bare tokens for older readers");
@@ -1648,7 +1632,7 @@ mod tests {
                         assert_eq!(input.continuation_token, original, "default rollout retains the known v1 limitation");
 
                         let raw = base64_simd::STANDARD
-                            .decode_to_vec(input.continuation_token.as_ref().expect("v1 token"))
+                            .decode_to_vec(input.continuation_token.as_ref().expect("v1 token").as_str())
                             .expect("base64 continuation token");
                         let mut token = decode_list_cursor(Some(std::str::from_utf8(&raw).expect("JSON token")))
                             .expect("v1 reader")
@@ -1656,12 +1640,14 @@ mod tests {
                         token.framed = framed;
                         token.v = 2;
                         token.no_progress = Some(MAX_LIST_NO_PROGRESS_PAGES - 2);
-                        input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(token.encode().as_bytes()));
+                        input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(token.encode().as_bytes()).into());
                         let response = execute_source_list(input.clone()).await.expect("reader-only node resumes v2");
-                        assert_eq!(response.output.key_count, Some(0));
-                        assert_eq!(response.output.is_truncated, Some(true));
+                        assert_eq!(response.output.key_count, 0);
+                        assert!(response.output.is_truncated);
                         let next = response.output.next_continuation_token.expect("last allowed empty cursor");
-                        let raw = base64_simd::STANDARD.decode_to_vec(&next).expect("base64 continuation token");
+                        let raw = base64_simd::STANDARD
+                            .decode_to_vec(next.as_str())
+                            .expect("base64 continuation token");
                         let token = decode_list_cursor(Some(std::str::from_utf8(&raw).expect("JSON token")))
                             .expect("v2 reader")
                             .expect("merged token");
@@ -1721,10 +1707,10 @@ mod tests {
                             .await
                             .expect("valid empty pages must remain resumable");
                         assert!(!first.headers.contains_key("x-rustfs-on-demand-migration-list"));
-                        assert!(first.output.contents.as_ref().is_none_or(Vec::is_empty));
-                        assert!(first.output.common_prefixes.as_ref().is_none_or(Vec::is_empty));
-                        assert_eq!(first.output.key_count, Some(0));
-                        assert_eq!(first.output.is_truncated, Some(true));
+                        assert!(first.output.contents.is_empty());
+                        assert!(first.output.common_prefixes.is_empty());
+                        assert_eq!(first.output.key_count, 0);
+                        assert!(first.output.is_truncated);
                         input.continuation_token = Some(first.output.next_continuation_token.expect("empty advancing cursor"));
 
                         let second = execute_source_list(input)
@@ -1734,15 +1720,13 @@ mod tests {
                         let output = second.output;
                         let objects = output
                             .contents
-                            .unwrap_or_default()
                             .into_iter()
-                            .map(|object| object.key.expect("listed object key"))
+                            .map(|object| object.key.as_str().to_owned())
                             .collect::<Vec<_>>();
                         let prefixes = output
                             .common_prefixes
-                            .unwrap_or_default()
                             .into_iter()
-                            .map(|prefix| prefix.prefix.expect("listed common prefix"))
+                            .map(|prefix| prefix.prefix)
                             .collect::<Vec<_>>();
                         if filter_prefix.is_some() {
                             assert_eq!(objects, vec!["z-local"]);
@@ -1751,8 +1735,8 @@ mod tests {
                             assert_eq!(objects, vec!["a-source", "z-local"]);
                             assert!(prefixes.is_empty());
                         }
-                        assert_eq!(output.key_count, Some(2));
-                        assert_eq!(output.is_truncated, Some(false));
+                        assert_eq!(output.key_count, 2);
+                        assert!(!output.is_truncated);
                         assert!(output.next_continuation_token.is_none());
                         let requests = tokio::time::timeout(Duration::from_secs(5), server)
                             .await
@@ -1781,7 +1765,7 @@ mod tests {
             input.prefix.clone(),
             input.delimiter.clone(),
             input.max_keys,
-            input.continuation_token.clone(),
+            input.continuation_token.as_ref().map(|token| token.as_str().to_owned()),
             input.start_after.clone(),
         )?;
         assert!(params.max_keys > 0, "the frozen route models active, nonzero merged requests");
@@ -1803,7 +1787,7 @@ mod tests {
         });
         let store = shared_gating_ecstore().await;
         let state = OnDemandMigrationSys::get()
-            .state(&input.bucket)
+            .state(input.bucket.as_str())
             .expect("installed real source state");
         assert!(state.config().policy.list_through);
         let mut outcome = tokio::time::timeout(
@@ -1811,7 +1795,7 @@ mod tests {
             merged_list_objects_v2(
                 &store,
                 Some(&state),
-                &input.bucket,
+                input.bucket.as_str(),
                 &params,
                 input.fetch_owner.unwrap_or_default(),
                 false,
@@ -1831,14 +1815,12 @@ mod tests {
         assert!(input.encoding_type.is_none(), "the frozen route models unencoded listings");
         let output = crate::app::bucket_usecase::list_objects::list_objects_v2_output(
             outcome.info,
-            &input.bucket,
+            input.bucket.as_str(),
             params,
             input.fetch_owner.unwrap_or_default(),
             None,
         )?;
-        let output = rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2::output_to_s3s(output)
-            .expect("the seam carries every member of a listing page");
-        Ok(S3Response::new(output))
+        Ok(listed(output))
     }
 
     fn e160_wire_cursor(wire: &str) -> crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor {
@@ -1894,7 +1876,7 @@ mod tests {
                         for key in ["b", "d"] {
                             store
                                 .put_object(
-                                    &input.bucket,
+                                    input.bucket.as_str(),
                                     key,
                                     &mut StoragePutObjReader::from_vec(vec![1]),
                                     &StorageObjectOptions::default(),
@@ -1919,12 +1901,16 @@ mod tests {
                                 execute_source_list(input.clone()).await
                             }
                             .expect("compatible framed reader must continue the same scan");
-                            assert_eq!(response.output.key_count, Some(1));
-                            assert_eq!(response.output.contents.as_ref().expect("one object")[0].key.as_deref(), Some(key));
-                            assert_eq!(response.output.is_truncated, Some(page != 4));
+                            assert_eq!(response.output.key_count, 1);
+                            assert_eq!(response.output.contents[0].key.as_str(), key);
+                            assert_eq!(response.output.is_truncated, page != 4);
                             input.continuation_token = response.output.next_continuation_token;
                             if page != 4 {
-                                let wire = input.continuation_token.as_deref().expect("framed continuation");
+                                let wire = input
+                                    .continuation_token
+                                    .as_ref()
+                                    .map(OpaqueString::as_str)
+                                    .expect("framed continuation");
                                 framed_pages.push((wire.to_string(), key));
                             } else {
                                 assert!(input.continuation_token.is_none());
@@ -1947,12 +1933,16 @@ mod tests {
                         temp_env::async_with_vars([(ENV_LIST_FRAMED_TOKENS, Some("false"))], async {
                             for (page, key) in ["a", "b", "c", "d", "z-local"].into_iter().enumerate() {
                                 let response = execute_source_list(input.clone()).await.expect("converged dual readers");
-                                assert_eq!(response.output.key_count, Some(1));
-                                assert_eq!(response.output.contents.as_ref().expect("one object")[0].key.as_deref(), Some(key));
-                                assert_eq!(response.output.is_truncated, Some(page != 4));
+                                assert_eq!(response.output.key_count, 1);
+                                assert_eq!(response.output.contents[0].key.as_str(), key);
+                                assert_eq!(response.output.is_truncated, page != 4);
                                 input.continuation_token = response.output.next_continuation_token;
                                 if page != 4 {
-                                    let wire = input.continuation_token.as_deref().expect("bare continuation");
+                                    let wire = input
+                                        .continuation_token
+                                        .as_ref()
+                                        .map(OpaqueString::as_str)
+                                        .expect("bare continuation");
                                     assert!(!decode_wire_token(wire).framed);
                                     assert!(
                                         matches!(e160_wire_cursor(wire),
@@ -2013,7 +2003,7 @@ mod tests {
                     for key in ["b", "d"] {
                         store
                             .put_object(
-                                &input.bucket,
+                                input.bucket.as_str(),
                                 key,
                                 &mut StoragePutObjReader::from_vec(vec![1]),
                                 &StorageObjectOptions::default(),
@@ -2023,9 +2013,13 @@ mod tests {
                     }
                     input.max_keys = Some(1);
                     let first = execute_source_list(input.clone()).await.expect("explicit bare first page");
-                    assert_eq!(first.output.contents.as_ref().expect("first object")[0].key.as_deref(), Some("a"));
+                    assert_eq!(first.output.contents[0].key.as_str(), "a");
                     input.continuation_token = first.output.next_continuation_token;
-                    let bare = input.continuation_token.as_deref().expect("new bare cursor");
+                    let bare = input
+                        .continuation_token
+                        .as_ref()
+                        .map(OpaqueString::as_str)
+                        .expect("new bare cursor");
                     assert!(!decode_wire_token(bare).framed);
                     assert!(matches!(
                         e160_wire_cursor(bare),
@@ -2034,18 +2028,27 @@ mod tests {
                     let repeated = execute_e160_source_list(input.clone())
                         .await
                         .expect("old reader silently restarts");
-                    assert_eq!(repeated.output.key_count, Some(1));
+                    assert_eq!(repeated.output.key_count, 1);
                     assert_eq!(
-                        repeated.output.contents.as_ref().expect("repeated object")[0].key.as_deref(),
-                        Some("a"),
+                        repeated.output.contents[0].key.as_str(),
+                        "a",
                         "negative control: the incompatible bare setting loses last_key and repeats a"
                     );
                     input.continuation_token = repeated.output.next_continuation_token;
-                    assert!(decode_wire_token(input.continuation_token.as_deref().expect("old framed cursor")).framed);
+                    assert!(
+                        decode_wire_token(
+                            input
+                                .continuation_token
+                                .as_ref()
+                                .map(OpaqueString::as_str)
+                                .expect("old framed cursor")
+                        )
+                        .framed
+                    );
                     let resumed = execute_source_list(input).await.expect("old writer now supplies framing");
                     assert_eq!(
-                        resumed.output.contents.as_ref().expect("next object")[0].key.as_deref(),
-                        Some("b"),
+                        resumed.output.contents[0].key.as_str(),
+                        "b",
                         "this mismatch need not loop forever: e160 subsequently emits a frame"
                     );
                     let requests = tokio::time::timeout(Duration::from_secs(5), server)
@@ -2079,13 +2082,13 @@ mod tests {
                     .map(|cursor| source_xml(Some(cursor), true, None)).collect()).await;
                 let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
                 input.max_keys = Some(1);
-                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(framed13.as_bytes()));
+                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(framed13.as_bytes()).into());
                 let fourteen = execute_source_list(input.clone()).await.expect("new reader preserves the old framed budget");
-                assert_eq!(fourteen.output.key_count, Some(0));
-                assert_eq!(fourteen.output.is_truncated, Some(true));
+                assert_eq!(fourteen.output.key_count, 0);
+                assert!(fourteen.output.is_truncated);
                 input.continuation_token = fourteen.output.next_continuation_token;
                 let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
-                    e160_wire_cursor(input.continuation_token.as_deref().expect("fourteenth empty page")) else {
+                    e160_wire_cursor(input.continuation_token.as_ref().map(OpaqueString::as_str).expect("fourteenth empty page")) else {
                         panic!("the new writer must preserve a framed v2 token for e160");
                     };
                 assert_eq!(old.v, 2);
@@ -2094,10 +2097,10 @@ mod tests {
                 assert!(old.local_done);
                 assert_eq!(old.last_key, None);
                 let fifteen = execute_e160_source_list(input.clone()).await.expect("e160 preserves an existing v2 budget");
-                assert_eq!(fifteen.output.key_count, Some(0));
-                assert_eq!(fifteen.output.is_truncated, Some(true));
+                assert_eq!(fifteen.output.key_count, 0);
+                assert!(fifteen.output.is_truncated);
                 input.continuation_token = fifteen.output.next_continuation_token;
-                let next = decode_wire_token(input.continuation_token.as_deref().expect("fifteenth empty page"));
+                let next = decode_wire_token(input.continuation_token.as_ref().map(OpaqueString::as_str).expect("fifteenth empty page"));
                 assert!(next.framed);
                 assert_eq!(next.v, 2);
                 assert_eq!(next.no_progress, Some(15));
@@ -2117,13 +2120,13 @@ mod tests {
                 ]).await;
                 let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
                 let bare15 = r#"{"t":"odm-list","v":2,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":null,"no_progress":15}"#;
-                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(bare15.as_bytes()));
-                assert!(matches!(e160_wire_cursor(input.continuation_token.as_deref().expect("bare v2")),
+                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(bare15.as_bytes()).into());
+                assert!(matches!(e160_wire_cursor(input.continuation_token.as_ref().map(OpaqueString::as_str).expect("bare v2")),
                     crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)));
                 let restarted = execute_e160_source_list(input).await.expect("negative control: old reader loses the budget");
-                assert_eq!(restarted.output.key_count, Some(0));
-                assert_eq!(restarted.output.is_truncated, Some(true));
-                let reset = decode_wire_token(restarted.output.next_continuation_token.as_deref().expect("restarted cursor"));
+                assert_eq!(restarted.output.key_count, 0);
+                assert!(restarted.output.is_truncated);
+                let reset = decode_wire_token(restarted.output.next_continuation_token.as_ref().map(OpaqueString::as_str).expect("restarted cursor"));
                 assert!(reset.framed);
                 assert_eq!(reset.v, 1);
                 assert_eq!(reset.no_progress, None, "bare v2 was never recognized by the e160 reader");
@@ -2193,7 +2196,7 @@ mod tests {
         for key in local_keys {
             store
                 .put_object(
-                    &input.bucket,
+                    input.bucket.as_str(),
                     key,
                     &mut StoragePutObjReader::from_vec(vec![1]),
                     &StorageObjectOptions::default(),
@@ -2210,24 +2213,18 @@ mod tests {
             let mut names = page
                 .contents
                 .iter()
-                .flatten()
-                .map(|object| object.key.clone().expect("listed object key"))
-                .chain(
-                    page.common_prefixes
-                        .iter()
-                        .flatten()
-                        .map(|prefix| prefix.prefix.clone().expect("listed common prefix")),
-                )
+                .map(|object| object.key.as_str().to_owned())
+                .chain(page.common_prefixes.iter().map(|prefix| prefix.prefix.clone()))
                 .collect::<Vec<_>>();
             names.sort();
             names
         };
         let first = execute_source_list(input.clone()).await.expect("first merged page").output;
         assert_eq!(page_names(&first), expected_first);
-        assert_eq!(first.key_count, Some(2));
-        assert_eq!(first.is_truncated, Some(true));
+        assert_eq!(first.key_count, 2);
+        assert!(first.is_truncated);
         let mut cursor = first.next_continuation_token.expect("merged cursor");
-        let mut token = decode_wire_token(&cursor);
+        let mut token = decode_wire_token(cursor.as_str());
         assert_eq!(token.framed, framed);
         let second_page = match scenario {
             DisabledListScenario::PartiallyConsumedLocalPage => Some((["c", "d"], ["c", "e"])),
@@ -2244,7 +2241,7 @@ mod tests {
             let second = execute_source_list(input.clone()).await.expect("second merged page").output;
             assert_eq!(page_names(&second), expected_second);
             cursor = second.next_continuation_token.expect("partially consumed local page");
-            token = decode_wire_token(&cursor);
+            token = decode_wire_token(cursor.as_str());
             assert_eq!(
                 token.local.as_deref(),
                 Some(first_local.as_str()),
@@ -2255,7 +2252,7 @@ mod tests {
             // fix that merely passes both would still replay c from this page.
             let token_wins = Arc::clone(&store)
                 .list_objects_v2(
-                    &input.bucket,
+                    input.bucket.as_str(),
                     "",
                     Some(first_local),
                     None,
@@ -2283,7 +2280,7 @@ mod tests {
         let requests_before_disable = source_requests.load(Ordering::SeqCst);
         assert_eq!(requests_before_disable, if second_page.is_some() { 2 } else { 1 });
         let sys = OnDemandMigrationSys::get();
-        let installed = sys.state(&input.bucket).expect("installed source state");
+        let installed = sys.state(input.bucket.as_str()).expect("installed source state");
         let saved_config = installed.config().clone();
         source_disabled.store(true, Ordering::SeqCst);
         if disable_module {
@@ -2291,7 +2288,7 @@ mod tests {
         } else {
             let mut disabled_config = saved_config.clone();
             disabled_config.policy.list_through = false;
-            sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&disabled_config))
+            sys.apply_for_incarnation(input.bucket.as_str(), installed.incarnation_id(), Some(&disabled_config))
                 .await;
         }
         input.continuation_token = Some(cursor);
@@ -2302,18 +2299,15 @@ mod tests {
             expected_disabled,
             "framed={framed}, module={disable_module}"
         );
-        assert_eq!(
-            disabled.output.key_count,
-            Some(i32::try_from(expected_disabled.len()).expect("page size"))
-        );
-        assert_eq!(disabled.output.prefix.as_deref(), Some(if prefixes { "p/" } else { "" }));
+        assert_eq!(disabled.output.key_count, i32::try_from(expected_disabled.len()).expect("page size"));
+        assert_eq!(disabled.output.prefix, if prefixes { "p/" } else { "" });
         assert_eq!(disabled.output.delimiter, input.delimiter);
         assert_eq!(disabled.output.start_after, input.start_after, "echo the client's original StartAfter");
         assert_eq!(source_requests.load(Ordering::SeqCst), requests_before_disable);
         if matches!(scenario, DisabledListScenario::Reenable) {
-            assert_eq!(disabled.output.is_truncated, Some(true));
+            assert!(disabled.output.is_truncated);
             let next = disabled.output.next_continuation_token.expect("local side still has z-local");
-            let next_token = decode_wire_token(&next);
+            let next_token = decode_wire_token(next.as_str());
             assert_eq!(next_token.framed, framed, "retain the chain's existing wire format");
             assert_eq!(next_token.source, token.source, "disabled requests do not consume source pages");
             assert_eq!(next_token.last_key.as_deref(), Some("e"));
@@ -2321,17 +2315,17 @@ mod tests {
             if disable_module {
                 sys.set_module_enabled(true);
             } else {
-                sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&saved_config))
+                sys.apply_for_incarnation(input.bucket.as_str(), installed.incarnation_id(), Some(&saved_config))
                     .await;
             }
             input.continuation_token = Some(next);
             let resumed = execute_source_list(input).await.expect("reenabled continuation").output;
             assert_eq!(page_names(&resumed), ["f", "z-local"], "both sides continue beyond the local-only page");
-            assert_eq!(resumed.is_truncated, Some(false));
+            assert!(!resumed.is_truncated);
             assert!(resumed.next_continuation_token.is_none());
             assert_eq!(source_requests.load(Ordering::SeqCst), requests_before_disable + 1);
         } else {
-            assert_eq!(disabled.output.is_truncated, Some(false));
+            assert!(!disabled.output.is_truncated);
             assert!(disabled.output.next_continuation_token.is_none());
         }
         stop.cancel();
@@ -2462,7 +2456,7 @@ mod tests {
                         ]).await;
                         let (_state_guard, mut input) = source_policy_input(endpoint, policy, None, None).await;
                         // Fixed bytes from the pre-framing writer, independent of today's encoder.
-                        input.continuation_token = Some("eyJ0Ijoib2RtLWxpc3QiLCJ2IjoyLCJsb2NhbCI6bnVsbCwibG9jYWxfZG9uZSI6ZmFsc2UsInNvdXJjZSI6IkEiLCJzb3VyY2VfZG9uZSI6ZmFsc2UsImxhc3Rfa2V5IjpudWxsLCJub19wcm9ncmVzcyI6MTV9".to_string());
+                        input.continuation_token = Some("eyJ0Ijoib2RtLWxpc3QiLCJ2IjoyLCJsb2NhbCI6bnVsbCwibG9jYWxfZG9uZSI6ZmFsc2UsInNvdXJjZSI6IkEiLCJzb3VyY2VfZG9uZSI6ZmFsc2UsImxhc3Rfa2V5IjpudWxsLCJub19wcm9ncmVzcyI6MTV9".to_string().into());
                         assert_source_policy_result(execute_source_list(input).await, policy);
                         let requests = tokio::time::timeout(Duration::from_secs(5), server).await
                             .expect("finite source server must finish").expect("source server must not panic");
@@ -2517,7 +2511,7 @@ mod tests {
                     for key in ["a-local", "b-local", json_key, "~last"] {
                         store
                             .put_object(
-                                &input.bucket,
+                                input.bucket.as_str(),
                                 key,
                                 &mut StoragePutObjReader::from_vec(vec![1]),
                                 &StorageObjectOptions::default(),
@@ -2527,10 +2521,10 @@ mod tests {
                     }
                     input.max_keys = Some(1);
                     let first = execute_source_list(input.clone()).await.expect("legitimate empty page");
-                    assert_eq!(first.output.key_count, Some(0));
-                    assert_eq!(first.output.is_truncated, Some(true));
+                    assert_eq!(first.output.key_count, 0);
+                    assert!(first.output.is_truncated);
                     let next = first.output.next_continuation_token.expect("first framed cursor");
-                    let token = decode_wire_token(&next);
+                    let token = decode_wire_token(next.as_str());
                     assert!(token.framed, "the independent switch permits first framing issuance");
                     assert_eq!(token.v, 1, "framing issuance cannot enable the no-progress budget");
                     assert_eq!(token.no_progress, None);
@@ -2539,10 +2533,10 @@ mod tests {
                         temp_env::async_with_vars([(ENV_LIST_PROGRESS_TOKENS, Some("true"))], execute_source_list(input.clone()))
                             .await
                             .expect("another valid empty page starts a budget only when enabled");
-                    assert_eq!(budget_page.output.key_count, Some(0));
-                    assert_eq!(budget_page.output.is_truncated, Some(true));
+                    assert_eq!(budget_page.output.key_count, 0);
+                    assert!(budget_page.output.is_truncated);
                     let next = budget_page.output.next_continuation_token.expect("framed v2 cursor");
-                    let token = decode_wire_token(&next);
+                    let token = decode_wire_token(next.as_str());
                     assert!(token.framed);
                     assert_eq!(token.v, 2);
                     assert_eq!(token.no_progress, Some(1));
@@ -2557,28 +2551,27 @@ mod tests {
                             let second = execute_source_list(input.clone())
                                 .await
                                 .expect("reader-only node reaches source data");
-                            assert_eq!(second.output.key_count, Some(1));
-                            assert_eq!(second.output.is_truncated, Some(true));
-                            assert_eq!(second.output.contents.expect("source object")[0].key.as_deref(), Some("0-source"));
+                            assert_eq!(second.output.key_count, 1);
+                            assert!(second.output.is_truncated);
+                            assert_eq!(second.output.contents[0].key.as_str(), "0-source");
                             let next = second.output.next_continuation_token.expect("remaining local listing");
-                            let token = decode_wire_token(&next);
+                            let token = decode_wire_token(next.as_str());
                             assert!(token.framed, "resetting the budget must not downgrade the framing");
                             assert_eq!(token.v, 1);
                             assert_eq!(token.no_progress, None);
                             assert!(token.source_done);
                             input.continuation_token = Some(next);
 
-                            OnDemandMigrationSys::get().remove(&input.bucket);
+                            OnDemandMigrationSys::get().remove(input.bucket.as_str());
                             for (index, key) in expected_local.iter().enumerate() {
                                 let page = execute_source_list(input.clone()).await.expect("local-only continuation");
                                 assert!(!page.headers.contains_key("x-rustfs-on-demand-migration-list"));
-                                assert_eq!(page.output.key_count, Some(1));
+                                assert_eq!(page.output.key_count, 1);
                                 let keys: Vec<_> = page
                                     .output
                                     .contents
-                                    .expect("one local object")
                                     .into_iter()
-                                    .map(|object| object.key.expect("local key"))
+                                    .map(|object| object.key.as_str().to_owned())
                                     .collect();
                                 assert_eq!(
                                     keys,
@@ -2586,10 +2579,10 @@ mod tests {
                                     "no duplicate or omitted key after disabling list-through"
                                 );
                                 let truncated = index + 1 < expected_local.len();
-                                assert_eq!(page.output.is_truncated, Some(truncated));
+                                assert_eq!(page.output.is_truncated, truncated);
                                 if truncated {
                                     let next = page.output.next_continuation_token.expect("local side still has keys");
-                                    let token = decode_wire_token(&next);
+                                    let token = decode_wire_token(next.as_str());
                                     assert!(token.framed);
                                     assert_eq!(token.v, 1);
                                     assert_eq!(token.no_progress, None);
@@ -2640,19 +2633,19 @@ mod tests {
                     ]).await;
                     let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
                     let wire = concat!("\0odm-list:", r#"{"t":"odm-list","v":2,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":null,"no_progress":15}"#);
-                    input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(wire.as_bytes()));
+                    input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(wire.as_bytes()).into());
                     input.max_keys = Some(0);
                     let zero = execute_source_list(input.clone()).await.expect("zero-sized request does not spend the budget");
-                    assert_eq!(zero.output.key_count, Some(0));
-                    assert_eq!(zero.output.is_truncated, Some(true));
+                    assert_eq!(zero.output.key_count, 0);
+                    assert!(zero.output.is_truncated);
                     let next = zero.output.next_continuation_token.expect("unconsumed source");
-                    let token = decode_wire_token(&next);
+                    let token = decode_wire_token(next.as_str());
                     assert!(token.framed);
                     assert_eq!(token.v, 2);
                     assert_eq!(token.no_progress, Some(15));
                     assert_eq!(token.source.as_deref(), Some("A"));
-                    assert_eq!(next, input.continuation_token.as_ref().expect("original cursor").as_str());
-                    let state = OnDemandMigrationSys::get().state(&input.bucket).expect("source state");
+                    assert_eq!(next.as_str(), input.continuation_token.as_ref().expect("original cursor").as_str());
+                    let state = OnDemandMigrationSys::get().state(input.bucket.as_str()).expect("source state");
                     assert_eq!(state.stats().snapshot(state.breaker().state()).source_latency.count, 0, "zero-sized request must not fetch the source");
                     input.continuation_token = Some(next);
                     input.max_keys = Some(2);
@@ -2690,15 +2683,15 @@ mod tests {
                             let json = format!(r#"{{"t":"odm-list","v":2,"local":"local-marker","local_done":{local_done},"source":"source-marker","source_done":{source_done},"last_key":null,"no_progress":15}}"#);
                             let wire = if framed { format!("\0odm-list:{json}") } else { json };
                             let original = base64_simd::STANDARD.encode_to_string(wire.as_bytes());
-                            input.continuation_token = Some(original.clone());
+                            input.continuation_token = Some(original.clone().into());
                             input.max_keys = Some(0);
                             let output = execute_source_list(input).await.expect("zero page remains local").output;
                             let has_more = !local_done || !source_done;
-                            assert_eq!(output.key_count, Some(0));
-                            assert_eq!(output.is_truncated, Some(has_more), "framed={framed}, local_done={local_done}, source_done={source_done}");
-                            assert_eq!(output.next_continuation_token.as_deref(), has_more.then_some(original.as_str()));
+                            assert_eq!(output.key_count, 0);
+                            assert_eq!(output.is_truncated, has_more, "framed={framed}, local_done={local_done}, source_done={source_done}");
+                            assert_eq!(output.next_continuation_token.as_ref().map(OpaqueString::as_str), has_more.then_some(original.as_str()));
                             if let Some(next) = output.next_continuation_token {
-                                let token = decode_wire_token(&next);
+                                let token = decode_wire_token(next.as_str());
                                 assert_eq!(token.framed, framed);
                                 assert_eq!(token.v, 2);
                                 assert_eq!(token.no_progress, Some(15));
@@ -2723,7 +2716,7 @@ mod tests {
             SourceErrorPolicy::Propagate => {
                 let error = result.expect_err("propagate must expose malformed pagination");
                 assert_eq!(error.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
-                assert_eq!(error.code(), &LegacyErrorCode::Custom("SourceUnavailable".into()));
+                assert_eq!(error.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
                 assert_eq!(error.message(), Some("invalid_pagination"));
             }
             SourceErrorPolicy::NotFound => {
@@ -2739,14 +2732,13 @@ mod tests {
                 assert_eq!(
                     output
                         .contents
-                        .unwrap_or_default()
                         .into_iter()
-                        .map(|object| object.key.expect("local key"))
+                        .map(|object| object.key.as_str().to_owned())
                         .collect::<Vec<_>>(),
                     vec!["z-local"]
                 );
-                assert_eq!(output.is_truncated, Some(false));
-                assert_eq!(output.key_count, Some(1));
+                assert!(!output.is_truncated);
+                assert_eq!(output.key_count, 1);
                 assert!(output.next_continuation_token.is_none());
             }
         }

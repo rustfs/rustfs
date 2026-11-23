@@ -27,7 +27,7 @@ use crate::app::storage_api::owned_parity::{
 use crate::app::storage_api::owned_parity::{authorize_create_bucket, authorize_delete_bucket};
 use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-    ObjectLockRetention, PutObjectInput, S3Error, S3ErrorCode, S3Request,
+    ObjectLockRetention, PutObjectInput, S3ErrorCode, S3Request,
 };
 use crate::app::{RequestEnvelope, RequestHead};
 use crate::auth::facts::{AuthzPrincipal, AuthzTarget};
@@ -464,7 +464,7 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             storage,
             crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })
         ));
-        let response = S3Error::from(err).to_http_response().expect("serialize publication failure");
+        let response = err.to_http_response().expect("serialize publication failure");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
         let body = response.into_body().collect().await.expect("read error XML").to_bytes();
@@ -629,9 +629,14 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
             ..Default::default()
         });
         let mut owned = envelope_from_request(&legacy);
-        let input =
-            rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::create_bucket::input_from_s3s(legacy.input.clone())
-                .expect("a valid CreateBucket input");
+        let input = rustfs_gateway_types::dto::CreateBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new(bucket).expect("valid bucket name"),
+            create_bucket_configuration: region.map(|region| rustfs_gateway_types::dto::CreateBucketConfiguration {
+                location_constraint: Some(rustfs_gateway_types::dto::LocationConstraint::custom(region.to_owned())),
+            }),
+            object_lock_enabled_for_bucket: Some(object_lock),
+            ..Default::default()
+        };
         let location = crate::app::bucket_usecase::requested_location_constraint(&input).map(str::to_owned);
         let lock = input.object_lock_enabled_for_bucket.is_some_and(|enabled| enabled);
 
@@ -1589,7 +1594,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             action,
         )
         .await
-        .map_err(S3Error::from);
+        .map_err(crate::error::legacy_error_for_test);
         let owned_ok = match &owned_result {
             Ok(()) => case.allowed,
             Err(err) => !case.allowed && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied,
@@ -1732,24 +1737,24 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
         let mut owned = envelope_from_request(&legacy);
         let action = Action::S3Action(action);
 
-        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action)
-            .await
-            .map_err(S3Error::from);
-        let outcome = |result: Result<(), S3ErrorCode>, snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| match result {
+        use rustfs_s3_types::S3ErrorCode as OwnedErrorCode;
+
+        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action).await;
+        let outcome = |result: Result<(), OwnedErrorCode>, snapshot: Result<Option<uuid::Uuid>, OwnedErrorCode>| match result {
             Ok(()) => MutationOutcome::Allowed(snapshot.ok().flatten()),
-            Err(S3ErrorCode::AccessDenied) => MutationOutcome::Denied,
+            Err(OwnedErrorCode::AccessDenied) => MutationOutcome::Denied,
             Err(code) => MutationOutcome::Failed(code.as_str().to_owned()),
         };
         let owned_outcome = outcome(
             owned_result.map_err(|err| err.code().clone()),
-            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone().into()),
+            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()),
         );
         // A refused request hands no snapshot on: the use case's reader refuses to run without one.
-        let refused_without_snapshot = |snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| {
-            matches!(expected, MutationOutcome::Allowed(_)) || snapshot == Err(S3ErrorCode::InternalError)
+        let refused_without_snapshot = |snapshot: Result<Option<uuid::Uuid>, OwnedErrorCode>| {
+            matches!(expected, MutationOutcome::Allowed(_)) || snapshot == Err(OwnedErrorCode::InternalError)
         };
         let both_refused_without_snapshot =
-            refused_without_snapshot(bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone().into()));
+            refused_without_snapshot(bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()));
         let bucket_recorded = owned.req_info().and_then(|info| info.bucket.as_deref()) == Some(bucket);
         if owned_outcome != expected || !both_refused_without_snapshot || !bucket_recorded {
             mismatches.push(format!("{name}: expected {expected:?}, owned {owned_outcome:?}"));

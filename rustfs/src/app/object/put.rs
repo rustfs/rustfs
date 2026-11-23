@@ -2645,14 +2645,14 @@ mod tests {
         let input = PutObjectWriteInput::from_legacy(input, None);
         Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
             .await
-            .map_err(S3Error::from)
+            .map_err(crate::error::legacy_error_for_test)
     }
 
     async fn put_extract_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
         let input = PutObjectWriteInput::from_legacy(input, None);
         Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input))
             .await
-            .map_err(S3Error::from)
+            .map_err(crate::error::legacy_error_for_test)
     }
 
     #[tokio::test]

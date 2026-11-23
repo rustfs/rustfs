@@ -181,7 +181,7 @@ fn list_parts_resolves_real_owners_and_retains_storage_errors() {
             let refusal = execute_counted(&usecase, envelope(), target, 1)
                 .await
                 .expect_err("surface the outage");
-            let legacy: LegacyS3Error = refusal.into();
+            let legacy: LegacyS3Error = crate::error::legacy_error_for_test(refusal);
             assert_eq!(legacy.code(), expected.code());
             assert_eq!(legacy.status_code(), expected.status_code());
             assert_eq!(legacy.message(), expected.message());

@@ -7404,7 +7404,7 @@ mod tests {
                 assert_eq!(req.input.key, "object");
                 assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
                 assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
-                check_preconditions(&req.headers, &object_info())?;
+                check_preconditions(&req.headers, &object_info()).map_err(crate::error::legacy_error_for_test)?;
                 Ok(s3s::S3Response::new(s3s::dto::GetObjectOutput {
                     body: Some(s3s::dto::StreamingBlob::from_bytes(Bytes::from_static(b"payload"))),
                     content_length: Some(7),
@@ -7422,7 +7422,7 @@ mod tests {
                 assert_eq!(req.input.key, "object");
                 assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
                 assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
-                check_preconditions(&req.headers, &object_info())?;
+                check_preconditions(&req.headers, &object_info()).map_err(crate::error::legacy_error_for_test)?;
                 Ok(s3s::S3Response::new(s3s::dto::HeadObjectOutput {
                     content_length: Some(7),
                     e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
@@ -8921,7 +8921,8 @@ mod tests {
                 let previous_name = rustfs_common::get_global_local_node_name().await;
                 rustfs_common::set_global_local_node_name(&address.to_string()).await;
                 let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
-                let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                let fallback =
+                    tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(rustfs_s3_types::Body::empty())) });
                 let service = hybrid(
                     InternodeRpcService::new(fallback),
                     RpcRequestPathService::new(Routes::new(node).prepare()),
