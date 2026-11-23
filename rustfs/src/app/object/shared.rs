@@ -17,9 +17,9 @@
 use super::*;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, Timestamp, TimestampFormat};
+use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption};
 #[cfg(test)]
-use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode};
+use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, Timestamp};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
@@ -707,7 +707,7 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     // `x-amz-expiration` is a date-valued S3 response header and therefore uses
     // HTTP-date, not ISO-8601: the AWS SDKs hand this value to an RFC 822
     // parser, which rejects `2026-10-02T00:00:00Z` and drops the metadata.
-    let expiry_date = format_http_date(&Timestamp::from(expire_time)).ok()?;
+    let expiry_date = format_http_date(&expire_time).ok()?;
     let value = format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id);
     http::HeaderValue::from_str(&value).is_ok().then_some(value)
 }
@@ -735,16 +735,14 @@ pub(super) fn expected_current_version_id(headers: &HeaderMap) -> S3Result<Optio
         .transpose()
 }
 
-pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<Timestamp>> {
+pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<OffsetDateTime>> {
     expires
         .map(|expires| {
-            Timestamp::parse(TimestampFormat::HttpDate, expires).map_err(|_| s3_error!(InvalidArgument, "Invalid Expires header"))
+            time::PrimitiveDateTime::parse(expires, RFC1123)
+                .map(time::PrimitiveDateTime::assume_utc)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Expires header"))
         })
         .transpose()
-}
-
-pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
-    format_http_date(expires)
 }
 
 /// Render a date-valued S3 response header (`Expires`, `x-amz-expiration`) as
@@ -754,17 +752,19 @@ pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
 /// Interoperability depends on this shape. `x-amz-expiration` in particular is
 /// parsed with an RFC 822 parser by the AWS SDKs, which rejects an RFC 3339
 /// value such as `2026-10-02T00:00:00Z` and then discards the whole header.
-pub(super) fn format_http_date(timestamp: &Timestamp) -> S3Result<String> {
-    let mut formatted = Vec::new();
-    timestamp
-        .format(TimestampFormat::HttpDate, &mut formatted)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: {e}"))))?;
-    Ok(String::from_utf8_lossy(&formatted).into_owned())
+/// Stored dates retain their local clock fields even when they carry an offset.
+fn format_http_date(timestamp: &OffsetDateTime) -> S3Result<String> {
+    let formatted = if (0..=9999).contains(&timestamp.year()) {
+        timestamp.format(RFC1123)
+    } else {
+        Err(time::error::Format::InvalidComponent("year"))
+    };
+    formatted.map_err(|error| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: time: {error}"))).into())
 }
 
-pub(super) fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&Timestamp>) -> S3Result<()> {
+pub(super) fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&OffsetDateTime>) -> S3Result<()> {
     if let Some(expires) = expires {
-        metadata.insert("expires".to_string(), format_expires_header(expires)?);
+        metadata.insert("expires".to_string(), format_http_date(expires)?);
     }
     Ok(())
 }
@@ -777,7 +777,7 @@ pub(super) fn apply_standard_object_metadata(
     content_encoding: Option<&str>,
     content_language: Option<&str>,
     content_type: Option<&str>,
-    expires: Option<&Timestamp>,
+    expires: Option<&OffsetDateTime>,
     website_redirect_location: Option<&str>,
 ) -> S3Result<()> {
     if let Some(cache_control) = cache_control {
@@ -1343,7 +1343,9 @@ mod tests {
             .expect("valid Expires header should parse")
             .expect("header should be present");
 
-        assert_eq!(format_expires_header(&expires).unwrap(), "Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(format_http_date(&expires).unwrap(), "Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(expires.offset(), time::UtcOffset::UTC);
+        assert!(parse_expires_header(None).expect("absent Expires is valid").is_none());
     }
 
     #[test]
@@ -1351,6 +1353,32 @@ mod tests {
         let err = parse_expires_header(Some("not-a-date")).expect_err("invalid Expires header should fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Invalid Expires header"));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn http_date_keeps_stored_wall_time_and_four_digit_years() {
+        for (timestamp, expected) in [
+            (time::macros::datetime!(0000-01-01 00:00 UTC), "Sat, 01 Jan 0000 00:00:00 GMT"),
+            (time::macros::datetime!(9999-12-31 23:59:59 UTC), "Fri, 31 Dec 9999 23:59:59 GMT"),
+            (time::macros::datetime!(2015-10-21 00:30:45.123 +05:30), "Wed, 21 Oct 2015 00:30:45 GMT"),
+        ] {
+            assert_eq!(format_http_date(&timestamp).expect("valid HTTP date"), expected);
+        }
+
+        let error = format_http_date(&time::macros::datetime!(-0001-12-31 00:00 UTC)).expect_err("year needs four digits");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(error.message(), Some("We encountered an internal error, please try again."));
+        let Some(StorageError::Io(source)) = error.source().and_then(|cause| cause.downcast_ref::<StorageError>()) else {
+            panic!("invalid year must retain its storage I/O error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "Invalid HTTP-date timestamp: time: The year component cannot be formatted into the requested format."
+        );
     }
 
     // classify_response_checksums is the single point that splits decrypted checksum
