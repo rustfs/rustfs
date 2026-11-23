@@ -1001,7 +1001,7 @@ const SIGV4_UNSIGNED_ENVELOPE_HEADERS: &[&str] = &[
 /// A header the parser rejects never authenticates as SigV4 upstream, but one
 /// that claims the SigV4 algorithm still fails closed here. SigV2 signs every
 /// `x-amz-*` header itself; JWT and anonymous requests carry no SigV4 list.
-pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     reject_unsigned_amz_headers_on_presigned_request(header, query)?;
 
     for value in header.get_all(http::header::AUTHORIZATION) {
@@ -1011,10 +1011,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
         let authorization = match rustfs_gateway::sig::SigV4HeaderCoverage::parse(value) {
             Some(authorization) => authorization,
             None if value.starts_with(SIGN_V4_ALGORITHM) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::AccessDenied,
-                    "Invalid SigV4 authorization header".to_owned(),
-                ));
+                return Err(owned_error!(AccessDenied, "Invalid SigV4 authorization header"));
             }
             None => continue,
         };
@@ -1026,10 +1023,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
                 reason = "unsupported_algorithm",
                 "SigV4 request rejected"
             );
-            return Err(S3Error::with_message(
-                S3ErrorCode::AccessDenied,
-                UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE.to_owned(),
-            ));
+            return Err(owned_error!(AccessDenied, "{UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE}"));
         }
         for name in header.keys() {
             // `HeaderName` is already lowercase; the verifier looks signed
@@ -1050,7 +1044,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
                 header = name,
                 "SigV4 request rejected"
             );
-            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+            return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));
         }
     }
     Ok(())
@@ -1091,7 +1085,7 @@ pub(crate) const UNSIGNED_HEADERS_MESSAGE: &str = "There were headers present in
 /// The rule relies on the verifier signing every query parameter except the
 /// signature itself, so neither `X-Amz-SignedHeaders` nor a property-carrying
 /// query parameter can be added after presigning.
-pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     let Some(query) = query else {
         return Ok(());
     };
@@ -1154,7 +1148,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
             header = name,
             "Presigned request rejected"
         );
-        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+        return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));
     }
 
     Ok(())
@@ -1365,6 +1359,7 @@ mod tests {
     };
     use rustfs_kms::KmsServiceManager;
     use rustfs_policy::auth::get_new_credentials_with_metadata;
+    use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
     use rustfs_trusted_proxies::ValidationMode;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -2521,7 +2516,7 @@ mod tests {
             headers.insert("content-type", HeaderValue::from_static("text/plain"));
             headers.insert(header, HeaderValue::from_static("attacker-controlled"));
             let error = reject_unsigned_amz_headers_on_presigned_request(&headers, Some(presigned_host_only)).unwrap_err();
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{header} must be rejected when unsigned");
+            assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied, "{header} must be rejected when unsigned");
             assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
         }
 
@@ -2539,7 +2534,7 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&missing_signed_headers))
                 .unwrap_err()
                 .code(),
-            &S3ErrorCode::AccessDenied
+            &OwnedS3ErrorCode::AccessDenied
         );
 
         // Detection follows the upstream dispatch: any query carrying the
@@ -2549,7 +2544,7 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&lowercase_query))
                 .unwrap_err()
                 .code(),
-            &S3ErrorCode::AccessDenied
+            &OwnedS3ErrorCode::AccessDenied
         );
 
         // Only the exact key the upstream verifier reads counts; a second
@@ -2560,14 +2555,14 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&widened_by_case))
                 .unwrap_err()
                 .code(),
-            &S3ErrorCode::AccessDenied
+            &OwnedS3ErrorCode::AccessDenied
         );
         let duplicated = format!("{presigned_host_only}&X-Amz-SignedHeaders=host%3Bx-amz-tagging");
         assert_eq!(
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&duplicated))
                 .unwrap_err()
                 .code(),
-            &S3ErrorCode::AccessDenied
+            &OwnedS3ErrorCode::AccessDenied
         );
     }
 
@@ -2595,7 +2590,7 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(signed_tagging))
                 .unwrap_err()
                 .code(),
-            &S3ErrorCode::AccessDenied
+            &OwnedS3ErrorCode::AccessDenied
         );
     }
 
@@ -2639,9 +2634,9 @@ mod tests {
         headers
     }
 
-    fn assert_unsigned_headers_denied(result: S3Result<()>) {
+    fn assert_unsigned_headers_denied(result: OwnedResult<()>) {
         let error = result.expect_err("unsigned x-amz header must be denied");
-        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied);
         assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
     }
 
@@ -2708,7 +2703,7 @@ mod tests {
             );
             let error = reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
                 .expect_err("non-SigV4 algorithm token must be denied");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied);
             assert_eq!(error.message(), Some(UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE));
 
             headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
@@ -2720,7 +2715,7 @@ mod tests {
         headers.insert("authorization", HeaderValue::from_static("AWS4-HMAC-SHA256 invalid"));
         let error =
             reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect_err("malformed SigV4 header must fail closed");
-        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied);
     }
 
     /// Every SigV4 signed-header list present must cover every `x-amz-*`
