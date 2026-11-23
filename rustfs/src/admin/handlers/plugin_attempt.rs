@@ -3,15 +3,13 @@
 //! Restricted vending for explicitly configured brokers, never AssumeRole chaining.
 use super::plugin_delegation::{owner, response, storage_error};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-#[cfg(test)]
-use crate::auth::check_key_valid_with_context;
 use crate::{
     admin::{
         router::{AdminOperation, S3Router},
         runtime_sources,
         storage_api::s3::{self, S3Error, S3ErrorCode, S3Result},
     },
-    auth::check_key_valid_owned,
+    auth::check_key_valid_with_context,
     server::ADMIN_PREFIX,
 };
 use http::{Method, StatusCode};
@@ -207,7 +205,7 @@ impl Operation for Issue {
             .await
             .map_err(storage_error)?;
         let policy = session_policy(&record, &attempt)?;
-        let (principal, root) = check_key_valid_owned("", &record.owner_access_key, Some(context.as_ref())).await?;
+        let (principal, root) = check_key_valid_with_context("", &record.owner_access_key, Some(context.as_ref())).await?;
         if root || principal.is_temp() || principal.is_service_account() {
             return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
         }
@@ -286,7 +284,8 @@ impl Operation for Issue {
                 .read_active_plugin_delegation_for_broker(id, now()?)
                 .await
                 .map_err(storage_error)?;
-            let (current, current_root) = check_key_valid_owned("", &record.owner_access_key, Some(context.as_ref())).await?;
+            let (current, current_root) =
+                check_key_valid_with_context("", &record.owner_access_key, Some(context.as_ref())).await?;
             let names = iam
                 .policy_db_get(&current.access_key, &current.groups)
                 .await

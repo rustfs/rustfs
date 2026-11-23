@@ -396,9 +396,8 @@ impl ProtocolStorageClient {
                 "protocol server application context is not initialized",
             )
         })?;
-        let (credentials, is_owner) = crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref()))
-            .await
-            .map_err(rustfs_s3_types::S3Error::from)?;
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
         let mut envelope =
             self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
         authorize_request(&mut envelope, protocol_policy_action(action)).await
@@ -785,7 +784,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let (credentials, is_owner) =
             crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
                 .await
-                .map_err(rustfs_s3_types::S3Error::from)
                 .map_err(|e| match e.code() {
                     rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
                         rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied)

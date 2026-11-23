@@ -24,7 +24,7 @@ use crate::admin::{
     router::{AdminOperation, S3Router},
 };
 use crate::app::RequestEnvelope;
-use crate::auth::{check_key_valid_owned, get_session_token};
+use crate::auth::{check_key_valid_with_context, get_session_token};
 use crate::error::ApiError;
 use crate::server::{TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
@@ -1338,7 +1338,7 @@ async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCa
     };
     let context = runtime_sources::app_context_from_envelope(req.envelope())
         .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
-    let (credentials, owner) = check_key_valid_owned(
+    let (credentials, owner) = check_key_valid_with_context(
         get_session_token(req.uri(), req.headers()).unwrap_or_default(),
         input_cred.access_key(),
         Some(context.as_ref()),

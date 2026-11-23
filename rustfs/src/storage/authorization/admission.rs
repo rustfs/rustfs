@@ -28,7 +28,7 @@ mod request_validation;
 use crate::auth::AuthType;
 use crate::auth::{
     RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
-    check_key_valid_owned, parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
+    check_key_valid_with_context, parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
 };
 use crate::license::license_check;
 use crate::storage::req_info::ReqInfo;
@@ -101,7 +101,7 @@ impl AccessMarkers {
 ///
 /// # Errors
 ///
-/// What [`check_key_valid_owned`] refuses: an unknown, disabled or expired credential, a
+/// What [`check_key_valid_with_context`] refuses: an unknown, disabled or expired credential, a
 /// session token that does not belong to it, or an IAM system that is not initialized.
 pub(crate) async fn resolve_req_info(
     server_ctx: &Arc<ServerContextSlot>,
@@ -112,7 +112,7 @@ pub(crate) async fn resolve_req_info(
     let app_context = server_ctx.app_context();
     let (cred, is_owner) = match access_key {
         Some(access_key) => {
-            let (cred, is_owner) = check_key_valid_owned(session_token, access_key, app_context.as_deref()).await?;
+            let (cred, is_owner) = check_key_valid_with_context(session_token, access_key, app_context.as_deref()).await?;
             (Some(cred), is_owner)
         }
         None => (None, false),
