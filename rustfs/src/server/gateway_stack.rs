@@ -716,7 +716,7 @@ mod object_lock_tests {
             .to_bytes();
         assert_eq!(put_status, StatusCode::OK, "{}", String::from_utf8_lossy(&put_body));
 
-        let (stored, _) = crate::storage::storage_api::ecstore_bucket::metadata_sys::get_object_lock_config(&bucket)
+        let (stored, _) = crate::storage_api::server::gateway_stack::get_object_lock_config(&bucket)
             .await
             .expect("stored lock config");
         assert_eq!(stored.object_lock_enabled.as_deref(), Some("Enabled"));

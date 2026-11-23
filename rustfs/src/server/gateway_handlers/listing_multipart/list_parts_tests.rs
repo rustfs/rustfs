@@ -14,7 +14,7 @@
 
 use super::{ListPartsInfo, dto, list_parts_output};
 use crate::app::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
-use crate::storage::storage_api::contract::multipart::PartInfo;
+use crate::storage_api::server::gateway_stack::PartInfo;
 use rustfs_gateway::{Limits, MetaView, OperationCodec, ResponseBody, TargetKind, WireRequest};
 use rustfs_s3_types::S3ErrorCode;
 
