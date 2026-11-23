@@ -830,21 +830,36 @@ mod tests {
     }
 
     async fn execute_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let request = S3Request {
-            input,
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/?list-type=2"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), request),
-        )
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2 as ops;
+
+        // Same facts this fixture's S3Request gave `list_objects_v2`: GET `/?list-type=2`,
+        // empty headers, empty extensions, and no credentials, region, or service.
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/?list-type=2"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let input = ops::input_from_s3s(input).map_err(crate::app::dto_values::seam_error)?;
+            let mut output =
+                crate::app::test_seams::list_objects_v2_owned(&DefaultBucketUsecase::from_global(), envelope, input).await?;
+            let migration_list = output.rustfs_on_demand_migration_list.take();
+            let s3s_output = ops::output_to_s3s(output).map_err(crate::app::dto_values::seam_error)?;
+            let mut response = S3Response::new(s3s_output);
+            if let Some(value) = migration_list {
+                response.headers.insert(
+                    "x-rustfs-on-demand-migration-list",
+                    http::HeaderValue::from_str(&value).expect("valid migration list header"),
+                );
+            }
+            Ok(response)
+        })
         .await
         .expect("listing must complete within its bounded source budget")
     }
