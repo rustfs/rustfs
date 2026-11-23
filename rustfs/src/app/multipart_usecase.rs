@@ -287,11 +287,7 @@ impl DefaultMultipartUsecase {
 /// or completed".
 fn multipart_upload_api_error(err: StorageError) -> S3Error {
     if matches!(err, StorageError::MalformedUploadID(_)) {
-        let mut error = S3Error::new(S3ErrorCode::NoSuchUpload);
-        if let Some(message) = error.code().default_message() {
-            error.set_message(message);
-        }
-        return error;
+        return S3Error::with_default_message(S3ErrorCode::NoSuchUpload);
     }
     ApiError::from(err).into()
 }

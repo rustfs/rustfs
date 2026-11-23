@@ -354,11 +354,7 @@ async fn replica_delete_fanout_state(
 
 fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
     if expected.is_some() && expected != requested {
-        let mut error = rustfs_s3_types::s3_error!(PreconditionFailed);
-        if let Some(message) = error.code().default_message() {
-            error.set_message(message);
-        }
-        return Err(error);
+        return Err(rustfs_s3_types::S3Error::with_default_message(S3ErrorCode::PreconditionFailed));
     }
     Ok(())
 }

@@ -133,13 +133,8 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
         (false, decoded, raw) => raw.or(decoded),
     };
 
-    size.filter(|&size| size >= 0).ok_or_else(|| {
-        let mut error = S3Error::new(S3ErrorCode::UnexpectedContent);
-        if let Some(message) = error.code().default_message() {
-            error.set_message(message);
-        }
-        error
-    })
+    size.filter(|&size| size >= 0)
+        .ok_or_else(|| S3Error::with_default_message(S3ErrorCode::UnexpectedContent))
 }
 
 /// Reject a declared upload length above the single-request ceiling
