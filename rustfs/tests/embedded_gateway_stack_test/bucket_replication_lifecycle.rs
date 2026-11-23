@@ -255,7 +255,76 @@ async fn the_configuration_reads_answer_what_is_stored(server: RustFSServer) {
         assert_answers_what_is_stored(&root, bucket).await;
     }
 
+    assert_stored_configuration_wire(&server).await;
+
     server.shutdown().await;
+}
+
+async fn assert_stored_configuration_wire(server: &RustFSServer) {
+    use super::object_write::WireClient;
+
+    const LIFECYCLE_INPUT: &[u8] = b"<LifecycleConfiguration><Rule><DelMarkerExpiration><Days>7</Days></DelMarkerExpiration>\
+<Expiration><Days>30</Days><ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration><Filter><And><Prefix>logs/\
+</Prefix><Tag><Key>tier</Key><Value>cold</Value></Tag><ObjectSizeGreaterThan>1</ObjectSizeGreaterThan></And></Filter>\
+<ID>members</ID><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays><NewerNoncurrentVersions>2\
+</NewerNoncurrentVersions></NoncurrentVersionExpiration><NoncurrentVersionTransition><NoncurrentDays>3</NoncurrentDays>\
+<StorageClass>WARM</StorageClass></NoncurrentVersionTransition><Status>Enabled</Status><Transition><Days>10</Days>\
+<StorageClass>WARM</StorageClass></Transition></Rule><Rule><AbortIncompleteMultipartUpload><DaysAfterInitiation>3\
+</DaysAfterInitiation></AbortIncompleteMultipartUpload><Expiration><Date>2099-01-01T00:00:00Z</Date></Expiration><ID>dated\
+</ID><Prefix>archive/</Prefix><Status>Disabled</Status><Transition><Date>2098-06-01T08:00:00+08:00</Date><StorageClass>WARM\
+</StorageClass></Transition></Rule></LifecycleConfiguration>";
+    const REPLICATION_INPUT: &[u8] = b"<ReplicationConfiguration><Role>arn:minio:replication::id:target</Role><Rule>\
+<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication><DeleteReplication><Status>Enabled</Status>\
+</DeleteReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket><StorageClass>STANDARD</StorageClass></Destination>\
+<ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication><Filter><And><Prefix>a/</Prefix><Tag><Key>k\
+</Key><Value>v</Value></Tag></And></Filter><ID>r1</ID><Priority>1</Priority><SourceSelectionCriteria><ReplicaModifications>\
+<Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria><Status>Enabled</Status></Rule>\
+</ReplicationConfiguration>";
+
+    // Complete GET response bodies captured from the pinned legacy HTTP service.
+    const LIFECYCLE_RESPONSE: &[u8] =
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<Rule><DelMarkerExpiration><Days>7</Days></DelMarkerExpiration><Expiration><Days>30</Days>\
+<ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration><Filter><And><ObjectSizeGreaterThan>1\
+</ObjectSizeGreaterThan><Prefix>logs/</Prefix><Tag><Key>tier</Key><Value>cold</Value></Tag></And></Filter>\
+<ID>members</ID><NoncurrentVersionExpiration><NewerNoncurrentVersions>2</NewerNoncurrentVersions>\
+<NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration><NoncurrentVersionTransition><NoncurrentDays>3\
+</NoncurrentDays><StorageClass>WARM</StorageClass></NoncurrentVersionTransition><Status>Enabled</Status>\
+<Transition><Days>10</Days><StorageClass>WARM</StorageClass></Transition></Rule><Rule>\
+<AbortIncompleteMultipartUpload><DaysAfterInitiation>3</DaysAfterInitiation></AbortIncompleteMultipartUpload>\
+<Expiration><Date>2099-01-01T00:00:00.000Z</Date></Expiration><ID>dated</ID><Prefix>archive/</Prefix>\
+<Status>Disabled</Status><Transition><Date>2098-06-01T08:00:00.000Z</Date><StorageClass>WARM</StorageClass>\
+</Transition></Rule></LifecycleConfiguration>";
+    const REPLICATION_RESPONSE: &[u8] =
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><ReplicationConfiguration><Role>arn:minio:replication::id:target</Role>\
+<Rule><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication><DeleteReplication>\
+<Status>Enabled</Status></DeleteReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket>\
+<StorageClass>STANDARD</StorageClass></Destination><ExistingObjectReplication><Status>Enabled</Status>\
+</ExistingObjectReplication><Filter><And><Prefix>a/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And>\
+</Filter><ID>r1</ID><Priority>1</Priority><SourceSelectionCriteria><ReplicaModifications><Status>Enabled\
+</Status></ReplicaModifications></SourceSelectionCriteria><Status>Enabled</Status></Rule>\
+</ReplicationConfiguration>";
+
+    let bucket = "a3-stored-wire";
+    create_bucket_in_the_store(bucket).await;
+    let endpoint = server.endpoint();
+    let client = WireClient {
+        endpoint: &endpoint,
+        access_key: server.access_key(),
+        secret_key: server.secret_key(),
+    };
+    for (file, query, stored, expected) in [
+        (BUCKET_LIFECYCLE_CONFIG, "lifecycle", LIFECYCLE_INPUT, LIFECYCLE_RESPONSE),
+        (BUCKET_REPLICATION_CONFIG, "replication", REPLICATION_INPUT, REPLICATION_RESPONSE),
+    ] {
+        metadata_sys::update(bucket, file, stored.to_vec())
+            .await
+            .expect("seed stored configuration");
+        let response = client.request("GET", &format!("/{bucket}?{query}"), &[], &[], Some(0)).await;
+        assert_eq!(response.status, 200, "{query}: {}", response.body);
+        assert_eq!(response.headers["content-type"], "application/xml", "{query}");
+        assert_eq!(response.body.as_bytes(), expected, "{query}");
+    }
 }
 
 async fn assert_answers_what_is_stored(root: &Client, bucket: &str) {

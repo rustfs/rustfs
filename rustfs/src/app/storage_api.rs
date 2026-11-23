@@ -44,8 +44,8 @@ pub(crate) mod diagnostic {
     };
 }
 
-/// S3 wire types for app-layer modules, funneled here so new files stay off
-/// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
+/// Legacy types used by the Linux RDMA transport and app-layer tests.
+#[cfg(any(test, all(target_os = "linux", any(feature = "cuobject", feature = "nixl"))))]
 pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use rustfs_gateway_types::dto::Status;
@@ -54,11 +54,15 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    #[cfg(test)]
     pub(crate) use rustfs_s3_types::StdError;
     #[cfg(test)]
     pub(crate) use s3s::Body;
     #[cfg(test)]
+    pub(crate) use s3s::TrailingHeaders;
+    #[cfg(test)]
     pub(crate) use s3s::auth::Credentials;
+    #[cfg(test)]
     pub(crate) use s3s::dto;
     #[cfg(test)]
     pub(crate) use s3s::dto::PutObjectInput;
@@ -71,16 +75,14 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
-    pub(crate) use s3s::header;
-    pub(crate) use s3s::s3_error;
+    #[cfg(test)]
     pub(crate) use s3s::stream;
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::UploadStreamError;
+    #[cfg(test)]
     pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
-    #[cfg(test)]
-    pub(crate) use s3s::{BodySizeLimitExceeded, TrailingHeaders};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
     #[cfg(test)]
     pub(crate) use s3s::{S3Request, S3Response};
@@ -1125,7 +1127,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod object_lock {
         pub(crate) mod types {
-            pub(crate) use crate::storage::storage_api::ecstore_bucket::object_lock::types::RetentionMode;
+            pub(crate) use crate::storage::storage_api::ecstore_bucket::object_lock::types::{LegalHoldStatus, RetentionMode};
         }
 
         pub(crate) mod objectlock {
@@ -1772,7 +1774,9 @@ pub(crate) mod bucket_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, error, helper, request_context, s3, s3_api, sse};
+    #[cfg(test)]
+    pub(crate) use super::s3;
+    pub(crate) use super::{access, bucket, error, helper, request_context, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
         validate_website_configuration,
@@ -1908,8 +1912,7 @@ pub(crate) mod multipart_usecase {
     pub(crate) use crate::storage::storage_api::{
         DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY,
         EC_BLOCK_SIZE_HINT_REASON_HEADER, EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, ECStore,
-        EcBlockSizeHintOutcome, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint,
-        validate_new_object_key,
+        EcBlockSizeHintOutcome, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint, validate_new_object_key,
     };
 }
 

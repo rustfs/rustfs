@@ -18,12 +18,12 @@ use super::veeam_sosapi;
 use super::*;
 
 use crate::app::dto_values::{stored_etag, timestamp};
-use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
 use crate::app::{Answered, RequestEnvelope};
 use rustfs_gateway_types::ByteRange;
 use rustfs_gateway_types::RangeParse;
 use rustfs_gateway_types::dto as gateway_dto;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_utils::http::headers::AMZ_RESTORE;
 
 use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
@@ -170,7 +170,7 @@ pub(super) fn odm_head_verdict(lookup: OdmLookup, miss: OdmLocalMiss) -> OdmHead
     let stats = state.stats();
     let unavailable = |error| {
         stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
-        OdmHeadVerdict::Fail(odm_source_error_response(policy, odm_state_error_class(error)).into())
+        OdmHeadVerdict::Fail(odm_source_error_response(policy, odm_state_error_class(error)))
     };
     match &lookup {
         OdmLookup::NegativeCached { .. } => {
@@ -248,11 +248,11 @@ pub(super) async fn odm_head_from_source<S: OdmHeadSource>(
         }
         Err(err @ SourceError::Unsupported(_)) => {
             stats.record_request(OdmOp::Head, OdmOutcome::Unsupported);
-            Err(odm_source_unavailable_error(err.class_label()).into())
+            Err(odm_source_unavailable_error(err.class_label()))
         }
         Err(err) => {
             stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
-            Err(odm_source_error_response(&state.config().policy, err.class_label()).into())
+            Err(odm_source_error_response(&state.config().policy, err.class_label()))
         }
     }
 }
@@ -571,15 +571,12 @@ impl DefaultObjectUsecase {
                         &bucket,
                         &key,
                         &opts,
-                        S3Error::new(S3ErrorCode::NoSuchKey).into(),
+                        S3Error::with_default_message(S3ErrorCode::NoSuchKey),
                     )
-                    .await
-                    .into());
+                    .await);
                 }
                 // Other errors, such as insufficient permissions, still return the original error
-                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into())
-                    .await
-                    .into());
+                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into()).await);
             }
         };
         if info.delete_marker {
@@ -591,14 +588,17 @@ impl DefaultObjectUsecase {
                 {
                     return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                 }
-                return Err(with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey).into(), &info, None).into());
+                return Err(with_delete_marker_read_headers(
+                    S3Error::with_default_message(S3ErrorCode::NoSuchKey),
+                    &info,
+                    None,
+                ));
             }
             return Err(with_delete_marker_read_headers(
-                S3Error::new(S3ErrorCode::MethodNotAllowed).into(),
+                S3Error::with_default_message(S3ErrorCode::MethodNotAllowed),
                 &info,
                 opts.version_id.as_deref(),
-            )
-            .into());
+            ));
         }
         // An authorized replication convergence check only needs etag/size/mtime
         // to compare source and replica; it holds no customer key, so the SSE-C
@@ -809,12 +809,12 @@ impl DefaultObjectUsecase {
             response.headers.insert(header_name, header_value);
         }
 
-        if let Some(amz_restore) = metadata_map.get(X_AMZ_RESTORE.as_str()) {
+        if let Some(amz_restore) = metadata_map.get(AMZ_RESTORE) {
             let Ok(restore_status) = parse_restore_obj_status(amz_restore) else {
                 return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
             };
             if let Ok(header_value) = HeaderValue::from_str(restore_status.to_string2().as_str()) {
-                response.headers.insert(X_AMZ_RESTORE, header_value);
+                response.headers.insert(AMZ_RESTORE, header_value);
             }
         }
         if let Some(amz_restore_request_date) = metadata_map.get(AMZ_RESTORE_REQUEST_DATE)

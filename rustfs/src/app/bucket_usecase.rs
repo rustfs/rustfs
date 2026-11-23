@@ -1001,14 +1001,14 @@ mod tests {
         // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
         let envelope = RequestEnvelope::from_parts(
             crate::app::RequestHead {
-                method: req.method.clone(),
-                uri: req.uri.clone(),
-                headers: req.headers.clone(),
+                method: req.method,
+                uri: req.uri,
+                headers: req.headers,
                 credentials: None,
                 region: None,
                 service: None,
             },
-            req.extensions.clone(),
+            req.extensions,
         );
         assert!(envelope.req_info().expect("req info should be present").is_owner);
     }

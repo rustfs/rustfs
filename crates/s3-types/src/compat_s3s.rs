@@ -134,12 +134,26 @@ impl From<S3Error> for legacy_s3s::S3Error {
 }
 
 impl S3Error {
-    /// The pinned legacy serializer's XML response. Call sites stay on this type.
-    /// DELETE BY T4.2 with the rest of this file.
-    pub fn to_http_response(self) -> Result<http::Response<crate::Body>, Self> {
-        let response = legacy_s3s::S3Error::from(self).to_http_response().map_err(Self::from)?;
-        let (parts, body) = response.into_parts();
-        Ok(http::Response::from_parts(parts, crate::Body::from(body)))
+    /// An error wrapped with its original cause can retain response fields the caller did not override.
+    pub(super) fn into_http_response_parts(self) -> crate::S3ErrorParts {
+        let mut parts = self.into_parts();
+        let original = parts
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<LegacyCause>())
+            .map(|cause| &cause.0)
+            .filter(|error| error.code() == &parts.code.clone().into());
+        if let Some(original) = original {
+            parts.message = parts
+                .message
+                .or_else(|| original.message().map(|text| Cow::Owned(text.to_owned())));
+            parts.request_id = parts.request_id.or_else(|| original.request_id().map(str::to_owned));
+            parts.status = parts.status.or_else(|| original.status_code());
+            parts.headers = parts.headers.or_else(|| original.headers().cloned());
+        } else if parts.message.is_none() {
+            parts.message = parts.code.default_message().map(Cow::Borrowed);
+        }
+        parts
     }
 }
 
@@ -252,7 +266,10 @@ mod tests {
     fn every_code_matches_the_s3s_default_message() {
         let mut mismatches = Vec::new();
         for code in S3ErrorCode::NAMED {
-            let legacy = oracle(code.as_str()).default_message();
+            let legacy_error = legacy_s3s::S3Error::new(oracle(code.as_str()));
+            let owned_error = S3Error::with_default_message(code.clone());
+            assert_eq!(owned_error.message(), legacy_error.message(), "{code}");
+            let legacy = legacy_error.code().default_message();
             if legacy.is_none() {
                 mismatches.push(format!("{code}: s3s has no default message"));
             }
@@ -264,6 +281,9 @@ mod tests {
         for custom in ["TierNotFound", "NoSuchKey", ""] {
             assert_eq!(legacy_s3s::S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
             assert_eq!(S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+            let owned = S3Error::with_default_message(S3ErrorCode::Custom(custom.into()));
+            let legacy = legacy_s3s::S3Error::new(legacy_s3s::S3ErrorCode::Custom(custom.into()));
+            assert_eq!(owned.message(), legacy.message(), "{custom}");
         }
     }
 

@@ -29,7 +29,6 @@ use super::storage_api::bucket_usecase::access::AuthorizationRequest;
 use super::storage_api::bucket_usecase::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket_usecase::contract::list::{ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _};
 use super::storage_api::bucket_usecase::contract::object::ObjectOperations as _;
-use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Result};
 use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
@@ -39,6 +38,7 @@ use crate::on_demand_migration::{
     SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
 };
 use futures::StreamExt;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, get_header};
 use std::sync::Arc;
 use std::time::Instant;
@@ -76,7 +76,7 @@ pub(crate) fn decode_list_cursor(decoded: Option<&str>) -> S3Result<Option<ListT
 
 fn invalid_continuation_token(err: &ListThroughTokenError) -> S3Error {
     debug!(error = %err, "rejected an on-demand migration list continuation token");
-    S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token".to_string())
+    S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token")
 }
 
 /// The bucket's live migration state when this request must merge the source.
@@ -472,7 +472,8 @@ mod tests {
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
     use crate::app::storage_api::bucket_usecase::s3::{
-        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response, XmlSerialize, XmlSerializer,
+        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3ErrorCode as LegacyErrorCode, S3Request, S3Response,
+        S3Result as LegacyResult, XmlSerialize, XmlSerializer,
     };
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -484,6 +485,8 @@ mod tests {
     use http::HeaderMap;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type ListResponse = LegacyResult<S3Response<ListObjectsV2Output>>;
 
     fn token(local: Option<&str>, local_done: bool) -> ListThroughToken {
         ListThroughToken {
@@ -619,16 +622,19 @@ mod tests {
         let tampered = token(Some("local-2"), false).encode().replace("\"v\":1", "\"v\":9");
         let err = decode_list_cursor(Some(&tampered)).expect_err("a bumped version is rejected");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Invalid continuation token"));
     }
 
     #[test]
     fn degrade_or_fail_follows_the_source_error_policy() {
         let mut merger = ListThroughMerger::new(10, None);
         let mut degraded = false;
-        assert!(
-            degrade_or_fail(&mut merger, &mut degraded, SourceErrorPolicy::Propagate, "server_error").is_err(),
-            "propagate must surface the failure"
-        );
+        let error = degrade_or_fail(&mut merger, &mut degraded, SourceErrorPolicy::Propagate, "server_error")
+            .expect_err("propagate must surface the failure");
+        assert_eq!(error.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
+        assert_eq!(error.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        assert_eq!(error.message(), Some("server_error"));
         assert!(!degraded);
 
         degrade_or_fail(&mut merger, &mut degraded, SourceErrorPolicy::NotFound, "server_error")
@@ -829,22 +835,37 @@ mod tests {
         (state_guard, input)
     }
 
-    async fn execute_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let request = S3Request {
-            input,
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/?list-type=2"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), request),
-        )
+    async fn execute_source_list(input: ListObjectsV2Input) -> ListResponse {
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2 as ops;
+
+        // Same facts this fixture's S3Request gave `list_objects_v2`: GET `/?list-type=2`,
+        // empty headers, empty extensions, and no credentials, region, or service.
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/?list-type=2"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let input = ops::input_from_s3s(input).map_err(crate::app::dto_values::seam_error)?;
+            let mut output =
+                crate::app::test_seams::list_objects_v2_owned(&DefaultBucketUsecase::from_global(), envelope, input).await?;
+            let migration_list = output.rustfs_on_demand_migration_list.take();
+            let s3s_output = ops::output_to_s3s(output).map_err(crate::app::dto_values::seam_error)?;
+            let mut response = S3Response::new(s3s_output);
+            if let Some(value) = migration_list {
+                response.headers.insert(
+                    "x-rustfs-on-demand-migration-list",
+                    http::HeaderValue::from_str(&value).expect("valid migration list header"),
+                );
+            }
+            Ok(response)
+        })
         .await
         .expect("listing must complete within its bounded source budget")
     }
@@ -960,7 +981,7 @@ mod tests {
         pages: Vec<(String, String)>,
         service_account: &str,
         max_keys: i32,
-    ) -> (S3Result<S3Response<ListObjectsV2Output>>, Vec<String>) {
+    ) -> (ListResponse, Vec<String>) {
         let (endpoint, server, stop) = native_list_source(provider, pages).await;
         let (_state_guard, mut input) = source_policy_input(endpoint.clone(), policy, None, None).await;
         input.max_keys = Some(max_keys);
@@ -1033,7 +1054,7 @@ mod tests {
                                     if policy == SourceErrorPolicy::Propagate {
                                         let err = result.expect_err("malformed native page must propagate");
                                         assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
-                                        assert_eq!(err.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
+                                        assert_eq!(err.code(), &LegacyErrorCode::Custom("SourceUnavailable".into()));
                                         assert_eq!(err.message(), Some("other"));
                                     } else {
                                         // Reuse the complete local-only assertions, including no
@@ -1136,7 +1157,7 @@ mod tests {
         policy: SourceErrorPolicy,
         resume_source: Option<&str>,
         filter_prefix: Option<&str>,
-    ) -> (S3Result<S3Response<ListObjectsV2Output>>, Vec<String>) {
+    ) -> (ListResponse, Vec<String>) {
         let (endpoint, server) = scripted_list_source(pages).await;
         let (_state_guard, input) = source_policy_input(endpoint, policy, resume_source, filter_prefix).await;
         let result = execute_source_list(input).await;
@@ -1752,7 +1773,7 @@ mod tests {
     // The e160 active-ODM route decoded before entering this same merge core.
     // Freeze both its reader and writer; use real local storage and HTTP source
     // calls here, without claiming that this harness executes an old binary.
-    async fn execute_e160_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
+    async fn execute_e160_source_list(input: ListObjectsV2Input) -> ListResponse {
         use crate::app::storage_api::bucket_usecase::s3_api::bucket::parse_list_objects_v2_params;
         use crate::on_demand_migration::list_through::e160_framed_reader as old;
 
@@ -2697,12 +2718,12 @@ mod tests {
         });
     }
 
-    fn assert_source_policy_result(result: S3Result<S3Response<ListObjectsV2Output>>, policy: SourceErrorPolicy) {
+    fn assert_source_policy_result(result: ListResponse, policy: SourceErrorPolicy) {
         match policy {
             SourceErrorPolicy::Propagate => {
                 let error = result.expect_err("propagate must expose malformed pagination");
                 assert_eq!(error.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
-                assert_eq!(error.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
+                assert_eq!(error.code(), &LegacyErrorCode::Custom("SourceUnavailable".into()));
                 assert_eq!(error.message(), Some("invalid_pagination"));
             }
             SourceErrorPolicy::NotFound => {

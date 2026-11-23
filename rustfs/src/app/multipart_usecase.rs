@@ -68,8 +68,7 @@ use super::storage_api::multipart_usecase::sse::{
     multipart_completion_authorization, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-    validate_new_object_key,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, validate_new_object_key,
 };
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
@@ -288,11 +287,7 @@ impl DefaultMultipartUsecase {
 /// or completed".
 fn multipart_upload_api_error(err: StorageError) -> S3Error {
     if matches!(err, StorageError::MalformedUploadID(_)) {
-        let mut error = S3Error::new(S3ErrorCode::NoSuchUpload);
-        if let Some(message) = error.code().default_message() {
-            error.set_message(message);
-        }
-        return error;
+        return S3Error::with_default_message(S3ErrorCode::NoSuchUpload);
     }
     ApiError::from(err).into()
 }

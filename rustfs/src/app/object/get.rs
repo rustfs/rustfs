@@ -20,15 +20,14 @@ use super::veeam_sosapi;
 use crate::app::dto_values::timestamp;
 use crate::app::{Answered, RequestEnvelope};
 use rustfs_gateway_types::dto as gateway_dto;
-use rustfs_s3_types::S3Result as OwnedResult;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_utils::http::headers::AMZ_RESTORE;
 
 use super::*;
 use crate::app::storage_api::object_usecase::object_cache::{
     GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
     with_get_object_read_condition,
 };
-use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, s3_error};
 use crate::on_demand_migration::WriteBackBody;
 
 struct ConditionalRead {
@@ -2584,7 +2583,7 @@ impl DefaultObjectUsecase {
             && part_number > 1
             && !info.parts.iter().any(|part| part.number == part_number)
         {
-            return Err(s3_error!(InvalidPart));
+            return Err(S3Error::with_default_message(S3ErrorCode::InvalidPart));
         }
         Ok(())
     }
@@ -2603,10 +2602,21 @@ impl DefaultObjectUsecase {
             } else {
                 S3ErrorCode::NoSuchKey
             };
-            return Err(with_delete_marker_read_headers(S3Error::new(code), info, input.version_id.as_deref()));
+            return Err(with_delete_marker_read_headers(
+                S3Error::with_default_message(code),
+                info,
+                input.version_id.as_deref(),
+            ));
         }
         let result = check_preconditions(envelope.headers(), info)
-            .map_err(S3Error::from)
+            .map_err(|mut error| {
+                if error.message().is_none()
+                    && let Some(message) = error.code().default_message()
+                {
+                    error.set_message(message);
+                }
+                error
+            })
             .and_then(|()| Self::validate_get_object_part_number(part_number, info));
         if result.is_err() {
             let principal = SseKmsPrincipal::from_request(envelope);
@@ -4074,7 +4084,7 @@ impl DefaultObjectUsecase {
         version_id_for_event: String,
         output: GetObjectOutputFacts,
         extra_checksum_headers: Vec<(&'static str, String)>,
-    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+    ) -> S3Result<Answered<GetObjectOutputFacts>> {
         let helper = match event_info {
             Some(event_info) => helper.object(event_info),
             None => helper,
@@ -4203,7 +4213,7 @@ impl DefaultObjectUsecase {
                     Ok(moved) => moved,
                     Err(error) => {
                         lifecycle.finish_err();
-                        return Err(error);
+                        return Err(error.into());
                     }
                 };
                 lifecycle.finish_ok();
@@ -4254,7 +4264,7 @@ impl DefaultObjectUsecase {
         let output_version_id = s3_response_version_id(info.version_id);
 
         // x-amz-restore: extract from object metadata
-        let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
+        let restore = info.user_defined.get(AMZ_RESTORE).and_then(|v| {
             let rs = parse_restore_obj_status(v).ok()?;
             Some(rs.to_string2())
         });
@@ -4467,7 +4477,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(envelope, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(OdmGetOutcome::Respond(Err(err.into()))),
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
@@ -4502,7 +4512,7 @@ impl DefaultObjectUsecase {
         &self,
         envelope: RequestEnvelope,
         input: gateway_dto::GetObjectInput,
-    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+    ) -> S3Result<Answered<GetObjectOutputFacts>> {
         self.execute_get_object_fields(envelope, input.into()).await
     }
 
@@ -4516,15 +4526,12 @@ impl DefaultObjectUsecase {
         &self,
         envelope: RequestEnvelope,
         input: GetObjectFields,
-    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+    ) -> S3Result<Answered<GetObjectOutputFacts>> {
         Box::pin(self.execute_get_object_inner(envelope, input)).await
     }
 
-    fn complete_get_object_error<T>(
-        helper: OperationHelper,
-        err: impl Into<rustfs_s3_types::S3Error>,
-    ) -> OwnedResult<Answered<T>> {
-        let result = Err(err.into());
+    fn complete_get_object_error<T>(helper: OperationHelper, err: S3Error) -> S3Result<Answered<T>> {
+        let result = Err(err);
         complete_read(helper, &result);
         result
     }
@@ -4537,7 +4544,7 @@ impl DefaultObjectUsecase {
         kind: veeam_sosapi::SosapiKind,
         part_number: Option<usize>,
         range: Option<&HTTPRangeSpec>,
-    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+    ) -> S3Result<Answered<GetObjectOutputFacts>> {
         let representation =
             veeam_sosapi::read_representation(store, &input.bucket, kind, envelope.headers(), part_number, range).await?;
         let content_type = veeam_sosapi::CONTENT_TYPE
@@ -4567,7 +4574,7 @@ impl DefaultObjectUsecase {
         &self,
         mut envelope: RequestEnvelope,
         input: GetObjectFields,
-    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+    ) -> S3Result<Answered<GetObjectOutputFacts>> {
         let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
             .suppress_event();
 
@@ -4627,10 +4634,7 @@ impl DefaultObjectUsecase {
         let store_lookup_start = stage_metrics_enabled.then(std::time::Instant::now);
         let Some(store) = self.object_store() else {
             lifecycle.finish_err();
-            return Self::complete_get_object_error(
-                helper,
-                S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()),
-            );
+            return Self::complete_get_object_error(helper, S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
         };
         if let Some(store_lookup_start) = store_lookup_start {
             rustfs_io_metrics::record_get_object_stage_duration(
@@ -5019,7 +5023,7 @@ pub(super) fn odm_get_verdict(lookup: OdmLookup) -> OdmGetVerdict {
     match &lookup {
         OdmLookup::NegativeCached { .. } => {
             stats.record_request(OdmOp::Get, OdmOutcome::NegativeCached);
-            OdmGetVerdict::Fail(S3Error::new(S3ErrorCode::NoSuchKey))
+            OdmGetVerdict::Fail(S3Error::with_default_message(S3ErrorCode::NoSuchKey))
         }
         OdmLookup::BreakerOpen { .. } => {
             stats.record_request(OdmOp::Get, OdmOutcome::BreakerOpen);
@@ -5057,7 +5061,7 @@ fn odm_get_source_failure(state: &BucketOdmState, err: &SourceError) -> S3Error 
     match err {
         SourceError::NotFound => {
             stats.record_request(OdmOp::Get, OdmOutcome::SourceMiss);
-            S3Error::new(S3ErrorCode::NoSuchKey)
+            S3Error::with_default_message(S3ErrorCode::NoSuchKey)
         }
         SourceError::Unsupported(_) => {
             stats.record_request(OdmOp::Get, OdmOutcome::Unsupported);
@@ -5075,7 +5079,7 @@ fn odm_content_length(size: u64) -> S3Result<i64> {
         .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "source object size exceeds the content-length range"))
 }
 
-/// Maps a source body onto the s3s output. Only what the source can vouch
+/// Maps a source body onto the GET output. Only what the source can vouch
 /// for is returned: the ETag and Last-Modified are the source's (the object
 /// is not local yet); no version id, SSE headers, storage class or checksums.
 fn odm_get_output(
@@ -6052,10 +6056,12 @@ mod on_demand_migration_tests {
 
         let err = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
         assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.message(), Some("The specified key does not exist."));
         assert_eq!(get_count(&state, OdmOutcome::SourceMiss), 1);
 
         let err = fail(&rt.sys, "n");
         assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.message(), Some("The specified key does not exist."));
         assert_eq!(get_count(&state, OdmOutcome::NegativeCached), 1);
         assert_eq!(source.head_calls(), 1, "the negative cache stops the second miss");
         assert!(matches!(rt.sys.resolve("n", "other"), Some(OdmLookup::Ready { .. })));
@@ -6467,6 +6473,44 @@ mod tests {
             let bytes = read_get_body(response.output.body.expect("GET body")).await;
             assert_eq!(bytes, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn expired_get_disk_planning_returns_the_permit_and_preserves_admission_errors() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let policy = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::from_millis(1),
+            enable_dynamic_timeout: false,
+            ..Default::default()
+        };
+        let wrapper = RequestTimeoutWrapper::with_request_id(policy.clone(), "expired-get");
+        tokio::time::sleep(policy.get_object_timeout).await;
+        let timeout = Some(GetObjectRequestTimeout {
+            wrapper: &wrapper,
+            policy: &policy,
+        });
+
+        let error = DefaultObjectUsecase::acquire_get_object_io_planning(&manager, timeout, "bucket", "key")
+            .await
+            .err()
+            .expect("the deadline expires after admission");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("Request timeout while waiting for disk permit"));
+        assert_eq!(error.status_code(), Some(http::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(error.headers().is_none());
+        assert!(error.source().is_none());
+        assert!(matches!(
+            manager.admit_disk_read(Duration::from_millis(1)).await.unwrap(),
+            DiskReadAdmission::Primary(_)
+        ));
+
+        manager.close_disk_read_admission_for_test();
+        let error = DefaultObjectUsecase::acquire_get_object_io_planning(&manager, timeout, "bucket", "key")
+            .await
+            .err()
+            .expect("closed admission precedes the deadline check");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("disk read semaphore closed"));
     }
 
     #[tokio::test]
@@ -7638,16 +7682,18 @@ mod tests {
             .lock()
             .expect("reader-open probe") = Some((key, Arc::clone(&reader_opens)));
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        for (header, value, expected) in [
+        for (header, value, expected, message) in [
             (
                 http::header::IF_NONE_MATCH,
                 format!("\"{}\"", info.etag.as_deref().expect("ETag")),
-                rustfs_s3_types::S3ErrorCode::NotModified,
+                S3ErrorCode::NotModified,
+                "Not Modified",
             ),
             (
                 http::header::IF_MATCH,
                 "\"other-etag\"".to_owned(),
-                rustfs_s3_types::S3ErrorCode::PreconditionFailed,
+                S3ErrorCode::PreconditionFailed,
+                "At least one of the preconditions you specified did not hold.",
             ),
         ] {
             let mut headers = HeaderMap::new();
@@ -7660,6 +7706,7 @@ mod tests {
             .await
             .expect_err("terminal condition");
             assert_eq!(error.code(), &expected);
+            assert_eq!(error.message(), Some(message));
             assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
             assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
             assert_eq!(fills.fills.load(Ordering::Relaxed), 0, "no cache-fill publish call");
@@ -12232,6 +12279,8 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("GET: partNumber must be between 1 and 10000"));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     #[test]
@@ -12256,6 +12305,12 @@ mod tests {
             DefaultObjectUsecase::validate_get_object_part_number(Some(2), &info).expect_err("missing requested part must fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+        assert_eq!(
+            err.message(),
+            Some(
+                "One or more of the specified parts could not be found. The part might not have been uploaded, or the specified entity tag might not have matched the part's entity tag."
+            )
+        );
         assert!(DefaultObjectUsecase::validate_get_object_part_number(Some(1), &info).is_ok());
     }
 
@@ -12314,6 +12369,8 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("range and part_number invalid"));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 }
 

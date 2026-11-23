@@ -17,12 +17,13 @@
 use super::*;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, Timestamp, TimestampFormat};
 #[cfg(test)]
-use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode};
-use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
+use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, Timestamp};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
+use rustfs_gateway_types::ChecksumAlgorithm;
+use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
+use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -163,7 +164,7 @@ pub(super) fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Resu
 
     match atoi::atoi::<i64>(val.as_bytes()) {
         Some(x) => Ok(Some(x)),
-        None => Err(s3_error!(UnexpectedContent)),
+        None => Err(S3Error::with_default_message(S3ErrorCode::UnexpectedContent)),
     }
 }
 
@@ -205,8 +206,6 @@ pub(crate) fn map_quota_check_outcome(
     bucket: &str,
     outcome: Result<QuotaCheckResult, QuotaError>,
 ) -> rustfs_s3_types::S3Result<QuotaCheckResult> {
-    use rustfs_s3_types::{S3Error, S3ErrorCode};
-
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -240,15 +239,12 @@ pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaChec
         return Ok(());
     };
     let Some(current_usage) = result.current_usage else {
-        return Err(S3Error::with_message(
-            S3ErrorCode::ServiceUnavailable,
-            "Bucket quota check temporarily unavailable, please retry".to_string(),
-        ));
+        return Err(s3_error!(ServiceUnavailable, "Bucket quota check temporarily unavailable, please retry"));
     };
     if current_usage > quota_limit {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        return Err(s3_error!(
+            InvalidRequest,
+            "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
         ));
     }
     let _ = opts.set_quota_admission(current_usage, quota_limit);
@@ -260,15 +256,15 @@ pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_siz
         return Ok(());
     };
     if new_size > quota_limit {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        return Err(s3_error!(
+            InvalidRequest,
+            "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
         ));
     }
     Ok(())
 }
 
-pub(super) fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
+pub(crate) fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
     match quota_object_size(info) {
         Ok(size) => Ok(size),
         Err(err) if fail_closed => Err(ApiError::from(err).into()),
@@ -363,10 +359,7 @@ pub(super) fn resolve_bucket_default_sse(
     };
 
     let effective_sse = requested_sse.or_else(|| bucket_default().map(bucket_default_write_sse));
-    let effective_kms_key_id = if effective_sse
-        .as_ref()
-        .is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS)
-    {
+    let effective_kms_key_id = if effective_sse.as_deref() == Some(AMZ_ENCRYPTION_KMS) {
         requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()))
     } else {
         requested_kms_key_id
@@ -618,29 +611,24 @@ pub(super) fn apply_trailing_checksums_native(
     trailing_headers: &Option<rustfs_rio::SharedTrailerSource>,
     checksums: &mut PutObjectChecksums,
 ) {
-    let Some(alg) = algorithm else { return };
-    let Some(trailer) = trailing_headers.as_ref() else { return };
-    let key = match alg {
-        ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-        ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-        ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-        ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-        ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+    let (Some(name), Some(trailer)) = (algorithm, trailing_headers.as_ref()) else {
+        return;
+    };
+    let Some(algorithm) = ChecksumAlgorithm::ALL.iter().find(|algorithm| algorithm.wire_name() == name) else {
+        return;
+    };
+    let slot = match algorithm {
+        ChecksumAlgorithm::Crc32 => &mut checksums.crc32,
+        ChecksumAlgorithm::Crc32c => &mut checksums.crc32c,
+        ChecksumAlgorithm::Sha1 => &mut checksums.sha1,
+        ChecksumAlgorithm::Sha256 => &mut checksums.sha256,
+        ChecksumAlgorithm::Crc64Nvme => &mut checksums.crc64nvme,
         _ => return,
     };
-    let checksum_str = match trailer.lookup(key.unwrap_or_default()) {
-        rustfs_rio::TrailerValue::Pending => return,
-        rustfs_rio::TrailerValue::Missing => None,
-        rustfs_rio::TrailerValue::Present(value) => Some(value),
-    };
-
-    match alg {
-        ChecksumAlgorithm::CRC32 => checksums.crc32 = checksum_str,
-        ChecksumAlgorithm::CRC32C => checksums.crc32c = checksum_str,
-        ChecksumAlgorithm::SHA1 => checksums.sha1 = checksum_str,
-        ChecksumAlgorithm::SHA256 => checksums.sha256 = checksum_str,
-        ChecksumAlgorithm::CRC64NVME => checksums.crc64nvme = checksum_str,
-        _ => (),
+    match trailer.lookup(algorithm.header_name()) {
+        rustfs_rio::TrailerValue::Pending => {}
+        rustfs_rio::TrailerValue::Missing => *slot = None,
+        rustfs_rio::TrailerValue::Present(value) => *slot = Some(value),
     }
 }
 
@@ -706,7 +694,7 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     // `x-amz-expiration` is a date-valued S3 response header and therefore uses
     // HTTP-date, not ISO-8601: the AWS SDKs hand this value to an RFC 822
     // parser, which rejects `2026-10-02T00:00:00Z` and drops the metadata.
-    let expiry_date = format_http_date(&Timestamp::from(expire_time)).ok()?;
+    let expiry_date = format_http_date(&expire_time).ok()?;
     let value = format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id);
     http::HeaderValue::from_str(&value).is_ok().then_some(value)
 }
@@ -734,16 +722,14 @@ pub(super) fn expected_current_version_id(headers: &HeaderMap) -> S3Result<Optio
         .transpose()
 }
 
-pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<Timestamp>> {
+pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<OffsetDateTime>> {
     expires
         .map(|expires| {
-            Timestamp::parse(TimestampFormat::HttpDate, expires).map_err(|_| s3_error!(InvalidArgument, "Invalid Expires header"))
+            time::PrimitiveDateTime::parse(expires, RFC1123)
+                .map(time::PrimitiveDateTime::assume_utc)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Expires header"))
         })
         .transpose()
-}
-
-pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
-    format_http_date(expires)
 }
 
 /// Render a date-valued S3 response header (`Expires`, `x-amz-expiration`) as
@@ -753,17 +739,19 @@ pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
 /// Interoperability depends on this shape. `x-amz-expiration` in particular is
 /// parsed with an RFC 822 parser by the AWS SDKs, which rejects an RFC 3339
 /// value such as `2026-10-02T00:00:00Z` and then discards the whole header.
-pub(super) fn format_http_date(timestamp: &Timestamp) -> S3Result<String> {
-    let mut formatted = Vec::new();
-    timestamp
-        .format(TimestampFormat::HttpDate, &mut formatted)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: {e}"))))?;
-    Ok(String::from_utf8_lossy(&formatted).into_owned())
+/// Stored dates retain their local clock fields even when they carry an offset.
+fn format_http_date(timestamp: &OffsetDateTime) -> S3Result<String> {
+    let formatted = if (0..=9999).contains(&timestamp.year()) {
+        timestamp.format(RFC1123)
+    } else {
+        Err(time::error::Format::InvalidComponent("year"))
+    };
+    formatted.map_err(|error| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: time: {error}"))).into())
 }
 
-pub(super) fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&Timestamp>) -> S3Result<()> {
+pub(super) fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&OffsetDateTime>) -> S3Result<()> {
     if let Some(expires) = expires {
-        metadata.insert("expires".to_string(), format_expires_header(expires)?);
+        metadata.insert("expires".to_string(), format_http_date(expires)?);
     }
     Ok(())
 }
@@ -776,7 +764,7 @@ pub(super) fn apply_standard_object_metadata(
     content_encoding: Option<&str>,
     content_language: Option<&str>,
     content_type: Option<&str>,
-    expires: Option<&Timestamp>,
+    expires: Option<&OffsetDateTime>,
     website_redirect_location: Option<&str>,
 ) -> S3Result<()> {
     if let Some(cache_control) = cache_control {
@@ -1092,7 +1080,7 @@ pub(crate) fn odm_source_unavailable_error(class: &'static str) -> S3Error {
 pub(crate) fn odm_source_error_response(policy: &PolicyConfig, class: &'static str) -> S3Error {
     match policy.source_error {
         SourceErrorPolicy::Propagate => odm_source_unavailable_error(class),
-        SourceErrorPolicy::NotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+        SourceErrorPolicy::NotFound => S3Error::with_default_message(S3ErrorCode::NoSuchKey),
     }
 }
 
@@ -1141,7 +1129,15 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
         user_defined: metadata.into(),
         ..Default::default()
     };
-    Ok(check_preconditions(headers, &info)?)
+    check_preconditions(headers, &info).map_err(|mut error| {
+        // The source-read response exposed the code's S3 message when the evaluator supplied none.
+        if error.message().is_none()
+            && let Some(message) = error.code().default_message()
+        {
+            error.set_message(message);
+        }
+        error
+    })
 }
 
 /// S3 documents write-side `If-None-Match` only as `*` (create-only).
@@ -1158,7 +1154,7 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bo
             })
         })
     {
-        return Err(S3Error::new(S3ErrorCode::NotImplemented));
+        return Err(S3Error::with_default_message(S3ErrorCode::NotImplemented));
     }
     Ok(())
 }
@@ -1166,6 +1162,7 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderMap, HeaderValue};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
@@ -1173,11 +1170,25 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn decoded_content_length_has_the_original_error_message() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-decoded-content-length", HeaderValue::from_static("invalid"));
+        let error = decoded_content_length_from_headers(&headers).unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(error.message(), Some("This request does not support content."));
+    }
+
+    #[test]
     fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
         let headers = HeaderMap::new();
         assert!(reject_non_wildcard_write_if_none_match(false, &headers).is_ok());
         let err = reject_non_wildcard_write_if_none_match(true, &headers).expect_err("an ETag If-None-Match must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(
+            err.message(),
+            Some("A header you provided implies functionality that is not implemented.")
+        );
         assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
         assert_eq!(
             err.message(),
@@ -1270,6 +1281,13 @@ mod tests {
             version_id: Some(Uuid::new_v4()),
             ..Default::default()
         };
+        let mut bare = S3Error::new(S3ErrorCode::NoSuchKey);
+        bare.set_source(Box::new(io::Error::other("bare storage failure")));
+        let bare = with_delete_marker_read_headers(bare, &info, None);
+        assert_eq!(bare.message(), None);
+        assert!(bare.source().unwrap().is::<io::Error>());
+        assert_eq!(bare.headers().unwrap()[X_AMZ_DELETE_MARKER], "true");
+
         let mut original = S3Error::with_message(S3ErrorCode::NoSuchKey, "original local read failure");
         original.set_source(Box::new(io::Error::other("original storage cause")));
         original.set_request_id("request-id");
@@ -1342,7 +1360,9 @@ mod tests {
             .expect("valid Expires header should parse")
             .expect("header should be present");
 
-        assert_eq!(format_expires_header(&expires).unwrap(), "Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(format_http_date(&expires).unwrap(), "Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(expires.offset(), time::UtcOffset::UTC);
+        assert!(parse_expires_header(None).expect("absent Expires is valid").is_none());
     }
 
     #[test]
@@ -1350,6 +1370,32 @@ mod tests {
         let err = parse_expires_header(Some("not-a-date")).expect_err("invalid Expires header should fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Invalid Expires header"));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn http_date_keeps_stored_wall_time_and_four_digit_years() {
+        for (timestamp, expected) in [
+            (time::macros::datetime!(0000-01-01 00:00 UTC), "Sat, 01 Jan 0000 00:00:00 GMT"),
+            (time::macros::datetime!(9999-12-31 23:59:59 UTC), "Fri, 31 Dec 9999 23:59:59 GMT"),
+            (time::macros::datetime!(2015-10-21 00:30:45.123 +05:30), "Wed, 21 Oct 2015 00:30:45 GMT"),
+        ] {
+            assert_eq!(format_http_date(&timestamp).expect("valid HTTP date"), expected);
+        }
+
+        let error = format_http_date(&time::macros::datetime!(-0001-12-31 00:00 UTC)).expect_err("year needs four digits");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(error.message(), Some("We encountered an internal error, please try again."));
+        let Some(StorageError::Io(source)) = error.source().and_then(|cause| cause.downcast_ref::<StorageError>()) else {
+            panic!("invalid year must retain its storage I/O error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "Invalid HTTP-date timestamp: time: The year component cannot be formatted into the requested format."
+        );
     }
 
     // classify_response_checksums is the single point that splits decrypted checksum
@@ -1458,6 +1504,84 @@ mod tests {
                 byte_range_to_http_range_spec(range).unwrap_err().code(),
                 &rustfs_s3_types::S3ErrorCode::InvalidRange
             );
+        }
+    }
+
+    #[test]
+    fn trailing_checksums_select_the_exact_algorithm_and_preserve_trailer_state() {
+        use rustfs_rio::{SharedTrailerSource, TrailerSource, TrailerValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Trailer {
+            header: Option<String>,
+            value: TrailerValue,
+            reads: AtomicUsize,
+        }
+
+        impl TrailerSource for Trailer {
+            fn lookup(&self, name: &str) -> TrailerValue {
+                assert_eq!(Some(name), self.header.as_deref());
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.value.clone()
+            }
+        }
+
+        let supported = ["CRC32", "CRC32C", "SHA1", "SHA256", "CRC64NVME"];
+        let ignored = [
+            "",
+            "crc32",
+            "Sha256",
+            "UNKNOWN",
+            "MD5",
+            "SHA512",
+            "XXHASH64",
+            "XXHASH3",
+            "XXHASH128",
+        ];
+        for name in supported.into_iter().chain(ignored).map(Some).chain([None]) {
+            let target = supported.iter().position(|&algorithm| Some(algorithm) == name);
+            for value in [
+                TrailerValue::Pending,
+                TrailerValue::Missing,
+                TrailerValue::Present("trailer".into()),
+                TrailerValue::Present(String::new()),
+            ] {
+                let trailer = Arc::new(Trailer {
+                    header: target.map(|slot| format!("x-amz-checksum-{}", supported[slot].to_ascii_lowercase())),
+                    value: value.clone(),
+                    reads: AtomicUsize::new(0),
+                });
+                let source: SharedTrailerSource = trailer.clone();
+                let mut sums = PutObjectChecksums {
+                    crc32: Some("input".into()),
+                    crc32c: Some("input".into()),
+                    sha1: Some("input".into()),
+                    sha256: Some("input".into()),
+                    crc64nvme: Some("input".into()),
+                };
+                apply_trailing_checksums_native(name, &Some(source), &mut sums);
+                assert_eq!(trailer.reads.load(Ordering::Relaxed), usize::from(target.is_some()), "{name:?}");
+
+                let mut expected = [Some("input"); 5];
+                if let Some(slot) = target {
+                    expected[slot] = match &value {
+                        TrailerValue::Pending => Some("input"),
+                        TrailerValue::Missing => None,
+                        TrailerValue::Present(value) => Some(value.as_str()),
+                    };
+                }
+                assert_eq!(
+                    [
+                        sums.crc32.as_deref(),
+                        sums.crc32c.as_deref(),
+                        sums.sha1.as_deref(),
+                        sums.sha256.as_deref(),
+                        sums.crc64nvme.as_deref()
+                    ],
+                    expected,
+                    "{name:?} {value:?}"
+                );
+            }
         }
     }
 
@@ -2230,7 +2354,9 @@ mod tests {
         let mut opts = ObjectOptions::default();
         let err =
             apply_quota_admission(&mut opts, &result).expect_err("legacy completion must not bypass an already exceeded quota");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 6 bytes, limit: 5 bytes"));
     }
 
     #[test]
@@ -2262,7 +2388,9 @@ mod tests {
             .expect("commit-time ledger must decide whether stale usage was reclaimed");
         let err = ensure_object_size_within_quota(&stale_full_usage, 4097)
             .expect_err("an object larger than the whole quota can never fit");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 4096 bytes, limit: 4096 bytes"));
     }
 
     #[test]
@@ -2278,6 +2406,16 @@ mod tests {
         .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message(), Some("Bucket quota check temporarily unavailable, please retry"));
+
+        let result = QuotaCheckResult {
+            current_usage: None,
+            uses_durable_reservations: false,
+            ..quota_result(true)
+        };
+        let error = apply_quota_admission(&mut ObjectOptions::default(), &result).expect_err("snapshot admission needs usage");
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(error.message(), Some("Bucket quota check temporarily unavailable, please retry"));
     }
 
     /// rustfs/backlog#2904: a durable-quota check whose scanner usage is
@@ -2386,6 +2524,7 @@ mod on_demand_migration_tests {
             ..Default::default()
         };
         let err = odm_source_error_response(&hide, "timeout");
+        assert_eq!(err.message(), Some("The specified key does not exist."));
         assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
         assert_eq!(err.status_code(), Some(StatusCode::NOT_FOUND));
     }
@@ -2432,6 +2571,7 @@ mod on_demand_migration_tests {
         )
         .expect_err("matching If-None-Match is 304");
         assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        assert_eq!(err.message(), Some("Not Modified"));
         assert_eq!(err.status_code(), Some(StatusCode::NOT_MODIFIED));
         let echoed = err.headers().expect("304 echoes validators");
         assert_eq!(
@@ -2448,6 +2588,7 @@ mod on_demand_migration_tests {
         let err = odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &head)
             .expect_err("mismatching If-Match is 412");
         assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+        assert_eq!(err.message(), Some("At least one of the preconditions you specified did not hold."));
         assert!(
             odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"0123456789abcdef0123456789abcdef\""), &head)
                 .is_ok()

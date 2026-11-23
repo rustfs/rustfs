@@ -18,9 +18,9 @@
 //! Responsible for: `EventName`, the error surface (`S3Error`, `S3ErrorCode`,
 //! `S3Result`, the `s3_error` macro) that every RustFS crate raises S3 errors with,
 //! and `Body`, the type-erased body the outbound client crates send.
-//! Not responsible for: I/O, global state, wire rendering, S3 body semantics
-//! (trailers, checksums, framing), or any s3s type; the legacy conversions live
-//! behind the `compat-s3s` feature in `compat_s3s` only.
+//! The `compat-s3s` feature also renders owned errors as HTTP responses and enables
+//! conversions to legacy types in `compat_s3s`. Transport I/O, shared state, trailers,
+//! checksums, and body framing belong to the callers.
 //! Upstream: `http`, `bytes`, `http-body`, `http-body-util`. Downstream: every
 //! crate that raises or inspects S3 errors, and the crates that build HTTP bodies.
 

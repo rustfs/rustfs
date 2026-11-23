@@ -17,16 +17,15 @@
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values::stored_etag;
+use crate::app::object::quota_accounting_object_size;
 use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
-use crate::app::storage_api::s3::header::{
-    X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-};
 use http::HeaderValue;
 use http::StatusCode;
 use rustfs_gateway_types::dto::{
     ChecksumType, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ServerSideEncryption,
 };
 use rustfs_gateway_types::{ETag, RecordedUpload, resolve_upload_async};
+use rustfs_s3_client::constants::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
 
@@ -127,14 +126,6 @@ fn validate_complete_multipart_checksum_type(headers: &HeaderMap, upload_metadat
     }
 
     Ok(())
-}
-
-fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
-    match quota_object_size(info) {
-        Ok(size) => Ok(size),
-        Err(err) if fail_closed => Err(ApiError::from(err).into()),
-        Err(_) => Ok(info.size.max(0) as u64),
-    }
 }
 
 fn encode_s3_path(path: &str) -> String {
@@ -803,6 +794,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::app::object::DefaultObjectUsecase;
+    use crate::app::storage_api::object_usecase::StorageObjectInfo as ObjectInfo;
     use crate::app::storage_api::s3::dto::{
         ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedPart, CreateMultipartUploadInput, ETag, StreamingBlob,
         UploadPartInput,
@@ -928,6 +920,12 @@ mod tests {
 
         let err = quota_accounting_object_size(&info, true).expect_err("invalid logical size must fail closed");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(err.message(), Some("part missing or corrupt"));
+        assert!(matches!(
+            err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::PartMissingOrCorrupt)
+        ));
         assert_eq!(quota_accounting_object_size(&info, false).expect("physical fallback should resolve"), 128);
     }
 
@@ -2364,30 +2362,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_complete_multipart_upload_rejects_object_lock_headers() {
-        let multipart_upload = CompletedMultipartUpload {
-            parts: Some(vec![CompletedPart {
-                part_number: Some(1),
-                ..Default::default()
-            }]),
-        };
-
         for (header_name, header_value) in [
             (AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2030-01-01T00:00:00Z"),
             (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON"),
             ("x-amz-bypass-governance-retention", "true"),
         ] {
-            let input = CompleteMultipartUploadInput::builder()
-                .bucket("bucket".to_string())
-                .key("object".to_string())
-                .upload_id("upload-id".to_string())
-                .multipart_upload(Some(multipart_upload.clone()))
-                .build()
-                .unwrap();
-            let mut req = build_request(input, Method::POST);
-            req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
-
-            let err = Box::pin(make_usecase().complete_for_s3s_request(req)).await.unwrap_err();
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let envelope = completion_with_header(header_name, HeaderValue::from_str(header_value).unwrap());
+            let input = completion_input("bucket", "object", "upload-id", vec![completion_part(1, None)]);
+            let err = Box::pin(make_usecase().execute_complete_multipart_upload(envelope, input))
+                .await
+                .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
         }
     }

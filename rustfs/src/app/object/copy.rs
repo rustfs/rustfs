@@ -18,7 +18,6 @@ use super::copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput};
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::CopySourceObject;
-use crate::app::storage_api::s3::dto::Timestamp;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{CopyObjectInput, CopySource, MetadataDirective, StorageClass};
 use futures::FutureExt;
@@ -585,8 +584,7 @@ impl DefaultObjectUsecase {
         // Extract user_defined from Arc for mutation; it will be re-wrapped after all edits.
         let mut user_defined = (*src_info.user_defined).clone();
         if !replaces_metadata {
-            let source_expires = src_info.expires.map(Timestamp::from);
-            insert_expires_metadata(&mut user_defined, source_expires.as_ref())?;
+            insert_expires_metadata(&mut user_defined, src_info.expires.as_ref())?;
         }
 
         strip_managed_encryption_metadata(&mut user_defined);
@@ -630,7 +628,7 @@ impl DefaultObjectUsecase {
             user_defined = replacement_metadata;
             src_info.content_type = effective_content_type;
             src_info.content_encoding = content_encoding.as_deref().and_then(normalize_content_encoding_for_storage);
-            src_info.expires = expires_timestamp.map(OffsetDateTime::from);
+            src_info.expires = expires_timestamp;
         } else if metadata_directive.is_some() || website_redirect_location.is_some() {
             user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_WEBSITE_REDIRECT_LOCATION));
             if let Some(website_redirect_location) = website_redirect_location {
