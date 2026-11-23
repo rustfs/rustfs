@@ -1185,7 +1185,18 @@ mod tests {
                         service: None,
                         trailing_headers: None,
                     };
-                    let get_env = crate::app::RequestEnvelope::from_s3s(&get);
+                    // Method GET, URI `/missing`, empty headers, and empty extensions.
+                    let get_env = crate::app::RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: get.method.clone(),
+                            uri: get.uri.clone(),
+                            headers: get.headers.clone(),
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        get.extensions.clone(),
+                    );
                     let authorized_generation =
                         super::super::storage_api::bucket_usecase::access::load_bucket_generation_from_store(
                             &store,
@@ -1215,7 +1226,17 @@ mod tests {
                     assert_ne!(replacement, old.incarnation_id());
                     sys.remove(&input.bucket);
                     let mut without_source = get.clone();
-                    let mut without_source_env = crate::app::RequestEnvelope::from_s3s(&without_source);
+                    let mut without_source_env = crate::app::RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: without_source.method.clone(),
+                            uri: without_source.uri.clone(),
+                            headers: without_source.headers.clone(),
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        without_source.extensions.clone(),
+                    );
                     super::super::storage_api::bucket_usecase::access::prepare_odm_read_generation(
                         &store,
                         &mut without_source_env,

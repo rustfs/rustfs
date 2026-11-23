@@ -21,6 +21,7 @@ async fn put_fixture_object(store: &Arc<ECStore>, bucket: &str, object: &str) {
 
 struct CycleHooks {
     resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
+    post_walk_hook: Option<Box<dyn FnOnce() + Send>>,
     post_walk_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     peer_observations: Option<super::super::io_cycle::ScannerCyclePeerObservations>,
 }
@@ -54,7 +55,7 @@ async fn run_cycle(
                 requires_full_scan,
                 service_cohort: None,
                 resolved_scope_observer: hooks.resolved_scope_observer,
-                post_walk_hook: None,
+                post_walk_hook: hooks.post_walk_hook,
                 post_walk_gate: hooks.post_walk_gate,
                 peer_observations: hooks.peer_observations,
             },
@@ -67,7 +68,7 @@ async fn run_cycle(
         assert_eq!(
             result.status,
             ScannerCycleStatus::Complete,
-            "one remote hot bucket cannot supersede certified cold buckets"
+            "cycle {cycle} must certify cold buckets: {result:?}"
         );
     }
     let snapshot = receiver.recv().await.expect("cycle should publish a snapshot");
@@ -102,6 +103,7 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
         true,
         CycleHooks {
             resolved_scope_observer: None,
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: None,
         },
@@ -140,6 +142,7 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
         false,
         CycleHooks {
             resolved_scope_observer: Some(observer),
+            post_walk_hook: None,
             post_walk_gate: Some(gate),
             peer_observations: None,
         },
@@ -188,6 +191,7 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
         false,
         CycleHooks {
             resolved_scope_observer: Some(observer),
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: None,
         },
@@ -240,6 +244,7 @@ async fn pending_put_tail_across_the_walk_no_longer_vetoes_the_cycle() {
         true,
         CycleHooks {
             resolved_scope_observer: None,
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: None,
         },
@@ -300,6 +305,7 @@ async fn guardrail_veto_still_supersedes_the_cycle_onto_the_observed_route() {
         true,
         CycleHooks {
             resolved_scope_observer: Some(observer),
+            post_walk_hook: None,
             post_walk_gate: Some(gate),
             peer_observations: None,
         },
@@ -407,6 +413,7 @@ async fn run_remote_certification_cycle(empty_ack: bool) {
         true,
         CycleHooks {
             resolved_scope_observer: None,
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: Some(observations.clone()),
         },
@@ -440,9 +447,11 @@ async fn run_remote_certification_cycle(empty_ack: bool) {
     let writer_store = Arc::clone(&store);
     let writer_peers = Arc::clone(&peers);
     let hot_incarnation = incarnations["hot-bucket"];
+    let (walk_finished, walked) = tokio::sync::oneshot::channel();
     let writer = tokio::spawn(async move {
-        let scope = resolved_scope.await.expect("real cycle resolved its scope");
-        put_fixture_object(&writer_store, "hot-bucket", "during-walk").await;
+        // Exercise the certification window after the walk has produced its candidate.
+        walked.await.expect("real cycle finished walking");
+        put_fixture_object(&writer_store, "hot-bucket", "before-certification").await;
         {
             let mut locked = writer_peers.lock().expect("peer fixture lock");
             let peer = locked.get_mut("peer-a:9000").expect("remote producer exists");
@@ -458,7 +467,6 @@ async fn run_remote_certification_cycle(empty_ack: bool) {
         }
         wait_for_namespace_commit_tails(writer_store.as_ref()).await;
         release.send(()).expect("cycle awaits its actual post-walk proof");
-        scope
     });
     let (result, published) = run_cycle(
         &store,
@@ -467,12 +475,14 @@ async fn run_remote_certification_cycle(empty_ack: bool) {
         false,
         CycleHooks {
             resolved_scope_observer: Some(observer),
+            post_walk_hook: Some(Box::new(move || walk_finished.send(()).expect("writer awaits the completed walk"))),
             post_walk_gate: Some(gate),
             peer_observations: Some(observations.clone()),
         },
     )
     .await;
-    let scope = writer.await.expect("writer completed");
+    writer.await.expect("writer completed");
+    let scope = resolved_scope.await.expect("real cycle resolved its scope");
     if empty_ack {
         assert!(scope.is_default(), "this case exercises the full-scope generation fallback");
     } else {
@@ -536,6 +546,7 @@ async fn run_remote_certification_cycle(empty_ack: bool) {
         false,
         CycleHooks {
             resolved_scope_observer: Some(observer),
+            post_walk_hook: None,
             post_walk_gate: None,
             peer_observations: Some(observations),
         },

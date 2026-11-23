@@ -585,11 +585,26 @@ mod tests {
     use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
     use http::HeaderValue;
 
+    /// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
+    fn envelope_from_presigned_fixture<T>(req: &crate::app::storage_api::s3::S3Request<T>) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials: None,
+                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+                service: req.service.clone(),
+            },
+            req.extensions.clone(),
+        )
+    }
+
     fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
         let mut req = build_request(UploadPartInput::default(), Method::PUT);
         req.uri = format!("/bucket/object?{query}").parse().unwrap();
         req.extensions.insert(VerifiedPresignedRequest);
-        (RequestEnvelope::from_s3s(&req), UploadPartWriteInput::from_legacy(req.input, None))
+        (envelope_from_presigned_fixture(&req), UploadPartWriteInput::from_legacy(req.input, None))
     }
 
     #[tokio::test]
@@ -675,7 +690,7 @@ mod tests {
     fn normalize_presigned_part_checksums_requires_verified_presign() {
         let mut legacy = build_request(UploadPartInput::default(), Method::PUT);
         legacy.uri = "/bucket/object?x-amz-checksum-sha256=one".parse().unwrap();
-        let mut req = RequestEnvelope::from_s3s(&legacy);
+        let mut req = envelope_from_presigned_fixture(&legacy);
         let mut input = UploadPartWriteInput::from_legacy(legacy.input, None);
         normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
         assert!(input.checksum_sha256.is_none());
