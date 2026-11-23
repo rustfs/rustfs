@@ -47,16 +47,20 @@ pub(crate) async fn get_object_gateway(
     get_object_fields(usecase, envelope, input.into()).await
 }
 
+pub(crate) fn get_http_body(body: GetObjectBody) -> rustfs_gateway_stream::Body {
+    use rustfs_gateway_stream::Body;
+
+    match body {
+        GetObjectBody::Bytes(bytes) => Body::from_bytes(bytes),
+        GetObjectBody::Stream(stream) => Body::from_stream(stream).expect("valid GET stream"),
+    }
+}
+
 /// Reads a successful GET body to completion where the caller verifies its bytes.
 pub(crate) async fn read_get_body(body: GetObjectBody) -> bytes::Bytes {
     use http_body_util::BodyExt;
-    use rustfs_gateway_stream::Body;
 
-    let body = match body {
-        GetObjectBody::Bytes(bytes) => Body::from_bytes(bytes),
-        GetObjectBody::Stream(stream) => Body::from_stream(stream).expect("valid GET stream"),
-    };
-    let collected = body.collect().await.expect("GET body must be readable");
+    let collected = get_http_body(body).collect().await.expect("GET body must be readable");
     assert!(collected.trailers().is_none(), "unexpected GET response trailers");
     collected.to_bytes()
 }

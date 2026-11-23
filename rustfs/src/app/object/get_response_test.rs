@@ -18,8 +18,9 @@
 use super::*;
 use crate::app::storage_api::s3::dto::Range;
 use crate::app::storage_api::test::ReqInfo;
-use crate::app::test_seams::{get_envelope, get_object_gateway, get_object_input};
+use crate::app::test_seams::{get_envelope, get_http_body, get_object_gateway, get_object_input};
 use http::Method;
+use http_body_util::BodyExt as _;
 use rustfs_gateway_types::{BucketName, ObjectKey, RangeSpec, dto};
 use rustfs_s3_types::S3ErrorCode;
 
@@ -100,7 +101,6 @@ async fn wire_get(
     headers: &[(&str, &str)],
     admitted: bool,
 ) -> http::Response<Bytes> {
-    use http_body_util::BodyExt as _;
     use hyper_util::rt::TokioIo;
     let before = operation_counts();
     let socket = tokio::net::TcpStream::connect(server.address()).await.unwrap();
@@ -219,9 +219,9 @@ fn get_boundary(stack: Option<&str>) {
                     let response = get_object_gateway(&usecase, get_envelope_with_info(&input, HeaderMap::new()), input)
                         .await
                         .unwrap();
-                    let tag = response.output.into_s3s().expect("typed output projection").e_tag.unwrap();
-                    assert_eq!(tag.value(), ["abc", "", "a\\b", "a\"b", "é", "a\rb", "a\nb", "a\0b"][index]);
-                    assert_eq!(tag.as_weak().is_some(), index == 1);
+                    let tag = response.output.etag.expect("unencoded GET retains its ETag");
+                    assert_eq!(tag.opaque, ["abc", "", "a\\b", "a\"b", "é", "a\rb", "a\nb", "a\0b"][index]);
+                    assert_eq!(tag.weak, index == 1);
                     assert_eq!(response.status, None);
                     for (case, suffix, headers) in [
                         ("ordinary", String::new(), vec![]),
@@ -523,7 +523,7 @@ async fn signed_override_contract(server: &crate::embedded::RustFSServer, bucket
 }
 
 async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embedded::RustFSServer, bucket: &str) {
-    use crate::app::storage_api::s3::dto::PutObjectInput;
+    use crate::app::object_usecase::PutObjectWriteInput;
     use md5::{Digest as _, Md5};
     let key = [0x2a_u8; 32];
     let encoded = base64_simd::STANDARD.encode_to_string(key);
@@ -531,33 +531,28 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
     let wrong = [0x2b_u8; 32];
     let wrong_encoded = base64_simd::STANDARD.encode_to_string(wrong);
     let wrong_digest = base64_simd::STANDARD.encode_to_string(Md5::digest(wrong));
-    let input = PutObjectInput::builder()
-        .bucket(bucket.to_owned())
-        .key("encrypted".to_owned())
-        .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"protected payload"))))
-        .content_length(Some(17))
-        .sse_customer_algorithm(Some("AES256".to_owned()))
-        .sse_customer_key(Some(encoded.clone()))
-        .sse_customer_key_md5(Some(digest.clone()))
-        .build()
-        .unwrap();
-    {
-        let envelope = crate::app::RequestEnvelope::from_parts(
-            crate::app::RequestHead {
-                method: Method::PUT,
-                uri: http::Uri::from_static("/"),
-                headers: http::HeaderMap::new(),
-                credentials: None,
-                region: None,
-                service: None,
-            },
-            http::Extensions::new(),
-        );
-        let input = crate::app::object_usecase::PutObjectWriteInput::from_legacy(input, None);
-        crate::app::test_seams::put_object(usecase, envelope, input)
-    }
-    .await
-    .unwrap();
+    let input = PutObjectWriteInput {
+        bucket: bucket.to_owned(),
+        key: "encrypted".to_owned(),
+        body: Some(rustfs_gateway_stream::Body::from_bytes(Bytes::from_static(b"protected payload"))),
+        content_length: Some(17),
+        sse_customer_algorithm: Some("AES256".to_owned()),
+        sse_customer_key: Some(encoded.clone()),
+        sse_customer_key_md5: Some(digest.clone()),
+        ..Default::default()
+    };
+    let envelope = crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: Method::PUT,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        http::Extensions::new(),
+    );
+    crate::app::test_seams::put_object(usecase, envelope, input).await.unwrap();
     for (case, valid, wrong_key, condition, range) in [
         ("ordinary", true, false, false, false),
         ("missing", false, false, false, false),
@@ -656,7 +651,7 @@ async fn get_reader_handoff_preserves_baseline_copy_count() {
             remaining: length,
             writes: Arc::clone(&writes),
         };
-        let mut body = DefaultObjectUsecase::build_reader_blob(
+        let blob = DefaultObjectUsecase::build_reader_blob(
             reader,
             length as i64,
             "copy-probe",
@@ -669,13 +664,17 @@ async fn get_reader_handoff_preserves_baseline_copy_count() {
             None,
         )
         .await
-        .unwrap()
-        .into_s3s();
+        .unwrap();
+        let mut body = get_http_body(blob);
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(length as u64));
         let mut chunks = Vec::new();
         let mut observed_writes = 0;
         let mut retained = 0;
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.unwrap();
+        while let Some(frame) = body.frame().await {
+            let chunk = frame
+                .expect("reader body must succeed")
+                .into_data()
+                .expect("unexpected reader trailers");
             let begin = chunk.as_ptr() as usize;
             let end = begin + chunk.len();
             let writes = writes.lock().unwrap();
@@ -693,6 +692,8 @@ async fn get_reader_handoff_preserves_baseline_copy_count() {
             observed_writes = writes.len();
             chunks.push(chunk);
         }
+        assert!(body.frame().await.is_none(), "EOF must be terminal");
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(0));
         let writes = writes.lock().unwrap();
         let total: usize = chunks.iter().map(Bytes::len).sum();
         assert_eq!(total, length);
@@ -712,19 +713,27 @@ async fn get_memory_handoff_retains_the_original_allocation() {
     for once in ["false", "true"] {
         let bytes = Bytes::from(vec![b'm'; 8193]);
         let address = bytes.as_ptr() as usize;
-        let mut body = temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some(once), || {
+        let blob = temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some(once), || {
             DefaultObjectUsecase::build_memory_bytes_blob(
                 bytes.clone(),
                 bytes.len() as i64,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 GetObjectBodyLifecycle::disabled(),
             )
-        })
-        .into_s3s();
+        });
+        let mut body = get_http_body(blob);
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(bytes.len() as u64));
         let mut chunks = Vec::new();
-        while let Some(chunk) = body.next().await {
-            chunks.push(chunk.unwrap());
+        while let Some(frame) = body.frame().await {
+            chunks.push(
+                frame
+                    .expect("memory body must succeed")
+                    .into_data()
+                    .expect("unexpected memory trailers"),
+            );
         }
+        assert!(body.frame().await.is_none(), "EOF must be terminal");
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(0));
         let retained: usize = chunks
             .iter()
             .map(|chunk| {

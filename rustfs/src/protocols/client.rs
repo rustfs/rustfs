@@ -1609,6 +1609,8 @@ mod tests {
     #[test]
     fn protocol_mainflow_retention_timestamp_matches_legacy_precision() {
         use crate::app::object_usecase::{GetObjectOutputFacts, HeadObjectOutputFacts};
+        use gateway_s3s_compat::generated::ops::{get_object, head_object};
+
         let instant = rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_456_789).expect("test timestamp");
         let get = || GetObjectOutputFacts {
             dto: gateway_dto::GetObjectOutput {
@@ -1624,12 +1626,10 @@ mod tests {
             },
             etag: None,
         };
-        let old_get =
-            gateway_s3s_compat::generated::ops::get_object::output_from_s3s(get().into_s3s().expect("old GET projection"))
-                .expect("old GET output");
-        let old_head =
-            gateway_s3s_compat::generated::ops::head_object::output_from_s3s(head().into_s3s().expect("old HEAD projection"))
-                .expect("old HEAD output");
+        let old_get = get_object::output_to_s3s(get().dto).expect("old GET projection");
+        let old_get = get_object::output_from_s3s(old_get).expect("old GET output");
+        let old_head = head_object::output_to_s3s(head().dto).expect("old HEAD projection");
+        let old_head = head_object::output_from_s3s(old_head).expect("old HEAD output");
         let old = (old_get.object_lock_retain_until_date, old_head.object_lock_retain_until_date);
         let expected =
             Some(rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("millisecond timestamp"));
