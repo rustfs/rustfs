@@ -4277,6 +4277,9 @@ dependencies = [
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-gateway",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-lock",
  "rustfs-madmin",
@@ -10396,7 +10399,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway"
 version = "0.66.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -10443,7 +10446,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-core"
 version = "0.63.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "bytes",
  "futures-core",
@@ -10464,7 +10467,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-dialect-rustfs-admin"
 version = "0.13.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -10478,7 +10481,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10496,7 +10499,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10506,7 +10509,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-sig"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10521,7 +10524,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10532,7 +10535,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-types"
 version = "0.42.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10555,7 +10558,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1c7486f1113769f643144d635ede30520e735141#1c7486f1113769f643144d635ede30520e735141"
+source = "git+https://github.com/rustfs/gateway.git?rev=5ea2ef14a1e7bd9e8025c7327ff65d8c86445864#5ea2ef14a1e7bd9e8025c7327ff65d8c86445864"
 dependencies = [
  "quick-xml 0.41.0",
 ]
