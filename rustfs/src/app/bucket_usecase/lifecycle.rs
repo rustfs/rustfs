@@ -405,7 +405,7 @@ mod tests {
         // waiter again on the single-thread test runtime.
         assert_eq!(admission.available_permits(), 1);
     }
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
@@ -427,10 +427,9 @@ mod tests {
     fn delete_envelope(context: &Arc<AppContext>, bucket: &str) -> (Arc<ServerContextSlot>, RequestEnvelope) {
         let server = ServerContextSlot::new();
         assert!(server.install(Arc::clone(context)));
-        let mut request = build_request((), Method::DELETE);
-        request.uri = format!("/{bucket}?lifecycle").parse().expect("bucket request URI");
-        request.extensions.insert(Arc::clone(&server));
-        request.extensions.insert(ReqInfo {
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Arc::clone(&server));
+        extensions.insert(ReqInfo {
             cred: Some(Credentials {
                 access_key: "lifecycle-delete-owner".to_owned(),
                 ..Default::default()
@@ -438,14 +437,25 @@ mod tests {
             is_owner: true,
             ..Default::default()
         });
-        request.extensions.insert(request_context::RequestContext {
+        extensions.insert(request_context::RequestContext {
             request_id: DELETE_REQUEST_ID.to_owned(),
             x_amz_request_id: DELETE_REQUEST_ID.to_owned(),
             trace_id: None,
             span_id: None,
             start_time: std::time::Instant::now(),
         });
-        (server, RequestEnvelope::from_s3s(&request))
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::DELETE,
+                uri: format!("/{bucket}?lifecycle").parse().expect("bucket request URI"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        (server, envelope)
     }
 
     async fn authorized_lifecycle_envelope(context: &Arc<AppContext>, bucket: &str) -> RequestEnvelope {

@@ -112,7 +112,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
@@ -154,10 +154,9 @@ mod tests {
 
         let server = ServerContextSlot::new();
         assert!(server.install(Arc::clone(&context)));
-        let mut request = build_request((), method);
-        request.uri = format!("/{bucket}?publicAccessBlock").parse().expect("request URI");
-        request.extensions.insert(Arc::clone(&server));
-        request.extensions.insert(ReqInfo {
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Arc::clone(&server));
+        extensions.insert(ReqInfo {
             cred: Some(Credentials {
                 access_key: "public-access-block-owner".to_owned(),
                 ..Default::default()
@@ -165,14 +164,24 @@ mod tests {
             is_owner: true,
             ..Default::default()
         });
-        request.extensions.insert(request_context::RequestContext {
+        extensions.insert(request_context::RequestContext {
             request_id: "public-access-block-fixture".to_owned(),
             x_amz_request_id: "public-access-block-fixture".to_owned(),
             trace_id: None,
             span_id: None,
             start_time: std::time::Instant::now(),
         });
-        let mut envelope = RequestEnvelope::from_s3s(&request);
+        let mut envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method,
+                uri: format!("/{bucket}?publicAccessBlock").parse().expect("request URI"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         authorize_bucket_config_mutation(&server, &mut envelope, &bucket, Action::S3Action(action))
             .await
             .expect("bucket owner authorization installs the incarnation snapshot");
