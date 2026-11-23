@@ -383,8 +383,8 @@ fn get_boundary(stack: Option<&str>) {
                     );
                 }
                 let response = wire_get(&server, &format!("/{bucket}/missing"), &[], true).await;
-                assert_eq!(response.status(), StatusCode::NOT_FOUND);
-                assert_error_body(&response, "NoSuchKey");
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_error_body(&response, "AccessDenied");
                 signed_override_contract(&server, bucket).await;
                 for (case, headers) in [
                     ("ordinary", vec![]),
@@ -393,8 +393,8 @@ fn get_boundary(stack: Option<&str>) {
                     ("range", vec![("range", "bytes=1-3")]),
                 ] {
                     let response = wire_get(&server, &format!("/{bucket}/missing"), &headers, true).await;
-                    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{case}");
-                    assert_error_body(&response, "NoSuchKey");
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{case}");
+                    assert_error_body(&response, "AccessDenied");
                 }
                 let marker = store
                     .delete_object(
@@ -407,6 +407,7 @@ fn get_boundary(stack: Option<&str>) {
                     )
                     .await
                     .unwrap();
+                let anonymous = reqwest::Client::builder().no_proxy().build().expect("local anonymous client");
                 for path in [
                     format!("/{bucket}/object-0"),
                     format!("/{bucket}/object-0?versionId={}", marker.version_id.unwrap()),
@@ -418,6 +419,17 @@ fn get_boundary(stack: Option<&str>) {
                     assert_eq!(response.headers()["x-amz-version-id"], marker.version_id.unwrap().to_string());
                     assert_eq!(response.headers().contains_key(http::header::LAST_MODIFIED), explicit);
                     assert_error_body(&response, if explicit { "MethodNotAllowed" } else { "NoSuchKey" });
+
+                    let head = anonymous
+                        .head(format!("{}{path}", server.endpoint()))
+                        .send()
+                        .await
+                        .expect("HEAD delete marker");
+                    assert_eq!(head.status(), response.status(), "HEAD {path}");
+                    for name in ["x-amz-delete-marker", "x-amz-version-id", "last-modified"] {
+                        assert_eq!(head.headers().get(name), response.headers().get(name), "HEAD {path}: {name}");
+                    }
+                    assert!(head.bytes().await.expect("HEAD response body").is_empty());
                 }
                 ssec_wire_contract(&usecase, &server, bucket).await;
                 for reserved in ["sthree-get-boundary", "get-boundary-s3alias"] {

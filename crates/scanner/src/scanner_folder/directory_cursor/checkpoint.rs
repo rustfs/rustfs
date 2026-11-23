@@ -9,6 +9,7 @@ use super::{DirectoryScope, DirectoryStamp, DirectoryWork, FolderScanMode, nativ
 use crate::data_usage_define::{
     DataUsageCacheInfo, DataUsageCacheSource, DataUsageEntry, DataUsageScanIdentity, DataUsageScanProgress,
 };
+use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -109,7 +110,7 @@ pub(super) struct Aggregate {
 
 /// Immutable directory membership and the last fully counted compacted child.
 /// The active child's provisional contribution is never part of this receipt.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DirectoryCheckpoint {
     version: u8,
     pub(super) parent: String,
@@ -124,6 +125,53 @@ pub struct DirectoryCheckpoint {
     pub(super) aggregate: Option<Aggregate>,
     endpoint: String,
     digest: [u8; 32],
+    /// Diagnostic time of the last acknowledged aggregate, never a save time.
+    #[serde(default)]
+    pub(super) measured_at: Option<u64>,
+}
+
+impl Serialize for DirectoryCheckpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.measured_at.is_none() {
+            // Enumeration-only receipts retain the compact version-one bytes
+            // so optional diagnostics do not enlarge each name-budget quantum.
+            let mut state = serializer.serialize_struct("DirectoryCheckpoint", 13)?;
+            state.serialize_field("version", &self.version)?;
+            state.serialize_field("parent", &self.parent)?;
+            state.serialize_field("scope", &self.scope)?;
+            state.serialize_field("physical", &self.physical)?;
+            state.serialize_field("pages", &self.pages)?;
+            state.serialize_field("anchor", &self.anchor)?;
+            state.serialize_field("entries_read", &self.entries_read)?;
+            state.serialize_field("sealed", &self.sealed)?;
+            state.serialize_field("part", &self.part)?;
+            state.serialize_field("metadata", &self.metadata)?;
+            state.serialize_field("aggregate", &self.aggregate)?;
+            state.serialize_field("endpoint", &self.endpoint)?;
+            state.serialize_field("digest", &self.digest)?;
+            return state.end();
+        }
+        // Version-one readers accept named fields and ignore this additive
+        // diagnostic field. Keep the existing coverage checksum unchanged.
+        let mut map = serializer.serialize_map(Some(13 + usize::from(self.measured_at.is_some())))?;
+        map.serialize_entry("version", &self.version)?;
+        map.serialize_entry("parent", &self.parent)?;
+        map.serialize_entry("scope", &self.scope)?;
+        map.serialize_entry("physical", &self.physical)?;
+        map.serialize_entry("pages", &self.pages)?;
+        map.serialize_entry("anchor", &self.anchor)?;
+        map.serialize_entry("entries_read", &self.entries_read)?;
+        map.serialize_entry("sealed", &self.sealed)?;
+        map.serialize_entry("part", &self.part)?;
+        map.serialize_entry("metadata", &self.metadata)?;
+        map.serialize_entry("aggregate", &self.aggregate)?;
+        map.serialize_entry("endpoint", &self.endpoint)?;
+        map.serialize_entry("digest", &self.digest)?;
+        if let Some(measured_at) = self.measured_at {
+            map.serialize_entry("measured_at", &measured_at)?;
+        }
+        map.end()
+    }
 }
 
 /// Physical progress orders only callbacks from the same directory generation.
@@ -251,6 +299,10 @@ impl DirectoryCheckpoint {
             through: done.through.clone(),
         })
     }
+    /// A display contribution contains only acknowledged compacted children.
+    pub(crate) fn display_usage(&self, info: &DataUsageCacheInfo) -> Option<(DirectoryProgress, &DataUsageEntry, Option<u64>)> {
+        Some((self.progress(info)?, &self.aggregate.as_ref()?.value, self.measured_at))
+    }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
@@ -348,6 +400,7 @@ impl Recorder {
                 aggregate,
                 endpoint: self.endpoint.clone(),
                 digest: [0; 32],
+                measured_at: work.measured_at,
             };
             checkpoint.checksum().map(|digest| {
                 checkpoint.digest = digest;

@@ -666,20 +666,28 @@ mod tests {
             .key("object".to_string())
             .build()
             .expect("create multipart request should build");
-        let mut request = build_request(input, Method::POST);
-        insert_header(&mut request.headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        request
-            .headers
-            .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::req_info::ReqInfo {
+        // Same facts `envelope_from_request` copies from `build_request`. Credentials, region, and service stay absent.
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        headers.insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
+        let mut extensions = Extensions::new();
+        extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
-
-        let envelope = envelope_from_request(&request);
-        let query_version = request.input.version_id.take();
-        let fields = CreateMultipartUploadFields::from_legacy(request.input);
-        let result = usecase.execute_create_multipart_upload(envelope, fields, query_version).await;
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::POST,
+                uri: http::Uri::from_static("/"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let fields = CreateMultipartUploadFields::from_legacy(input);
+        let result = usecase.execute_create_multipart_upload(envelope, fields, None).await;
         assert!(
             store
                 .list_multipart_uploads(&bucket, "", None, None, None, 100)

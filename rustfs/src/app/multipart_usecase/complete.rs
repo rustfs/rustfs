@@ -995,21 +995,22 @@ mod tests {
             .key(object.to_string())
             .build()
             .expect("create multipart input should build");
-        let mut create_request = build_request(create_input, Method::POST);
-        create_request
-            .headers
-            .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
-        create_request.extensions.insert(crate::storage::req_info::ReqInfo {
+        // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+        let mut create_envelope = completion_with_header(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
+        create_envelope.install_req_info(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
         let upload_id = usecase
-            .execute_create_multipart_upload_from_s3s(create_request)
+            .execute_create_multipart_upload(
+                create_envelope,
+                super::super::CreateMultipartUploadFields::from_legacy(create_input),
+                None,
+            )
             .await
             .expect("authorized REPLICA-only create should succeed")
-            .output
-            .upload_id
-            .expect("create response should contain upload id");
+            .upload_id;
+        assert!(!upload_id.is_empty(), "create response should contain upload id");
 
         let mut reader = PutObjReader::from_vec(b"authorized replica-only multipart body".to_vec());
         let part = store

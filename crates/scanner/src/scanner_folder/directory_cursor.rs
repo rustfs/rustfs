@@ -195,6 +195,7 @@ pub(super) struct DirectoryWork {
     // The final compaction threshold caps how many paths this list can hold.
     pub(super) linked: Vec<String>,
     pub(super) compacted_total: super::DataUsageEntry,
+    pub(super) measured_at: Option<u64>,
     pub(super) gap: bool,
     compacted: bool,
     recorder: Option<Recorder>,
@@ -225,6 +226,9 @@ impl DirectoryWork {
     pub(super) fn acknowledge(&mut self, name: &str, linked: bool, compacted: bool) {
         if self.names.acknowledge() {
             self.compacted = compacted;
+            if compacted {
+                self.measured_at = crate::data_usage_define::scan_measurement_time_millis(std::time::SystemTime::now());
+            }
             if linked && !compacted {
                 self.linked.push(name.to_owned());
             }
@@ -236,6 +240,7 @@ impl DirectoryWork {
         self.names.rewind();
         self.linked.clear();
         self.compacted_total = super::DataUsageEntry::default();
+        self.measured_at = None;
         self.gap = false;
     }
 }
@@ -467,6 +472,7 @@ impl ScannerDirectory {
                 if let Some(aggregate) = &saved.aggregate {
                     work.compacted = true;
                     work.compacted_total = aggregate.value.clone();
+                    work.measured_at = saved.measured_at;
                 }
                 let physical_path: Arc<Path> = Arc::from(Path::new(path));
                 if let Some(part) = &saved.part {

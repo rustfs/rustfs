@@ -4510,9 +4510,10 @@ impl DefaultObjectUsecase {
 
     pub(crate) async fn execute_get_object(
         &self,
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         input: gateway_dto::GetObjectInput,
     ) -> S3Result<Answered<GetObjectOutputFacts>> {
+        envelope.check_list_bucket_on_missing_key = input.version_id.is_none();
         self.execute_get_object_fields(envelope, input.into()).await
     }
 
@@ -4771,7 +4772,7 @@ impl DefaultObjectUsecase {
                 }
                 Some(OdmGetOutcome::Respond(Err(err))) => {
                     lifecycle.finish_err();
-                    return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
+                    return finish_object_read_error(&mut envelope, helper.version_id(version_id_for_event), err).await;
                 }
                 Some(OdmGetOutcome::RetryLocal) => {
                     let prepare_read_retry_start = stage_metrics_enabled.then(std::time::Instant::now);
@@ -4803,7 +4804,7 @@ impl DefaultObjectUsecase {
             Err(err) => {
                 let err = enrich_delete_marker_read_error(&store, &bucket, &key, &opts, err).await;
                 lifecycle.finish_err();
-                return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
+                return finish_object_read_error(&mut envelope, helper.version_id(version_id_for_event), err).await;
             }
         };
         let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
