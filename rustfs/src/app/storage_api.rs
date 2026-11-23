@@ -61,16 +61,16 @@ pub(crate) mod s3 {
     pub(crate) use s3s::auth::Credentials;
     pub(crate) use s3s::dto;
     #[cfg(test)]
+    pub(crate) use s3s::dto::PutObjectInput;
+    #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
         ObjectLockRetention,
     };
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectInput, ListObjectsV2Input, ListObjectsV2Output};
-    #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectOutput, PutObjectInput};
-    #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
     pub(crate) use s3s::header;
     pub(crate) use s3s::s3_error;
     pub(crate) use s3s::stream;
