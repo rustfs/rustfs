@@ -58,7 +58,7 @@ impl PayloadStream for CountedBody {
     }
 }
 
-fn input(bucket: &str, upload: &str, number: i32, length: i64) -> (dto::UploadPartInput, Arc<AtomicUsize>) {
+fn input(bucket: &str, number: i32, length: i64) -> (dto::UploadPartInput, Arc<AtomicUsize>) {
     let polls = Arc::new(AtomicUsize::new(0));
     let body = ByteStream::new(Box::pin(CountedBody {
         polls: polls.clone(),
@@ -70,7 +70,6 @@ fn input(bucket: &str, upload: &str, number: i32, length: i64) -> (dto::UploadPa
         dto::UploadPartInput {
             bucket: crate::app::dto_values::stored_bucket_name(bucket).expect("stored bucket"),
             key: crate::app::dto_values::stored_object_key("directory/a ?#+%.txt").expect("stored key"),
-            upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(upload),
             part_number: number,
             content_length: length,
             body: Some(body),
@@ -122,12 +121,13 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
             "bad-sse-md5",
         ] {
             let make = || {
-                let (mut request, polls) = input(bucket, &created.upload_id, 1, 3);
+                let (mut request, polls) = input(bucket, 1, 3);
+                let mut upload_id = created.upload_id.as_str();
                 match case {
                     "zero" => request.part_number = 0,
                     "negative" => request.part_number = -1,
                     "too-large" => request.part_number = 10001,
-                    "missing-upload" => request.upload_id = rustfs_gateway_types::UploadIdClaim::from_wire("missing/+?=&%"),
+                    "missing-upload" => upload_id = "missing/+?=&%",
                     "wrong-key" => request.key = crate::app::dto_values::stored_object_key("different").expect("key"),
                     "no-body" => request.body = None,
                     "unknown-length" => request.content_length = -1,
@@ -151,7 +151,7 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                     }
                     _ => unreachable!(),
                 }
-                (request, polls)
+                (MultipartRequest::upload_part(request, upload_id), polls)
             };
             let (request, new_polls) = make();
             let before = count();
@@ -171,7 +171,12 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                 .parts;
             let actual_audit = audit_facts(&probe);
             let new_polls = new_polls.load(Ordering::Relaxed);
-            assert!(actual.is_err(), "{case}: expected refusal");
+            let refusal = actual.err().expect("expected upload refusal");
+            if case == "missing-upload" {
+                assert_eq!(refusal.code(), &S3ErrorCode::NoSuchUpload);
+                assert_eq!(refusal.status_code(), Some(http::StatusCode::NOT_FOUND));
+                assert!(!refusal.message().unwrap_or_default().contains("missing/+?=&%"));
+            }
             assert_eq!(parts.len(), 0, "{case}: no parts persisted");
             assert_eq!(actual_count, 1, "{case}: count");
             assert_eq!(actual_audit.len(), 1, "{case}: audit");
@@ -207,11 +212,14 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
             .await
             .expect("create upload");
         for part_num in [1, 2] {
-            let (mut request, polls) = input(bucket, &created.upload_id, part_num, 3);
+            let (mut request, polls) = input(bucket, part_num, 3);
             request.checksum_spec =
                 Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "NSRBwg==").expect("checksum"));
             let before = count();
-            let output = backend.upload_part(request, &root).await.expect("upload part");
+            let output = backend
+                .upload_part(MultipartRequest::upload_part(request, &created.upload_id), &root)
+                .await
+                .expect("upload part");
             assert_eq!(count() - before, 1);
             assert!(polls.load(Ordering::Relaxed) > 0, "successful upload must poll its producer");
             let _ = &output.e_tag;
@@ -243,7 +251,6 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
         let complete = dto::CompleteMultipartUploadInput {
             bucket: created.bucket,
             key: created.key,
-            upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
             multipart_upload: dto::CompletedMultipartUpload {
                 parts: vec![dto::CompletedPart {
                     part_number: 2,
@@ -253,7 +260,10 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
             },
             ..Default::default()
         };
-        backend.complete_multipart_upload(complete, &root).await.expect("complete");
+        backend
+            .complete_multipart_upload(MultipartRequest::complete(complete, &created.upload_id), &root)
+            .await
+            .expect("complete");
         let read = backend
             .get_object(bucket, "directory/a ?#+%.txt", &root, None)
             .await
@@ -289,10 +299,12 @@ fn upload_part_checksum_observations_match_original() {
             )
             .await
             .expect("create upload");
-        let (mut request, _) = input(bucket, &created.upload_id, 1, 3);
+        let (mut request, _) = input(bucket, 1, 3);
         request.checksum_spec =
             Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "AAAAAA==").expect("checksum"));
-        let result = backend.upload_part(request, &root).await;
+        let result = backend
+            .upload_part(MultipartRequest::upload_part(request, &created.upload_id), &root)
+            .await;
         assert!(result.is_ok(), "checksum projection remains representable");
     });
 }
