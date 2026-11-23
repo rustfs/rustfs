@@ -72,9 +72,11 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
     pub(crate) use s3s::s3_error;
+    #[cfg(test)]
     pub(crate) use s3s::stream;
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::UploadStreamError;
+    #[cfg(test)]
     pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
