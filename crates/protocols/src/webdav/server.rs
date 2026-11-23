@@ -927,7 +927,7 @@ fn base64_decode(encoded: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::client::s3::StorageBackend;
+    use crate::common::client::s3::{MultipartRequest, StorageBackend};
     use async_trait::async_trait;
     use dav_server::memfs::MemFs;
     use futures_util::stream;
@@ -1055,7 +1055,7 @@ mod tests {
 
         async fn upload_part(
             &self,
-            _input: UploadPartInput,
+            _input: MultipartRequest<UploadPartInput>,
             _credentials: &Credentials,
         ) -> Result<UploadPartOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
@@ -1063,7 +1063,7 @@ mod tests {
 
         async fn complete_multipart_upload(
             &self,
-            _input: CompleteMultipartUploadInput,
+            _input: MultipartRequest<CompleteMultipartUploadInput>,
             _credentials: &Credentials,
         ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
@@ -1071,7 +1071,7 @@ mod tests {
 
         async fn abort_multipart_upload(
             &self,
-            _input: AbortMultipartUploadInput,
+            _input: MultipartRequest<AbortMultipartUploadInput>,
             _credentials: &Credentials,
         ) -> Result<AbortMultipartUploadOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
@@ -1079,7 +1079,7 @@ mod tests {
 
         async fn upload_part_copy(
             &self,
-            _input: UploadPartCopyInput,
+            _input: MultipartRequest<UploadPartCopyInput>,
             _credentials: &Credentials,
         ) -> Result<UploadPartCopyOutput, Self::Error> {
             unreachable!("connection tests should not hit storage")
