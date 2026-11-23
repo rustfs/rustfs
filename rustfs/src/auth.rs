@@ -30,7 +30,6 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case;
 use s3s::S3Error;
-use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::auth::S3Auth;
 use s3s::auth::SecretKey;
@@ -290,6 +289,17 @@ pub async fn check_key_valid_with_context(
     access_key: &str,
     ctx: Option<&AppContext>,
 ) -> S3Result<(Credentials, bool)> {
+    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public credential API until its legacy error type retires.
+    check_key_valid_owned(session_token, access_key, ctx)
+        .await
+        .map_err(S3Error::from)
+}
+
+pub(crate) async fn check_key_valid_owned(
+    session_token: &str,
+    access_key: &str,
+    ctx: Option<&AppContext>,
+) -> OwnedResult<(Credentials, bool)> {
     // KEYSTONE INTEGRATION: Check if Keystone credentials are present in task-local storage
     // This handles both:
     // 1. Pure X-Auth-Token requests (access_key may be empty)
@@ -317,7 +327,7 @@ pub async fn check_key_valid_with_context(
         );
 
         if !auth_keystone::is_keystone_enabled() {
-            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+            return Err(owned_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
         debug!(
@@ -359,10 +369,10 @@ pub async fn check_key_valid_with_context(
         );
 
         if !auth_keystone::is_keystone_enabled() {
-            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+            return Err(owned_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
-        return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
+        return Err(owned_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
     // Prefer this server's context (backlog#1052 S6); fall back to the ambient
@@ -372,10 +382,7 @@ pub async fn check_key_valid_with_context(
         None => current_action_credentials(),
     };
     let Some(mut cred) = root_cred else {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
-        ));
+        return Err(owned_error!(InternalError, "get_global_action_cred {:?}", IamError::IamSysNotInitialized));
     };
 
     let sys_cred = cred.clone();
@@ -387,16 +394,13 @@ pub async fn check_key_valid_with_context(
             None => current_ready_iam_handle().map_err(|_| ()),
         };
         let Ok(iam_store) = iam_store else {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
-            ));
+            return Err(owned_error!(InternalError, "check_key_valid {:?}", IamError::IamSysNotInitialized));
         };
 
         let (u, ok) = iam_store
             .check_key(access_key)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {e}")))?;
+            .map_err(|e| owned_error!(InternalError, "check claims failed1 {e}"))?;
 
         if !ok {
             let Some(ref u) = u else {
@@ -408,7 +412,7 @@ pub async fn check_key_valid_with_context(
                     reason = "user_not_found",
                     "Access key validation rejected"
                 );
-                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+                return Err(owned_error!(InvalidAccessKeyId, "check key failed"));
             };
 
             if u.credentials.status == "off" {
@@ -420,7 +424,7 @@ pub async fn check_key_valid_with_context(
                     reason = "account_disabled",
                     "Access key validation rejected"
                 );
-                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+                return Err(owned_error!(InvalidAccessKeyId, "check key failed"));
             }
 
             check_session_token(session_token, &u.credentials)?;
@@ -433,11 +437,11 @@ pub async fn check_key_valid_with_context(
                 reason = "validation_failed",
                 "Access key validation rejected"
             );
-            return Err(s3_error!(InvalidRequest, "check key failed"));
+            return Err(owned_error!(InvalidRequest, "check key failed"));
         }
 
         let Some(u) = u else {
-            return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+            return Err(owned_error!(InvalidAccessKeyId, "check key failed"));
         };
 
         cred = u.credentials;
@@ -452,31 +456,31 @@ pub async fn check_key_valid_with_context(
 }
 
 pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<HashMap<String, Value>> {
-    check_claims_from_token_with_context(token, cred, None)
+    check_claims_from_token_with_context(token, cred, None).map_err(S3Error::from)
 }
 
-fn check_session_token(token: &str, cred: &Credentials) -> S3Result<()> {
+fn check_session_token(token: &str, cred: &Credentials) -> OwnedResult<()> {
     // Session identity survives expiration; is_temp() only describes active credentials.
     let has_session_token = !cred.session_token.is_empty();
 
     if !token.is_empty() && cred.access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "no access key"));
+        return Err(owned_error!(InvalidRequest, "no access key"));
     }
 
     if token.is_empty() && has_session_token && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token1"));
+        return Err(owned_error!(InvalidRequest, "invalid token1"));
     }
 
     if !token.is_empty() && !has_session_token {
-        return Err(s3_error!(InvalidRequest, "invalid token2"));
+        return Err(owned_error!(InvalidRequest, "invalid token2"));
     }
 
     if !cred.is_service_account() && has_session_token && !constant_time_eq(token, &cred.session_token) {
-        return Err(s3_error!(InvalidRequest, "invalid token3"));
+        return Err(owned_error!(InvalidRequest, "invalid token3"));
     }
 
     if has_session_token && !cred.is_service_account() && cred.is_expired() {
-        return Err(s3_error!(ExpiredToken, "The provided token has expired."));
+        return Err(owned_error!(ExpiredToken, "The provided token has expired."));
     }
 
     Ok(())
@@ -486,7 +490,7 @@ fn check_claims_from_token_with_context(
     token: &str,
     cred: &Credentials,
     ctx: Option<&AppContext>,
-) -> S3Result<HashMap<String, Value>> {
+) -> OwnedResult<HashMap<String, Value>> {
     check_session_token(token, cred)?;
 
     let sys_cred = match ctx {
@@ -494,7 +498,7 @@ fn check_claims_from_token_with_context(
         None => current_action_credentials(),
     };
     let Some(sys_cred) = sys_cred else {
-        return Err(s3_error!(InternalError, "action cred not init"));
+        return Err(owned_error!(InternalError, "action cred not init"));
     };
 
     let (token, secret) = if cred.is_service_account() {
@@ -506,9 +510,9 @@ fn check_claims_from_token_with_context(
     if !token.is_empty() {
         let claims: HashMap<String, Value> = if cred.is_service_account() {
             get_claims_from_token_with_secret_allow_missing_exp(token, secret)
-                .map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+                .map_err(|_e| owned_error!(InvalidRequest, "invalid token"))?
         } else {
-            get_claims_from_token_with_secret(token, secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+            get_claims_from_token_with_secret(token, secret).map_err(|_e| owned_error!(InvalidRequest, "invalid token"))?
         };
         return Ok(claims);
     }
@@ -1364,6 +1368,7 @@ mod tests {
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     };
+    use s3s::S3ErrorCode;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1740,16 +1745,16 @@ mod tests {
         iam_cache
             .cache
             .add_or_update_sts_account(&valid.access_key, &UserIdentity::new(valid.clone()), now);
-        assert!(
-            check_key_valid_with_context(&valid.session_token, &valid.access_key, Some(&context))
-                .await
-                .is_ok()
-        );
-        assert!(
-            check_key_valid_with_context("", &root.access_key, Some(&context))
-                .await
-                .is_ok()
-        );
+        for (token, key) in [
+            (valid.session_token.as_str(), valid.access_key.as_str()),
+            ("", root.access_key.as_str()),
+        ] {
+            let (public_cred, public_owner) = check_key_valid_with_context(token, key, Some(&context)).await.unwrap();
+            let (owned_cred, owned_owner) = check_key_valid_owned(token, key, Some(&context)).await.unwrap();
+            assert_eq!(owned_owner, public_owner);
+            assert!(owned_owner);
+            assert!(serde_json::to_value(owned_cred).unwrap() == serde_json::to_value(public_cred).unwrap());
+        }
 
         // Seed the state of an issued identity after expiration without sleeping
         // or changing the clock used by signature verification.
@@ -1786,6 +1791,13 @@ mod tests {
             let error = check_key_valid_with_context(token, &credential.access_key, Some(&context))
                 .await
                 .unwrap_err();
+            let owned = check_key_valid_owned(token, &credential.access_key, Some(&context))
+                .await
+                .unwrap_err();
+            assert_eq!(owned.code().as_str(), expected.as_str(), "{name}");
+            assert_eq!(owned.message(), error.message(), "{name}");
+            assert_eq!(owned.status_code(), error.status_code(), "{name}");
+            assert!(owned.source().is_none() && error.source().is_none(), "{name}");
             assert_eq!(error.code(), &expected, "{name}");
             if expected == S3ErrorCode::ExpiredToken {
                 let response = error.to_http_response().expect("serialize the S3 error");
