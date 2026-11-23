@@ -4509,23 +4509,7 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: gateway_dto::GetObjectInput,
     ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
-        use rustfs_gateway_types::RangeParse;
-        self.execute_get_object_fields(
-            envelope,
-            GetObjectFields {
-                bucket: input.bucket.as_str().to_owned(),
-                key: input.key.as_str().to_owned(),
-                version_id: input.version_id,
-                part_number: input.part_number,
-                range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
-                    RangeParse::One(range) => Some(range),
-                    _ => None,
-                }),
-                sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
-                sse_customer_key_md5: input.sse_customer_key_md5,
-            },
-        )
-        .await
+        self.execute_get_object_fields(envelope, input.into()).await
     }
 
     #[instrument(name = "execute_get_object", level = "trace", skip(self, envelope, input))]

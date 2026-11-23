@@ -44,7 +44,7 @@ pub(crate) async fn get_object_gateway(
     input: rustfs_gateway_types::dto::GetObjectInput,
 ) -> rustfs_s3_types::S3Result<crate::app::Answered<crate::app::object_usecase::GetObjectOutputFacts>> {
     rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
-    usecase.execute_get_object(envelope, input).await
+    get_object_fields(usecase, envelope, input.into()).await
 }
 
 /// Calls `DefaultObjectUsecase::execute_get_object` with today's arguments.
@@ -74,8 +74,8 @@ pub(crate) async fn get_object_method_only(
     usecase: &DefaultObjectUsecase,
     input: GetObjectInput,
 ) -> S3Result<S3Response<GetObjectOutput>> {
-    use crate::app::object_usecase::GetObjectFields;
     use crate::app::Answered;
+    use crate::app::object_usecase::GetObjectFields;
     rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
     let envelope = get_envelope(http::HeaderMap::new(), http::Extensions::new());
     let Answered { output, status, headers } = get_object_fields(usecase, envelope, GetObjectFields::from_s3s(input)).await?;
