@@ -266,7 +266,10 @@ mod tests {
     fn every_code_matches_the_s3s_default_message() {
         let mut mismatches = Vec::new();
         for code in S3ErrorCode::NAMED {
-            let legacy = oracle(code.as_str()).default_message();
+            let legacy_error = legacy_s3s::S3Error::new(oracle(code.as_str()));
+            let owned_error = S3Error::with_default_message(code.clone());
+            assert_eq!(owned_error.message(), legacy_error.message(), "{code}");
+            let legacy = legacy_error.code().default_message();
             if legacy.is_none() {
                 mismatches.push(format!("{code}: s3s has no default message"));
             }
@@ -278,6 +281,9 @@ mod tests {
         for custom in ["TierNotFound", "NoSuchKey", ""] {
             assert_eq!(legacy_s3s::S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
             assert_eq!(S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+            let owned = S3Error::with_default_message(S3ErrorCode::Custom(custom.into()));
+            let legacy = legacy_s3s::S3Error::new(legacy_s3s::S3ErrorCode::Custom(custom.into()));
+            assert_eq!(owned.message(), legacy.message(), "{custom}");
         }
     }
 
