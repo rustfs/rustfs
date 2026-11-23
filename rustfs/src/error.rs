@@ -18,7 +18,6 @@ use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use rustfs_lock::LockError;
 use rustfs_s3_types::S3ErrorCode;
-use s3s::S3Error as LegacyS3Error;
 use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
 
 const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
@@ -350,13 +349,7 @@ impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
 impl ApiErrorDiagnostic {
     pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut diagnostic = ApiErrorDiagnostic::default();
-        // S3Error retains its payload through an inherent accessor; its
-        // std::error::Error implementation does not expose that source.
-        let mut current = if let Some(error) = error.downcast_ref::<LegacyS3Error>() {
-            error.source().map(|source| source as &(dyn std::error::Error + 'static))
-        } else {
-            std::error::Error::source(error)
-        };
+        let mut current = error.source();
         for _ in 0..16 {
             let Some(error) = current else {
                 return diagnostic;
@@ -389,8 +382,6 @@ impl ApiErrorDiagnostic {
                 diagnostic.io_os_error = io.raw_os_error();
                 // io::Error::source can skip the wrapped error itself.
                 io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
-            } else if let Some(error) = error.downcast_ref::<LegacyS3Error>() {
-                error.source().map(|source| source as &(dyn std::error::Error + 'static))
             } else {
                 error.source()
             };
@@ -737,11 +728,9 @@ impl From<ApiError> for rustfs_s3_types::S3Error {
     }
 }
 
-/// The s3s error for the legacy edge: the conversion above carried across
-/// with `From`, which yields field for field what the s3s constructor builds
-/// (code, message, explicit status, the cause itself), so both error types
-/// come from one mapping.
-impl From<ApiError> for LegacyS3Error {
+/// Project the native error into the pinned wire oracle.
+#[cfg(test)]
+impl From<ApiError> for s3s::S3Error {
     fn from(err: ApiError) -> Self {
         rustfs_s3_types::S3Error::from(err).into()
     }
@@ -969,7 +958,7 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
     use rustfs_s3_ops::S3Operation;
-    use rustfs_s3_types::S3ErrorCode;
+    use rustfs_s3_types::{S3Error as OwnedS3Error, S3ErrorCode};
     use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
     use s3s::{S3Error, S3ErrorCode as LegacyS3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
@@ -1349,8 +1338,8 @@ mod tests {
             assert_eq!(diagnostic.storage_code, Some(StorageErrorCode::Lock));
             assert_eq!(diagnostic.lock_reason, Some(expected));
             assert!(!format!("{diagnostic:?}").contains("private"));
-            let s3: S3Error = api.into();
-            assert_eq!(s3.code(), &LegacyS3ErrorCode::ServiceUnavailable);
+            let s3 = OwnedS3Error::from(api);
+            assert_eq!(s3.code(), &S3ErrorCode::ServiceUnavailable);
             assert_eq!(super::ApiErrorDiagnostic::from_error(&s3).lock_reason, Some(expected));
         }
 
@@ -1395,7 +1384,7 @@ mod tests {
         let api = ApiError::from(StorageError::Io(IoError::from_raw_os_error(30)));
         let before = api.diagnostic();
         assert_eq!(before.io_os_error, Some(30));
-        let mut error: S3Error = api.into();
+        let mut error = OwnedS3Error::from(api);
         error.set_request_id("server-owned-request");
         let code = error.code().clone();
         let status = error.status_code();
@@ -1405,16 +1394,20 @@ mod tests {
         assert_eq!(error.status_code(), status);
         assert_eq!(error.message(), message.as_deref());
         assert_eq!(error.request_id(), Some("server-owned-request"));
-        assert!(error.source().is_some());
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&error).unwrap().is::<StorageError>());
 
-        let error: S3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
+        let legacy = S3Error::from(error);
+        assert!(legacy.source().unwrap().is::<StorageError>());
+        assert!(std::error::Error::source(&legacy).is_none());
+        assert_eq!(super::ApiErrorDiagnostic::from_error(&OwnedS3Error::from(legacy)), before);
+
+        let error: OwnedS3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
         assert_eq!(
             super::ApiErrorDiagnostic::from_error(&error).storage_code,
             Some(StorageErrorCode::ErasureReadQuorum)
         );
 
-        let nested: S3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
+        let nested: OwnedS3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
         let api = ApiError::from(StorageError::Io(IoError::other(nested)));
         assert_eq!(api.diagnostic().storage_code, Some(StorageErrorCode::ErasureReadQuorum));
     }
@@ -1440,12 +1433,12 @@ mod tests {
         };
         assert!(error.diagnostic().truncated);
         assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
-        let error: S3Error = error.into();
+        let error = OwnedS3Error::from(error);
         let diagnostic = super::ApiErrorDiagnostic::from_error(&error);
         assert!(diagnostic.truncated);
         assert!(!format!("{diagnostic:?}").contains("secret"));
 
-        let error = S3Error::from(ApiError {
+        let error = OwnedS3Error::from(ApiError {
             code: S3ErrorCode::ServiceUnavailable,
             message: "safe".into(),
             source: Some(Box::new(Cycle)),
