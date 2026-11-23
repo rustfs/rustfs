@@ -61,6 +61,7 @@ use tracing::trace;
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
+const EVENT_HEAL_STAGED_TMP_CLEANUP: &str = "heal_staged_tmp_cleanup";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
 const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
@@ -606,6 +607,91 @@ fn is_retryable_heal_writer_error(error: &DiskError) -> bool {
             | DiskError::FaultyDisk
             | DiskError::RemoteClientUnavailable(_)
     ) || error.is_retryable_internode_write_failure()
+}
+
+/// Removes the parts a heal staged under its own tmp prefix when the heal
+/// future is dropped before its own cleanup runs. A task timeout or a
+/// cancellation drops the future in the middle of the data stage, and the
+/// staged shards would otherwise stay until the stale-tmp sweep.
+///
+/// The guard is armed for the data stage only and is disarmed before the
+/// rename phase: removing the prefix under a rename that outlives the dropped
+/// future could publish a data directory with missing parts. A detached write
+/// that lands after this removal leaves residue for the stale-tmp sweep, as
+/// before.
+struct StagedHealTmpGuard {
+    disks: Vec<Option<DiskStore>>,
+    tmp_id: String,
+    armed: bool,
+}
+
+impl StagedHealTmpGuard {
+    fn new(disks: &[Option<DiskStore>], tmp_id: &str) -> Self {
+        Self {
+            disks: disks.to_vec(),
+            tmp_id: tmp_id.to_string(),
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedHealTmpGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop cannot await storage IO. Without a runtime the removal is left
+        // to the stale-tmp sweep.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let disks = std::mem::take(&mut self.disks);
+        let tmp_id = std::mem::take(&mut self.tmp_id);
+        runtime.spawn(async move {
+            let results = join_all(disks.iter().flatten().map(|disk| {
+                disk.delete(
+                    RUSTFS_META_TMP_BUCKET,
+                    &tmp_id,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+            }))
+            .await;
+            let mut failed = 0usize;
+            let mut first_error = None;
+            for result in results {
+                match result {
+                    Ok(()) | Err(DiskError::FileNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound) => {}
+                    Err(err) => {
+                        failed += 1;
+                        first_error.get_or_insert(err);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                warn!(
+                    event = EVENT_HEAL_STAGED_TMP_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
+                    result = "cleanup_failed",
+                    tmp_id,
+                    failed,
+                    error = %error,
+                    "Heal staged data cleanup failed after the heal was dropped"
+                );
+            }
+        });
+    }
 }
 
 struct HealWriterFailures {
@@ -1699,8 +1785,10 @@ impl SetDisks {
                         };
                         let src_data_dir = data_dir.to_string();
                         let dst_data_dir = data_dir;
+                        let mut staged_tmp_guard = StagedHealTmpGuard::new(&out_dated_disks, &tmp_id);
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
+                            staged_tmp_guard.arm();
                             let stage_result: disk::error::Result<Option<DiskError>> = async {
                                 let erasure_info = latest_meta.erasure.clone();
                                 let frame_size = crate::object_api::persisted_ec_read_quantum(
@@ -1944,6 +2032,7 @@ impl SetDisks {
                                     // Release readers and writers before removing all parts
                                     // staged under this heal's exclusively owned prefix.
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    staged_tmp_guard.disarm();
                                     return failure.map(|error| (result, error));
                                 }
                             }
@@ -1954,6 +2043,7 @@ impl SetDisks {
                                 .is_some_and(|guard| guard.is_lock_lost())
                             {
                                 let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                staged_tmp_guard.disarm();
                                 return Err(DiskError::DiskOngoingReq);
                             }
                             drop(_read_repair_read_lock_guard.take());
@@ -1970,16 +2060,23 @@ impl SetDisks {
                                 Ok(Some(guard)) => Some(Arc::new(guard)),
                                 Ok(None) => {
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    staged_tmp_guard.disarm();
                                     return Ok((result, Some(DiskError::Timeout)));
                                 }
                                 Err(err) => {
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    staged_tmp_guard.disarm();
                                     return Err(err);
                                 }
                             }
                         } else {
                             None
                         };
+
+                        // From here the staged data is renamed into place. The guard
+                        // must not remove the prefix under a rename that outlives a
+                        // dropped future.
+                        staged_tmp_guard.disarm();
 
                         // Rename from tmp location to the actual location.
                         // MinIO stops on the first RenameData error. RustFS intentionally
@@ -4790,6 +4887,99 @@ mod heal_result_report_tests {
             .await
             .expect("complete repaired object body");
         assert_eq!(actual, payloads.concat());
+    }
+
+    /// A heal task timeout drops the heal future in the middle of the data
+    /// stage. The parts it had staged must not wait for the stale-tmp sweep.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_dropped_during_staging_removes_staged_parts() {
+        use crate::set_disk::CompletePart;
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-dropped-during-staging";
+        let object = "multipart.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let upload = set
+            .new_multipart_upload(bucket, object, &options)
+            .await
+            .expect("multipart upload");
+        let payloads = [vec![0x35; 5 * 1024 * 1024], vec![0x69; 1024 * 1024]];
+        let mut completed = Vec::new();
+        for (index, payload) in payloads.iter().enumerate() {
+            let part = set
+                .put_object_part(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    index + 1,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &options,
+                )
+                .await
+                .expect("multipart part");
+            completed.push(CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        set.clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, completed, &options)
+            .await
+            .expect("completed multipart object");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("healthy source metadata");
+        let data_dir = source.data_dir.expect("multipart data directory").to_string();
+        for dir in &dirs[..2] {
+            tokio::fs::remove_dir_all(dir.path().join(bucket).join(object).join(&data_dir))
+                .await
+                .expect("remove target shards");
+        }
+        let tmp_before = non_trash_tmp_entries(&dirs).await;
+        let heal_options = HealOpts {
+            no_lock: true,
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (pause_scope, arrived, _release) =
+            ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(2));
+        let mut heal = Box::pin(set.heal_object(bucket, object, "", &heal_options));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                biased;
+                _ = arrived.notified() => {}
+                _ = &mut heal => panic!("the heal must still be staging when it is dropped"),
+            }
+        })
+        .await
+        .expect("the heal must reach the second part");
+        assert_ne!(
+            non_trash_tmp_entries(&dirs).await,
+            tmp_before,
+            "the first part must already be staged before the heal is dropped"
+        );
+
+        // A task timeout does exactly this to the heal future.
+        drop(heal);
+        drop(pause_scope);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while non_trash_tmp_entries(&dirs).await != tmp_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a dropped heal must remove the parts it staged");
     }
 
     async fn real_disk() -> (TempDir, Endpoint, DiskStore) {
