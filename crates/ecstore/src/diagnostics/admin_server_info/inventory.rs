@@ -229,7 +229,11 @@ mod tests {
             super::super::load_server_info_usage_snapshot(store.clone()).await
         };
         let (loaded, listing, result) = collect(&store, cold_refresh, store.list_bucket_for_scanner(&options)).await;
-        assert_eq!(loaded.unwrap().usage_snapshot_converged, Some(true));
+        let loaded = loaded.expect("cold admin snapshot should load");
+        assert!(loaded.usage_snapshot_admin_projection);
+        assert_eq!(loaded.usage_snapshot_converged, Some(false));
+        assert_eq!(loaded.buckets_usage.len(), 1);
+        assert_eq!(loaded.buckets_usage["unchanged"].objects_count, 4);
         assert!(listing.unwrap().topology_complete);
         assert_eq!(result.current_buckets, Some(3));
         assert_eq!(result.measured_buckets, Some(1));

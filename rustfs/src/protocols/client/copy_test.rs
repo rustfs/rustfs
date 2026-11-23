@@ -324,6 +324,31 @@ fn copy_output_facts(tag: Option<&str>) -> CopyObjectWriteOutput {
         checksum_type: None,
     }
 }
+
+/// Same facts `RequestEnvelope::from_s3s` copies: method, URI, headers, extensions, region, service, and credentials.
+fn envelope_from_legacy_copy_request(req: &s3s::S3Request<()>) -> crate::app::RequestEnvelope {
+    let credentials = req.credentials.as_ref().map(|credentials| {
+        let session_token = crate::auth::get_session_token(&req.uri, &req.headers).map(str::to_owned);
+        crate::app::RequestCredentials::new(
+            credentials.access_key.clone(),
+            credentials.secret_key.expose().to_owned(),
+            session_token.clone(),
+        )
+        .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
+    });
+    crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            credentials,
+            region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+            service: req.service.clone(),
+        },
+        req.extensions.clone(),
+    )
+}
+
 #[test]
 fn protocol_copy_request_head_matches_legacy() {
     fn facts(envelope: &crate::app::RequestEnvelope) -> serde_json::Value {
@@ -355,7 +380,7 @@ fn protocol_copy_request_head_matches_legacy() {
             credentials: &credentials,
         };
         let old = ProtocolStorageClient::create_request((), Method::PUT, uri.clone(), params()).expect("legacy request");
-        let old = crate::app::RequestEnvelope::from_s3s(&old);
+        let old = envelope_from_legacy_copy_request(&old);
         let current = ProtocolStorageClient::create_envelope(Method::PUT, uri, params());
         assert_eq!(facts(&current), facts(&old));
     }

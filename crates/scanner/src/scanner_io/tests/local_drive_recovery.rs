@@ -32,10 +32,8 @@ async fn retire(probe: &Probe, disk: &Arc<Disk>) {
         )
         .await
         .expect("replacement wrapper");
-        assert_eq!(
-            next.get_disk_id().await.expect("replacement identity"),
-            disk.get_disk_id().await.expect("old identity")
-        );
+        let identity = disk.get_disk_id().await.expect("read old identity").expect("formatted drive");
+        assert_eq!(next.get_disk_id().await.expect("read replacement identity"), Some(identity));
         Some(next)
     } else {
         None
@@ -89,8 +87,8 @@ impl Drop for RegisteredProbe {
     }
 }
 
-async fn recovery_fixture(bucket: &str, before: bool, replace: bool, faulty: bool, eof: bool) {
-    let (_dir, store) = setup_local_scanner_store(1, 1).await;
+async fn recovery_fixture(bucket: &str, before: bool, replace: bool, faulty: bool, eof: bool) -> Option<(usize, DataUsageEntry)> {
+    let (dir, store) = setup_local_scanner_store(1, 1).await;
     clear_dirty_usage_buckets_for_tests();
     for name in [bucket, "unaffected-bucket"] {
         store
@@ -120,15 +118,12 @@ async fn recovery_fixture(bucket: &str, before: bool, replace: bool, faulty: boo
         .lock()
         .expect("probe registry")
         .insert(bucket.to_string(), probe.clone());
-    let _registered = RegisteredProbe(bucket.to_string());
+    let registered = RegisteredProbe(bucket.to_string());
     let status = run_full_cycle(&store, 1).await;
-    if replace || faulty {
+    let attempts = probe.attempts.load(Ordering::SeqCst);
+    let recovered = if replace || faulty {
         assert_eq!(status, ScannerCycleStatus::Complete);
-        assert_eq!(
-            probe.attempts.load(Ordering::SeqCst),
-            2,
-            "one recovery attempt including zero-progress interruption"
-        );
+        assert_eq!(attempts, 2, "one recovery attempt including zero-progress interruption");
         let mut cache = DataUsageCache::default();
         cache
             .load(set, &path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]))
@@ -138,41 +133,65 @@ async fn recovery_fixture(bucket: &str, before: bool, replace: bool, faulty: boo
         let total = cache.checked_flatten(bucket).expect("complete recovered statistics");
         assert_eq!(total.objects, 3);
         assert_eq!(total.size, 21);
+        Some((attempts, total))
     } else {
         assert_ne!(status, ScannerCycleStatus::Complete, "retired drive cannot certify completion");
-        assert_eq!(probe.attempts.load(Ordering::SeqCst), 1, "no repeated scans on a retired wrapper");
-    }
+        assert_eq!(attempts, 1, "no repeated scans on a retired wrapper");
+        None
+    };
     clear_dirty_usage_buckets_for_tests();
+    drop(registered);
+    drop(probe);
+    drop(store);
+    dir.close().expect("remove recovery fixture");
+    recovered
 }
 
 #[tokio::test]
 #[serial]
 async fn issue_9469_recovers_retired_wrapper_before_first_object() {
-    recovery_fixture("recovery-first", true, true, false, false).await;
+    let (attempts, total) = recovery_fixture("recovery-first", true, true, false, false)
+        .await
+        .expect("retired wrapper recovered");
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-21",
+            "assertion_id": "USAGE-21-A01",
+            "status": "PASS",
+            "evidence": {
+                "same_format_identity": true,
+                "attempts": attempts,
+                "durable_objects": total.objects,
+                "durable_bytes": total.size,
+            }
+        })
+    );
+    println!("usage_cleanup: {}", serde_json::json!({"case_id": "USAGE-21", "status": "PASS"}));
 }
 
 #[tokio::test]
 #[serial]
 async fn issue_9469_recovers_retired_wrapper_in_deep_subtree() {
-    recovery_fixture("recovery-deep", false, true, false, false).await;
+    let _ = recovery_fixture("recovery-deep", false, true, false, false).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn issue_9469_persistent_retirement_is_bounded() {
-    recovery_fixture("recovery-offline", true, false, false, false).await;
+    let _ = recovery_fixture("recovery-offline", true, false, false, false).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn issue_9469_faulty_metadata_stops_and_retries_without_losing_object() {
-    recovery_fixture("recovery-faulty", false, false, true, false).await;
+    let _ = recovery_fixture("recovery-faulty", false, false, true, false).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn issue_9469_retirement_at_eof_cannot_certify_old_handle() {
-    recovery_fixture("recovery-eof", false, true, false, true).await;
+    let _ = recovery_fixture("recovery-eof", false, true, false, true).await;
 }
 
 #[tokio::test]
