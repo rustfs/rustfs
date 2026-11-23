@@ -20,7 +20,7 @@ use super::veeam_sosapi;
 use crate::app::dto_values::timestamp;
 use crate::app::{Answered, RequestEnvelope};
 use rustfs_gateway_types::dto as gateway_dto;
-use rustfs_s3_types::S3Result as OwnedResult;
+use rustfs_s3_types::{S3ErrorCode as OwnedS3ErrorCode, S3Result as OwnedResult, s3_error as owned_error};
 use rustfs_utils::http::headers::AMZ_RESTORE;
 
 use super::*;
@@ -2179,7 +2179,7 @@ impl GetObjectResumeContext {
         let disk_permit = DefaultObjectUsecase::admit_get_object_disk_read(get_concurrency_manager(), &self.bucket, &self.key)
             .await
             .map_err(|err| {
-                if err.code() == &S3ErrorCode::SlowDown {
+                if err.code() == &OwnedS3ErrorCode::SlowDown {
                     GetObjectResumeFailure::Retryable
                 } else {
                     GetObjectResumeFailure::Fatal
@@ -2544,7 +2544,7 @@ impl DefaultObjectUsecase {
         Ok(blob)
     }
 
-    fn init_get_object_bootstrap(&self, bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
+    fn init_get_object_bootstrap(&self, bucket: &str, key: &str, request_id: &str) -> OwnedResult<GetObjectBootstrap> {
         #[cfg(test)]
         let timeout_config = self
             .get_object_timeout_policy
@@ -2650,7 +2650,7 @@ impl DefaultObjectUsecase {
         request_timeout: Option<GetObjectRequestTimeout<'_>>,
         bucket: &str,
         key: &str,
-    ) -> S3Result<GetObjectIoPlanning> {
+    ) -> OwnedResult<GetObjectIoPlanning> {
         let permit_wait_start = std::time::Instant::now();
         let disk_permit = Self::admit_get_object_disk_read(manager, bucket, key).await?;
         let permit_wait_duration = permit_wait_start.elapsed();
@@ -2716,7 +2716,7 @@ impl DefaultObjectUsecase {
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
-    ) -> S3Result<Option<GetObjectDiskPermit>> {
+    ) -> OwnedResult<Option<GetObjectDiskPermit>> {
         let permit_wait_start = std::time::Instant::now();
         let permit_wait_timeout = Self::disk_permit_wait_timeout();
         // Active readers own admission until EOF, drop, or watchdog retirement.
@@ -2729,7 +2729,7 @@ impl DefaultObjectUsecase {
         let disk_permit = match manager
             .admit_disk_read(permit_wait_timeout)
             .await
-            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?
+            .map_err(|_| owned_error!(InternalError, "disk read semaphore closed"))?
         {
             DiskReadAdmission::Primary(permit) => Some(permit),
             // Throttling disabled by config (primary cap 0): proceed without an
@@ -2753,7 +2753,7 @@ impl DefaultObjectUsecase {
                     wait_ms = permit_wait_start.elapsed().as_millis() as u64,
                     "GetObject rejected: disk-read hard concurrency cap reached"
                 );
-                return Err(s3_error!(
+                return Err(owned_error!(
                     SlowDown,
                     "disk read concurrency limit reached, please reduce your request rate"
                 ));
@@ -2769,7 +2769,7 @@ impl DefaultObjectUsecase {
     ) -> Result<GetObjectIoPlanning, ColdFillError> {
         match Self::acquire_get_object_io_planning(manager, None, bucket, key).await {
             Ok(io) => Ok(io),
-            Err(err) if err.code() == &S3ErrorCode::SlowDown => Err(ColdFillError::Storage(StorageError::SlowDown)),
+            Err(err) if err.code() == &OwnedS3ErrorCode::SlowDown => Err(ColdFillError::Storage(StorageError::SlowDown)),
             Err(_) => Err(ColdFillError::DiskAdmissionClosed),
         }
     }
@@ -2790,7 +2790,7 @@ impl DefaultObjectUsecase {
 
     /// Cheap request-shape validations, run before the bucket-existence store
     /// lookup so invalid requests keep their InvalidArgument precedence.
-    fn validate_get_object_request(input: &GetObjectFields) -> S3Result<GetObjectValidatedRequest> {
+    fn validate_get_object_request(input: &GetObjectFields) -> OwnedResult<GetObjectValidatedRequest> {
         // Clone only the fields this path needs instead of the whole input.
         let bucket = input.bucket.clone();
         let key = input.key.clone();
@@ -2805,7 +2805,7 @@ impl DefaultObjectUsecase {
         let rs = range.map(byte_range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
-            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+            return Err(owned_error!(InvalidArgument, "range and part_number invalid"));
         }
 
         Ok(GetObjectValidatedRequest {
@@ -4018,7 +4018,7 @@ impl DefaultObjectUsecase {
         bucket: &str,
         key: &str,
         stage: GetObjectTimeoutStage,
-    ) -> S3Result<()> {
+    ) -> OwnedResult<()> {
         if !wrapper.is_timeout() {
             return Ok(());
         }
@@ -4035,7 +4035,7 @@ impl DefaultObjectUsecase {
                     elapsed_ms,
                     "GetObject request timed out before processing"
                 );
-                Err(s3_error!(InternalError, "Request timeout before processing"))
+                Err(owned_error!(InternalError, "Request timeout before processing"))
             }
             GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration } => {
                 warn!(
@@ -4047,7 +4047,7 @@ impl DefaultObjectUsecase {
                     "GetObject request timed out while waiting for disk permit"
                 );
                 rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
-                Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"))
+                Err(owned_error!(InternalError, "Request timeout while waiting for disk permit"))
             }
             GetObjectTimeoutStage::BeforeRead => {
                 warn!(
@@ -4058,7 +4058,7 @@ impl DefaultObjectUsecase {
                     "GetObject request timed out before reading object"
                 );
                 rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
-                Err(s3_error!(InternalError, "Request timeout before reading object"))
+                Err(owned_error!(InternalError, "Request timeout before reading object"))
             }
         }
     }
@@ -6467,6 +6467,44 @@ mod tests {
             let bytes = read_get_body(response.output.body.expect("GET body")).await;
             assert_eq!(bytes, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn expired_get_disk_planning_returns_the_permit_and_preserves_admission_errors() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let policy = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::from_millis(1),
+            enable_dynamic_timeout: false,
+            ..Default::default()
+        };
+        let wrapper = RequestTimeoutWrapper::with_request_id(policy.clone(), "expired-get");
+        tokio::time::sleep(policy.get_object_timeout).await;
+        let timeout = Some(GetObjectRequestTimeout {
+            wrapper: &wrapper,
+            policy: &policy,
+        });
+
+        let error = DefaultObjectUsecase::acquire_get_object_io_planning(&manager, timeout, "bucket", "key")
+            .await
+            .err()
+            .expect("the deadline expires after admission");
+        assert_eq!(error.code(), &OwnedS3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("Request timeout while waiting for disk permit"));
+        assert_eq!(error.status_code(), Some(http::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(error.headers().is_none());
+        assert!(error.source().is_none());
+        assert!(matches!(
+            manager.admit_disk_read(Duration::from_millis(1)).await.unwrap(),
+            DiskReadAdmission::Primary(_)
+        ));
+
+        manager.close_disk_read_admission_for_test();
+        let error = DefaultObjectUsecase::acquire_get_object_io_planning(&manager, timeout, "bucket", "key")
+            .await
+            .err()
+            .expect("closed admission precedes the deadline check");
+        assert_eq!(error.code(), &OwnedS3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("disk read semaphore closed"));
     }
 
     #[tokio::test]
@@ -12232,6 +12270,8 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("GET: partNumber must be between 1 and 10000"));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     #[test]
@@ -12314,6 +12354,8 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("range and part_number invalid"));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 }
 
