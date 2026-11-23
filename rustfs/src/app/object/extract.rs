@@ -18,15 +18,14 @@ use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::AuthorizationRequest;
+use crate::app::storage_api::object_usecase::bucket::object_lock::types::LegalHoldStatus;
 use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
-use crate::app::storage_api::s3::dto::{
-    ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, Timestamp, TimestampFormat,
-};
 use futures::stream::FuturesUnordered;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 use std::collections::HashSet;
 
 // One logical member can be preceded by local PAX, GNU long-name, and GNU
@@ -1715,16 +1714,12 @@ fn apply_extract_pax_overrides(
     let object_lock_mode = canonical_headers
         .get(AMZ_OBJECT_LOCK_MODE_LOWER)
         .map(|value| {
-            let value = value
+            value
                 .to_str()
-                .map(str::trim)
-                .map(str::to_ascii_uppercase)
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock mode"))?;
-            match value.as_str() {
-                ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::GOVERNANCE.to_owned()),
-                ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::COMPLIANCE.to_owned()),
-                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")),
-            }
+                .ok()
+                .and_then(|value| RetentionMode::parse(value.trim()))
+                .map(|value| value.as_str().to_owned())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))
         })
         .transpose()?;
     if let Some(mode) = object_lock_mode.as_ref() {
@@ -1737,8 +1732,7 @@ fn apply_extract_pax_overrides(
             let value = value.to_str().map(str::trim).map_err(|_| {
                 S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock retain-until date")
             })?;
-            Timestamp::parse(TimestampFormat::DateTime, value)
-                .map(OffsetDateTime::from)
+            OffsetDateTime::parse(value, &Rfc3339)
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
         })
         .transpose()?;
@@ -1753,14 +1747,12 @@ fn apply_extract_pax_overrides(
     let object_lock_legal_hold_status = canonical_headers
         .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
         .map(|value| {
-            let value = value.to_str().map(str::trim).map(str::to_ascii_uppercase).map_err(|_| {
-                S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock legal-hold status")
-            })?;
-            match value.as_str() {
-                ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::ON.to_owned()),
-                ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::OFF.to_owned()),
-                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status")),
-            }
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| LegalHoldStatus::parse(value.trim()))
+                .map(|value| value.as_str().to_owned())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
         })
         .transpose()?;
     if let Some(status) = object_lock_legal_hold_status.as_ref() {
@@ -2146,7 +2138,7 @@ impl DefaultObjectUsecase {
         );
         if effective_sse
             .as_ref()
-            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(AMZ_ENCRYPTION_KMS))
         {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }

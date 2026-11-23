@@ -1126,7 +1126,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod object_lock {
         pub(crate) mod types {
-            pub(crate) use crate::storage::storage_api::ecstore_bucket::object_lock::types::RetentionMode;
+            pub(crate) use crate::storage::storage_api::ecstore_bucket::object_lock::types::{LegalHoldStatus, RetentionMode};
         }
 
         pub(crate) mod objectlock {
