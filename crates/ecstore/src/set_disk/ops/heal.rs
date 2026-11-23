@@ -625,6 +625,10 @@ struct StagedHealTmpGuard {
     armed: bool,
 }
 
+/// Counts the removals the guard dispatched, so tests can prove none ran.
+#[cfg(test)]
+static STAGED_HEAL_TMP_CLEANUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl StagedHealTmpGuard {
     fn new(disks: &[Option<DiskStore>], tmp_id: &str) -> Self {
         Self {
@@ -655,6 +659,8 @@ impl Drop for StagedHealTmpGuard {
         };
         let disks = std::mem::take(&mut self.disks);
         let tmp_id = std::mem::take(&mut self.tmp_id);
+        #[cfg(test)]
+        STAGED_HEAL_TMP_CLEANUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         runtime.spawn(async move {
             let results = join_all(disks.iter().flatten().map(|disk| {
                 disk.delete(
@@ -4889,24 +4895,44 @@ mod heal_result_report_tests {
         assert_eq!(actual, payloads.concat());
     }
 
-    /// A heal task timeout drops the heal future in the middle of the data
-    /// stage. The parts it had staged must not wait for the stale-tmp sweep.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn heal_dropped_during_staging_removes_staged_parts() {
+    /// A two-part object whose shards were removed from the first two disks,
+    /// ready to be healed onto them.
+    struct StagedHealFixture {
+        dirs: Vec<TempDir>,
+        disks: Vec<DiskStore>,
+        set: Arc<SetDisks>,
+        data_dir: String,
+        payload: Vec<u8>,
+        tmp_before: Vec<String>,
+    }
+
+    const STAGED_HEAL_BUCKET: &str = "heal-dropped-future";
+    const STAGED_HEAL_OBJECT: &str = "multipart.bin";
+
+    fn staged_heal_options() -> (ObjectOptions, HealOpts) {
+        (
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+            HealOpts {
+                no_lock: true,
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn staged_heal_fixture() -> StagedHealFixture {
         use crate::set_disk::CompletePart;
         use crate::storage_api_contracts::multipart::MultipartOperations as _;
 
         let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
-        let bucket = "heal-dropped-during-staging";
-        let object = "multipart.bin";
+        let (bucket, object) = (STAGED_HEAL_BUCKET, STAGED_HEAL_OBJECT);
         for disk in &disks {
             disk.make_volume(bucket).await.expect("fixture bucket");
         }
-        let options = ObjectOptions {
-            no_lock: true,
-            ..Default::default()
-        };
+        let (options, _) = staged_heal_options();
         let upload = set
             .new_multipart_upload(bucket, object, &options)
             .await
@@ -4946,14 +4972,28 @@ mod heal_result_report_tests {
                 .expect("remove target shards");
         }
         let tmp_before = non_trash_tmp_entries(&dirs).await;
-        let heal_options = HealOpts {
-            no_lock: true,
-            scan_mode: HealScanMode::Deep,
-            ..Default::default()
-        };
+        StagedHealFixture {
+            dirs,
+            disks,
+            set,
+            data_dir,
+            payload: payloads.concat(),
+            tmp_before,
+        }
+    }
+
+    /// A heal task timeout drops the heal future in the middle of the data
+    /// stage. The parts it had staged must not wait for the stale-tmp sweep.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_dropped_during_staging_removes_staged_parts() {
+        let fixture = staged_heal_fixture().await;
+        let (bucket, object) = (STAGED_HEAL_BUCKET, STAGED_HEAL_OBJECT);
+        let (_, heal_options) = staged_heal_options();
+        let cleanups_before = super::STAGED_HEAL_TMP_CLEANUPS.load(std::sync::atomic::Ordering::Relaxed);
         let (pause_scope, arrived, _release) =
             ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(2));
-        let mut heal = Box::pin(set.heal_object(bucket, object, "", &heal_options));
+        let mut heal = Box::pin(fixture.set.heal_object(bucket, object, "", &heal_options));
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::select! {
                 biased;
@@ -4964,8 +5004,8 @@ mod heal_result_report_tests {
         .await
         .expect("the heal must reach the second part");
         assert_ne!(
-            non_trash_tmp_entries(&dirs).await,
-            tmp_before,
+            non_trash_tmp_entries(&fixture.dirs).await,
+            fixture.tmp_before,
             "the first part must already be staged before the heal is dropped"
         );
 
@@ -4973,13 +5013,117 @@ mod heal_result_report_tests {
         drop(heal);
         drop(pause_scope);
 
+        assert_eq!(
+            super::STAGED_HEAL_TMP_CLEANUPS.load(std::sync::atomic::Ordering::Relaxed),
+            cleanups_before + 1,
+            "a heal dropped during the data stage must dispatch one removal"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while non_trash_tmp_entries(&dirs).await != tmp_before {
+            while non_trash_tmp_entries(&fixture.dirs).await != fixture.tmp_before {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("a dropped heal must remove the parts it staged");
+    }
+
+    /// The removal must stop before the rename phase. A heal dropped while a
+    /// rename is in flight leaves the staged data to that rename: removing the
+    /// prefix under it could publish a data directory with missing parts.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_dropped_during_rename_leaves_staged_parts_to_the_rename() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = staged_heal_fixture().await;
+        let (bucket, object) = (STAGED_HEAL_BUCKET, STAGED_HEAL_OBJECT);
+        let (options, heal_options) = staged_heal_options();
+        let cleanups_before = super::STAGED_HEAL_TMP_CLEANUPS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Pause the physical rename on whichever target the heal publishes first.
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let mut releases = Vec::new();
+        let mut installed = Vec::new();
+        for (index, disk) in fixture.disks[..2].iter().enumerate() {
+            let destination = disk
+                .get_object_path_for_io_if_local(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+                .expect("local disk")
+                .expect("destination metadata path");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let entered = entered_tx.clone();
+            installed.push(hooks::install(&destination, move || {
+                let _ = entered.send(index);
+                let _ = release_rx.recv();
+            }));
+            releases.push(release_tx);
+        }
+
+        let mut heal = Box::pin(fixture.set.heal_object(bucket, object, "", &heal_options));
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                biased;
+                index = entered_rx.recv() => index.expect("a rename entered its physical publication"),
+                _ = &mut heal => panic!("the heal finished before a rename could be paused"),
+            }
+        })
+        .await
+        .expect("the heal must start a rename");
+
+        // A task timeout does exactly this to the heal future, while the
+        // rename it started keeps running detached.
+        drop(heal);
+        assert_eq!(
+            super::STAGED_HEAL_TMP_CLEANUPS.load(std::sync::atomic::Ordering::Relaxed),
+            cleanups_before,
+            "no staged-prefix removal may be dispatched once the rename phase has started"
+        );
+
+        releases[paused].send(()).expect("release the paused rename");
+        let healed = fixture.dirs[paused].path().join(bucket).join(object).join(&fixture.data_dir);
+        let source = fixture.dirs[2].path().join(bucket).join(object).join(&fixture.data_dir);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let published = fixture.disks[paused]
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .is_ok_and(|version| version.data_dir.is_some_and(|dir| dir.to_string() == fixture.data_dir));
+                if published {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached rename must still publish the healed target");
+        for part in ["part.1", "part.2"] {
+            let healed_len = tokio::fs::metadata(healed.join(part))
+                .await
+                .expect("the healed target must keep every staged part")
+                .len();
+            let source_len = tokio::fs::metadata(source.join(part)).await.expect("source part").len();
+            assert_eq!(healed_len, source_len, "{part} must be complete on the healed target");
+        }
+        drop(installed);
+
+        let (_, error) = fixture
+            .set
+            .heal_object(bucket, object, "", &heal_options)
+            .await
+            .expect("heal after the dropped attempt");
+        assert!(error.is_none(), "the remaining target must heal afterwards: {error:?}");
+        let mut reader = fixture
+            .set
+            .get_object_reader(bucket, object, None, Default::default(), &options)
+            .await
+            .expect("read the healed object");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("complete healed object body");
+        assert_eq!(actual, fixture.payload);
     }
 
     async fn real_disk() -> (TempDir, Endpoint, DiskStore) {
