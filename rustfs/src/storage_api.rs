@@ -593,7 +593,10 @@ pub(crate) mod table {
 
     #[cfg(test)]
     pub(crate) mod test_support {
-        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+        pub(crate) use crate::storage::storage_api::contract::bucket::{
+            BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, MakeBucketOptions,
+        };
+        pub(crate) use crate::storage::storage_api::managed::HealOpts;
     }
 }
 

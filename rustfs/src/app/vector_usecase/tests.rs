@@ -17,15 +17,15 @@ use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
 use rustfs_policy::policy::Policy;
 use serde_json::{Value, json};
 
-struct Fixture {
-    app: Arc<AppContext>,
-    service: DefaultVectorUsecase,
-    credentials: Credentials,
+pub(super) struct Fixture {
+    pub(super) app: Arc<AppContext>,
+    pub(super) service: DefaultVectorUsecase,
+    pub(super) credentials: Credentials,
     policy: String,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let app = shared_gating_ambient().await;
         let suffix = Uuid::new_v4().simple().to_string();
         if app.action_credentials().get().is_none() {
@@ -95,7 +95,7 @@ impl Fixture {
         }
     }
 
-    fn verified(&self, request: Request) -> admission::VerifiedVectorRequest {
+    pub(super) fn verified(&self, request: Request) -> admission::VerifiedVectorRequest {
         let mut extensions = http::Extensions::new();
         extensions.insert(self.service.server.clone());
         extensions.insert(crate::app::storage_api::vector_usecase::RequestContext::fallback());
@@ -116,12 +116,12 @@ impl Fixture {
         admission::VerifiedVectorRequest::for_test(self.service.server.clone(), envelope, request, self.service.region.clone())
     }
 
-    async fn execute(&self, request: Request) -> Result<Response, ProtocolError> {
+    pub(super) async fn execute(&self, request: Request) -> Result<Response, ProtocolError> {
         let admitted = self.service.admit(self.verified(request.clone())).await?;
         self.service.execute_authorized(admitted, request).await
     }
 
-    async fn set_statements(&self, statements: Value) {
+    pub(super) async fn set_statements(&self, statements: Value) {
         self.app
             .iam()
             .handle()
@@ -575,5 +575,45 @@ fn vector_list_indexes_returns_complete_pages_and_rejects_unsupported_continuati
                 .code(),
             ErrorCode::ServiceUnavailable
         );
+    });
+}
+
+#[test]
+fn vector_maintenance_identity_reloads_rotation_disable_and_deletion() {
+    run_large_stack_test("vector-maintenance-current-identity", || async {
+        let fixture = Fixture::new().await;
+        let account = &fixture.credentials.access_key;
+        let iam = fixture.app.iam().handle();
+        let (first, _) = super::maintenance::resolve_identity(&fixture.app, account)
+            .await
+            .expect("ordinary maintenance identity");
+        assert_eq!(first.account(), account);
+        assert_ne!(first.user_generation(), &[0; 16]);
+        let root = fixture.app.action_credentials().get().expect("installed root");
+        assert!(
+            super::maintenance::resolve_identity(&fixture.app, &root.access_key)
+                .await
+                .is_err()
+        );
+        iam.create_user(
+            account,
+            &AddOrUpdateUserReq {
+                secret_key: Uuid::new_v4().simple().to_string(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("rotate selected ordinary account");
+        let (rotated, _) = super::maintenance::resolve_identity(&fixture.app, account)
+            .await
+            .expect("new generation resolves");
+        assert_ne!(rotated, first, "the running worker must reject a rotated account generation");
+        iam.set_user_status(account, AccountStatus::Disabled)
+            .await
+            .expect("disable maintenance account");
+        assert!(super::maintenance::resolve_identity(&fixture.app, account).await.is_err());
+        iam.delete_user(account, true).await.expect("delete maintenance account");
+        assert!(super::maintenance::resolve_identity(&fixture.app, account).await.is_err());
     });
 }

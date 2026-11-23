@@ -44,6 +44,8 @@ const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
 
 #[derive(Clone)]
 pub(crate) struct ManagedLanceObjects {
+    #[cfg(test)]
+    instance_id: uuid::Uuid,
     usecase: crate::app::object::DefaultObjectUsecase,
     context: crate::app::object::ManagedObjectContext,
     max_bytes: usize,
@@ -74,6 +76,8 @@ pub(crate) fn managed_lance_objects(
             source: Box::new(source),
         })?;
     Ok(Arc::new(ManagedLanceObjects {
+        #[cfg(test)]
+        instance_id: app.object_store().id,
         usecase: crate::app::object::DefaultObjectUsecase::with_context(Some(app)),
         context,
         max_bytes,
@@ -224,6 +228,11 @@ impl ManagedLanceObjects {
 
 #[async_trait::async_trait]
 impl crate::vector::lance::ManagedManifestObjects for ManagedLanceObjects {
+    #[cfg(test)]
+    fn fault_instance_id(&self) -> Option<uuid::Uuid> {
+        Some(self.instance_id)
+    }
+
     async fn create_only(
         &self,
         access: &crate::storage_api::startup::services::ManagedObjectAccess,
@@ -393,6 +402,112 @@ pub(crate) fn guarded_managed_lance_objects(
         })?
         .operation_guard = Some(guard);
     Ok(objects)
+}
+
+pub(crate) fn maintenance_managed_lance_objects(
+    app: Arc<crate::runtime_sources::AppContext>,
+    context: crate::app::object::ManagedObjectContext,
+    guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+    limits: crate::vector::lance::ManifestIoLimits,
+) -> std::result::Result<Arc<ManagedLanceObjects>, crate::vector::lance::LanceManifestError> {
+    use crate::vector::lance::LanceManifestError;
+    guard.check_held()?;
+    let resource = guard.resource_identity();
+    let access = context.access();
+    if resource.vector_bucket() != Some(access.bucket())
+        || resource.table_id() != access.table_id()
+        || resource.dataset_prefix() != access.allowed_prefix()
+    {
+        return Err(LanceManifestError::ResourceMismatch {
+            reason: "maintenance reader differs from its Catalog operation",
+        });
+    }
+    guard.lifecycle_guard()?;
+    let max_bytes = usize::try_from(limits.max_manifest_bytes.get()).map_err(|source| LanceManifestError::Storage {
+        operation: "convert maintenance manifest budget",
+        source: Box::new(source),
+    })?;
+    Ok(Arc::new(ManagedLanceObjects {
+        #[cfg(test)]
+        instance_id: app.object_store().id,
+        usecase: crate::app::object::DefaultObjectUsecase::with_context(Some(app)),
+        context,
+        max_bytes,
+        operation_guard: Some(guard),
+    }))
+}
+
+struct ManagedDispatchCandidateReader {
+    objects: ManagedLanceObjects,
+    guard: Arc<crate::table_catalog::VectorMaintenanceDispatchGuard>,
+}
+
+#[async_trait::async_trait]
+impl crate::table_catalog::CatalogManagedCandidateReader for ManagedDispatchCandidateReader {
+    async fn read_managed_candidate(
+        &self,
+        bucket: &crate::storage_api::table::managed::BucketHandle,
+        metadata: &crate::table_catalog::CatalogMetadataRef,
+        max_size: usize,
+        lifecycle: &crate::storage_api::table::managed::BucketIncarnationFenceGuard,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
+        self.guard.check_held()?;
+        if !std::ptr::eq(self.guard.lifecycle_owner().as_ref(), lifecycle) {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "maintenance candidate read received another lifecycle owner".into(),
+            ));
+        }
+        let result = crate::table_catalog::CatalogManagedCandidateReader::read_managed_candidate(
+            &self.objects,
+            bucket,
+            metadata,
+            max_size,
+            lifecycle,
+        )
+        .await?;
+        self.guard.check_held()?;
+        Ok(result)
+    }
+}
+
+/// Build a candidate reader that retains its admitted maintenance dispatch.
+/// Catalog supplies the existing lifecycle owner for each bounded read.
+///
+/// Returns an error when the dispatch is lost, its resource differs from the
+/// Managed capability, or the manifest limit exceeds the platform address space.
+pub(crate) fn maintenance_dispatch_candidate_reader(
+    app: Arc<crate::runtime_sources::AppContext>,
+    context: crate::app::object::ManagedObjectContext,
+    guard: Arc<crate::table_catalog::VectorMaintenanceDispatchGuard>,
+    limits: crate::vector::lance::ManifestIoLimits,
+) -> std::result::Result<Arc<dyn crate::table_catalog::CatalogManagedCandidateReader>, crate::vector::lance::LanceManifestError> {
+    use crate::vector::lance::LanceManifestError;
+    guard.check_held()?;
+    let resource = guard.lease().resource();
+    let access = context.access();
+    if resource.vector_bucket() != Some(access.bucket())
+        || resource.table_id() != access.table_id()
+        || resource.dataset_prefix() != access.allowed_prefix()
+    {
+        return Err(LanceManifestError::ResourceMismatch {
+            reason: "maintenance candidate reader differs from its dispatch resource",
+        });
+    }
+    let max_bytes = usize::try_from(limits.max_manifest_bytes.get()).map_err(|source| LanceManifestError::Storage {
+        operation: "convert maintenance candidate budget",
+        source: Box::new(source),
+    })?;
+    Ok(Arc::new(ManagedDispatchCandidateReader {
+        objects: ManagedLanceObjects {
+            #[cfg(test)]
+            instance_id: app.object_store().id,
+            usecase: crate::app::object::DefaultObjectUsecase::with_context(Some(app)),
+            context,
+            max_bytes,
+            operation_guard: None,
+        },
+        guard,
+    }))
 }
 
 async fn run_managed_bridge_mutation<T, F>(operation: F) -> std::result::Result<T, crate::vector::lance::LanceManifestError>
@@ -568,6 +683,7 @@ impl crate::vector::lance::ManagedDatasetMultipart for ManagedObjectMultipartSes
 }
 
 pub(crate) struct StartupServiceRuntime {
+    pub(crate) vector_maintenance: crate::table_catalog::CatalogBackgroundTask,
     pub(crate) table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
     pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
     pub(crate) oidc_recovery: Option<AbortOnDropHandle<()>>,
@@ -580,6 +696,7 @@ pub(crate) struct StartupServiceRuntime {
 }
 
 pub(crate) struct EmbeddedStartupServiceRuntime {
+    pub(crate) vector_maintenance: crate::table_catalog::CatalogBackgroundTask,
     pub(crate) table_rename_recovery: crate::table_catalog::CatalogBackgroundTask,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
 }
@@ -600,6 +717,7 @@ pub(crate) async fn init_embedded_startup_runtime_services(
     init_embedded_notification_runtime(endpoint_pools, buckets).await;
 
     Ok(EmbeddedStartupServiceRuntime {
+        vector_maintenance: crate::app::vector_usecase::maintenance::spawn(server_ctx.clone(), &ctx),
         iam_bootstrap,
         table_rename_recovery: crate::table_catalog::spawn_table_rename_recovery(server_ctx, &ctx),
     })
@@ -657,6 +775,7 @@ pub(crate) async fn init_startup_runtime_services(
         .map(|config| crate::table_catalog::PeriodicMaintenanceRuntime::spawn(config, server_ctx.clone(), &ctx));
 
     Ok(StartupServiceRuntime {
+        vector_maintenance: crate::app::vector_usecase::maintenance::spawn(server_ctx.clone(), &ctx),
         table_maintenance,
         table_rename_recovery: Some(crate::table_catalog::spawn_table_rename_recovery(server_ctx, &ctx)),
         oidc_recovery,
@@ -1197,6 +1316,7 @@ mod tests {
             let mut entry = TableEntry {
                 vector_head_binding: None,
                 vector_index_definition: None,
+                vector_maintenance_binding: None,
                 version: 2,
                 table_bucket: bucket_id.to_owned(),
                 namespace: namespace.public_name(),
@@ -1890,6 +2010,7 @@ mod managed_bridge_tests {
             created_at: Some("2026-11-16T00:00:00Z".into()),
             updated_at: None,
             vector_index_definition: None,
+            vector_maintenance_binding: None,
             vector_head_binding: None,
         };
         let initial = adapter
@@ -2211,7 +2332,7 @@ mod managed_bridge_tests {
             _principal: &crate::app::storage_api::sse::SseKmsPrincipal,
             action: rustfs_policy::policy::action::KmsAction,
             key_id: &str,
-        ) -> std::result::Result<bool, crate::error::ApiError> {
+        ) -> std::result::Result<bool, rustfs_sse::SseError> {
             self.calls
                 .lock()
                 .expect("KMS authorization calls")

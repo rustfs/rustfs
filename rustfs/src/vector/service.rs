@@ -117,6 +117,7 @@ pub(crate) struct VectorService<B: TableCatalogObjectBackend> {
     catalog: Arc<ObjectTableCatalogStore<B>>,
     limits: ManifestIoLimits,
     max_write_attempts: NonZeroUsize,
+    numeric_proof_cache: Arc<super::lance::LanceNumericProofCache>,
 }
 
 pub(crate) enum VectorExecution<B: TableCatalogObjectBackend> {
@@ -195,7 +196,13 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             catalog,
             limits,
             max_write_attempts,
+            numeric_proof_cache: Arc::new(super::lance::LanceNumericProofCache::default()),
         }
+    }
+
+    pub(crate) fn with_numeric_proof_cache(mut self, cache: Arc<super::lance::LanceNumericProofCache>) -> Self {
+        self.numeric_proof_cache = cache;
+        self
     }
 
     pub(crate) async fn execute(&self, context: &dyn VectorRequestAccess) -> Result<VectorExecution<B>, VectorServiceError> {
@@ -318,7 +325,8 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             context.index_name().clone(),
             index,
             self.limits,
-        )?;
+        )?
+        .with_numeric_proof_cache(self.numeric_proof_cache.clone())?;
         Ok(BoundIndex {
             entry,
             guard,
@@ -415,7 +423,8 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             reservation.name().clone(),
             index.clone(),
             self.limits,
-        )?;
+        )?
+        .with_numeric_proof_cache(self.numeric_proof_cache.clone())?;
         let prepared = adapter
             .prepare_initial_manifest(
                 &managed.access,
@@ -661,6 +670,11 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             .and_then(NonZeroUsize::new)
             .ok_or_else(|| ProtocolError::validation("topK", "must be positive"))?;
         let snapshot = bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?;
+        #[cfg(test)]
+        bound
+            .adapter
+            .pause_query_snapshot(&snapshot, &bound.entry.head().expected_head())
+            .await;
         let candidates = snapshot.query_matches(&input.query_vector.float32, top_k, filter).await?;
         let metadata_rows = if input.return_metadata.unwrap_or(false) {
             let rows = snapshot

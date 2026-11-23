@@ -174,6 +174,27 @@ impl DefaultMultipartUsecase {
 
     pub(crate) async fn execute_upload_part_with_origin(
         &self,
+        req: RequestEnvelope,
+        input: UploadPartWriteInput,
+        mut origin: MultipartOrigin,
+    ) -> S3Result<(UploadPartWriteOutput, CompletePart)> {
+        if origin.is_managed() {
+            let owner = self.clone();
+            return run_owned_mutation(async move {
+                let helper = origin.take_completion();
+                let result = owner.execute_upload_part_with_origin_inner(req, input, origin).await;
+                if let Some(helper) = helper {
+                    let _ = helper.complete_owned(&result, http::StatusCode::OK, &HeaderMap::new());
+                }
+                result
+            })
+            .await;
+        }
+        self.execute_upload_part_with_origin_inner(req, input, origin).await
+    }
+
+    async fn execute_upload_part_with_origin_inner(
+        &self,
         mut req: RequestEnvelope,
         mut input: UploadPartWriteInput,
         origin: MultipartOrigin,
@@ -196,7 +217,7 @@ impl DefaultMultipartUsecase {
         let (bucket, key) = input.target.resource();
         let mut opts = ObjectOptions::default();
         origin.apply_bucket_guard(&req, bucket, &mut opts)?;
-        let part_principal = SseKmsPrincipal::from_request(&req);
+        let part_principal = origin.principal(&req);
         let UploadPartWriteInput {
             body,
             frame_trailers,

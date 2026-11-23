@@ -15,7 +15,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use crate::storage_api::vector::{ManagedObjectAccess, ManagedObjectOperation};
@@ -29,7 +29,7 @@ use futures::{
 use lance_io::object_store::{ObjectStore as LanceObjectStore, ObjectStoreParams, ObjectStoreProvider};
 use object_store_lance::{
     Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, path::Path,
+    ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, path::Path,
 };
 use tokio::sync::Semaphore;
 use url::Url;
@@ -48,6 +48,9 @@ pub(super) struct ManagedObjectStore {
     limits: ManifestIoLimits,
     data_references: Arc<RwLock<HashMap<Path, TableCatalogObjectMetadata>>>,
     read_permits: Arc<Semaphore>,
+    control: OnceLock<crate::table_catalog::VectorMaintenanceControl>,
+    #[cfg(test)]
+    delete_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl fmt::Debug for ManagedObjectStore {
@@ -74,7 +77,147 @@ impl ManagedObjectStore {
             limits,
             data_references: Arc::new(RwLock::new(HashMap::new())),
             read_permits: Arc::new(Semaphore::new(limits.max_concurrent_reads.get())),
+            control: OnceLock::new(),
+            #[cfg(test)]
+            delete_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fault_instance_id(&self) -> Option<uuid::Uuid> {
+        self.objects.fault_instance_id()
+    }
+
+    #[cfg(test)]
+    pub(super) fn delete_attempts(&self) -> usize {
+        self.delete_attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn set_maintenance_control(
+        &self,
+        control: crate::table_catalog::VectorMaintenanceControl,
+    ) -> Result<(), LanceManifestError> {
+        control.check_admission()?;
+        self.control.set(control).map_err(|_| LanceManifestError::ReferenceMismatch {
+            reason: "maintenance adapter is already bound to an execution",
+        })
+    }
+
+    pub(super) fn has_maintenance_control(&self) -> bool {
+        self.control.get().is_some()
+    }
+
+    pub(super) fn check_admission(&self) -> Result<(), LanceManifestError> {
+        if let Some(control) = self.control.get() {
+            control.check_admission()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn budget_bytes(&self, bytes: Bytes) -> Result<Bytes, LanceManifestError> {
+        let reservation = self
+            .control
+            .get()
+            .map(|control| control.reserve_memory(bytes.len() as u64))
+            .transpose()?;
+        Ok(Bytes::from_owner(BudgetedBytes {
+            bytes,
+            _reservation: reservation,
+        }))
+    }
+
+    pub(super) fn budget_memory(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<Arc<crate::table_catalog::VectorMaintenanceMemoryReservation>>, LanceManifestError> {
+        self.control
+            .get()
+            .map(|control| control.reserve_memory(bytes))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub(super) fn budget_batch(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<Arc<crate::table_catalog::VectorMaintenanceBatchReservation>>, LanceManifestError> {
+        self.control
+            .get()
+            .map(|control| control.reserve_batch(bytes))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn head_owned(&self, key: &CatalogObjectKey) -> Result<TableCatalogObjectMetadata, LanceManifestError> {
+        let permit = match self.control.get() {
+            Some(control) => Some(control.acquire_io().await?),
+            None => None,
+        };
+        let objects = self.objects.clone();
+        let access = self.access.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            objects.head(&access, &key).await
+        })
+        .await
+        .map_err(owned_join_error)?
+    }
+
+    async fn read_owned(
+        &self,
+        key: &CatalogObjectKey,
+        range: Option<std::ops::Range<u64>>,
+        revision: uuid::Uuid,
+        size: u64,
+    ) -> Result<BudgetedRead, LanceManifestError> {
+        let reservation = self.control.get().map(|control| control.reserve_memory(size)).transpose()?;
+        let permit = match self.control.get() {
+            Some(control) => Some(control.acquire_io().await?),
+            None => None,
+        };
+        let objects = self.objects.clone();
+        let access = self.access.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let object = objects.get(&access, &key, range, Some(revision)).await?;
+            Ok(BudgetedRead {
+                object,
+                _reservation: reservation,
+            })
+        })
+        .await
+        .map_err(owned_join_error)?
+    }
+
+    async fn create_owned(
+        &self,
+        key: &CatalogObjectKey,
+        content: Bytes,
+    ) -> Result<TableCatalogObjectMetadata, LanceManifestError> {
+        let reservation = self
+            .control
+            .get()
+            .map(|control| control.reserve_memory(content.len() as u64))
+            .transpose()?;
+        let content = Bytes::from_owner(BudgetedBytes {
+            bytes: content,
+            _reservation: reservation,
+        });
+        let permit = match self.control.get() {
+            Some(control) => Some(control.acquire_io().await?),
+            None => None,
+        };
+        let objects = self.objects.clone();
+        let access = self.access.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            objects.create_only(&access, &key, content).await
+        })
+        .await
+        .map_err(owned_join_error)?
     }
 
     pub(super) async fn bind_data_reference(
@@ -82,7 +225,7 @@ impl ManagedObjectStore {
         reference: &super::files::ManifestObjectReference,
     ) -> Result<(), LanceManifestError> {
         self.access.check(reference.key.as_str(), ManagedObjectOperation::Head)?;
-        let metadata = self.objects.head(&self.access, &reference.key).await?;
+        let metadata = self.head_owned(&reference.key).await?;
         require_revision(metadata.body_revision)?;
         if reference
             .expected_size
@@ -96,6 +239,22 @@ impl ManagedObjectStore {
         bind_data_identity(&self.data_references, Path::from(reference.key.as_str()), metadata)
     }
 
+    pub(super) fn bound_data_identity(
+        &self,
+        key: &CatalogObjectKey,
+    ) -> Result<crate::table_catalog::CatalogManagedObjectIdentity, LanceManifestError> {
+        let metadata = self
+            .data_reference(&Path::from(key.as_str()))?
+            .ok_or(LanceManifestError::ReferenceMismatch {
+                reason: "object reference is unbound",
+            })?;
+        let revision = require_revision(metadata.body_revision)?;
+        Ok(crate::table_catalog::CatalogManagedObjectIdentity::try_new(
+            key.clone(),
+            crate::table_catalog::CatalogBodyRevision::try_new(revision)?,
+        )?)
+    }
+
     pub(super) async fn read_data_bytes(&self, key: &CatalogObjectKey, limit: u64) -> Result<Bytes, LanceManifestError> {
         let path = Path::from(key.as_str());
         let reference = self.data_reference(&path)?.ok_or(LanceManifestError::ReferenceMismatch {
@@ -107,11 +266,7 @@ impl ManagedObjectStore {
                 limit,
             });
         }
-        self.get_opts(&path, GetOptions::default())
-            .await?
-            .bytes()
-            .await
-            .map_err(Into::into)
+        self.get_range(&path, 0..reference.size).await.map_err(Into::into)
     }
 
     fn data_reference(&self, path: &Path) -> Result<Option<TableCatalogObjectMetadata>, LanceManifestError> {
@@ -148,7 +303,7 @@ impl ManagedObjectStore {
         self.access
             .check(key.as_str(), ManagedObjectOperation::Head)
             .map_err(|source| object_error(source.into()))?;
-        let actual = self.objects.head(&self.access, &key).await.map_err(object_error)?;
+        let actual = self.head_owned(&key).await.map_err(object_error)?;
         if actual.body_revision != expected.body_revision || actual.size != expected.size || actual.etag != expected.etag {
             return Err(object_error(LanceManifestError::ReferenceMismatch {
                 reason: "Dataset object differs from its bound identity",
@@ -182,12 +337,19 @@ impl ManagedObjectStore {
         let access = self.access.clone();
         let permits = self.read_permits.clone();
         let expected_etag = expected.etag;
+        let control = self.control.get().cloned();
+        let io_owner = match &control {
+            Some(control) => Some(Arc::new(control.acquire_io().await.map_err(|error| object_error(error.into()))?)),
+            None => None,
+        };
         let stream = stream::try_unfold(range.start, move |start| {
             let objects = objects.clone();
             let access = access.clone();
             let permits = permits.clone();
             let key = key.clone();
             let expected_etag = expected_etag.clone();
+            let control = control.clone();
+            let io_owner = io_owner.clone();
             async move {
                 if start >= stream_end {
                     return Ok(None);
@@ -202,10 +364,22 @@ impl ManagedObjectStore {
                         source: Box::new(source),
                     })
                 })?;
-                let object = objects
-                    .get(&access, &key, Some(start..end), Some(revision))
-                    .await
-                    .map_err(object_error)?;
+                let reservation = control
+                    .as_ref()
+                    .map(|control| control.reserve_memory(end - start))
+                    .transpose()
+                    .map_err(|error| object_error(error.into()))?;
+                let object = tokio::spawn(async move {
+                    let _io_owner = io_owner;
+                    let object = objects.get(&access, &key, Some(start..end), Some(revision)).await?;
+                    Ok::<_, LanceManifestError>(BudgetedRead {
+                        object,
+                        _reservation: reservation,
+                    })
+                })
+                .await
+                .map_err(|error| object_error(owned_join_error(error)))?
+                .map_err(object_error)?;
                 if object.body_revision != Some(revision)
                     || object.etag != expected_etag
                     || object.data.len() as u64 != end - start
@@ -214,7 +388,7 @@ impl ManagedObjectStore {
                         reason: "Dataset range differs from the bound identity or requested length",
                     }));
                 }
-                Ok(Some((Bytes::from(object.data), end)))
+                Ok(Some((object.into_bytes(), end)))
             }
         })
         .boxed();
@@ -265,7 +439,7 @@ impl ManagedObjectStore {
     ) -> Result<CatalogMetadataRef, LanceManifestError> {
         self.access.check(key.as_str(), ManagedObjectOperation::CreateOnly)?;
         self.check_length(content.len() as u64)?;
-        let created = self.objects.create_only(&self.access, key, content.clone()).await?;
+        let created = self.create_owned(key, content.clone()).await?;
         let revision = require_revision(created.body_revision)?;
         if created.size != content.len() as u64 {
             return Err(LanceManifestError::LengthMismatch {
@@ -282,7 +456,7 @@ impl ManagedObjectStore {
                 source: Box::new(source),
             })?;
         self.access.check(key.as_str(), ManagedObjectOperation::Get)?;
-        let object = self.objects.get(&self.access, key, None, Some(revision)).await?;
+        let object = self.read_owned(key, None, revision, content.len() as u64).await?;
         if object.body_revision != Some(revision) || object.data.as_slice() != content.as_ref() {
             return Err(LanceManifestError::ReferenceMismatch {
                 reason: "candidate readback differs from its create-only result",
@@ -332,7 +506,7 @@ impl ManagedObjectStore {
                 operation: "acquire candidate reconciliation permit",
                 source: Box::new(source),
             })?;
-        let metadata = self.objects.head(&self.access, key).await?;
+        let metadata = self.head_owned(key).await?;
         if metadata.size != content.len() as u64 {
             return Err(LanceManifestError::LengthMismatch {
                 expected: content.len() as u64,
@@ -340,7 +514,7 @@ impl ManagedObjectStore {
             });
         }
         let revision = require_revision(metadata.body_revision)?;
-        let object = self.objects.get(&self.access, key, None, Some(revision)).await?;
+        let object = self.read_owned(key, None, revision, content.len() as u64).await?;
         if object.body_revision != Some(revision) || object.data.as_slice() != content.as_ref() || object.etag != metadata.etag {
             return Err(LanceManifestError::ReferenceMismatch {
                 reason: "existing candidate differs from the exact attempted content",
@@ -351,7 +525,7 @@ impl ManagedObjectStore {
         Ok(reference)
     }
 
-    pub(super) async fn read_exact(&self, reference: &CatalogMetadataRef) -> Result<TableCatalogObject, LanceManifestError> {
+    pub(super) async fn read_exact(&self, reference: &CatalogMetadataRef) -> Result<BudgetedRead, LanceManifestError> {
         self.bind_reference(reference)?;
         let _permit = self
             .read_permits
@@ -363,13 +537,12 @@ impl ManagedObjectStore {
             })?;
         self.access
             .check(reference.object_key().as_str(), ManagedObjectOperation::Head)?;
-        let metadata = self.objects.head(&self.access, reference.object_key()).await?;
+        let metadata = self.head_owned(reference.object_key()).await?;
         check_metadata(reference, &metadata)?;
         self.check_length(metadata.size)?;
         let revision = require_revision(reference.body_revision().map(|value| value.as_uuid()))?;
         let object = self
-            .objects
-            .get(&self.access, reference.object_key(), None, Some(revision))
+            .read_owned(reference.object_key(), None, revision, reference.content_length())
             .await?;
         let actual = CatalogMetadataRef::from_read(reference.object_key().clone(), &object)?;
         if actual.content_length() != reference.content_length() {
@@ -460,6 +633,7 @@ struct DatasetMultipart {
     length: u64,
     completed: Option<TableCatalogObjectMetadata>,
     aborted: bool,
+    control: Option<crate::table_catalog::VectorMaintenanceControl>,
 }
 
 impl fmt::Debug for DatasetMultipart {
@@ -485,8 +659,34 @@ impl MultipartUpload for DatasetMultipart {
         self.length = length;
         let number = self.parts;
         let upload = self.upload.clone();
-        let content = payload.into_iter().collect();
-        async move { upload.put_part(number, content, size).await.map_err(object_error) }.boxed()
+        let control = self.control.clone();
+        let reservation = match control.as_ref().map(|control| control.reserve_memory(size)).transpose() {
+            Ok(reservation) => reservation,
+            Err(error) => return futures::future::ready(Err(object_error(error.into()))).boxed(),
+        };
+        let content: Vec<Bytes> = payload
+            .into_iter()
+            .map(|bytes| {
+                Bytes::from_owner(BudgetedBytes {
+                    bytes,
+                    _reservation: reservation.clone(),
+                })
+            })
+            .collect();
+        async move {
+            let permit = match &control {
+                Some(control) => Some(control.acquire_io().await.map_err(|error| object_error(error.into()))?),
+                None => None,
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                upload.put_part(number, content, size).await
+            })
+            .await
+            .map_err(|error| object_error(owned_join_error(error)))?
+            .map_err(object_error)
+        }
+        .boxed()
     }
 
     async fn complete(&mut self) -> object_store_lance::Result<PutResult> {
@@ -496,7 +696,19 @@ impl MultipartUpload for DatasetMultipart {
         if let Some(metadata) = &self.completed {
             return Ok(put_result(metadata));
         }
-        let metadata = self.upload.complete(self.parts).await.map_err(object_error)?;
+        let permit = match &self.control {
+            Some(control) => Some(control.acquire_io().await.map_err(|error| object_error(error.into()))?),
+            None => None,
+        };
+        let upload = self.upload.clone();
+        let parts = self.parts;
+        let metadata = tokio::spawn(async move {
+            let _permit = permit;
+            upload.complete(parts).await
+        })
+        .await
+        .map_err(|error| object_error(owned_join_error(error)))?
+        .map_err(object_error)?;
         if metadata.size != self.length {
             return Err(object_error(LanceManifestError::LengthMismatch {
                 expected: self.length,
@@ -512,7 +724,11 @@ impl MultipartUpload for DatasetMultipart {
         if self.completed.is_some() || self.aborted {
             return Ok(());
         }
-        self.upload.abort().await.map_err(object_error)?;
+        let upload = self.upload.clone();
+        tokio::spawn(async move { upload.abort().await })
+            .await
+            .map_err(|error| object_error(owned_join_error(error)))?
+            .map_err(object_error)?;
         self.aborted = true;
         Ok(())
     }
@@ -618,15 +834,17 @@ impl ObjectStore for ManagedObjectStore {
             };
         }
         let expected_length = payload.content_length() as u64;
+        let _buffer_reservation = self
+            .control
+            .get()
+            .map(|control| control.reserve_memory(expected_length))
+            .transpose()
+            .map_err(|error| object_error(error.into()))?;
         let mut bytes = BytesMut::with_capacity(payload.content_length());
         for part in payload {
             bytes.extend_from_slice(&part);
         }
-        let metadata = self
-            .objects
-            .create_only(&self.access, &key, bytes.freeze())
-            .await
-            .map_err(object_error)?;
+        let metadata = self.create_owned(&key, bytes.freeze()).await.map_err(object_error)?;
         if metadata.size != expected_length {
             return Err(object_error(LanceManifestError::LengthMismatch {
                 expected: expected_length,
@@ -649,11 +867,19 @@ impl ObjectStore for ManagedObjectStore {
         self.access
             .check(key.as_str(), ManagedObjectOperation::CreateMultipart)
             .map_err(|source| object_error(source.into()))?;
-        let upload = self
-            .objects
-            .create_multipart(&self.access, &key)
-            .await
-            .map_err(object_error)?;
+        let permit = match self.control.get() {
+            Some(control) => Some(control.acquire_io().await.map_err(|error| object_error(error.into()))?),
+            None => None,
+        };
+        let objects = self.objects.clone();
+        let access = self.access.clone();
+        let upload = tokio::spawn(async move {
+            let _permit = permit;
+            objects.create_multipart(&access, &key).await
+        })
+        .await
+        .map_err(|error| object_error(owned_join_error(error)))?
+        .map_err(object_error)?;
         Ok(Box::new(DatasetMultipart {
             upload,
             location: location.clone(),
@@ -662,6 +888,7 @@ impl ObjectStore for ManagedObjectStore {
             length: 0,
             completed: None,
             aborted: false,
+            control: self.control.get().cloned(),
         }))
     }
 
@@ -677,13 +904,48 @@ impl ObjectStore for ManagedObjectStore {
             .check(location.as_ref(), operation)
             .map_err(|source| object_error(source.into()))?;
         if let Some(reference) = self.data_reference(location).map_err(object_error)? {
-            return self.get_data(location, options, reference).await;
+            let result = self.get_data(location, options, reference).await?;
+            let length = result.range.end - result.range.start;
+            let Some(control) = self.control.get().filter(|_| length > DATA_READ_CHUNK_BYTES) else {
+                return Ok(result);
+            };
+            let reservation = control.reserve_memory(length).map_err(|error| object_error(error.into()))?;
+            let GetResult {
+                payload,
+                meta,
+                range,
+                attributes,
+                extensions,
+            } = result;
+            let GetResultPayload::Stream(mut chunks) = payload else {
+                return Err(unsupported("managed Dataset read returned a local file"));
+            };
+            let capacity = usize::try_from(length).map_err(|_| unsupported("Dataset range exceeds address space"))?;
+            let output = stream::once(async move {
+                use futures::TryStreamExt;
+                let mut bytes = BytesMut::with_capacity(capacity);
+                while let Some(chunk) = chunks.try_next().await? {
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(Bytes::from_owner(BudgetedBytes {
+                    bytes: bytes.freeze(),
+                    _reservation: Some(reservation),
+                }))
+            })
+            .boxed();
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(output),
+                meta,
+                range,
+                attributes,
+                extensions,
+            });
         }
         let reference = self.reference(location).map_err(object_error)?;
         let object = self.read_exact(&reference).await.map_err(object_error)?;
         let metadata = TableCatalogObjectMetadata {
             body_revision: object.body_revision,
-            etag: object.etag,
+            etag: object.etag.clone(),
             mod_time: object.mod_time,
             size: object.data.len() as u64,
         };
@@ -708,7 +970,7 @@ impl ObjectStore for ManagedObjectStore {
         let bytes = if options.head {
             Bytes::new()
         } else {
-            Bytes::from(object.data).slice(range.start as usize..range.end as usize)
+            object.into_bytes().slice(range.start as usize..range.end as usize)
         };
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
@@ -723,8 +985,12 @@ impl ObjectStore for ManagedObjectStore {
         &self,
         locations: BoxStream<'static, object_store_lance::Result<Path>>,
     ) -> BoxStream<'static, object_store_lance::Result<Path>> {
+        #[cfg(test)]
+        let attempts = self.delete_attempts.clone();
         locations
-            .map(|result| {
+            .map(move |result| {
+                #[cfg(test)]
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 result.and_then(|_| Err(unsupported("managed manifest deletion requires Catalog retention authorization")))
             })
             .boxed()
@@ -778,5 +1044,99 @@ impl ObjectStoreProvider for ManagedStoreProvider {
             access.bucket().incarnation().as_uuid(),
             access.table_id().as_str()
         ))
+    }
+}
+
+pub(super) struct BudgetedRead {
+    object: TableCatalogObject,
+    _reservation: Option<Arc<crate::table_catalog::VectorMaintenanceMemoryReservation>>,
+}
+impl std::ops::Deref for BudgetedRead {
+    type Target = TableCatalogObject;
+    fn deref(&self) -> &Self::Target {
+        &self.object
+    }
+}
+impl AsRef<[u8]> for BudgetedRead {
+    fn as_ref(&self) -> &[u8] {
+        &self.object.data
+    }
+}
+impl BudgetedRead {
+    pub(super) fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+struct BudgetedBytes {
+    bytes: Bytes,
+    _reservation: Option<Arc<crate::table_catalog::VectorMaintenanceMemoryReservation>>,
+}
+impl AsRef<[u8]> for BudgetedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+fn owned_join_error(source: tokio::task::JoinError) -> LanceManifestError {
+    LanceManifestError::Storage {
+        operation: "join owned maintenance I/O",
+        source: Box::new(source),
+    }
+}
+
+impl ManagedObjectStore {
+    pub(super) async fn exact_data_reference(&self, key: &CatalogObjectKey) -> Result<CatalogMetadataRef, LanceManifestError> {
+        use futures::TryStreamExt;
+        use sha2::{Digest, Sha256};
+        let metadata = self
+            .data_reference(&Path::from(key.as_str()))?
+            .ok_or(LanceManifestError::ReferenceMismatch {
+                reason: "reference closure contains an unbound object",
+            })?;
+        let mut stream = self
+            .get_data(&Path::from(key.as_str()), GetOptions::default(), metadata.clone())
+            .await?
+            .into_stream();
+        let mut digest = Sha256::new();
+        let mut length = 0u64;
+        while let Some(bytes) = stream.try_next().await? {
+            length = length
+                .checked_add(bytes.len() as u64)
+                .ok_or(LanceManifestError::ReferenceMismatch {
+                    reason: "reference byte count overflowed",
+                })?;
+            digest.update(&bytes);
+        }
+        if length != metadata.size {
+            return Err(LanceManifestError::LengthMismatch {
+                expected: metadata.size,
+                actual: length,
+            });
+        }
+        Ok(CatalogMetadataRef::try_from_identity(
+            key.clone(),
+            length,
+            crate::table_catalog::CatalogContentSha256::from_bytes(digest.finalize().into()),
+            crate::table_catalog::CatalogBodyRevision::try_new(require_revision(metadata.body_revision)?)?,
+            metadata.etag,
+        )?)
+    }
+
+    pub(super) async fn discover_exact_candidate(
+        &self,
+        key: &CatalogObjectKey,
+    ) -> Result<Option<CatalogMetadataRef>, LanceManifestError> {
+        let metadata = match self.head_owned(key).await {
+            Ok(metadata) => metadata,
+            Err(LanceManifestError::ObjectNotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.check_length(metadata.size)?;
+        let object = self
+            .read_owned(key, None, require_revision(metadata.body_revision)?, metadata.size)
+            .await?;
+        let reference = CatalogMetadataRef::from_read(key.clone(), &object)?;
+        check_metadata(&reference, &metadata)?;
+        self.bind_reference(&reference)?;
+        Ok(Some(reference))
     }
 }

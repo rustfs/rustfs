@@ -65,8 +65,13 @@ mod maintenance;
 mod model;
 mod rename_recovery;
 mod store;
+mod vector_maintenance_model;
 
-pub(crate) use background::CatalogBackgroundTask;
+pub(crate) use background::{CatalogBackgroundTask, CatalogBackgroundTaskError};
+
+#[cfg(test)]
+#[path = "store/vector_retirement_app_tests.rs"]
+mod retirement_app_tests;
 pub(crate) use commit::*;
 pub(crate) use error::CatalogIoErrorKind;
 pub use error::{CatalogIdentifierError, TableObjectMutationError};
@@ -86,6 +91,7 @@ pub(crate) use maintenance::*;
 pub(crate) use model::*;
 pub(crate) use rename_recovery::spawn_table_rename_recovery;
 pub(crate) use store::*;
+pub(crate) use vector_maintenance_model::*;
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;
 pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved for the table catalog";

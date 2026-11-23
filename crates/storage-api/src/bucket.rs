@@ -255,6 +255,8 @@ pub enum ManagedObjectOperation {
     UploadPart,
     CompleteMultipart,
     AbortMultipart,
+    /// Exact retirement deletion; application authorization and retained owners are required.
+    Delete,
 }
 
 /// Pure scope data. Possessing this value does not authorize an operation.

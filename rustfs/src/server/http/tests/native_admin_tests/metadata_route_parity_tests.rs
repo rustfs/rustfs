@@ -213,6 +213,7 @@ async fn seed_table_bucket(env: &rustfs_test_utils::TestECStoreEnv) {
             table_uuid: uuid::Uuid::new_v4().to_string(),
             vector_head_binding: None,
             vector_index_definition: None,
+            vector_maintenance_binding: None,
             format: "ICEBERG".to_owned(),
             format_version: 2,
             warehouse_location: format!("s3://{TABLES}/tables/table-id"),

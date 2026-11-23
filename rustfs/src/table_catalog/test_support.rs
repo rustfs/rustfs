@@ -27,6 +27,9 @@ pub(crate) mod real_maintenance;
 
 pub(crate) mod real_catalog_backend;
 
+#[cfg(test)]
+pub(crate) mod catalog_write_faults;
+
 #[cfg(unix)]
 pub(crate) fn vector_catalog_paths() -> TableCatalogObjectPaths {
     TableCatalogObjectPaths::for_vector()
@@ -2062,6 +2065,7 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
 impl IcebergCatalogCommit for NoopTableCatalogStore {
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
         let table = TableEntry {
+            vector_maintenance_binding: None,
             vector_index_definition: None,
             vector_head_binding: None,
             version: TABLE_CATALOG_ENTRY_VERSION,

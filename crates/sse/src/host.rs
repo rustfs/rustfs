@@ -19,7 +19,7 @@
 //! entry point that consults the server takes the host as its first argument, so
 //! a caller cannot reach key selection without saying which server it speaks for.
 
-use crate::{SseError, SseKmsPrincipal};
+use crate::{SseDekProvider, SseError, SseKmsPrincipal};
 use async_trait::async_trait;
 use rustfs_kms::KmsServiceManager;
 use rustfs_kms::service::ObjectEncryptionService;
@@ -40,6 +40,29 @@ pub trait SseHost: Send + Sync {
     /// Only its status is read, to tell a configured KMS that is not serving
     /// (retryable) from a deployment that never configured one (a request error).
     fn kms_service_manager(&self) -> Option<Arc<KmsServiceManager>>;
+
+    /// Whether KMS is configured but unavailable for this operation.
+    ///
+    /// An operation-bound host returns its admission-time snapshot. The default
+    /// implementation reads the current manager status for ordinary S3 requests.
+    async fn kms_configured_but_unavailable(&self) -> bool {
+        match self.kms_service_manager() {
+            Some(manager) => !matches!(manager.get_status().await, rustfs_kms::KmsServiceStatus::NotConfigured),
+            None => false,
+        }
+    }
+
+    /// The local master-key provider serving this operation.
+    ///
+    /// An operation-bound host keeps its provider in the owning runtime. The
+    /// default uses the ordinary process-local provider and test injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing local-master-key configuration or cache error.
+    fn local_sse_dek_provider(&self) -> Result<Arc<dyn SseDekProvider>, SseError> {
+        crate::kms::provider::get_local_sse_dek_provider()
+    }
 
     /// The bucket's default-encryption configuration.
     ///

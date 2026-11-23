@@ -42,7 +42,14 @@ impl VerifiedVectorRequest {
             presigned: scheme.location() == SigLocation::Query,
         };
         let envelope = RequestEnvelope::from_gateway(context, &server, signature).map_err(s3_error)?;
-        admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature).map_err(s3_error)?;
+        admit_operation(
+            envelope.method(),
+            envelope.headers(),
+            envelope.uri().query(),
+            context.operation(),
+            signature,
+        )
+        .map_err(s3_error)?;
         Ok(Self {
             server,
             envelope,
@@ -53,6 +60,16 @@ impl VerifiedVectorRequest {
 
     pub(super) fn request(&self) -> &Request {
         &self.request
+    }
+
+    #[cfg(test)]
+    pub(super) fn fault_http_request_id(&self) -> Option<&str> {
+        self.envelope.request_context().map(|context| context.request_id.as_str())
+    }
+
+    #[cfg(test)]
+    pub(super) fn fault_account(&self) -> Option<&str> {
+        self.envelope.credentials().map(|credentials| credentials.access_key())
     }
 
     pub(super) fn revoked_identity_audit_envelope(&self) -> Result<RequestEnvelope, ProtocolError> {

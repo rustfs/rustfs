@@ -23,7 +23,7 @@ mod dropped_table_history;
 mod superseded_commit_recovery;
 
 #[path = "tests/prepared_commit.rs"]
-mod prepared_commit;
+pub(in crate::table_catalog) mod prepared_commit;
 
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
@@ -2065,6 +2065,7 @@ fn catalog_entry_structures_serialize_stable_fields() {
         updated_at: Some("2026-05-23T00:00:00Z".to_string()),
     };
     let table = TableEntry {
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
@@ -2123,6 +2124,7 @@ fn catalog_entry_deserialization_rejects_unknown_fields() {
     use std::collections::BTreeMap;
 
     let table = TableEntry {
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
@@ -3421,6 +3423,7 @@ async fn snapshot_validation_bounds_changed_statistics_object_fanout() {
             .collect(),
     );
     let entry = TableEntry {
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
@@ -3484,6 +3487,7 @@ async fn snapshot_validation_bounds_changed_statistics_object_bytes() {
             .collect(),
     );
     let entry = TableEntry {
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
@@ -3888,6 +3892,7 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
     let entry = TableEntry {
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
@@ -4940,6 +4945,7 @@ pub(super) fn test_table_entry(
     metadata_location: String,
 ) -> TableEntry {
     TableEntry {
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,

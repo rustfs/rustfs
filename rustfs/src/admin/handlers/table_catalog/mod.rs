@@ -3849,6 +3849,7 @@ fn table_entry_from_register_request(
     Ok(crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -3885,6 +3886,7 @@ fn table_entry_from_import_request(
     Ok(crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -3947,6 +3949,7 @@ fn table_entry_from_create_table_request(
     let entry = crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -7271,6 +7274,7 @@ where
     let mut entry = crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),

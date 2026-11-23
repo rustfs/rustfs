@@ -251,6 +251,7 @@ lance = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-file = { workspace = true }
+lance-index = { workspace = true }
 lance-io = { workspace = true }
 lance-table = { workspace = true }
 object_store_lance = { workspace = true }

@@ -4,13 +4,16 @@
 use std::{collections::BTreeSet, num::NonZeroU64};
 
 use lance_file::version::ConcreteFileVersion;
-use lance_table::format::{Manifest, pb};
+use lance_table::format::{IndexMetadata, Manifest, pb};
 use object_store_lance::path::Path;
+use prost::Message;
 use uuid::Uuid;
 
 use crate::table_catalog::{CatalogObjectKey, CatalogResourceIdentity};
 
-use super::LanceManifestError;
+use super::{LanceManifestError, VectorIndexManifestSpec};
+
+pub(super) const ANN_INDEX_NAME: &str = "rustfs_vector_ann";
 
 pub(super) struct ManifestObjectReference {
     pub key: CatalogObjectKey,
@@ -208,6 +211,15 @@ pub(super) fn validate_writable_relative_path(relative: &str) -> Result<(), Lanc
         canonical_uuid(id)?;
         return Ok(());
     }
+    if let Some(name) = relative.strip_prefix("_indices/") {
+        let (id, file) = name.split_once('/').ok_or_else(invalid)?;
+        canonical_uuid(id)?;
+        return if matches!(file, "index.idx" | "auxiliary.idx") {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
+    }
     if let Some(name) = relative.strip_prefix("_deletions/") {
         let name = name
             .strip_suffix(".arrow")
@@ -231,7 +243,11 @@ pub(super) fn validate_writable_relative_path(relative: &str) -> Result<(), Lanc
 pub(super) fn validate_transaction(transaction: &pb::Transaction, manifest: &Manifest) -> Result<(), LanceManifestError> {
     use pb::transaction::Operation;
     canonical_uuid(&transaction.uuid)?;
-    if transaction.read_version == 0 || transaction.read_version.checked_add(1) != Some(manifest.version) {
+    if transaction.read_version == 0
+        || (transaction.read_version.checked_add(1) != Some(manifest.version)
+            && !(matches!(transaction.operation, Some(Operation::Rewrite(_)))
+                && transaction.read_version.checked_add(2) == Some(manifest.version)))
+    {
         return Err(LanceManifestError::ReferenceMismatch {
             reason: "transaction read version differs from the manifest predecessor",
         });
@@ -240,6 +256,9 @@ pub(super) fn validate_transaction(transaction: &pb::Transaction, manifest: &Man
         return Err(LanceManifestError::UnsupportedFormat {
             reason: "Vector transactions cannot set tags or arbitrary properties",
         });
+    }
+    if is_maintenance_transaction(transaction) {
+        return validate_maintenance_transaction(transaction, manifest);
     }
     let (updated, new, removed) = match transaction.operation.as_ref() {
         Some(Operation::Update(update)) => {
@@ -316,6 +335,251 @@ pub(super) fn validate_transaction(transaction: &pb::Transaction, manifest: &Man
         return Err(LanceManifestError::ReferenceMismatch {
             reason: "transaction file name differs from the transaction identity",
         });
+    }
+    Ok(())
+}
+
+pub(super) fn decode_indices(indices: Vec<pb::IndexMetadata>) -> Result<Vec<IndexMetadata>, LanceManifestError> {
+    indices
+        .into_iter()
+        .map(|index| {
+            if index.clustering_id.is_some()
+                || !index.metadata.is_empty()
+                || index.created_at.is_some_and(|value| {
+                    i64::try_from(value)
+                        .ok()
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                        .is_none()
+                })
+            {
+                return Err(LanceManifestError::UnsupportedFormat {
+                    reason: "unsupported index metadata or timestamp",
+                });
+            }
+            let bitmap_length = index.fragment_bitmap.len();
+            let decoded =
+                IndexMetadata::try_from(index).map_err(|source| LanceManifestError::engine("decode index metadata", source))?;
+            if decoded
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.serialized_size() != bitmap_length)
+            {
+                return Err(LanceManifestError::CorruptManifest {
+                    reason: "ANN fragment bitmap contains trailing or unsupported bytes",
+                });
+            }
+            Ok(decoded)
+        })
+        .collect()
+}
+
+pub(super) fn validate_indices(
+    indices: &[IndexMetadata],
+    manifest: &Manifest,
+    definition: &VectorIndexManifestSpec,
+) -> Result<(), LanceManifestError> {
+    if indices.len() > 1 {
+        return Err(LanceManifestError::UnsupportedFormat {
+            reason: "only one logical ANN index is supported",
+        });
+    }
+    let vector = manifest.schema.field("vector").ok_or(LanceManifestError::SchemaMismatch {
+        reason: "vector field is absent",
+    })?;
+    for index in indices {
+        if index.uuid.is_nil()
+            || index.name != ANN_INDEX_NAME
+            || index.fields != [vector.id]
+            || !index.covering_fields.is_empty()
+            || index.base_id.is_some()
+            || index.index_version != 1
+            || index.dataset_version == 0
+            || index.dataset_version > manifest.version
+            || index.fragment_bitmap.is_none()
+        {
+            return Err(LanceManifestError::UnsupportedFormat {
+                reason: "unsupported ANN identity, fields, version or coverage",
+            });
+        }
+        let details = index.index_details.as_ref().ok_or(LanceManifestError::CorruptManifest {
+            reason: "ANN details are absent",
+        })?;
+        if details.type_url != "/lance.index.pb.VectorIndexDetails"
+            && details.type_url != "type.googleapis.com/lance.index.pb.VectorIndexDetails"
+        {
+            return Err(LanceManifestError::UnsupportedFormat {
+                reason: "unsupported ANN details type",
+            });
+        }
+        let details = lance_index::pb::VectorIndexDetails::decode(details.value.as_slice())
+            .map_err(|source| LanceManifestError::Protobuf { source })?;
+        let metric = match definition.distance_metric {
+            super::schema::VectorDistanceMetric::Euclidean => 0,
+            super::schema::VectorDistanceMetric::Cosine => 1,
+        };
+        if details.metric_type != metric
+            || details.target_partition_size != 0
+            || details.hnsw_index_config.is_some()
+            || !matches!(details.compression, Some(lance_index::pb::vector_index_details::Compression::Flat(_)))
+        {
+            return Err(LanceManifestError::UnsupportedFormat {
+                reason: "ANN requires the configured metric and native IVF_FLAT",
+            });
+        }
+        for (key, value) in &details.runtime_hints {
+            let expected = match key.as_str() {
+                "lance.ivf.max_iters" => Some("20"),
+                "lance.ivf.sample_rate" => Some("64"),
+                "lance.ivf.shuffle_partition_batches" => Some("10240"),
+                "lance.ivf.shuffle_partition_concurrency" => Some("2"),
+                "lance.skip_transpose" => Some("false"),
+                _ => None,
+            };
+            if expected.is_some_and(|expected| expected != value) {
+                return Err(LanceManifestError::UnsupportedFormat {
+                    reason: "ANN runtime hint is unsupported",
+                });
+            }
+        }
+        index_objects(index, None)?;
+    }
+    Ok(())
+}
+
+fn index_objects(
+    index: &IndexMetadata,
+    resource: Option<&CatalogResourceIdentity>,
+) -> Result<Vec<ManifestObjectReference>, LanceManifestError> {
+    let files = index.files.as_ref().ok_or(LanceManifestError::ReferenceMismatch {
+        reason: "ANN file size table is absent",
+    })?;
+    if files.len() != 2 {
+        return Err(LanceManifestError::ReferenceMismatch {
+            reason: "IVF_FLAT requires exactly two files",
+        });
+    }
+    let mut names = BTreeSet::new();
+    let mut references = Vec::new();
+    for file in files {
+        if !matches!(file.path.as_str(), "index.idx" | "auxiliary.idx")
+            || !names.insert(file.path.as_str())
+            || file.size_bytes == 0
+        {
+            return Err(LanceManifestError::ReferenceMismatch {
+                reason: "ANN file name, size or uniqueness is invalid",
+            });
+        }
+        if let Some(resource) = resource {
+            references.push(ManifestObjectReference {
+                key: CatalogObjectKey::try_new(format!("{}_indices/{}/{}", resource.dataset_prefix(), index.uuid, file.path))?,
+                expected_size: NonZeroU64::new(file.size_bytes),
+            });
+        }
+    }
+    Ok(references)
+}
+
+pub(super) fn index_references(
+    indices: &[IndexMetadata],
+    resource: &CatalogResourceIdentity,
+) -> Result<Vec<ManifestObjectReference>, LanceManifestError> {
+    indices.iter().try_fold(Vec::new(), |mut references, index| {
+        references.extend(index_objects(index, Some(resource))?);
+        Ok(references)
+    })
+}
+
+pub(super) fn is_maintenance_transaction(transaction: &pb::Transaction) -> bool {
+    matches!(
+        transaction.operation,
+        Some(
+            pb::transaction::Operation::CreateIndex(_)
+                | pb::transaction::Operation::ReserveFragments(_)
+                | pb::transaction::Operation::Rewrite(_)
+        )
+    )
+}
+
+fn validate_maintenance_transaction(transaction: &pb::Transaction, manifest: &Manifest) -> Result<(), LanceManifestError> {
+    use pb::transaction::Operation;
+    if manifest
+        .transaction_file
+        .as_ref()
+        .is_some_and(|name| *name != format!("{}-{}.txn", transaction.read_version, transaction.uuid))
+    {
+        return Err(LanceManifestError::ReferenceMismatch {
+            reason: "maintenance transaction file identity differs",
+        });
+    }
+    match transaction.operation.as_ref() {
+        Some(Operation::CreateIndex(create)) => {
+            if create.new_indices.len() != 1 || create.removed_indices.len() > 1 {
+                return Err(LanceManifestError::UnsupportedFormat {
+                    reason: "ANN rebuild must replace the complete logical index",
+                });
+            }
+            decode_indices(create.new_indices.clone())?;
+            decode_indices(create.removed_indices.clone())?;
+        }
+        Some(Operation::ReserveFragments(_)) => {}
+        Some(Operation::Rewrite(rewrite)) => {
+            if !rewrite.old_fragments.is_empty() || !rewrite.new_fragments.is_empty() || rewrite.groups.is_empty() {
+                return Err(LanceManifestError::UnsupportedFormat {
+                    reason: "compaction requires explicit rewrite groups",
+                });
+            }
+            let mut old_ids = BTreeSet::new();
+            let mut new_ids = BTreeSet::new();
+            for group in &rewrite.groups {
+                if group.old_fragments.is_empty() {
+                    return Err(LanceManifestError::CorruptManifest {
+                        reason: "rewrite source group is empty",
+                    });
+                }
+                validate_fragment_protobuf(&group.old_fragments)?;
+                validate_fragment_protobuf(&group.new_fragments)?;
+                for old in &group.old_fragments {
+                    if !old_ids.insert(old.id) || manifest.fragments.iter().any(|fragment| fragment.id == old.id) {
+                        return Err(LanceManifestError::ReferenceMismatch {
+                            reason: "rewrite source is repeated or retained",
+                        });
+                    }
+                }
+                for new in &group.new_fragments {
+                    if !new_ids.insert(new.id)
+                        || !manifest
+                            .fragments
+                            .iter()
+                            .any(|fragment| pb::DataFragment::from(fragment) == *new)
+                    {
+                        return Err(LanceManifestError::ReferenceMismatch {
+                            reason: "rewrite output is repeated or absent",
+                        });
+                    }
+                }
+                let live = |fragments: &[pb::DataFragment]| {
+                    fragments.iter().try_fold(0u64, |sum, fragment| {
+                        sum.checked_add(
+                            fragment.physical_rows
+                                - fragment
+                                    .deletion_file
+                                    .as_ref()
+                                    .map_or(0, |deletion| deletion.num_deleted_rows),
+                        )
+                    })
+                };
+                if live(&group.old_fragments) != live(&group.new_fragments) {
+                    return Err(LanceManifestError::ReferenceMismatch {
+                        reason: "rewrite changes the live row count",
+                    });
+                }
+            }
+        }
+        _ => {
+            return Err(LanceManifestError::UnsupportedFormat {
+                reason: "unsupported maintenance operation",
+            });
+        }
     }
     Ok(())
 }

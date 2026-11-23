@@ -318,6 +318,7 @@ lance = { version = "=14.0.2", default-features = false }
 lance-arrow = { version = "=14.0.2", default-features = false }
 lance-core = { version = "=14.0.2", default-features = false }
 lance-file = { version = "=14.0.2", default-features = false }
+lance-index = { version = "=14.0.2", default-features = false }
 lance-io = { version = "=14.0.2", default-features = false }
 lance-table = { version = "=14.0.2", default-features = false }
 lazy_static = "1.5.1"

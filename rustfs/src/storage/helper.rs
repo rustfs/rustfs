@@ -330,6 +330,7 @@ pub struct EnabledOperationHelper {
     audit_enabled: bool,
     notify_enabled: bool,
     audit_builder: Option<AuditEntryBuilder>,
+    audit_tags: HashMap<String, Value>,
     api_builder: ApiDetailsBuilder,
     event_builder: Option<EventArgsBuilder>,
     start_time: std::time::Instant,
@@ -486,12 +487,21 @@ impl OperationHelper {
             audit_enabled,
             notify_enabled,
             audit_builder,
+            audit_tags: HashMap::new(),
             api_builder,
             event_builder,
             start_time: request_context.start_time,
             request_context,
             kms_audit,
         }))
+    }
+
+    /// Adds trusted operation identity fields while retaining the request audit fields.
+    pub(crate) fn with_audit_tags(mut self, tags: impl IntoIterator<Item = (String, Value)>) -> Self {
+        if let Self::Enabled(state) = &mut self {
+            state.audit_tags.extend(tags);
+        }
+        self
     }
 
     /// True when a pending event notification still needs the final ObjectInfo.
@@ -769,7 +779,13 @@ impl Drop for OperationHelper {
         if state.audit_enabled
             && let Some(builder) = state.audit_builder.take()
         {
-            let entry = builder.build();
+            let mut entry = builder.build();
+            if !state.audit_tags.is_empty() {
+                let tags = entry.tags.get_or_insert_with(HashMap::new);
+                for (key, value) in std::mem::take(&mut state.audit_tags) {
+                    tags.entry(key).or_insert(value);
+                }
+            }
             #[cfg(test)]
             if let Some(probe) = entry.api.bucket.as_deref().and_then(completion_probe) {
                 probe.audits.lock().expect("audits").push(entry.clone());

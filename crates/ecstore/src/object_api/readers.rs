@@ -717,6 +717,7 @@ impl ReadPlan {
         h: &HeaderMap<HeaderValue>,
         resolver: Option<&dyn ObjectEncryptionResolver>,
     ) -> Result<Self> {
+        let resolver = opts.read_encryption_resolver.as_deref().or(resolver);
         let mut rs = rs;
         // A part number addresses the object's PLAINTEXT bytes. A restore read
         // serves the stored representation instead (see
@@ -1500,6 +1501,76 @@ mod tests {
             HeaderValue::from_str(&BASE64_STANDARD.encode_to_string(key_bytes)).expect("test key header is valid"),
         );
         headers
+    }
+
+    struct CountingReadResolver {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for CountingReadResolver {
+        async fn resolve_read_material(
+            &self,
+            _request: ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                Err(EncryptionResolutionError::new(
+                    EncryptionResolutionErrorKind::InvalidMetadata,
+                    "bound resolver refused",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_read_resolver_failure_never_uses_instance_resolver() {
+        let object = ObjectInfo {
+            size: 42,
+            user_defined: Arc::new(HashMap::from([
+                ("x-rustfs-encryption-key".to_owned(), "encrypted-key".to_owned()),
+                ("x-rustfs-encryption-original-size".to_owned(), "10".to_owned()),
+            ])),
+            ..Default::default()
+        };
+        for fail in [false, true] {
+            let bound = Arc::new(CountingReadResolver {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail,
+            });
+            let ambient = CountingReadResolver {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: false,
+            };
+            let opts = ObjectOptions {
+                read_encryption_resolver: Some(bound.clone()),
+                ..Default::default()
+            };
+            let cloned = opts.clone();
+            let result = ReadPlan::build_with_resolver(None, &object, &cloned, &HeaderMap::new(), Some(&ambient)).await;
+            assert!(result.is_err(), "encrypted material must be required");
+            assert_eq!(bound.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                ambient.calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "override failure must remain final"
+            );
+        }
+        let ambient = CountingReadResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        };
+        let result =
+            ReadPlan::build_with_resolver(None, &object, &ObjectOptions::default(), &HeaderMap::new(), Some(&ambient)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            ambient.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ordinary options retain the instance resolver"
+        );
     }
 
     #[tokio::test]

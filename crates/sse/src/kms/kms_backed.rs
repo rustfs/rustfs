@@ -14,8 +14,7 @@
 
 //! The provider that wraps and unwraps data keys through the KMS service.
 
-use crate::core::audit::KmsDataPlaneFailure;
-use crate::error::SseError;
+use crate::error::{SseError, kms_operation_error};
 use crate::host::SseHost;
 use crate::kms::provider::SseDekProvider;
 use async_trait::async_trait;
@@ -33,18 +32,8 @@ pub(crate) struct KmsSseDekProvider<'a> {
 /// Where a [`KmsSseDekProvider`] finds the service that is serving right now.
 enum KmsServiceSource<'a> {
     Host(&'a dyn SseHost),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     Manager(Arc<rustfs_kms::KmsServiceManager>),
-}
-
-pub(crate) fn kms_operation_error(error: rustfs_kms::KmsError) -> SseError {
-    let class = rustfs_kms::audit::error_class(&error);
-    let mut api_error = SseError::internal(error);
-    // Wrap rather than replace the source so the original chain stays intact for
-    // logging; the wrapper only adds the class the audit attachment needs.
-    let source = api_error.source.take();
-    api_error.source = Some(Box::new(KmsDataPlaneFailure { class, source }));
-    api_error
 }
 
 /// Classification for a failed data-key unwrap.
@@ -79,7 +68,7 @@ impl<'a> KmsSseDekProvider<'a> {
         Ok(provider)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn new_with_service_manager(service_manager: Arc<rustfs_kms::KmsServiceManager>) -> Result<Self, SseError> {
         let provider = Self {
             service_source: KmsServiceSource::Manager(service_manager),
@@ -94,7 +83,7 @@ impl<'a> KmsSseDekProvider<'a> {
     async fn current_service(&self) -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
         match &self.service_source {
             KmsServiceSource::Host(host) => host.encryption_service().await,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             KmsServiceSource::Manager(service_manager) => service_manager.get_encryption_service().await,
         }
     }

@@ -22,6 +22,7 @@ mod oidc;
 mod scanner;
 pub mod storageclass;
 mod target_defaults;
+mod vector_maintenance;
 
 use crate::error::Result;
 use crate::store::ECStore;
@@ -246,6 +247,10 @@ pub async fn try_migrate_server_config(api: Arc<ECStore>, decrypt_fn: Option<cra
 
 pub fn init() {
     let mut kvs = HashMap::new();
+    kvs.insert(
+        rustfs_config::S3VECTORS_MAINTENANCE_SUB_SYS.to_owned(),
+        vector_maintenance::DEFAULT_KVS.clone(),
+    );
     // Load storageclass default configuration
     kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DEFAULT_KVS.clone());
     kvs.insert(rustfs_config::SCANNER_SUB_SYS.to_owned(), scanner::DEFAULT_KVS.clone());

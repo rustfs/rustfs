@@ -62,6 +62,9 @@
 //! }
 //! ```
 
+#[cfg(test)]
+mod managed_operation_tests;
+
 mod core;
 mod error;
 mod host;

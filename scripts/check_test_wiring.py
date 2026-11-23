@@ -660,30 +660,76 @@ def check_catalog_fault_wiring(root: Path) -> list[str]:
 
 
 def catalog_fault_test_names(root: Path) -> set[str]:
-    """Inventory real test attributes, including tests inside inline oracle modules."""
-    code = rust_code_only((root / CATALOG_FAULT_SOURCE).read_text())
+    """Inventory tests from the registered canonical Catalog module graph."""
+    src = root / "crates/e2e_test/src"
+    source = root / CATALOG_FAULT_SOURCE
+    parent = module_source(src, Path("distributed"))
+    require(parent is not None and declared(src / "lib.rs", "distributed", root)
+            and declared(parent, source.stem, root), "Catalog source ancestors are not registered")
+    require(module_source(src, source.relative_to(src).with_suffix("")) == source,
+            "Catalog root source is missing or ambiguous")
     attribute = r"#\[(?:tokio::)?test(?:\([^]\n]*\))?\]"
-    pattern = re.compile(attribute + r"\s*(?:#\[[^]\n]*\]\s*)*(?:async\s+)?fn\s+(\w+)\s*\(")
-    tests = list(pattern.finditer(code))
-    require(tests and len(tests) == len(re.findall(attribute, code)), "unrecognized Catalog test declaration")
-    tokens = iter(re.finditer(r"\bmod\s+(\w+)\s*\{|[{}]", code))
-    token = next(tokens, None)
-    scopes: list[str | None] = []
+    test = (attribute + r"\s*(?:#\[[^]\n]*\]\s*)*"
+            r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<test>\w+)\s*\(")
+    module = r"(?:\bpub(?:\([^)]*\))?\s+)?\bmod\s+(?P<module>\w+)\s*(?P<module_end>[;{])"
+    tokens = re.compile(f"{test}|{module}|[{{}}]")
     names: set[str] = set()
-    for test in tests:
-        while token is not None and token.start() < test.start():
-            if token.group(1):
-                scopes.append(token.group(1))
+    modules = {CATALOG_FAULT_MODULE}
+    visited: set[Path] = set()
+
+    def visit(path: Path, module_path: list[str]) -> None:
+        identity = path.resolve()
+        require(identity not in visited, f"Catalog source has multiple module owners: {path}")
+        visited.add(identity)
+        original = path.read_text()
+        code = rust_code_only(original)
+        directory = path.parent if path.name == "mod.rs" else path.with_suffix("")
+        scopes: list[str | None] = []
+        test_count = 0
+        for token in tokens.finditer(code):
+            if token.group("module"):
+                require(all(scope is not None for scope in scopes), "Catalog module nested outside a module")
+                child = token.group("module")
+                components = [*module_path, *scopes, child]
+                require(len(components) <= 64, "Catalog module nesting exceeds 64 levels")
+                name = "::".join(components)
+                require(name not in modules, f"duplicate Catalog module identity: {name}")
+                require(module_preamble_allowed(original, code, token.start(), path, child, root),
+                        f"unsupported Catalog module declaration: {name}")
+                modules.add(name)
+                if token.group("module_end") == "{":
+                    scopes.append(child)
+                else:
+                    owner = directory.joinpath(*scopes)
+                    candidates = [candidate for candidate in (owner / f"{child}.rs", owner / child / "mod.rs")
+                                  if candidate.is_file()]
+                    require(len(candidates) == 1, f"missing or ambiguous Catalog module source: {name}")
+                    visit(candidates[0], components)
+            elif token.group("test"):
+                test_count += 1
+                require(all(scope is not None for scope in scopes), "Catalog test nested outside a module")
+                prefix = code[:token.start()]
+                boundary = max(prefix.rfind(";"), prefix.rfind("{"), prefix.rfind("}"))
+                attributes = code[boundary + 1:token.end()]
+                conditions = re.findall(r"#\[\s*(?:ignore|cfg(?:_attr)?)\b[^]]*\]", attributes)
+                require(all(re.sub(r"\s+", "", condition) == "#[cfg(test)]" for condition in conditions),
+                        "Catalog tests must be unconditional and non-ignored")
+                name = "::".join([*module_path, *scopes, token.group("test")])
+                require(name not in names, f"duplicate Catalog test identity: {name}")
+                names.add(name)
             elif token.group() == "{":
                 scopes.append(None)
             else:
                 require(bool(scopes), "unbalanced Catalog source braces")
                 scopes.pop()
-            token = next(tokens, None)
-        require(all(scope is not None for scope in scopes), "Catalog test nested outside a module")
-        name = "::".join([CATALOG_FAULT_MODULE, *scopes, test.group(1)])
-        require(name not in names, "duplicate Catalog test identity")
-        names.add(name)
+        require(not scopes, "unbalanced Catalog source braces")
+        require(test_count == len(re.findall(attribute, code)), f"unrecognized Catalog test declaration: {path}")
+
+    visit(source, [CATALOG_FAULT_MODULE])
+    for path in source.with_suffix("").rglob("*.rs"):
+        if re.search(attribute, rust_code_only(path.read_text())):
+            require(path.resolve() in visited, f"Catalog test source has no module owner: {path}")
+    require(bool(names), "Catalog source graph has no tests")
     return names
 
 
@@ -717,55 +763,55 @@ def check_catalog_fault_listing(root: Path, listing: Path, junit: Path | None = 
         return [f"Catalog feature test evidence: {error}"]
 
 
-def declared(parent: Path, module: str, root: Path | None = None) -> bool:
-    source = parent.read_text()
-    code = rust_code_only(source)
-    pattern = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(module)}\s*;", re.MULTILINE)
+def module_preamble_allowed(source: str, code: str, offset: int, parent: Path,
+                            module: str, root: Path | None) -> bool:
+    prefix = code[:offset]
+    boundary = max(prefix.rfind(";"), prefix.rfind("{"), prefix.rfind("}"))
+    code_preamble = re.sub(r"\s+", "", prefix[boundary + 1:])
     allowed_preambles = {
         "#[cfg(test)]": "#[cfg(test)]",
         "#[cfg(all(test,target_os=))]": '#[cfg(all(test,target_os="linux"))]',
     }
+    if not code_preamble:
+        return True
+    attr_start = prefix.rfind("#[cfg", boundary + 1)
+    preamble = re.sub(r"\s+", "", source[attr_start:offset]) if attr_start >= 0 else ""
+    if code_preamble in allowed_preambles:
+        return preamble == allowed_preambles[code_preamble]
+    if (root is not None
+            and parent == root / "crates/e2e_test/src/distributed/mod.rs"
+            and module == "catalog_fault_acceptance_test"
+            and code_preamble == "#[cfg(all(feature=,unix))]"
+            and preamble == '#[cfg(all(feature="catalog-fault-worker",unix))]'):
+        return not check_catalog_fault_wiring(root)
+    return False
+
+
+def declared(parent: Path, module: str, root: Path | None = None) -> bool:
+    source = parent.read_text()
+    code = rust_code_only(source)
+    pattern = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(module)}\s*;", re.MULTILINE)
+    declarations = []
     for match in pattern.finditer(code):
-        prefix = code[: match.start()]
         depths = {"(": 0, "[": 0, "{": 0}
         pairs = {")": "(", "]": "[", "}": "{"}
-        for char in prefix:
+        for char in code[:match.start()]:
             if char in depths:
                 depths[char] += 1
             elif char in pairs:
                 depths[pairs[char]] -= 1
-        if any(depths.values()):
-            continue
-
-        boundary = max(prefix.rfind(";"), prefix.rfind("{"), prefix.rfind("}"))
-        code_preamble = re.sub(r"\s+", "", prefix[boundary + 1 :])
-        if not code_preamble:
-            return True
-        if code_preamble in allowed_preambles:
-            attr_start = prefix.rfind("#[cfg", boundary + 1)
-            if attr_start >= 0 and re.sub(r"\s+", "", source[attr_start : match.start()]) == allowed_preambles[code_preamble]:
-                return True
-        if (root is not None
-                and parent == root / "crates/e2e_test/src/distributed/mod.rs"
-                and module == "catalog_fault_acceptance_test"):
-            attr_start = prefix.rfind("#[cfg", boundary + 1)
-            preamble = re.sub(r"\s+", "", source[attr_start:match.start()]) if attr_start >= 0 else ""
-            if (code_preamble == "#[cfg(all(feature=,unix))]"
-                    and preamble == '#[cfg(all(feature="catalog-fault-worker",unix))]'):
-                return not check_catalog_fault_wiring(root)
-    return False
+        if not any(depths.values()):
+            declarations.append(match)
+    return (len(declarations) == 1
+            and module_preamble_allowed(source, code, declarations[0].start(), parent, module, root))
 
 
 def module_source(src: Path, directory: Path) -> Path | None:
     if not directory.parts:
         return src / "lib.rs"
-
-    mod_file = src / directory / "mod.rs"
-    if mod_file.is_file():
-        return mod_file
-
-    sibling = src.joinpath(*directory.parts[:-1], f"{directory.name}.rs")
-    return sibling if sibling.is_file() else None
+    candidates = [path for path in (src / directory / "mod.rs",
+                                    src.joinpath(*directory.parts[:-1], f"{directory.name}.rs")) if path.is_file()]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def check_e2e_modules(root: Path) -> list[str]:
@@ -790,7 +836,7 @@ def check_e2e_modules(root: Path) -> list[str]:
             if parent is None:
                 errors.append(f"{relative}: module {module} has no canonical parent")
                 break
-            if not declared(parent, module):
+            if not declared(parent, module, root):
                 errors.append(f"{relative}: module {module} not declared by {parent.relative_to(root).as_posix()}")
     return errors
 
@@ -6031,6 +6077,180 @@ class SelfTests(unittest.TestCase):
             source = root / CATALOG_FAULT_SOURCE
             source.write_text(source.read_text() + '\n#[test]\nfn new_fault_case() {}\n')
             self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+
+    def catalog_nested_feature_fixture(self, root: Path) -> tuple[Path, Path, set[str]]:
+        listing, junit = self.catalog_feature_fixture(root)
+        source = root / CATALOG_FAULT_SOURCE
+        source.write_text(source.read_text() + "mod branch_test;\n")
+        directory = source.with_suffix("")
+        files = {
+            "branch_test.rs": ('#[test]\nfn external_case() {}\n'
+                               'mod inline { mod deeper { #[test]\nfn inline_case() {} } }\n'
+                               'mod child_test;\nmod folder;\n'),
+            "branch_test/child_test.rs": '#[tokio::test]\nasync fn child_case() {}\n',
+            "branch_test/folder/mod.rs": 'mod nested { #[test]\nfn folder_case() {} }\n',
+        }
+        for path, content in files.items():
+            target = directory / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        names = {CATALOG_FAULT_MODULE + "::" + name for name in (
+            "fault_observed", "record_checked", "oracle::invalid_record_rejected",
+            "branch_test::external_case", "branch_test::inline::deeper::inline_case",
+            "branch_test::child_test::child_case", "branch_test::folder::nested::folder_case",
+        )}
+        listing.write_text(json.dumps({"rust-suites": {"e2e_test": {"testcases": {
+            name: {"ignored": False, "filter-match": {"status": "matches"}} for name in names}}}}))
+        suite = ET.Element("testsuite")
+        for name in sorted(names):
+            ET.SubElement(suite, "testcase", {"name": name})
+        ET.ElementTree(suite).write(junit)
+        return listing, junit, names
+
+    def test_catalog_canonical_descendants_keep_feature_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.catalog_nested_feature_fixture(root)
+            self.assertEqual(check_e2e_modules(root), [])
+            mutations = (
+                ("crates/e2e_test/src/distributed/mod.rs", 'feature="catalog-fault-worker"', 'feature="other"'),
+                ("crates/e2e_test/Cargo.toml", "catalog-fault-worker=[]", "other=[]"),
+                (".github/workflows/e2e-catalog-fault.yml", "--no-tests fail", "--no-tests pass"),
+            )
+            for path, before, after in mutations:
+                with self.subTest(path=path):
+                    target = root / path
+                    original = target.read_text()
+                    target.write_text(original.replace(before, after))
+                    errors = check_e2e_modules(root)
+                    self.assertTrue(any("branch_test.rs:" in error for error in errors), errors)
+                    self.assertTrue(any("child_test.rs:" in error for error in errors), errors)
+                    target.write_text(original)
+
+    def test_catalog_recursive_inventory_includes_canonical_and_inline_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing, junit, names = self.catalog_nested_feature_fixture(root)
+            self.assertEqual(catalog_fault_test_names(root), names)
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+
+    def test_catalog_recursive_inventory_rejects_invalid_source_graphs(self) -> None:
+        for mode in ("missing-source", "ambiguous-source", "missing-declaration", "wrong-owner",
+                     "path-override", "duplicate-declaration", "duplicate-inline", "duplicate-test",
+                     "disabled-module", "disabled-inline", "ignored-test", "ignored-before-test",
+                     "disabled-test", "nonmodule-test", "unrecognized-test"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                listing, junit, _ = self.catalog_nested_feature_fixture(root)
+                source = root / CATALOG_FAULT_SOURCE
+                directory = source.with_suffix("")
+                branch = directory / "branch_test.rs"
+                if mode == "missing-source":
+                    branch.unlink()
+                elif mode == "ambiguous-source":
+                    (directory / "branch_test/mod.rs").write_text("#[test]\nfn another_case() {}\n")
+                elif mode == "missing-declaration":
+                    source.write_text(source.read_text().replace("mod branch_test;", ""))
+                elif mode == "wrong-owner":
+                    branch.rename(directory / "wrong_test.rs")
+                elif mode == "path-override":
+                    source.write_text(source.read_text().replace("mod branch_test;", '#[path="elsewhere.rs"]\nmod branch_test;'))
+                elif mode == "duplicate-declaration":
+                    source.write_text(source.read_text() + "mod branch_test;\n")
+                elif mode == "duplicate-inline":
+                    branch.write_text(branch.read_text() + "mod inline {}\n")
+                elif mode == "duplicate-test":
+                    branch.write_text(branch.read_text() + "#[test]\nfn external_case() {}\n")
+                elif mode == "disabled-module":
+                    source.write_text(source.read_text().replace("mod branch_test;", "#[cfg(any())]\nmod branch_test;"))
+                elif mode == "disabled-inline":
+                    branch.write_text(branch.read_text().replace("mod inline", "#[cfg(any())]\nmod inline"))
+                elif mode == "ignored-test":
+                    branch.write_text(branch.read_text().replace("#[test]", "#[test]\n#[ignore]", 1))
+                elif mode == "ignored-before-test":
+                    branch.write_text(branch.read_text().replace("#[test]", "#[ignore]\n#[test]", 1))
+                elif mode == "disabled-test":
+                    branch.write_text(branch.read_text().replace("#[test]", "#[cfg(any())]\n#[test]", 1))
+                elif mode == "nonmodule-test":
+                    branch.write_text(branch.read_text() + "fn hidden() { #[test]\nfn unreachable() {} }\n")
+                else:
+                    branch.write_text(branch.read_text() + "#[test]\nconst HIDDEN: bool = true;\n")
+                with self.assertRaises((OSError, ValueError)):
+                    catalog_fault_test_names(root)
+                self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+
+    def test_catalog_recursive_inventory_checks_registered_ancestors(self) -> None:
+        for path, before, after in (
+            ("crates/e2e_test/src/lib.rs", "#[cfg(test)]", "#[cfg(any())]"),
+            ("crates/e2e_test/src/distributed/mod.rs", 'feature="catalog-fault-worker"', 'feature="other"'),
+            ("crates/e2e_test/src/distributed/mod.rs", "mod catalog_fault_acceptance_test;", ""),
+        ):
+            with self.subTest(path=path, after=after), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.catalog_nested_feature_fixture(root)
+                target = root / path
+                target.write_text(target.read_text().replace(before, after))
+                with self.assertRaises(ValueError):
+                    catalog_fault_test_names(root)
+
+    def test_catalog_recursive_evidence_requires_every_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing, junit, names = self.catalog_nested_feature_fixture(root)
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+            original_listing, original_junit = listing.read_text(), junit.read_text()
+            descendant = CATALOG_FAULT_MODULE + "::branch_test::child_test::child_case"
+            for mode in ("missing", "extra", "ignored", "filtered", "wrong-owner", "duplicate-suite"):
+                with self.subTest(listing=mode):
+                    data = json.loads(original_listing)
+                    cases = data["rust-suites"]["e2e_test"]["testcases"]
+                    if mode == "missing":
+                        del cases[descendant]
+                    elif mode == "extra":
+                        cases[descendant + "_extra"] = dict(cases[descendant])
+                    elif mode == "ignored":
+                        cases[descendant]["ignored"] = True
+                    elif mode == "filtered":
+                        cases[descendant]["filter-match"]["status"] = "mismatch"
+                    elif mode == "wrong-owner":
+                        cases[descendant.replace("::branch_test::", "::another::")] = cases.pop(descendant)
+                    else:
+                        data["rust-suites"]["duplicate"] = {"testcases": {descendant: dict(cases[descendant])}}
+                    listing.write_text(json.dumps(data))
+                    self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+            listing.write_text(original_listing)
+            for mode in ("missing", "extra", "duplicate", "skipped", "failure", "error", "missing-file"):
+                with self.subTest(junit=mode):
+                    tree = ET.fromstring(original_junit)
+                    case = next(case for case in tree if case.get("name") == descendant)
+                    if mode == "missing":
+                        tree.remove(case)
+                    elif mode in ("extra", "duplicate"):
+                        ET.SubElement(tree, "testcase", {"name": descendant if mode == "duplicate" else descendant + "_extra"})
+                    elif mode != "missing-file":
+                        ET.SubElement(case, mode)
+                    ET.ElementTree(tree).write(junit)
+                    if mode == "missing-file":
+                        junit.unlink()
+                    self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+            junit.write_text(original_junit)
+            self.assertEqual(catalog_fault_test_names(root), names)
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+
+    def test_catalog_canonical_parents_reject_ambiguous_sources_and_declarations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.catalog_nested_feature_fixture(root)
+            src = root / "crates/e2e_test/src"
+            directory = Path("distributed/catalog_fault_acceptance_test/branch_test")
+            (src / directory / "mod.rs").write_text("mod child_test;\n")
+            self.assertIsNone(module_source(src, directory))
+            self.assertTrue(check_e2e_modules(root))
+            (src / directory / "mod.rs").unlink()
+            parent = root / CATALOG_FAULT_SOURCE
+            parent.write_text(parent.read_text() + "mod branch_test;\n")
+            self.assertFalse(declared(parent, "branch_test", root))
+            self.assertTrue(check_e2e_modules(root))
 
     def test_e2e_requires_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

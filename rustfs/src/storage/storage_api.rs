@@ -97,10 +97,10 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod multipart {
-        pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
+        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartCompletionAuthorization};
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{CompletePart, ListPartsInfo, MultipartOperations, PartInfo};
+        pub(crate) use super::super::storage_contracts::{MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -205,7 +205,7 @@ pub(crate) mod owned_parity_consumer {
     };
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
     pub(crate) use super::super::authorization::parity_test_support;
-    pub(crate) use super::super::authorization::{AuthorizationRequest, authorize_request, replication_request_authorized};
+    pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
     pub(crate) use super::super::authorization::{
         authorize_bucket_config_mutation, authorize_object_request, authorize_replication_only_put_headers,
         authorize_staged_multipart_part, authorize_write_etag_condition,
@@ -460,6 +460,7 @@ pub(crate) mod sse_consumer {
         encryption_material_to_metadata, extract_ssec_params_from_headers, extract_ssekms_context_from_headers, init_sse_startup,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
+    pub(crate) use super::super::sse::{KmsKeyAuthorizer, ManagedSseRuntime, managed_read_encryption_resolver, sse_error};
     pub(crate) use super::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
         authorize_sse_kms_multipart_write, authorize_sse_kms_object_read, classify_sse_read_response,
@@ -2125,6 +2126,7 @@ pub(crate) mod managed {
     pub(crate) use super::BucketMetadata;
     pub(crate) use super::ecstore_bucket::metadata::BUCKET_VECTOR_STORAGE_PREFIX;
     pub(crate) use super::ecstore_bucket::metadata::{BUCKET_TAGGING_CONFIG, ConfigState};
+    pub(crate) use super::storage_contracts::DeleteAccounting;
     use super::storage_contracts::MakeBucketOptions;
     pub(crate) use super::storage_contracts::bucket::{
         AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedTableId, StorageBucketId,
@@ -2133,6 +2135,7 @@ pub(crate) mod managed {
         BucketIdentityError, ManagedBucketConfigMutation, ManagedObjectAccess, ManagedObjectOperation,
     };
     use super::{Arc, ECStore, Result, ecstore_bucket};
+    pub(crate) use rustfs_heal_contracts::heal_channel::HealOpts;
 
     pub(crate) type BucketIncarnationFenceGuard = ecstore_bucket::BucketIncarnationFenceGuard;
 

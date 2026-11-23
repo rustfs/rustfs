@@ -141,11 +141,27 @@ pub(crate) enum MultipartOrigin {
     Request,
     Managed {
         context: Box<crate::app::object::ManagedObjectContext>,
+        principal: Box<SseKmsPrincipal>,
+        completion: Option<OperationHelper>,
         lifecycle_guard: Arc<crate::app::storage_api::managed::BucketIncarnationFenceGuard>,
     },
 }
 
 impl MultipartOrigin {
+    fn take_completion(&mut self) -> Option<OperationHelper> {
+        match self {
+            Self::Request => None,
+            Self::Managed { completion, .. } => completion.take(),
+        }
+    }
+
+    fn principal(&self, request: &crate::app::RequestEnvelope) -> Option<SseKmsPrincipal> {
+        match self {
+            Self::Request => SseKmsPrincipal::from_request(request),
+            Self::Managed { principal, .. } => Some(principal.as_ref().clone()),
+        }
+    }
+
     fn is_managed(&self) -> bool {
         match self {
             Self::Request => false,
@@ -172,6 +188,7 @@ impl MultipartOrigin {
             Self::Managed {
                 context,
                 lifecycle_guard,
+                ..
             } => {
                 if context.access().bucket().storage_bucket_id().as_str() != bucket || lifecycle_guard.is_lock_lost() {
                     return Err(ApiError::from(StorageError::PreconditionFailed).into());

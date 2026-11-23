@@ -157,7 +157,7 @@ impl DefaultMultipartUsecase {
         envelope: RequestEnvelope,
         input: CreateMultipartUploadFields,
         query_version_id: Option<String>,
-        origin: MultipartOrigin,
+        mut origin: MultipartOrigin,
     ) -> S3Result<CreateMultipartUploadResult> {
         validate_new_object_key(&input.key, "CreateMultipartUpload")?;
         let origin_headers = origin.headers(&envelope);
@@ -174,12 +174,14 @@ impl DefaultMultipartUsecase {
                 envelope.verified_presigned().is_some(),
             )?;
         }
-        let helper = OperationHelper::from_view(
-            &envelope.audit_view(),
-            EventName::ObjectCreatedCreateMultipartUpload,
-            S3Operation::CreateMultipartUpload,
-        )
-        .suppress_event();
+        let helper = origin.take_completion().unwrap_or_else(|| {
+            OperationHelper::from_view(
+                &envelope.audit_view(),
+                EventName::ObjectCreatedCreateMultipartUpload,
+                S3Operation::CreateMultipartUpload,
+            )
+            .suppress_event()
+        });
         let replication_authorized = !origin.is_managed() && replication_request_authorized(&envelope);
         let CreateMultipartUploadFields {
             bucket,
@@ -267,7 +269,7 @@ impl DefaultMultipartUsecase {
 
         // The session data key is generated here, so this is where a multipart upload is held
         // to the KMS key it names. Parts and completion also authorize their own caller.
-        let session_principal = SseKmsPrincipal::from_request(&envelope);
+        let session_principal = origin.principal(&envelope);
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
             key: &key,

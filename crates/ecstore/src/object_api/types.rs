@@ -1218,6 +1218,10 @@ impl std::fmt::Debug for GetObjectSink {
 
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    /// Exclusive per-operation read resolver. Never persisted or sent over RPC.
+    /// A present resolver failure never falls back to the store resolver.
+    #[doc(hidden)]
+    pub read_encryption_resolver: Option<Arc<dyn ObjectEncryptionResolver>>,
     /// Part copies retain source locks and cannot queue for capped upload staging.
     pub multipart_copy_source_locked: bool,
     #[doc(hidden)]
@@ -1506,6 +1510,7 @@ impl ObjectOptions {
 impl std::fmt::Debug for ObjectOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectOptions")
+            .field("read_encryption_resolver", &self.read_encryption_resolver.is_some())
             .field("max_parity", &self.max_parity)
             .field("mod_time", &self.mod_time)
             .field("part_number", &self.part_number)

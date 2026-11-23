@@ -4642,6 +4642,7 @@ fn list_tables_response_uses_rest_identifier_shape() {
         vec![crate::table_catalog::TableEntry {
             vector_head_binding: None,
             vector_index_definition: None,
+            vector_maintenance_binding: None,
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: "warehouse".to_string(),
             namespace: namespace.public_name(),
@@ -4926,6 +4927,7 @@ async fn rest_list_pagination_covers_namespaces_tables_and_views() {
         store.tables.lock().await.push(crate::table_catalog::TableEntry {
             vector_head_binding: None,
             vector_index_definition: None,
+            vector_maintenance_binding: None,
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: "warehouse".to_string(),
             namespace: namespace.public_name(),
@@ -5113,6 +5115,7 @@ async fn table_exists_status_uses_head_rest_semantics() {
         .create_table(crate::table_catalog::TableEntry {
             vector_head_binding: None,
             vector_index_definition: None,
+            vector_maintenance_binding: None,
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: "warehouse".to_string(),
             namespace: namespace.public_name(),
@@ -8566,6 +8569,7 @@ async fn rolling_upgrade_initial_publication_fences_old_and_new_data_plane_write
     let entry = crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "warehouse".to_string(),
         namespace: namespace.public_name(),
@@ -15110,6 +15114,7 @@ fn table_entry_for_credentials() -> crate::table_catalog::TableEntry {
     crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "warehouse".to_string(),
         namespace: "analytics".to_string(),
@@ -16297,6 +16302,7 @@ async fn seed_object_table_for_metadata_maintenance(
         .create_table(crate::table_catalog::TableEntry {
             vector_head_binding: None,
             vector_index_definition: None,
+            vector_maintenance_binding: None,
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: bucket.to_string(),
             namespace: namespace.public_name(),
@@ -16743,6 +16749,7 @@ fn table_format_upgrade_accepts_historical_v1_metadata_and_rejects_downgrade() {
     let entry = crate::table_catalog::TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "warehouse".to_string(),
         namespace: "analytics".to_string(),

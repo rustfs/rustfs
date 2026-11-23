@@ -425,3 +425,664 @@ pub(crate) fn maintenance_terminal_report_continues_running(
                 && event.after_status.as_ref() == Some(&finished.status)
         })
 }
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VectorMaintenanceExecutionError {
+    #[error("vector maintenance job finished in a failed state")]
+    FailedJob,
+    #[error("vector maintenance worker did not complete")]
+    Join(#[source] tokio::task::JoinError),
+    #[error(transparent)]
+    Budget(#[from] VectorMaintenanceBudgetError),
+    #[error(transparent)]
+    Catalog(#[from] TableCatalogStoreError),
+    #[error("vector maintenance executor failed")]
+    Executor {
+        category: VectorMaintenanceFailureCode,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl VectorMaintenanceExecutionError {
+    /// A normally returned task error keeps its resource's durable recovery path available.
+    /// Join failure cannot establish normal owner completion and stops this runtime.
+    pub(crate) fn requires_runtime_stop(&self) -> bool {
+        matches!(self, Self::Join(_))
+    }
+
+    pub(crate) fn category(&self) -> VectorMaintenanceFailureCode {
+        match self {
+            Self::Budget(VectorMaintenanceBudgetError::Stopped) => VectorMaintenanceFailureCode::Interrupted,
+            Self::Budget(_) => VectorMaintenanceFailureCode::CapacityExceeded,
+            Self::Catalog(TableCatalogStoreError::Io {
+                classification: CatalogIoErrorKind::Denied,
+                ..
+            }) => VectorMaintenanceFailureCode::IdentityDenied,
+            Self::Catalog(TableCatalogStoreError::Conflict(_)) => VectorMaintenanceFailureCode::Conflict,
+            Self::Catalog(TableCatalogStoreError::Invalid(_)) => VectorMaintenanceFailureCode::CorruptRecord,
+            Self::Catalog(_) => VectorMaintenanceFailureCode::StorageUnavailable,
+            Self::Join(_) => VectorMaintenanceFailureCode::UnknownOutcome,
+            Self::FailedJob => VectorMaintenanceFailureCode::UnknownOutcome,
+            Self::Executor { category, .. } => *category,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VectorMaintenanceRuntimeFailure {
+    pub(crate) task_failure: Option<VectorMaintenanceExecutionError>,
+    pub(crate) fatal_failure: Option<VectorMaintenanceExecutionError>,
+}
+
+impl std::fmt::Display for VectorMaintenanceRuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("vector maintenance retained a worker failure")
+    }
+}
+
+impl std::error::Error for VectorMaintenanceRuntimeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.fatal_failure
+            .as_ref()
+            .or(self.task_failure.as_ref())
+            .map(|error| error as _)
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait VectorMaintenanceExecutor<B: TableCatalogObjectBackend>: Send + Sync {
+    /// Run before the worker installs any dispatch or heartbeat owner. The control has no dispatch guard.
+    /// The fixed adapter owns each proof scope: drain readers and release every lifecycle/dispatch/GC
+    /// owner before native replay, then reacquire and revalidate before admitting a sealed result.
+    /// Return only after all admitted native work and all temporary owners have completed.
+    async fn recover_native(
+        &self,
+        store: Arc<ObjectTableCatalogStore<B>>,
+        work: VectorMaintenanceWork,
+        control: VectorMaintenanceControl,
+    ) -> Result<(), VectorMaintenanceExecutionError>;
+
+    /// Return only after every admitted engine and Managed operation has completed.
+    async fn execute(
+        &self,
+        store: Arc<ObjectTableCatalogStore<B>>,
+        work: VectorMaintenanceWork,
+        control: VectorMaintenanceControl,
+    ) -> Result<VectorMaintenanceExecutionOutcome, VectorMaintenanceExecutionError>;
+
+    async fn prepare(
+        &self,
+        store: Arc<ObjectTableCatalogStore<B>>,
+        action: VectorMaintenancePreparationAction,
+        control: VectorMaintenanceControl,
+    ) -> Result<(), VectorMaintenanceExecutionError>;
+}
+
+struct VectorMaintenanceOwnedResult<T> {
+    output: T,
+    revision: Uuid,
+    heartbeat_error: Option<TableCatalogStoreError>,
+}
+
+/// Native replay acquires lifecycle protection itself. This phase has no worker-owned guard or heartbeat.
+async fn coordinate_vector_native_recovery<F>(execution: F, control: VectorMaintenanceControl) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(execution);
+    tokio::select! {
+        biased;
+        _ = control.stop_new_work.cancelled() => {}
+        _ = tokio::time::sleep_until(control.admission_deadline) => control.stop_new_work.cancel(),
+        output = &mut execution => return output,
+    }
+    execution.await
+}
+
+/// Cancellation changes admission while the same execution future retains its owners.
+async fn coordinate_vector_execution<F, H, HF>(
+    execution: F,
+    mut heartbeat: H,
+    control: VectorMaintenanceControl,
+    heartbeat_interval: std::time::Duration,
+    mut revision: Uuid,
+) -> VectorMaintenanceOwnedResult<F::Output>
+where
+    F: std::future::Future,
+    H: FnMut(Uuid) -> HF,
+    HF: std::future::Future<Output = TableCatalogStoreResult<Uuid>>,
+{
+    tokio::pin!(execution);
+    let mut heartbeat_timer = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat_interval, heartbeat_interval);
+    heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stopping = false;
+    let mut heartbeat_error = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = control.stop_new_work.cancelled(), if !stopping => { stopping = true; }
+            _ = tokio::time::sleep_until(control.admission_deadline), if !stopping => {
+                control.stop_new_work.cancel();
+                stopping = true;
+            }
+            output = &mut execution => return VectorMaintenanceOwnedResult { output, revision, heartbeat_error },
+            _ = heartbeat_timer.tick(), if heartbeat_error.is_none() => {
+                match heartbeat(revision).await {
+                    Ok(next) => revision = next,
+                    Err(error) => {
+                        heartbeat_error = Some(error);
+                        control.stop_new_work.cancel();
+                        stopping = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum VectorMaintenanceWorkerResult {
+    Finished(VectorMaintenanceJobState),
+    Replay(VectorMaintenanceJobState),
+    Skipped(VectorMaintenanceNotEligible),
+    Prepared,
+}
+
+pub(crate) struct VectorMaintenanceExecutionContext<B: TableCatalogObjectBackend> {
+    pub(crate) identity: VectorMaintenanceExecutionIdentityV1,
+    pub(crate) source: Arc<dyn super::periodic::VectorMaintenanceSource>,
+    pub(crate) executor: Arc<dyn VectorMaintenanceExecutor<B>>,
+}
+
+#[cfg(test)]
+use super::fault_observation::{self, VectorMaintenanceObservedPhase as ObservedPhase};
+
+pub(crate) async fn execute_vector_maintenance_job<B: TableCatalogObjectBackend>(
+    store: ObjectTableCatalogStore<B>,
+    resource: VectorMaintenanceResourceV1,
+    job_id: Uuid,
+    worker: VectorMaintenanceWorker,
+    context: VectorMaintenanceExecutionContext<B>,
+    control: VectorMaintenanceControl,
+) -> Result<VectorMaintenanceWorkerResult, VectorMaintenanceExecutionError> {
+    let VectorMaintenanceExecutionContext {
+        identity,
+        source,
+        executor,
+    } = context;
+    if control.dispatch_guard().is_ok() {
+        return Err(TableCatalogStoreError::Invalid("maintenance worker requires an unowned control".into()).into());
+    }
+    let _record_memory =
+        control.reserve_memory((2 * VECTOR_MAINTENANCE_RECORD_MAX_BYTES + 8 * VECTOR_MAINTENANCE_JOB_MAX_BYTES) as u64)?;
+    let store = Arc::new(store);
+    control.check_admission()?;
+    source.check_admission(&identity).await?;
+    let resource_identity = resource.identity()?;
+    let namespace = Namespace::parse(resource.namespace()).map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+    let name = CatalogName::parse(resource.name().clone()).map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+    let snapshot = store
+        .read_vector_maintenance_job(&resource_identity, job_id)
+        .await?
+        .ok_or_else(|| TableCatalogStoreError::NotFound("Vector maintenance job".into()))?;
+    if snapshot.job().resource() != &resource {
+        return Ok(VectorMaintenanceWorkerResult::Skipped(VectorMaintenanceNotEligible::ResourceChanged));
+    }
+    if snapshot.job().execution_identity() != &identity {
+        return Ok(VectorMaintenanceWorkerResult::Skipped(VectorMaintenanceNotEligible::IdentityDenied));
+    }
+    control.check_admission()?;
+    let observed = store
+        .read_vector_maintenance_resource(&resource_identity, &namespace, &name)
+        .await?;
+    let condition = VectorMaintenanceClaimCondition::from_snapshot(&snapshot, observed);
+    control.check_admission()?;
+    source.check_admission(&identity).await?;
+    #[cfg(test)]
+    fault_observation::phase(ObservedPhase::Claim);
+    let work = match store
+        .claim_vector_maintenance_job(&resource_identity, job_id, condition, worker, Uuid::new_v4())
+        .await?
+    {
+        VectorMaintenanceClaimOutcome::Acquired(work) => *work,
+        VectorMaintenanceClaimOutcome::Replay(snapshot) => {
+            return Ok(VectorMaintenanceWorkerResult::Replay(*snapshot.job().state()));
+        }
+        VectorMaintenanceClaimOutcome::NotEligible(reason) => return Ok(VectorMaintenanceWorkerResult::Skipped(reason)),
+    };
+    #[cfg(test)]
+    {
+        fault_observation::claimed(&work);
+        fault_observation::phase(ObservedPhase::NativeRecovery);
+    }
+    // No worker-owned lifecycle, dispatch, GC, authorizer, or heartbeat exists during native replay.
+    // The same admitted callback must drain even when cancellation stops subsequent admissions.
+    let recovery_error: Option<VectorMaintenanceExecutionError> = match control.check_admission() {
+        Err(error) => Some(error.into()),
+        Ok(()) => {
+            source.check_admission(&identity).await?;
+            coordinate_vector_native_recovery(
+                executor.recover_native(store.clone(), work.clone(), control.clone()),
+                control.clone(),
+            )
+            .await
+            .err()
+        }
+    };
+    #[cfg(test)]
+    {
+        if let Some(error) = &recovery_error {
+            fault_observation::diagnostic(ObservedPhase::NativeRecovery, error);
+        }
+        fault_observation::phase(ObservedPhase::Readmission);
+    }
+    // Revoke new admissions on identity changes. An expired lease remains unresolved and cannot
+    // establish that a prior native operation ended. begin_dispatch validates the current lease.
+    source.check_admission(&identity).await?;
+    let guard = Arc::new(store.begin_vector_maintenance_dispatch(work.lease()).await?);
+    let current = store.read_vector_maintenance_job_with_guard(&guard).await?;
+    if current.job().resource() != &resource || current.job().execution_identity() != &identity {
+        return Err(TableCatalogStoreError::Conflict("maintenance resource or identity changed after recovery".into()).into());
+    }
+    source.check_admission(&identity).await?;
+    let policy = work.snapshot().job().policy();
+    let heartbeat_interval = std::time::Duration::from_secs(*policy.heartbeat_interval_seconds());
+    let revision = *current.job().revision();
+    let lease = work.lease().clone();
+    let control = control.with_dispatch(guard.clone());
+    let (outcome, diagnostic) = if let Some(error) = recovery_error {
+        (
+            VectorMaintenanceExecutionOutcome::Unknown {
+                reason: error.category(),
+            },
+            Some(error),
+        )
+    } else if control.check_admission().is_err() {
+        (
+            VectorMaintenanceExecutionOutcome::Unknown {
+                reason: VectorMaintenanceFailureCode::Interrupted,
+            },
+            None,
+        )
+    } else {
+        #[cfg(test)]
+        fault_observation::phase(ObservedPhase::Executor);
+        let result = coordinate_vector_execution(
+            executor.execute(store.clone(), work, control.clone()),
+            |revision| {
+                let store = &store;
+                let guard = &guard;
+                let source = &source;
+                let identity = &identity;
+                async move {
+                    source.check_admission(identity).await?;
+                    guard.check_held()?;
+                    store
+                        .heartbeat_vector_maintenance_job(guard, revision)
+                        .await
+                        .map(|snapshot| *snapshot.job().revision())
+                }
+            },
+            control,
+            heartbeat_interval,
+            revision,
+        )
+        .await;
+        // The coordinator serializes revision changes; the final read also resolves a lost response.
+        let _latest_heartbeat_revision = result.revision;
+        let diagnostic = result.heartbeat_error.map(|error| {
+            let error = VectorMaintenanceExecutionError::Catalog(error);
+            #[cfg(test)]
+            fault_observation::diagnostic(ObservedPhase::Heartbeat, &error);
+            error
+        });
+        match result.output {
+            Ok(outcome) => (outcome, diagnostic),
+            Err(error) => {
+                #[cfg(test)]
+                fault_observation::diagnostic(ObservedPhase::Executor, &error);
+                (
+                    VectorMaintenanceExecutionOutcome::Unknown {
+                        reason: error.category(),
+                    },
+                    Some(error),
+                )
+            }
+        }
+    };
+    #[cfg(test)]
+    fault_observation::phase(ObservedPhase::FinishRead);
+    guard.check_held()?;
+    // Refresh after the serialized heartbeat; never race terminal publication against it.
+    // The admitted owner records its exact completed result even after new admissions are revoked.
+    let latest = store.read_vector_maintenance_job_with_guard(&guard).await?;
+    if *latest.job().attempt() != lease.attempt() || latest.job().execution_identity() != &identity {
+        return Err(TableCatalogStoreError::Conflict("maintenance attempt changed before finish".into()).into());
+    }
+    #[cfg(test)]
+    fault_observation::phase(ObservedPhase::Finish);
+    match store
+        .finish_vector_maintenance_job(&guard, *latest.job().revision(), outcome)
+        .await
+    {
+        Ok(finished) => {
+            #[cfg(test)]
+            fault_observation::durable_job(&finished);
+            match diagnostic {
+                Some(error) => {
+                    #[cfg(test)]
+                    fault_observation::returning_diagnostic();
+                    Err(error)
+                }
+                None => Ok(VectorMaintenanceWorkerResult::Finished(*finished.job().state())),
+            }
+        }
+        Err(error) => {
+            let error = VectorMaintenanceExecutionError::Catalog(error);
+            #[cfg(test)]
+            {
+                fault_observation::capture(ObservedPhase::Finish, &error);
+                fault_observation::phase(ObservedPhase::FinishReadback);
+            }
+            // One accurate read can recognize an accepted terminal write whose response was lost.
+            let recovered = store
+                .read_vector_maintenance_job_with_guard(&guard)
+                .await
+                .map_err(VectorMaintenanceExecutionError::Catalog);
+            #[cfg(test)]
+            if let Err(error) = &recovered {
+                fault_observation::capture(ObservedPhase::FinishReadback, error);
+            }
+            if let Ok(recovered) = recovered
+                && *recovered.job().attempt() == lease.attempt()
+                && recovered.job().execution_identity() == &identity
+                && matches!(
+                    recovered.job().state(),
+                    VectorMaintenanceJobState::Succeeded
+                        | VectorMaintenanceJobState::Failed
+                        | VectorMaintenanceJobState::ManualReview
+                        | VectorMaintenanceJobState::PartialRecovered
+                )
+            {
+                #[cfg(test)]
+                fault_observation::durable_job(&recovered);
+                return match diagnostic {
+                    Some(error) => {
+                        #[cfg(test)]
+                        fault_observation::returning_diagnostic();
+                        Err(error)
+                    }
+                    None => Ok(VectorMaintenanceWorkerResult::Finished(*recovered.job().state())),
+                };
+            }
+            #[cfg(test)]
+            fault_observation::phase(ObservedPhase::Finish);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn execute_vector_maintenance_preparation<B: TableCatalogObjectBackend>(
+    store: ObjectTableCatalogStore<B>,
+    resource: VectorMaintenanceResourceV1,
+    kind: super::periodic::VectorMaintenancePreparationKind,
+    expected: CatalogMetadataRefRecordV1,
+    context: VectorMaintenanceExecutionContext<B>,
+    control: VectorMaintenanceControl,
+) -> Result<VectorMaintenanceWorkerResult, VectorMaintenanceExecutionError> {
+    let VectorMaintenanceExecutionContext {
+        identity,
+        source,
+        executor,
+    } = context;
+    let _record_memory = control.reserve_memory((6 * VECTOR_MAINTENANCE_RECORD_MAX_BYTES) as u64)?;
+    let store = Arc::new(store);
+    control.check_admission()?;
+    source.check_admission(&identity).await?;
+    source.authorize_preparation(&identity, &resource).await?;
+    let resource_identity = resource.identity()?;
+    let namespace = Namespace::parse(resource.namespace()).map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+    let name = CatalogName::parse(resource.name().clone()).map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+    let expected: CatalogMetadataRef = (&expected).try_into()?;
+    control.check_admission()?;
+    let snapshot = store
+        .read_vector_maintenance_resource(&resource_identity, &namespace, &name)
+        .await?;
+    if snapshot.observed_object() != &expected {
+        return Ok(VectorMaintenanceWorkerResult::Skipped(VectorMaintenanceNotEligible::ResourceChanged));
+    }
+    match kind {
+        super::periodic::VectorMaintenancePreparationKind::Current => {
+            control.check_admission()?;
+            let bucket = resource.bucket().to_handle()?;
+            let (guard, entry) = store.begin_vector_operation(&bucket, &namespace, &name).await?;
+            let head = VectorMaintenanceHeadV1::from_entry(&entry)?;
+            if entry.head().resource_identity() != &resource_identity || snapshot.head() != Some(&head) {
+                return Ok(VectorMaintenanceWorkerResult::Skipped(VectorMaintenanceNotEligible::ResourceChanged));
+            }
+            if *head.entry_version() != 3 {
+                return Ok(VectorMaintenanceWorkerResult::Skipped(
+                    VectorMaintenanceNotEligible::MaintenanceEnrollmentRequired,
+                ));
+            }
+            guard.check_held()?;
+            drop(guard);
+            let commit_id = vector_maintenance_enroll_commit_id(&resource_identity, &head)?;
+            control.check_admission()?;
+            source.authorize_preparation(&identity, &resource).await?;
+            control.check_admission()?;
+            #[cfg(test)]
+            fault_observation::phase(ObservedPhase::Preparation);
+            executor
+                .prepare(
+                    store.clone(),
+                    VectorMaintenancePreparationAction::EnrollCurrent {
+                        expected: Box::new(entry),
+                        commit_id,
+                    },
+                    control.clone(),
+                )
+                .await?;
+        }
+        super::periodic::VectorMaintenancePreparationKind::Deleted => {
+            let update_id = vector_maintenance_enroll_deleted_update_id(&resource_identity, &expected)?;
+            control.check_admission()?;
+            source.authorize_preparation(&identity, &resource).await?;
+            control.check_admission()?;
+            #[cfg(test)]
+            fault_observation::phase(ObservedPhase::Preparation);
+            executor
+                .prepare(
+                    store.clone(),
+                    VectorMaintenancePreparationAction::EnrollDeleted {
+                        resource: resource_identity,
+                        expected_intent: expected,
+                        update_id,
+                    },
+                    control.clone(),
+                )
+                .await?;
+        }
+    }
+    Ok(VectorMaintenanceWorkerResult::Prepared)
+}
+
+pub(crate) async fn execute_vector_maintenance_action<B: TableCatalogObjectBackend>(
+    store: ObjectTableCatalogStore<B>,
+    action: VectorMaintenancePreparationAction,
+    context: VectorMaintenanceExecutionContext<B>,
+    control: VectorMaintenanceControl,
+) -> Result<VectorMaintenanceWorkerResult, VectorMaintenanceExecutionError> {
+    let VectorMaintenanceExecutionContext {
+        identity,
+        source,
+        executor,
+    } = context;
+    control.check_admission()?;
+    source.check_admission(&identity).await?;
+    control.check_admission()?;
+    // The fixed preparation executor checks current action-specific permissions and
+    // revalidates the exact source/head while holding the real Catalog protections.
+    #[cfg(test)]
+    fault_observation::phase(ObservedPhase::Preparation);
+    executor.prepare(Arc::new(store), action, control).await?;
+    Ok(VectorMaintenanceWorkerResult::Prepared)
+}
+
+#[cfg(test)]
+mod vector_worker_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+
+    struct DropOwner(Arc<AtomicBool>);
+    impl Drop for DropOwner {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vector_worker_deadline_retains_execute_owner() {
+        let token = CancellationToken::new();
+        let budgets = VectorMaintenanceBudgets::new(&VectorMaintenanceRuntimeConfig::default(), None).unwrap();
+        let control = VectorMaintenanceControl::new(token.clone(), Instant::now() + Duration::from_secs(5), budgets);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = DropOwner(dropped.clone());
+        let (entered, started) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let task = tokio::spawn(coordinate_vector_execution(
+            async move {
+                let _owner = owner;
+                entered.send(()).unwrap();
+                resume.await.unwrap();
+                17u8
+            },
+            |_| async { Ok(Uuid::from_u128(2)) },
+            control,
+            Duration::from_secs(60),
+            Uuid::from_u128(1),
+        ));
+        started.await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled()).await.unwrap();
+        assert!(token.is_cancelled());
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        let result = task.await.unwrap();
+        assert_eq!(result.output, 17);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vector_worker_heartbeat_conflict_stops_new_work_and_drains() {
+        let token = CancellationToken::new();
+        let budgets = VectorMaintenanceBudgets::new(&VectorMaintenanceRuntimeConfig::default(), None).unwrap();
+        let control = VectorMaintenanceControl::new(token.clone(), Instant::now() + Duration::from_secs(900), budgets);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat_calls = calls.clone();
+        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel(2);
+        let (release, resume) = oneshot::channel();
+        let (entered, started) = oneshot::channel();
+        let task = tokio::spawn(coordinate_vector_execution(
+            async move {
+                entered.send(()).unwrap();
+                resume.await.unwrap()
+            },
+            move |revision| {
+                let count = heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+                let heartbeat_tx = heartbeat_tx.clone();
+                async move {
+                    heartbeat_tx.send(count).await.unwrap();
+                    if count == 0 {
+                        assert_eq!(revision, Uuid::from_u128(1));
+                        Ok(Uuid::from_u128(2))
+                    } else {
+                        assert_eq!(revision, Uuid::from_u128(2));
+                        Err(TableCatalogStoreError::Conflict("changed revision".into()))
+                    }
+                }
+            },
+            control,
+            Duration::from_secs(60),
+            Uuid::from_u128(1),
+        ));
+        started.await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(heartbeat_rx.recv().await, Some(0));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(heartbeat_rx.recv().await, Some(1));
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled()).await.unwrap();
+        assert!(token.is_cancelled());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        let result = task.await.unwrap();
+        assert_eq!(result.revision, Uuid::from_u128(2));
+        assert!(result.heartbeat_error.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vector_worker_native_recovery_deadline_drains_original_future() {
+        let token = CancellationToken::new();
+        let budgets = VectorMaintenanceBudgets::new(&VectorMaintenanceRuntimeConfig::default(), None).unwrap();
+        let control = VectorMaintenanceControl::new(token.clone(), Instant::now() + Duration::from_secs(5), budgets);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = DropOwner(dropped.clone());
+        let (entered, started) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let task = tokio::spawn(coordinate_vector_native_recovery(
+            async move {
+                let _owner = owner;
+                entered.send(()).unwrap();
+                resume.await.unwrap();
+                Err::<(), _>(TableCatalogStoreError::Unavailable("native recovery unresolved".into()))
+            },
+            control,
+        ));
+        started.await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled()).await.unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        assert!(matches!(task.await.unwrap(), Err(TableCatalogStoreError::Unavailable(_))));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn vector_worker_native_recovery_cancellation_retains_io_permit() {
+        let token = CancellationToken::new();
+        let config = VectorMaintenanceRuntimeConfig {
+            io_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        };
+        let budgets = VectorMaintenanceBudgets::new(&config, None).unwrap();
+        let control = VectorMaintenanceControl::new(token.clone(), Instant::now() + Duration::from_secs(900), budgets.clone());
+        assert!(control.dispatch_guard().is_err());
+        let io = control.acquire_io().await.unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let task = tokio::spawn(coordinate_vector_native_recovery(
+            async move {
+                let _io = io;
+                entered.send(()).unwrap();
+                resume.await.unwrap();
+            },
+            control,
+        ));
+        started.await.unwrap();
+        token.cancel();
+        assert!(budgets.try_acquire_io().is_err());
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        task.await.unwrap();
+        assert!(budgets.try_acquire_io().is_ok());
+    }
+}

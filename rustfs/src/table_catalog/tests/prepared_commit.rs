@@ -89,13 +89,13 @@ fn vector_bucket() -> BucketHandle {
     .unwrap()
 }
 
-struct PreparedFixture {
-    backend: TestCatalogObjectBackend,
-    store: ObjectTableCatalogStore<TestCatalogObjectBackend>,
-    bucket: BucketHandle,
-    entry: TableEntry,
-    initial: CatalogMetadataRef,
-    initial_descriptor: CatalogFormatDescriptor,
+pub(in crate::table_catalog) struct PreparedFixture {
+    pub(in crate::table_catalog) backend: TestCatalogObjectBackend,
+    pub(in crate::table_catalog) store: ObjectTableCatalogStore<TestCatalogObjectBackend>,
+    pub(in crate::table_catalog) bucket: BucketHandle,
+    pub(in crate::table_catalog) entry: TableEntry,
+    pub(in crate::table_catalog) initial: CatalogMetadataRef,
+    pub(in crate::table_catalog) initial_descriptor: CatalogFormatDescriptor,
 }
 
 async fn prepared_fixture() -> PreparedFixture {
@@ -153,6 +153,7 @@ async fn prepared_fixture() -> PreparedFixture {
         properties: BTreeMap::new(),
         created_at: None,
         updated_at: None,
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: Some(VectorHeadBindingV1::try_new(&resource, &initial, &initial_descriptor).unwrap()),
     };
@@ -1324,13 +1325,10 @@ async fn catalog_vector_v3_recovery_rejects_definition_and_state_mismatched_ance
         assert_eq!(recovery.recovery_state, TableCommitRecoveryState::ManualReview);
     }
     let mut contradictory = logs.clone();
-    contradictory[1]
-        .vector_resource_mutation
-        .as_mut()
-        .unwrap()
-        .expected_definition
-        .tags
-        .insert("unexpected".into(), "value".into());
+    let VectorResourceMutationBinding::V1(binding) = contradictory[1].vector_resource_mutation.as_mut().unwrap() else {
+        panic!("fixture uses V1 resource mutation");
+    };
+    binding.expected_definition.tags.insert("unexpected".into(), "value".into());
     let history = TableCommitHistoryIndex::new(&head, &contradictory);
     assert!(!history.proves_committed(&contradictory[0]));
 }
@@ -1352,13 +1350,10 @@ async fn catalog_vector_v3_superseded_recovery_requires_exact_resource_predecess
         if corrupt_generation {
             contradictory.vector_commit_binding.as_mut().unwrap().expected_generation += 1;
         } else {
-            contradictory
-                .vector_resource_mutation
-                .as_mut()
-                .unwrap()
-                .expected_definition
-                .tags
-                .insert("unknown".into(), "base".into());
+            let VectorResourceMutationBinding::V1(binding) = contradictory.vector_resource_mutation.as_mut().unwrap() else {
+                panic!("fixture uses V1 resource mutation");
+            };
+            binding.expected_definition.tags.insert("unknown".into(), "base".into());
         }
         let mut records = logs.clone();
         records.push(contradictory.clone());
@@ -1385,7 +1380,7 @@ async fn catalog_vector_v3_recovery_proof_checks_exact_binding_and_generation() 
     }
 }
 
-async fn prepared_v3_fixture() -> PreparedFixture {
+pub(in crate::table_catalog) async fn prepared_v3_fixture() -> PreparedFixture {
     let mut fixture = prepared_fixture().await;
     fixture.entry = serde_json::from_value(v3_entry_json(
         &fixture.entry,
@@ -2770,7 +2765,7 @@ async fn catalog_vector_v3_parent_registration_rejects_retained_old_incarnation(
     assert_eq!(after.etag, before.etag);
 }
 
-type NativeVectorParentStorage = crate::storage_api::startup::services::ECStore;
+pub(in crate::table_catalog) type NativeVectorParentStorage = crate::storage_api::startup::services::ECStore;
 
 #[tokio::test]
 async fn catalog_vector_namespace_creation_rejects_inactive_exact_records() {
@@ -2962,17 +2957,17 @@ async fn catalog_vector_namespace_exact_lookup_keeps_identity_validation() {
     );
 }
 
-struct NativeVectorParentFixture {
-    bucket: BucketHandle,
-    request: Arc<crate::app::RequestEnvelope>,
-    access: crate::storage_api::startup::services::ManagedObjectAccess,
-    storage: Arc<NativeVectorParentStorage>,
-    backend: EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>,
-    catalog: ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
-    guard: Arc<crate::storage_api::table::managed::BucketIncarnationFenceGuard>,
+pub(in crate::table_catalog) struct NativeVectorParentFixture {
+    pub(in crate::table_catalog) bucket: BucketHandle,
+    pub(in crate::table_catalog) request: Arc<crate::app::RequestEnvelope>,
+    pub(in crate::table_catalog) access: crate::storage_api::startup::services::ManagedObjectAccess,
+    pub(in crate::table_catalog) storage: Arc<NativeVectorParentStorage>,
+    pub(in crate::table_catalog) backend: EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>,
+    pub(in crate::table_catalog) catalog: ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
+    pub(in crate::table_catalog) guard: Arc<crate::storage_api::table::managed::BucketIncarnationFenceGuard>,
 }
 
-async fn native_vector_parent_fixture() -> (NativeVectorParentFixture, impl Send) {
+pub(in crate::table_catalog) async fn native_vector_parent_fixture() -> (NativeVectorParentFixture, impl Send) {
     let (request, access, storage, reset) =
         crate::app::object::managed_request_fixture_with_encryption(crate::app::object::ManagedEncryption::Unencrypted).await;
     let app = request.server_context().unwrap().installed_app_context().unwrap();
@@ -3681,7 +3676,7 @@ impl NativeVectorDeleteFixture {
 
 // Match the debug service worker allocation for these native storage futures.
 // Construct the test future on its execution thread and propagate its failure.
-fn run_native_vector_delete_test<F, Fut>(name: &'static str, test: F)
+pub(in crate::table_catalog) fn run_native_vector_delete_test<F, Fut>(name: &'static str, test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
@@ -4033,6 +4028,16 @@ async fn native_vector_delete_child(
     ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
     TableEntry,
 ) {
+    native_vector_delete_child_at(fixture, None).await
+}
+
+async fn native_vector_delete_child_at(
+    fixture: &NativeVectorDeleteFixture,
+    mod_time: Option<OffsetDateTime>,
+) -> (
+    ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
+    TableEntry,
+) {
     use crate::vector::lance::ManagedManifestObjects;
     let resource =
         CatalogResourceIdentity::try_new(fixture.bucket.clone(), fixture.access.table_id().clone(), CatalogFormat::Lance)
@@ -4053,12 +4058,35 @@ async fn native_vector_delete_child(
         .create_only(&fixture.access, &object_key, bytes::Bytes::from_static(b"opaque fixture manifest"))
         .await
         .unwrap();
+    if let Some(mod_time) = mod_time {
+        let mut reader = PutObjReader::from_vec(b"opaque fixture manifest".to_vec());
+        fixture
+            .storage
+            .put_object(
+                resource.storage_bucket_id(),
+                &key,
+                &mut reader,
+                &ObjectOptions {
+                    mod_time: Some(mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
     let content = objects
-        .get(&fixture.access, &object_key, None, created.body_revision)
+        .get(
+            &fixture.access,
+            &object_key,
+            None,
+            if mod_time.is_some() { None } else { created.body_revision },
+        )
         .await
         .unwrap();
     assert!(created.body_revision.is_some());
-    assert_eq!(content.body_revision, created.body_revision);
+    if mod_time.is_none() {
+        assert_eq!(content.body_revision, created.body_revision);
+    }
     let metadata = CatalogMetadataRef::from_read(object_key, &content).unwrap();
     let descriptor =
         CatalogFormatDescriptor::try_new(1, CatalogFormat::Lance, 1, metadata.clone(), b"opaque fixture descriptor".to_vec())
@@ -4084,6 +4112,7 @@ async fn native_vector_delete_child(
         properties: BTreeMap::new(),
         created_at: None,
         updated_at: None,
+        vector_maintenance_binding: None,
         vector_index_definition: Some(VectorIndexDefinitionV1 {
             version: 1,
             effective_encryption: VectorEffectiveEncryptionV1::Unencrypted,
@@ -4297,4 +4326,26 @@ fn catalog_vector_empty_delete_holds_real_writer_across_registration_cleanup() {
         assert_eq!(fixture.bytes().await, (None, None));
         assert!(!reader.is_lock_lost());
     });
+}
+
+pub(in crate::table_catalog) async fn native_vector_index_fixture() -> (
+    ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
+    TableEntry,
+    impl Send,
+) {
+    let (fixture, reset) = native_vector_delete_fixture().await;
+    let (store, entry) = native_vector_delete_child(&fixture).await;
+    (store, entry, (fixture, reset))
+}
+
+pub(in crate::table_catalog) async fn native_vector_index_fixture_at(
+    mod_time: OffsetDateTime,
+) -> (
+    ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
+    TableEntry,
+    impl Send,
+) {
+    let (fixture, reset) = native_vector_delete_fixture().await;
+    let (store, entry) = native_vector_delete_child_at(&fixture, Some(mod_time)).await;
+    (store, entry, (fixture, reset))
 }

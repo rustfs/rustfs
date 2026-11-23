@@ -1193,9 +1193,11 @@ impl RemotePeerS3Client {
         };
 
         let port = url.port_or_known_default().unwrap_or(80);
+        // URL host strings retain IPv6 brackets; the tuple resolver expects the bare address.
+        let connect_host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
 
         // Try to establish TCP connection
-        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((connect_host, port))).await {
             Ok(Ok(_)) => Ok(()),
             _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
@@ -1999,6 +2001,84 @@ mod tests {
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
         }
+    }
+
+    async fn assert_peer_connectivity(listener: &tokio::net::TcpListener, url: &str) {
+        let result = RemotePeerS3Client::perform_connectivity_check(url).await;
+        assert!(result.is_ok(), "peer connectivity check for {url} failed: {result:?}");
+        let (accepted, peer) = tokio::time::timeout(get_drive_active_check_timeout(), listener.accept())
+            .await
+            .expect("successful health check must reach the original listener before the deadline")
+            .expect("accept the health-check connection");
+        assert_eq!(
+            accepted.local_addr().expect("accepted socket address"),
+            listener.local_addr().expect("listener socket address"),
+            "the URL must select the original listener port"
+        );
+        assert!(peer.ip().is_loopback(), "health check must use the local test endpoint");
+    }
+
+    #[tokio::test]
+    async fn test_peer_connectivity_ipv6_loopback() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the real IPv6 loopback listener");
+        let address = listener.local_addr().expect("IPv6 listener address");
+        let bare = tokio::time::timeout(
+            get_drive_active_check_timeout(),
+            TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, address.port())),
+        )
+        .await
+        .expect("the bare IPv6 connection must complete before the deadline")
+        .expect("the bare IPv6 address must reach the same listener");
+        let (accepted, _) = tokio::time::timeout(get_drive_active_check_timeout(), listener.accept())
+            .await
+            .expect("accept the bare IPv6 connection before the deadline")
+            .expect("accept the bare IPv6 connection");
+        drop((bare, accepted));
+
+        assert_peer_connectivity(&listener, &format!("http://{address}/test-disk")).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_connectivity_ipv4_loopback() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the real IPv4 loopback listener");
+        let address = listener.local_addr().expect("IPv4 listener address");
+        assert_peer_connectivity(&listener, &format!("http://{address}/test-disk")).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_connectivity_localhost() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the localhost test listener");
+        let port = listener.local_addr().expect("localhost listener address").port();
+        assert_peer_connectivity(&listener, &format!("http://localhost:{port}/test-disk?port=1#ignored")).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_connectivity_rejects_invalid_url_and_unreachable_peer() {
+        for (url, message) in [("not a URL", "Invalid URL:"), ("data:text/plain,peer", "No host in URL")] {
+            let error = RemotePeerS3Client::perform_connectivity_check(url)
+                .await
+                .expect_err("invalid peer URL must remain an error");
+            assert!(error.to_string().contains(message), "unexpected error for {url}: {error:?}");
+        }
+
+        let socket = tokio::net::TcpSocket::new_v6().expect("create an IPv6 socket that will not listen");
+        socket
+            .bind((std::net::Ipv6Addr::LOCALHOST, 0).into())
+            .expect("reserve an unlistened IPv6 port");
+        let address = socket.local_addr().expect("reserved IPv6 socket address");
+        let error = RemotePeerS3Client::perform_connectivity_check(&format!("http://{address}/test-disk"))
+            .await
+            .expect_err("a bound socket without a listener must remain unreachable");
+        assert!(
+            error.to_string().contains(&format!("Cannot connect to {address}")),
+            "connection failure must preserve the URL host and port: {error:?}"
+        );
     }
 
     #[test]

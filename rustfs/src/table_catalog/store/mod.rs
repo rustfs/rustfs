@@ -27,6 +27,8 @@ pub(in crate::table_catalog) use object_backup::{
 };
 mod publication_deadline;
 mod reader;
+mod vector_maintenance;
+pub(crate) use vector_maintenance::*;
 mod registration_cache;
 pub(crate) use publication_deadline::TablePublicationPreparation;
 pub(in crate::table_catalog) use publication_deadline::publication_preparation;
@@ -732,6 +734,7 @@ pub(crate) struct TableCatalogObjectMetadata {
 pub(crate) struct TableCatalogLockGuard {
     _guard: Box<dyn Send>,
     lifecycle_guard: Option<Arc<BucketIncarnationFenceGuard>>,
+    namespace_read_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     write_commit_guard: Option<WriteCommitGuard>,
 }
@@ -745,6 +748,7 @@ impl TableCatalogLockGuard {
         Self {
             _guard: Box::new(guard),
             lifecycle_guard: None,
+            namespace_read_guard: None,
             lock_lost: None,
             write_commit_guard: None,
         }
@@ -753,8 +757,9 @@ impl TableCatalogLockGuard {
     fn namespace(guard: rustfs_lock::NamespaceLockGuard) -> Self {
         let lock_lost = guard.lock_lost_signal();
         Self {
-            _guard: Box::new(guard),
+            _guard: Box::new(()),
             lifecycle_guard: None,
+            namespace_read_guard: Some(Arc::new(guard)),
             lock_lost,
             write_commit_guard: None,
         }
@@ -770,6 +775,7 @@ impl TableCatalogLockGuard {
         Self {
             _guard: Box::new(()),
             lifecycle_guard: None,
+            namespace_read_guard: None,
             lock_lost,
             write_commit_guard: Some(guard),
         }
@@ -2394,6 +2400,7 @@ where
         Ok(TableCatalogLockGuard {
             _guard: Box::new(()),
             lifecycle_guard: Some(Arc::new(guard)),
+            namespace_read_guard: None,
             lock_lost,
             write_commit_guard: None,
         })
@@ -2867,7 +2874,16 @@ where
             .new_ns_lock(bucket, object)
             .await
             .map_err(|err| storage_error_to_catalog("create catalog table lock", err))?;
-        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
+        let timeout = get_lock_acquire_timeout();
+        let acquire = WriteCommitGuard::acquire(&lock, timeout);
+        #[cfg(test)]
+        let acquire = crate::table_catalog::maintenance::fault_observation::observe_native_gc_write_lock(
+            lock.resource(),
+            lock.owner(),
+            timeout,
+            acquire,
+        );
+        let guard = acquire
             .await
             .map_err(|err| catalog_lock_acquisition_error("acquire catalog table lock", err))?;
         Ok(TableCatalogLockGuard::write_namespace(guard))
@@ -2985,6 +3001,7 @@ where
         write_guards: Option<Vec<WriteCommitGuard>>,
         fence: Option<&TableCatalogObjectMutationFence>,
     ) -> TableCatalogStoreResult<()> {
+        #[cfg(not(test))]
         let mut reader = PutObjReader::from_vec(data);
         let mut opts = ObjectOptions {
             http_preconditions: http_preconditions_for_catalog_put(precondition),
@@ -3003,18 +3020,66 @@ where
             }
             opts.write_completion = WriteCompletion::TailDrained;
         }
+        #[cfg(test)]
+        let fault_observation = crate::table_catalog::test_support::catalog_write_faults::CatalogWriteObservation::begin(
+            Arc::as_ptr(&self.store) as usize,
+            bucket,
+            object,
+            &data,
+            matches!(&opts.write_completion, WriteCompletion::TailDrained),
+        );
+        #[cfg(test)]
+        let mut reader = PutObjReader::from_vec(data);
+        #[cfg(test)]
+        if let Err(error) = fault_observation
+            .checkpoint(crate::table_catalog::test_support::catalog_write_faults::CatalogWriteFaultPhase::Before)
+            .await
+        {
+            fault_observation.response_ready(false);
+            return Err(error);
+        }
+        #[cfg(test)]
+        fault_observation.native_started();
         let result = self
             .store
             .put_object(bucket, object, &mut reader, &opts)
             .await
             .map(|_| ())
             .map_err(|err| storage_error_to_catalog("write catalog object", err));
-        if result.is_ok()
-            && let Some(fence) = fence
+        #[cfg(test)]
         {
-            fence.ensure_held()?;
+            use crate::table_catalog::test_support::catalog_write_faults::{CatalogWriteFaultPhase, CatalogWriteFenceOutcome};
+            fault_observation.native_returned(result.is_ok());
+            let after_native = fault_observation.checkpoint(CatalogWriteFaultPhase::AfterNative).await;
+            let (result, fence_outcome) = if result.is_err() {
+                (result, CatalogWriteFenceOutcome::NativeError)
+            } else if let Some(fence) = fence {
+                let checked = fence.ensure_held();
+                let outcome = if checked.is_ok() {
+                    CatalogWriteFenceOutcome::Held
+                } else {
+                    CatalogWriteFenceOutcome::Lost
+                };
+                (checked, outcome)
+            } else {
+                (result, CatalogWriteFenceOutcome::NotProvided)
+            };
+            fault_observation.fence_checked(fence_outcome);
+            let after_fence = fault_observation.checkpoint(CatalogWriteFaultPhase::AfterFence).await;
+            let before_response = fault_observation.checkpoint(CatalogWriteFaultPhase::BeforeResponse).await;
+            let result = result.and(after_native).and(after_fence).and(before_response);
+            fault_observation.response_ready(result.is_ok());
+            result
         }
-        result
+        #[cfg(not(test))]
+        {
+            if result.is_ok()
+                && let Some(fence) = fence
+            {
+                fence.ensure_held()?;
+            }
+            result
+        }
     }
 }
 
@@ -3025,12 +3090,14 @@ pub(crate) struct VectorCatalogOperationGuard {
 
 struct VectorCatalogOperationState {
     owner: Arc<()>,
+    retirement_validation_owner: Arc<()>,
     resource_identity: CatalogResourceIdentity,
     namespace: Namespace,
     name: CatalogName,
     lifecycle: tokio::sync::Mutex<TableCatalogLockGuard>,
     native_lifecycle: Option<Arc<BucketIncarnationFenceGuard>>,
     gc: parking_lot::Mutex<TableCatalogLockGuard>,
+    gc_exclusive: bool,
     fence: TableCatalogObjectMutationFence,
 }
 
@@ -3079,9 +3146,11 @@ pub(crate) struct VectorCatalogEntry {
 }
 
 impl VectorCatalogEntry {
-    fn from_entry(entry: TableEntry) -> TableCatalogStoreResult<Self> {
-        if entry.version != 3 {
-            return Err(TableCatalogStoreError::Unsupported("formal Vector operations require Catalog v3".into()));
+    pub(in crate::table_catalog) fn from_entry(entry: TableEntry) -> TableCatalogStoreResult<Self> {
+        if !matches!(entry.version, 3 | 4) {
+            return Err(TableCatalogStoreError::Unsupported(
+                "formal Vector operations require Catalog v3 or v4".into(),
+            ));
         }
         let head = CatalogHead::from_vector_entry(&entry)?;
         let definition = entry
@@ -3221,6 +3290,7 @@ impl<S: TableCatalogStorage> EcStoreTableCatalogObjectBackend<S> {
         Ok(TableCatalogLockGuard {
             _guard: Box::new(()),
             lifecycle_guard: Some(guard),
+            namespace_read_guard: None,
             lock_lost,
             write_commit_guard: None,
         })

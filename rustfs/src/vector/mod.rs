@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub(crate) mod access_core;
+#[cfg(test)]
+pub(crate) mod fault_test;
 pub(crate) mod filter;
 pub(crate) mod lance;
 pub(crate) mod model;

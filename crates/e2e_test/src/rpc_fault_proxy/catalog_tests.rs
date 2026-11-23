@@ -513,3 +513,103 @@ async fn catalog_proxy_drop_cancels_selected_original_without_replaying_it() {
     .await
     .expect("proxy drop deadline");
 }
+
+#[tokio::test]
+async fn catalog_acquisition_partition_preserves_exact_frames_and_other_methods() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let backend = catalog_backend(RenameDataResponse {
+            success: true,
+            ..Default::default()
+        })
+        .await
+        .expect("backend");
+        let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+            .await
+            .expect("proxy");
+        let resource = ObjectKey::new(".rustfs.sys", HEAD);
+        let selected = lock_request(resource.clone(), "writer-a");
+        let unrelated = lock_request(ObjectKey::new(".rustfs.sys", format!("{HEAD}-suffix")), "writer-b");
+        let gate = proxy
+            .pause_catalog_locks(vec![resource.clone()])
+            .expect("acquisition partition");
+        assert!(
+            proxy.observe_catalog_locks(vec![resource]).is_err(),
+            "observer must not bypass an acquisition partition"
+        );
+        let address = proxy.local_addr();
+        let single = lock_frame(&selected);
+        let batch = frame(&BatchGenerallyLockRequest {
+            args: [&unrelated, &selected]
+                .into_iter()
+                .map(|request| serde_json::to_string(request).expect("typed lock"))
+                .collect(),
+        });
+        let first = tokio::spawn(send(address, "Lock", single.clone()));
+        gate.wait_for_hits(1).await.expect("initial Lock blocked");
+        let second = tokio::spawn(send(address, "LockBatch", batch.clone()));
+        gate.wait_for_hits(2).await.expect("initial batch blocked");
+        assert_eq!(backend.received.lock().expect("backend evidence").len(), 0);
+        send(address, "Refresh", single.clone())
+            .await
+            .expect("Refresh remains available");
+        send(address, "Lock", lock_frame(&unrelated))
+            .await
+            .expect("neighboring resource remains available");
+        let mut inconsistent = selected.clone();
+        inconsistent.lock_id.resource = unrelated.resource.clone();
+        send(address, "Lock", lock_frame(&inconsistent))
+            .await
+            .expect("inconsistent lock identity does not match");
+        send(address, "RenameData", rename_request("candidate", ".rustfs.sys", HEAD))
+            .await
+            .expect("data lane remains available");
+        assert_eq!(gate.snapshot().hits, 2);
+        gate.release_all().expect("restore original acquisition packets");
+        first.await.expect("single task").expect("single response");
+        second.await.expect("batch task").expect("batch response");
+        completed(&gate, 2).await;
+        let evidence = gate.snapshot();
+        assert_eq!(
+            (evidence.blocked, evidence.forwarded, evidence.discarded, evidence.overflow),
+            (0, 2, 0, 0)
+        );
+        for packet in &evidence.packets {
+            assert_eq!(packet.locks.len(), 1);
+            assert_eq!(packet.locks[0].lock_id, selected.lock_id);
+            assert_eq!(packet.locks[0].owner, selected.owner);
+        }
+        let received = backend.received.lock().expect("backend evidence");
+        assert_eq!(received.len(), 6);
+        assert!(received[4..].iter().any(|request| request.body == single));
+        assert!(received[4..].iter().any(|request| request.body == batch));
+    })
+    .await
+    .expect("acquisition partition deadline");
+}
+
+#[tokio::test]
+async fn catalog_acquisition_partition_drop_discards_pending_and_removes_rule() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let backend = catalog_backend(RenameDataResponse::default()).await.expect("backend");
+        let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+            .await
+            .expect("proxy");
+        let resource = ObjectKey::new(".rustfs.sys", HEAD);
+        let gate = proxy.pause_catalog_locks(vec![resource.clone()]).expect("partition");
+        let request = lock_frame(&lock_request(resource.clone(), "writer-a"));
+        let held = tokio::spawn(send(proxy.local_addr(), "Lock", request.clone()));
+        gate.wait_for_hits(1).await.expect("blocked request");
+        assert_eq!(gate.snapshot().overflow, 0);
+        drop(gate);
+        assert!(held.await.expect("request owner").is_err());
+        assert!(backend.received.lock().expect("backend evidence").is_empty());
+        let observer = proxy.observe_catalog_locks(vec![resource]).expect("partition slot released");
+        send(proxy.local_addr(), "Lock", request.clone())
+            .await
+            .expect("restored request");
+        completed(&observer, 1).await;
+        assert_eq!(backend.received.lock().expect("backend evidence")[0].body, request);
+    })
+    .await
+    .expect("partition owner drain deadline");
+}

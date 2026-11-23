@@ -12,7 +12,37 @@ use crate::{
 };
 
 #[derive(Default)]
-pub(super) struct CandidateReader(parking_lot::RwLock<Option<std::sync::Weak<crate::startup_services::ManagedLanceObjects>>>);
+pub(super) struct CandidateReader {
+    objects: parking_lot::RwLock<Option<std::sync::Weak<crate::startup_services::ManagedLanceObjects>>>,
+    owned_maintenance: Option<Arc<dyn CatalogManagedCandidateReader>>,
+    maintenance: Option<crate::table_catalog::VectorMaintenanceControl>,
+    retained_allocations: parking_lot::Mutex<Vec<Arc<crate::table_catalog::VectorMaintenanceMemoryReservation>>>,
+}
+
+impl CandidateReader {
+    pub(super) fn bind(&self, objects: &Arc<crate::startup_services::ManagedLanceObjects>) {
+        *self.objects.write() = Some(Arc::downgrade(objects));
+    }
+
+    /// Retain the admitted reader and its allocation budget through Catalog publication.
+    pub(super) fn with_owned_maintenance_reader(
+        control: crate::table_catalog::VectorMaintenanceControl,
+        reader: Arc<dyn CatalogManagedCandidateReader>,
+    ) -> Self {
+        Self {
+            owned_maintenance: Some(reader),
+            maintenance: Some(control),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_maintenance_control(control: crate::table_catalog::VectorMaintenanceControl) -> Self {
+        Self {
+            maintenance: Some(control),
+            ..Self::default()
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl CatalogManagedCandidateReader for CandidateReader {
@@ -23,11 +53,46 @@ impl CatalogManagedCandidateReader for CandidateReader {
         max_size: usize,
         lifecycle: &BucketIncarnationFenceGuard,
     ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
-        let reader =
-            self.0.read().as_ref().and_then(std::sync::Weak::upgrade).ok_or_else(|| {
-                TableCatalogStoreError::Unavailable("request has no authorized Managed candidate reader".into())
-            })?;
-        reader.read_managed_candidate(bucket, metadata, max_size, lifecycle).await
+        let reader: Arc<dyn CatalogManagedCandidateReader> = match &self.owned_maintenance {
+            Some(reader) => reader.clone(),
+            None => self
+                .objects
+                .read()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Unavailable("request has no authorized Managed candidate reader".into())
+                })?,
+        };
+        let Some(control) = &self.maintenance else {
+            return reader.read_managed_candidate(bucket, metadata, max_size, lifecycle).await;
+        };
+        let size = max_size.min(usize::try_from(metadata.content_length()).map_err(|error| TableCatalogStoreError::Io {
+            classification: crate::table_catalog::CatalogIoErrorKind::Unavailable,
+            context: "measure maintenance candidate read",
+            source: Box::new(error),
+        })?);
+        let budget_error = |error| TableCatalogStoreError::Io {
+            classification: crate::table_catalog::CatalogIoErrorKind::Unavailable,
+            context: "admit maintenance candidate read",
+            source: Box::new(error),
+        };
+        let peak = control
+            .reserve_memory(u64::try_from(size).unwrap_or(u64::MAX).saturating_mul(2))
+            .map_err(budget_error)?;
+        let io = control.acquire_io().await.map_err(budget_error)?;
+        let result = reader.read_managed_candidate(bucket, metadata, size, lifecycle).await?;
+        drop(io);
+        if let Some(object) = &result {
+            let retained = control
+                .reserve_memory(u64::try_from(object.data.capacity()).unwrap_or(u64::MAX))
+                .map_err(budget_error)?;
+            // Catalog consumes an owned Vec. Its binding retains the allocation charge
+            // through all validation and publication using this reader.
+            self.retained_allocations.lock().push(retained);
+        }
+        drop(peak);
+        Ok(result)
     }
 }
 
@@ -196,7 +261,7 @@ impl VectorRequestAccess for IndexRequest<'_> {
             guard,
             self.owner.limits,
         )?;
-        *self.authorization.reader.0.write() = Some(Arc::downgrade(&objects));
+        self.authorization.reader.bind(&objects);
         Ok(ManagedDatasetAccess { access, objects })
     }
 }

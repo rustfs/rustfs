@@ -143,13 +143,16 @@ impl LanceManifestDescriptorV1 {
         resource: &CatalogResourceIdentity,
         index: &VectorIndexManifestSpec,
     ) -> Result<Self, LanceManifestError> {
-        if descriptor.encoding_version() != 1 || descriptor.format() != CatalogFormat::Lance || descriptor.format_version() != 1 {
+        if descriptor.encoding_version() != 1
+            || descriptor.format() != CatalogFormat::Lance
+            || !matches!(descriptor.format_version(), 1 | 2)
+        {
             return Err(LanceManifestError::UnsupportedFormat {
                 reason: "unsupported Catalog Lance descriptor envelope",
             });
         }
         let decoded: Self = serde_json::from_slice(descriptor.payload())?;
-        if decoded.descriptor_version != 1
+        if decoded.descriptor_version != descriptor.format_version()
             || decoded.library_version != "14.0.2"
             || decoded.footer_major != 0
             || decoded.footer_minor != 2
@@ -207,6 +210,7 @@ impl LanceManifestDescriptorV1 {
         if self.manifest_version != manifest.version
             || self.reader_feature_flags != manifest.reader_feature_flags
             || self.writer_feature_flags != manifest.writer_feature_flags
+            || (self.descriptor_version == 1 && validated.requires_v2())
         {
             return Err(LanceManifestError::ReferenceMismatch {
                 reason: "descriptor flags or version differ from the stored manifest",
@@ -309,7 +313,9 @@ pub(super) struct ValidatedLanceManifest {
     exact_file: Bytes,
     content_identity: ManifestContentIdentity,
     bound_reference: Option<CatalogMetadataRef>,
-    inline_transaction: Option<lance_table::format::pb::Transaction>,
+    transaction: Option<lance_table::format::pb::Transaction>,
+    indices: Vec<IndexMetadata>,
+    format_version: u16,
 }
 
 impl ValidatedLanceManifest {
@@ -346,6 +352,7 @@ impl ValidatedLanceManifest {
             index,
         )?;
         super::files::manifest_objects(validated.manifest(), resource)?;
+        super::files::validate_indices(&validated.indices, validated.manifest(), index)?;
         validated.bound_reference = Some(reference.clone());
         Ok(validated)
     }
@@ -377,7 +384,7 @@ impl ValidatedLanceManifest {
         )?;
         validate_manifest_path(resource, reference, self.manifest.version, None)?;
         let payload = LanceManifestDescriptorV1 {
-            descriptor_version: 1,
+            descriptor_version: self.format_version,
             library_version: "14.0.2".into(),
             manifest_version: self.manifest.version,
             footer_major: 0,
@@ -392,7 +399,7 @@ impl ValidatedLanceManifest {
         Ok(CatalogFormatDescriptor::try_new(
             1,
             CatalogFormat::Lance,
-            1,
+            self.format_version,
             reference.clone(),
             serde_json::to_vec(&payload)?,
         )?)
@@ -416,7 +423,7 @@ impl ValidatedLanceManifest {
             parts.resource_identity.storage_bucket_id(),
             parts.resource_identity.dataset_prefix().trim_end_matches('/')
         );
-        let updates = CatalogEntryUpdates::try_new(Some(warehouse), Some(1))?;
+        let updates = CatalogEntryUpdates::try_new(Some(warehouse), Some(self.format_version))?;
         Ok(PreparedCatalogCommit::try_from_validated_parts(
             parts,
             reference,
@@ -485,12 +492,31 @@ impl ValidatedLanceManifest {
         for position in [manifest.index_section, manifest.transaction_section].into_iter().flatten() {
             validate_section(&bytes, position, manifest_offset)?;
         }
-        if !manifest.base_paths.is_empty() || manifest.index_section.is_some() || manifest.version_aux_data != 0 {
+        if !manifest.base_paths.is_empty() || manifest.version_aux_data != 0 {
             return Err(LanceManifestError::UnsupportedFormat {
                 reason: "Vector manifests cannot contain external bases or unsupported auxiliary sections",
             });
         }
-        let inline_transaction = manifest
+        if let (Some(index_position), Some(transaction_position)) = (manifest.index_section, manifest.transaction_section) {
+            let index_end = validate_section(&bytes, index_position, manifest_offset)?;
+            let transaction_end = validate_section(&bytes, transaction_position, manifest_offset)?;
+            if index_position < transaction_end && transaction_position < index_end {
+                return Err(LanceManifestError::CorruptManifest {
+                    reason: "manifest sections overlap",
+                });
+            }
+        }
+        let indices = manifest
+            .index_section
+            .map(|position| {
+                let end = validate_section(&bytes, position, manifest_offset)?;
+                let section = lance_table::format::pb::IndexSection::decode(&bytes[position + 4..end])
+                    .map_err(|source| LanceManifestError::Protobuf { source })?;
+                super::files::decode_indices(section.indices)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let transaction = manifest
             .transaction_section
             .map(|position| {
                 let end = validate_section(&bytes, position, manifest_offset)?;
@@ -500,22 +526,59 @@ impl ValidatedLanceManifest {
                 Ok::<_, LanceManifestError>(transaction)
             })
             .transpose()?;
-        if !manifest.fragments.is_empty() && inline_transaction.is_none() && manifest.transaction_file.is_none() {
+        if !manifest.fragments.is_empty() && transaction.is_none() && manifest.transaction_file.is_none() {
             return Err(LanceManifestError::CorruptManifest {
                 reason: "nonempty Dataset manifest has no transaction",
             });
         }
+        let format_version = if !indices.is_empty() || transaction.as_ref().is_some_and(super::files::is_maintenance_transaction)
+        {
+            2
+        } else {
+            1
+        };
         Ok(Self {
             manifest,
             exact_file: bytes,
             content_identity,
             bound_reference: None,
-            inline_transaction,
+            transaction,
+            indices,
+            format_version,
         })
     }
 
-    pub(super) fn inline_transaction(&self) -> Option<&lance_table::format::pb::Transaction> {
-        self.inline_transaction.as_ref()
+    pub(super) fn retain_format_version(&mut self, version: u16) {
+        self.format_version = self.format_version.max(version);
+    }
+
+    pub(super) fn requires_v2(&self) -> bool {
+        self.format_version == 2
+    }
+
+    pub(super) fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
+    pub(super) fn transaction(&self) -> Option<&lance_table::format::pb::Transaction> {
+        self.transaction.as_ref()
+    }
+
+    pub(super) fn bind_external_transaction(
+        &mut self,
+        transaction: lance_table::format::pb::Transaction,
+    ) -> Result<(), LanceManifestError> {
+        super::files::validate_transaction(&transaction, &self.manifest)?;
+        if self.transaction.as_ref().is_some_and(|inline| inline != &transaction) {
+            return Err(LanceManifestError::ReferenceMismatch {
+                reason: "inline and external transactions differ",
+            });
+        }
+        if super::files::is_maintenance_transaction(&transaction) {
+            self.retain_format_version(2);
+        }
+        self.transaction = Some(transaction);
+        Ok(())
     }
 
     pub(super) fn manifest(&self) -> &Manifest {
@@ -620,7 +683,6 @@ fn validate_protobuf(bytes: &[u8], manifest_offset: usize, dimension: NonZeroU32
         || !message.clustering.is_empty()
         || !message.config.is_empty()
         || !message.base_paths.is_empty()
-        || message.index_section.is_some()
         || message.version_aux_data != 0
     {
         return Err(LanceManifestError::UnsupportedFormat {

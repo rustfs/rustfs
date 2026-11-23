@@ -23,8 +23,13 @@ fn vector_resource_successor_matches(table: &TableEntry, log: &CommitLogEntry) -
         table.vector_index_definition.as_ref(),
         log.vector_resource_mutation.as_ref(),
     ) {
-        (3, 3, Some(definition), Some(mutation)) => {
-            mutation.validate().is_ok() && definition == &mutation.next_definition && table.state == mutation.next_state
+        (3 | 4, 3 | 4, Some(definition), Some(mutation)) => {
+            table.version == mutation.entry_version()
+                && log.version == mutation.entry_version()
+                && mutation.validate().is_ok()
+                && definition == mutation.next_definition()
+                && &table.state == mutation.next_state()
+                && table.vector_maintenance_binding.as_ref() == mutation.next_maintenance()
         }
         (1, 1, None, None) | (2, 2, None, None) => true,
         _ => false,
@@ -38,8 +43,18 @@ fn vector_resource_predecessor_matches(table: &TableEntry, log: &CommitLogEntry)
         table.vector_index_definition.as_ref(),
         log.vector_resource_mutation.as_ref(),
     ) {
-        (3, 3, Some(definition), Some(mutation)) => {
-            mutation.validate().is_ok() && definition == &mutation.expected_definition && table.state == mutation.expected_state
+        (3 | 4, 3 | 4, Some(definition), Some(mutation)) => {
+            log.version == mutation.entry_version()
+                && table.version
+                    == if mutation.kind() == VectorResourceMutationKind::Enroll {
+                        3
+                    } else {
+                        log.version
+                    }
+                && mutation.validate().is_ok()
+                && definition == mutation.expected_definition()
+                && &table.state == mutation.expected_state()
+                && table.vector_maintenance_binding.as_ref() == mutation.expected_maintenance()
         }
         (1, 1, None, None) | (2, 2, None, None) => true,
         _ => false,
@@ -117,7 +132,7 @@ impl<'a> TableCommitHistoryIndex<'a> {
         let mut reachable_version_tokens = BTreeSet::new();
         let mut committed_successors = BTreeMap::new();
         let mut version_token_reused = false;
-        let vector_entry = table.version == 3;
+        let vector_entry = matches!(table.version, 3 | 4);
         let mut vector_cursor = VectorHistoryCursor::from_entry(table);
         let mut vector_history_valid = !vector_entry || vector_cursor.is_some();
         let mut vector_commits = BTreeMap::new();
@@ -170,7 +185,7 @@ impl<'a> TableCommitHistoryIndex<'a> {
                     .get(target.commit_id.as_str())
                     .is_some_and(|committed| commit_logs_share_recovery_payload(committed, target));
         }
-        target.version != 3
+        !matches!(target.version, 3 | 4)
             && !self.cycle_detected
             && self.table_id == target.table_id.as_str()
             && !matches!(target.status, CommitLogStatus::Failed)
@@ -184,7 +199,7 @@ impl<'a> TableCommitHistoryIndex<'a> {
 
     fn proven_superseding_commit(&self, target: &CommitLogEntry) -> Option<&CommitLogEntry> {
         if (self.vector_entry && !self.vector_history_valid)
-            || (!self.vector_entry && target.version == 3)
+            || (!self.vector_entry && matches!(target.version, 3 | 4))
             || self.cycle_detected
             || self.version_token_reused
             || !self.ambiguous_states.is_empty()
@@ -637,7 +652,10 @@ pub(crate) fn commit_log_matches_prepared(log: &CommitLogEntry, prepared: &Prepa
                     .is_ok_and(|payload| payload.matches_values(&log.requirements))
         }
         CatalogFormat::Lance => {
-            log.version == if prepared.vector_resource_mutation().is_some() { 3 } else { 2 }
+            log.version
+                == prepared
+                    .vector_resource_mutation()
+                    .map_or(2, VectorResourceMutationBinding::entry_version)
                 && log.vector_resource_mutation.as_ref() == prepared.vector_resource_mutation()
                 && log.requirements.is_empty()
                 && VectorCommitBindingV1::from_prepared(prepared).ok().as_ref() == log.vector_commit_binding.as_ref()
@@ -691,6 +709,8 @@ pub(in crate::table_catalog) fn vector_committed_history_versions(
     let mut token = head.version_token().as_str().to_string();
     let mut generation = head.generation().get();
     let mut definition = entry.vector_index_definition.as_ref();
+    let mut record_version = entry.version;
+    let mut maintenance = entry.vector_maintenance_binding.as_ref();
     let mut state = &entry.state;
     let mut seen_tokens = BTreeSet::new();
     let mut versions = Vec::new();
@@ -707,7 +727,7 @@ pub(in crate::table_catalog) fn vector_committed_history_versions(
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
-            if generation != 1 || (entry.version == 3 && state != &TableCatalogEntryState::Active) {
+            if generation != 1 || (matches!(entry.version, 3 | 4) && state != &TableCatalogEntryState::Active) {
                 return Err(TableCatalogStoreError::Invalid("Vector history is incomplete".to_string()));
             }
             versions.push(CatalogCommittedVersion::new(metadata, descriptor, None)?);
@@ -727,10 +747,20 @@ pub(in crate::table_catalog) fn vector_committed_history_versions(
             .as_ref()
             .ok_or_else(|| TableCatalogStoreError::Invalid("Vector history record has no binding".to_string()))?;
         binding.validate_log(log, &entry.table_bucket, &entry.table_id)?;
-        match (entry.version, log.version, definition, log.vector_resource_mutation.as_ref()) {
-            (3, 3, Some(current), Some(mutation)) if current == &mutation.next_definition && state == &mutation.next_state => {
-                definition = Some(&mutation.expected_definition);
-                state = &mutation.expected_state;
+        match (record_version, log.version, definition, log.vector_resource_mutation.as_ref()) {
+            (3 | 4, 3 | 4, Some(current), Some(mutation))
+                if record_version == log.version
+                    && log.version == mutation.entry_version()
+                    && current == mutation.next_definition()
+                    && state == mutation.next_state()
+                    && maintenance == mutation.next_maintenance() =>
+            {
+                definition = Some(mutation.expected_definition());
+                state = mutation.expected_state();
+                maintenance = mutation.expected_maintenance();
+                if mutation.kind() == VectorResourceMutationKind::Enroll {
+                    record_version = 3;
+                }
             }
             (2, 2, None, None) => {}
             _ => {
@@ -854,6 +884,8 @@ impl CatalogCommitInput<'_> {
 }
 
 struct VectorHistoryCursor<'a> {
+    version: u16,
+    maintenance: Option<&'a VectorMaintenanceBindingV1>,
     bucket: &'a VectorBucketBindingV1,
     table_id: &'a str,
     metadata: &'a CatalogMetadataRefRecordV1,
@@ -865,11 +897,13 @@ struct VectorHistoryCursor<'a> {
 
 impl<'a> VectorHistoryCursor<'a> {
     fn from_entry(entry: &'a TableEntry) -> Option<Self> {
-        if entry.version != 3 || CatalogHead::from_vector_entry(entry).is_err() {
+        if !matches!(entry.version, 3 | 4) || CatalogHead::from_vector_entry(entry).is_err() {
             return None;
         }
         let head = entry.vector_head_binding.as_ref()?;
         Some(Self {
+            version: entry.version,
+            maintenance: entry.vector_maintenance_binding.as_ref(),
             bucket: &head.bucket,
             table_id: &entry.table_id,
             metadata: &head.metadata,
@@ -884,7 +918,9 @@ impl<'a> VectorHistoryCursor<'a> {
         let (Some(binding), Some(mutation)) = (&commit.vector_commit_binding, &commit.vector_resource_mutation) else {
             return false;
         };
-        if commit.version != 3
+        if commit.version != self.version
+            || commit.version != mutation.entry_version()
+            || self.maintenance != mutation.next_maintenance()
             || binding
                 .validate_log(commit, &self.bucket.storage_bucket_id, self.table_id)
                 .is_err()
@@ -892,8 +928,8 @@ impl<'a> VectorHistoryCursor<'a> {
             || &binding.candidate_metadata != self.metadata
             || &binding.descriptor != self.descriptor
             || binding.expected_generation.checked_add(1) != Some(self.generation)
-            || &mutation.next_definition != self.definition
-            || &mutation.next_state != self.state
+            || mutation.next_definition() != self.definition
+            || mutation.next_state() != self.state
         {
             return false;
         }
@@ -903,13 +939,17 @@ impl<'a> VectorHistoryCursor<'a> {
         self.metadata = metadata;
         self.descriptor = descriptor;
         self.generation = binding.expected_generation;
-        self.definition = &mutation.expected_definition;
-        self.state = &mutation.expected_state;
+        self.definition = mutation.expected_definition();
+        self.state = mutation.expected_state();
+        self.maintenance = mutation.expected_maintenance();
+        if mutation.kind() == VectorResourceMutationKind::Enroll {
+            self.version = 3;
+        }
         true
     }
 
     fn is_initial(&self) -> bool {
-        self.generation == 1 && self.state == &TableCatalogEntryState::Active
+        self.generation == 1 && self.version == 3 && self.maintenance.is_none() && self.state == &TableCatalogEntryState::Active
     }
 }
 
@@ -922,8 +962,8 @@ fn vector_recovery_predecessors_match(left: &CommitLogEntry, right: &CommitLogEn
     ) else {
         return false;
     };
-    left.version == 3
-        && right.version == 3
+    matches!(left.version, 3 | 4)
+        && left.version == right.version
         && left_binding
             .validate_log(left, &left_binding.bucket.storage_bucket_id, &left.table_id)
             .is_ok()
@@ -935,6 +975,7 @@ fn vector_recovery_predecessors_match(left: &CommitLogEntry, right: &CommitLogEn
         && left_binding.expected_generation == right_binding.expected_generation
         && left_binding.expected_metadata == right_binding.expected_metadata
         && left_binding.expected_descriptor == right_binding.expected_descriptor
-        && left_mutation.expected_definition == right_mutation.expected_definition
-        && left_mutation.expected_state == right_mutation.expected_state
+        && left_mutation.expected_definition() == right_mutation.expected_definition()
+        && left_mutation.expected_state() == right_mutation.expected_state()
+        && left_mutation.expected_maintenance() == right_mutation.expected_maintenance()
 }

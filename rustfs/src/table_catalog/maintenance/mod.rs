@@ -13,10 +13,25 @@
 // limitations under the License.
 
 mod config;
+#[cfg(test)]
+pub(in crate::table_catalog) mod fault_observation;
 mod periodic;
 mod periodic_runtime;
 mod worker;
 
 pub(crate) use config::*;
-pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime};
+pub(crate) use periodic::{
+    VectorMaintenanceActiveBucketCursor, VectorMaintenanceDiscoveryCursor, VectorMaintenanceDiscoveryFailure,
+    VectorMaintenancePreparationKind, VectorMaintenanceResourceStage, VectorMaintenanceSource, VectorMaintenanceTarget,
+    VectorMaintenanceTargetPage,
+};
+#[cfg(test)]
+pub(crate) use periodic::{VectorMaintenancePassReport, VectorMaintenanceScheduler};
+pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime, spawn_vector_maintenance};
 pub(crate) use worker::*;
+
+#[cfg(test)]
+pub(crate) use fault_observation::{
+    VectorMaintenanceCompletionObserver, VectorMaintenanceCompletionSnapshot, VectorMaintenanceGcLockSnapshot,
+    VectorMaintenanceObservedSourceKind,
+};

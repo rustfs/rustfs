@@ -1044,7 +1044,8 @@ pub(super) enum PutObjectContentMd5 {
 pub(super) enum PutObjectOrigin<'a> {
     Managed {
         context: &'a super::managed::ManagedObjectContext,
-        principal: SseKmsPrincipal,
+        principal: Box<SseKmsPrincipal>,
+        request_context: Option<crate::app::storage_api::context::RequestContext>,
         lifecycle_guard: Option<Arc<crate::app::storage_api::managed::BucketIncarnationFenceGuard>>,
         completion: Option<OperationHelper>,
     },
@@ -1143,7 +1144,7 @@ impl PutObjectOrigin<'_> {
         match self {
             Self::S3 { req, .. } => SseKmsPrincipal::from_request(*req),
             Self::Internal { .. } => None,
-            Self::Managed { principal, .. } => Some(principal.clone()),
+            Self::Managed { principal, .. } => Some(principal.as_ref().clone()),
         }
     }
 }
@@ -2249,13 +2250,17 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
         let (mut completion, request_context) = match &mut origin {
-            PutObjectOrigin::Managed { context, completion, .. } => (
+            PutObjectOrigin::Managed {
+                request_context,
+                completion,
+                ..
+            } => (
                 PutObjectCompletion::S3(
                     completion
                         .take()
                         .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "managed completion owner is missing"))?,
                 ),
-                context.request.request_context().cloned(),
+                request_context.clone(),
             ),
             PutObjectOrigin::S3 { req, event_name, .. } => (
                 PutObjectCompletion::S3(OperationHelper::from_view(&req.audit_view(), *event_name, S3Operation::PutObject)),

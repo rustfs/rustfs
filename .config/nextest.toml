@@ -885,6 +885,20 @@ slow-timeout = { period = "120s", terminate-after = 6 }
 [profile.e2e-distributed.junit]
 path = "junit.xml"
 
+# This recovery case waits for the production 900-second lease to expire.
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d05_test::catalog_m4_d05_ann_result_interruption_recovers_after_process_restart)'
+slow-timeout = { period = "120s", terminate-after = 15 }
+
+# These GC cases wait for the production orphan retention interval.
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d08_test::catalog_m4_d08_long_query_gc_and_restart_preserve_references)'
+slow-timeout = { period = "120s", terminate-after = 15 }
+
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d10_test::catalog_m4_d10_failed_sdk_candidate_retains_v2_charge_until_physical_gc)'
+slow-timeout = { period = "120s", terminate-after = 20 }
+
 [[profile.e2e-distributed.overrides]]
 filter = 'package(e2e_test)'
 test-group = 'e2e-cluster-nightly'

@@ -462,8 +462,8 @@ pub(in crate::table_catalog) fn bounded_table_entry_objects_for_data_plane_scan(
 pub(crate) struct ObjectTableCatalogStore<B> {
     pub(in crate::table_catalog) backend: B,
     pub(in crate::table_catalog) paths: TableCatalogObjectPaths,
-    vector_bucket: Option<BucketHandle>,
-    vector_owner: Arc<()>,
+    pub(super) vector_bucket: Option<BucketHandle>,
+    pub(super) vector_owner: Arc<()>,
 }
 
 impl<B> ObjectTableCatalogStore<B>
@@ -3512,7 +3512,10 @@ where
         Ok(Some(commit))
     }
 
-    async fn read_table_commit_logs(&self, entry: &TableEntry) -> TableCatalogStoreResult<Vec<(String, CommitLogEntry)>> {
+    pub(super) async fn read_table_commit_logs(
+        &self,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<Vec<(String, CommitLogEntry)>> {
         let commit_prefix = self.paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id);
         let mut commits = Vec::new();
         for object in self.backend.list_objects(self.catalog_bucket(), &commit_prefix).await? {
@@ -6535,7 +6538,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 .into_iter()
                 .map(|(_, log)| log)
                 .collect::<Vec<_>>();
-            let versions = vector_committed_history_versions(&entry, &records)?;
+            let versions = self
+                .filter_vector_retired_versions(&entry, vector_committed_history_versions(&entry, &records)?)
+                .await?;
             let (after, _) = self
                 .read_table_with_etag(bucket.storage_bucket_id().as_str(), head.namespace(), head.name())
                 .await?
@@ -6571,7 +6576,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         self.commit_catalog_with_operation_guard(input, publication, None).await
     }
 
-    async fn commit_catalog_with_operation_guard(
+    pub(super) async fn commit_catalog_with_operation_guard(
         &self,
         input: CatalogCommitInput<'_>,
         publication: &(dyn TableCommitPublication + Sync),
@@ -6665,6 +6670,32 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             } else {
                 self.ensure_no_active_table_rename(&request.table_bucket).await?;
             }
+            // Managed authorization reads the current head; finish that read before its writer is acquired.
+            // Keep its result until after the existing replay and complete expected-head checks.
+            let vector_candidate = if self.paths.scope == CatalogScope::Vector {
+                let candidate = supplied
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("Vector commit requires prepared metadata".into()))?
+                    .candidate_metadata();
+                let limit = usize::try_from(candidate.content_length())
+                    .ok()
+                    .and_then(|size| size.checked_add(1))
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("candidate length exceeds address space".into()))?;
+                Some(
+                    self.backend
+                        .read_managed_candidate(
+                            self.vector_bucket_for(&request.table_bucket)?,
+                            candidate,
+                            limit,
+                            shared_lifecycle
+                                .as_deref_mut()
+                                .or(_migration_guard.as_mut())
+                                .ok_or_else(|| TableCatalogStoreError::Internal("Vector commit has no lifecycle guard".into()))?,
+                        )
+                        .await,
+                )
+            } else {
+                None
+            };
             let table_path = self.paths.table_entry_path(&request.table_bucket, &namespace, &table);
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
             // Preserve catalog -> publication -> object lock order across rolling upgrades.
@@ -6951,9 +6982,27 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                     prepared.vector_resource_mutation(),
                 ) {
                     (2, None, None) => {}
-                    (3, Some(definition), Some(mutation))
-                        if definition == &mutation.expected_definition && current.state == mutation.expected_state => {}
+                    (3 | 4, Some(definition), Some(mutation))
+                        if definition == mutation.expected_definition()
+                            && &current.state == mutation.expected_state()
+                            && current.vector_maintenance_binding.as_ref() == mutation.expected_maintenance()
+                            && current.version
+                                == if mutation.kind() == VectorResourceMutationKind::Enroll {
+                                    3
+                                } else {
+                                    mutation.entry_version()
+                                } => {}
                     _ => return Err(TableCatalogStoreError::Conflict("prepared Vector resource definition changed".into())),
+                }
+                if current.version == 4
+                    && prepared
+                        .vector_resource_mutation()
+                        .is_some_and(|m| m.kind() == VectorResourceMutationKind::Dataset)
+                {
+                    let guard = operation_guard.ok_or_else(|| {
+                        TableCatalogStoreError::Invalid("v4 Dataset publication requires its reference guard".into())
+                    })?;
+                    self.validate_prepared_retirement_proof(guard, &prepared, &current)?;
                 }
                 let head = CatalogHead::from_vector_entry(&current)?;
                 if head.expected_head() != *prepared.expected_head() {
@@ -6966,16 +7015,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 .and_then(|size| size.checked_add(1))
                 .ok_or_else(|| TableCatalogStoreError::Invalid("candidate length exceeds address space".to_string()))?;
             let candidate_object = if self.paths.scope == CatalogScope::Vector {
-                self.backend
-                    .read_managed_candidate(
-                        self.vector_bucket_for(&request.table_bucket)?,
-                        candidate,
-                        limit,
-                        shared_lifecycle.as_deref_mut().or(_migration_guard.as_mut()).ok_or_else(|| {
-                            TableCatalogStoreError::Internal("Vector commit has no lifecycle guard".to_string())
-                        })?,
-                    )
-                    .await?
+                vector_candidate
+                    .ok_or_else(|| TableCatalogStoreError::Internal("Vector candidate read was not prepared".into()))??
             } else {
                 reader
                     .ok_or_else(|| TableCatalogStoreError::Internal("Table commit has no prepared object reader".into()))?
@@ -7013,7 +7054,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 vector_resource_mutation: prepared.vector_resource_mutation().cloned(),
                 vector_commit_binding,
                 version: if self.paths.scope == CatalogScope::Vector {
-                    if prepared.vector_resource_mutation().is_some() { 3 } else { 2 }
+                    prepared
+                        .vector_resource_mutation()
+                        .map_or(2, VectorResourceMutationBinding::entry_version)
                 } else {
                     TABLE_CATALOG_ENTRY_VERSION
                 },
@@ -7024,7 +7067,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 expected_version_token: request.expected_version_token.clone(),
                 new_version_token: if prepared
                     .vector_resource_mutation()
-                    .is_some_and(|mutation| mutation.kind == VectorResourceMutationKind::Delete)
+                    .is_some_and(|mutation| mutation.kind() == VectorResourceMutationKind::Delete)
                 {
                     format!("delete-{}", prepared.commit_id().as_str())
                 } else {
@@ -7051,8 +7094,10 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             next.version_token = staged_commit_log.new_version_token.clone();
             next.generation = prepared.expected_head().generation().checked_next()?.get();
             if let Some(mutation) = prepared.vector_resource_mutation() {
-                next.vector_index_definition = Some(mutation.next_definition.clone());
-                next.state = mutation.next_state.clone();
+                next.vector_index_definition = Some(mutation.next_definition().clone());
+                next.state = mutation.next_state().clone();
+                next.version = mutation.entry_version();
+                next.vector_maintenance_binding = mutation.next_maintenance().cloned();
             }
             if self.paths.scope == CatalogScope::Vector {
                 next.vector_head_binding = Some(VectorHeadBindingV1::try_new(
@@ -7191,7 +7236,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
-    async fn retain_vector_resource_guard(
+    pub(super) async fn retain_vector_resource_guard(
         &self,
         resource: CatalogResourceIdentity,
         namespace: Namespace,
@@ -7220,12 +7265,14 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let guard = VectorCatalogOperationGuard {
             inner: Arc::new(VectorCatalogOperationState {
                 owner: self.vector_owner.clone(),
+                retirement_validation_owner: Arc::new(()),
                 resource_identity: resource,
                 namespace,
                 name,
                 lifecycle: tokio::sync::Mutex::new(lifecycle),
                 native_lifecycle,
                 gc: parking_lot::Mutex::new(gc),
+                gc_exclusive: false,
                 fence,
             }),
         };
@@ -7233,7 +7280,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(guard)
     }
 
-    async fn require_vector_parent_and_namespace(
+    pub(super) async fn require_vector_parent_and_namespace(
         &self,
         bucket: &BucketHandle,
         namespace: &Namespace,
@@ -7265,7 +7312,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         ))
     }
 
-    fn validate_vector_operation_guard(&self, guard: &VectorCatalogOperationGuard) -> TableCatalogStoreResult<()> {
+    pub(super) fn validate_vector_operation_guard(&self, guard: &VectorCatalogOperationGuard) -> TableCatalogStoreResult<()> {
         if self.paths.scope != CatalogScope::Vector
             || !Arc::ptr_eq(&self.vector_owner, &guard.inner.owner)
             || guard.resource_identity().vector_bucket() != self.vector_bucket.as_ref()
@@ -7359,7 +7406,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             .into_iter()
             .map(|(_, log)| log)
             .collect::<Vec<_>>();
-        let versions = vector_committed_history_versions(&current.entry, &logs)?;
+        let versions = self
+            .filter_vector_retired_versions(&current.entry, vector_committed_history_versions(&current.entry, &logs)?)
+            .await?;
         let after = self.read_vector_entry_with_guard(guard).await?;
         if current.entry != after.entry {
             return Err(TableCatalogStoreError::Conflict("Vector entry changed during history read".into()));
@@ -7382,14 +7431,29 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 "prepared Vector commit differs from the operation guard".into(),
             ));
         }
-        let prepared = prepared.with_vector_resource_mutation(VectorResourceMutationBindingV1 {
-            version: 1,
-            kind: VectorResourceMutationKind::Dataset,
-            expected_definition: expected_definition.clone(),
-            next_definition: expected_definition.clone(),
-            expected_state: TableCatalogEntryState::Active,
-            next_state: TableCatalogEntryState::Active,
-        })?;
+        let current = self.read_vector_entry_with_guard(guard).await?;
+        let prepared = if let Some(binding) = &current.entry.vector_maintenance_binding {
+            self.validate_prepared_retirement_proof(guard, &prepared, &current.entry)?;
+            prepared.with_vector_resource_mutation_v2(VectorResourceMutationBindingV2 {
+                version: 2,
+                kind: VectorResourceMutationKind::Dataset,
+                expected_definition: expected_definition.clone(),
+                next_definition: expected_definition.clone(),
+                expected_state: TableCatalogEntryState::Active,
+                next_state: TableCatalogEntryState::Active,
+                expected_maintenance: Some(binding.clone()),
+                next_maintenance: binding.clone(),
+            })?
+        } else {
+            prepared.with_vector_resource_mutation(VectorResourceMutationBindingV1 {
+                version: 1,
+                kind: VectorResourceMutationKind::Dataset,
+                expected_definition: expected_definition.clone(),
+                next_definition: expected_definition.clone(),
+                expected_state: TableCatalogEntryState::Active,
+                next_state: TableCatalogEntryState::Active,
+            })?
+        };
         let store = self.clone();
         let guard = guard.clone();
         run_vector_catalog_mutation(async move {
@@ -7404,7 +7468,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 }
 
-async fn run_vector_catalog_mutation<F, T>(operation: F) -> TableCatalogStoreResult<T>
+pub(super) async fn run_vector_catalog_mutation<F, T>(operation: F) -> TableCatalogStoreResult<T>
 where
     F: std::future::Future<Output = TableCatalogStoreResult<T>> + Send + 'static,
     T: Send + 'static,
@@ -7456,7 +7520,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         fence.ensure_held()
     }
 
-    async fn finalize_commit_log_with_fence(
+    pub(super) async fn finalize_commit_log_with_fence(
         &self,
         commit_path: &str,
         idempotency_path: Option<&str>,
@@ -7532,7 +7596,7 @@ fn validate_vector_create_intent_object(
 fn validate_vector_delete_intent_object(
     paths: &TableCatalogObjectPaths,
     object: &str,
-    intent: &VectorIndexDeleteIntentV1,
+    intent: &VectorIndexDeleteIntent,
 ) -> TableCatalogStoreResult<()> {
     intent.validate()?;
     if paths.scope != CatalogScope::Vector
@@ -7574,6 +7638,7 @@ fn initial_vector_entry(
         created_at: Some(intent.created_at.clone()),
         updated_at: Some(intent.created_at.clone()),
         vector_head_binding: Some(VectorHeadBindingV1::try_new(&resource, &metadata, &descriptor)?),
+        vector_maintenance_binding: None,
         vector_index_definition: Some(intent.definition.clone()),
     };
     CatalogHead::from_vector_entry(&entry)?;
@@ -7638,11 +7703,27 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             return Err(TableCatalogStoreError::Conflict("Vector creation recovery differs from its store".into()));
         }
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.resume_vector_index_creation_with_lifecycle(bucket, namespace, name, lifecycle, None)
+            .await
+    }
+    pub(super) async fn resume_vector_index_creation_with_lifecycle(
+        &self,
+        bucket: &BucketHandle,
+        namespace: &Namespace,
+        name: &CatalogName,
+        lifecycle: TableCatalogLockGuard,
+        expected: Option<&CatalogResourceIdentity>,
+    ) -> TableCatalogStoreResult<(VectorIndexCreateReservation, VectorCatalogOperationGuard)> {
         let (intent, _) = self
             .read_vector_create_intent(bucket, namespace, name)
             .await?
             .ok_or_else(|| TableCatalogStoreError::NotFound("Vector creation reservation".into()))?;
         let reservation = VectorIndexCreateReservation::from_intent(intent)?;
+        if expected.is_some_and(|expected| expected != &reservation.resource_identity) {
+            return Err(TableCatalogStoreError::Conflict(
+                "creation recovery reserved another resource identity".into(),
+            ));
+        }
         let guard = self
             .retain_vector_resource_guard(reservation.resource_identity.clone(), namespace.clone(), name.clone(), lifecycle)
             .await?;
@@ -7700,7 +7781,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         }
         let path = self.paths.vector_delete_intent_path(&entry.table_bucket, &entry.table_id);
         let (intent, _) = self
-            .read_entry::<VectorIndexDeleteIntentV1>(self.catalog_bucket(), &path)
+            .read_entry::<VectorIndexDeleteIntent>(self.catalog_bucket(), &path)
             .await?
             .ok_or_else(|| TableCatalogStoreError::Conflict("Vector tombstone has no retained deletion proof".into()))?;
         validate_vector_delete_intent_object(&self.paths, &path, &intent)?;
@@ -7768,8 +7849,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             recovered.vector_head_binding = Some(VectorHeadBindingV1::try_new(&resource, &metadata, &descriptor)?);
             recovered.version_token.clone_from(&first.expected_version_token);
             recovered.generation = binding.expected_generation;
-            recovered.vector_index_definition = Some(mutation.expected_definition.clone());
-            recovered.state = mutation.expected_state.clone();
+            recovered.vector_index_definition = Some(mutation.expected_definition().clone());
+            recovered.state = mutation.expected_state().clone();
             recovered.updated_at.clone_from(&initial.updated_at);
         }
         if recovered != *initial {
@@ -7922,7 +8003,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             }
             requested.validate()?;
             if self
-                .read_entry::<VectorIndexDeleteIntentV1>(
+                .read_entry::<VectorIndexDeleteIntent>(
                     self.catalog_bucket(),
                     &self
                         .paths
@@ -8154,7 +8235,7 @@ fn prepare_vector_resource_mutation(
     operation: &str,
 ) -> TableCatalogStoreResult<PreparedCatalogCommit> {
     let head = CatalogHead::from_vector_entry(expected)?;
-    PreparedCatalogCommit::try_from_validated_parts(
+    let prepared = PreparedCatalogCommit::try_from_validated_parts(
         CatalogCommitParts {
             resource_identity: head.resource_identity().clone(),
             namespace: Namespace::parse(&expected.namespace)
@@ -8170,8 +8251,21 @@ fn prepare_vector_resource_mutation(
         head.format_descriptor().clone(),
         CatalogEntryUpdates::try_new(Some(expected.warehouse_location.clone()), Some(expected.format_version))?,
         Vec::new(),
-    )?
-    .with_vector_resource_mutation(mutation)
+    )?;
+    if let Some(binding) = &expected.vector_maintenance_binding {
+        prepared.with_vector_resource_mutation_v2(VectorResourceMutationBindingV2 {
+            version: 2,
+            kind: mutation.kind,
+            expected_definition: mutation.expected_definition,
+            next_definition: mutation.next_definition,
+            expected_state: mutation.expected_state,
+            next_state: mutation.next_state,
+            expected_maintenance: Some(binding.clone()),
+            next_maintenance: binding.clone(),
+        })
+    } else {
+        prepared.with_vector_resource_mutation(mutation)
+    }
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
@@ -8179,12 +8273,12 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         &self,
         bucket: &BucketHandle,
         table_id: &str,
-    ) -> TableCatalogStoreResult<Option<(VectorIndexDeleteIntentV1, String)>> {
+    ) -> TableCatalogStoreResult<Option<(VectorIndexDeleteIntent, String)>> {
         let path = self
             .paths
             .vector_delete_intent_path(bucket.storage_bucket_id().as_str(), table_id);
         let Some((intent, etag)) = self
-            .read_entry::<VectorIndexDeleteIntentV1>(self.catalog_bucket(), &path)
+            .read_entry::<VectorIndexDeleteIntent>(self.catalog_bucket(), &path)
             .await?
         else {
             return Ok(None);
@@ -8201,9 +8295,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         )))
     }
 
-    async fn verify_vector_deleted_history(
+    pub(super) async fn verify_vector_deleted_history(
         &self,
-        intent: &VectorIndexDeleteIntentV1,
+        intent: &VectorIndexDeleteIntent,
         authoritative: Option<&TableEntry>,
     ) -> TableCatalogStoreResult<CommitLogEntry> {
         intent.validate()?;
@@ -8213,62 +8307,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             .into_iter()
             .map(|(_, log)| log)
             .collect::<Vec<_>>();
-        let matching = logs
-            .iter()
-            .filter(|log| log.commit_id == intent.delete_id)
-            .collect::<Vec<_>>();
-        let [log] = matching.as_slice() else {
-            return Err(TableCatalogStoreError::Invalid(
-                "Vector deletion has no unique exact commit receipt".into(),
-            ));
-        };
-        let mutation = VectorResourceMutationBindingV1 {
-            version: 1,
-            kind: VectorResourceMutationKind::Delete,
-            expected_definition: intent
-                .expected_entry
-                .vector_index_definition
-                .clone()
-                .ok_or_else(|| TableCatalogStoreError::Invalid("Vector deletion has no definition".into()))?,
-            next_definition: intent
-                .deleted_entry
-                .vector_index_definition
-                .clone()
-                .ok_or_else(|| TableCatalogStoreError::Invalid("Vector deletion has no terminal definition".into()))?,
-            expected_state: TableCatalogEntryState::Active,
-            next_state: TableCatalogEntryState::Deleted,
-        };
-        let prepared = prepare_vector_resource_mutation(
-            &intent.expected_entry,
-            mutation,
-            CatalogCommitId::try_new(intent.delete_id.clone())?,
-            "vector-delete",
-        )?;
-        if !commit_log_matches_prepared(log, &prepared, &intent.table_id)
-            || !table_matches_committed_log(&intent.deleted_entry, log)
-            || !table_matches_staged_base(&intent.expected_entry, log)
-            || log.status == CommitLogStatus::Failed
-        {
-            return Err(TableCatalogStoreError::Invalid(
-                "Vector delete receipt differs from its exact resource transition".into(),
-            ));
-        }
-        let observed_terminal = authoritative.is_some_and(|entry| *entry == intent.deleted_entry);
-        let retained_terminal = matches!(
-            intent.phase,
-            VectorIndexDeletePhase::LogicallyDeleted
-                | VectorIndexDeletePhase::RetirementPending
-                | VectorIndexDeletePhase::Complete
-        ) && log.status == CommitLogStatus::Committed;
-        if !observed_terminal && !retained_terminal {
-            return Err(TableCatalogStoreError::Conflict(
-                "Vector deletion has no authoritative terminal evidence".into(),
-            ));
-        }
-        // A PREPARED intent cannot prove its own publication. The current head
-        // or a previously finalized retained deletion supplies that evidence.
-        vector_committed_history_versions(&intent.deleted_entry, &logs)?;
-        Ok((**log).clone())
+        verify_vector_deleted_history_with_logs(intent, authoritative, &logs)
     }
 
     pub(crate) async fn delete_vector_index_with_guard(
@@ -8320,6 +8359,11 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             created_at: now.clone(),
             updated_at: now,
         };
+        let intent = if expected.entry.version == 4 {
+            VectorIndexDeleteIntent::V2(VectorIndexDeleteIntentV2::from_deletion(intent)?)
+        } else {
+            VectorIndexDeleteIntent::V1(intent)
+        };
         intent.validate()?;
         let store = self.clone();
         let guard = guard.clone();
@@ -8333,8 +8377,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     async fn reserve_vector_deletion(
         &self,
         guard: &VectorCatalogOperationGuard,
-        requested: VectorIndexDeleteIntentV1,
-    ) -> TableCatalogStoreResult<VectorIndexDeleteIntentV1> {
+        requested: VectorIndexDeleteIntent,
+    ) -> TableCatalogStoreResult<VectorIndexDeleteIntent> {
         let bucket = self.vector_bucket_for(guard.resource_identity().storage_bucket_id())?;
         let publication = TableCommitLockPublication::new(&self.backend, &self.paths);
         publication_preparation(&publication, async {
@@ -8393,7 +8437,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     async fn continue_vector_deletion(
         &self,
         guard: &VectorCatalogOperationGuard,
-        intent: VectorIndexDeleteIntentV1,
+        intent: VectorIndexDeleteIntent,
         prepared: PreparedCatalogCommit,
     ) -> TableCatalogStoreResult<()> {
         let bucket = self.vector_bucket_for(guard.resource_identity().storage_bucket_id())?;
@@ -8472,6 +8516,15 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             return Err(TableCatalogStoreError::Conflict("Vector delete recovery differs from its store".into()));
         }
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.recover_vector_index_deletion_with_lifecycle(bucket, table_id, lifecycle)
+            .await
+    }
+    pub(super) async fn recover_vector_index_deletion_with_lifecycle(
+        &self,
+        bucket: &BucketHandle,
+        table_id: &str,
+        lifecycle: TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<()> {
         let (intent, _) = self
             .read_vector_delete_intent(bucket, table_id)
             .await?
@@ -8865,4 +8918,66 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         })
         .await
     }
+}
+
+pub(super) fn verify_vector_deleted_history_with_logs(
+    intent: &VectorIndexDeleteIntent,
+    authoritative: Option<&TableEntry>,
+    logs: &[CommitLogEntry],
+) -> TableCatalogStoreResult<CommitLogEntry> {
+    intent.validate()?;
+    let matching = logs
+        .iter()
+        .filter(|log| log.commit_id == intent.delete_id)
+        .collect::<Vec<_>>();
+    let [log] = matching.as_slice() else {
+        return Err(TableCatalogStoreError::Invalid(
+            "Vector deletion has no unique exact commit receipt".into(),
+        ));
+    };
+    let mutation = VectorResourceMutationBindingV1 {
+        version: 1,
+        kind: VectorResourceMutationKind::Delete,
+        expected_definition: intent
+            .expected_entry
+            .vector_index_definition
+            .clone()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Vector deletion has no definition".into()))?,
+        next_definition: intent
+            .deleted_entry
+            .vector_index_definition
+            .clone()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Vector deletion has no terminal definition".into()))?,
+        expected_state: TableCatalogEntryState::Active,
+        next_state: TableCatalogEntryState::Deleted,
+    };
+    let prepared = prepare_vector_resource_mutation(
+        &intent.expected_entry,
+        mutation,
+        CatalogCommitId::try_new(intent.delete_id.clone())?,
+        "vector-delete",
+    )?;
+    if !commit_log_matches_prepared(log, &prepared, &intent.table_id)
+        || !table_matches_committed_log(&intent.deleted_entry, log)
+        || !table_matches_staged_base(&intent.expected_entry, log)
+        || log.status == CommitLogStatus::Failed
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "Vector delete receipt differs from its exact resource transition".into(),
+        ));
+    }
+    let observed_terminal = authoritative.is_some_and(|entry| *entry == intent.deleted_entry);
+    let retained_terminal = matches!(
+        intent.phase,
+        VectorIndexDeletePhase::LogicallyDeleted | VectorIndexDeletePhase::RetirementPending | VectorIndexDeletePhase::Complete
+    ) && log.status == CommitLogStatus::Committed;
+    if !observed_terminal && !retained_terminal {
+        return Err(TableCatalogStoreError::Conflict(
+            "Vector deletion has no authoritative terminal evidence".into(),
+        ));
+    }
+    // A PREPARED intent cannot prove its own publication. The current head
+    // or a previously finalized retained deletion supplies that evidence.
+    vector_committed_history_versions(&intent.deleted_entry, logs)?;
+    Ok((**log).clone())
 }

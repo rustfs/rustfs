@@ -26,6 +26,8 @@ collection:
 
 - [S3 Tables catalog lifecycle](operations/s3-tables-catalog-lifecycle.md) — disablement, fenced empty-table cleanup, and registration-cache boundaries.
 
+- [S3 Vectors maintenance](operations/s3-vectors-maintenance.md) — background IAM identity, Catalog publications, exact cleanup, shutdown and upgrade requirements.
+
 For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
 see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
 

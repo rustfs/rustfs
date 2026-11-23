@@ -114,6 +114,7 @@ impl Fixture {
             .create_table(TableEntry {
                 vector_head_binding: None,
                 vector_index_definition: None,
+                vector_maintenance_binding: None,
                 version: TABLE_CATALOG_ENTRY_VERSION,
                 table_bucket: bucket.clone(),
                 namespace: namespace.public_name(),

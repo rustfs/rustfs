@@ -18,7 +18,7 @@ use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values::stored_etag;
 use crate::app::object::quota_accounting_object_size;
-use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
+use crate::app::storage_api::multipart_usecase::{EC_BLOCK_SIZE_RESPONSE_HEADER, StorageObjectInfo};
 use http::HeaderValue;
 use http::StatusCode;
 use rustfs_gateway_types::dto::{
@@ -245,7 +245,7 @@ impl DefaultMultipartUsecase {
         input: CompleteMultipartUploadInput,
         multipart_upload: Option<rustfs_gateway_types::dto::CompletedMultipartUpload>,
         origin: MultipartOrigin,
-    ) -> S3Result<(CompleteMultipartUploadOutput, ObjectInfo)> {
+    ) -> S3Result<(CompleteMultipartUploadOutput, StorageObjectInfo)> {
         let owner = self.clone();
         run_owned_mutation(async move {
             Box::pin(owner.execute_complete_multipart_upload_owned(envelope, input, multipart_upload, origin)).await
@@ -258,8 +258,8 @@ impl DefaultMultipartUsecase {
         envelope: RequestEnvelope,
         input: CompleteMultipartUploadInput,
         multipart_upload: Option<rustfs_gateway_types::dto::CompletedMultipartUpload>,
-        origin: MultipartOrigin,
-    ) -> S3Result<(CompleteMultipartUploadOutput, ObjectInfo)> {
+        mut origin: MultipartOrigin,
+    ) -> S3Result<(CompleteMultipartUploadOutput, StorageObjectInfo)> {
         let mut owned_headers = origin.headers(&envelope);
         if origin.is_managed() {
             owned_headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
@@ -278,11 +278,13 @@ impl DefaultMultipartUsecase {
                 envelope.verified_presigned().is_some(),
             )?;
         }
-        let mut helper = OperationHelper::from_view(
-            &envelope.audit_view(),
-            EventName::ObjectCreatedCompleteMultipartUpload,
-            S3Operation::CompleteMultipartUpload,
-        );
+        let mut helper = origin.take_completion().unwrap_or_else(|| {
+            OperationHelper::from_view(
+                &envelope.audit_view(),
+                EventName::ObjectCreatedCompleteMultipartUpload,
+                S3Operation::CompleteMultipartUpload,
+            )
+        });
         let replication_authorized = !origin.is_managed() && replication_request_authorized(&envelope);
         let CompleteMultipartUploadInput {
             bucket: bucket_name,
@@ -427,7 +429,7 @@ impl DefaultMultipartUsecase {
             },
         };
 
-        let completion_principal = SseKmsPrincipal::from_request(&envelope);
+        let completion_principal = origin.principal(&envelope);
         let completion_authorization = multipart_completion_authorization(
             EncryptionRequest {
                 bucket: &bucket,

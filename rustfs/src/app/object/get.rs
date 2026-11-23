@@ -2383,6 +2383,7 @@ pub(super) struct ManagedReadInput<'a> {
     pub expected: &'a ObjectInfo,
     pub max_bytes: usize,
     pub principal: &'a SseKmsPrincipal,
+    pub request_id: &'a str,
 }
 
 impl DefaultObjectUsecase {
@@ -2402,14 +2403,17 @@ impl DefaultObjectUsecase {
             expected,
             max_bytes,
             principal,
+            request_id,
         } = input;
         let bucket = context.access.bucket().storage_bucket_id().as_str();
-        let request_id = context
-            .request
-            .request_context()
-            .ok_or(ManagedObjectError::MissingPrincipal)?
-            .request_id
-            .as_str();
+        let mut opts = opts.clone();
+        if principal.is_managed_maintenance() {
+            opts.read_encryption_resolver = Some(crate::app::storage_api::object_usecase::sse::managed_read_encryption_resolver(
+                bucket.to_owned(),
+                key.to_owned(),
+                principal.clone(),
+            ));
+        }
         let bootstrap = self.init_get_object_bootstrap(bucket, key, request_id)?;
         let manager = get_concurrency_manager();
         let _admission = Self::acquire_get_object_io_planning(
@@ -2427,7 +2431,7 @@ impl DefaultObjectUsecase {
             .ok_or_else(|| ApiError::invalid_request("object store is not initialized"))?;
         let read = async {
             let reader = store
-                .get_object_reader(bucket, key, range.clone(), HeaderMap::new(), opts)
+                .get_object_reader(bucket, key, range.clone(), HeaderMap::new(), &opts)
                 .await
                 .map_err(ApiError::from)?;
             context

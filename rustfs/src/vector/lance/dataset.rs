@@ -133,6 +133,8 @@ pub(crate) enum DatasetError {
     InvalidOffset,
     #[error("Lance Dataset query limit exceeds 10000")]
     InvalidQueryLimit,
+    #[error(transparent)]
+    Budget(#[from] crate::table_catalog::VectorMaintenanceBudgetError),
     #[error("vector batch repeats a key at position {position}")]
     DuplicateInputKey { position: usize },
 }
@@ -304,6 +306,8 @@ pub(super) async fn query_matches(
     index: &VectorIndexManifestSpec,
     top_k: NonZeroUsize,
     filter: Option<ValidatedFilter>,
+    ann_partitions: Option<usize>,
+    #[cfg(test)] ann_completed: &std::sync::atomic::AtomicUsize,
 ) -> Result<Vec<QueryMatch>, DatasetError> {
     validate_vector(query, index.dimension, index.distance_metric)?;
     if top_k.get() > 10_000 {
@@ -315,8 +319,13 @@ pub(super) async fn query_matches(
         0.0
     };
 
-    // ANN training provenance is not available for this snapshot. Scan every
-    // visible fragment using its original float32 values and controlled filter.
+    if let Some(partitions) = ann_partitions.filter(|_| numeric_vector_eligible(query, index.distance_metric))
+        && let Some(matches) = ann_query_matches(dataset, query, index, top_k, filter.clone(), partitions).await?
+    {
+        #[cfg(test)]
+        ann_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return Ok(matches);
+    }
     let mut scanner = dataset.scan();
     scanner
         .project(&["key", "vector"])?
@@ -508,4 +517,278 @@ fn decode_metadata(values: &ArrayRef, row: usize) -> Result<Option<Map<String, V
         return Err(DatasetError::InvalidColumn { column: "metadata" });
     };
     Ok(Some(serde_json::from_str(&json)?))
+}
+
+pub(super) fn numeric_vector_eligible(vector: &[f32], metric: VectorDistanceMetric) -> bool {
+    vector.iter().all(|value| value.is_finite() && value.abs() <= 1_048_576.0)
+        && (metric != VectorDistanceMetric::Cosine
+            || vector.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>() >= 2f64.powi(-40))
+}
+
+pub(super) async fn numeric_eligibility(
+    dataset: &Dataset,
+    index: &VectorIndexManifestSpec,
+    control: Option<&crate::table_catalog::VectorMaintenanceControl>,
+) -> Result<Option<u64>, DatasetError> {
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["vector"])?
+        .use_scalar_index(false)
+        .batch_size(128)
+        .batch_size_bytes(4 * 1024 * 1024)
+        .batch_readahead(1)
+        .fragment_readahead(1)
+        .io_buffer_size(8 * 1024 * 1024);
+    let mut stream = scanner.try_into_stream().await?;
+    let mut count = 0u64;
+    while let Some(batch) = stream.try_next().await? {
+        let _reservation = control
+            .map(|control| control.reserve_batch(batch.get_array_memory_size() as u64))
+            .transpose()?;
+        let vectors = required_array::<FixedSizeListArray>(&batch, "vector")?;
+        for row in 0..batch.num_rows() {
+            let values = vectors.value(row);
+            let values = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or(DatasetError::InvalidColumn { column: "vector" })?;
+            if values.null_count() != 0 || !numeric_vector_eligible(values.values(), index.distance_metric) {
+                return Ok(None);
+            }
+        }
+        count = count
+            .checked_add(batch.num_rows() as u64)
+            .ok_or(DatasetError::InvalidOffset)?;
+        tokio::task::yield_now().await;
+    }
+    Ok(Some(count))
+}
+
+struct MaintenanceIndexProgress(crate::table_catalog::VectorMaintenanceControl);
+
+impl std::fmt::Debug for MaintenanceIndexProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("MaintenanceIndexProgress").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl lance_index::progress::IndexBuildProgress for MaintenanceIndexProgress {
+    async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> lance_core::Result<()> {
+        self.stage_complete("").await
+    }
+    async fn stage_progress(&self, _: &str, _: u64) -> lance_core::Result<()> {
+        self.stage_complete("").await
+    }
+    async fn stage_complete(&self, _: &str) -> lance_core::Result<()> {
+        self.0
+            .check_admission()
+            .map_err(|error| lance_core::Error::invalid_input(error.to_string()))
+    }
+}
+
+pub(super) async fn build_ann(
+    dataset: Arc<Dataset>,
+    index: &VectorIndexManifestSpec,
+    handler: Arc<dyn CommitHandler>,
+    control: &crate::table_catalog::VectorMaintenanceControl,
+) -> Result<Option<Dataset>, DatasetError> {
+    use lance::index::{CreateIndexBuilder, DatasetIndexExt, vector::VectorIndexParams};
+    use lance_index::{IndexType, vector::ivf::builder::IvfBuildParams};
+    use lance_table::transaction::{Operation, TransactionBuilder};
+    control.check_admission()?;
+    let Some(rows) = numeric_eligibility(&dataset, index, Some(control)).await? else {
+        return Ok(None);
+    };
+    if rows < 1024 {
+        return Ok(None);
+    }
+    let partitions = usize::try_from((rows / 256).clamp(1, 64)).map_err(|_| DatasetError::InvalidOffset)?;
+    let old_indices = dataset.load_indices().await?;
+    if let Some(old) = old_indices
+        .iter()
+        .find(|metadata| metadata.name == super::files::ANN_INDEX_NAME)
+    {
+        let coverage = old
+            .fragment_bitmap
+            .as_ref()
+            .ok_or(DatasetError::InvalidColumn { column: "ANN coverage" })?;
+        let uncovered = dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|fragment| !coverage.contains(fragment.id() as u32))
+            .try_fold(0usize, |sum, fragment| {
+                sum.checked_add(fragment.metadata().num_rows().unwrap_or(0))
+                    .ok_or(DatasetError::InvalidOffset)
+            })?;
+        if (uncovered as u64) < 1024.max(rows.div_ceil(5)) {
+            return Ok(None);
+        }
+    }
+    #[cfg(test)]
+    crate::vector::fault_test::ann_input_opened(
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().id)
+            .collect(),
+        rows,
+    )
+    .await;
+    let params = VectorIndexParams::with_ivf_flat_params(
+        match index.distance_metric {
+            VectorDistanceMetric::Cosine => "cosine",
+            VectorDistanceMetric::Euclidean => "l2",
+        }
+        .try_into()?,
+        IvfBuildParams {
+            max_iters: 20,
+            sample_rate: 64,
+            ..IvfBuildParams::new(partitions)
+        },
+    );
+    let mut working = dataset.as_ref().clone();
+    let metadata = CreateIndexBuilder::new(&mut working, &["vector"], IndexType::IvfFlat, &params)
+        .name(super::files::ANN_INDEX_NAME.to_owned())
+        .replace(true)
+        .train(true)
+        .progress(Arc::new(MaintenanceIndexProgress(control.clone())))
+        .execute_uncommitted()
+        .await?;
+    control.check_admission()?;
+    let removed_indices = old_indices
+        .iter()
+        .filter(|metadata| metadata.name == super::files::ANN_INDEX_NAME)
+        .cloned()
+        .collect();
+    let transaction = TransactionBuilder::new(
+        dataset.version().version,
+        Operation::CreateIndex {
+            new_indices: vec![metadata],
+            removed_indices,
+        },
+    )
+    .build();
+    Ok(Some(commit_builder(dataset, handler).execute(transaction).await?))
+}
+
+async fn ann_query_matches(
+    dataset: &Dataset,
+    query: &[f32],
+    index: &VectorIndexManifestSpec,
+    top_k: NonZeroUsize,
+    filter: Option<ValidatedFilter>,
+    partitions: usize,
+) -> Result<Option<Vec<QueryMatch>>, DatasetError> {
+    let rows = dataset.count_rows(None).await?;
+    let candidate_k = top_k.get().checked_mul(4).ok_or(DatasetError::InvalidQueryLimit)?.min(rows);
+    if candidate_k == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    for probes in [partitions.min(8), partitions] {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["key"])?
+            .with_row_id()
+            .nearest("vector", &Float32Array::from(query.to_vec()), candidate_k)?
+            .distance_metric(
+                match index.distance_metric {
+                    VectorDistanceMetric::Cosine => "cosine",
+                    VectorDistanceMetric::Euclidean => "l2",
+                }
+                .try_into()?,
+            )
+            .prefilter(true)
+            .use_index(true)
+            .use_scalar_index(false)
+            .nprobes(probes);
+        if let Some(filter) = filter.clone() {
+            scanner.filter_expr(filter_expr(filter));
+        }
+        let mut stream = scanner.try_into_stream().await?;
+        let mut candidates = Vec::with_capacity(candidate_k);
+        let mut ids = BTreeSet::new();
+        while let Some(batch) = stream.try_next().await? {
+            let keys = required_array::<StringArray>(&batch, "key")?;
+            let row_ids = required_array::<UInt64Array>(&batch, "_rowid")?;
+            let distances = required_array::<Float32Array>(&batch, "_distance")?;
+            for row in 0..batch.num_rows() {
+                let distance = distances.value(row);
+                if !distance.is_finite() || !ids.insert(row_ids.value(row)) || candidates.len() == candidate_k {
+                    return Ok(None);
+                }
+                candidates.push((row_ids.value(row), keys.value(row).to_owned(), distance));
+            }
+        }
+        if candidates.len() < top_k.get() {
+            continue;
+        }
+        candidates.sort_by(|left, right| left.2.total_cmp(&right.2));
+        if candidates.len() == candidate_k
+            && candidates.len() > 1
+            && candidates
+                .last()
+                .is_some_and(|last| candidates[candidates.len() - 2].2 == last.2)
+        {
+            return Ok(None);
+        }
+        let query_norm = query.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>().sqrt();
+        let mut matches = BinaryHeap::<RankedQueryMatch>::with_capacity(top_k.get());
+        for chunk in candidates.chunks(128) {
+            let row_ids = chunk.iter().map(|candidate| candidate.0).collect::<Vec<_>>();
+            let originals = take_rows(
+                dataset,
+                &row_ids,
+                VectorProjection {
+                    data: true,
+                    metadata: false,
+                },
+            )
+            .await?;
+            if originals.len() != chunk.len() {
+                return Ok(None);
+            }
+            for (original, (row_id, key, _)) in originals.into_iter().zip(chunk) {
+                let Some(vector) = original.data else {
+                    return Ok(None);
+                };
+                if &original.key != key || !numeric_vector_eligible(&vector, index.distance_metric) {
+                    return Ok(None);
+                }
+                let candidate = RankedQueryMatch(QueryMatch {
+                    key: original.key,
+                    row_id: *row_id,
+                    distance_f64: distance_f64(query, &vector, index.distance_metric, query_norm),
+                });
+                if matches.len() < top_k.get() {
+                    matches.push(candidate);
+                } else if let Some(mut farthest) = matches.peek_mut()
+                    && candidate < *farthest
+                {
+                    *farthest = candidate;
+                }
+            }
+        }
+        return Ok(Some(matches.into_sorted_vec().into_iter().map(|value| value.0).collect()));
+    }
+    Ok(None)
+}
+
+pub(super) fn compaction_options() -> lance::dataset::optimize::CompactionOptions {
+    use lance::dataset::optimize::{CompactionOptions, IndexRemapMode};
+    CompactionOptions {
+        target_rows_per_fragment: 65_536,
+        max_rows_per_group: 128,
+        max_bytes_per_file: Some(67_108_864),
+        num_threads: Some(1),
+        batch_size: Some(128),
+        io_buffer_size: Some(8_388_608),
+        max_source_fragments: Some(8),
+        max_source_rows: Some(65_536),
+        max_source_bytes: Some(67_108_864),
+        index_remap_mode: IndexRemapMode::Compact,
+        defer_index_remap: false,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..CompactionOptions::default()
+    }
 }

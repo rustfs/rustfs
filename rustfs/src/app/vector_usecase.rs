@@ -7,6 +7,7 @@ mod admission;
 mod bucket;
 mod dataset;
 mod encryption;
+pub(crate) mod maintenance;
 mod target;
 #[cfg(test)]
 mod tests;
@@ -46,6 +47,7 @@ pub(crate) struct DefaultVectorUsecase {
     region: String,
     limits: ManifestIoLimits,
     max_write_attempts: NonZeroUsize,
+    numeric_proof_cache: Arc<crate::vector::lance::LanceNumericProofCache>,
 }
 
 pub(crate) struct AuthorizedVectorRequest {
@@ -77,6 +79,7 @@ impl DefaultVectorUsecase {
             region,
             limits,
             max_write_attempts,
+            numeric_proof_cache: app.vector_numeric_proof_cache(),
         })
     }
 
@@ -249,11 +252,24 @@ impl DefaultVectorUsecase {
                     authorization: &authorization,
                     index,
                 };
-                match VectorService::new(catalog, self.limits, self.max_write_attempts)
+                let execution = VectorService::new(catalog, self.limits, self.max_write_attempts)
+                    .with_numeric_proof_cache(self.numeric_proof_cache.clone())
                     .execute(&context)
-                    .await
-                    .map_err(|error| service_error_for_operation(request.operation(), error))?
-                {
+                    .await;
+                #[cfg(test)]
+                if let Err(error) = &execution {
+                    crate::vector::fault_test::observe_sdk_request_failure(
+                        crate::vector::fault_test::SdkRequestFailureContext {
+                            instance_id: self.server.installed_app_context().map(|app| app.object_store().id),
+                            resource: authorization.resource.as_ref(),
+                            request_id: authorization.request_id.as_uuid(),
+                            http_request_id: authorization.verified.fault_http_request_id(),
+                            account: authorization.verified.fault_account(),
+                        },
+                        error,
+                    );
+                }
+                match execution.map_err(|error| service_error_for_operation(request.operation(), error))? {
                     VectorExecution::Complete(response) => Ok(response),
                     VectorExecution::GetVectors(prepared) => Ok(Response::GetVectors(dto::GetVectorsOutput {
                         vectors: prepared.vectors,
@@ -266,6 +282,12 @@ impl DefaultVectorUsecase {
             _ => self.execute_bucket(authorization, &request).await,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn catalog_worker_test_identity() -> (Arc<crate::runtime_sources::AppContext>, rustfs_credentials::Credentials) {
+    let fixture = tests::Fixture::new().await;
+    (fixture.app, fixture.credentials)
 }
 
 struct OwnedExecutionError(ProtocolError);

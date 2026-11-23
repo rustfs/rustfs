@@ -230,6 +230,8 @@ pub(crate) struct TableEntry {
     pub vector_head_binding: Option<VectorHeadBindingV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_index_definition: Option<VectorIndexDefinitionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_maintenance_binding: Option<VectorMaintenanceBindingV1>,
     pub version: u16,
     pub table_bucket: String,
     pub namespace: String,
@@ -312,7 +314,7 @@ pub(crate) struct CommitLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_commit_binding: Option<VectorCommitBindingV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vector_resource_mutation: Option<VectorResourceMutationBindingV1>,
+    pub vector_resource_mutation: Option<VectorResourceMutationBinding>,
     pub version: u16,
     pub commit_id: String,
     pub idempotency_key: Option<String>,
@@ -1500,6 +1502,10 @@ impl CatalogObjectKey {
     }
 }
 impl CatalogContentSha256 {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub(crate) fn digest(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
     }
@@ -1626,6 +1632,28 @@ pub(crate) struct CatalogMetadataRef {
     etag: Option<String>,
 }
 impl CatalogMetadataRef {
+    pub(crate) fn try_from_identity(
+        object_key: CatalogObjectKey,
+        content_length: u64,
+        content_sha256: CatalogContentSha256,
+        body_revision: CatalogBodyRevision,
+        etag: Option<String>,
+    ) -> TableCatalogStoreResult<Self> {
+        if content_length == 0
+            || etag
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control))
+        {
+            return Err(TableCatalogStoreError::Invalid("invalid exact object reference length or ETag".into()));
+        }
+        Ok(Self {
+            object_key,
+            content_length,
+            content_sha256,
+            body_revision: Some(body_revision),
+            etag,
+        })
+    }
     pub(crate) fn from_read(object_key: CatalogObjectKey, object: &TableCatalogObject) -> TableCatalogStoreResult<Self> {
         Ok(Self {
             object_key,
@@ -1683,7 +1711,7 @@ impl CatalogFormatDescriptor {
         payload: Vec<u8>,
     ) -> TableCatalogStoreResult<Self> {
         if encoding_version != 1
-            || !matches!((format, format_version), (CatalogFormat::Lance, 1) | (CatalogFormat::Iceberg, 1 | 2))
+            || !matches!((format, format_version), (CatalogFormat::Lance, 1 | 2) | (CatalogFormat::Iceberg, 1 | 2))
         {
             return Err(TableCatalogStoreError::Unsupported(
                 "unsupported catalog format descriptor version".to_string(),
@@ -1816,7 +1844,8 @@ pub(crate) struct PreparedCatalogCommit {
     writer: Option<String>,
     entry_updates: CatalogEntryUpdates,
     legacy_requirements: Vec<u8>,
-    vector_resource_mutation: Option<VectorResourceMutationBindingV1>,
+    vector_resource_mutation: Option<VectorResourceMutationBinding>,
+    retirement_validation: Option<CatalogRetirementValidation>,
 }
 impl PreparedCatalogCommit {
     pub(crate) fn try_from_validated_parts(
@@ -1870,9 +1899,25 @@ impl PreparedCatalogCommit {
             entry_updates,
             legacy_requirements,
             vector_resource_mutation: None,
+            retirement_validation: None,
         };
         prepared.request_digest = catalog_prepared_request_digest(&prepared)?;
         Ok(prepared)
+    }
+    pub(crate) fn with_retirement_validation(mut self, validation: CatalogRetirementValidation) -> TableCatalogStoreResult<Self> {
+        if self.resource_identity != validation.resource
+            || self.candidate_metadata != validation.metadata
+            || self.retirement_validation.is_some()
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "retirement validation differs from prepared candidate".into(),
+            ));
+        }
+        self.retirement_validation = Some(validation);
+        Ok(self)
+    }
+    pub(in crate::table_catalog) fn retirement_validation(&self) -> Option<&CatalogRetirementValidation> {
+        self.retirement_validation.as_ref()
     }
     pub(crate) fn resource_identity(&self) -> &CatalogResourceIdentity {
         &self.resource_identity
@@ -1947,7 +1992,7 @@ impl TryFrom<&CatalogMetadataRefRecordV1> for CatalogMetadataRef {
         })
     }
 }
-fn decode_catalog_digest(value: &str) -> TableCatalogStoreResult<[u8; 32]> {
+pub(in crate::table_catalog) fn decode_catalog_digest(value: &str) -> TableCatalogStoreResult<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()
@@ -2153,13 +2198,21 @@ impl CatalogHead {
     pub(in crate::table_catalog) fn from_vector_entry(entry: &TableEntry) -> TableCatalogStoreResult<Self> {
         match (entry.version, entry.vector_index_definition.as_ref()) {
             (2, None) => {}
-            (3, Some(definition)) => definition.validate()?,
-            (2 | 3, _) => {
+            (3 | 4, Some(definition)) => definition.validate()?,
+            (2..=4, _) => {
                 return Err(TableCatalogStoreError::Invalid(
                     "Vector entry definition does not match its version".into(),
                 ));
             }
             _ => return Err(TableCatalogStoreError::Unsupported("unsupported Vector entry version".into())),
+        }
+        if (entry.version == 4) != entry.vector_maintenance_binding.is_some() {
+            return Err(TableCatalogStoreError::Invalid(
+                "Vector maintenance binding does not match entry version".into(),
+            ));
+        }
+        if let Some(binding) = &entry.vector_maintenance_binding {
+            binding.validate()?;
         }
         let binding = entry
             .vector_head_binding
@@ -2167,7 +2220,8 @@ impl CatalogHead {
             .ok_or_else(|| TableCatalogStoreError::Unsupported("catalog entry has no vector head binding".to_string()))?;
         let (resource_identity, metadata, format_descriptor) = binding.validate()?;
         if entry.format != "lance"
-            || entry.format_version != 1
+            || !matches!(entry.format_version, 1 | 2)
+            || entry.format_version != format_descriptor.format_version()
             || entry.table_id != binding.table_id
             || entry.table_uuid != binding.table_id
             || entry.table_bucket != binding.bucket.storage_bucket_id
@@ -2273,7 +2327,7 @@ impl VectorCommitBindingV1 {
         bucket: &str,
         table_id: &str,
     ) -> TableCatalogStoreResult<()> {
-        if self.version != 1 || !matches!(entry.version, 2 | 3) {
+        if self.version != 1 || !matches!(entry.version, 2..=4) {
             return Err(TableCatalogStoreError::Unsupported("unsupported Vector commit version".to_string()));
         }
         let identity = CatalogResourceIdentity::try_new(
@@ -2287,7 +2341,7 @@ impl VectorCommitBindingV1 {
         decode_catalog_digest(&self.request_digest_sha256)?;
         match (entry.version, entry.vector_resource_mutation.as_ref()) {
             (2, None) => {}
-            (3, Some(mutation)) => mutation.validate()?,
+            (3 | 4, Some(mutation)) if mutation.entry_version() == entry.version => mutation.validate()?,
             _ => {
                 return Err(TableCatalogStoreError::Invalid(
                     "Vector commit mutation does not match its version".into(),
@@ -2480,6 +2534,8 @@ pub(crate) enum VectorResourceMutationKind {
     Dataset,
     Tags,
     Delete,
+    Enroll,
+    Retire,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2512,6 +2568,7 @@ impl VectorResourceMutationBindingV1 {
                 VectorResourceMutationKind::Delete => {
                     self.next_state == TableCatalogEntryState::Deleted && self.expected_definition == self.next_definition
                 }
+                VectorResourceMutationKind::Enroll | VectorResourceMutationKind::Retire => false,
             };
         if !valid {
             return Err(TableCatalogStoreError::Invalid("invalid Vector resource mutation transition".into()));
@@ -2646,6 +2703,8 @@ impl<'de> Deserialize<'de> for VectorResourceMutationKind {
             "DATASET" => Ok(Self::Dataset),
             "TAGS" => Ok(Self::Tags),
             "DELETE" => Ok(Self::Delete),
+            "ENROLL" => Ok(Self::Enroll),
+            "RETIRE" => Ok(Self::Retire),
             _ => Err(serde::de::Error::custom("unsupported Vector resource mutation kind")),
         }
     }
@@ -2676,6 +2735,9 @@ impl<'de> Deserialize<'de> for VectorResourceMutationBindingV1 {
             next_state: TableCatalogEntryState,
         }
         let fields: Fields = deserialize_vector_record(deserializer)?;
+        if matches!(fields.kind, VectorResourceMutationKind::Enroll | VectorResourceMutationKind::Retire) {
+            return Err(serde::de::Error::custom("unsupported Vector v1 resource mutation kind"));
+        }
         Ok(Self {
             version: fields.version,
             kind: fields.kind,
@@ -2732,10 +2794,12 @@ impl<'de> Deserialize<'de> for TableEntry {
             updated_at: Option<String>,
             #[serde(default)]
             vector_index_definition: Option<VectorIndexDefinitionV1>,
+            #[serde(default, deserialize_with = "deserialize_present_maintenance_binding")]
+            vector_maintenance_binding: Option<VectorMaintenanceBindingV1>,
         }
         impl Fields {
             fn finish<E: serde::de::Error>(self, object: bool) -> Result<TableEntry, E> {
-                if self.version == 3
+                if matches!(self.version, 3 | 4)
                     && (!object
                         || !self.state.is_string()
                         || self
@@ -2745,9 +2809,13 @@ impl<'de> Deserialize<'de> for TableEntry {
                 {
                     return Err(E::custom("Vector v3 entry requires object records and a string state"));
                 }
+                if (self.version == 4) != self.vector_maintenance_binding.is_some() {
+                    return Err(E::custom("Vector maintenance binding does not match entry version"));
+                }
                 Ok(TableEntry {
                     vector_head_binding: self.vector_head_binding.map(|binding| binding.into_binding()),
                     vector_index_definition: self.vector_index_definition,
+                    vector_maintenance_binding: self.vector_maintenance_binding,
                     version: self.version,
                     table_bucket: self.table_bucket,
                     namespace: self.namespace,
@@ -2826,11 +2894,11 @@ impl<'de> Deserialize<'de> for CommitLogEntry {
             created_at: Option<String>,
             updated_at: Option<String>,
             #[serde(default)]
-            vector_resource_mutation: Option<VectorResourceMutationBindingV1>,
+            vector_resource_mutation: Option<VectorResourceMutationBinding>,
         }
         impl Fields {
             fn finish<E: serde::de::Error>(self, object: bool) -> Result<CommitLogEntry, E> {
-                if self.version == 3
+                if matches!(self.version, 3 | 4)
                     && (!object
                         || !self.status.is_string()
                         || self
@@ -3009,9 +3077,20 @@ impl CatalogRecordRepresentation<VectorCommitBindingFields> {
 
 impl PreparedCatalogCommit {
     pub(in crate::table_catalog) fn with_vector_resource_mutation(
-        mut self,
+        self,
         mutation: VectorResourceMutationBindingV1,
     ) -> TableCatalogStoreResult<Self> {
+        self.with_vector_mutation_binding(mutation.into())
+    }
+
+    pub(in crate::table_catalog) fn with_vector_resource_mutation_v2(
+        self,
+        mutation: VectorResourceMutationBindingV2,
+    ) -> TableCatalogStoreResult<Self> {
+        self.with_vector_mutation_binding(mutation.into())
+    }
+
+    fn with_vector_mutation_binding(mut self, mutation: VectorResourceMutationBinding) -> TableCatalogStoreResult<Self> {
         if self.resource_identity.format() != CatalogFormat::Lance || self.vector_resource_mutation.is_some() {
             return Err(TableCatalogStoreError::Invalid("invalid prepared Vector resource mutation".into()));
         }
@@ -3027,7 +3106,7 @@ impl PreparedCatalogCommit {
         Ok(self)
     }
 
-    pub(in crate::table_catalog) fn vector_resource_mutation(&self) -> Option<&VectorResourceMutationBindingV1> {
+    pub(in crate::table_catalog) fn vector_resource_mutation(&self) -> Option<&VectorResourceMutationBinding> {
         self.vector_resource_mutation.as_ref()
     }
 }
@@ -3526,6 +3605,19 @@ impl VectorIndexDeleteIntentV1 {
             )?,
             Vec::new(),
         )?;
+        if let Some(maintenance) = &self.expected_entry.vector_maintenance_binding {
+            return VectorResourceMutationBinding::from(VectorResourceMutationBindingV2 {
+                version: 2,
+                kind: VectorResourceMutationKind::Delete,
+                expected_definition: definition.clone(),
+                next_definition: definition,
+                expected_state: TableCatalogEntryState::Active,
+                next_state: TableCatalogEntryState::Deleted,
+                expected_maintenance: Some(maintenance.clone()),
+                next_maintenance: maintenance.clone(),
+            })
+            .request_digest(&prepared);
+        }
         VectorResourceMutationBindingV1 {
             version: 1,
             kind: VectorResourceMutationKind::Delete,
@@ -3541,6 +3633,13 @@ impl VectorIndexDeleteIntentV1 {
         if self.version != 1 {
             return Err(TableCatalogStoreError::Unsupported("unsupported Vector delete intent version".into()));
         }
+        if self.expected_entry.version != 3 || self.deleted_entry.version != 3 {
+            return Err(TableCatalogStoreError::Invalid("v1 deletion requires v3 entries".into()));
+        }
+        self.validate_transition(self.canonical_request_digest()?)
+    }
+
+    pub(in crate::table_catalog) fn validate_transition(&self, digest: CatalogRequestDigest) -> TableCatalogStoreResult<()> {
         validate_vector_intent_uuid(&self.table_id)?;
         validate_vector_intent_uuid(&self.delete_id)?;
         validate_vector_intent_timestamps(&self.created_at, &self.updated_at)?;
@@ -3556,8 +3655,8 @@ impl VectorIndexDeleteIntentV1 {
         intended.version_token.clone_from(&self.deleted_entry.version_token);
         intended.generation = next_generation;
         intended.updated_at.clone_from(&self.deleted_entry.updated_at);
-        if self.expected_entry.version != 3
-            || self.deleted_entry.version != 3
+        if !matches!(self.expected_entry.version, 3 | 4)
+            || self.deleted_entry.version != self.expected_entry.version
             || self.namespace != "indexes"
             || self.expected_entry.namespace != self.namespace
             || self.expected_entry.table != self.name
@@ -3567,7 +3666,7 @@ impl VectorIndexDeleteIntentV1 {
             || expected.resource_identity() != deleted.resource_identity()
             || self.expected_entry.version_token == self.deleted_entry.version_token
             || intended != self.deleted_entry
-            || decode_catalog_digest(&self.request_sha256)? != self.canonical_request_digest()?.0
+            || decode_catalog_digest(&self.request_sha256)? != digest.0
         {
             return Err(TableCatalogStoreError::Invalid(
                 "Vector delete intent does not bind the exact resource transition".into(),
@@ -3597,6 +3696,35 @@ impl CatalogExpectedHead {
             generation: CatalogGeneration(0),
             metadata: None,
             format_descriptor: None,
+        })
+    }
+}
+
+fn deserialize_present_maintenance_binding<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<VectorMaintenanceBindingV1>, D::Error> {
+    VectorMaintenanceBindingV1::deserialize(deserializer).map(Some)
+}
+
+impl CatalogHead {
+    pub(crate) fn from_maintenance_snapshot(
+        resource: &VectorMaintenanceResourceV1,
+        head: &VectorMaintenanceHeadV1,
+    ) -> TableCatalogStoreResult<Self> {
+        resource.validate()?;
+        head.validate()?;
+        let (identity, metadata, format_descriptor) = head.binding().validate()?;
+        if identity != resource.identity()? {
+            return Err(TableCatalogStoreError::Conflict("maintenance head belongs to another resource".into()));
+        }
+        Ok(Self {
+            resource_identity: identity,
+            namespace: Namespace::parse(resource.namespace()).map_err(|e| TableCatalogStoreError::Invalid(e.to_string()))?,
+            name: CatalogName::parse(resource.name()).map_err(|e| TableCatalogStoreError::Invalid(e.to_string()))?,
+            version_token: CatalogVersionToken::try_new(head.version_token().clone())?,
+            generation: CatalogGeneration(*head.generation()),
+            metadata,
+            format_descriptor,
         })
     }
 }

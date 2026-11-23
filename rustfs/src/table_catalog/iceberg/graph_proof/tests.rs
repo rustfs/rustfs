@@ -45,6 +45,7 @@ fn entry() -> TableEntry {
         properties: BTreeMap::new(),
         created_at: None,
         updated_at: None,
+        vector_maintenance_binding: None,
         vector_index_definition: None,
         vector_head_binding: None,
     }

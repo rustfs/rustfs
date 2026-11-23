@@ -14,6 +14,8 @@
 
 //! Catalog acceptance with four real startup processes and retained evidence.
 
+mod catalog_m4_acceptance_test;
+
 use super::catalog_fault_worker::{
     CatalogCluster, LateCommitProof, LateCommitRole, Session, TestResult, assert_late_commit_proof, assert_no_head_regression,
     assert_retained_record, field, sha256, verify_manifest,

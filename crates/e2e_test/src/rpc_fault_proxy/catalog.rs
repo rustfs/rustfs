@@ -92,6 +92,7 @@ enum Selection {
     Rename { scope: CatalogRenameScope, limit: usize },
     Refresh(Vec<LockId>),
     Observe(Vec<ObjectKey>),
+    Acquire(Vec<ObjectKey>),
 }
 
 #[derive(Default)]
@@ -138,7 +139,7 @@ impl CatalogRules {
         let slot = match &selection {
             Selection::Rename { .. } => &mut slots.rename,
             Selection::Refresh(_) => &mut slots.refresh,
-            Selection::Observe(_) => &mut slots.observe,
+            Selection::Observe(_) | Selection::Acquire(_) => &mut slots.observe,
         };
         if slot.is_some() {
             return Err(invalid("catalog RPC rule already armed"));
@@ -191,6 +192,14 @@ impl RpcFaultProxy {
             return Err(invalid("catalog refresh requires 1..=64 exact lock IDs"));
         }
         self.catalog.arm(Selection::Refresh(lock_ids))
+    }
+
+    /// Hold exact initial acquisition requests without selecting Refresh or data RPCs.
+    pub(crate) fn pause_catalog_locks(&self, resources: Vec<ObjectKey>) -> io::Result<CatalogRpcGate> {
+        if resources.is_empty() || resources.len() > 64 || resources.iter().any(|resource| resource.bucket.is_empty()) {
+            return Err(invalid("catalog lock partition requires 1..=64 exact resources"));
+        }
+        self.catalog.arm(Selection::Acquire(resources))
     }
 
     /// Observe matching members while forwarding each original batch intact.
@@ -300,7 +309,7 @@ impl Drop for CatalogRpcGate {
         let slot = match self.state.selection {
             Selection::Rename { .. } => &mut slots.rename,
             Selection::Refresh(_) => &mut slots.refresh,
-            Selection::Observe(_) => &mut slots.observe,
+            Selection::Observe(_) | Selection::Acquire(_) => &mut slots.observe,
         };
         if slot.as_ref().is_some_and(|active| Arc::ptr_eq(active, &self.state)) {
             *slot = None;
@@ -362,7 +371,7 @@ fn selected_packet(state: &GateState, method: &str, body: &[u8]) -> Option<Catal
                 owner: request.owner,
             });
         }
-        Selection::Observe(resources) => {
+        Selection::Observe(resources) | Selection::Acquire(resources) => {
             let requests = if method == "LockBatch" {
                 BatchGenerallyLockRequest::decode(payload).ok()?.args
             } else {
@@ -599,7 +608,7 @@ async fn process_packet(
                         .map(|reply| (reply.success, reply.error_info))
                         .map_err(io::Error::other)
                 }),
-                Selection::Observe(_) => {
+                Selection::Observe(_) | Selection::Acquire(_) => {
                     // LockBatch uses a different response; the original bytes are retained.
                     state.data.lock().expect("catalog response evidence").packets[sequence].response = Some(evidence);
                     let body = Full::new(bytes)

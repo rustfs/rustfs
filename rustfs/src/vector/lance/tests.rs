@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[path = "sdk_candidate_tests.rs"]
+mod sdk_candidate_tests;
+
 use std::{collections::HashMap, error::Error, num::NonZeroU32, sync::Arc};
 
 use bytes::Bytes;
@@ -878,6 +881,7 @@ async fn catalog_fixture() -> CatalogFixture {
     let mut entry = TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: 2,
         table_bucket: bucket_id.into(),
         namespace: "indexes".into(),
@@ -2267,6 +2271,7 @@ async fn distance_catalog_fixture(metric: super::VectorDistanceMetric, dimension
     let mut entry = TableEntry {
         vector_head_binding: None,
         vector_index_definition: None,
+        vector_maintenance_binding: None,
         version: 2,
         table_bucket: bucket_id.into(),
         namespace: "indexes".into(),
@@ -3615,6 +3620,23 @@ impl crate::vector::service::VectorRequestAccess for ServiceRetryRequestFixture 
     }
 }
 
+// Keep request construction outside the concurrent retry orchestration poll frame.
+fn service_retry_request<'a>(
+    service: &'a crate::vector::service::VectorService<crate::table_catalog::test_support::TestCatalogObjectBackend>,
+    context: &'a dyn crate::vector::service::VectorRequestAccess,
+) -> std::pin::Pin<
+    Box<
+        impl std::future::Future<
+            Output = Result<
+                crate::vector::service::VectorExecution<crate::table_catalog::test_support::TestCatalogObjectBackend>,
+                crate::vector::service::VectorServiceError,
+            >,
+        > + 'a,
+    >,
+> {
+    Box::pin(service.execute(context))
+}
+
 async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
     use crate::vector::{
         protocol::{Request, dto},
@@ -3626,7 +3648,9 @@ async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
     let creation = service_request(&fixture);
     let mut control = creation.clone();
     let service = index_service(&fixture);
-    service.execute(&creation).await.expect("create the original Index");
+    service_retry_request(&service, &creation)
+        .await
+        .expect("create the original Index");
     let seed_request = |edition: &str, target: [f32; 3]| {
         Request::PutVectors(dto::PutVectorsInput {
             vector_bucket_name: Some("vectors".into()),
@@ -3649,7 +3673,9 @@ async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
         })
     };
     control.request = seed_request("original", [1.0, 0.0, 0.0]);
-    service.execute(&control).await.expect("publish the original target");
+    service_retry_request(&service, &control)
+        .await
+        .expect("publish the original target");
     let namespace = crate::table_catalog::Namespace::parse("indexes").expect("Index namespace");
     let (original_guard, original_entry) = fixture
         .store
@@ -3702,7 +3728,7 @@ async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
         managed_attempts: std::sync::atomic::AtomicUsize::new(0),
         authorized_resources: std::sync::Mutex::new(Vec::new()),
     };
-    let mut delayed = Box::pin(service.execute(&delayed_context));
+    let mut delayed = service_retry_request(&service, &delayed_context);
     tokio::select! {
         result = &mut delayed => panic!("write returned before the first Managed bind: {:?}", result.err()),
         entered = tokio::time::timeout(Duration::from_secs(10), delayed_context.first_managed_entered.notified()) => {
@@ -3713,8 +3739,7 @@ async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
         resource_arn: "arn:aws:s3vectors:us-east-1::bucket/vectors/index/service-index".into(),
         tags: [("conflict".into(), "winner".into())].into(),
     });
-    service
-        .execute(&control)
+    service_retry_request(&service, &control)
         .await
         .expect("publish a competing head for the same identity");
     let (tagged_guard, tagged_entry) = fixture
@@ -3743,10 +3768,16 @@ async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
                 index_name: Some("service-index".into()),
                 index_arn: None,
             });
-            service.execute(&control).await.expect("logically delete the original Index");
-            service.execute(&creation).await.expect("recreate the same Index name");
+            service_retry_request(&service, &control)
+                .await
+                .expect("logically delete the original Index");
+            service_retry_request(&service, &creation)
+                .await
+                .expect("recreate the same Index name");
             control.request = seed_request("replacement", [0.0, 0.0, 1.0]);
-            service.execute(&control).await.expect("publish the replacement Index target");
+            service_retry_request(&service, &control)
+                .await
+                .expect("publish the replacement Index target");
         })
         .await
         .expect("Index deletion and recreation complete while the original read is paused");
@@ -3824,8 +3855,7 @@ async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
         return_distance: Some(true),
         next_token: None,
     });
-    let VectorExecution::QueryVectors(query) = service
-        .execute(&control)
+    let VectorExecution::QueryVectors(query) = service_retry_request(&service, &control)
         .await
         .expect("read the authoritative Dataset after retry")
     else {
@@ -3946,4 +3976,1425 @@ fn metadata_non_filterable_exclusion_only_removes_configured_root_fields() {
     );
     let error = record_batch(&[record], &index).expect_err("nested names do not inherit the root non-filterable exclusion");
     assert!(matches!(error, DatasetError::InvalidVector(_)), "{error:?}");
+}
+
+fn maintenance_control() -> crate::table_catalog::VectorMaintenanceControl {
+    use crate::table_catalog::*;
+    VectorMaintenanceControl::new(
+        tokio_util::sync::CancellationToken::new(),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(900),
+        VectorMaintenanceBudgets::new(&VectorMaintenanceRuntimeConfig::default(), None).unwrap(),
+    )
+}
+
+async fn maintenance_adapter(
+    metric: super::VectorDistanceMetric,
+    dimensions: u32,
+) -> (
+    CatalogFixture,
+    super::LanceManifestAdapter<crate::table_catalog::test_support::TestCatalogObjectBackend>,
+    crate::storage_api::vector::ManagedObjectAccess,
+) {
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let crate::vector::protocol::Request::CreateIndex(input) = &mut context.request else {
+        unreachable!()
+    };
+    input.dimension = dimensions as i32;
+    input.distance_metric = match metric {
+        super::VectorDistanceMetric::Cosine => crate::vector::protocol::dto::DistanceMetric::Cosine,
+        super::VectorDistanceMetric::Euclidean => crate::vector::protocol::dto::DistanceMetric::Euclidean,
+    };
+    index_service(&fixture).execute(&context).await.unwrap();
+    let (adapter, access) = reopen_maintenance_adapter(&fixture).await;
+    (fixture, adapter, access)
+}
+
+async fn reopen_maintenance_adapter(
+    fixture: &CatalogFixture,
+) -> (
+    super::LanceManifestAdapter<crate::table_catalog::test_support::TestCatalogObjectBackend>,
+    crate::storage_api::vector::ManagedObjectAccess,
+) {
+    use crate::vector::service::VectorRequestAccess;
+    let context = service_request(fixture);
+    let (guard, entry) = fixture
+        .store
+        .begin_vector_operation(
+            &context.bucket,
+            &crate::table_catalog::Namespace::parse("indexes").unwrap(),
+            &context.name,
+        )
+        .await
+        .unwrap();
+    let guard = Arc::new(guard);
+    let managed = context.managed_dataset(guard.clone(), entry.definition()).await.unwrap();
+    let adapter = super::LanceManifestAdapter::new_guarded(
+        super::LanceOperationContext {
+            catalog: fixture.store.clone(),
+            objects: managed.objects,
+            access: managed.access.clone(),
+            guard,
+            definition: entry.definition().clone(),
+        },
+        context.name,
+        super::LanceManifestAdapter::<crate::table_catalog::test_support::TestCatalogObjectBackend>::index_from_catalog(&entry)
+            .unwrap(),
+        io_limits(),
+    )
+    .unwrap();
+    (adapter, managed.access)
+}
+
+async fn maintenance_request(
+    fixture: &CatalogFixture,
+    access: &crate::storage_api::vector::ManagedObjectAccess,
+    index: &super::VectorIndexManifestSpec,
+    id: u128,
+) -> super::ManifestPrepareRequest {
+    use crate::table_catalog::*;
+    let namespace = Namespace::parse("indexes").unwrap();
+    let name = CatalogName::parse("service-index").unwrap();
+    let head = fixture
+        .store
+        .read_catalog_head(access.bucket(), &namespace, &name)
+        .await
+        .unwrap();
+    super::ManifestPrepareRequest {
+        parts: CatalogCommitParts {
+            resource_identity: head.resource_identity().clone(),
+            namespace,
+            name,
+            expected_head: head.expected_head(),
+            commit_id: CatalogCommitId::try_new(uuid::Uuid::from_u128(id).to_string()).unwrap(),
+            operation: "maintenance-test".into(),
+            idempotency_key: None,
+            writer: None,
+        },
+        index: index.clone(),
+    }
+}
+
+fn ann_records(count: usize, dimensions: usize) -> Vec<super::VectorRecord> {
+    (0..count)
+        .map(|row| {
+            let mut seed = row as u32 + 1;
+            let data = (0..dimensions)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 8) as f32 / 16_777_216.0
+                })
+                .collect();
+            super::VectorRecord {
+                key: format!("row-{row:05}"),
+                data,
+                metadata: Some(
+                    serde_json::json!({"group":row % 2,"ordinal":row,"labels":["sample"],"private":"opaque"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            }
+        })
+        .collect()
+}
+
+async fn build_ann_fixture(metric: super::VectorDistanceMetric) {
+    use crate::table_catalog::*;
+    let (fixture, adapter, access) = maintenance_adapter(metric, 128).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let initial = adapter.open_current(&access, &resource).await.unwrap();
+    let index = initial.info().index.clone();
+    let records = ann_records(8192, 128);
+    for (ordinal, batch) in records.chunks(4096).enumerate() {
+        let request = maintenance_request(&fixture, &access, &index, 50_001 + ordinal as u128).await;
+        adapter.put_vectors(&access, request, batch).await.unwrap();
+    }
+    let request = maintenance_request(&fixture, &access, &index, 50_003).await;
+    let base = adapter.maintenance_base(&access, &request).await.unwrap();
+    let handler = Arc::new(adapter.handler(Some(request)));
+    let result = super::dataset::build_ann(base.dataset.clone(), &index, handler.clone(), &maintenance_control())
+        .await
+        .unwrap()
+        .expect("eligible native ANN build");
+    let indexed = adapter.committed_snapshot(result, &handler).unwrap();
+    assert_eq!(indexed.info().manifest_version, 4);
+    let head = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.format_descriptor().format_version(), 2);
+    let payload: serde_json::Value = serde_json::from_slice(head.format_descriptor().payload()).unwrap();
+    assert_eq!(payload["descriptor_version"], 2);
+    let references = adapter
+        .collect_references(head.metadata(), head.format_descriptor())
+        .await
+        .unwrap();
+    let index_files = references
+        .iter()
+        .filter(|reference| reference.object_key().as_str().contains("/_indices/"))
+        .collect::<Vec<_>>();
+    assert_eq!(index_files.len(), 2);
+    assert!(
+        index_files
+            .iter()
+            .all(|reference| reference.content_length() > 0 && reference.body_revision().is_some())
+    );
+    let query = &records[123].data;
+    let matches = indexed
+        .query_matches(query, NonZeroUsize::new(5).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        indexed.ann_completions(),
+        1,
+        "production query completed native ANN and float64 reranking"
+    );
+    assert_eq!(matches[0].key, records[123].key);
+    assert_eq!(matches[0].distance_f64, 0.0);
+    assert_eq!(indexed.dataset.count_rows(None).await.unwrap(), 8192);
+    let completions = indexed.ann_completions();
+    for filter in [
+        serde_json::json!({"ordinal":123}),
+        serde_json::json!({"group":"1"}),
+        serde_json::json!({"absent":{"$exists":true}}),
+    ] {
+        let filter = crate::vector::filter::ValidatedFilter::parse(&filter, &index.non_filterable_metadata_keys).unwrap();
+        let found = indexed
+            .query_matches(query, NonZeroUsize::new(5).unwrap(), Some(filter.clone()))
+            .await
+            .unwrap();
+        let exact = super::dataset::query_matches(
+            &indexed.dataset,
+            query,
+            &index,
+            NonZeroUsize::new(5).unwrap(),
+            Some(filter),
+            None,
+            &std::sync::atomic::AtomicUsize::new(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found, exact);
+    }
+    assert_eq!(
+        indexed.ann_completions(),
+        completions,
+        "low candidate filters complete the exact fallback"
+    );
+    assert!(
+        crate::vector::filter::ValidatedFilter::parse(
+            &serde_json::json!({"private":"opaque"}),
+            &index.non_filterable_metadata_keys
+        )
+        .is_err()
+    );
+
+    let indexed = compact_indexed_fixture(&fixture, &adapter, &access, &index, 50_004).await;
+    let matches = indexed
+        .query_matches(query, NonZeroUsize::new(5).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(matches[0].key, records[123].key);
+    assert_eq!(indexed.dataset.get_fragments().len(), 1);
+    assert_eq!(indexed.dataset.count_rows(None).await.unwrap(), 8192);
+    let mut latest = records[123].clone();
+    latest.key = "new-unindexed-nearest".into();
+    let request = maintenance_request(&fixture, &access, &index, 50_006).await;
+    let appended = adapter.put_vectors(&access, request, &[latest]).await.unwrap();
+    let request = maintenance_request(&fixture, &access, &index, 50_007).await;
+    let deleted = adapter
+        .delete_vectors(&access, request, &[records[123].key.clone()])
+        .await
+        .unwrap();
+    let matches = deleted
+        .query_matches(query, NonZeroUsize::new(5).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(matches[0].key, "new-unindexed-nearest");
+    assert!(!matches.iter().any(|value| value.key == records[123].key));
+    assert_eq!(appended.dataset.count_rows(None).await.unwrap(), 8193);
+    assert_eq!(deleted.dataset.count_rows(None).await.unwrap(), 8192);
+}
+
+#[tokio::test]
+async fn maintenance_ann_8192x128_euclidean() {
+    build_ann_fixture(super::VectorDistanceMetric::Euclidean).await;
+}
+
+#[tokio::test]
+async fn maintenance_ann_8192x128_cosine() {
+    build_ann_fixture(super::VectorDistanceMetric::Cosine).await;
+}
+
+#[test]
+fn maintenance_index_metadata_matches_persisted_precision_and_fields() {
+    use lance_table::format::{IndexMetadata, pb};
+    let mut native = IndexMetadata::try_from(pb::IndexMetadata {
+        uuid: Some((&uuid::Uuid::from_u128(1)).into()),
+        fields: vec![1],
+        name: super::files::ANN_INDEX_NAME.into(),
+        dataset_version: 3,
+        index_version: Some(1),
+        files: vec![pb::IndexFile {
+            path: "index.idx".into(),
+            size_bytes: 64,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    native.created_at = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789);
+    let persisted = IndexMetadata::try_from(pb::IndexMetadata::from(&native)).unwrap();
+    assert_ne!(native.created_at, persisted.created_at);
+    assert!(super::commit::persisted_indices_match(
+        std::slice::from_ref(&native),
+        std::slice::from_ref(&persisted)
+    ));
+    for changed in [
+        IndexMetadata {
+            dataset_version: 4,
+            ..persisted.clone()
+        },
+        IndexMetadata {
+            fields: vec![2],
+            ..persisted.clone()
+        },
+        IndexMetadata {
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 124_000_000),
+            ..persisted.clone()
+        },
+    ] {
+        assert!(!super::commit::persisted_indices_match(std::slice::from_ref(&native), &[changed]));
+    }
+    let mut changed_file = persisted;
+    changed_file.files.as_mut().unwrap()[0].size_bytes += 1;
+    assert!(!super::commit::persisted_indices_match(&[native], &[changed_file]));
+}
+
+#[test]
+fn maintenance_numeric_boundaries() {
+    use super::{VectorDistanceMetric as Metric, dataset::numeric_vector_eligible};
+    assert!(numeric_vector_eligible(&[1_048_576.0, -1_048_576.0], Metric::Euclidean));
+    assert!(!numeric_vector_eligible(&[1_048_576.0_f32.next_up()], Metric::Euclidean));
+    assert!(numeric_vector_eligible(&[2f32.powi(-20)], Metric::Cosine));
+    assert!(!numeric_vector_eligible(&[2f32.powi(-21)], Metric::Cosine));
+    assert!(!numeric_vector_eligible(&[f32::MAX], Metric::Euclidean));
+}
+
+#[tokio::test]
+async fn maintenance_native_compaction_has_two_catalog_stages() {
+    use crate::table_catalog::*;
+    use futures::TryStreamExt;
+    use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
+    let (fixture, adapter, access) = maintenance_adapter(super::VectorDistanceMetric::Euclidean, 3).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let initial = adapter.open_current(&access, &resource).await.unwrap();
+    let index = initial.info().index.clone();
+    for (ordinal, key) in ["first", "second"].into_iter().enumerate() {
+        let request = maintenance_request(&fixture, &access, &index, 60_001 + ordinal as u128).await;
+        adapter
+            .put_vectors(&access, request, &[dataset_record(key, [1.0, 2.0, 3.0], None)])
+            .await
+            .unwrap();
+    }
+    let request = maintenance_request(&fixture, &access, &index, 60_003).await;
+    let base = adapter.maintenance_base(&access, &request).await.unwrap();
+    assert_eq!(base.dataset.get_fragments().len(), 2);
+    let options = super::dataset::compaction_options();
+    let plan = lance::dataset::optimize::plan_compaction(&base.dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.num_tasks(), 1);
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        let result = task.execute(&base.dataset).await.unwrap();
+        assert_eq!(result.read_version, base.info().manifest_version);
+        results.push(result);
+    }
+    let expected = results.iter().map(|result| result.new_fragments.len() as u32).sum();
+    let handler = adapter.compaction_handler(
+        request,
+        CatalogCommitId::try_new(uuid::Uuid::from_u128(60_004).to_string()).unwrap(),
+        expected,
+        maintenance_control(),
+    );
+    let mut working = adapter
+        .open_for_compaction(base.info().manifest_version, handler.clone())
+        .await
+        .unwrap();
+    lance::dataset::optimize::commit_compaction(
+        &mut working,
+        results,
+        Arc::new(lance::dataset::index::DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+    assert_eq!(working.version().version, base.info().manifest_version + 2);
+    assert_eq!(working.get_fragments().len(), 1);
+    assert_eq!(working.count_rows(None).await.unwrap(), 2);
+    let final_snapshot = adapter.committed_snapshot(working, handler.rewrite.get().unwrap()).unwrap();
+    let rows = final_snapshot
+        .get(&["first".into(), "second".into()], all_vector_fields())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let reservation = adapter
+        .open_committed_version(&access, &resource, NonZeroU64::new(base.info().manifest_version + 1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(reservation.dataset.get_fragments().len(), 2);
+    assert_eq!(reservation.dataset.count_rows(None).await.unwrap(), 2);
+    let unrelated_key = format!("{}_versions/999.manifest", resource.dataset_prefix());
+    fixture
+        .backend
+        .seed_object(resource.storage_bucket_id(), &unrelated_key, b"unpublished candidate".to_vec())
+        .await;
+    let store = final_snapshot.dataset.object_store(None).await.unwrap();
+    let path = Path::from(resource.dataset_prefix().trim_end_matches('/'));
+    let versions: Vec<_> = handler
+        .list_manifest_locations(&path, &store, true)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(versions.iter().map(|location| location.version).collect::<Vec<_>>(), vec![5, 4, 3, 2, 1]);
+    let stages: Vec<_> = handler
+        .list_manifest_locations_since(&path, &store, base.info().manifest_version)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(stages.iter().map(|location| location.version).collect::<Vec<_>>(), vec![5, 4]);
+    assert_eq!(stages[0].path.as_ref(), final_snapshot.info().reference.object_key().as_str());
+    assert_eq!(stages[1].path.as_ref(), reservation.info().reference.object_key().as_str());
+    assert!(
+        !handler
+            .version_exists(&path, 999, store.inner.as_ref(), ManifestNamingScheme::V1)
+            .await
+            .unwrap()
+    );
+    let detached: Vec<_> = handler
+        .list_detached_manifest_locations(&path, &store)
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(detached.is_empty());
+}
+
+#[tokio::test]
+async fn maintenance_ann_ineligible_snapshots_preserve_catalog_head() {
+    use crate::table_catalog::*;
+    let (fixture, adapter, access) = maintenance_adapter(super::VectorDistanceMetric::Euclidean, 3).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let initial = adapter.open_current(&access, &resource).await.unwrap();
+    let index = initial.info().index.clone();
+    for (ordinal, records) in [
+        ann_records(16, 3),
+        (0..1024)
+            .map(|row| dataset_record(&format!("unsafe-{row}"), [f32::MAX, 1.0, 2.0], None))
+            .collect(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = maintenance_request(&fixture, &access, &index, 70_001 + ordinal as u128 * 2).await;
+        let written = adapter.put_vectors(&access, request, &records).await.unwrap();
+        let request = maintenance_request(&fixture, &access, &index, 70_002 + ordinal as u128 * 2).await;
+        let base = adapter.maintenance_base(&access, &request).await.unwrap();
+        let handler = Arc::new(adapter.handler(Some(request)));
+        assert!(
+            super::dataset::build_ann(base.dataset.clone(), &index, handler, &maintenance_control())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let current = adapter.open_current(&access, &resource).await.unwrap();
+        assert_eq!(current.info().reference, written.info().reference);
+    }
+    let control = maintenance_control();
+    control.stop_new_work.cancel();
+    let request = maintenance_request(&fixture, &access, &index, 70_010).await;
+    let base = adapter.maintenance_base(&access, &request).await.unwrap();
+    let handler = Arc::new(adapter.handler(Some(request)));
+    assert!(matches!(
+        super::dataset::build_ann(base.dataset.clone(), &index, handler, &control).await,
+        Err(super::DatasetError::Budget(VectorMaintenanceBudgetError::Stopped))
+    ));
+}
+
+#[test]
+fn maintenance_index_paths_reject_external_and_duplicate_layouts() {
+    let id = uuid::Uuid::from_u128(1);
+    for name in ["index.idx", "auxiliary.idx"] {
+        super::files::validate_writable_relative_path(&format!("_indices/{id}/{name}")).unwrap();
+    }
+    for name in ["../index.idx", "index.idx/extra", "http://host/index.idx", "unknown.idx"] {
+        assert!(super::files::validate_writable_relative_path(&format!("_indices/{id}/{name}")).is_err());
+    }
+    assert!(super::files::validate_writable_relative_path("_indices/00000000-0000-0000-0000-000000000000/index.idx").is_err());
+}
+
+#[tokio::test]
+async fn maintenance_budget_follows_cloned_read_buffers_and_open_streams() {
+    use crate::table_catalog::*;
+    let objects = Arc::new(TestManagedObjects::default());
+    let store = super::object_store::ManagedObjectStore::new(objects, dataset_access(), io_limits());
+    let path = native_data_path(90);
+    store.put(&path, Bytes::from_static(b"controlled").into()).await.unwrap();
+    let config = VectorMaintenanceRuntimeConfig {
+        memory_bytes: NonZeroU64::new(1024 * 1024).unwrap(),
+        ..VectorMaintenanceRuntimeConfig::default()
+    };
+    let budgets = VectorMaintenanceBudgets::new(&config, None).unwrap();
+    let control = VectorMaintenanceControl::new(
+        tokio_util::sync::CancellationToken::new(),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        budgets.clone(),
+    );
+    store.set_maintenance_control(control.clone()).unwrap();
+    let retained = budgets.try_reserve_memory(1024 * 1024 - 65_536).unwrap();
+    let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+    let cloned = bytes.clone();
+    drop(bytes);
+    assert!(budgets.try_reserve_memory(65_536).is_err(), "last Bytes clone owns the reservation");
+    drop(cloned);
+    assert!(budgets.try_reserve_memory(65_536).is_ok());
+    drop(retained);
+    let first = store.get(&path).await.unwrap();
+    let second = store.get(&path).await.unwrap();
+    assert!(budgets.try_acquire_io().is_err(), "both open streams retain global I/O permits");
+    control.stop_new_work.cancel();
+    assert!(store.get(&path).await.is_err(), "cancellation stops fresh I/O admission");
+    assert!(budgets.try_acquire_io().is_err());
+    drop(first);
+    assert!(budgets.try_acquire_io().is_ok());
+    drop(second);
+}
+
+async fn compact_indexed_fixture(
+    fixture: &CatalogFixture,
+    adapter: &super::LanceManifestAdapter<crate::table_catalog::test_support::TestCatalogObjectBackend>,
+    access: &crate::storage_api::vector::ManagedObjectAccess,
+    index: &super::VectorIndexManifestSpec,
+    id: u128,
+) -> super::DatasetSnapshot<crate::table_catalog::test_support::TestCatalogObjectBackend> {
+    use lance::index::DatasetIndexExt;
+    let request = maintenance_request(fixture, access, index, id).await;
+    let base = adapter.maintenance_base(access, &request).await.unwrap();
+    let previous_indices = base.dataset.load_indices().await.unwrap();
+    let options = super::dataset::compaction_options();
+    let plan = lance::dataset::optimize::plan_compaction(&base.dataset, &options)
+        .await
+        .unwrap();
+    assert!(plan.num_tasks() > 0);
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        let result = task.execute(&base.dataset).await.unwrap();
+        assert_eq!(result.read_version, base.info().manifest_version);
+        results.push(result);
+    }
+    let expected = results.iter().map(|result| result.new_fragments.len() as u32).sum();
+    let handler = adapter.compaction_handler(
+        request,
+        crate::table_catalog::CatalogCommitId::try_new(uuid::Uuid::from_u128(id + 1).to_string()).unwrap(),
+        expected,
+        maintenance_control(),
+    );
+    let mut working = adapter
+        .open_for_compaction(base.info().manifest_version, handler.clone())
+        .await
+        .unwrap();
+    lance::dataset::optimize::commit_compaction(
+        &mut working,
+        results,
+        Arc::new(lance::dataset::index::DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+    assert_eq!(working.version().version, base.info().manifest_version + 2);
+    let current_indices = working.load_indices().await.unwrap();
+    assert_eq!(current_indices.len(), previous_indices.len());
+    if let Some(previous) = previous_indices.first() {
+        assert_ne!(current_indices[0].uuid, previous.uuid);
+        assert_eq!(current_indices[0].name, previous.name);
+    }
+    adapter.committed_snapshot(working, handler.rewrite.get().unwrap()).unwrap()
+}
+
+async fn compaction_conflict_fixture(after_reserve: bool) {
+    use crate::table_catalog::*;
+    let (fixture, adapter, access) = maintenance_adapter(super::VectorDistanceMetric::Euclidean, 3).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let initial = adapter.open_current(&access, &resource).await.unwrap();
+    let index = initial.info().index.clone();
+    for (ordinal, key) in ["one", "two"].into_iter().enumerate() {
+        let request = maintenance_request(&fixture, &access, &index, 80_001 + ordinal as u128).await;
+        adapter
+            .put_vectors(&access, request, &[dataset_record(key, [1.0, 2.0, 3.0], None)])
+            .await
+            .unwrap();
+    }
+    let request = maintenance_request(&fixture, &access, &index, 80_003).await;
+    let base = adapter.maintenance_base(&access, &request).await.unwrap();
+    let options = super::dataset::compaction_options();
+    let plan = lance::dataset::optimize::plan_compaction(&base.dataset, &options)
+        .await
+        .unwrap();
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        results.push(task.execute(&base.dataset).await.unwrap());
+    }
+    let outputs = results
+        .iter()
+        .flat_map(|result| {
+            result.new_fragments.iter().flat_map(|fragment| {
+                fragment
+                    .files
+                    .iter()
+                    .map(|file| format!("{}data/{}", resource.dataset_prefix(), file.path))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(!outputs.is_empty());
+    let count = results.iter().map(|result| result.new_fragments.len() as u32).sum();
+    let handler = adapter.compaction_handler(
+        request,
+        CatalogCommitId::try_new(uuid::Uuid::from_u128(80_004).to_string()).unwrap(),
+        count,
+        maintenance_control(),
+    );
+    let mut working = adapter
+        .open_for_compaction(base.info().manifest_version, handler.clone())
+        .await
+        .unwrap();
+    if after_reserve {
+        let pause = handler.pause_after_reserve();
+        let mut compaction = Box::pin(lance::dataset::optimize::commit_compaction(
+            &mut working,
+            results,
+            Arc::new(lance::dataset::index::DatasetIndexRemapperOptions::default()),
+            &options,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! { result = &mut compaction => panic!("compaction returned before the reservation barrier: {result:?}"), _ = pause.entered.notified() => {} }
+        }).await.expect("native reservation barrier timed out");
+        let request = maintenance_request(&fixture, &access, &index, 80_005).await;
+        adapter
+            .put_vectors(&access, request, &[dataset_record("foreground", [4.0, 5.0, 6.0], None)])
+            .await
+            .unwrap();
+        pause.release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), compaction)
+                .await
+                .expect("conflicted rewrite timed out")
+                .is_err()
+        );
+        let reserved = adapter
+            .open_committed_version(&access, &resource, NonZeroU64::new(base.info().manifest_version + 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reserved.dataset.count_rows(None).await.unwrap(), 2);
+    } else {
+        let request = maintenance_request(&fixture, &access, &index, 80_005).await;
+        adapter
+            .put_vectors(&access, request, &[dataset_record("foreground", [4.0, 5.0, 6.0], None)])
+            .await
+            .unwrap();
+        assert!(
+            lance::dataset::optimize::commit_compaction(
+                &mut working,
+                results,
+                Arc::new(lance::dataset::index::DatasetIndexRemapperOptions::default()),
+                &options
+            )
+            .await
+            .is_err()
+        );
+        assert!(adapter.native_delete_attempts() > 0, "native reservation failure requested cleanup");
+    }
+    let current = adapter.open_current(&access, &resource).await.unwrap();
+    assert_eq!(current.dataset.count_rows(None).await.unwrap(), 3);
+    let objects = fixture.backend.state.lock().await;
+    for key in outputs {
+        assert!(
+            objects
+                .objects
+                .contains_key(&(access.bucket().storage_bucket_id().as_str().to_string(), key)),
+            "native cleanup must retain exact produced files"
+        );
+    }
+}
+
+#[tokio::test]
+async fn maintenance_compaction_conflict_before_reserve_retains_native_files() {
+    compaction_conflict_fixture(false).await;
+}
+
+#[tokio::test]
+async fn maintenance_compaction_conflict_between_stages_preserves_reservation() {
+    compaction_conflict_fixture(true).await;
+}
+
+#[tokio::test]
+async fn maintenance_restart_revalidates_exact_compaction_candidates() {
+    use crate::table_catalog::*;
+    let (fixture, adapter, access) = maintenance_adapter(super::VectorDistanceMetric::Euclidean, 3).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let index = adapter.open_current(&access, &resource).await.unwrap().info().index.clone();
+    for (offset, key) in ["first", "second"].into_iter().enumerate() {
+        let request = maintenance_request(&fixture, &access, &index, 91_001 + offset as u128).await;
+        adapter
+            .put_vectors(&access, request, &[dataset_record(key, [1.0, 2.0, 3.0], None)])
+            .await
+            .unwrap();
+    }
+    let absent = maintenance_request(&fixture, &access, &index, 91_003).await;
+    assert!(
+        adapter
+            .prepare_existing_maintenance_candidate(absent)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let reserved_request = maintenance_request(&fixture, &access, &index, 91_003).await;
+    let request = maintenance_request(&fixture, &access, &index, 91_003).await;
+    let base = adapter.maintenance_base(&access, &request).await.unwrap();
+    let options = super::dataset::compaction_options();
+    let plan = lance::dataset::optimize::plan_compaction(&base.dataset, &options)
+        .await
+        .unwrap();
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        results.push(task.execute(&base.dataset).await.unwrap());
+    }
+    let count = results.iter().map(|result| result.new_fragments.len() as u32).sum();
+    let handler = adapter.compaction_handler(
+        request,
+        CatalogCommitId::try_new(uuid::Uuid::from_u128(91_004).to_string()).unwrap(),
+        count,
+        maintenance_control(),
+    );
+    let pause = handler.pause_after_reserve();
+    let mut working = adapter
+        .open_for_compaction(base.info().manifest_version, handler.clone())
+        .await
+        .unwrap();
+    let mut commit = Box::pin(lance::dataset::optimize::commit_compaction(
+        &mut working,
+        results,
+        Arc::new(lance::dataset::index::DatasetIndexRemapperOptions::default()),
+        &options,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::select! { result = &mut commit => panic!("native commit bypassed reservation barrier: {result:?}"), _ = pause.entered.notified() => {} }
+    }).await.expect("reservation barrier timed out");
+    let mut rewrite_request = maintenance_request(&fixture, &access, &index, 91_004).await;
+    rewrite_request.parts.operation = "rewrite".into();
+    pause.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(30), commit)
+        .await
+        .expect("native commit timed out")
+        .unwrap();
+    let before = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    let final_reference = adapter
+        .open_current(&access, &resource)
+        .await
+        .unwrap()
+        .info()
+        .reference
+        .clone();
+    drop(working);
+    drop(base);
+    drop(handler);
+    drop(adapter);
+
+    let (restarted, access) = reopen_maintenance_adapter(&fixture).await;
+    let reserved = restarted
+        .prepare_existing_maintenance_candidate(reserved_request)
+        .await
+        .unwrap()
+        .expect("exact reservation candidate");
+    let rewrite = restarted
+        .prepare_existing_maintenance_candidate(rewrite_request)
+        .await
+        .unwrap()
+        .expect("exact rewrite candidate");
+    assert_ne!(reserved.commit_id(), rewrite.commit_id());
+    assert_eq!(rewrite.candidate_metadata(), &final_reference);
+    assert_eq!(reserved.format_descriptor().format_version(), 2);
+    assert_eq!(rewrite.format_descriptor().format_version(), 2);
+    let after = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.expected_head(),
+        after.expected_head(),
+        "recovery parsing cannot reserve fragment IDs again"
+    );
+    assert_eq!(
+        restarted
+            .open_current(&access, &resource)
+            .await
+            .unwrap()
+            .dataset
+            .count_rows(None)
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn maintenance_catalog_recovery_preserves_v1_and_rejects_changed_body() {
+    use crate::table_catalog::*;
+    let (fixture, adapter, access) = maintenance_adapter(super::VectorDistanceMetric::Euclidean, 3).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let index = adapter.open_current(&access, &resource).await.unwrap().info().index.clone();
+    let recovery = maintenance_request(&fixture, &access, &index, 92_001).await;
+    let request = maintenance_request(&fixture, &access, &index, 92_001).await;
+    adapter
+        .put_vectors(&access, request, &[dataset_record("original", [1.0, 2.0, 3.0], None)])
+        .await
+        .unwrap();
+    let head = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.format_descriptor().format_version(), 1);
+    drop(adapter);
+    let (restarted, access) = reopen_maintenance_adapter(&fixture).await;
+    let prepared = restarted
+        .prepare_exact_catalog_candidate(recovery, head.metadata(), head.format_descriptor())
+        .await
+        .unwrap();
+    assert_eq!(prepared.candidate_metadata(), head.metadata());
+    assert_eq!(prepared.format_descriptor(), head.format_descriptor());
+    let unchanged = maintenance_request(&fixture, &access, &index, 92_002).await;
+    let preserved = restarted
+        .prepare_exact_catalog_candidate(unchanged, head.metadata(), head.format_descriptor())
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved.candidate_metadata(),
+        head.metadata(),
+        "metadata mutation keeps the original Dataset candidate"
+    );
+    let after = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.expected_head(), after.expected_head());
+    let invalid = maintenance_request(&fixture, &access, &index, 92_003).await;
+    {
+        let mut objects = fixture.backend.state.lock().await;
+        let original = objects
+            .objects
+            .get_mut(&(resource.storage_bucket_id().into(), head.metadata().object_key().as_str().into()))
+            .unwrap();
+        original.body_revision = Some(uuid::Uuid::from_u128(92_004));
+        original.data[0] ^= 1;
+    }
+    assert!(
+        restarted
+            .prepare_exact_catalog_candidate(invalid, head.metadata(), head.format_descriptor())
+            .await
+            .is_err()
+    );
+    let unchanged = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        head.expected_head(),
+        unchanged.expected_head(),
+        "recovery validation never publishes a replacement body"
+    );
+}
+
+struct TestPublicationAdmission {
+    resource: crate::table_catalog::CatalogResourceIdentity,
+    pause_at: usize,
+    allowed: std::sync::atomic::AtomicBool,
+    candidates: tokio::sync::Mutex<Vec<crate::table_catalog::CatalogMetadataRef>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl super::MaintenancePublicationAuthorizer for TestPublicationAdmission {
+    async fn authorize(
+        &self,
+        resource: &crate::table_catalog::CatalogResourceIdentity,
+        candidate: &crate::table_catalog::CatalogMetadataRef,
+    ) -> Result<(), LanceManifestError> {
+        assert_eq!(resource, &self.resource);
+        let count = {
+            let mut candidates = self.candidates.lock().await;
+            candidates.push(candidate.clone());
+            candidates.len()
+        };
+        if count == self.pause_at {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        if !self.allowed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(LanceManifestError::Storage {
+                operation: "test current publication authority",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "publication permission revoked",
+                )),
+            });
+        }
+        Ok(())
+    }
+}
+
+async fn maintenance_publication_admission_fixture(revoked_stage: Option<usize>) {
+    use crate::table_catalog::*;
+    let (fixture, foreground, access) = maintenance_adapter(super::VectorDistanceMetric::Euclidean, 3).await;
+    let resource =
+        CatalogResourceIdentity::try_new(access.bucket().clone(), access.table_id().clone(), CatalogFormat::Lance).unwrap();
+    let index = foreground
+        .open_current(&access, &resource)
+        .await
+        .unwrap()
+        .info()
+        .index
+        .clone();
+    for (offset, key) in ["first", "second"].into_iter().enumerate() {
+        let request = maintenance_request(&fixture, &access, &index, 93_001 + offset as u128).await;
+        foreground
+            .put_vectors(&access, request, &[dataset_record(key, [1.0, 2.0, 3.0], None)])
+            .await
+            .unwrap();
+    }
+    let before = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(foreground);
+    let authorizer = Arc::new(TestPublicationAdmission {
+        resource: resource.clone(),
+        pause_at: revoked_stage.unwrap_or(usize::MAX),
+        allowed: std::sync::atomic::AtomicBool::new(true),
+        candidates: tokio::sync::Mutex::new(Vec::new()),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let (adapter, access) = reopen_maintenance_adapter(&fixture).await;
+    let adapter = if revoked_stage.is_some() {
+        adapter.with_maintenance_publication_authorizer(authorizer.clone()).unwrap()
+    } else {
+        adapter
+    };
+    let control = maintenance_control();
+    let adapter = adapter.with_maintenance_control(control.clone()).unwrap();
+    let request = maintenance_request(&fixture, &access, &index, 93_003).await;
+    let first_candidate = adapter.maintenance_stage_candidate_key(&request).unwrap();
+    let base = adapter.maintenance_base(&access, &request).await.unwrap();
+    let options = super::dataset::compaction_options();
+    let plan = lance::dataset::optimize::plan_compaction(&base.dataset, &options)
+        .await
+        .unwrap();
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        results.push(task.execute(&base.dataset).await.unwrap());
+    }
+    let count = results.iter().map(|result| result.new_fragments.len() as u32).sum();
+    let handler = adapter.compaction_handler(
+        request,
+        CatalogCommitId::try_new(uuid::Uuid::from_u128(93_004).to_string()).unwrap(),
+        count,
+        control,
+    );
+    let mut working = adapter
+        .open_for_compaction(base.info().manifest_version, handler)
+        .await
+        .unwrap();
+    let mut commit = Box::pin(lance::dataset::optimize::commit_compaction(
+        &mut working,
+        results,
+        Arc::new(lance::dataset::index::DatasetIndexRemapperOptions::default()),
+        &options,
+    ));
+    if let Some(stage) = revoked_stage {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! { result = &mut commit => panic!("publication did not reach authorization: {result:?}"), _ = authorizer.entered.notified() => {} }
+        }).await.expect("publication admission barrier timed out");
+        let candidates = authorizer.candidates.lock().await;
+        assert_eq!(candidates.len(), stage);
+        let state = fixture.backend.state.lock().await;
+        let candidate = candidates.last().unwrap();
+        let stored = state
+            .objects
+            .get(&(resource.storage_bucket_id().into(), candidate.object_key().as_str().into()))
+            .expect("candidate exists before authorization recheck");
+        assert_eq!(CatalogContentSha256::digest(&stored.data), candidate.content_sha256());
+        assert_eq!(stored.body_revision, candidate.body_revision().map(|value| value.as_uuid()));
+        drop(state);
+        drop(candidates);
+        authorizer.allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        authorizer.release.notify_one();
+    }
+    let error = tokio::time::timeout(std::time::Duration::from_secs(30), commit)
+        .await
+        .expect("denied publication timed out")
+        .expect_err("maintenance publication must be denied");
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    let mut denied = false;
+    let mut missing_authorizer = false;
+    loop {
+        denied |= source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        missing_authorizer |= matches!(
+            source.downcast_ref::<LanceManifestError>(),
+            Some(LanceManifestError::ResourceMismatch {
+                reason: "maintenance publication requires current write authorization"
+            })
+        );
+        let Some(next) = source.source() else {
+            break;
+        };
+        source = next;
+    }
+    if revoked_stage.is_some() {
+        assert!(denied, "the original authorization error must remain in the source chain: {error:?}");
+    } else {
+        assert!(
+            missing_authorizer,
+            "the missing maintenance authorizer must reject publication: {error:?}"
+        );
+    }
+    let after = fixture
+        .store
+        .read_catalog_head(
+            access.bucket(),
+            &Namespace::parse("indexes").unwrap(),
+            &CatalogName::parse("service-index").unwrap(),
+        )
+        .await
+        .unwrap();
+    let candidates = authorizer.candidates.lock().await;
+    if revoked_stage == Some(2) {
+        assert_eq!(after.metadata(), &candidates[0], "only the authorized reservation may publish");
+        assert_eq!(after.expected_head().generation().get(), before.expected_head().generation().get() + 1);
+    } else {
+        assert_eq!(
+            after.expected_head(),
+            before.expected_head(),
+            "denied reservation must preserve the original head"
+        );
+    }
+    let state = fixture.backend.state.lock().await;
+    assert!(
+        state
+            .objects
+            .contains_key(&(resource.storage_bucket_id().into(), first_candidate.as_str().into()))
+    );
+    for candidate in candidates.iter() {
+        let stored = state
+            .objects
+            .get(&(resource.storage_bucket_id().into(), candidate.object_key().as_str().into()))
+            .expect("denied candidate remains recoverable");
+        assert_eq!(CatalogContentSha256::digest(&stored.data), candidate.content_sha256());
+    }
+}
+
+#[tokio::test]
+async fn maintenance_publication_rechecks_write_permission_after_candidate() {
+    maintenance_publication_admission_fixture(Some(1)).await;
+}
+
+#[tokio::test]
+async fn maintenance_compaction_rechecks_write_permission_before_rewrite() {
+    maintenance_publication_admission_fixture(Some(2)).await;
+}
+
+#[tokio::test]
+async fn maintenance_publication_requires_an_authorizer() {
+    maintenance_publication_admission_fixture(None).await;
+}
+
+#[tokio::test]
+async fn d02_engine_catch_up_returns_definite_conflict_for_the_original_computation_base() {
+    use super::dataset;
+    let fixture = catalog_fixture().await;
+    let access = managed_access();
+    let stale_request = fixture.request(701).await;
+    let stale_base = fixture
+        .adapter
+        .write_base(&access, &stale_request)
+        .await
+        .expect("open B's original base");
+    assert!(
+        stale_base
+            .get(&["same".into()], all_vector_fields())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let winner = fixture
+        .adapter
+        .put_vectors(&access, fixture.request(702).await, &[dataset_record("same", [1.0, 0.0, 0.0], None)])
+        .await
+        .expect("A publishes from the same absent-key base");
+    assert_eq!(winner.info().manifest_version, stale_base.info().manifest_version + 1);
+    let handler = Arc::new(fixture.adapter.handler(Some(stale_request)));
+    let batch = dataset::record_batch(&[dataset_record("same", [0.0, 1.0, 0.0], None)], &index_spec()).unwrap();
+    // Use the original engine with B's already opened base after A has committed.
+    let error = match dataset::put(stale_base.dataset.clone(), batch, handler).await {
+        Ok(_) => panic!("B published without recomputing the same-key merge"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, dataset::DatasetError::Engine(lance_core::Error::CommitConflict { .. })),
+        "expected the original typed conflict, received {error:?}"
+    );
+    assert!(error.is_definite_conflict());
+    let current = fixture.adapter.open_current(&access, &resource_identity()).await.unwrap();
+    assert_eq!(current.info().reference, winner.info().reference);
+    let rows = current.get(&["same".into()], all_vector_fields()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data, Some(vec![1.0, 0.0, 0.0]));
+}
+
+#[tokio::test]
+async fn d02_service_recomputes_same_absent_key_after_engine_catch_up() {
+    use crate::vector::{
+        protocol::{Request, dto},
+        service::VectorExecution,
+    };
+    use std::{sync::atomic::Ordering, time::Duration};
+    let fixture = catalog_fixture().await;
+    let creation = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&creation).await.expect("create the shared empty Dataset");
+    let namespace = crate::table_catalog::Namespace::parse("indexes").unwrap();
+    let (guard, entry) = fixture
+        .store
+        .begin_vector_operation(&creation.bucket, &namespace, &creation.name)
+        .await
+        .unwrap();
+    let initial = entry.head().expected_head();
+    drop(guard);
+    let put = |value: [f32; 3]| {
+        Request::PutVectors(dto::PutVectorsInput {
+            vector_bucket_name: Some("vectors".into()),
+            index_name: Some("service-index".into()),
+            index_arn: None,
+            vectors: vec![dto::PutInputVector {
+                key: "same".into(),
+                data: dto::VectorData { float32: value.into() },
+                metadata: None,
+            }],
+        })
+    };
+    let mut a = creation.clone();
+    a.request = put([1.0, 0.0, 0.0]);
+    let mut b = creation.clone();
+    b.request = put([0.0, 1.0, 0.0]);
+    b.managed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pause = fixture
+        .backend
+        .pause_next_read(
+            creation.bucket.storage_bucket_id().as_str(),
+            initial.metadata().expect("initial manifest").object_key().as_str(),
+        )
+        .await;
+    let mut delayed = Box::pin(service.execute(&b));
+    tokio::select! {
+        result = &mut delayed => panic!("B returned before its original manifest read: {:?}", result.err()),
+        entered = tokio::time::timeout(Duration::from_secs(10), pause.wait_started()) => {
+            entered.expect("B captures its original immutable manifest bytes");
+        }
+    }
+    service.execute(&a).await.expect("A publishes the initially absent key");
+    let (guard, winner) = fixture
+        .store
+        .begin_vector_operation(&creation.bucket, &namespace, &creation.name)
+        .await
+        .unwrap();
+    assert!(winner.head().expected_head().generation().get() > initial.generation().get());
+    drop(guard);
+    pause.release();
+    tokio::time::timeout(Duration::from_secs(30), &mut delayed)
+        .await
+        .expect("bounded B completion")
+        .expect("B rereads the head and repeats the key merge");
+    drop(delayed);
+    assert_eq!(b.managed_calls.load(Ordering::SeqCst), 2, "B must open a new bound Dataset attempt");
+    let (guard, completed) = fixture
+        .store
+        .begin_vector_operation(&creation.bucket, &namespace, &creation.name)
+        .await
+        .unwrap();
+    assert!(completed.head().expected_head().generation().get() > winner.head().expected_head().generation().get());
+    drop(guard);
+    let mut read = creation.clone();
+    read.request = Request::QueryVectors(dto::QueryVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        top_k: 10,
+        query_vector: dto::VectorData {
+            float32: vec![0.0, 1.0, 0.0],
+        },
+        filter: None,
+        query_mode: Some(dto::IndexMode::Enhanced),
+        return_metadata: Some(true),
+        return_distance: Some(true),
+        next_token: None,
+    });
+    let VectorExecution::QueryVectors(result) = service.execute(&read).await.unwrap() else {
+        panic!("expected actual QueryVectors result")
+    };
+    assert_eq!(result.candidates.len(), 1, "same-key merge must leave exactly one row");
+    assert_eq!(result.candidates[0].key, "same");
+    let rows = result.snapshot.get(&["same".into()], all_vector_fields()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data, Some(vec![0.0, 1.0, 0.0]));
+}
+
+#[tokio::test]
+async fn d02_unchanged_head_keeps_manifest_version_mismatch() {
+    use lance_table::io::commit::{CommitError, CommitHandler, ManifestNamingScheme};
+    let fixture = catalog_fixture().await;
+    let request = fixture.request(703).await;
+    let handler = fixture.adapter.handler(Some(request));
+    let mut manifest = empty_manifest(dimension(), 99, HashMap::new()).unwrap();
+    let base = Path::from(resource_identity().dataset_prefix().trim_end_matches('/'));
+    let error = handler
+        .commit(
+            &mut manifest,
+            None,
+            &base,
+            &ObjectStore::memory(),
+            write_manifest_file_to_path,
+            ManifestNamingScheme::V2,
+            None,
+        )
+        .await
+        .expect_err("invalid engine version must remain an error");
+    let CommitError::OtherError(error) = error else {
+        panic!("unchanged head was classified as a conflict")
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut original = false;
+    while let Some(error) = source {
+        if matches!(
+            error.downcast_ref::<LanceManifestError>(),
+            Some(LanceManifestError::VersionMismatch { expected: 2, actual: 99 })
+        ) {
+            original = true;
+        }
+        source = error.source();
+    }
+    assert!(original, "original manifest version error was not retained: {error:?}");
+}
+
+#[tokio::test]
+async fn d02_delete_rejects_changed_computation_base_before_publication() {
+    let fixture = catalog_fixture().await;
+    let access = managed_access();
+    fixture
+        .adapter
+        .put_vectors(&access, fixture.request(711).await, &[dataset_record("same", [1.0, 0.0, 0.0], None)])
+        .await
+        .expect("seed the key in the original delete base");
+    let request = fixture.request(712).await;
+    let stale = fixture
+        .adapter
+        .write_base(&access, &request)
+        .await
+        .expect("open the original delete base");
+    let winner = fixture
+        .adapter
+        .put_vectors(&access, fixture.request(713).await, &[dataset_record("same", [0.0, 1.0, 0.0], None)])
+        .await
+        .expect("publish the competing key update");
+    let handler = Arc::new(fixture.adapter.handler(Some(request)));
+    let error = super::dataset::delete(stale.dataset.clone(), &["same".into()], handler)
+        .await
+        .expect_err("the original delete must be recomputed from the changed base");
+    assert!(
+        matches!(error, super::DatasetError::Engine(lance_core::Error::CommitConflict { .. })),
+        "the history reader must return the original typed conflict: {error:?}"
+    );
+    assert!(error.is_definite_conflict());
+    let current = fixture
+        .adapter
+        .open_current(&access, &resource_identity())
+        .await
+        .expect("read the winning head");
+    assert_eq!(current.info().reference, winner.info().reference);
+    let rows = current
+        .get(&["same".into()], all_vector_fields())
+        .await
+        .expect("read the retained winning row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data, Some(vec![0.0, 1.0, 0.0]));
+}
+
+#[tokio::test]
+async fn d02_unknown_publication_retains_written_head_and_candidates() {
+    use lance_table::io::commit::CommitHandler;
+    use std::time::Duration;
+
+    let fixture = catalog_fixture().await;
+    let access = managed_access();
+    let request = fixture.request(721).await;
+    let original = fixture
+        .adapter
+        .open_current(&access, &resource_identity())
+        .await
+        .expect("read the original head");
+    assert!(
+        !fixture.adapter.handler(None).is_version_not_found_definitive(),
+        "unknown publication must retain the original handler's conservative default"
+    );
+    let (catalog_key, original_entry) = {
+        let state = fixture.backend.state.lock().await;
+        let entries = state
+            .objects
+            .iter()
+            .filter_map(|(key, record)| {
+                let entry = serde_json::from_slice::<crate::table_catalog::TableEntry>(&record.data).ok()?;
+                (entry.table_id == resource_identity().table_id().as_str() && entry.table == "index.v1")
+                    .then(|| (key.clone(), entry))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "identify the original authoritative Catalog entry");
+        entries.into_iter().next().expect("the exact Catalog entry exists")
+    };
+    fixture.backend.fail_after_next_put(&catalog_key.0, &catalog_key.1).await;
+    let pause = fixture.backend.pause_next_put(&catalog_key.0, &catalog_key.1).await;
+    let records = [dataset_record("same", [0.0, 1.0, 0.0], None)];
+    let mut operation = Box::pin(fixture.adapter.put_vectors(&access, request, &records));
+    tokio::select! {
+        result = &mut operation => panic!("publication returned before the original head write: {:?}", result.err()),
+        entered = tokio::time::timeout(Duration::from_secs(10), pause.wait_started()) => {
+            entered.expect("the original Catalog head write was invoked");
+        }
+    }
+    let (head_attempt, candidates) = {
+        let mut state = fixture.backend.state.lock().await;
+        let next_read = state.read_attempts.get(&catalog_key).copied().unwrap_or_default() + 1;
+        state
+            .fail_read_attempts
+            .entry(catalog_key.clone())
+            .or_default()
+            .extend(next_read..next_read + 32);
+        let head_attempt = *state
+            .put_attempts
+            .get(&catalog_key)
+            .expect("the actual head write attempt is retained");
+        let candidates = state
+            .objects
+            .iter()
+            .filter(|((bucket, key), _)| {
+                bucket == access.bucket().storage_bucket_id().as_str() && key.starts_with(&resource_identity().dataset_prefix())
+            })
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect::<Vec<_>>();
+        assert!(!candidates.is_empty(), "the original engine created physical candidates");
+        (head_attempt, candidates)
+    };
+    pause.release();
+    let error = match tokio::time::timeout(Duration::from_secs(30), &mut operation)
+        .await
+        .expect("bounded completion of the original uncertain publication")
+    {
+        Ok(_) => panic!("a written head with failed verification must remain unknown"),
+        Err(error) => error,
+    };
+    drop(operation);
+    assert!(
+        matches!(&error, super::DatasetError::Engine(source) if source.is_commit_status_unknown()),
+        "the original engine must preserve unknown publication: {error:?}"
+    );
+    assert!(
+        !error.is_definite_conflict(),
+        "a possible publication must not request a new Service attempt"
+    );
+    {
+        let mut state = fixture.backend.state.lock().await;
+        assert_eq!(
+            state.put_attempts.get(&catalog_key),
+            Some(&head_attempt),
+            "the original write was not retried"
+        );
+        assert!(state.fail_after_put_attempts[&catalog_key].contains(&head_attempt));
+        let written: crate::table_catalog::TableEntry =
+            serde_json::from_slice(&state.objects[&catalog_key].data).expect("decode the physically written original head");
+        assert!(written.generation > original_entry.generation);
+        assert_ne!(written.metadata_location, original_entry.metadata_location);
+        for (key, record) in candidates {
+            assert_eq!(
+                state.objects.get(&key),
+                Some(&record),
+                "unknown publication must retain candidate {key:?}"
+            );
+        }
+        state.fail_read_attempts.remove(&catalog_key);
+    }
+    let committed = fixture
+        .adapter
+        .open_current(&access, &resource_identity())
+        .await
+        .expect("read the actual published head");
+    assert_eq!(committed.info().manifest_version, original.info().manifest_version + 1);
+    let rows = committed
+        .get(&["same".into()], all_vector_fields())
+        .await
+        .expect("read the actual published vector");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data, Some(vec![0.0, 1.0, 0.0]));
 }

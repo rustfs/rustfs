@@ -23,7 +23,10 @@ mod schema;
 
 #[cfg(test)]
 pub(crate) use commit::CommittedManifestInfo;
-pub(crate) use commit::{DatasetSnapshot, LanceManifestAdapter, LanceOperationContext, ManifestPrepareRequest};
+pub(crate) use commit::{
+    DatasetSnapshot, LanceManifestAdapter, LanceNumericProofCache, LanceOperationContext, MaintenancePublicationAuthorizer,
+    ManifestPrepareRequest,
+};
 pub(crate) use dataset::{DatasetError, ProjectedVector, QueryMatch, VectorProjection, VectorRecord, validate_record_keys};
 pub(crate) use initial::{decode_initialization_payload, encode_initialization_payload, plan_initial_manifest};
 #[cfg(test)]
@@ -50,6 +53,11 @@ pub(crate) struct ManifestIoLimits {
 
 #[async_trait::async_trait]
 pub(crate) trait ManagedManifestObjects: Send + Sync {
+    #[cfg(test)]
+    fn fault_instance_id(&self) -> Option<Uuid> {
+        None
+    }
+
     async fn create_only(
         &self,
         access: &ManagedObjectAccess,
@@ -131,6 +139,8 @@ pub(crate) enum LanceManifestError {
     VersionNotCommitted { version: u64 },
     #[error("the expected Catalog head changed before Lance publication")]
     ExpectedHeadConflict,
+    #[error(transparent)]
+    Budget(#[from] crate::table_catalog::VectorMaintenanceBudgetError),
     #[error("Lance catalog operation failed")]
     Catalog(#[from] crate::table_catalog::TableCatalogStoreError),
     #[error("managed Lance object access was denied")]

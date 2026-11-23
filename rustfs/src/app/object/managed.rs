@@ -24,9 +24,19 @@ pub(crate) enum ManagedEncryption {
 #[derive(Clone)]
 pub(crate) struct ManagedObjectContext {
     pub(super) access: ManagedObjectAccess,
-    pub(super) principal: SseKmsPrincipal,
-    pub(super) request: Arc<RequestEnvelope>,
+    pub(super) identity: ManagedObjectIdentity,
     encryption: ManagedEncryption,
+}
+
+#[derive(Clone)]
+pub(super) enum ManagedObjectIdentity {
+    Request {
+        request: Arc<RequestEnvelope>,
+        principal: Box<SseKmsPrincipal>,
+    },
+    Maintenance {
+        context: Arc<super::managed_maintenance::ManagedMaintenanceContext>,
+    },
 }
 
 pub(crate) struct ManagedMultipartUpload {
@@ -68,16 +78,6 @@ impl From<rustfs_s3_types::S3Error> for ManagedObjectError {
     }
 }
 
-impl From<S3Error> for ManagedObjectError {
-    fn from(error: S3Error) -> Self {
-        Self::Api(ApiError {
-            code: error.code().clone().into(),
-            message: error.message().unwrap_or_default().to_owned(),
-            source: Some(Box::new(error)),
-        })
-    }
-}
-
 impl ManagedObjectContext {
     /// Called only after the resource service authorizes its operation and resolves the current bucket.
     pub(crate) fn from_authorized_request(
@@ -89,6 +89,24 @@ impl ManagedObjectContext {
         if request.request_context().is_none() || request.req_info().and_then(|info| info.cred.as_ref()).is_none() {
             return Err(ManagedObjectError::MissingPrincipal);
         }
+        Self::validate_scope(&access, &encryption)?;
+        if access
+            .check(&format!("{}scope-check", access.allowed_prefix()), ManagedObjectOperation::Delete)
+            .is_ok()
+        {
+            return Err(BucketIdentityError::OperationNotAllowed.into());
+        }
+        Ok(Self {
+            access,
+            identity: ManagedObjectIdentity::Request {
+                request,
+                principal: Box::new(principal),
+            },
+            encryption,
+        })
+    }
+
+    fn validate_scope(access: &ManagedObjectAccess, encryption: &ManagedEncryption) -> Result<(), ManagedObjectError> {
         let table_id = Uuid::parse_str(access.table_id().as_str()).map_err(|_| BucketIdentityError::InvalidTableId)?;
         let dataset_prefix = format!(".rustfs-table/{table_id}/dataset/");
         let result_prefix = format!(".rustfs-table/{table_id}/query-results/");
@@ -114,12 +132,28 @@ impl ManagedObjectContext {
         if matches!(&encryption, ManagedEncryption::AwsKms { key_id } if key_id.is_empty()) {
             return Err(ManagedObjectError::EncryptionMismatch);
         }
+        Ok(())
+    }
+
+    pub(crate) fn from_maintenance(
+        access: ManagedObjectAccess,
+        encryption: ManagedEncryption,
+        context: Arc<super::managed_maintenance::ManagedMaintenanceContext>,
+    ) -> Result<Self, ManagedObjectError> {
+        Self::validate_scope(&access, &encryption)?;
         Ok(Self {
             access,
-            principal,
-            request,
             encryption,
+            identity: ManagedObjectIdentity::Maintenance { context },
         })
+    }
+
+    #[cfg(test)]
+    fn request_for_test(&self) -> &Arc<RequestEnvelope> {
+        match &self.identity {
+            ManagedObjectIdentity::Request { request, .. } => request,
+            ManagedObjectIdentity::Maintenance { .. } => panic!("foreground fixture required"),
+        }
     }
 
     pub(crate) fn access(&self) -> &ManagedObjectAccess {
@@ -128,12 +162,6 @@ impl ManagedObjectContext {
 
     pub(in crate::app) fn encryption(&self) -> &ManagedEncryption {
         &self.encryption
-    }
-
-    fn operation_principal(&self) -> SseKmsPrincipal {
-        // Capture the audit slot synchronously after this operation registers it.
-        // The immutable request carries the same already-validated principal.
-        SseKmsPrincipal::from_request(self.request.as_ref()).unwrap_or_else(|| self.principal.clone())
     }
 
     pub(super) async fn validate_object(
@@ -201,9 +229,15 @@ impl ManagedObjectContext {
 }
 
 impl ManagedMultipartUpload {
-    fn origin(&self) -> crate::app::multipart_usecase::MultipartOrigin {
+    fn origin(
+        &self,
+        principal: SseKmsPrincipal,
+        completion: Option<OperationHelper>,
+    ) -> crate::app::multipart_usecase::MultipartOrigin {
         crate::app::multipart_usecase::MultipartOrigin::Managed {
             context: Box::new(self.context.clone()),
+            principal: Box::new(principal),
+            completion,
             lifecycle_guard: self.lifecycle_guard.clone(),
         }
     }
@@ -224,6 +258,7 @@ struct ManagedGetInput<'a> {
     range: Option<Range<u64>>,
     max_bytes: usize,
     principal: &'a SseKmsPrincipal,
+    request_id: &'a str,
 }
 
 impl DefaultObjectUsecase {
@@ -248,10 +283,9 @@ impl DefaultObjectUsecase {
         expected_body_revision: Option<Uuid>,
         guard: &BucketIncarnationFenceGuard,
     ) -> Result<ObjectInfo, ManagedObjectError> {
-        let helper =
-            OperationHelper::from_view(&context.request.audit_view(), EventName::ObjectAccessedHead, S3Operation::HeadObject)
-                .suppress_event();
-        let principal = context.operation_principal();
+        let super::managed_maintenance::ManagedOperation { principal, helper, .. } = context
+            .admit(key, ManagedObjectOperation::Head, S3Operation::HeadObject)
+            .await?;
         let result = self
             .managed_head_object_under_guard(context, key, expected_body_revision, &principal, guard)
             .await;
@@ -306,7 +340,14 @@ impl DefaultObjectUsecase {
             object_lock_mode: None,
             object_lock_retain_until_date: None,
         };
-        let request = context.request.fork_for_authorization();
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper,
+        } = context
+            .admit(key, ManagedObjectOperation::CreateMultipart, S3Operation::CreateMultipartUpload)
+            .await?;
+        let request = request.fork_for_authorization();
         let upload = Arc::new(ManagedMultipartUpload {
             context: context.clone(),
             key: key.to_owned(),
@@ -314,9 +355,9 @@ impl DefaultObjectUsecase {
             lifecycle_guard: guard,
         });
         let owner = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.context.clone());
-        let session = run_owned_mutation(async move {
+        run_owned_mutation(async move {
             let response = owner
-                .create_multipart_with_origin(request, input, None, upload.origin())
+                .create_multipart_with_origin(request, input, None, upload.origin(principal, Some(helper)))
                 .await?;
             let upload_id = response.upload_id;
             Ok::<_, rustfs_s3_types::S3Error>(Arc::new(ManagedMultipartUpload {
@@ -326,8 +367,8 @@ impl DefaultObjectUsecase {
                 lifecycle_guard: upload.lifecycle_guard.clone(),
             }))
         })
-        .await?;
-        Ok(session)
+        .await
+        .map_err(ManagedObjectError::from)
     }
 
     pub(crate) async fn managed_upload_part<B>(
@@ -340,8 +381,15 @@ impl DefaultObjectUsecase {
     where
         B: Stream<Item = io::Result<Bytes>> + Send + Sync + Unpin + 'static,
     {
-        let helper = OperationHelper::audit_only_from_view(&upload.context.request.audit_view(), S3Operation::UploadPart);
-        let result = async {
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper,
+        } = upload
+            .context
+            .admit(&upload.key, ManagedObjectOperation::UploadPart, S3Operation::UploadPart)
+            .await?;
+        async {
             self.managed_validate_upload(upload, ManagedObjectOperation::UploadPart)
                 .await?;
             let input = crate::app::multipart_usecase::UploadPartWriteInput {
@@ -368,13 +416,11 @@ impl DefaultObjectUsecase {
             };
             let owner = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.context.clone());
             let (_, part) = owner
-                .execute_upload_part_with_origin(upload.context.request.fork_for_authorization(), input, upload.origin())
+                .execute_upload_part_with_origin(request.fork_for_authorization(), input, upload.origin(principal, Some(helper)))
                 .await?;
             Ok(part)
         }
-        .await;
-        finish_managed_read(helper, &result);
-        result
+        .await
     }
 
     pub(crate) async fn managed_complete_multipart_upload(
@@ -382,6 +428,18 @@ impl DefaultObjectUsecase {
         upload: &Arc<ManagedMultipartUpload>,
         parts: Vec<CompletePart>,
     ) -> Result<ObjectInfo, ManagedObjectError> {
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper,
+        } = upload
+            .context
+            .admit(
+                &upload.key,
+                ManagedObjectOperation::CompleteMultipart,
+                S3Operation::CompleteMultipartUpload,
+            )
+            .await?;
         self.managed_validate_upload(upload, ManagedObjectOperation::CompleteMultipart)
             .await?;
         upload.context.access.check(&upload.key, ManagedObjectOperation::CreateOnly)?;
@@ -409,10 +467,10 @@ impl DefaultObjectUsecase {
         let owner = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.context.clone());
         let (_, info) = owner
             .complete_multipart_with_origin(
-                upload.context.request.fork_for_authorization(),
+                request.fork_for_authorization(),
                 input,
                 Some(rustfs_gateway_types::dto::CompletedMultipartUpload { parts }),
-                upload.origin(),
+                upload.origin(principal, Some(helper)),
             )
             .await?;
         info.data_dir
@@ -428,9 +486,14 @@ impl DefaultObjectUsecase {
         upload: &Arc<ManagedMultipartUpload>,
         expected_body_revision: Uuid,
     ) -> Result<ObjectInfo, ManagedObjectError> {
-        let helper =
-            OperationHelper::audit_only_from_view(&upload.context.request.audit_view(), S3Operation::CompleteMultipartUpload);
-        let principal = upload.context.operation_principal();
+        let super::managed_maintenance::ManagedOperation { principal, helper, .. } = upload
+            .context
+            .admit(
+                &upload.key,
+                ManagedObjectOperation::CompleteMultipart,
+                S3Operation::CompleteMultipartUpload,
+            )
+            .await?;
         let result = async {
             if expected_body_revision.is_nil() {
                 return Err(ManagedObjectError::MissingBodyRevision);
@@ -467,8 +530,14 @@ impl DefaultObjectUsecase {
         &self,
         upload: &Arc<ManagedMultipartUpload>,
     ) -> Result<(), ManagedObjectError> {
-        let helper =
-            OperationHelper::audit_only_from_view(&upload.context.request.audit_view(), S3Operation::AbortMultipartUpload);
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper,
+        } = upload
+            .context
+            .admit(&upload.key, ManagedObjectOperation::AbortMultipart, S3Operation::AbortMultipartUpload)
+            .await?;
         let result = async {
             self.managed_validate_upload(upload, ManagedObjectOperation::AbortMultipart)
                 .await?;
@@ -479,8 +548,8 @@ impl DefaultObjectUsecase {
                 upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(upload.upload_id.clone()),
             };
             let owner = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.context.clone());
-            let request = upload.context.request.fork_for_authorization();
-            let origin = upload.origin();
+            let request = request.fork_for_authorization();
+            let origin = upload.origin(principal, None);
             run_owned_mutation(async move {
                 owner.abort_multipart_with_origin(request, target, origin).await?;
                 Ok::<_, rustfs_s3_types::S3Error>(())
@@ -519,7 +588,7 @@ impl DefaultObjectUsecase {
         Ok((store, guard))
     }
 
-    async fn managed_store_under_guard(
+    pub(super) async fn managed_store_under_guard(
         &self,
         context: &ManagedObjectContext,
         guard: &BucketIncarnationFenceGuard,
@@ -542,6 +611,9 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
         metadata.validate_bucket_handle(identity).map_err(ApiError::from)?;
+        if metadata.versioning() || !metadata.versioning_config_xml.is_empty() {
+            return Err(ApiError::invalid_request("managed object storage requires an unversioned bucket").into());
+        }
         // The authorized context carries the effective Index configuration, including explicit overrides.
         if context.encryption == ManagedEncryption::Unencrypted && !metadata.encryption_config_xml.is_empty() {
             return Err(ManagedObjectError::EncryptionMismatch);
@@ -576,9 +648,13 @@ impl DefaultObjectUsecase {
     where
         B: Stream<Item = io::Result<Bytes>> + Send + Sync + 'static,
     {
-        let completion =
-            OperationHelper::from_view(&context.request.audit_view(), EventName::ObjectCreatedPut, S3Operation::PutObject);
-        let principal = context.operation_principal();
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper: completion,
+        } = context
+            .admit(key, ManagedObjectOperation::CreateOnly, S3Operation::PutObject)
+            .await?;
         let guard = match guard {
             Some(guard) => {
                 context.access.check(key, ManagedObjectOperation::CreateOnly)?;
@@ -640,7 +716,8 @@ impl DefaultObjectUsecase {
             preserve_etag: None,
             origin: PutObjectOrigin::Managed {
                 context,
-                principal,
+                principal: Box::new(principal),
+                request_context: request.request_context().cloned(),
                 lifecycle_guard: Some(guard),
                 completion: Some(completion),
             },
@@ -662,10 +739,9 @@ impl DefaultObjectUsecase {
         key: &str,
         expected_body_revision: Option<Uuid>,
     ) -> Result<ObjectInfo, ManagedObjectError> {
-        let helper =
-            OperationHelper::from_view(&context.request.audit_view(), EventName::ObjectAccessedHead, S3Operation::HeadObject)
-                .suppress_event();
-        let principal = context.operation_principal();
+        let super::managed_maintenance::ManagedOperation { principal, helper, .. } = context
+            .admit(key, ManagedObjectOperation::Head, S3Operation::HeadObject)
+            .await?;
         let result = self
             .managed_head_object_inner(context, key, expected_body_revision, &principal)
             .await;
@@ -718,10 +794,26 @@ impl DefaultObjectUsecase {
         range: Option<Range<u64>>,
         max_bytes: usize,
     ) -> Result<(ObjectInfo, Bytes), ManagedObjectError> {
-        let helper =
-            OperationHelper::from_view(&context.request.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
-                .suppress_event();
-        let principal = context.operation_principal();
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper,
+        } = context
+            .admit(
+                key,
+                if range.is_some() {
+                    ManagedObjectOperation::Range
+                } else {
+                    ManagedObjectOperation::Get
+                },
+                S3Operation::GetObject,
+            )
+            .await?;
+        let request_id = request
+            .request_context()
+            .ok_or(ManagedObjectError::MissingPrincipal)?
+            .request_id
+            .as_str();
         let result = async {
             context.access.check(
                 key,
@@ -742,6 +834,7 @@ impl DefaultObjectUsecase {
                     range,
                     max_bytes,
                     principal: &principal,
+                    request_id,
                 },
                 &guard,
             )
@@ -761,10 +854,26 @@ impl DefaultObjectUsecase {
         max_bytes: usize,
         guard: &BucketIncarnationFenceGuard,
     ) -> Result<(ObjectInfo, Bytes), ManagedObjectError> {
-        let helper =
-            OperationHelper::from_view(&context.request.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
-                .suppress_event();
-        let principal = context.operation_principal();
+        let super::managed_maintenance::ManagedOperation {
+            request,
+            principal,
+            helper,
+        } = context
+            .admit(
+                key,
+                if range.is_some() {
+                    ManagedObjectOperation::Range
+                } else {
+                    ManagedObjectOperation::Get
+                },
+                S3Operation::GetObject,
+            )
+            .await?;
+        let request_id = request
+            .request_context()
+            .ok_or(ManagedObjectError::MissingPrincipal)?
+            .request_id
+            .as_str();
         let result = self
             .managed_get_object_inner(
                 ManagedGetInput {
@@ -774,6 +883,7 @@ impl DefaultObjectUsecase {
                     range,
                     max_bytes,
                     principal: &principal,
+                    request_id,
                 },
                 guard,
             )
@@ -794,6 +904,7 @@ impl DefaultObjectUsecase {
             range,
             max_bytes,
             principal,
+            request_id,
         } = input;
         let operation = if range.is_some() {
             ManagedObjectOperation::Range
@@ -827,6 +938,7 @@ impl DefaultObjectUsecase {
                 expected: &info,
                 max_bytes,
                 principal,
+                request_id,
             })
             .await?;
         context.validate_object(&result.0, key, info.data_dir, principal).await?;
@@ -856,7 +968,7 @@ fn managed_range(range: Option<Range<u64>>, size: u64) -> Result<(Option<HTTPRan
     ))
 }
 
-fn finish_managed_read<T>(helper: OperationHelper, result: &Result<T, ManagedObjectError>) {
+pub(super) fn finish_managed_read<T>(helper: OperationHelper, result: &Result<T, ManagedObjectError>) {
     let outcome: rustfs_s3_types::S3Result<()> = match result {
         Ok(_) => Ok(()),
         Err(error) => {
@@ -1124,7 +1236,7 @@ pub(super) mod tests {
         encryption: ManagedEncryption,
     ) -> (Arc<RequestEnvelope>, ManagedObjectAccess, Arc<ECStore>, SseProviderReset) {
         let (_, context, store, reset) = managed_fixture_with_encryption(encryption).await;
-        (context.request, context.access, store, reset)
+        (context.request_for_test().clone(), context.access, store, reset)
     }
 
     fn multipart_context(context: &ManagedObjectContext) -> ManagedObjectContext {
@@ -1146,7 +1258,7 @@ pub(super) mod tests {
             .collect(),
         )
         .expect("complete multipart scope");
-        ManagedObjectContext::from_authorized_request(access, context.request.clone(), context.encryption.clone())
+        ManagedObjectContext::from_authorized_request(access, context.request_for_test().clone(), context.encryption.clone())
             .expect("authorized multipart context")
     }
 
@@ -1423,9 +1535,12 @@ pub(super) mod tests {
             .collect(),
         )
         .expect("query result scope shape");
-        let results =
-            ManagedObjectContext::from_authorized_request(access, dataset.request.clone(), ManagedEncryption::Unencrypted)
-                .expect("independent query result context");
+        let results = ManagedObjectContext::from_authorized_request(
+            access,
+            dataset.request_for_test().clone(),
+            ManagedEncryption::Unencrypted,
+        )
+        .expect("independent query result context");
         let key = format!("{prefix}result.json");
         let created = usecase
             .managed_create_object(&results, &key, 2, futures::stream::iter([Ok(Bytes::from_static(b"[]"))]))
@@ -1470,7 +1585,11 @@ pub(super) mod tests {
             )
             .expect("well-formed but non-Dataset scope");
             assert!(matches!(
-                ManagedObjectContext::from_authorized_request(access, context.request.clone(), ManagedEncryption::Unencrypted),
+                ManagedObjectContext::from_authorized_request(
+                    access,
+                    context.request_for_test().clone(),
+                    ManagedEncryption::Unencrypted
+                ),
                 Err(ManagedObjectError::Scope(BucketIdentityError::InvalidPrefix))
             ));
         }
@@ -1520,7 +1639,7 @@ pub(super) mod tests {
         request.extensions.insert(request_context.clone());
         request
             .extensions
-            .insert(original.request.server_context().expect("server context").clone());
+            .insert(original.request_for_test().server_context().expect("server context").clone());
         request.extensions.insert(crate::app::storage_api::test::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: "unencrypted-user".into(),
@@ -1590,9 +1709,12 @@ pub(super) mod tests {
             .managed_create_object(&plain, &plaintext_key, 5, futures::stream::iter([Ok(Bytes::from_static(b"plain"))]))
             .await
             .expect("plain candidate");
-        let encrypted =
-            ManagedObjectContext::from_authorized_request(plain.access.clone(), plain.request.clone(), ManagedEncryption::Aes256)
-                .expect("explicit Index AES256 override");
+        let encrypted = ManagedObjectContext::from_authorized_request(
+            plain.access.clone(),
+            plain.request_for_test().clone(),
+            ManagedEncryption::Aes256,
+        )
+        .expect("explicit Index AES256 override");
         assert!(matches!(
             usecase
                 .managed_head_object(&encrypted, &plaintext_key, plaintext.data_dir)
@@ -1622,7 +1744,7 @@ pub(super) mod tests {
         let (encrypted_usecase, encrypted_bucket, _, _encrypted_reset) = managed_fixture().await;
         let invalid = ManagedObjectContext::from_authorized_request(
             encrypted_bucket.access.clone(),
-            encrypted_bucket.request.clone(),
+            encrypted_bucket.request_for_test().clone(),
             ManagedEncryption::Unencrypted,
         )
         .expect("context syntax remains separate from persisted defaults");
@@ -1751,8 +1873,9 @@ pub(super) mod tests {
             [ManagedObjectOperation::CreateOnly].into_iter().collect(),
         )
         .expect("current scope");
-        let current = ManagedObjectContext::from_authorized_request(access, context.request.clone(), ManagedEncryption::Aes256)
-            .expect("current context");
+        let current =
+            ManagedObjectContext::from_authorized_request(access, context.request_for_test().clone(), ManagedEncryption::Aes256)
+                .expect("current context");
         usecase
             .managed_create_object(&current, &key, 7, futures::stream::iter([Ok(Bytes::from_static(b"current"))]))
             .await
@@ -1797,7 +1920,10 @@ pub(super) mod tests {
             let audits = probe.audits.lock().expect("audit entries");
             assert_eq!(
                 audits[0].request_id.as_deref(),
-                context.request.request_context().map(|value| value.request_id.as_str())
+                context
+                    .request_for_test()
+                    .request_context()
+                    .map(|value| value.request_id.as_str())
             );
             assert_eq!(audits[0].access_key.as_deref(), Some("managed-test-user"));
             assert_eq!(audits[0].api.status.as_deref(), Some("success"));
@@ -1990,7 +2116,7 @@ pub(super) mod tests {
         assert_eq!(multipart_bytes, Bytes::from_static(b"msdat"));
         let unavailable = ManagedObjectContext::from_authorized_request(
             context.access.clone(),
-            context.request.clone(),
+            context.request_for_test().clone(),
             ManagedEncryption::AwsKms {
                 key_id: "missing-managed-key".into(),
             },
@@ -2228,9 +2354,12 @@ pub(super) mod tests {
             release_rx.await.map_err(io::Error::other)?;
             Ok(Bytes::from_static(b"staged"))
         });
-        let write_context =
-            ManagedObjectContext::from_authorized_request(encrypted_access, context.request.clone(), ManagedEncryption::Aes256)
-                .expect("fixed AES256 configuration for the streaming Index");
+        let write_context = ManagedObjectContext::from_authorized_request(
+            encrypted_access,
+            context.request_for_test().clone(),
+            ManagedEncryption::Aes256,
+        )
+        .expect("fixed AES256 configuration for the streaming Index");
         let write_usecase = DefaultObjectUsecase::with_context(usecase.context.clone());
         let write_key = key.clone();
         let write = tokio::spawn(async move { write_usecase.managed_create_object(&write_context, &write_key, 6, body).await });
@@ -2296,6 +2425,709 @@ pub(super) mod tests {
             .expect_err("over-quota object must remain absent");
         assert_eq!(ApiError::from(missing).code, S3ErrorCode::NoSuchKey);
         wait_for_managed_lock_counts(locks_before).await;
+    }
+
+    struct MaintenanceTestAuthorizer {
+        runtime: Arc<crate::app::storage_api::object_usecase::sse::ManagedSseRuntime>,
+        enabled: std::sync::atomic::AtomicBool,
+        generation: std::sync::Mutex<[u8; 16]>,
+        operations: std::sync::Mutex<Vec<ManagedObjectOperation>>,
+    }
+
+    struct MaintenanceTestKeyAuthorizer;
+    #[async_trait::async_trait]
+    impl crate::app::storage_api::object_usecase::sse::KmsKeyAuthorizer for MaintenanceTestKeyAuthorizer {
+        async fn is_allowed(
+            &self,
+            _: &SseKmsPrincipal,
+            _: rustfs_policy::policy::action::KmsAction,
+            _: &str,
+        ) -> Result<bool, rustfs_sse::SseError> {
+            Ok(true)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::managed_maintenance::ManagedMaintenanceAuthorizer for MaintenanceTestAuthorizer {
+        async fn authorize(
+            &self,
+            _: &ManagedObjectAccess,
+            operation: ManagedObjectOperation,
+            _: &str,
+            _: &ManagedEncryption,
+            audit: &super::super::managed_maintenance::ManagedMaintenanceAuditContext,
+        ) -> Result<super::super::managed_maintenance::ManagedMaintenanceAdmission, ManagedObjectError> {
+            if !self.enabled.load(std::sync::atomic::Ordering::Acquire)
+                || self.generation.lock().expect("generation").as_slice() != audit.execution_identity().user_generation()
+            {
+                return Err(ApiError::access_denied().into());
+            }
+            self.operations.lock().expect("operations").push(operation);
+            let mut context = rustfs_kms::types::OperationContext::new(audit.execution_identity().account().to_owned());
+            context.operation_id = audit.operation_id();
+            let principal = SseKmsPrincipal::for_managed_maintenance(
+                &rustfs_credentials::Credentials {
+                    access_key: audit.execution_identity().account().to_owned(),
+                    ..Default::default()
+                },
+                HashMap::new(),
+                &audit.operation_id().to_string(),
+                Arc::new(MaintenanceTestKeyAuthorizer),
+                Arc::new(self.runtime.begin_operation(context).await),
+            );
+            super::super::managed_maintenance::ManagedMaintenanceAdmission::new(principal, audit.clone())
+        }
+    }
+
+    fn maintenance_context(
+        foreground: &ManagedObjectContext,
+        runtime: Arc<crate::app::storage_api::object_usecase::sse::ManagedSseRuntime>,
+    ) -> (ManagedObjectContext, Arc<MaintenanceTestAuthorizer>) {
+        use super::super::managed_maintenance::*;
+        let authorizer = Arc::new(MaintenanceTestAuthorizer {
+            runtime,
+            enabled: std::sync::atomic::AtomicBool::new(true),
+            generation: std::sync::Mutex::new([3; 16]),
+            operations: std::sync::Mutex::new(Vec::new()),
+        });
+        let audit = ManagedMaintenanceAuditContext::new(
+            ManagedMaintenanceIdentityRef::new("maintenance-account".to_owned(), [3; 16]),
+            Uuid::new_v4(),
+            1,
+            "worker".to_owned(),
+            Uuid::new_v4(),
+            None,
+        );
+        let context = ManagedObjectContext::from_maintenance(
+            foreground.access.clone(),
+            foreground.encryption.clone(),
+            Arc::new(ManagedMaintenanceContext::new(audit, authorizer.clone())),
+        )
+        .expect("maintenance context");
+        (context, authorizer)
+    }
+
+    async fn maintenance_kms_runtime() -> (
+        tempfile::TempDir,
+        Arc<rustfs_kms::KmsServiceManager>,
+        Arc<crate::app::storage_api::object_usecase::sse::ManagedSseRuntime>,
+    ) {
+        let directory = tempfile::tempdir().expect("instance key directory");
+        let manager = Arc::new(rustfs_kms::KmsServiceManager::new());
+        manager
+            .reconfigure(rustfs_kms::KmsConfig::local(directory.path().to_path_buf()).with_insecure_development_defaults())
+            .await
+            .expect("configure instance KMS");
+        manager
+            .get_encryption_service()
+            .await
+            .expect("instance encryption service")
+            .create_key(rustfs_kms::types::CreateKeyRequest {
+                key_name: Some("maintenance-key".to_owned()),
+                key_usage: rustfs_kms::types::KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("create instance encryption key");
+        let runtime = Arc::new(crate::app::storage_api::object_usecase::sse::ManagedSseRuntime::new(Some(
+            manager.clone(),
+        )));
+        (directory, manager, runtime)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maintenance_revocation_and_generation_change_stop_the_next_real_io() {
+        let (usecase, foreground, store, _reset) = managed_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let (context, authorizer) = maintenance_context(
+            &foreground,
+            Arc::new(crate::app::storage_api::object_usecase::sse::ManagedSseRuntime::new(None)),
+        );
+        let key = format!("{}maintenance.bin", context.access.allowed_prefix());
+        let info = usecase
+            .managed_create_object(&context, &key, 4, futures::stream::iter([Ok(Bytes::from_static(b"data"))]))
+            .await
+            .expect("unencrypted operation needs no KMS");
+        let (_, data) = usecase
+            .managed_get_object(&context, &key, info.data_dir, None, 4)
+            .await
+            .expect("current read admission");
+        assert_eq!(data, Bytes::from_static(b"data"));
+        authorizer.enabled.store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            usecase
+                .managed_get_object(&context, &key, info.data_dir, None, 4)
+                .await
+                .is_err(),
+            "revocation refuses next GET"
+        );
+        authorizer.enabled.store(true, std::sync::atomic::Ordering::Release);
+        *authorizer.generation.lock().expect("change generation") = [4; 16];
+        let refused = format!("{}refused.bin", context.access.allowed_prefix());
+        assert!(
+            usecase
+                .managed_create_object(&context, &refused, 4, futures::stream::iter([Ok(Bytes::from_static(b"data"))]))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_object_info(context.access.bucket().storage_bucket_id().as_str(), &refused, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "changed generation must not dispatch a write"
+        );
+        assert_eq!(
+            *authorizer.operations.lock().expect("admissions"),
+            [ManagedObjectOperation::CreateOnly, ManagedObjectOperation::Get]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn preparation_reads_and_denials_audit_real_preparation_identity() {
+        use super::super::managed_maintenance::*;
+        let (usecase, foreground, _store, _reset) = managed_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let key = format!("{}preparation.bin", foreground.access.allowed_prefix());
+        let body = Bytes::from_static(b"preparation-data");
+        let info = usecase
+            .managed_create_object(
+                &foreground,
+                &key,
+                u64::try_from(body.len()).expect("body size"),
+                futures::stream::iter([Ok(body.clone())]),
+            )
+            .await
+            .expect("source object");
+        let bucket = foreground.access.bucket().storage_bucket_id().as_str();
+        let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(bucket);
+        let mut expected = HashMap::new();
+        for purpose in [
+            ManagedMaintenancePreparationPurpose::Enroll,
+            ManagedMaintenancePreparationPurpose::GarbageCollectionPlanning,
+            ManagedMaintenancePreparationPurpose::RecoveryPlanning,
+        ] {
+            let preparation_id = Uuid::new_v4();
+            let (_, authorizer) = maintenance_context(
+                &foreground,
+                Arc::new(crate::app::storage_api::object_usecase::sse::ManagedSseRuntime::new(None)),
+            );
+            let audit = ManagedMaintenanceAuditContext::new_preparation(
+                ManagedMaintenanceIdentityRef::new("maintenance-account".to_owned(), [3; 16]),
+                preparation_id,
+                purpose,
+                "preparation-worker".to_owned(),
+                Uuid::new_v4(),
+                None,
+            );
+            assert_eq!((audit.job_id(), audit.attempt()), (None, None));
+            assert_eq!(audit.preparation_id(), Some(preparation_id));
+            assert_eq!(audit.preparation_purpose(), Some(purpose));
+            expected.insert(preparation_id.to_string(), (purpose.as_str(), audit.worker_boot_id().to_string()));
+            let context = ManagedObjectContext::from_maintenance(
+                foreground.access.clone(),
+                foreground.encryption.clone(),
+                Arc::new(ManagedMaintenanceContext::new(audit, authorizer.clone())),
+            )
+            .expect("preparation context");
+            let (_, actual) = usecase
+                .managed_get_object(&context, &key, info.data_dir, None, body.len())
+                .await
+                .expect("preparation GET");
+            assert_eq!(actual, body);
+            let (_, ranged) = usecase
+                .managed_get_object(&context, &key, info.data_dir, Some(2..7), 5)
+                .await
+                .expect("preparation Range");
+            assert_eq!(ranged.as_ref(), &body[2..7]);
+            assert!(
+                matches!(
+                    usecase
+                        .managed_get_object(&context, ".rustfs-table/other/dataset/denied", None, None, body.len())
+                        .await,
+                    Err(ManagedObjectError::Scope(_))
+                ),
+                "out-of-scope access must remain denied and audited"
+            );
+            authorizer.enabled.store(false, std::sync::atomic::Ordering::Release);
+            assert!(
+                matches!(usecase.managed_get_object(&context, &key, info.data_dir, None, body.len()).await,
+                Err(ManagedObjectError::Api(error)) if error.code == S3ErrorCode::AccessDenied)
+            );
+        }
+        probe.wait_for(12, 0).await;
+        let audits = probe.audits.lock().expect("preparation audit entries");
+        assert_eq!(audits.len(), 12);
+        let mut operation_ids = std::collections::HashSet::new();
+        let mut denied = 0;
+        for entry in audits.iter() {
+            assert_eq!(entry.access_key.as_deref(), Some("maintenance-account"));
+            let tags = entry.tags.as_ref().expect("preparation audit tags");
+            assert!(!tags.contains_key("maintenanceJobId"));
+            assert!(!tags.contains_key("maintenanceAttempt"));
+            let preparation_id = tags["maintenancePreparationId"].as_str().expect("preparation id");
+            let (purpose, boot) = expected.get(preparation_id).expect("actual admitted preparation");
+            assert_eq!(tags["maintenancePreparationPurpose"], *purpose);
+            assert_eq!(tags["maintenanceWorkerId"], "preparation-worker");
+            assert_eq!(tags["maintenanceWorkerBootId"].as_str(), Some(boot.as_str()));
+            let operation_id = entry.request_id.as_deref().expect("fresh operation id");
+            assert_eq!(tags["maintenanceOperationId"], operation_id);
+            assert!(operation_ids.insert(operation_id.to_owned()), "each admission has its own operation id");
+            if entry.api.status.as_deref() == Some("failure") {
+                denied += 1;
+            }
+        }
+        assert_eq!(denied, 6, "each denied admission preserves its identity and failure outcome");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maintenance_actual_get_and_range_use_the_bound_kms_instance() {
+        let (usecase, foreground, _store, _reset) = managed_fixture_with_encryption(ManagedEncryption::AwsKms {
+            key_id: "maintenance-key".to_owned(),
+        })
+        .await;
+        let (_b_directory, _b_manager, b) = maintenance_kms_runtime().await;
+        let (_a_directory, _a_manager, a) = maintenance_kms_runtime().await;
+        let (context, _) = maintenance_context(&foreground, b);
+        let (wrong_context, _) = maintenance_context(&foreground, a);
+        for size in [32_usize, 1024 * 1024] {
+            let key = format!("{}kms-{size}.bin", context.access.allowed_prefix());
+            let plaintext = Bytes::from(vec![0x54; size]);
+            let info = usecase
+                .managed_create_object(
+                    &context,
+                    &key,
+                    u64::try_from(size).expect("size"),
+                    futures::stream::iter([Ok(plaintext.clone())]),
+                )
+                .await
+                .expect("bound instance encrypted PUT");
+            let (_, actual) = usecase
+                .managed_get_object(&context, &key, info.data_dir, None, size)
+                .await
+                .expect("real bound GET");
+            assert_eq!(actual, plaintext);
+            let (_, ranged) = usecase
+                .managed_get_object(&context, &key, info.data_dir, Some(7..23), 16)
+                .await
+                .expect("real bound Range GET");
+            assert_eq!(ranged.as_ref(), &plaintext[7..23]);
+            assert!(
+                usecase
+                    .managed_get_object(&wrong_context, &key, info.data_dir, None, size)
+                    .await
+                    .is_err(),
+                "other instance cannot decrypt this body"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maintenance_multipart_steps_reauthorize_and_read_bound_ciphertext() {
+        let (usecase, foreground, _store, _reset) = managed_fixture_with_encryption(ManagedEncryption::AwsKms {
+            key_id: "maintenance-key".to_owned(),
+        })
+        .await;
+        let (_directory, _manager, runtime) = maintenance_kms_runtime().await;
+        let (mut context, authorizer) = maintenance_context(&foreground, runtime);
+        context.access = ManagedObjectAccess::try_from_parts(
+            context.access.bucket().clone(),
+            context.access.table_id().clone(),
+            context.access.allowed_prefix().to_owned(),
+            [
+                ManagedObjectOperation::CreateOnly,
+                ManagedObjectOperation::CreateMultipart,
+                ManagedObjectOperation::UploadPart,
+                ManagedObjectOperation::CompleteMultipart,
+                ManagedObjectOperation::AbortMultipart,
+                ManagedObjectOperation::Get,
+                ManagedObjectOperation::Range,
+                ManagedObjectOperation::Head,
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("multipart capability");
+        let key = format!("{}multipart.lance", context.access.allowed_prefix());
+        let upload = usecase
+            .managed_create_multipart_upload(&context, &key)
+            .await
+            .expect("bound multipart session");
+        let plaintext = Bytes::from(vec![0x53; 128 * 1024]);
+        let part = usecase
+            .managed_upload_part(
+                &upload,
+                1,
+                u64::try_from(plaintext.len()).expect("part size"),
+                futures::stream::iter([Ok(plaintext.clone())]),
+            )
+            .await
+            .expect("bound encrypted part");
+        authorizer.enabled.store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            usecase
+                .managed_complete_multipart_upload(&upload, vec![part.clone()])
+                .await
+                .is_err(),
+            "permission removal blocks completion"
+        );
+        authorizer.enabled.store(true, std::sync::atomic::Ordering::Release);
+        let info = usecase
+            .managed_complete_multipart_upload(&upload, vec![part])
+            .await
+            .expect("currently authorized completion");
+        let (_, actual) = usecase
+            .managed_get_object(&context, &key, info.data_dir, None, plaintext.len())
+            .await
+            .expect("actual multipart GET");
+        assert_eq!(actual, plaintext);
+        let (_, actual) = usecase
+            .managed_get_object(&context, &key, info.data_dir, Some(1024..2048), 1024)
+            .await
+            .expect("actual multipart Range");
+        assert_eq!(actual.as_ref(), &plaintext[1024..2048]);
+        assert_eq!(
+            *authorizer.operations.lock().expect("admissions"),
+            [
+                ManagedObjectOperation::CreateMultipart,
+                ManagedObjectOperation::UploadPart,
+                ManagedObjectOperation::CompleteMultipart,
+                ManagedObjectOperation::Get,
+                ManagedObjectOperation::Range
+            ]
+        );
+    }
+
+    async fn exact_delete_permit(
+        context: &ManagedObjectContext,
+        store: &Arc<ECStore>,
+        key: &str,
+        info: &ObjectInfo,
+    ) -> super::super::managed_maintenance::ManagedRetirementDeletePermit {
+        use super::super::managed_maintenance::*;
+        let ManagedObjectIdentity::Maintenance { context: maintenance } = &context.identity else {
+            panic!("maintenance context")
+        };
+        let audit = &maintenance.audit;
+        let bucket = context.access.bucket().storage_bucket_id().as_str();
+        let lifecycle = Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(bucket, context.access.bucket().incarnation().as_uuid())
+                .await
+                .expect("exact lifecycle owner"),
+        );
+        let lock = store
+            .new_ns_lock(bucket, &format!("dispatch/{}", audit.job_id().expect("persisted job identity")))
+            .await
+            .expect("dispatch namespace");
+        let dispatch = Arc::new(
+            lock.get_read_lock(Duration::from_secs(10))
+                .await
+                .expect("actual dispatch read owner"),
+        );
+        let retained: Arc<dyn Send + Sync> = Arc::new((lifecycle.clone(), dispatch.clone()));
+        let signals = dispatch.lock_lost_signal().into_iter().collect();
+        ManagedRetirementDeletePermit::from_verified_dispatch(ManagedRetirementDeletePermitParts {
+            access: context.access.clone(),
+            target: ManagedRetiredObject {
+                key: key.to_owned(),
+                body_revision: info.data_dir.expect("body revision"),
+                mod_time: info.mod_time,
+                content_length: u64::try_from(info.size).expect("stored size"),
+                version_id: None,
+                delete_marker: false,
+            },
+            retirement_id: Uuid::new_v4(),
+            retirement_revision: Uuid::new_v4(),
+            job_id: audit.job_id().expect("persisted job identity"),
+            job_revision: Uuid::new_v4(),
+            attempt: audit.attempt().expect("persisted job attempt"),
+            lease_id: Uuid::new_v4(),
+            worker_id: audit.worker_id().to_owned(),
+            worker_boot_id: audit.worker_boot_id(),
+            dispatch_id: Uuid::new_v4(),
+            ordinal: 0,
+            execution_identity: audit.execution_identity().clone(),
+            lifecycle_owner: lifecycle,
+            dispatch_owner: dispatch,
+            retained_guard_owner: retained,
+            retained_guard_loss_signals: signals,
+        })
+        .expect("verified exact permit")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn preparation_context_cannot_consume_a_job_delete_permit() {
+        use super::super::managed_maintenance::*;
+        let (usecase, foreground, store, _reset) = managed_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let key = format!("{}retirement.bin", foreground.access.allowed_prefix());
+        let info = usecase
+            .managed_create_object(&foreground, &key, 4, futures::stream::iter([Ok(Bytes::from_static(b"data"))]))
+            .await
+            .expect("existing body");
+        let (mut job, authorizer) = maintenance_context(
+            &foreground,
+            Arc::new(crate::app::storage_api::object_usecase::sse::ManagedSseRuntime::new(None)),
+        );
+        job.access = ManagedObjectAccess::try_from_parts(
+            job.access.bucket().clone(),
+            job.access.table_id().clone(),
+            job.access.allowed_prefix().to_owned(),
+            [ManagedObjectOperation::Delete].into_iter().collect(),
+        )
+        .expect("job deletion capability");
+        let permit = exact_delete_permit(&job, &store, &key, &info).await;
+        let ManagedObjectIdentity::Maintenance { context: maintenance } = &job.identity else {
+            panic!("job identity")
+        };
+        let preparation = ManagedMaintenanceAuditContext::new_preparation(
+            maintenance.audit.execution_identity().clone(),
+            Uuid::new_v4(),
+            ManagedMaintenancePreparationPurpose::RecoveryPlanning,
+            maintenance.audit.worker_id().to_owned(),
+            maintenance.audit.worker_boot_id(),
+            None,
+        );
+        let context = ManagedObjectContext::from_maintenance(
+            job.access.clone(),
+            ManagedEncryption::Unencrypted,
+            Arc::new(ManagedMaintenanceContext::new(preparation, authorizer.clone())),
+        )
+        .expect("preparation context");
+        assert!(matches!(usecase.delete_retired_object(context, permit).await,
+            Err(ManagedObjectError::Api(error)) if error.code == S3ErrorCode::PreconditionFailed));
+        assert!(
+            authorizer.operations.lock().expect("admissions").is_empty(),
+            "a preparation cannot admit job deletion"
+        );
+        let current = store
+            .get_object_info_for_delete(job.access.bucket().storage_bucket_id().as_str(), &key, &ObjectOptions::default())
+            .await
+            .expect("body survives invalid origin");
+        assert_eq!(current.data_dir, info.data_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maintenance_delete_audit_retains_real_job_through_cancelled_native_work() {
+        use crate::app::storage_api::test::{
+            LocalPublicationPause, LocalPublicationStage, ReadOptions, StorageDiskRpcExt as _, find_local_disk_by_ref,
+        };
+        let (usecase, foreground, store, _reset) = managed_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let (mut context, _) = maintenance_context(
+            &foreground,
+            Arc::new(crate::app::storage_api::object_usecase::sse::ManagedSseRuntime::new(None)),
+        );
+        let bucket = context.access.bucket().storage_bucket_id().as_str().to_owned();
+        let key = format!("{}native-retirement.bin", context.access.allowed_prefix());
+        let mut reader = PutObjReader::from_vec(vec![0x52; 1024 * 1024]);
+        let info = store
+            .put_object(
+                &bucket,
+                &key,
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("external body for native cleanup");
+        context.access = ManagedObjectAccess::try_from_parts(
+            context.access.bucket().clone(),
+            context.access.table_id().clone(),
+            context.access.allowed_prefix().to_owned(),
+            [ManagedObjectOperation::Delete].into_iter().collect(),
+        )
+        .expect("deletion scope");
+        let ManagedObjectIdentity::Maintenance { context: maintenance } = &context.identity else {
+            panic!("maintenance identity")
+        };
+        let expected_job_id = maintenance.audit.job_id().expect("real job").to_string();
+        let expected_attempt = maintenance.audit.attempt().expect("real attempt");
+        let expected_boot = maintenance.audit.worker_boot_id().to_string();
+        let permit = exact_delete_permit(&context, &store, &key, &info).await;
+        let endpoints = store.instance_endpoints().expect("store endpoints");
+        let endpoint = endpoints
+            .as_ref()
+            .iter()
+            .flat_map(|pool| pool.endpoints.as_ref())
+            .find(|endpoint| endpoint.is_local)
+            .expect("local disk");
+        let disk = find_local_disk_by_ref(&endpoint.to_string()).await.expect("selected disk");
+        let physical = disk
+            .read_version("", &bucket, &key, "", &ReadOptions::default())
+            .await
+            .expect("physical body metadata");
+        assert!(!physical.inline_data(), "native pause must cover an external payload");
+        assert_eq!(physical.data_dir, info.data_dir);
+        let part_path = format!("{key}/{}/part.1", physical.data_dir.expect("physical data directory"));
+        let mut pause = LocalPublicationPause::install(&disk, &bucket, &part_path, LocalPublicationStage::Remove)
+            .expect("pause native removal");
+        let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(&bucket);
+        let mut deletion = tokio::spawn(async move { usecase.delete_retired_object(context, permit).await });
+        tokio::select! {
+            biased;
+            result = &mut deletion => panic!("delete returned before native removal pause: {}", result.is_ok()),
+            entered = tokio::time::timeout(Duration::from_secs(10), pause.entered()) => {
+                entered.expect("physical cleanup reached").expect("native cleanup entry signal");
+            }
+        }
+        deletion.abort();
+        assert!(
+            matches!(deletion.await, Err(error) if error.is_cancelled()),
+            "outer waiter must be cancelled"
+        );
+        assert!(
+            probe.audits.lock().expect("audit owner").is_empty(),
+            "native holder retains the audit until completion"
+        );
+        drop(pause);
+        probe.wait_for(1, 0).await;
+        let audits = probe.audits.lock().expect("completed native audit");
+        assert_eq!(audits.len(), 1);
+        let audit = &audits[0];
+        assert_eq!(audit.access_key.as_deref(), Some("maintenance-account"));
+        assert_eq!(audit.api.status.as_deref(), Some("success"));
+        let tags = audit.tags.as_ref().expect("job audit tags");
+        assert_eq!(tags["maintenanceJobId"].as_str(), Some(expected_job_id.as_str()));
+        assert_eq!(tags["maintenanceAttempt"], expected_attempt);
+        assert_eq!(tags["maintenanceWorkerBootId"].as_str(), Some(expected_boot.as_str()));
+        assert!(!tags.contains_key("maintenancePreparationId"));
+        assert!(!tags.contains_key("maintenancePreparationPurpose"));
+        assert_eq!(tags["maintenanceOperationId"].as_str(), audit.request_id.as_deref());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maintenance_exact_delete_preserves_replacement_and_needs_no_kms() {
+        use super::super::managed_maintenance::ManagedDeleteOutcome;
+        use crate::app::storage_api::test::data_usage::{
+            apply_bucket_usage_memory_overlay, get_bucket_usage_memory, seed_bucket_usage_memory_for_test,
+        };
+
+        async fn observed_usage(bucket: &str) -> Option<u64> {
+            let mut usage = rustfs_data_usage::DataUsageInfo::default();
+            apply_bucket_usage_memory_overlay(&mut usage).await;
+            usage.buckets_usage.get(bucket).map(|entry| entry.size)
+        }
+        let (usecase, foreground, store, _reset) = managed_fixture_with_encryption(ManagedEncryption::AwsKms {
+            key_id: "maintenance-key".to_owned(),
+        })
+        .await;
+        let (_directory, manager, runtime) = maintenance_kms_runtime().await;
+        let (mut context, authorizer) = maintenance_context(&foreground, runtime);
+        let key = format!("{}retired.bin", context.access.allowed_prefix());
+        let info = usecase
+            .managed_create_object(&context, &key, 32, futures::stream::iter([Ok(Bytes::from(vec![0x41; 32]))]))
+            .await
+            .expect("real encrypted retired body");
+        context.access = ManagedObjectAccess::try_from_parts(
+            context.access.bucket().clone(),
+            context.access.table_id().clone(),
+            context.access.allowed_prefix().to_owned(),
+            [ManagedObjectOperation::Delete, ManagedObjectOperation::Get]
+                .into_iter()
+                .collect(),
+        )
+        .expect("retirement access");
+        let bucket = context.access.bucket().storage_bucket_id().as_str().to_owned();
+        seed_bucket_usage_memory_for_test(&bucket, 2_000).await;
+        manager.stop().await.expect("stop the exact KMS instance");
+        assert!(
+            usecase
+                .managed_get_object(&context, &key, info.data_dir, None, 32)
+                .await
+                .is_err(),
+            "encrypted content still needs KMS"
+        );
+        let mut replacement_claim = info.clone();
+        replacement_claim.data_dir = Some(Uuid::new_v4());
+        let mismatch = exact_delete_permit(&context, &store, &key, &replacement_claim).await;
+        assert!(matches!(
+            usecase
+                .delete_retired_object(context.clone(), mismatch)
+                .await
+                .expect("delete outcome"),
+            ManagedDeleteOutcome::NeedsRecovery { .. }
+        ));
+        assert_eq!(get_bucket_usage_memory(&bucket).await, Some(2_000));
+        assert_eq!(observed_usage(&bucket).await, Some(2_000));
+        let current = store
+            .get_object_info_for_delete(context.access.bucket().storage_bucket_id().as_str(), &key, &ObjectOptions::default())
+            .await
+            .expect("replacement survived");
+        assert_eq!(current.data_dir, info.data_dir);
+        let permit = exact_delete_permit(&context, &store, &key, &info).await;
+        let ManagedDeleteOutcome::DeleteCommitted { accounting } = usecase
+            .delete_retired_object(context.clone(), permit)
+            .await
+            .expect("metadata-only exact delete")
+        else {
+            panic!("unavailable wrapping key cannot prevent a proven exact deletion")
+        };
+        assert!(accounting.removed_current_object);
+        assert!(accounting.version_id.is_none());
+        let expected_usage = 2_000 - accounting.size.expect("actual encrypted body accounting size");
+        assert_eq!(observed_usage(&bucket).await, Some(expected_usage));
+        assert_eq!(get_bucket_usage_memory(&bucket).await, Some(2_000));
+        let replay = exact_delete_permit(&context, &store, &key, &info).await;
+        assert!(
+            matches!(
+                usecase.delete_retired_object(context, replay).await.expect("replay outcome"),
+                ManagedDeleteOutcome::NeedsRecovery { error: None }
+            ),
+            "unproved absence must supply no second accounting receipt"
+        );
+        assert_eq!(
+            observed_usage(&bucket).await,
+            Some(expected_usage),
+            "an absent replay cannot decrement usage again"
+        );
+        assert_eq!(
+            get_bucket_usage_memory(&bucket).await,
+            Some(2_000),
+            "quota retains its scanner reconciliation floor"
+        );
+        assert_eq!(
+            authorizer
+                .operations
+                .lock()
+                .expect("admissions")
+                .iter()
+                .filter(|operation| **operation == ManagedObjectOperation::Delete)
+                .count(),
+            3,
+            "every dispatch has a fresh deletion admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn foreground_managed_context_rejects_delete_capability() {
+        let (_usecase, context, _store, _reset) = managed_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let access = ManagedObjectAccess::try_from_parts(
+            context.access.bucket().clone(),
+            context.access.table_id().clone(),
+            context.access.allowed_prefix().to_owned(),
+            [ManagedObjectOperation::Delete].into_iter().collect(),
+        )
+        .expect("delete scope data");
+        assert!(matches!(
+            ManagedObjectContext::from_authorized_request(
+                access,
+                context.request_for_test().clone(),
+                ManagedEncryption::Unencrypted
+            ),
+            Err(ManagedObjectError::Scope(BucketIdentityError::OperationNotAllowed))
+        ));
     }
 
     #[test]

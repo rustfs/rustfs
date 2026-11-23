@@ -592,7 +592,28 @@ const MQTT_HELP_KEYS: &[HelpKeyMetadata] = &[
     },
 ];
 
+const VECTOR_MAINTENANCE_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: ENABLE_KEY,
+        type_name: "on|off",
+        description: "enable Vector maintenance after restart; disabled by default",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: rustfs_config::S3VECTORS_MAINTENANCE_EXECUTION_ACCOUNT,
+        type_name: "string",
+        description: "existing ordinary IAM account used for resource-scoped Vector maintenance",
+        optional: true,
+    },
+];
+
 const HELP_SUBSYSTEMS: &[HelpSubSystemMetadata] = &[
+    HelpSubSystemMetadata {
+        key: rustfs_config::S3VECTORS_MAINTENANCE_SUB_SYS,
+        description: "configure Vector maintenance identity and restart-required enablement",
+        multiple_targets: false,
+        keys: VECTOR_MAINTENANCE_HELP_KEYS,
+    },
     HelpSubSystemMetadata {
         key: STORAGE_CLASS_SUB_SYS,
         description: "define object level redundancy",
