@@ -775,16 +775,28 @@ mod tests {
             assert!(slot.install(context));
             let bucket = format!("create-multipart-{}", Uuid::new_v4().simple());
             let other = format!("create-multipart-{}", Uuid::new_v4().simple());
-            let request = |bucket: &str| {
-                let input = CreateMultipartUploadInput {
-                    bucket: bucket.to_owned(),
+            let make_request = |target_bucket: &str| {
+                let mut input = CreateMultipartUploadInput {
+                    bucket: target_bucket.to_owned(),
                     key: "object".to_owned(),
                     ..Default::default()
                 };
-                let mut request = build_request(input, Method::POST);
-                request.uri = format!("/{bucket}/object?uploads").parse().expect("fixture URI");
-                request.extensions.insert(slot.clone());
-                request
+                let mut extensions = Extensions::new();
+                extensions.insert(slot.clone());
+                let envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::POST,
+                        uri: format!("/{target_bucket}/object?uploads").parse().expect("fixture URI"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                let query_version = input.version_id.take();
+                let fields = CreateMultipartUploadFields::from_legacy(input);
+                (envelope, fields, query_version)
             };
             for name in [&bucket, &other] {
                 store
@@ -792,14 +804,6 @@ mod tests {
                     .await
                     .expect("create bucket");
             }
-
-            let make_request = |target_bucket: &str| {
-                let mut req = request(target_bucket);
-                let envelope = RequestEnvelope::from_s3s(&req);
-                let query_version = req.input.version_id.take();
-                let fields = CreateMultipartUploadFields::from_legacy(req.input);
-                (envelope, fields, query_version)
-            };
 
             let (mut stale_env, stale_fields, stale_ver) = make_request(&bucket);
             let guard = load_bucket_generation_from_store(&store, &stale_env, &bucket)

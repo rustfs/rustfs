@@ -472,8 +472,8 @@ mod tests {
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
     use crate::app::storage_api::bucket_usecase::s3::{
-        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response,
-        XmlSerialize, XmlSerializer,
+        GetObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response, XmlSerialize,
+        XmlSerializer,
     };
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -1185,7 +1185,18 @@ mod tests {
                         service: None,
                         trailing_headers: None,
                     };
-                    let get_env = crate::app::RequestEnvelope::from_s3s(&get);
+                    // Method GET, URI `/missing`, empty headers, and empty extensions.
+                    let get_env = crate::app::RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: get.method.clone(),
+                            uri: get.uri.clone(),
+                            headers: get.headers.clone(),
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        get.extensions.clone(),
+                    );
                     let authorized_generation =
                         super::super::storage_api::bucket_usecase::access::load_bucket_generation_from_store(
                             &store,
@@ -1215,7 +1226,17 @@ mod tests {
                     assert_ne!(replacement, old.incarnation_id());
                     sys.remove(&input.bucket);
                     let mut without_source = get.clone();
-                    let mut without_source_env = crate::app::RequestEnvelope::from_s3s(&without_source);
+                    let mut without_source_env = crate::app::RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: without_source.method.clone(),
+                            uri: without_source.uri.clone(),
+                            headers: without_source.headers.clone(),
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        without_source.extensions.clone(),
+                    );
                     super::super::storage_api::bucket_usecase::access::prepare_odm_read_generation(
                         &store,
                         &mut without_source_env,
@@ -1238,12 +1259,18 @@ mod tests {
                             if capture == 1 {
                                 get.extensions.insert(authorized_generation.clone());
                             }
-                            let mut head = get.clone().map_input(|_| HeadObjectInput {
-                                bucket: input.bucket.clone(),
-                                key: "missing".into(),
-                                ..Default::default()
-                            });
-                            head.method = http::Method::HEAD;
+                            let head_envelope = crate::app::RequestEnvelope::from_parts(
+                                crate::app::RequestHead {
+                                    method: http::Method::HEAD,
+                                    uri: get.uri.clone(),
+                                    headers: get.headers.clone(),
+                                    credentials: None,
+                                    region: None,
+                                    service: None,
+                                },
+                                get.extensions.clone(),
+                            );
+                            let head = crate::app::test_seams::head_object_input(&input.bucket, "missing", None);
                             let mut list = get.clone().map_input(|_| input.clone());
                             list.uri = http::Uri::from_static("/?list-type=2");
                             let usecase = crate::app::object::DefaultObjectUsecase::from_global();
@@ -1255,12 +1282,12 @@ mod tests {
                             assert_eq!(*get_error.code(), S3ErrorCode::NoSuchKey);
                             let head_error = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                crate::app::test_seams::head_object(&usecase, head),
+                                crate::app::test_seams::head_object_gateway(&usecase, head_envelope, head),
                             )
                             .await
                             .expect("HEAD stays local")
                             .expect_err("local object is absent");
-                            assert_eq!(*head_error.code(), S3ErrorCode::NoSuchKey);
+                            assert_eq!(head_error.code(), &rustfs_s3_types::S3ErrorCode::NoSuchKey);
                             let listing = tokio::time::timeout(
                                 Duration::from_secs(10),
                                 crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), list),

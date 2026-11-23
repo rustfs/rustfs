@@ -59,7 +59,7 @@ pub(super) async fn write_format_bootstrap_intents(disks: &[Option<DiskStore>], 
         return Err(Error::CorruptedFormat);
     }
     let max_bytes = legacy_format_max_bytes(disks.len())?;
-    match first.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
+    match first.read_format_control(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
         Ok(reader) => {
             let data = read_legacy_format_bytes(reader, max_bytes).await?;
             let existing = FormatV3::try_from(data.as_slice())?;
@@ -73,7 +73,7 @@ pub(super) async fn write_format_bootstrap_intents(disks: &[Option<DiskStore>], 
             // retain the single-anchor absence fast path.
             let reads = stream::iter(disks.iter().skip(1).cloned().map(|disk| async move {
                 let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
-                match disk.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
+                match disk.read_format_control(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
                     Err(DiskError::FileNotFound) => Ok(()),
                     Ok(_) => Err(DiskError::CorruptedFormat),
                     Err(error) => Err(error),
@@ -127,7 +127,7 @@ pub(super) async fn resume_format_bootstrap(
         return Ok(None);
     };
     let first_intent = async {
-        let reader = first.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await?;
+        let reader = first.read_format_control(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await?;
         let data = read_legacy_format_bytes(reader, max_bytes).await?;
         FormatV3::try_from(data.as_slice()).map_err(DiskError::from)
     }
@@ -152,7 +152,7 @@ pub(super) async fn resume_format_bootstrap(
     let intents = {
         let reads = stream::iter(disks.iter().cloned().enumerate().skip(1).map(|(index, disk)| async move {
             let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
-            let reader = match disk.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
+            let reader = match disk.read_format_control(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
                 Ok(reader) => reader,
                 Err(DiskError::FileNotFound) => return Ok((index, None)),
                 Err(error) => return Err(error),

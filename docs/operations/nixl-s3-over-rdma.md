@@ -157,10 +157,7 @@ stays on the internode HTTP connection; only the data moves over the rails.
   same disk writer as the TCP path (create, or append for later segments),
   checks the declared size on the last segment and flushes. The buffers
   return to the writer's pool only after the node answered.
-- Directory walks, unbounded reads and any read stream whose first chunk
-  fails use TCP/HTTP, which also keeps its typed errors (file not found and
-  so on). A build without the `nixl` feature answers the route with `404`,
-  which the reader treats the same way.
+- Shard reads and writes require NIXL on both peers. After a non-inline EC:0 upload, the owning peer reads its staged shard locally and returns the verification result over the control channel. Directory walks, scanner requests and format metadata use the control transport, including during first startup.
 - A receive buffer whose request was abandoned (a dropped reader, chunks past
   the end of the file) stays out of the pool for two minutes, longer than
   the serving node's transfer timeout, because the peer may still write it.

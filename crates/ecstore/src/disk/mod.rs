@@ -356,6 +356,14 @@ pub enum Disk {
 }
 
 impl Disk {
+    /// Open format metadata through the control transport, including before shard I/O is available.
+    pub(crate) async fn read_format_control(&self, volume: &str, path: &str) -> Result<FileReader> {
+        match self {
+            Self::Local(disk) => disk.read_file(volume, path).await,
+            Self::Remote(disk) => disk.read_format_control(volume, path).await,
+        }
+    }
+
     /// Physical ownership belongs to the node hosting the local attachment.
     pub fn physical_admission(&self) -> Option<Arc<PhysicalDiskBinding>> {
         match self {

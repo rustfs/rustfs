@@ -17,40 +17,21 @@
 //! Retained for `admin/router.rs` (object-lambda), `app/website.rs`, and `app/test_seams` until
 //! T4.2 removes the remaining `s3s` dependency from `admin/router.rs`.
 
-use crate::app::object_usecase::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 #[cfg(test)]
-use crate::app::object_usecase::{HeadObjectFields, HeadObjectOutputFacts};
+use crate::app::object_usecase::HeadObjectOutputFacts;
+use crate::app::object_usecase::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 use rustfs_gateway_stream::{BoxPayloadStream, PayloadRead, StreamError, StreamErrorKind};
 use rustfs_gateway_types::ByteRange;
 use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_object;
 #[cfg(test)]
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::head_object;
-use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, Range, StreamingBlob};
 #[cfg(test)]
-use s3s::dto::{HeadObjectInput, HeadObjectOutput};
+use s3s::dto::HeadObjectOutput;
+use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, Range, StreamingBlob};
 use std::pin::Pin;
 use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
-
-#[cfg(test)]
-impl HeadObjectFields {
-    pub(crate) fn from_s3s(input: HeadObjectInput) -> Self {
-        Self {
-            bucket: input.bucket,
-            key: input.key,
-            version_id: input.version_id,
-            part_number: input.part_number,
-            range: input.range.map(|range| match range {
-                Range::Int { first, last: Some(last) } => ByteRange::FromTo { first, last },
-                Range::Int { first, last: None } => ByteRange::From { first },
-                Range::Suffix { length } => ByteRange::Suffix { length },
-            }),
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-        }
-    }
-}
 
 #[cfg(test)]
 impl HeadObjectOutputFacts {

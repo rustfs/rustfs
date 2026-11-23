@@ -1862,7 +1862,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput};
+    use crate::app::storage_api::s3::dto::GetObjectInput;
+    use crate::app::test_seams::{head_envelope, head_object_gateway, head_object_input};
     use http::{HeaderMap, HeaderValue, Method};
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
@@ -2251,30 +2252,20 @@ mod tests {
                             .version_id(requested_version.clone())
                             .build()
                             .expect("GET request");
-                        let head = HeadObjectInput::builder()
-                            .bucket(bucket.clone())
-                            .key(key.to_string())
-                            .version_id(requested_version)
-                            .build()
-                            .expect("HEAD request");
+                        let head = head_object_input(&bucket, key, requested_version);
                         let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("marker GET");
-                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
-                            .await
-                            .expect_err("marker HEAD");
-                        for (method, error) in [("GET", get_error), ("HEAD", head_error)] {
-                            assert_eq!(
-                                error.code(),
-                                if explicit {
-                                    &S3ErrorCode::MethodNotAllowed
-                                } else {
-                                    &S3ErrorCode::NoSuchKey
-                                }
-                            );
-                            let headers = error
-                                .headers()
-                                .unwrap_or_else(|| panic!("{method} marker response omitted headers"));
+                        let head_error =
+                            head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
+                                .await
+                                .expect_err("marker HEAD");
+                        for (method, code, headers) in [
+                            ("GET", get_error.code().as_str(), get_error.headers()),
+                            ("HEAD", head_error.code().as_str(), head_error.headers()),
+                        ] {
+                            assert_eq!(code, if explicit { "MethodNotAllowed" } else { "NoSuchKey" });
+                            let headers = headers.unwrap_or_else(|| panic!("{method} marker response omitted headers"));
                             assert_eq!(headers.get("x-amz-delete-marker").expect("marker header"), "true");
                             assert_eq!(headers.get("x-amz-version-id").expect("version header"), marker_id.as_str());
                             if explicit {
@@ -2285,18 +2276,31 @@ mod tests {
                                     .expect("HTTP date");
                                 assert_eq!(headers.get("last-modified").expect("marker timestamp header"), modified.as_str());
                             }
-                            let wire = error.to_http_response().expect("serialize marker error response");
+                        }
+
+                        // Retain the pinned XML error contract for both use-case results.
+                        let get_wire = get_error
+                            .to_http_response()
+                            .expect("serialize GET marker error")
+                            .into_parts()
+                            .0;
+                        let head_wire = head_error
+                            .to_http_response()
+                            .expect("serialize HEAD marker error")
+                            .into_parts()
+                            .0;
+                        for wire in [get_wire, head_wire] {
                             assert_eq!(
-                                wire.status(),
+                                wire.status,
                                 if explicit {
                                     StatusCode::METHOD_NOT_ALLOWED
                                 } else {
                                     StatusCode::NOT_FOUND
                                 }
                             );
-                            assert_eq!(wire.headers()["x-amz-delete-marker"], "true");
-                            assert_eq!(wire.headers()["x-amz-version-id"], marker_id.as_str());
-                            assert_eq!(wire.headers()[http::header::CONTENT_TYPE], "application/xml");
+                            assert_eq!(wire.headers["x-amz-delete-marker"], "true");
+                            assert_eq!(wire.headers["x-amz-version-id"], marker_id.as_str());
+                            assert_eq!(wire.headers[http::header::CONTENT_TYPE], "application/xml");
                         }
                     }
 
@@ -2317,17 +2321,12 @@ mod tests {
                         actual.extend_from_slice(&chunk.expect("historical data remains readable"));
                     }
                     assert_eq!(actual, payload);
-                    let head = HeadObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(original_id.clone()))
-                        .build()
-                        .expect("historical HEAD request");
-                    let response = crate::app::test_seams::head_object_method_only(&usecase, head)
+                    let head = head_object_input(&bucket, key, Some(original_id.clone()));
+                    let response = head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                         .await
                         .expect("historical HEAD");
-                    assert_eq!(response.output.content_length, Some(i64::try_from(payload.len()).unwrap()));
-                    assert_eq!(response.output.version_id.as_deref(), Some(original_id.as_str()));
+                    assert_eq!(response.output.dto.content_length, Some(i64::try_from(payload.len()).unwrap()));
+                    assert_eq!(response.output.dto.version_id.as_deref(), Some(original_id.as_str()));
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
 
                     for (absent_key, version) in [("missing", None), (key, Some(Uuid::new_v4().to_string()))] {
@@ -2337,30 +2336,21 @@ mod tests {
                             .version_id(version.clone())
                             .build()
                             .expect("missing GET request");
-                        let head = HeadObjectInput::builder()
-                            .bucket(bucket.clone())
-                            .key(absent_key.to_string())
-                            .version_id(version)
-                            .build()
-                            .expect("missing HEAD request");
+                        let head = head_object_input(&bucket, absent_key, version);
                         let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
                             .await
                             .expect_err("missing GET");
-                        let head_error = crate::app::test_seams::head_object_method_only(&usecase, head)
-                            .await
-                            .expect_err("missing HEAD");
-                        for error in [get_error, head_error] {
-                            assert_eq!(error.code().status_code(), Some(StatusCode::NOT_FOUND));
-                            assert!(
-                                error
-                                    .headers()
-                                    .is_none_or(|headers| !headers.contains_key("x-amz-delete-marker"))
-                            );
-                            assert!(
-                                error
-                                    .headers()
-                                    .is_none_or(|headers| !headers.contains_key("x-amz-version-id"))
-                            );
+                        let head_error =
+                            head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
+                                .await
+                                .expect_err("missing HEAD");
+                        for (status, headers) in [
+                            (get_error.code().status_code(), get_error.headers()),
+                            (head_error.code().status_code(), head_error.headers()),
+                        ] {
+                            assert_eq!(status, Some(StatusCode::NOT_FOUND));
+                            assert!(headers.is_none_or(|headers| !headers.contains_key("x-amz-delete-marker")));
+                            assert!(headers.is_none_or(|headers| !headers.contains_key("x-amz-version-id")));
                         }
                     }
                 }
@@ -2445,16 +2435,15 @@ mod tests {
                         .await
                         .expect_err("GET of a marker remains forbidden");
                     assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
-                    let head = HeadObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(marker_id.clone()))
-                        .build()
-                        .unwrap();
-                    let head_err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, head))
-                        .await
-                        .expect_err("HEAD of a marker remains forbidden");
-                    assert_eq!(head_err.code(), &S3ErrorCode::MethodNotAllowed);
+                    let head = head_object_input(&bucket, key, Some(marker_id.clone()));
+                    let head_err = Box::pin(head_object_gateway(
+                        &usecase,
+                        head_envelope(HeaderMap::new(), http::Extensions::new()),
+                        head,
+                    ))
+                    .await
+                    .expect_err("HEAD of a marker remains forbidden");
+                    assert_eq!(head_err.code(), &rustfs_s3_types::S3ErrorCode::MethodNotAllowed);
 
                     if batch {
                         let input = DeleteBatchInput {
