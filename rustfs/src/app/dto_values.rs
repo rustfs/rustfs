@@ -16,14 +16,14 @@
 //!
 //! Responsible for: the bucket name, object key, timestamp, owner and stored-configuration
 //! conversions a use case needs to build a gateway output from what the store returned, under the
-//! rule in [`crate::app`]; and [`seam_error`], the one answer for a value the s3s compatibility
-//! seam refused.
+//! rule in [`crate::app`].
 //! NOT responsible for: validating names a client sends (the edge that accepted the request did),
 //! or deciding what a use case lists.
 //! Upstream: the use cases in `crate::app`. Downstream: `rustfs_gateway_types`.
 
 use super::storage_api::bucket_usecase::bucket::utils::{BucketConfigXml, serialize};
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
+#[cfg(test)]
 use rustfs_gateway_types::compat::{ConversionError, NameRefusal};
 use rustfs_gateway_types::dto::Owner;
 use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, ObjectKey, Stricter, Timestamp};
@@ -63,7 +63,7 @@ pub(crate) fn stored_bucket_name(name: &str) -> S3Result<BucketName> {
     })
 }
 
-/// What a legacy edge answers when the s3s compatibility seam refuses a value of an admitted request.
+/// The legacy error expected by compatibility tests when the s3s seam refuses an admitted value.
 ///
 /// - An object key below the gateway's key floor (empty, over 1024 bytes, a NUL) is refused as
 ///   `validate_object_key` refuses one: `400 InvalidArgument`, with a fixed message. An edge whose
@@ -71,6 +71,7 @@ pub(crate) fn stored_bucket_name(name: &str) -> S3Result<BucketName> {
 /// - A bucket name below the bucket floor is a server fault: s3s admits only `[a-z0-9.-]{3,63}`,
 ///   which the floor always accepts, so no bucket a request names reaches it.
 /// - Any other refusal is a value the gateway shape cannot hold: a server fault.
+#[cfg(test)]
 pub(crate) fn seam_error(error: ConversionError) -> S3Error {
     match error.name_kind() {
         Some(NameRefusal::ObjectKey) => S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"),
