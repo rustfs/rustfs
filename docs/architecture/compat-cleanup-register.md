@@ -11,7 +11,6 @@
 
 ## Open Items
 
-- `backlog-2734` public auth error adapters: check_key_valid and check_key_valid_with_context retain their public s3s::S3Result credential API while check_key_valid_owned returns native errors; hoist_signed_query_params similarly converts errors from hoist_signed_query_params_owned for its public s3s::S3Result API. Remove the credential error conversion after the public check_key_valid/check_key_valid_with_context API no longer requires s3s::S3Error. Remove the query-parameter error conversion after the public hoist_signed_query_params API no longer requires s3s::S3Error.
 - `9526` NIXL shard reads recognize the exact file-missing response from peers that predate the disk error header. Remove the response-body check once all supported NIXL peers send the header.
 
 - `openidconnect-hmac-signature-width` ID token verification guard: openidconnect 4.1.0 converts decoded HMAC signatures to fixed-size arrays, which panic on unexpected lengths. Check HS256, HS384, and HS512 signature widths before delegating all cryptographic, issuer, audience, expiry, and nonce checks to the upstream verifier. Remove the guard after a supported upstream release returns verification errors for arbitrary HMAC signature lengths.

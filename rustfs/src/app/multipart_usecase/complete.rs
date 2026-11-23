@@ -2224,7 +2224,7 @@ mod tests {
                         S3ErrorCode::InvalidRequest,
                         400,
                         "Bucket quota exceeded. Current usage: 2 bytes, limit: 1 bytes",
-                        false,
+                        true,
                     )
                 } else if locked {
                     (
@@ -2252,6 +2252,14 @@ mod tests {
                     storage_cause,
                     "{label}"
                 );
+                let quota_cause = error
+                    .source()
+                    .and_then(|cause| cause.downcast_ref::<StorageError>())
+                    .and_then(|cause| match cause {
+                        StorageError::QuotaExceeded { current, limit } => Some((*current, *limit)),
+                        _ => None,
+                    });
+                assert_eq!(quota_cause, (raw_id.is_none() && full_quota).then_some((2, 1)), "{shape}/{label}");
             }
         }
     }
