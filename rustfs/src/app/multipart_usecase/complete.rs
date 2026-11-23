@@ -2362,30 +2362,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_complete_multipart_upload_rejects_object_lock_headers() {
-        let multipart_upload = CompletedMultipartUpload {
-            parts: Some(vec![CompletedPart {
-                part_number: Some(1),
-                ..Default::default()
-            }]),
-        };
-
         for (header_name, header_value) in [
             (AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2030-01-01T00:00:00Z"),
             (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON"),
             ("x-amz-bypass-governance-retention", "true"),
         ] {
-            let input = CompleteMultipartUploadInput::builder()
-                .bucket("bucket".to_string())
-                .key("object".to_string())
-                .upload_id("upload-id".to_string())
-                .multipart_upload(Some(multipart_upload.clone()))
-                .build()
-                .unwrap();
-            let mut req = build_request(input, Method::POST);
-            req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
-
-            let err = Box::pin(make_usecase().complete_for_s3s_request(req)).await.unwrap_err();
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let envelope = completion_with_header(header_name, HeaderValue::from_str(header_value).unwrap());
+            let input = completion_input("bucket", "object", "upload-id", vec![completion_part(1, None)]);
+            let err = Box::pin(make_usecase().execute_complete_multipart_upload(envelope, input))
+                .await
+                .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
         }
     }
