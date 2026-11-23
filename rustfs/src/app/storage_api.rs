@@ -44,8 +44,8 @@ pub(crate) mod diagnostic {
     };
 }
 
-/// S3 wire types for app-layer modules, funneled here so new files stay off
-/// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
+/// Legacy types used by the Linux RDMA transport and app-layer tests.
+#[cfg(any(test, all(target_os = "linux", any(feature = "cuobject", feature = "nixl"))))]
 pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use rustfs_gateway_types::dto::Status;
@@ -54,6 +54,7 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    #[cfg(test)]
     pub(crate) use rustfs_s3_types::StdError;
     #[cfg(test)]
     pub(crate) use s3s::Body;
@@ -72,7 +73,6 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
-    pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::stream;
     #[cfg(test)]
