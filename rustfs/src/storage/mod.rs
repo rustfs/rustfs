@@ -20,6 +20,8 @@ pub mod deadlock_detector;
 pub(crate) mod denial_audit;
 pub(crate) mod helper;
 pub mod options;
+#[cfg(test)]
+mod replication_config_tests;
 pub(crate) mod req_info;
 pub mod request_context;
 pub(crate) mod request_markers;
