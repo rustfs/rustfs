@@ -289,7 +289,7 @@ pub async fn check_key_valid_with_context(
     access_key: &str,
     ctx: Option<&AppContext>,
 ) -> S3Result<(Credentials, bool)> {
-    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public credential API until its legacy error type retires.
+    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public credential API. Remove after its legacy error type retires.
     check_key_valid_owned(session_token, access_key, ctx)
         .await
         .map_err(S3Error::from)
@@ -790,7 +790,7 @@ fn query_may_carry_user_metadata(query: &str) -> bool {
 /// rejected rather than stored: the read path rebuilds them as header fields,
 /// where a control character would fail every `HeadObject` of that object.
 pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> S3Result<()> {
-    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public error type until the legacy auth API retires.
+    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public error type. Remove after the legacy auth API retires.
     hoist_signed_query_params_owned(headers, query).map_err(S3Error::from)
 }
 
