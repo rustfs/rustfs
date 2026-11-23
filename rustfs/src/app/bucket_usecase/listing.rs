@@ -19,14 +19,17 @@ use super::*;
 use crate::app::storage_api::bucket_usecase::contract::list::ListOperations as _;
 #[cfg(test)]
 use crate::app::storage_api::s3::S3ErrorCode;
+use crate::app::storage_api::s3::S3Result;
 use crate::app::storage_api::s3::dto::{
-    CommonPrefix, DeleteMarkerEntry, EncodingType, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, MetadataEntry, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
-    UserMetadata,
+    CommonPrefix, EncodingType, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    MetadataEntry, ObjectStorageClass, Owner, Timestamp, TimestampFormat, UserMetadata,
 };
-use crate::app::storage_api::s3::xml::{SerResult, SerializeContent};
-use crate::app::storage_api::s3::{S3Result, xml};
+use quick_xml::{
+    Writer,
+    events::{BytesDecl, BytesText, Event},
+};
 use rustfs_gateway_types::ETag;
+use std::io;
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 
@@ -49,8 +52,8 @@ pub(crate) struct ObjectMetadataExtension {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ListObjectVersionMetadataEntry {
-    DeleteMarker(DeleteMarkerEntry, ObjectMetadataExtension),
-    Version(ObjectMetadataEntry<ObjectVersion>),
+    DeleteMarker(MetadataObject, ObjectMetadataExtension),
+    Version(ObjectMetadataEntry),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -60,8 +63,19 @@ pub(crate) struct ListObjectVersionsMetadataOutput {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct ObjectMetadataEntry<T> {
-    pub object: T,
+pub(crate) struct MetadataObject {
+    key: String,
+    is_latest: Option<bool>,
+    last_modified: Option<Timestamp>,
+    owner: Option<Owner>,
+    size: Option<i64>,
+    storage_class: Option<String>,
+    version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectMetadataEntry {
+    pub object: MetadataObject,
     pub e_tag: Option<ETag>,
     pub extension: ObjectMetadataExtension,
 }
@@ -69,125 +83,129 @@ pub(crate) struct ObjectMetadataEntry<T> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ListObjectsV2MetadataOutput {
     pub output: ListObjectsV2Output,
-    pub contents: Vec<ObjectMetadataEntry<Object>>,
+    pub contents: Vec<ObjectMetadataEntry>,
 }
 
-impl xml::Serialize for ListObjectVersionsMetadataOutput {
-    fn serialize<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
-        s.content_with_ns("ListVersionsResult", XMLNS_S3, self)
+type ListingWriter = Writer<Vec<u8>>;
+
+fn document(root: &str, content: impl FnOnce(&mut ListingWriter) -> io::Result<()>) -> io::Result<Vec<u8>> {
+    let mut writer = Writer::new(Vec::with_capacity(1024));
+    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+    writer
+        .create_element(root)
+        .with_attribute(("xmlns", XMLNS_S3))
+        .write_inner_content(content)?;
+    Ok(writer.into_inner())
+}
+
+fn text(xml: &mut Writer<impl Write>, name: &str, value: Option<&str>) -> io::Result<()> {
+    if let Some(value) = value {
+        xml.create_element(name).write_text_content(BytesText::new(value))?;
     }
+    Ok(())
 }
 
-impl SerializeContent for ListObjectVersionsMetadataOutput {
-    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
-        if let Some(iter) = &self.output.common_prefixes {
-            s.flattened_list("CommonPrefixes", iter)?;
-        }
-        if let Some(ref val) = self.output.delimiter {
-            s.content("Delimiter", val)?;
-        }
-        if let Some(ref val) = self.output.encoding_type {
-            s.content("EncodingType", val)?;
-        }
-        if let Some(ref val) = self.output.is_truncated {
-            s.content("IsTruncated", val)?;
-        }
-        if let Some(ref val) = self.output.key_marker {
-            s.content("KeyMarker", val)?;
-        }
-        if let Some(ref val) = self.output.max_keys {
-            s.content("MaxKeys", val)?;
-        }
-        if let Some(ref val) = self.output.name {
-            s.content("Name", val)?;
-        }
-        if let Some(ref val) = self.output.next_key_marker {
-            s.content("NextKeyMarker", val)?;
-        }
-        if let Some(ref val) = self.output.next_version_id_marker {
-            s.content("NextVersionIdMarker", val)?;
-        }
-        if let Some(ref val) = self.output.prefix {
-            s.content("Prefix", val)?;
-        }
-        if let Some(ref val) = self.output.version_id_marker {
-            s.content("VersionIdMarker", val)?;
-        }
-        for entry in &self.entries {
-            match entry {
-                ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
-                    s.element("DeleteMarker", |s| {
-                        marker.serialize_content(s)?;
-                        extension.serialize_content(s)
-                    })?;
+fn display_field(xml: &mut ListingWriter, name: &str, value: Option<impl Display>) -> io::Result<()> {
+    text(xml, name, value.map(|v| v.to_string()).as_deref())
+}
+
+fn write_prefixes(xml: &mut ListingWriter, prefixes: Option<&[CommonPrefix]>) -> io::Result<()> {
+    for prefix in prefixes.unwrap_or_default() {
+        xml.create_element("CommonPrefixes")
+            .write_inner_content(|xml| text(xml, "Prefix", prefix.prefix.as_deref()))?;
+    }
+    Ok(())
+}
+
+impl ListObjectVersionsMetadataOutput {
+    pub(crate) fn to_xml(&self) -> io::Result<Vec<u8>> {
+        let page = &self.output;
+        document("ListVersionsResult", |xml| {
+            write_prefixes(xml, page.common_prefixes.as_deref())?;
+            text(xml, "Delimiter", page.delimiter.as_deref())?;
+            text(xml, "EncodingType", page.encoding_type.as_ref().map(EncodingType::as_str))?;
+            display_field(xml, "IsTruncated", page.is_truncated)?;
+            text(xml, "KeyMarker", page.key_marker.as_deref())?;
+            display_field(xml, "MaxKeys", page.max_keys)?;
+            text(xml, "Name", page.name.as_deref())?;
+            text(xml, "NextKeyMarker", page.next_key_marker.as_deref())?;
+            text(xml, "NextVersionIdMarker", page.next_version_id_marker.as_deref())?;
+            text(xml, "Prefix", page.prefix.as_deref())?;
+            text(xml, "VersionIdMarker", page.version_id_marker.as_deref())?;
+            for entry in &self.entries {
+                match entry {
+                    ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
+                        xml.create_element("DeleteMarker").write_inner_content(|xml| {
+                            marker.write_xml(xml)?;
+                            extension.write_xml(xml)
+                        })?;
+                    }
+                    ListObjectVersionMetadataEntry::Version(entry) => {
+                        xml.create_element("Version")
+                            .write_inner_content(|xml| entry.write_xml(xml))?;
+                    }
                 }
-                ListObjectVersionMetadataEntry::Version(entry) => s.content("Version", entry)?,
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
-impl xml::Serialize for ListObjectsV2MetadataOutput {
-    fn serialize<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
-        s.content_with_ns("ListBucketResult", XMLNS_S3, self)
+impl ListObjectsV2MetadataOutput {
+    pub(crate) fn to_xml(&self) -> io::Result<Vec<u8>> {
+        let page = &self.output;
+        document("ListBucketResult", |xml| {
+            text(xml, "Name", page.name.as_deref())?;
+            text(xml, "Prefix", page.prefix.as_deref())?;
+            display_field(xml, "MaxKeys", page.max_keys)?;
+            display_field(xml, "KeyCount", page.key_count)?;
+            text(xml, "ContinuationToken", page.continuation_token.as_deref())?;
+            display_field(xml, "IsTruncated", page.is_truncated)?;
+            text(xml, "NextContinuationToken", page.next_continuation_token.as_deref())?;
+            for entry in &self.contents {
+                xml.create_element("Contents")
+                    .write_inner_content(|xml| entry.write_xml(xml))?;
+            }
+            write_prefixes(xml, page.common_prefixes.as_deref())?;
+            text(xml, "Delimiter", page.delimiter.as_deref())?;
+            text(xml, "EncodingType", page.encoding_type.as_ref().map(EncodingType::as_str))?;
+            text(xml, "StartAfter", page.start_after.as_deref())
+        })
     }
 }
 
-impl SerializeContent for ListObjectsV2MetadataOutput {
-    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
-        if let Some(ref val) = self.output.name {
-            s.content("Name", val)?;
-        }
-        if let Some(ref val) = self.output.prefix {
-            s.content("Prefix", val)?;
-        }
-        if let Some(ref val) = self.output.max_keys {
-            s.content("MaxKeys", val)?;
-        }
-        if let Some(ref val) = self.output.key_count {
-            s.content("KeyCount", val)?;
-        }
-        if let Some(ref val) = self.output.continuation_token {
-            s.content("ContinuationToken", val)?;
-        }
-        if let Some(ref val) = self.output.is_truncated {
-            s.content("IsTruncated", val)?;
-        }
-        if let Some(ref val) = self.output.next_continuation_token {
-            s.content("NextContinuationToken", val)?;
-        }
-        for entry in &self.contents {
-            s.content("Contents", entry)?;
-        }
-        if let Some(iter) = &self.output.common_prefixes {
-            s.flattened_list("CommonPrefixes", iter)?;
-        }
-        if let Some(ref val) = self.output.delimiter {
-            s.content("Delimiter", val)?;
-        }
-        if let Some(ref val) = self.output.encoding_type {
-            s.content("EncodingType", val)?;
-        }
-        if let Some(ref val) = self.output.start_after {
-            s.content("StartAfter", val)?;
-        }
-        Ok(())
-    }
-}
-
-impl<T: SerializeContent> SerializeContent for ObjectMetadataEntry<T> {
-    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+impl ObjectMetadataEntry {
+    fn write_xml(&self, xml: &mut ListingWriter) -> io::Result<()> {
         if let Some(etag) = &self.e_tag {
-            // Both strong and weak tags use literal quotes around XML-escaped text in listings.
-            s.element("ETag", |s| {
-                s.write_raw_text("\"")?;
-                etag.opaque_tag().serialize_content(s)?;
-                s.write_raw_text("\"")
+            // The XML listing uses literal outer quotes even for a weak tag. The opaque text is escaped.
+            let quoted = format!("\"{}\"", quick_xml::escape::escape(etag.opaque_tag()));
+            xml.create_element("ETag")
+                .write_text_content(BytesText::from_escaped(quoted))?;
+        }
+        self.object.write_xml(xml)?;
+        self.extension.write_xml(xml)
+    }
+}
+
+impl MetadataObject {
+    fn write_xml(&self, xml: &mut ListingWriter) -> io::Result<()> {
+        display_field(xml, "IsLatest", self.is_latest)?;
+        text(xml, "Key", Some(&self.key))?;
+        if let Some(date) = &self.last_modified {
+            xml.create_element("LastModified").write_inner_content(|xml| {
+                date.format(TimestampFormat::DateTime, xml.get_mut())
+                    .map_err(io::Error::other)
             })?;
         }
-        self.object.serialize_content(s)?;
-        self.extension.serialize_content(s)
+        if let Some(owner) = &self.owner {
+            xml.create_element("Owner").write_inner_content(|xml| {
+                text(xml, "DisplayName", owner.display_name.as_deref())?;
+                text(xml, "ID", owner.id.as_deref())
+            })?;
+        }
+        display_field(xml, "Size", self.size)?;
+        text(xml, "StorageClass", self.storage_class.as_deref())?;
+        text(xml, "VersionId", self.version_id.as_deref())
     }
 }
 
@@ -225,38 +243,28 @@ fn sanitize_xml_text(value: &str) -> Cow<'_, str> {
     }
 }
 
-impl SerializeContent for ObjectMetadataExtension {
-    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+impl ObjectMetadataExtension {
+    fn write_xml(&self, xml: &mut ListingWriter) -> io::Result<()> {
         if let Some(metadata) = &self.user_metadata {
-            s.element("UserMetadata", |s| {
+            xml.create_element("UserMetadata").write_inner_content(|xml| {
                 for entry in metadata {
-                    if let (Some(name), Some(value)) = (&entry.name, &entry.value) {
-                        // Skip entries whose key is not a valid XML element name and strip
-                        // XML-illegal control characters from the value, so a single poison
-                        // object can never corrupt the whole listing document. See issue #2743.
-                        if is_valid_xml_name(name) {
-                            let sanitized = sanitize_xml_text(value);
-                            s.content(name, sanitized.as_ref())?;
-                        }
+                    if let (Some(name), Some(value)) = (&entry.name, &entry.value)
+                        && is_valid_xml_name(name)
+                    {
+                        text(xml, name, Some(&sanitize_xml_text(value)))?;
                     }
                 }
                 Ok(())
             })?;
         }
-        if let Some(tags) = &self.user_tags {
-            s.content("UserTags", tags)?;
-        }
+        text(xml, "UserTags", self.user_tags.as_deref())?;
         if let Some(internal) = &self.internal {
-            s.content("Internal", internal)?;
+            xml.create_element("Internal").write_inner_content(|xml| {
+                display_field(xml, "K", Some(internal.k))?;
+                display_field(xml, "M", Some(internal.m))
+            })?;
         }
         Ok(())
-    }
-}
-
-impl SerializeContent for ObjectInternalInfo {
-    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
-        s.content("K", &self.k)?;
-        s.content("M", &self.m)
     }
 }
 
@@ -429,31 +437,31 @@ fn build_list_object_versions_metadata_output(
 
             if object.delete_marker {
                 ListObjectVersionMetadataEntry::DeleteMarker(
-                    DeleteMarkerEntry {
-                        key: Some(object_name),
+                    MetadataObject {
+                        key: object_name,
                         last_modified: object.mod_time.map(Timestamp::from),
                         owner: Some(owner.clone()),
                         version_id: Some(version_id),
                         is_latest: Some(object.is_latest),
+                        ..Default::default()
                     },
                     extension,
                 )
             } else {
                 ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
                     e_tag: listed_etag(&object),
-                    object: ObjectVersion {
-                        key: Some(object_name),
+                    object: MetadataObject {
+                        key: object_name,
                         last_modified: object.mod_time.map(Timestamp::from),
                         size: Some(object.size),
                         version_id: Some(version_id),
                         is_latest: Some(object.is_latest),
-                        storage_class: Some(ObjectVersionStorageClass::from(
+                        storage_class: Some(
                             object
                                 .storage_class
-                                .unwrap_or_else(|| ObjectVersionStorageClass::STANDARD.to_string()),
-                        )),
+                                .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
+                        ),
                         owner: Some(owner.clone()),
-                        ..Default::default()
                     },
                     extension,
                 })
@@ -530,16 +538,16 @@ fn build_list_objects_v2_metadata_output(
 
             ObjectMetadataEntry {
                 e_tag: listed_etag(object),
-                object: Object {
-                    key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
+                object: MetadataObject {
+                    key: encode_list_objects_v2_value(&object.name, encoding_type),
                     last_modified: object.mod_time.map(Timestamp::from),
                     size: Some(object.get_actual_size_or_physical()),
-                    storage_class: Some(ObjectStorageClass::from(
+                    storage_class: Some(
                         object
                             .storage_class
                             .clone()
                             .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
-                    )),
+                    ),
                     owner: fetch_owner.then_some(owner.clone()),
                     ..Default::default()
                 },
@@ -723,14 +731,160 @@ mod tests {
     use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
 
-    /// Response bodies are not bucket configurations: they are written by the
-    /// s3s encoder itself, as the legacy stack does.
-    fn serialize_s3s_response<T: xml::Serialize>(value: &T) -> Vec<u8> {
-        let mut buf = Vec::new();
-        value
-            .serialize(&mut xml::Serializer::new(&mut buf))
-            .expect("metadata output should serialize");
-        buf
+    #[test]
+    fn metadata_listings_match_the_legacy_xml_bytes() {
+        let owner = Owner {
+            display_name: Some("user<&".into()),
+            id: Some("a'b".into()),
+        };
+        let at = Timestamp::from(time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789).unwrap());
+        let object = MetadataObject {
+            key: "key&".into(),
+            last_modified: Some(at),
+            owner: Some(owner),
+            ..Default::default()
+        };
+        let extension = ObjectMetadataExtension {
+            user_metadata: Some(vec![
+                MetadataEntry {
+                    name: Some("bad key".into()),
+                    value: Some("absent".into()),
+                },
+                MetadataEntry {
+                    name: Some("键名".into()),
+                    value: Some("a\u{1}\t\n\r<&>\"'".into()),
+                },
+            ]),
+            user_tags: Some("tag=x&z=y".into()),
+            internal: Some(ObjectInternalInfo { k: 4, m: 2 }),
+        };
+        let prefixes = Some(vec![CommonPrefix {
+            prefix: Some("dir/".into()),
+        }]);
+        let v2 = ListObjectsV2MetadataOutput {
+            output: ListObjectsV2Output {
+                name: Some("bucket".into()),
+                prefix: Some(String::new()),
+                max_keys: Some(3),
+                key_count: Some(2),
+                continuation_token: Some("a+b".into()),
+                is_truncated: Some(true),
+                next_continuation_token: Some("c=".into()),
+                common_prefixes: prefixes.clone(),
+                delimiter: Some("/".into()),
+                encoding_type: Some(EncodingType::from_static("url")),
+                start_after: Some("key\r".into()),
+                ..Default::default()
+            },
+            contents: vec![ObjectMetadataEntry {
+                object: MetadataObject {
+                    size: Some(9),
+                    storage_class: Some("STANDARD".into()),
+                    ..object.clone()
+                },
+                e_tag: Some(ETag::from_stored("x<&\"'")),
+                extension: extension.clone(),
+            }],
+        };
+        let versions = ListObjectVersionsMetadataOutput {
+            output: ListObjectVersionsOutput {
+                common_prefixes: prefixes,
+                delimiter: Some("/".into()),
+                encoding_type: Some(EncodingType::from_static("url")),
+                is_truncated: Some(false),
+                key_marker: Some(String::new()),
+                max_keys: Some(3),
+                name: Some("bucket".into()),
+                next_key_marker: Some("mark".into()),
+                next_version_id_marker: Some("next".into()),
+                prefix: Some("prefix".into()),
+                version_id_marker: Some(String::new()),
+                ..Default::default()
+            },
+            entries: vec![
+                ListObjectVersionMetadataEntry::DeleteMarker(
+                    MetadataObject {
+                        is_latest: Some(true),
+                        version_id: Some("null".into()),
+                        ..object.clone()
+                    },
+                    ObjectMetadataExtension {
+                        user_metadata: Some(vec![]),
+                        ..Default::default()
+                    },
+                ),
+                ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
+                    object: MetadataObject {
+                        is_latest: Some(false),
+                        size: Some(99),
+                        storage_class: Some("GLACIER".into()),
+                        version_id: Some("v1".into()),
+                        ..object
+                    },
+                    e_tag: Some(ETag::new_weak("weak").unwrap()),
+                    extension,
+                }),
+            ],
+        };
+        // Complete documents captured from the metadata route's s3s serializer at 056e59af7.
+        assert_eq!(
+            v2.to_xml().unwrap(),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name>",
+                "<Prefix></Prefix><MaxKeys>3</MaxKeys><KeyCount>2</KeyCount>",
+                "<ContinuationToken>a+b</ContinuationToken><IsTruncated>true</IsTruncated>",
+                "<NextContinuationToken>c=</NextContinuationToken><Contents>",
+                "<ETag>\"x&lt;&amp;&quot;&apos;\"</ETag><Key>key&amp;</Key>",
+                "<LastModified>2023-11-14T22:13:20.123Z</LastModified><Owner>",
+                "<DisplayName>user&lt;&amp;</DisplayName><ID>a&apos;b</ID></Owner><Size>9</Size>",
+                "<StorageClass>STANDARD</StorageClass><UserMetadata>",
+                "<键名>a\t\n&#13;&lt;&amp;&gt;&quot;&apos;</键名></UserMetadata>",
+                "<UserTags>tag=x&amp;z=y</UserTags><Internal><K>4</K><M>2</M></Internal></Contents>",
+                "<CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes><Delimiter>/</Delimiter>",
+                "<EncodingType>url</EncodingType><StartAfter>key&#13;</StartAfter></ListBucketResult>",
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            versions.to_xml().unwrap(),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><CommonPrefixes>",
+                "<Prefix>dir/</Prefix></CommonPrefixes><Delimiter>/</Delimiter>",
+                "<EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><KeyMarker></KeyMarker>",
+                "<MaxKeys>3</MaxKeys><Name>bucket</Name><NextKeyMarker>mark</NextKeyMarker>",
+                "<NextVersionIdMarker>next</NextVersionIdMarker><Prefix>prefix</Prefix><VersionIdMarker>",
+                "</VersionIdMarker><DeleteMarker><IsLatest>true</IsLatest><Key>key&amp;</Key>",
+                "<LastModified>2023-11-14T22:13:20.123Z</LastModified><Owner>",
+                "<DisplayName>user&lt;&amp;</DisplayName><ID>a&apos;b</ID></Owner>",
+                "<VersionId>null</VersionId><UserMetadata></UserMetadata></DeleteMarker><Version>",
+                "<ETag>\"weak\"</ETag><IsLatest>false</IsLatest><Key>key&amp;</Key>",
+                "<LastModified>2023-11-14T22:13:20.123Z</LastModified><Owner>",
+                "<DisplayName>user&lt;&amp;</DisplayName><ID>a&apos;b</ID></Owner><Size>99</Size>",
+                "<StorageClass>GLACIER</StorageClass><VersionId>v1</VersionId><UserMetadata>",
+                "<键名>a\t\n&#13;&lt;&amp;&gt;&quot;&apos;</键名></UserMetadata>",
+                "<UserTags>tag=x&amp;z=y</UserTags><Internal><K>4</K><M>2</M></Internal></Version>",
+                "</ListVersionsResult>",
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            ListObjectsV2MetadataOutput::default().to_xml().unwrap(),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></ListBucketResult>",
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            ListObjectVersionsMetadataOutput::default().to_xml().unwrap(),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></ListVersionsResult>",
+            )
+            .as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -860,7 +1014,7 @@ mod tests {
             #[serde(rename = "ETag")]
             e_tag: Option<String>,
         }
-        for bytes in [serialize_s3s_response(&listings), serialize_s3s_response(&versions)] {
+        for bytes in [listings.to_xml().unwrap(), versions.to_xml().unwrap()] {
             let xml = std::str::from_utf8(&bytes).expect("UTF-8 listing");
             assert!(!xml.contains(legacy_md5));
             assert!(xml.contains(r#"<ETag>"a&amp;&lt;b"</ETag>"#));
@@ -1050,7 +1204,7 @@ mod tests {
                 extension,
                 ..
             }) => {
-                assert_eq!(version.key.as_deref(), Some("obj-a"));
+                assert_eq!(version.key, "obj-a");
                 // A null version's synthesized nil UUID must surface as the
                 // literal `null`, never as `00000000-…` (issue #6745).
                 assert_eq!(version.version_id.as_deref(), Some("null"));
@@ -1069,7 +1223,7 @@ mod tests {
 
         match &output.entries[1] {
             ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
-                assert_eq!(marker.key.as_deref(), Some("obj-b"));
+                assert_eq!(marker.key, "obj-b");
                 assert_eq!(marker.version_id.as_deref(), Some("null"));
                 assert!(extension.user_tags.is_none());
                 assert_eq!(
@@ -1136,7 +1290,7 @@ mod tests {
                 extension,
                 ..
             }) => {
-                assert_eq!(version.key.as_deref(), Some("logs%20and%20more%2Fobject%20one.txt"));
+                assert_eq!(version.key, "logs%20and%20more%2Fobject%20one.txt");
                 assert!(extension.user_metadata.is_none());
                 assert!(extension.user_tags.is_none());
                 assert!(extension.internal.is_none());
@@ -1221,7 +1375,7 @@ mod tests {
         assert_eq!(output.output.common_prefixes.as_ref().map(Vec::len), Some(1));
 
         let entry = output.contents.first().unwrap();
-        assert_eq!(entry.object.key.as_deref(), Some("logs/obj%20a.txt"));
+        assert_eq!(entry.object.key, "logs/obj%20a.txt");
         assert_eq!(entry.extension.user_tags.as_deref(), Some("env=prod"));
         assert_eq!(entry.extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
         assert!(entry.object.owner.is_some());
@@ -1274,7 +1428,7 @@ mod tests {
         };
 
         let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
-        let xml = String::from_utf8(serialize_s3s_response(&output)).expect("metadata output should be UTF-8");
+        let xml = String::from_utf8(output.to_xml().unwrap()).expect("metadata output should be UTF-8");
 
         assert!(xml.contains("<ListBucketResult"));
         assert!(xml.contains("<Contents>"));
@@ -1346,7 +1500,7 @@ mod tests {
         };
 
         let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
-        let xml = String::from_utf8(serialize_s3s_response(&output)).expect("metadata output should be UTF-8");
+        let xml = String::from_utf8(output.to_xml().unwrap()).expect("metadata output should be UTF-8");
 
         // Good sibling metadata survives.
         assert!(xml.contains("<project>alpha</project>"), "well-formed key must remain: {xml}");
@@ -1416,7 +1570,7 @@ mod tests {
         assert_eq!(output.output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
 
         let entry = output.contents.first().unwrap();
-        assert_eq!(entry.object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
+        assert_eq!(entry.object.key, "logs%20and%20more/object%20one.txt");
         assert!(entry.object.owner.is_none());
         assert!(entry.extension.user_metadata.is_none());
         assert!(entry.extension.user_tags.is_none());

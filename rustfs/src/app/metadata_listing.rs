@@ -28,7 +28,6 @@
 use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::storage_api::s3::dto::{EncodingType, ListObjectVersionsInput, ListObjectsV2Input};
-use crate::app::storage_api::s3::xml;
 use crate::storage::access_owned::listing_multipart::authorize_bucket_listing;
 use crate::storage::authorization::AuthorizationRequest;
 use http::{HeaderMap, Uri};
@@ -78,23 +77,21 @@ pub(crate) async fn answer(envelope: &RequestEnvelope, listing: MetadataListing,
     match listing {
         MetadataListing::ListObjectVersions => {
             let input = list_object_versions_input(bucket, envelope.uri(), envelope.headers())?;
-            render(&usecase.list_object_versions_metadata(envelope, input).await?)
+            usecase
+                .list_object_versions_metadata(envelope, input)
+                .await?
+                .to_xml()
+                .map_err(S3Error::internal_error)
         }
         MetadataListing::ListObjectsV2 => {
             let input = list_objects_v2_input(bucket, envelope.uri(), envelope.headers())?;
-            render(&usecase.list_objects_v2_metadata(envelope, input).await?)
+            usecase
+                .list_objects_v2_metadata(envelope, input)
+                .await?
+                .to_xml()
+                .map_err(S3Error::internal_error)
         }
     }
-}
-
-fn render<T: xml::Serialize>(output: &T) -> S3Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(1024);
-    let mut serializer = xml::Serializer::new(&mut body);
-    serializer
-        .decl()
-        .and_then(|()| output.serialize(&mut serializer))
-        .map_err(S3Error::internal_error)?;
-    Ok(body)
 }
 
 fn list_object_versions_input(bucket: String, uri: &Uri, headers: &HeaderMap) -> S3Result<ListObjectVersionsInput> {
