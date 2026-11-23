@@ -138,6 +138,9 @@ rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", 
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
+rustfs-gateway.workspace = true
+rustfs-gateway-types.workspace = true
+rustfs-gateway-stream.workspace = true
 serde-value.workspace = true
 s3s = { workspace = true, features = ["minio"] }
 s3s-sigv4.workspace = true
