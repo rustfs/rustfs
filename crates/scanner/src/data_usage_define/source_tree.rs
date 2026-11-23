@@ -21,13 +21,19 @@ pub struct SourceTree {
 }
 
 impl SourceTree {
+    fn matches(&self, bucket: &str, identity: DataUsageScanIdentity, started_plan: DataUsageScanPlanDigest) -> bool {
+        self.bucket == bucket
+            && self.identity.is_valid()
+            && identity.is_valid()
+            && self.identity.same_checkpoint_scope(&identity)
+            && self.started_plan == started_plan
+    }
+
     /// An inactive receipt may preserve an existing source position. Only an
     /// active, verified traversal can contribute new progress.
     pub(super) fn frontier(&self, info: &DataUsageCacheInfo) -> Option<&str> {
-        if self.bucket != info.name
-            || Some(self.identity) != info.scan_identity
-            || Some(self.started_plan) != info.scan_progress.map(|p| p.started_plan)
-        {
+        let (identity, progress) = (info.scan_identity?, info.scan_progress?);
+        if !self.matches(&info.name, identity, progress.started_plan) {
             return None;
         }
         self.coverage.as_ref().map(|receipt| receipt.through.as_str())
@@ -60,9 +66,7 @@ impl DataUsageCache {
                     && directory_source_location(work.endpoint()) != current_location
         });
         self.info.scan_source_trees.retain(|key, tree| {
-            tree.bucket == self.info.name
-                && tree.identity == identity
-                && tree.started_plan == progress.started_plan
+            tree.matches(&self.info.name, identity, progress.started_plan)
                 && (key == &source
                     || endpoints.contains(directory_source_location(key)) && directory_source_location(key) != current_location)
         });
@@ -109,9 +113,21 @@ impl DataUsageCache {
             self.info.scan_raw_enumeration_page_index = tree.index;
             self.info.scan_raw_enumeration_path_page_indexes = tree.ancestors;
             // A dormant tree must provide the same coverage/graph guarantees
-            // required of an active checkpoint before its child links are used.
-            if self.checked_flatten_complete_scope(&self.info.name).is_none()
-                || self.info.scan_coverage_receipt.is_some() && self.validated_scan_frontier().is_none()
+            // required of an active checkpoint. Validate its receipt under the
+            // saved identity before re-signing it under the adopted epoch;
+            // signing first would turn corrupt accounting into trusted work.
+            self.info.scan_identity = Some(tree.identity);
+            let graph_valid = self.checked_flatten_complete_scope(&self.info.name).is_some();
+            let frontier = self.validated_scan_frontier().map(str::to_owned);
+            let receipt_valid = self.info.scan_coverage_receipt.is_none() || frontier.is_some();
+            self.info.scan_identity = Some(identity);
+            if !graph_valid || !receipt_valid {
+                self.clear_active_directory_traversal();
+                return;
+            }
+            if tree.identity != identity
+                && let Some(frontier) = frontier
+                && self.seal_scan_frontier(Some(&frontier)).is_err()
             {
                 self.clear_active_directory_traversal();
             }
@@ -131,3 +147,6 @@ impl DataUsageCache {
 fn directory_source_location(source: &str) -> &str {
     source.split_once('|').map_or(source, |(_, endpoint)| endpoint)
 }
+
+#[cfg(test)]
+mod tests;

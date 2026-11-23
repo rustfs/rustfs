@@ -193,9 +193,10 @@ fn bucket_coverage_tracks_only_this_bucket_and_structural_identity() {
     );
     let mut changed = identity();
     changed.publication_epoch += 1;
-    assert_ne!(
+    assert_eq!(
         original,
-        scanner_single_bucket_coverage_digest(&bucket, source, Some(changed), TEST_PLAN_DIGEST)
+        scanner_single_bucket_coverage_digest(&bucket, source, Some(changed), TEST_PLAN_DIGEST),
+        "a publication fence change must not invalidate the bucket's traversal coverage"
     );
     assert_ne!(
         original,
