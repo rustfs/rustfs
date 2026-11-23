@@ -1014,8 +1014,8 @@ const SIGV4_UNSIGNED_ENVELOPE_HEADERS: &[&str] = &[
 ///
 /// Every signed-header list the request carries must cover every `x-amz-*`
 /// header, so an `Authorization` header can never widen a presigned URL and a
-/// query can never widen a header signature. The header is parsed with the
-/// verifier's own parser so both sides read the same `SignedHeaders` list, and
+/// query can never widen a header signature. The gateway reads the verifier's
+/// header grammar so both sides see the same `SignedHeaders` list, and
 /// the algorithm token is pinned because the verifier accepts any token there.
 /// A header the parser rejects never authenticates as SigV4 upstream, but one
 /// that claims the SigV4 algorithm still fails closed here. SigV2 signs every
@@ -1027,17 +1027,17 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
         let Ok(value) = value.to_str() else {
             continue;
         };
-        let authorization = match s3s_sigv4::AuthorizationV4::parse(value) {
-            Ok(authorization) => authorization,
-            Err(_) if value.starts_with(SIGN_V4_ALGORITHM) => {
+        let authorization = match rustfs_gateway::sig::SigV4HeaderCoverage::parse(value) {
+            Some(authorization) => authorization,
+            None if value.starts_with(SIGN_V4_ALGORITHM) => {
                 return Err(S3Error::with_message(
                     S3ErrorCode::AccessDenied,
                     "Invalid SigV4 authorization header".to_owned(),
                 ));
             }
-            Err(_) => continue,
+            None => continue,
         };
-        if authorization.algorithm != SIGN_V4_ALGORITHM {
+        if authorization.algorithm() != SIGN_V4_ALGORITHM {
             warn!(
                 event = EVENT_SIGV4_UNSUPPORTED_ALGORITHM,
                 component = LOG_COMPONENT_AUTH,
@@ -1057,10 +1057,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
             if !name.starts_with("x-amz-")
                 || SIGV4_UNSIGNED_ENVELOPE_HEADERS.contains(&name)
                 || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name)
-                || authorization
-                    .signed_headers
-                    .iter()
-                    .any(|signed_name| signed_name.eq_ignore_ascii_case(name))
+                || authorization.covers_header(name)
             {
                 continue;
             }
