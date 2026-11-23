@@ -17,6 +17,7 @@
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values::stored_etag;
+use crate::app::object::quota_accounting_object_size;
 use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
 use http::HeaderValue;
 use http::StatusCode;
@@ -125,14 +126,6 @@ fn validate_complete_multipart_checksum_type(headers: &HeaderMap, upload_metadat
     }
 
     Ok(())
-}
-
-fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
-    match quota_object_size(info) {
-        Ok(size) => Ok(size),
-        Err(err) if fail_closed => Err(ApiError::from(err).into()),
-        Err(_) => Ok(info.size.max(0) as u64),
-    }
 }
 
 fn encode_s3_path(path: &str) -> String {
@@ -801,6 +794,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::app::object::DefaultObjectUsecase;
+    use crate::app::storage_api::object_usecase::StorageObjectInfo as ObjectInfo;
     use crate::app::storage_api::s3::dto::{
         ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedPart, CreateMultipartUploadInput, ETag, StreamingBlob,
         UploadPartInput,
@@ -926,6 +920,12 @@ mod tests {
 
         let err = quota_accounting_object_size(&info, true).expect_err("invalid logical size must fail closed");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(err.message(), Some("part missing or corrupt"));
+        assert!(matches!(
+            err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::PartMissingOrCorrupt)
+        ));
         assert_eq!(quota_accounting_object_size(&info, false).expect("physical fallback should resolve"), 128);
     }
 

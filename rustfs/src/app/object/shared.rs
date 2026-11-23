@@ -23,6 +23,7 @@ use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
+use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -232,7 +233,7 @@ pub(crate) fn map_quota_check_outcome(
     }
 }
 
-pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaCheckResult) -> S3Result<()> {
+pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaCheckResult) -> OwnedResult<()> {
     if result.uses_durable_reservations {
         return Ok(());
     }
@@ -240,35 +241,35 @@ pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaChec
         return Ok(());
     };
     let Some(current_usage) = result.current_usage else {
-        return Err(S3Error::with_message(
-            S3ErrorCode::ServiceUnavailable,
-            "Bucket quota check temporarily unavailable, please retry".to_string(),
+        return Err(owned_error!(
+            ServiceUnavailable,
+            "Bucket quota check temporarily unavailable, please retry"
         ));
     };
     if current_usage > quota_limit {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
         ));
     }
     let _ = opts.set_quota_admission(current_usage, quota_limit);
     Ok(())
 }
 
-pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_size: u64) -> S3Result<()> {
+pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_size: u64) -> OwnedResult<()> {
     let (Some(current_usage), Some(quota_limit)) = (result.current_usage, result.quota_limit) else {
         return Ok(());
     };
     if new_size > quota_limit {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
         ));
     }
     Ok(())
 }
 
-pub(super) fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
+pub(crate) fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> OwnedResult<u64> {
     match quota_object_size(info) {
         Ok(size) => Ok(size),
         Err(err) if fail_closed => Err(ApiError::from(err).into()),
@@ -2230,7 +2231,9 @@ mod tests {
         let mut opts = ObjectOptions::default();
         let err =
             apply_quota_admission(&mut opts, &result).expect_err("legacy completion must not bypass an already exceeded quota");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 6 bytes, limit: 5 bytes"));
     }
 
     #[test]
@@ -2262,7 +2265,9 @@ mod tests {
             .expect("commit-time ledger must decide whether stale usage was reclaimed");
         let err = ensure_object_size_within_quota(&stale_full_usage, 4097)
             .expect_err("an object larger than the whole quota can never fit");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 4096 bytes, limit: 4096 bytes"));
     }
 
     #[test]
@@ -2278,6 +2283,16 @@ mod tests {
         .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message(), Some("Bucket quota check temporarily unavailable, please retry"));
+
+        let result = QuotaCheckResult {
+            current_usage: None,
+            uses_durable_reservations: false,
+            ..quota_result(true)
+        };
+        let error = apply_quota_admission(&mut ObjectOptions::default(), &result).expect_err("snapshot admission needs usage");
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(error.message(), Some("Bucket quota check temporarily unavailable, please retry"));
     }
 
     /// rustfs/backlog#2904: a durable-quota check whose scanner usage is

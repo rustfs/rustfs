@@ -756,7 +756,7 @@ async fn complete_extract_member_post_commit(
             }
             None
         }
-        Err(err) => Some(err.into()),
+        Err(err) => Some(err),
     };
     let _ = invalidate_object_data_cache_after_put_success(&context.cache_adapter, &context.bucket, &key).await;
 

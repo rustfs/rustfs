@@ -1909,8 +1909,7 @@ pub(crate) mod multipart_usecase {
     pub(crate) use crate::storage::storage_api::{
         DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY,
         EC_BLOCK_SIZE_HINT_REASON_HEADER, EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, ECStore,
-        EcBlockSizeHintOutcome, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint,
-        validate_new_object_key,
+        EcBlockSizeHintOutcome, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint, validate_new_object_key,
     };
 }
 

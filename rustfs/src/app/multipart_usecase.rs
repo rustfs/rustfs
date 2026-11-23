@@ -68,8 +68,7 @@ use super::storage_api::multipart_usecase::sse::{
     multipart_completion_authorization, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-    validate_new_object_key,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, validate_new_object_key,
 };
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
