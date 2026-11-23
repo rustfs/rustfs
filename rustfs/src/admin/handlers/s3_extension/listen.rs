@@ -335,7 +335,7 @@ impl ListenNotificationAuthorization {
             .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
         rustfs_keystone::KEYSTONE_CREDENTIALS
             .scope(keystone, async {
-                let (cred, is_owner) = crate::auth::check_key_valid_owned(
+                let (cred, is_owner) = crate::auth::check_key_valid_with_context(
                     get_session_token(self.envelope.uri(), self.envelope.headers()).unwrap_or_default(),
                     &access_key,
                     context.as_deref(),

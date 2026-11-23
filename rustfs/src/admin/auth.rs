@@ -288,7 +288,7 @@ pub(crate) async fn authenticate_envelope_credentials(credentials: &RequestCrede
 }
 
 async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
-    use crate::auth::check_key_valid_owned;
+    use crate::auth::check_key_valid_with_context;
 
     // Log authentication attempt for debugging
     debug!(
@@ -298,7 +298,7 @@ async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3
     );
 
     // Validate credentials using the core authentication function
-    let result = check_key_valid_owned(session_token, access_key, None).await;
+    let result = check_key_valid_with_context(session_token, access_key, None).await;
 
     match &result {
         Ok((cred, is_owner)) => {

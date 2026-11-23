@@ -18,14 +18,14 @@
 use super::*;
 use crate::app::multipart_usecase::{DefaultMultipartUsecase, UploadPartCopyWriteInput, UploadPartCopyWriteOutput};
 use rustfs_gateway_types::{CopySourceValue, UploadIdClaim, dto};
-use rustfs_protocols::common::client::s3::StorageBackend;
+use rustfs_protocols::common::client::s3::{MultipartRequest, StorageBackend};
 use rustfs_s3_types::S3Error;
 
-fn input(bucket: &str, upload: &str) -> dto::UploadPartCopyInput {
+fn input(bucket: &str) -> dto::UploadPartCopyInput {
     dto::UploadPartCopyInput {
         bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
         key: rustfs_gateway_types::ObjectKey::new("copy-target").expect("key"),
-        upload_id: UploadIdClaim::from_wire(upload),
+        upload_id: UploadIdClaim::default(),
         part_number: 1,
         copy_source: CopySourceValue::Bucket {
             bucket: bucket.into(),
@@ -117,8 +117,9 @@ fn protocol_upload_copy_original_refusal_order() {
             .await
             .expect("metadata");
         for case in 0..13 {
+            let upload_id = if case == 4 { "missing" } else { &upload.upload_id };
             let make = || {
-                let mut request = input(bucket, &upload.upload_id);
+                let mut request = input(bucket);
                 match case {
                     0 => {
                         request.part_number = 0;
@@ -142,10 +143,7 @@ fn protocol_upload_copy_original_refusal_order() {
                         request.copy_source_range = Some("bad-range".into());
                     }
                     3 => request.part_number = 0,
-                    4 => {
-                        request.upload_id = UploadIdClaim::from_wire("missing");
-                        request.copy_source_if_match = Some("missing".into());
-                    }
+                    4 => request.copy_source_if_match = Some("missing".into()),
                     5 => {
                         request.copy_source_if_match = Some("missing".into());
                         request.copy_source_range = Some("bytes=100-200".into());
@@ -174,7 +172,10 @@ fn protocol_upload_copy_original_refusal_order() {
             };
             let expected_count = if matches!(case, 0 | 8..=10) { 0 } else { 1 };
             let before_count = copy_count();
-            let actual = backend.upload_part_copy(make(), &root).await.expect_err("client refusal");
+            let actual = backend
+                .upload_part_copy(MultipartRequest::upload_part_copy(make(), upload_id), &root)
+                .await
+                .expect_err("client refusal");
             assert_eq!(copy_count() - before_count, expected_count);
             assert_eq!(
                 audit_operations(),
@@ -286,11 +287,14 @@ fn protocol_upload_copy_original_range_and_metadata() {
                     .get_multipart_info(bucket, "copy-target", &upload.upload_id, &options)
                     .await
                     .expect("metadata");
-                let mut request = input(bucket, &upload.upload_id);
+                let mut request = input(bucket);
                 request.copy_source_range = Some("bytes=2-6".into());
                 request.copy_source_if_match = Some(format!("\"{source_etag}\""));
                 let before_count = copy_count();
-                let output = backend.upload_part_copy(request, &root).await.expect("range copy");
+                let output = backend
+                    .upload_part_copy(MultipartRequest::upload_part_copy(request, &upload.upload_id), &root)
+                    .await
+                    .expect("range copy");
                 assert_eq!(copy_count() - before_count, 1);
                 let result = output;
                 assert!(result.last_modified.is_some());
@@ -383,7 +387,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             .new_multipart_upload(destination, "copy-target", &options)
             .await
             .expect("old upload");
-        let mut request = input(source, &upload.upload_id);
+        let mut request = input(source);
         request.bucket = rustfs_gateway_types::BucketName::new(destination).expect("destination name");
         let uri = build_object_uri(
             destination,
@@ -421,7 +425,8 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             )
             .await
             .expect("replacement bytes");
-        let (_, input) = multipart::prepare_upload_part_copy(request).expect("owned input");
+        let (_, input) = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(request, &upload.upload_id))
+            .expect("owned input");
         let result = backend
             .owned_multipart_usecase()
             .execute_upload_part_copy_with_audit(envelope, input)
@@ -450,7 +455,7 @@ fn owned_condition(value: Option<crate::app::object_usecase::CopySourceCondition
 fn protocol_upload_copy_input_matches_original_codec() {
     for case in 0..22 {
         let make = || {
-            let mut request = input("bucket", "upload ?&");
+            let mut request = input("bucket");
             match case {
                 0..=8 => {
                     let condition = [
@@ -506,10 +511,12 @@ fn protocol_upload_copy_input_matches_original_codec() {
         let expected = legacy_copy_source(make().copy_source)
             .map_err(|error| conversion_error("UploadPartCopy copy_source", error))
             .and_then(|source| {
-                gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(make(), source)
+                let mut legacy = make();
+                legacy.upload_id = UploadIdClaim::from_wire("upload ?&");
+                gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(legacy, source)
                     .map_err(|error| conversion_error("UploadPartCopy input", error))
             });
-        let actual = multipart::prepare_upload_part_copy(make());
+        let actual = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(make(), "upload ?&"));
         match (actual, expected) {
             (Err(actual), Err(expected)) => assert_eq!(error_facts(actual), error_facts(expected)),
             (Ok((uri, actual)), Ok(expected)) => {
@@ -746,9 +753,10 @@ async fn protocol_upload_copy_capabilities_precede_part_validation() {
             extensions,
         );
         let usecase = DefaultMultipartUsecase::without_context();
-        let mut request = input("bucket", "upload");
+        let mut request = input("bucket");
         request.part_number = 0;
-        let (_, input) = multipart::prepare_upload_part_copy(request).expect("owned input");
+        let (_, input) =
+            multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(request, "upload")).expect("owned input");
         let actual = owned_copy_future(&usecase, envelope, input)
             .await
             .err()

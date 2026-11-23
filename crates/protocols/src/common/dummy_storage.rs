@@ -31,7 +31,7 @@
 
 #[cfg(feature = "webdav")]
 use crate::common::client::s3::SessionCapacityView;
-use crate::common::client::s3::StorageBackend;
+use crate::common::client::s3::{MultipartRequest, StorageBackend};
 #[cfg(any(feature = "webdav", feature = "sftp"))]
 use crate::common::session::SessionContext;
 use async_trait::async_trait;
@@ -996,7 +996,12 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn upload_part(&self, mut input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
+    async fn upload_part(
+        &self,
+        input: MultipartRequest<UploadPartInput>,
+        _credentials: &Credentials,
+    ) -> Result<UploadPartOutput, Self::Error> {
+        let (mut input, _) = input.into_parts();
         self.record_upload_body(&mut input.body).await?;
         // Record the call and decide the control flow while holding the
         // lock. Release the lock before awaiting so the stall path does
@@ -1030,9 +1035,10 @@ impl StorageBackend for DummyBackend {
 
     async fn complete_multipart_upload(
         &self,
-        input: CompleteMultipartUploadInput,
+        input: MultipartRequest<CompleteMultipartUploadInput>,
         _credentials: &Credentials,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
+        let input = input.input();
         let part_count = input.multipart_upload.parts.len();
         {
             let mut inner = self.inner.lock().expect("lock");
@@ -1051,10 +1057,11 @@ impl StorageBackend for DummyBackend {
 
     async fn abort_multipart_upload(
         &self,
-        input: AbortMultipartUploadInput,
+        input: MultipartRequest<AbortMultipartUploadInput>,
         _credentials: &Credentials,
     ) -> Result<AbortMultipartUploadOutput, Self::Error> {
         {
+            let input = input.input();
             let mut inner = self.inner.lock().expect("lock");
             inner.abort_multipart_calls.push(AbortCall {
                 bucket: input.bucket.as_str().to_owned(),
@@ -1070,7 +1077,7 @@ impl StorageBackend for DummyBackend {
 
     async fn upload_part_copy(
         &self,
-        _input: UploadPartCopyInput,
+        _input: MultipartRequest<UploadPartCopyInput>,
         _credentials: &Credentials,
     ) -> Result<UploadPartCopyOutput, Self::Error> {
         match self.inner.lock().expect("lock").upload_part_copy.pop_front() {
@@ -1116,7 +1123,10 @@ mod tests {
             .key(ObjectKey::new("k").expect("key"))
             .upload_id(rustfs_gateway_types::UploadIdClaim::from_wire("UP-1"))
             .build();
-        backend.abort_multipart_upload(input, &credentials).await.expect("Ok");
+        backend
+            .abort_multipart_upload(MultipartRequest::abort(input, "UP-1"), &credentials)
+            .await
+            .expect("Ok");
         let calls = backend.abort_multipart_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].upload_id, OPAQUE_UPLOAD_ID);

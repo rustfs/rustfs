@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
+#[cfg(test)]
+use crate::runtime_sources::ServerContextSlot;
+use crate::runtime_sources::{AppContext, current_action_credentials, current_ready_iam_handle};
 use facts::{AuthzFacts, AuthzPrincipal, AuthzTarget};
 use http::HeaderMap;
 use http::HeaderValue;
@@ -29,11 +31,12 @@ use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case;
-use s3s::S3Error;
-use s3s::S3Result;
-use s3s::auth::S3Auth;
-use s3s::auth::SecretKey;
-use s3s::s3_error;
+#[cfg(test)]
+use s3s::{
+    S3Error, S3Result,
+    auth::{S3Auth, SecretKey},
+    s3_error,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -130,15 +133,17 @@ pub enum AuthType {
     StreamingUnsignedTrailer,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
-pub struct IAMAuth {
+pub(crate) struct IAMAuth {
     access_key: String,
     secret_key: SecretKey,
     server_ctx: Option<std::sync::Arc<ServerContextSlot>>,
 }
 
+#[cfg(test)]
 impl IAMAuth {
-    pub fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
+    pub(crate) fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
         Self {
             access_key: ak.into(),
             secret_key: sk.into(),
@@ -146,7 +151,6 @@ impl IAMAuth {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_server_context(
         ak: impl Into<String>,
         sk: impl Into<SecretKey>,
@@ -158,6 +162,7 @@ impl IAMAuth {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl S3Auth for IAMAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
@@ -246,6 +251,7 @@ impl S3Auth for IAMAuth {
     }
 }
 
+#[cfg(test)]
 fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
     s3_error!(InternalError, "IAM user lookup failed")
 }
@@ -265,7 +271,7 @@ pub(crate) fn keystone_is_owner(credentials: &Credentials) -> bool {
 }
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
-pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
+pub async fn check_key_valid(session_token: &str, access_key: &str) -> OwnedResult<(Credentials, bool)> {
     check_key_valid_with_context(session_token, access_key, None).await
 }
 
@@ -285,17 +291,6 @@ fn has_root_access(sys_cred: &Credentials, cred: &Credentials) -> bool {
 /// of the process defaults; `None` falls back to the ambient globals — the
 /// single-instance legacy behavior that all existing callers keep.
 pub async fn check_key_valid_with_context(
-    session_token: &str,
-    access_key: &str,
-    ctx: Option<&AppContext>,
-) -> S3Result<(Credentials, bool)> {
-    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public credential API. Remove after its legacy error type retires.
-    check_key_valid_owned(session_token, access_key, ctx)
-        .await
-        .map_err(S3Error::from)
-}
-
-pub(crate) async fn check_key_valid_owned(
     session_token: &str,
     access_key: &str,
     ctx: Option<&AppContext>,
@@ -455,8 +450,8 @@ pub(crate) async fn check_key_valid_owned(
     Ok((cred, owner))
 }
 
-pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<HashMap<String, Value>> {
-    check_claims_from_token_with_context(token, cred, None).map_err(S3Error::from)
+pub fn check_claims_from_token(token: &str, cred: &Credentials) -> OwnedResult<HashMap<String, Value>> {
+    check_claims_from_token_with_context(token, cred, None)
 }
 
 fn check_session_token(token: &str, cred: &Credentials) -> OwnedResult<()> {
@@ -789,12 +784,7 @@ fn query_may_carry_user_metadata(query: &str) -> bool {
 /// not sign. Keys and values that could not have arrived as a header are
 /// rejected rather than stored: the read path rebuilds them as header fields,
 /// where a control character would fail every `HeadObject` of that object.
-pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> S3Result<()> {
-    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public error type. Remove after the legacy auth API retires.
-    hoist_signed_query_params_owned(headers, query).map_err(S3Error::from)
-}
-
-pub(crate) fn hoist_signed_query_params_owned(headers: &mut HeaderMap, query: Option<&str>) -> OwnedResult<()> {
+pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     let Some(query) = query else {
         return Ok(());
     };
@@ -1352,6 +1342,7 @@ mod tests {
     use crate::runtime_sources::{IamInterface, KmsInterface};
     use http::header::{IF_MATCH, IF_NONE_MATCH};
     use http::{HeaderMap, HeaderValue, Uri};
+    use http_body_util::BodyExt;
     use rustfs_credentials::Credentials;
     use rustfs_iam::sys::OIDC_ISSUER_CLAIM;
     use rustfs_iam::{
@@ -1363,12 +1354,12 @@ mod tests {
     };
     use rustfs_kms::KmsServiceManager;
     use rustfs_policy::auth::get_new_credentials_with_metadata;
-    use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_trusted_proxies::ValidationMode;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     };
-    use s3s::S3ErrorCode;
+    use s3s::S3ErrorCode as LegacyErrorCode;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1396,17 +1387,9 @@ mod tests {
             if applied {
                 expected.insert("x-amz-meta-a", HeaderValue::from_static("1"));
             }
-            let mut public_headers = headers.clone();
-            let public_error = hoist_signed_query_params(&mut public_headers, Some(query)).unwrap_err();
-            assert_eq!(public_headers, expected);
-            assert_eq!(public_error.code(), &S3ErrorCode::InvalidArgument);
-            assert_eq!(public_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
-            assert_eq!(public_error.message(), Some(message));
-            assert!(public_error.source().is_none());
-
-            let error = hoist_signed_query_params_owned(&mut headers, Some(query)).unwrap_err();
+            let error = hoist_signed_query_params(&mut headers, Some(query)).unwrap_err();
             assert_eq!(headers, expected);
-            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
             assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
             assert_eq!(error.message(), Some(message));
             assert!(error.source().is_none());
@@ -1508,10 +1491,10 @@ mod tests {
         use rustfs_keystone::KEYSTONE_CREDENTIALS;
         let auth = IAMAuth::new("root", "root-secret");
         for key in ["keystone:x", "keystone:admin"] {
-            assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &S3ErrorCode::InvalidAccessKeyId);
+            assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &LegacyErrorCode::InvalidAccessKeyId);
             KEYSTONE_CREDENTIALS
                 .scope(None, async {
-                    assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &S3ErrorCode::InvalidAccessKeyId);
+                    assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &LegacyErrorCode::InvalidAccessKeyId);
                 })
                 .await;
         }
@@ -1566,7 +1549,7 @@ mod tests {
 
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert_eq!(error.code(), &S3ErrorCode::UnauthorizedAccess);
+        assert_eq!(error.code(), &LegacyErrorCode::UnauthorizedAccess);
         assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
     }
 
@@ -1613,7 +1596,7 @@ mod tests {
                 .with_subscriber(subscriber)
                 .await
                 .expect_err("unknown credentials must be rejected");
-            assert_eq!(error.code(), &S3ErrorCode::InvalidAccessKeyId);
+            assert_eq!(error.code(), &LegacyErrorCode::InvalidAccessKeyId);
             let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
             assert!(captured.contains(reason), "capture the expected rejection: {captured}");
             for forbidden in ["LEAK", "TAIL", "private-access-key", "access_key="] {
@@ -1626,7 +1609,7 @@ mod tests {
     fn test_iam_lookup_error_maps_to_internal_error() {
         let result = iam_lookup_error_to_s3_error(&IamError::Io(std::io::Error::other("load user failed")));
 
-        assert_eq!(result.code(), &S3ErrorCode::InternalError);
+        assert_eq!(result.code(), &LegacyErrorCode::InternalError);
         assert_eq!(result.message(), Some("IAM user lookup failed"));
     }
 
@@ -1684,8 +1667,8 @@ mod tests {
         assert!(error.message().unwrap_or("").contains("invalid token3"));
     }
 
-    #[test]
-    fn test_check_claims_from_token_expired_credentials() {
+    #[tokio::test]
+    async fn test_check_claims_from_token_expired_credentials() {
         let mut cred = create_temp_credentials();
         cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
 
@@ -1693,7 +1676,7 @@ mod tests {
         assert_eq!(error.code(), &S3ErrorCode::ExpiredToken);
         let response = error.to_http_response().expect("serialize the S3 error");
         assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-        let body = response.body().bytes().expect("error XML body");
+        let body = response.into_body().collect().await.expect("error XML body").to_bytes();
         let xml = std::str::from_utf8(&body).expect("UTF-8 error XML");
         assert!(xml.contains("<Code>ExpiredToken</Code>"));
         assert!(!xml.contains(&cred.session_token));
@@ -1748,18 +1731,14 @@ mod tests {
         for (fixture, expected_claims) in [(&valid, Some(&claims)), (&root, None)] {
             let token = &fixture.session_token;
             let key = &fixture.access_key;
-            for (verified, is_owner) in [
-                check_key_valid_with_context(token, key, Some(&context)).await.unwrap(),
-                check_key_valid_owned(token, key, Some(&context)).await.unwrap(),
-            ] {
-                assert!(is_owner);
-                assert!(verified.access_key == fixture.access_key);
-                assert!(verified.secret_key == fixture.secret_key);
-                assert!(verified.session_token == fixture.session_token);
-                assert!(verified.parent_user == fixture.parent_user);
-                assert_eq!(verified.expiration, fixture.expiration);
-                assert!(verified.claims.as_ref() == expected_claims);
-            }
+            let (verified, is_owner) = check_key_valid_with_context(token, key, Some(&context)).await.unwrap();
+            assert!(is_owner);
+            assert!(verified.access_key == fixture.access_key);
+            assert!(verified.secret_key == fixture.secret_key);
+            assert!(verified.session_token == fixture.session_token);
+            assert!(verified.parent_user == fixture.parent_user);
+            assert_eq!(verified.expiration, fixture.expiration);
+            assert!(verified.claims.as_ref() == expected_claims);
         }
 
         // Seed the state of an issued identity after expiration without sleeping
@@ -1822,22 +1801,14 @@ mod tests {
             let error = check_key_valid_with_context(token, &credential.access_key, Some(&context))
                 .await
                 .unwrap_err();
-            let owned = check_key_valid_owned(token, &credential.access_key, Some(&context))
-                .await
-                .unwrap_err();
-            for (code, text, status, has_source) in [
-                (error.code().as_str(), error.message(), error.status_code(), error.source().is_some()),
-                (owned.code().as_str(), owned.message(), owned.status_code(), owned.source().is_some()),
-            ] {
-                assert_eq!(code, expected.as_str(), "{name}");
-                assert_eq!(text, Some(message), "{name}");
-                assert_eq!(status, expected.status_code(), "{name}");
-                assert!(!has_source, "{name}");
-            }
+            assert_eq!(error.code(), &expected, "{name}");
+            assert_eq!(error.message(), Some(message), "{name}");
+            assert_eq!(error.status_code(), expected.status_code(), "{name}");
+            assert!(error.source().is_none(), "{name}");
             if expected == S3ErrorCode::ExpiredToken {
                 let response = error.to_http_response().expect("serialize the S3 error");
                 assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-                let body = response.body().bytes().expect("error XML body");
+                let body = response.into_body().collect().await.expect("error XML body").to_bytes();
                 assert!(std::str::from_utf8(&body).unwrap().contains("<Code>ExpiredToken</Code>"));
             }
         }
@@ -2563,7 +2534,7 @@ mod tests {
             headers.insert("content-type", HeaderValue::from_static("text/plain"));
             headers.insert(header, HeaderValue::from_static("attacker-controlled"));
             let error = reject_unsigned_amz_headers_on_presigned_request(&headers, Some(presigned_host_only)).unwrap_err();
-            assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied, "{header} must be rejected when unsigned");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{header} must be rejected when unsigned");
             assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
         }
 
@@ -2581,7 +2552,7 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&missing_signed_headers))
                 .unwrap_err()
                 .code(),
-            &OwnedS3ErrorCode::AccessDenied
+            &S3ErrorCode::AccessDenied
         );
 
         // Detection follows the upstream dispatch: any query carrying the
@@ -2591,7 +2562,7 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&lowercase_query))
                 .unwrap_err()
                 .code(),
-            &OwnedS3ErrorCode::AccessDenied
+            &S3ErrorCode::AccessDenied
         );
 
         // Only the exact key the upstream verifier reads counts; a second
@@ -2602,14 +2573,14 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&widened_by_case))
                 .unwrap_err()
                 .code(),
-            &OwnedS3ErrorCode::AccessDenied
+            &S3ErrorCode::AccessDenied
         );
         let duplicated = format!("{presigned_host_only}&X-Amz-SignedHeaders=host%3Bx-amz-tagging");
         assert_eq!(
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&duplicated))
                 .unwrap_err()
                 .code(),
-            &OwnedS3ErrorCode::AccessDenied
+            &S3ErrorCode::AccessDenied
         );
     }
 
@@ -2637,7 +2608,7 @@ mod tests {
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(signed_tagging))
                 .unwrap_err()
                 .code(),
-            &OwnedS3ErrorCode::AccessDenied
+            &S3ErrorCode::AccessDenied
         );
     }
 
@@ -2683,7 +2654,7 @@ mod tests {
 
     fn assert_unsigned_headers_denied(result: OwnedResult<()>) {
         let error = result.expect_err("unsigned x-amz header must be denied");
-        assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied);
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
     }
 
@@ -2750,7 +2721,7 @@ mod tests {
             );
             let error = reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
                 .expect_err("non-SigV4 algorithm token must be denied");
-            assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
             assert_eq!(error.message(), Some(UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE));
 
             headers.insert("x-amz-copy-source", HeaderValue::from_static("/source/secret"));
@@ -2762,7 +2733,7 @@ mod tests {
         headers.insert("authorization", HeaderValue::from_static("AWS4-HMAC-SHA256 invalid"));
         let error =
             reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect_err("malformed SigV4 header must fail closed");
-        assert_eq!(error.code(), &OwnedS3ErrorCode::AccessDenied);
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
     }
 
     /// Every SigV4 signed-header list present must cover every `x-amz-*`
@@ -3219,7 +3190,7 @@ mod tests {
         // Should fail with InvalidAccessKeyId because Keystone is not enabled
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidAccessKeyId);
+        assert_eq!(*err.code(), S3ErrorCode::InvalidAccessKeyId);
     }
 
     #[tokio::test]
