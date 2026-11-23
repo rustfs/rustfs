@@ -18,6 +18,8 @@ mod admin_bucket_identity;
 pub(crate) use admin_bucket_identity::current_admin_bucket_incarnations;
 pub use admin_bucket_identity::verified_account_bucket_usage;
 pub mod local_snapshot;
+mod scan_progress;
+pub use scan_progress::load_bucket_scan_progress_for_admin;
 
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},

@@ -766,6 +766,20 @@ impl DataUsageCache {
             _ => (inline.clone(), [None, None]),
         };
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let display_progress = timeout(Duration::from_secs(2), async {
+            let input = if expected_epoch.is_some() && self.info.scan_identity.is_some() && self.info.name != DATA_USAGE_ROOT {
+                match &encoded {
+                    Some(encoded) => encoded.progress_input().await,
+                    None => Some(vec![inline.clone()]),
+                }
+            } else {
+                None
+            };
+            self.prepare_display_progress(store.clone(), expected_epoch, input).await
+        })
+        .await
+        .ok()
+        .flatten();
         let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),
@@ -778,6 +792,7 @@ impl DataUsageCache {
         )
         .await?;
 
+        Self::persist_display_progress(store.clone(), display_progress, expected_epoch).await;
         pages::reclaim_retired(store.clone(), name, primary_retired, expected_epoch).await;
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
@@ -815,7 +830,11 @@ impl DataUsageCache {
             pages::reclaim_retired(store, &backup_name, retired, expected_epoch).await;
             Ok::<_, StorageError>(())
         };
-        if let Err(e) = save_backup.await {
+        let backup_result = match timeout(backup_timeout_duration, save_backup).await {
+            Ok(result) => result,
+            Err(_) => Err(StorageError::other("scanner cache backup save timed out")),
+        };
+        if let Err(e) = backup_result {
             warn!(
                 target: "rustfs::scanner::data_usage",
                 event = EVENT_SCANNER_CACHE_SAVE_STATE,

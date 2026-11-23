@@ -4059,6 +4059,7 @@ pub(crate) async fn scan_data_folder_scoped(
             new_cache.info.scan_directory_source = None;
             new_cache.info.scan_source_trees.clear();
             new_cache.info.scan_coverage_receipt = None;
+            new_cache.info.scan_coverage_measured_at = None;
             if had_scan_checkpoint {
                 global_metrics().record_scanner_checkpoint_cleared();
             }
@@ -4119,6 +4120,7 @@ pub(crate) async fn scan_data_folder_scoped(
                     new_cache.info.scan_checkpoint = None;
                     new_cache.info.scan_resume_after = None;
                     new_cache.info.scan_coverage_receipt = None;
+                    new_cache.info.scan_coverage_measured_at = None;
                 }
                 if raw_enumeration_page_index.is_some() {
                     new_cache.info.scan_raw_enumeration_page_index = raw_enumeration_page_index;
@@ -4126,6 +4128,7 @@ pub(crate) async fn scan_data_folder_scoped(
                     new_cache.info.scan_checkpoint = None;
                     new_cache.info.scan_resume_after = None;
                     new_cache.info.scan_coverage_receipt = None;
+                    new_cache.info.scan_coverage_measured_at = None;
                 }
                 if partial_cache_is_useful(&root, pending_heals_changed)
                     || !new_cache.info.scan_directory_work.is_empty()
