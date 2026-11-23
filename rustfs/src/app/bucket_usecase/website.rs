@@ -81,7 +81,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::super::{BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG};
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::object_usecase::helper::MutationCompletionProbe;
@@ -117,16 +117,22 @@ mod tests {
                     (http::Method::DELETE, S3Operation::DeleteBucketWebsite, StatusCode::NO_CONTENT),
                 ] {
                     let probe = MutationCompletionProbe::install(&bucket);
-                    let mut request = build_request_with_req_info(
-                        (),
-                        method,
-                        ReqInfo {
-                            bucket: Some(bucket.clone()),
-                            ..Default::default()
+                    let mut extensions = http::Extensions::new();
+                    extensions.insert(ReqInfo {
+                        bucket: Some(bucket.clone()),
+                        ..Default::default()
+                    });
+                    let envelope = RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method,
+                            uri: format!("/{bucket}").parse().expect("audit request URI"),
+                            headers: http::HeaderMap::new(),
+                            credentials: None,
+                            region: None,
+                            service: None,
                         },
+                        extensions,
                     );
-                    request.uri = format!("/{bucket}").parse().expect("audit request URI");
-                    let envelope = RequestEnvelope::from_s3s(&request);
                     let result = match operation {
                         S3Operation::PutBucketAccelerateConfiguration => {
                             usecase
@@ -253,10 +259,9 @@ mod tests {
                     .make_bucket(&bucket, &MakeBucketOptions::default())
                     .await
                     .expect("create original bucket");
-                let mut request = build_request((), method.clone());
-                request.uri = format!("/{bucket}?{query}").parse().expect("bucket request URI");
-                request.extensions.insert(Arc::clone(&server));
-                request.extensions.insert(ReqInfo {
+                let mut extensions = http::Extensions::new();
+                extensions.insert(Arc::clone(&server));
+                extensions.insert(ReqInfo {
                     cred: Some(Credentials {
                         access_key: "core-config-owner".to_owned(),
                         ..Default::default()
@@ -264,7 +269,17 @@ mod tests {
                     is_owner: true,
                     ..Default::default()
                 });
-                let mut envelope = RequestEnvelope::from_s3s(&request);
+                let mut envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: method.clone(),
+                        uri: format!("/{bucket}?{query}").parse().expect("bucket request URI"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
                 authorize_bucket_config_mutation(
                     &server,
                     &mut envelope,

@@ -172,7 +172,12 @@ pub(crate) async fn handle_read_file_nixl(req: Request<Incoming>) -> Response<Bo
     let chunk = match read {
         Ok(Ok(chunk)) => chunk,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return reply(StatusCode::NOT_FOUND, "file not found");
+            let mut response = reply(StatusCode::NOT_FOUND, "file not found");
+            response.headers_mut().insert(
+                rustfs_rio::INTERNODE_DISK_ERROR_HEADER,
+                HeaderValue::from_static(rustfs_rio::INTERNODE_FILE_NOT_FOUND),
+            );
+            return response;
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             return refuse(StatusCode::FORBIDDEN, "path_outside_volume", error);

@@ -64,7 +64,9 @@ use super::super::{
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_decode_inline_data_shards, warn,
 };
-use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::bitrot_self_verify::{
+    BitrotSelfVerifyTarget, WrittenBitrotShards, drop_failed_writer_disks, verify_written_bitrot_shards,
+};
 use super::delete_recovery::DeleteRecoveryContext;
 
 const EVENT_SET_DISK_DELETE_OBJECTS_STAGE: &str = "set_disk_delete_objects_stage";
@@ -4697,7 +4699,8 @@ impl SetDisks {
 
         let tmp_dir = Uuid::new_v4().to_string();
 
-        let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
+        let tmp_data_dir = format!("{}/{}", tmp_dir, fi.data_dir.ok_or(Error::FileCorrupt)?);
+        let tmp_object = format!("{tmp_data_dir}/part.1");
 
         let (operation_cancellation, mut commit_cancellation_handoff_tx, cancellation_wait) =
             if let Some(cancellation) = opts.put_object_cancellation.clone() {
@@ -5020,12 +5023,7 @@ impl SetDisks {
                     integrity.part
                 } else {
                     integrity
-                        .write(
-                            &mut shuffle_disks,
-                            bucket,
-                            RUSTFS_META_TMP_BUCKET,
-                            &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
-                        )
+                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_data_dir)
                         .await?
                 })
             } else {
@@ -5132,19 +5130,21 @@ impl SetDisks {
                 verify_written_bitrot_shards(
                     &shuffle_disks,
                     if is_inline_buffer {
-                        Some(parts_metadatas.as_slice())
+                        WrittenBitrotShards::Inline(&parts_metadatas)
                     } else {
-                        None
+                        WrittenBitrotShards::Staged {
+                            directory: &tmp_data_dir,
+                            layout: &parts_metadatas[response_metadata_slot].erasure,
+                            part_size: w_size,
+                        }
                     },
                     BitrotSelfVerifyTarget {
                         operation: "put_object",
                         bucket,
                         object,
                         part_number: None,
-                        volume: RUSTFS_META_TMP_BUCKET,
-                        path: &tmp_object,
                         logical_shard_size,
-                        shard_size,
+                        shard_size: frame_size,
                         write_quorum,
                     },
                 )
@@ -16742,6 +16742,137 @@ mod metadata_mutation_generation_tests {
         assert!(aliases.iter().all(|(_, value)| value.as_str() == expected));
         assert!(metadata.contains_key(&format!("x-rustfs-internal-{suffix}")));
         assert!(metadata.contains_key(&format!("x-minio-internal-{suffix}")));
+    }
+
+    const EC_BLOCK_SIZE_PROJECTION_KEYS: [&str; 2] = ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"];
+
+    /// Metadata keys of the latest version as persisted on every disk.
+    async fn stored_metadata_keys(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<HashSet<String>> {
+        let mut stored = Vec::with_capacity(disks.len());
+        for disk in disks {
+            let bytes = disk
+                .read_all(bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("persisted metadata");
+            let fi = FileMeta::load(&bytes)
+                .expect("decode xl.meta")
+                .into_fileinfo(bucket, object, "", false, false, false)
+                .expect("latest version");
+            stored.push(fi.metadata.into_keys().collect());
+        }
+        stored
+    }
+
+    #[tokio::test]
+    async fn default_layout_metadata_copy_persists_no_ec_block_size_projection() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "default-layout-copy";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"default layout".to_vec()),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                user_defined: HashMap::from([("x-amz-meta-color".to_string(), "red".to_string())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let before = stored_metadata_keys(&disks, bucket, object).await;
+
+        let opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        let mut source = set.get_object_info(bucket, object, &opts).await.expect("read metadata");
+        assert_eq!(source.effective_ec_block_size(), Some(crate::object_api::DEFAULT_EC_BLOCK_SIZE));
+        source.metadata_only = true;
+        Arc::make_mut(&mut source.user_defined).insert("x-amz-meta-color".to_string(), "blue".to_string());
+        set.copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            .await
+            .expect("metadata-replacing copy");
+
+        let after = stored_metadata_keys(&disks, bucket, object).await;
+        for keys in &after {
+            for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
+                assert!(!keys.contains(key), "a default-layout copy must not persist {key}");
+            }
+        }
+        assert_eq!(after, before, "a metadata-replacing copy keeps the stored key set");
+        let copied = set
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("read copied metadata");
+        assert_eq!(copied.user_defined.get("x-amz-meta-color").map(String::as_str), Some("blue"));
+        assert_eq!(copied.effective_ec_block_size(), Some(crate::object_api::DEFAULT_EC_BLOCK_SIZE));
+    }
+
+    #[tokio::test]
+    async fn default_layout_replication_status_writeback_persists_no_ec_block_size_projection() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "default-layout-writeback";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"default layout".to_vec()),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let before = stored_metadata_keys(&disks, bucket, object).await;
+        let snapshot = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read metadata")
+            .replication_generation_snapshot();
+        let status = replication_metadata(None, None, "arn:test=COMPLETED;");
+        set.put_object_metadata(
+            bucket,
+            object,
+            &ObjectOptions {
+                eval_metadata: Some(status.clone()),
+                replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                    expected_generation: snapshot,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("replication status write-back");
+
+        let after = stored_metadata_keys(&disks, bucket, object).await;
+        for (keys, before) in after.iter().zip(&before) {
+            for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
+                assert!(!keys.contains(key), "a status write-back must not persist {key}");
+            }
+            // The write-back adds exactly the status keys `main` writes.
+            let added: HashSet<&str> = keys.difference(before).map(String::as_str).collect();
+            let expected: HashSet<&str> = status
+                .keys()
+                .map(String::as_str)
+                .chain([
+                    "X-Amz-Replication-Status",
+                    "x-rustfs-internal-replication-status",
+                    "x-minio-internal-replication-status",
+                    "x-rustfs-internal-data-moved",
+                    "x-minio-internal-data-moved",
+                ])
+                .collect();
+            assert_eq!(added, expected);
+        }
     }
 
     #[tokio::test]

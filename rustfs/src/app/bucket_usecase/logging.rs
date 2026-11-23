@@ -56,7 +56,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::bucket_usecase::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
@@ -100,10 +100,9 @@ mod tests {
                 .expect("create original bucket");
             let server = ServerContextSlot::new();
             assert!(server.install(Arc::clone(&context)));
-            let mut request = build_request((), Method::PUT);
-            request.uri = format!("/{bucket}?logging").parse().expect("logging request URI");
-            request.extensions.insert(Arc::clone(&server));
-            request.extensions.insert(ReqInfo {
+            let mut extensions = http::Extensions::new();
+            extensions.insert(Arc::clone(&server));
+            extensions.insert(ReqInfo {
                 cred: Some(Credentials {
                     access_key: "logging-owner".to_owned(),
                     ..Default::default()
@@ -111,7 +110,17 @@ mod tests {
                 is_owner: true,
                 ..Default::default()
             });
-            let mut envelope = RequestEnvelope::from_s3s(&request);
+            let mut envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::PUT,
+                    uri: format!("/{bucket}?logging").parse().expect("logging request URI"),
+                    headers: http::HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            );
             authorize_bucket_config_mutation(&server, &mut envelope, &bucket, Action::S3Action(S3Action::PutBucketLoggingAction))
                 .await
                 .expect("snapshot the original bucket incarnation");

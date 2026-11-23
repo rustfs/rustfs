@@ -524,7 +524,7 @@ async fn try_migrate_format(
                 {
                     return (index, Some(Err(error.clone())));
                 }
-                let reader = match disk.read_file(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
+                let reader = match disk.read_format_control(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
                     Ok(reader) => reader,
                     Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return (index, None),
                     Err(err) => return (index, Some(Err(err))),
