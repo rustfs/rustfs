@@ -8341,6 +8341,70 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn rename_fanout_falls_back_once_per_slot_when_old_peer_rejects_batch() {
+        use crate::cluster::rpc::remote_disk::RenameBatchFallbackPeer;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let peer = RenameBatchFallbackPeer::spawn().await;
+
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            let mut disks = Vec::new();
+            for slot in 0..4 {
+                let mut endpoint =
+                    Endpoint::try_from(format!("{}/data/rustfs{slot}", peer.addr()).as_str()).expect("rename fallback endpoint");
+                endpoint.is_local = false;
+                disks.push(Some(
+                    new_disk(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("rename fallback remote disk"),
+                ));
+            }
+            assert_eq!(peer.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+
+            let mut file_info = metadata_test_fileinfo("object");
+            file_info.erasure.index = 0;
+            let commit = SetDisks::rename_data_owned(
+                &disks,
+                (RUSTFS_META_TMP_BUCKET, "source"),
+                vec![file_info; disks.len()],
+                ("bucket", "object"),
+                disks.len(),
+                false,
+            )
+            .await
+            .expect("unary fallback must satisfy every rename slot");
+
+            assert_eq!(peer.batch_calls(), 1, "one peer group makes one batch attempt");
+            let mut expected_disks = disks
+                .iter()
+                .flatten()
+                .map(|disk| disk.endpoint().to_string())
+                .collect::<Vec<_>>();
+            expected_disks.sort();
+            let mut batch_disks = peer.batch_disks();
+            batch_disks.sort();
+            assert_eq!(batch_disks, expected_disks, "the rejected batch must cover every planned slot");
+            let mut unary_disks = peer.unary_disks();
+            unary_disks.sort();
+            assert_eq!(unary_disks, expected_disks, "each slot falls back to unary exactly once");
+            assert_eq!(commit.online_disks.iter().filter(|disk| disk.is_some()).count(), disks.len());
+            assert_eq!(commit.convergence, RenameConvergence::AllSuccessIdentical);
+            assert_eq!(peer.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+        })
+        .await;
+
+        rustfs_protos::evict_failed_connection(peer.addr()).await;
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn rename_fanout_plan_batches_only_multi_slot_ordinary_peers() {
         temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
             let mut disks = Vec::new();
