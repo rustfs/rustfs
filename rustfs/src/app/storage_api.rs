@@ -71,7 +71,6 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
-    pub(crate) use s3s::header;
     pub(crate) use s3s::s3_error;
     pub(crate) use s3s::stream;
     #[cfg(test)]

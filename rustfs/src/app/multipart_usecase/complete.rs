@@ -18,15 +18,13 @@ use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values::stored_etag;
 use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
-use crate::app::storage_api::s3::header::{
-    X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-};
 use http::HeaderValue;
 use http::StatusCode;
 use rustfs_gateway_types::dto::{
     ChecksumType, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ServerSideEncryption,
 };
 use rustfs_gateway_types::{ETag, RecordedUpload, resolve_upload_async};
+use rustfs_s3_client::constants::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
 

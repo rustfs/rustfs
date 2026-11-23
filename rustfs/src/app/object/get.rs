@@ -21,13 +21,13 @@ use crate::app::dto_values::timestamp;
 use crate::app::{Answered, RequestEnvelope};
 use rustfs_gateway_types::dto as gateway_dto;
 use rustfs_s3_types::S3Result as OwnedResult;
+use rustfs_utils::http::headers::AMZ_RESTORE;
 
 use super::*;
 use crate::app::storage_api::object_usecase::object_cache::{
     GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
     with_get_object_read_condition,
 };
-use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, s3_error};
 use crate::on_demand_migration::WriteBackBody;
 
@@ -4254,7 +4254,7 @@ impl DefaultObjectUsecase {
         let output_version_id = s3_response_version_id(info.version_id);
 
         // x-amz-restore: extract from object metadata
-        let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
+        let restore = info.user_defined.get(AMZ_RESTORE).and_then(|v| {
             let rs = parse_restore_obj_status(v).ok()?;
             Some(rs.to_string2())
         });
